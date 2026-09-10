@@ -149,45 +149,45 @@ impl AddrFile {
 
 /// Entry point dispatched from `main::run_command`.
 pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
-    #[cfg(unix)]
-    let code = run_unix(action, opts);
-    #[cfg(not(unix))]
-    let code = run_non_unix(action, opts);
+    #[cfg(any(unix, windows))]
+    let code = run_lifecycle(action, opts);
+    #[cfg(not(any(unix, windows)))]
+    let code = run_without_lifecycle(action, opts);
     std::process::exit(code);
 }
 
-/// The refusal printed when the daemon lifecycle is invoked on a non-Unix host.
+/// The refusal printed on a platform with neither POSIX signals nor the Windows
+/// process/service APIs the daemon lifecycle is built on.
 ///
-/// Built from [`crate::platform`] so the tier name, the reason, and the policy
-/// link match `autumn doctor` and the published guide exactly. Compiled on every
-/// platform (not just the one that prints it) so its wording is covered by tests
-/// on Linux/macOS CI rather than only on a Windows runner.
+/// Unix and Windows both run the full lifecycle (#1639); this covers whatever is
+/// left. Compiled on every platform so its wording is covered by tests rather
+/// than only on the host that prints it.
 fn daemon_unsupported_message() -> String {
     format!(
-        "autumn serve: {}\n  Plain `autumn serve` (foreground) is Tier 1 and runs \
-         natively here.",
-        crate::platform::tier_two_windows_error("autumn serve --daemon / stop / status / restart")
+        "autumn serve: the background daemon lifecycle (--daemon / stop / status \
+         / restart) is not supported on {}.\n  Plain `autumn serve` (foreground) \
+         runs natively here.",
+        std::env::consts::OS
     )
 }
 
-/// Non-Unix entry point. The background-daemon lifecycle (`--daemon`, `stop`,
-/// `status`, `restart`) is built on Unix domain sockets and POSIX signals and is
-/// not supported here, but a plain foreground `autumn serve` still works: it
-/// builds and runs the app binary, which binds TCP per its config.
-#[cfg(not(unix))]
-fn run_non_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
+/// Entry point for a platform without the daemon lifecycle. A plain foreground
+/// `autumn serve` still works: it builds and runs the app binary, which binds
+/// TCP per its config.
+#[cfg(not(any(unix, windows)))]
+fn run_without_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     if action.is_some() || opts.daemon {
         eprintln!("{}", daemon_unsupported_message());
         return 1;
     }
-    // Plain foreground server: builds and runs on the configured transport,
-    // deferring (and, when not bundling Postgres, skipping) runtime-path setup.
     start_foreground(opts)
 }
 
-/// Unix implementation of `run` (daemon lifecycle).
-#[cfg(unix)]
-fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
+/// The daemon lifecycle. Identical on Unix and Windows at this level: the two
+/// diverge only in how the daemon's endpoint is chosen and how it is asked to
+/// drain, both of which are behind helpers below.
+#[cfg(any(unix, windows))]
+fn run_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     match action {
         None => start(opts),
         Some(ServeAction::Stop) => stop(opts),
@@ -302,6 +302,56 @@ fn managed_cluster_present(package: Option<&str>) -> bool {
         .is_ok_and(|p| p.pg_data_dir().join("PG_VERSION").exists())
 }
 
+/// Where a running daemon accepts traffic.
+///
+/// Unix daemons bind a per-project Unix socket the CLI chooses; Windows daemons
+/// bind their configured `server.host:port` and report it back through the
+/// readiness file. Both are carried by `serve.addr` so a thin client reads one
+/// shape on either platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonEndpoint {
+    /// `"unix"` or `"tcp"`.
+    transport: String,
+    /// Socket path (unix) or `host:port` (tcp).
+    address: String,
+}
+
+/// The transports the CLI knows how to probe. An endpoint outside this set is
+/// rejected rather than recorded: `status` would otherwise report a daemon it
+/// can never confirm, and `stop` would trust an address it cannot reach.
+const KNOWN_TRANSPORTS: [&str; 2] = ["unix", "tcp"];
+
+/// How long to wait for a TCP connect when probing a daemon's liveness. Short:
+/// the endpoint is on loopback, so anything slower is not a live listener.
+const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+
+impl DaemonEndpoint {
+    /// Parse a readiness-file endpoint line: `<transport> <address>`.
+    ///
+    /// Splits on the FIRST space only, so a Unix socket path containing spaces
+    /// survives. Returns `None` for an unknown transport or a missing address.
+    fn parse(line: &str) -> Option<Self> {
+        let (transport, address) = line.trim().split_once(' ')?;
+        let address = address.trim();
+        if address.is_empty() || !KNOWN_TRANSPORTS.contains(&transport) {
+            return None;
+        }
+        Some(Self {
+            transport: transport.to_owned(),
+            address: address.to_owned(),
+        })
+    }
+
+    /// Whether a listener is answering here.
+    fn is_live(&self) -> bool {
+        match self.transport.as_str() {
+            "unix" => socket_is_live(Path::new(&self.address)),
+            "tcp" => tcp_is_live(&self.address),
+            _ => false,
+        }
+    }
+}
+
 /// Whether a Unix socket at `path` has a live listener (a `connect` succeeds).
 /// Used as a portable daemon-identity check where the OS can't verify a recorded
 /// process start time (e.g. macOS).
@@ -313,6 +363,65 @@ fn socket_is_live(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn socket_is_live(_path: &Path) -> bool {
     false
+}
+
+/// Whether a TCP listener is answering at `address` (`host:port`).
+///
+/// Every resolved address is tried: a daemon bound to `localhost` may be on
+/// `::1` while the first resolution is `127.0.0.1`, and reporting "not running"
+/// for a daemon that is plainly up would let a second start double-bind.
+fn tcp_is_live(address: &str) -> bool {
+    use std::net::ToSocketAddrs as _;
+    address.to_socket_addrs().is_ok_and(|addrs| {
+        addrs
+            .into_iter()
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, ENDPOINT_PROBE_TIMEOUT).is_ok())
+    })
+}
+
+/// The endpoint the CLI *forces* on the daemon, where it chooses one.
+///
+/// Unix: the per-project socket path, known before the daemon exists. Windows:
+/// `None` — the app binds its own configured `server.host`/`port` and reports
+/// back, so nothing here can know it in advance.
+#[cfg_attr(
+    unix,
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "infallible on Unix, `None` on Windows — one signature, two answers"
+    )
+)]
+fn forced_endpoint(paths: &RuntimePaths) -> Option<DaemonEndpoint> {
+    #[cfg(unix)]
+    {
+        Some(DaemonEndpoint {
+            transport: "unix".to_owned(),
+            address: paths.socket_file().display().to_string(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        None
+    }
+}
+
+/// The endpoint this project's daemon serves on, when it can be known: the one
+/// the CLI forced, else the one a running daemon recorded.
+///
+/// Used for liveness and identity checks, never to *write* the address file —
+/// falling back to `serve.addr` there would let a stale record from a crashed
+/// predecessor describe a fresh daemon that bound a different port.
+fn daemon_endpoint(paths: &RuntimePaths) -> Option<DaemonEndpoint> {
+    forced_endpoint(paths).or_else(|| {
+        read_addr_file(paths)
+            .and_then(|addr| DaemonEndpoint::parse(&format!("{} {}", addr.transport, addr.address)))
+    })
+}
+
+/// Whether a listener is answering at this project's daemon endpoint.
+fn daemon_endpoint_is_live(paths: &RuntimePaths) -> bool {
+    daemon_endpoint(paths).is_some_and(|endpoint| endpoint.is_live())
 }
 
 /// The PID of the process listening on the Unix socket at `path`, via
@@ -331,11 +440,24 @@ fn socket_owner_pid(_path: &Path) -> Option<u32> {
     None
 }
 
-/// Best-effort check that the daemon serving on `socket` is `pid`: a definitive
-/// `SO_PEERCRED` match on Linux, otherwise socket liveness (so a reused PID that
-/// is genuinely not the listener is rejected where the kernel can tell us).
-fn socket_identity_matches(socket: &Path, pid: u32) -> bool {
-    socket_owner_pid(socket).map_or_else(|| socket_is_live(socket), |owner| owner == pid)
+/// Best-effort check that the daemon serving this project's endpoint is `pid`: a
+/// definitive `SO_PEERCRED` match on Linux, otherwise endpoint liveness (so a
+/// reused PID that is genuinely not the listener is rejected where the kernel
+/// can tell us).
+fn endpoint_identity_matches(paths: &RuntimePaths, pid: u32) -> bool {
+    endpoint_owner_pid(paths).map_or_else(|| daemon_endpoint_is_live(paths), |owner| owner == pid)
+}
+
+/// The PID owning this project's daemon endpoint, where the OS will say.
+///
+/// Only Linux's `SO_PEERCRED` on a Unix socket answers this. Windows records a
+/// process start time instead, which makes [`confirmed_running`] conclusive
+/// there without needing a peer PID at all.
+fn endpoint_owner_pid(paths: &RuntimePaths) -> Option<u32> {
+    let endpoint = daemon_endpoint(paths)?;
+    (endpoint.transport == "unix")
+        .then(|| socket_owner_pid(Path::new(&endpoint.address)))
+        .flatten()
 }
 
 /// Whether `rec` identifies our live daemon, guarding against PID reuse.
@@ -347,24 +469,28 @@ fn socket_identity_matches(socket: &Path, pid: u32) -> bool {
 /// listening there. This stops `status`/`stop` from acting on a reused PID.
 ///
 /// `startup_in_progress` (the startup lock still exists) covers the boot window:
-/// the pidfile is written before the app binds its socket, so on macOS/BSD a
+/// the pidfile is written before the app binds its endpoint, so on macOS/BSD a
 /// live PID with no listener yet would otherwise be misread as a dead stale
 /// pidfile and removed mid-startup.
-fn confirmed_running(rec: &process::PidRecord, socket: &Path, startup_in_progress: bool) -> bool {
+fn confirmed_running(
+    rec: &process::PidRecord,
+    paths: &RuntimePaths,
+    startup_in_progress: bool,
+) -> bool {
     if !process::is_process_alive(rec.pid) {
         return false;
     }
     match (rec.start_time, process::process_start_time(rec.pid)) {
-        // Identity is known on both sides (Linux): trust the comparison and do
-        // *not* fall back to the socket — a reused PID with a different start
-        // time is stale even if some daemon happens to be listening.
+        // Identity is known on both sides (Linux, Windows): trust the comparison
+        // and do *not* fall back to the endpoint — a reused PID with a different
+        // start time is stale even if some daemon happens to be listening.
         (Some(recorded), Some(current)) => recorded == current,
         // Identity unknown (no recorded start time, or a platform like macOS
         // that can't report one): a start still in progress means the live PID
-        // is our daemon binding its socket; otherwise confirm the PID actually
-        // owns the socket (SO_PEERCRED on Linux, else liveness) so a reused PID
+        // is our daemon binding its endpoint; otherwise confirm the PID actually
+        // owns the endpoint (SO_PEERCRED on Linux, else liveness) so a reused PID
         // isn't accepted.
-        _ => startup_in_progress || socket_identity_matches(socket, rec.pid),
+        _ => startup_in_progress || endpoint_identity_matches(paths, rec.pid),
     }
 }
 
@@ -380,14 +506,14 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path, startup_in_progres
 /// some unrelated process could own the socket while the recorded PID is a
 /// reused stranger. Require `SO_PEERCRED` proof; where peer-PID is unavailable
 /// (macOS/BSD), report "not running" rather than risk signalling the wrong PID.
-fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidRecord> {
+fn lifecycle_target(paths: &RuntimePaths) -> Option<process::PidRecord> {
     let pidfile_rec = process::read_pidfile(&paths.pid_file());
     // A definitive socket owner (Linux `SO_PEERCRED`) is the live daemon. Prefer
     // it over a parseable-but-*stale* pidfile (e.g. one overwritten/restored
     // while the daemon is healthy) so a damaged pidfile doesn't make a running
     // daemon unmanageable. Keep the pidfile record when it matches the owner so
     // its recorded start time is retained.
-    if let Some(owner) = socket_owner_pid(socket) {
+    if let Some(owner) = endpoint_owner_pid(paths) {
         // Keep the pidfile record when it matches the live owner (retains start_time).
         if let Some(rec) = pidfile_rec
             && rec.pid == owner
@@ -411,10 +537,10 @@ fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidR
         return Some(rec);
     }
     // Last resort: the address file — but only when a peer-PID proves it owns the
-    // socket (it doesn't here, since `socket_owner_pid` was `None`), so this
+    // endpoint (it doesn't here, since `endpoint_owner_pid` was `None`), so this
     // reports "not running" rather than risk signalling a reused PID.
     let addr = read_addr_file(paths)?;
-    (socket_owner_pid(socket) == Some(addr.pid)).then_some(process::PidRecord {
+    (endpoint_owner_pid(paths) == Some(addr.pid)).then_some(process::PidRecord {
         pid: addr.pid,
         start_time: None,
     })
@@ -589,7 +715,7 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // an unrelated process (notably on macOS, where start time isn't available)
     // doesn't block a legitimate start.
     if let Some(rec) = process::read_pidfile(&paths.pid_file())
-        && confirmed_running(&rec, &paths.socket_file(), startup_in_progress(&paths))
+        && confirmed_running(&rec, &paths, startup_in_progress(&paths))
     {
         eprintln!(
             "autumn serve: already running (pid {}). \
@@ -614,7 +740,7 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // above misses a healthy daemon whose `serve.pid` is missing/corrupt, and
     // reaping would cut that daemon off from its database before
     // `launch_daemon_child`'s live-socket guard rejects this start.
-    if opts.bundled_pg && !startup_in_progress(&paths) && !socket_is_live(&paths.socket_file()) {
+    if opts.bundled_pg && !startup_in_progress(&paths) && !daemon_endpoint_is_live(&paths) {
         reap_managed_postgres(&paths);
     }
 
@@ -698,24 +824,38 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
         cmd.current_dir(&dir);
         cmd.env("AUTUMN_MANIFEST_DIR", &dir);
     }
-    // The Unix-domain socket is the daemon's private transport (for address-file
-    // discovery and the thin client). Only force it for daemon starts: a plain
-    // foreground `autumn serve` must stay on its configured `server.host`/`port`
-    // (the app rejects `unix_socket` off-Unix anyway), so it remains reachable at
-    // the expected TCP address like any production server.
-    #[cfg(unix)]
     if opts.daemon
         && let Some(paths) = paths
     {
-        // The standard nested-config env var feeds the default loader. We also
-        // set a dedicated out-of-band override the framework re-applies *after*
-        // config loading, so a custom `with_config_loader` that ignores env
-        // can't drop the daemon's socket and strand it on TCP.
-        cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
-        cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
         // The app creates this file right after startup completes; the
-        // supervisor polls it to detect readiness without an HTTP probe.
+        // supervisor polls it to detect readiness without an HTTP probe, then
+        // reads back the drain budget and the address the app actually bound.
         cmd.env(SERVE_READY_FILE_ENV, paths.ready_file());
+        // The Unix-domain socket is the daemon's private transport (for
+        // address-file discovery and the thin client). Only force it for daemon
+        // starts: a plain foreground `autumn serve` must stay on its configured
+        // `server.host`/`port`, so it remains reachable at the expected TCP
+        // address like any production server.
+        //
+        // Windows has no Unix socket to force, so a Windows daemon keeps its
+        // configured `server.host`/`port` — which is also what a self-hosting
+        // operator wants — and reports the bound address back through the
+        // readiness file instead of being told it in advance.
+        #[cfg(unix)]
+        {
+            // The standard nested-config env var feeds the default loader. We
+            // also set a dedicated out-of-band override the framework re-applies
+            // *after* config loading, so a custom `with_config_loader` that
+            // ignores env can't drop the daemon's socket and strand it on TCP.
+            cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
+            cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
+        }
+        // Where there is no `SIGTERM` to send, `autumn serve stop` asks for the
+        // drain by creating this file — the same graceful path a signal takes,
+        // rather than a `TerminateProcess` that skips `on_shutdown` hooks and
+        // orphans a managed Postgres child (#1639).
+        #[cfg(not(unix))]
+        cmd.env(autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV, paths.stop_file());
     }
     if opts.bundled_pg
         && let Some(paths) = paths
@@ -812,26 +952,28 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
 /// Launch the detached daemon child and record its pidfile, under a separate
 /// startup lock. On success returns the running child plus the still-held
 /// startup-lock path (the caller releases it only once the daemon is ready, so a
-/// concurrent start can't race in during readiness). `Err(exit_code)` on failure
-/// (after cleaning up and releasing the lock). The pidfile only ever holds the
-/// child's pid, so concurrent lifecycle commands never see the launcher.
+/// concurrent start can't race in during readiness). `Err(())` on failure, after
+/// printing the reason, cleaning up and releasing the lock. The pidfile only
+/// ever holds the child's pid, so concurrent lifecycle commands never see the
+/// launcher.
 fn launch_daemon_child(
     binary: &Path,
     paths: &RuntimePaths,
     opts: &ServeOptions,
     socket: &Path,
-) -> Result<(std::process::Child, PathBuf), i32> {
-    // A live listener already owning the socket means a daemon is serving here
+    working_dir: Option<&Path>,
+) -> Result<(std::process::Child, PathBuf), String> {
+    // A live listener already owning the endpoint means a daemon is serving here
     // even if the pidfile is missing or stale; refuse so readiness can't latch
     // onto the pre-existing listener (mirrors the pidfile guard).
-    #[cfg(unix)]
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        eprintln!(
-            "autumn serve: already running (a live server owns {}). \
+    if let Some(endpoint) = daemon_endpoint(paths)
+        && endpoint.is_live()
+    {
+        return Err(format!(
+            "autumn serve: already running (a live server owns {}:{}). \
              Use `autumn serve stop` or `autumn serve restart`.",
-            socket.display()
-        );
-        return Err(1);
+            endpoint.transport, endpoint.address
+        ));
     }
 
     // Separate startup lock (claimed with our own pid) so two concurrent starts
@@ -841,38 +983,49 @@ fn launch_daemon_child(
     match process::acquire_pidfile(&start_lock, std::process::id()) {
         Ok(()) => {}
         Err(AcquireError::AlreadyRunning(existing)) => {
-            eprintln!("autumn serve: another `autumn serve` is starting (pid {existing}).");
-            return Err(1);
+            return Err(format!(
+                "autumn serve: another `autumn serve` is starting (pid {existing})."
+            ));
         }
         Err(AcquireError::Io(e)) => {
-            eprintln!("autumn serve: cannot take startup lock: {e}");
-            return Err(1);
+            return Err(format!("autumn serve: cannot take startup lock: {e}"));
         }
     }
     let log = match create_private_log(&paths.log_file()) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
+            let message = format!(
                 "autumn serve: cannot open log file {}: {e}",
                 paths.log_file().display()
             );
             let _ = std::fs::remove_file(&start_lock);
             cleanup(paths, socket);
-            return Err(1);
+            return Err(message);
         }
     };
     let Ok(log_err) = log.try_clone() else {
-        eprintln!("autumn serve: cannot duplicate log handle");
         let _ = std::fs::remove_file(&start_lock);
         cleanup(paths, socket);
-        return Err(1);
+        return Err("autumn serve: cannot duplicate log handle".to_owned());
     };
 
     // Clear any readiness file left by a previous run so `wait_for_ready` only
-    // returns on the file the child we are about to spawn creates.
+    // returns on the file the child we are about to spawn creates — and reads
+    // back THIS child's budget and bound address, not the last one's.
     let _ = std::fs::remove_file(paths.ready_file());
+    // Clear a stop request left by a crashed or force-killed predecessor. The
+    // app drains as soon as it sees this file, so a stale one would make the
+    // daemon we are about to start shut down the moment it boots.
+    process::clear_stop_request(&paths.stop_file());
 
     let mut cmd = base_command(binary, Some(paths), opts);
+    // The Service Control Manager starts its hosted process from
+    // `C:\Windows\System32`, so the app would look for `autumn.toml` and its
+    // asset dirs there. Point it at the project the install recorded.
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+        cmd.env("AUTUMN_MANIFEST_DIR", dir);
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(log_err);
@@ -881,23 +1034,22 @@ fn launch_daemon_child(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("\u{2717} Failed to start daemon: {e}");
+            let message = format!("\u{2717} Failed to start daemon: {e}");
             let _ = std::fs::remove_file(&start_lock);
             cleanup(paths, socket);
-            return Err(1);
+            return Err(message);
         }
     };
     let pid = child.id();
 
-    // The live-socket guard at the top proved no daemon is serving this socket,
-    // and we hold the startup lock, so any existing pidfile is from a daemon
-    // that has already exited. On platforms that don't record a process start
-    // time (macOS/BSD, or an older pidfile), `acquire_pidfile` can't tell that
+    // The live-endpoint guard at the top proved no daemon is serving here, and
+    // we hold the startup lock, so any existing pidfile is from a daemon that
+    // has already exited. On platforms that don't record a process start time
+    // (macOS/BSD, or an older pidfile), `acquire_pidfile` can't tell that
     // crashed daemon from an unrelated process that reused its PID, and would
     // reject the start as `AlreadyRunning` — permanently blocking restart until
-    // the pidfile is deleted by hand. Since the socket is provably dead, clear
+    // the pidfile is deleted by hand. Since the endpoint is provably dead, clear
     // such an unverifiable pidfile so the acquire below can reclaim it.
-    #[cfg(unix)]
     if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.start_time.is_none()) {
         let _ = std::fs::remove_file(paths.pid_file());
     }
@@ -906,29 +1058,78 @@ fn launch_daemon_child(
     // caller releases it only after the daemon is ready, so a concurrent start
     // can't spawn a second child while this one is still binding.
     if let Err(e) = process::acquire_pidfile(&paths.pid_file(), pid) {
-        match e {
+        let message = match e {
             AcquireError::AlreadyRunning(existing) => {
-                eprintln!("autumn serve: already running (pid {existing}).");
+                format!("autumn serve: already running (pid {existing}).")
             }
-            AcquireError::Io(e) => eprintln!("autumn serve: cannot write pidfile: {e}"),
-        }
-        let _ = child.kill();
+            AcquireError::Io(e) => format!("autumn serve: cannot write pidfile: {e}"),
+        };
         process::force_kill_group(pid);
+        let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(&start_lock);
         cleanup(paths, socket);
-        return Err(1);
+        return Err(message);
     }
     Ok((child, start_lock))
 }
 
 /// Spawn the server detached into the background and supervise readiness.
 fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
+    match start_supervised(binary, paths, opts, None) {
+        Ok(child) => {
+            let pid = child.id();
+            let where_it_serves = read_addr_file(paths).map_or_else(
+                || paths.socket_file().display().to_string(),
+                |addr| format!("{}:{}", addr.transport, addr.address),
+            );
+            println!("autumn serve: started (pid {pid}) on {where_it_serves}");
+            println!("  address file: {}", paths.addr_file().display());
+            println!("  logs: {}", paths.log_file().display());
+            // Detach: leave the running child to be reparented to init on exit.
+            // (Dropping the handle does not signal or reap the live process.)
+            drop(child);
+            0
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            1
+        }
+    }
+}
+
+/// How long a start waits for the daemon to report ready.
+#[must_use]
+pub fn start_ready_timeout(bundled_pg: bool) -> Duration {
+    if bundled_pg {
+        READY_TIMEOUT_MANAGED_PG
+    } else {
+        READY_TIMEOUT
+    }
+}
+
+/// Launch the app child, wait for it to report ready, and record its pidfile,
+/// address file and mode marker. Returns the **live** child on success.
+///
+/// Shared by `autumn serve --daemon` and the Windows service host, so a
+/// service-hosted daemon leaves exactly the state `status` and `stop` expect
+/// rather than a second, parallel set of records. `working_dir` overrides where
+/// the child runs, which the service host needs because it is started by the
+/// Service Control Manager from `C:\Windows\System32`.
+///
+/// # Errors
+///
+/// Returns the message to show the operator. Everything this function created is
+/// cleaned up first, including a managed Postgres the failed start left holding
+/// its data dir.
+pub fn start_supervised(
+    binary: &Path,
+    paths: &RuntimePaths,
+    opts: &ServeOptions,
+    working_dir: Option<&Path>,
+) -> Result<std::process::Child, String> {
     let socket = paths.socket_file();
-    let (mut child, start_lock) = match launch_daemon_child(binary, paths, opts, &socket) {
-        Ok(launched) => launched,
-        Err(code) => return code,
-    };
+    let (mut child, start_lock) = launch_daemon_child(binary, paths, opts, &socket, working_dir)?;
     let pid = child.id();
     let log_path = paths.log_file();
     // The startup lock is held until the daemon is ready, then released here on
@@ -936,66 +1137,115 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
     let release_lock = || {
         let _ = std::fs::remove_file(&start_lock);
     };
-
-    let ready_timeout = if opts.bundled_pg {
-        READY_TIMEOUT_MANAGED_PG
-    } else {
-        READY_TIMEOUT
-    };
-    if wait_for_ready(&paths.ready_file(), &mut child, ready_timeout) {
-        if let Err(e) = write_addr_file(paths, pid, &socket, opts) {
-            // Without the discovery file the daemon is unreachable to clients;
-            // treat it like the pidfile failure — stop the child and fail.
-            eprintln!(
-                "autumn serve: cannot write address file {}: {e}",
-                paths.addr_file().display()
-            );
-            let _ = child.kill();
-            process::force_kill_group(pid);
-            let _ = child.wait();
-            // Postgres `setsid`s out of the daemon's group, so the group kill
-            // above can't reach it; reap it directly via `postmaster.pid`.
-            if opts.bundled_pg {
-                reap_managed_postgres(paths);
-            }
-            release_lock();
-            cleanup(paths, &socket);
-            return 1;
-        }
-        release_lock();
-        println!(
-            "autumn serve: started (pid {pid}) on unix:{}",
-            socket.display()
-        );
-        println!("  address file: {}", paths.addr_file().display());
-        println!("  logs: {}", log_path.display());
-        // Detach: leave the running child to be reparented to init on exit.
-        // (Dropping the handle does not signal or reap the live process.)
-        drop(child);
-        0
-    } else {
-        eprintln!(
-            "autumn serve: daemon did not become ready within {}s; see {}",
-            ready_timeout.as_secs(),
-            log_path.display()
-        );
-        // Kill the whole group: a startup that timed out may have spawned
+    // Everything a failed start has to undo, in one place so no exit path
+    // forgets a piece.
+    let abandon = |child: &mut std::process::Child| {
+        // Kill the whole tree: a startup that timed out may have spawned
         // children that `Child::kill()` alone would leave orphaned.
-        let _ = child.kill();
         process::force_kill_group(pid);
+        let _ = child.kill();
         let _ = child.wait();
-        // A managed Postgres started during `--bundled-pg` provisioning leaves
-        // the daemon's process group (it `setsid`s itself) and no `serve.addr`
-        // was written for a later `stop` to consult, so the group kill above
-        // can't reach it. Reap it directly via `postmaster.pid` so a readiness
-        // timeout doesn't strand the cluster on the data dir/port.
+        // A managed Postgres puts itself outside the daemon's group/job, so the
+        // sweep above can't reach it and no `serve.addr` was written for a later
+        // `stop` to consult. Reap it directly via `postmaster.pid` so a failed
+        // start doesn't strand the cluster on the data dir/port.
         if opts.bundled_pg {
             reap_managed_postgres(paths);
         }
         release_lock();
         cleanup(paths, &socket);
-        1
+    };
+
+    let ready_timeout = start_ready_timeout(opts.bundled_pg);
+    if !wait_for_ready(&paths.ready_file(), &mut child, ready_timeout) {
+        abandon(&mut child);
+        return Err(format!(
+            "autumn serve: daemon did not become ready within {}s; see {}",
+            ready_timeout.as_secs(),
+            log_path.display()
+        ));
     }
+    if let Err(e) = write_addr_file(paths, pid, opts) {
+        // Without the discovery file the daemon is unreachable to clients;
+        // treat it like the pidfile failure — stop the child and fail.
+        let message = format!(
+            "autumn serve: cannot write address file {}: {e}",
+            paths.addr_file().display()
+        );
+        abandon(&mut child);
+        return Err(message);
+    }
+    release_lock();
+    Ok(child)
+}
+
+/// Ask `child` to drain, wait out `budget_secs`, then force-kill its tree.
+/// Returns the child's exit code, or `None` when it could not be reaped.
+///
+/// The Windows service host's stop path. It asks the same way `autumn serve
+/// stop` asks — by creating the cooperative-shutdown file the child watches —
+/// so an SCM stop and a CLI stop run one drain, not two.
+pub fn stop_child(
+    child: &mut std::process::Child,
+    paths: &RuntimePaths,
+    budget_secs: u64,
+) -> Option<i32> {
+    let _ = process::create_stop_request(&paths.stop_file());
+    let budget = Duration::from_secs(budget_secs) + STOP_GRACE_BUFFER;
+    if process::wait_with_timeout(child, budget).is_err() {
+        process::force_kill_group(child.id());
+        let _ = child.kill();
+    }
+    child.wait().ok().and_then(|status| status.code())
+}
+
+/// The drain budget this daemon recorded at start, from its address file.
+#[must_use]
+pub fn recorded_stop_budget(paths: &RuntimePaths) -> Option<u64> {
+    read_addr_file(paths).and_then(|addr| addr.stop_budget_secs)
+}
+
+/// Reap a managed Postgres cluster this project's daemon may have left running.
+pub fn reap_managed_postgres_for(paths: &RuntimePaths) {
+    reap_managed_postgres(paths);
+}
+
+/// Remove this project's daemon records.
+pub fn cleanup_daemon_state(paths: &RuntimePaths) {
+    cleanup(paths, &paths.socket_file());
+}
+
+/// This project's stable identity, as the runtime dirs and the Windows service
+/// name are both derived from.
+#[must_use]
+pub fn project_identity_for(package: Option<&str>) -> String {
+    project_identity(package)
+}
+
+/// This project's running daemon, as `(pid, "<transport>:<address>")`, or `None`
+/// when nothing is running.
+///
+/// Confirms the same way `status` does — a live process whose recorded identity
+/// still matches — so `autumn doctor` cannot report a daemon that `status` calls
+/// stopped.
+#[must_use]
+pub fn running_daemon_summary(package: Option<&str>) -> Option<(u32, String)> {
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
+    let rec = lifecycle_target(&paths)?;
+    if !confirmed_running(&rec, &paths, startup_in_progress(&paths)) {
+        return None;
+    }
+    let where_it_serves = read_addr_file(&paths)
+        .map(|a| format!("{}:{}", a.transport, a.address))
+        .or_else(|| daemon_endpoint(&paths).map(|e| format!("{}:{}", e.transport, e.address)))
+        .unwrap_or_else(|| "unknown".to_owned());
+    Some((rec.pid, where_it_serves))
+}
+
+/// The profile selected by this shell's environment, for recording at install.
+#[must_use]
+pub fn env_profile_for_record() -> Option<String> {
+    env_profile()
 }
 
 /// Apply OS-specific flags to detach the spawned process from the terminal.
@@ -1051,9 +1301,26 @@ fn wait_for_ready(ready_file: &Path, child: &mut std::process::Child, timeout: D
 /// any custom `with_config_loader` the CLI can't see. `None` if the file is
 /// absent or doesn't parse (e.g. an app predating the readiness protocol).
 fn child_reported_budget(paths: &RuntimePaths) -> Option<u64> {
-    std::fs::read_to_string(paths.ready_file())
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+    parse_ready_payload(&std::fs::read_to_string(paths.ready_file()).ok()?).0
+}
+
+/// The endpoint the daemon reported in its readiness file — where it *actually*
+/// bound. `None` for an app predating the address line, or an unreadable file.
+fn child_reported_endpoint(paths: &RuntimePaths) -> Option<DaemonEndpoint> {
+    parse_ready_payload(&std::fs::read_to_string(paths.ready_file()).ok()?).1
+}
+
+/// Parse the readiness file: drain budget on line one, bound endpoint on line
+/// two. Both are optional and independent — a corrupt budget must not cost us
+/// the address, and an app predating the address line still reports its budget.
+///
+/// The writer is `autumn_web::app::serve_ready_payload`; this module's tests
+/// round-trip against it rather than against a copied literal.
+fn parse_ready_payload(contents: &str) -> (Option<u64>, Option<DaemonEndpoint>) {
+    let mut lines = contents.lines();
+    let budget = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
+    let endpoint = lines.next().and_then(DaemonEndpoint::parse);
+    (budget, endpoint)
 }
 
 /// Write the address-discovery file with `0600` permissions.
@@ -1063,16 +1330,25 @@ fn child_reported_budget(paths: &RuntimePaths) -> Option<u64> {
 /// Returns the I/O error if the file cannot be written — a daemon without its
 /// discovery file is unreachable to thin clients/agents, so the caller treats
 /// this as a failed start.
-fn write_addr_file(
-    paths: &RuntimePaths,
-    pid: u32,
-    socket: &Path,
-    opts: &ServeOptions,
-) -> std::io::Result<()> {
+fn write_addr_file(paths: &RuntimePaths, pid: u32, opts: &ServeOptions) -> std::io::Result<()> {
+    // Prefer where the child says it actually bound: `server.port = 0` resolves
+    // in the kernel, a socket adopted from a predecessor keeps that process's
+    // port, and on Windows the CLI never chose the address at all. Fall back to
+    // the endpoint the CLI forced, which covers an app built before the address
+    // line existed — and is `None` on Windows, where nothing else knows it.
+    let endpoint = child_reported_endpoint(paths)
+        .or_else(|| forced_endpoint(paths))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the app did not report the address it bound; rebuild it against \
+                 this version of autumn-web",
+            )
+        })?;
     let addr = AddrFile {
         pid,
-        transport: "unix".to_owned(),
-        address: socket.display().to_string(),
+        transport: endpoint.transport,
+        address: endpoint.address,
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
@@ -1165,7 +1441,7 @@ fn running_daemon_mode(package: Option<&str>) -> Option<ModeFile> {
 fn stop(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
     let socket = paths.socket_file();
-    let Some(rec) = lifecycle_target(&paths, &socket) else {
+    let Some(rec) = lifecycle_target(&paths) else {
         println!("autumn serve: not running");
         return 0;
     };
@@ -1173,7 +1449,7 @@ fn stop(opts: &ServeOptions) -> i32 {
     // cluster it launched can still be alive (Postgres `setsid`s out of the
     // daemon's process group, so it survives the app's crash/kill).
     let addr = read_addr_file(&paths);
-    if !confirmed_running(&rec, &socket, startup_in_progress(&paths)) {
+    if !confirmed_running(&rec, &paths, startup_in_progress(&paths)) {
         // A concurrent `autumn serve --daemon` can reclaim this stale pidfile and
         // bring up a successor between the check above and the cleanup below.
         // Bail out (touching nothing) if the pidfile no longer records `rec`, a
@@ -1181,7 +1457,7 @@ fn stop(opts: &ServeOptions) -> i32 {
         // delete the successor's state and reap its just-started Postgres.
         if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid)
             || startup_in_progress(&paths)
-            || socket_is_live(&socket)
+            || daemon_endpoint_is_live(&paths)
         {
             println!("autumn serve: not running (a newer daemon has since started)");
             return 0;
@@ -1206,10 +1482,23 @@ fn stop(opts: &ServeOptions) -> i32 {
     // daemons started before that field was recorded.
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
+    // How to ask. Unix sends `SIGTERM`; Windows has none, so the daemon was
+    // started watching `serve.stop` and creating it requests the identical
+    // graceful drain — readiness flip, prestop grace, in-flight drain, then
+    // `on_shutdown` hooks. Either way `stop_record` escalates to a force-kill of
+    // the process tree only once the recorded budget expires.
+    let stop_file = paths.stop_file();
+    #[cfg(unix)]
+    let request = {
+        let _ = &stop_file;
+        process::StopRequest::Signal
+    };
+    #[cfg(not(unix))]
+    let request = process::StopRequest::File(&stop_file);
     if !process::stop_record(
         &rec,
         stop_timeout(opts, recorded_release, recorded_budget),
-        &socket,
+        &request,
     ) {
         // The daemon is still alive and we couldn't signal it (e.g. it is owned
         // by another user — `kill` returned `EPERM`). Do NOT remove its state or
@@ -1682,15 +1971,21 @@ fn env_u64_from(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<u64> 
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
 fn status(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
-    let socket = paths.socket_file();
-    let Some(rec) = lifecycle_target(&paths, &socket) else {
+    let Some(rec) = lifecycle_target(&paths) else {
         println!("autumn serve: stopped");
         return 3;
     };
-    if confirmed_running(&rec, &socket, startup_in_progress(&paths)) {
-        let address =
-            read_addr_file(&paths).map_or_else(|| socket.display().to_string(), |a| a.address);
-        println!("autumn serve: running (pid {}) on unix:{address}", rec.pid);
+    if confirmed_running(&rec, &paths, startup_in_progress(&paths)) {
+        // `<transport>:<address>` on both platforms — `unix:/run/.../serve.sock`
+        // or `tcp:127.0.0.1:3000` — so a script reads one shape everywhere.
+        let where_it_serves = read_addr_file(&paths)
+            .map(|a| format!("{}:{}", a.transport, a.address))
+            .or_else(|| daemon_endpoint(&paths).map(|e| format!("{}:{}", e.transport, e.address)))
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!(
+            "autumn serve: running (pid {}) on {where_it_serves}",
+            rec.pid
+        );
         0
     } else {
         println!(
@@ -1702,12 +1997,14 @@ fn status(opts: &ServeOptions) -> i32 {
 }
 
 /// Best-effort removal of the pidfile, address file, mode marker, readiness
-/// file, and socket.
+/// file, cooperative-stop request, and socket.
 fn cleanup(paths: &RuntimePaths, socket: &Path) {
     let _ = std::fs::remove_file(paths.pid_file());
     let _ = std::fs::remove_file(paths.addr_file());
     let _ = std::fs::remove_file(paths.mode_file());
     let _ = std::fs::remove_file(paths.ready_file());
+    // A request left behind would drain the next daemon the moment it boots.
+    process::clear_stop_request(&paths.stop_file());
     remove_socket_if_not_live(socket);
 }
 
@@ -1753,32 +2050,176 @@ fn remove_socket_if_not_live(_socket: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    // ── Readiness protocol and the daemon endpoint (issue #1639) ───────────
     //
-    // The daemon lifecycle is Unix domain sockets plus POSIX signals, so it is
-    // Tier 2 (WSL2). The refusal is compiled on every platform and tested here
-    // so the wording cannot rot on a host that never runs it.
+    // On Unix the CLI chooses the daemon's endpoint (the socket path it forces
+    // on the child), so it is known before the daemon exists. On Windows the app
+    // binds its configured address and reports back through the readiness file,
+    // and this is the parser that reads it. Compiled and tested on every
+    // platform so the Windows arm is not the one nobody exercises.
 
     #[test]
-    fn daemon_refusal_names_the_tier_the_reason_and_the_policy() {
+    fn ready_payload_round_trips_the_runtime_writer() {
+        // Against the runtime's own writer, not a hand-copied literal: two
+        // hand-written halves of a wire format drift, a round trip cannot.
+        let written = autumn_web::app::serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        let (budget, endpoint) = parse_ready_payload(&written);
+        assert_eq!(budget, Some(35));
+        assert_eq!(
+            endpoint,
+            Some(DaemonEndpoint {
+                transport: "tcp".to_owned(),
+                address: "127.0.0.1:3000".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn ready_payload_reads_a_budget_only_file_from_an_older_app() {
+        // An app built before the address line still reports its drain budget,
+        // and `stop` must keep honouring it rather than fall back to guessing.
+        let (budget, endpoint) = parse_ready_payload("35\n");
+        assert_eq!(budget, Some(35));
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn ready_payload_keeps_a_socket_path_containing_spaces_intact() {
+        let written = autumn_web::app::serve_ready_payload(1, "unix /home/a b/serve.sock");
+        let (_, endpoint) = parse_ready_payload(&written);
+        assert_eq!(
+            endpoint.map(|e| e.address),
+            Some("/home/a b/serve.sock".to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_payload_rejects_an_unknown_transport() {
+        // The transport selects how liveness is probed, so recording one we
+        // cannot probe would make `status` report a daemon it can never confirm.
+        let (_, endpoint) = parse_ready_payload("5\nquic 127.0.0.1:3000");
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn ready_payload_rejects_a_transport_with_no_address() {
+        let (_, endpoint) = parse_ready_payload("5\ntcp");
+        assert_eq!(endpoint, None);
+        let (_, endpoint) = parse_ready_payload("5\ntcp   ");
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn ready_payload_survives_a_corrupt_budget_without_losing_the_address() {
+        // Half a file is better than none: the address still lets `status` and
+        // the discovery file work while `stop` falls back to recomputing.
+        let (budget, endpoint) = parse_ready_payload("not-a-number\ntcp 127.0.0.1:9\n");
+        assert_eq!(budget, None);
+        assert_eq!(endpoint.map(|e| e.address), Some("127.0.0.1:9".to_owned()));
+    }
+
+    #[test]
+    fn child_reported_endpoint_reads_the_ready_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "proj");
+        std::fs::create_dir_all(paths.ready_file().parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            paths.ready_file(),
+            autumn_web::app::serve_ready_payload(12, "tcp 127.0.0.1:4321"),
+        )
+        .expect("write ready file");
+        assert_eq!(
+            child_reported_endpoint(&paths).map(|e| e.address),
+            Some("127.0.0.1:4321".to_owned())
+        );
+        assert_eq!(child_reported_budget(&paths), Some(12));
+    }
+
+    // ── Windows daemon wiring (issue #1639) ────────────────────────────────
+
+    #[test]
+    fn a_daemon_start_hands_the_child_its_readiness_file() {
+        // The readiness file is the whole startup handshake — and on Windows the
+        // only channel that reports the bound address — so a daemon start must
+        // always pass it, on every platform.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "proj");
+        let opts = ServeOptions {
+            daemon: true,
+            ..serve_opts_with_role(None)
+        };
+        let cmd = base_command(Path::new("/bin/true"), Some(&paths), &opts);
+        assert_eq!(
+            env_value(&cmd, SERVE_READY_FILE_ENV),
+            Some(paths.ready_file().display().to_string())
+        );
+    }
+
+    #[test]
+    fn a_foreground_start_hands_the_child_no_daemon_wiring() {
+        // A plain `autumn serve` is not supervised: readiness signalling and a
+        // file-triggered drain would both be unowned machinery.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "proj");
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), Some(&paths), &opts);
+        assert_eq!(env_value(&cmd, SERVE_READY_FILE_ENV), None);
+        assert_eq!(
+            env_value(&cmd, autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV),
+            None
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_daemon_start_hands_the_child_its_cooperative_stop_file() {
+        // Where there is no `SIGTERM`, this variable is the ONLY way `stop` can
+        // ask for a graceful drain. Without it every stop would be a hard kill.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "proj");
+        let opts = ServeOptions {
+            daemon: true,
+            ..serve_opts_with_role(None)
+        };
+        let cmd = base_command(Path::new("app.exe"), Some(&paths), &opts);
+        assert_eq!(
+            env_value(&cmd, autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV),
+            Some(paths.stop_file().display().to_string())
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_the_stop_request() {
+        // A request left behind would drain the next daemon the moment it boots.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "proj");
+        std::fs::create_dir_all(paths.stop_file().parent().unwrap()).expect("mkdir");
+        std::fs::write(paths.stop_file(), "").expect("seed stop request");
+        cleanup(&paths, &paths.socket_file());
+        assert!(!paths.stop_file().exists());
+    }
+
+    #[test]
+    fn daemon_refusal_names_the_platform_and_the_native_alternative() {
+        // Unix and Windows both run the lifecycle natively (#1639), so this
+        // message is for whatever is left. A developer who hits it needs to know
+        // foreground `autumn serve` still works before concluding nothing does.
         let message = daemon_unsupported_message();
-        assert!(message.contains("Tier 2 (WSL2)"), "{message}");
-        assert!(message.contains("Unix domain sockets"), "{message}");
+        assert!(message.contains(std::env::consts::OS), "{message}");
         assert!(
-            message.contains(crate::platform::POLICY_DOC_URL),
+            message.contains("autumn serve") && message.contains("foreground"),
             "{message}"
         );
     }
 
     #[test]
-    fn daemon_refusal_still_points_at_the_native_alternative() {
-        // Foreground `autumn serve` IS Tier 1, and a developer who just hit
-        // this wall needs to know that before reaching for WSL2.
+    fn daemon_refusal_does_not_send_a_windows_developer_to_wsl2() {
+        // The refusal predates #1639, when the lifecycle was Tier 2 on Windows.
+        // Pointing at WSL2 now would send a Windows operator away from a journey
+        // that runs natively on the machine they are already on.
         let message = daemon_unsupported_message();
-        assert!(
-            message.contains("autumn serve") && message.contains("foreground"),
-            "{message}"
-        );
+        assert!(!message.contains("WSL2"), "{message}");
+        assert!(!message.contains("Tier 2"), "{message}");
     }
 
     use super::*;
@@ -2227,15 +2668,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn confirmed_running_false_for_dead_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
         let rec = process::PidRecord {
             pid: 2_147_483_640,
             start_time: None,
         };
-        assert!(!confirmed_running(
-            &rec,
-            std::path::Path::new("/nonexistent/serve.sock"),
-            false,
-        ));
+        assert!(!confirmed_running(&rec, &paths, false));
     }
 
     #[cfg(unix)]
@@ -2243,31 +2682,27 @@ mod tests {
     fn confirmed_running_true_while_startup_in_progress() {
         // During boot the pidfile exists before the socket binds; a live PID with
         // the startup lock present must read as running (not a dead stale lock).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
         let rec = process::PidRecord {
             pid: std::process::id(),
             start_time: None,
         };
-        assert!(confirmed_running(
-            &rec,
-            std::path::Path::new("/nonexistent/serve.sock"),
-            true,
-        ));
+        assert!(confirmed_running(&rec, &paths, true));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_running_true_for_self_via_start_time() {
-        // A matching start time is conclusive without needing a live socket.
+        // A matching start time is conclusive without needing a live endpoint.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
         let pid = std::process::id();
         let rec = process::PidRecord {
             pid,
             start_time: process::process_start_time(pid),
         };
-        assert!(confirmed_running(
-            &rec,
-            std::path::Path::new("/nonexistent/serve.sock"),
-            false,
-        ));
+        assert!(confirmed_running(&rec, &paths, false));
     }
 
     #[test]
@@ -2276,12 +2711,12 @@ mod tests {
         let paths = RuntimePaths::from_base(dir.path(), "p");
         paths.ensure_dirs().expect("dirs");
         std::fs::write(paths.pid_file(), "4242 0\n").expect("write pid");
-        let rec = lifecycle_target(&paths, &paths.socket_file()).expect("target");
+        let rec = lifecycle_target(&paths).expect("target");
         assert_eq!(rec.pid, 4242);
     }
 
     #[test]
-    fn lifecycle_target_addr_fallback_requires_live_socket() {
+    fn lifecycle_target_addr_fallback_requires_a_live_endpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_base(dir.path(), "p");
         paths.ensure_dirs().expect("dirs");
@@ -2289,7 +2724,7 @@ mod tests {
         // socket: we must not treat the recorded PID as the daemon.
         let addr = sample("unix", &paths.socket_file().display().to_string(), false);
         std::fs::write(paths.addr_file(), addr.to_toml()).expect("write addr");
-        assert!(lifecycle_target(&paths, &paths.socket_file()).is_none());
+        assert!(lifecycle_target(&paths).is_none());
     }
 
     #[test]

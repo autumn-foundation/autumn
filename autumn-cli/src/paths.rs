@@ -7,12 +7,20 @@
 //! directory, `/etc`, or `/tmp` (a predictable path under `/tmp` is a symlink
 //! hazard for the `0600` socket).
 //!
+//! On Unix the directories are held at `0700` and the files at `0600`. Windows
+//! has no mode bits, so [`RuntimePaths::ensure_dirs`] applies the equivalent
+//! ACL — the owning user, `SYSTEM` and the local `Administrators` group, with
+//! inheritance broken so nothing wider leaks in from the parent. That is the
+//! ACL `%LOCALAPPDATA%` itself carries; setting it explicitly is what makes the
+//! guarantee hold for an `AUTUMN_RUNTIME_DIR` pointed somewhere else.
+//!
 //! [`RuntimePaths::resolve`] performs the real per-OS resolution and honours
 //! the `AUTUMN_RUNTIME_DIR` override used by integration tests.
 //! [`RuntimePaths::from_base`] is the pure, fs-free seam the unit tests drive.
 
 #![allow(dead_code, clippy::missing_const_for_fn)]
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Environment variable that overrides the runtime base directory. When set,
@@ -81,7 +89,48 @@ fn short_socket_root() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
+/// The resolved directories, in a form that can be recorded and read back.
+///
+/// A Windows service registered by `autumn serve install-service` runs as Local
+/// System, which cannot resolve the installing user's `%LOCALAPPDATA%`. Handing
+/// it the *resolved* directories, rather than a project name to re-resolve,
+/// keeps the service and the user's own `autumn serve status` looking at one set
+/// of files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeParts {
+    /// PID lockfile, address file, mode marker, readiness and stop-request files.
+    pub runtime: PathBuf,
+    /// Root of the managed-Postgres data dir.
+    pub data: PathBuf,
+    /// Daemon log files.
+    pub logs: PathBuf,
+    /// Unix socket path (unused on Windows, carried so the round trip is total).
+    pub socket: PathBuf,
+}
+
 impl RuntimePaths {
+    /// The resolved directories, for recording.
+    #[must_use]
+    pub fn parts(&self) -> RuntimeParts {
+        RuntimeParts {
+            runtime: self.runtime.clone(),
+            data: self.data.clone(),
+            logs: self.logs.clone(),
+            socket: self.socket.clone(),
+        }
+    }
+
+    /// Rebuild from recorded directories, bypassing platform resolution.
+    #[must_use]
+    pub fn from_parts(parts: RuntimeParts) -> Self {
+        Self {
+            runtime: parts.runtime,
+            data: parts.data,
+            logs: parts.logs,
+            socket: parts.socket,
+        }
+    }
+
     /// Resolve platform directories for `project`.
     ///
     /// Honours `AUTUMN_RUNTIME_DIR` (rooting everything at
@@ -179,6 +228,25 @@ impl RuntimePaths {
         self.runtime.join("serve.ready")
     }
 
+    /// Cooperative-shutdown request file (`<runtime>/serve.stop`).
+    ///
+    /// Where there is no `SIGTERM` to send (Windows), `autumn serve stop` asks
+    /// the daemon to drain by creating this file and the daemon watches for it
+    /// via `AUTUMN_SHUTDOWN_SIGNAL_FILE`. A fixed leaf of the runtime dir, not a
+    /// path the daemon chooses, so a `stop` in a different shell finds it.
+    #[must_use]
+    pub fn stop_file(&self) -> PathBuf {
+        self.runtime.join("serve.stop")
+    }
+
+    /// The Windows service record (`<runtime>/serve.service.toml`): what
+    /// `install-service` wrote for the Service Control Manager's hosted process
+    /// to read back. Inside the runtime dir, so it inherits its owner-only ACL.
+    #[must_use]
+    pub fn service_record_file(&self) -> PathBuf {
+        self.runtime.join("serve.service.toml")
+    }
+
     /// Managed-Postgres cluster data directory (`<data>/pg`).
     #[must_use]
     pub fn pg_data_dir(&self) -> PathBuf {
@@ -212,6 +280,17 @@ impl RuntimePaths {
         // redirect `stop`/`status` at the wrong process or strand the daemon.
         #[cfg(unix)]
         harden_private_dir(&self.runtime)?;
+        // The Windows arm of the same guarantee (#1639). It also covers the log
+        // and data dirs, because the `(OI)(CI)` grants are inherited by
+        // everything created inside — which is how the daemon log, the address
+        // file and the managed-Postgres cluster get an owner-only ACL without
+        // each write site having to set one.
+        #[cfg(windows)]
+        {
+            restrict_to_owner(&self.runtime)?;
+            restrict_to_owner(&self.logs)?;
+            restrict_to_owner(&self.data)?;
+        }
         // Harden the directory the control socket is bound in (the runtime dir,
         // or a short fallback under a shared temp root). Making it `0700` *before*
         // the app binds means no other local user can reach the socket during the
@@ -257,6 +336,120 @@ fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
         ));
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// The `icacls` arguments that restrict `dir` to `owner`, `SYSTEM` and the local
+/// `Administrators` group.
+///
+/// `/inheritance:r` drops inherited ACEs first, so a permissive parent (an
+/// `AUTUMN_RUNTIME_DIR` under a shared root) cannot leak access in, and
+/// `/grant:r` *replaces* rather than adds, so a pre-existing ACE for another
+/// user is removed rather than kept alongside ours. `(OI)(CI)F` grants full
+/// control and marks the ACE inheritable by files and subdirectories, which is
+/// how the daemon log, address file and managed-Postgres cluster inherit the
+/// same restriction without a per-file call.
+///
+/// The two built-in trustees are named by **well-known SID**, not by name:
+/// `SYSTEM` and `Administrators` are localized, and a German or Japanese Windows
+/// would fail to resolve them and refuse the grant. `SYSTEM` is kept because a
+/// service registered by `autumn serve install-service` runs as Local System and
+/// must reach the state the installing user created.
+///
+/// Pure, so the ACL policy is unit-tested on every platform rather than only on
+/// the one that applies it.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the Windows hardening arm, compiled and tested everywhere"
+    )
+)]
+fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
+    /// `S-1-5-18` — Local System.
+    const LOCAL_SYSTEM_SID: &str = "*S-1-5-18";
+    /// `S-1-5-32-544` — the built-in Administrators group.
+    const ADMINISTRATORS_SID: &str = "*S-1-5-32-544";
+    /// Full control, inherited by contained objects and containers.
+    const FULL_INHERITED: &str = ":(OI)(CI)F";
+
+    let mut args = vec![dir.as_os_str().to_os_string()];
+    args.push("/inheritance:r".into());
+    for trustee in [owner, LOCAL_SYSTEM_SID, ADMINISTRATORS_SID] {
+        args.push("/grant:r".into());
+        args.push(format!("{trustee}{FULL_INHERITED}").into());
+    }
+    // Suppress the per-file success chatter; failures still print.
+    args.push("/Q".into());
+    args
+}
+
+/// The account name to grant, from `USERDOMAIN` and `USERNAME`.
+///
+/// Prefers the domain-qualified spelling, which is unambiguous on a
+/// domain-joined machine. A blank component is treated as absent: building
+/// `CORP\` or a bare `\dev` would make `icacls` refuse the whole command, which
+/// (because hardening fails closed) would refuse the daemon.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the Windows hardening arm, compiled and tested everywhere"
+    )
+)]
+fn owner_trustee_from(domain: Option<String>, user: Option<String>) -> Option<String> {
+    let user = user
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())?;
+    let domain = domain
+        .map(|d| d.trim().to_owned())
+        .filter(|d| !d.is_empty());
+    Some(domain.map_or_else(|| user.clone(), |d| format!("{d}\\{user}")))
+}
+
+/// Apply [`owner_only_acl_args`] to `dir`.
+///
+/// Fails **closed**, exactly as the Unix `harden_private_dir` does: the runtime
+/// dir holds the records `stop`/`status` act on, so starting a daemon while they
+/// stay writable by other local users is the outcome this exists to prevent.
+/// `icacls.exe` ships with every supported Windows and is invoked by absolute
+/// path so a `PATH` entry cannot shadow it.
+#[cfg(windows)]
+fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    let Some(owner) = owner_trustee_from(
+        std::env::var("USERDOMAIN").ok(),
+        std::env::var("USERNAME").ok(),
+    ) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to use {} for daemon state: USERNAME is unset, so its \
+                 access cannot be restricted to the owning user",
+                dir.display()
+            ),
+        ));
+    };
+    let icacls = std::path::PathBuf::from(
+        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()),
+    )
+    .join("System32")
+    .join("icacls.exe");
+    let output = std::process::Command::new(&icacls)
+        .args(owner_only_acl_args(dir, &owner))
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing to use {} for daemon state: could not restrict it to {owner} \
+             ({} exited {}): {}",
+            dir.display(),
+            icacls.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -334,6 +527,123 @@ mod tests {
         let sock = paths.socket_file();
         assert!(sock.is_absolute());
         assert!(sock.starts_with("/tmp/xdg-base"));
+    }
+
+    // ── Windows daemon state (#1639) ─────────────────────────────────────
+    //
+    // Compiled and run on every platform: the ACL argument construction is the
+    // part that decides whether daemon state is owner-only on Windows, and it
+    // must not be the part nobody exercises until a user reports it.
+
+    #[test]
+    fn stop_request_file_sits_beside_the_pidfile() {
+        // `stop` has to find it from a different shell than `start` ran in, so
+        // it is a fixed leaf of the runtime dir, not something the daemon names.
+        let paths = RuntimePaths::from_base(Path::new("/var/run"), "demo");
+        assert_eq!(paths.stop_file(), Path::new("/var/run/demo/serve.stop"));
+        assert_eq!(
+            paths.stop_file().parent(),
+            paths.pid_file().parent(),
+            "stop request and pidfile must share a directory"
+        );
+    }
+
+    #[test]
+    fn owner_only_acl_grants_exactly_the_owner_system_and_administrators() {
+        let args = owner_only_acl_args(Path::new(r"C:\state\demo"), "CORP\\dev");
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rendered[0], r"C:\state\demo");
+        assert!(
+            rendered.contains(&"/inheritance:r".to_owned()),
+            "inherited ACEs must be dropped, or a permissive parent leaks in: {rendered:?}"
+        );
+        // Exactly three trustees, and the grants REPLACE rather than add
+        // (`/grant:r`), so a pre-existing ACE for another user is removed.
+        let grants = rendered
+            .iter()
+            .skip_while(|a| *a != "/grant:r")
+            .filter(|a| a.contains(":(OI)(CI)F"))
+            .count();
+        assert_eq!(grants, 3, "{rendered:?}");
+        assert_eq!(
+            rendered.iter().filter(|a| *a == "/grant:r").count(),
+            3,
+            "every trustee needs its own /grant:r: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&r"CORP\dev:(OI)(CI)F".to_owned()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn owner_only_acl_names_the_builtin_trustees_by_sid_not_by_localized_name() {
+        // "SYSTEM" and "Administrators" are localized; a German or Japanese
+        // Windows would fail to resolve them and the grant would be refused.
+        // Well-known SIDs are locale-independent.
+        let args = owner_only_acl_args(Path::new("state"), "dev");
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rendered.contains(&"*S-1-5-18:(OI)(CI)F".to_owned()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"*S-1-5-32-544:(OI)(CI)F".to_owned()),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|a| a.starts_with("SYSTEM:")),
+            "a localized trustee name must not be used: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn owner_trustee_prefers_the_qualified_domain_account() {
+        assert_eq!(
+            owner_trustee_from(Some("CORP".into()), Some("dev".into())).as_deref(),
+            Some(r"CORP\dev")
+        );
+        assert_eq!(
+            owner_trustee_from(None, Some("dev".into())).as_deref(),
+            Some("dev")
+        );
+        // A blank value is not an account name; treating it as one would build
+        // `\` and make icacls refuse the whole grant.
+        assert_eq!(
+            owner_trustee_from(Some("CORP".into()), Some("  ".into())),
+            None
+        );
+        assert_eq!(owner_trustee_from(Some("CORP".into()), None), None);
+    }
+
+    #[test]
+    fn runtime_parts_round_trip_without_re_resolving() {
+        // A Windows service runs as Local System and would resolve a DIFFERENT
+        // `%LOCALAPPDATA%`, so the recorded directories — not the project name —
+        // are what keep it and the user's `autumn serve status` on one tree.
+        let original = RuntimePaths::from_base(Path::new("/var/run"), "demo");
+        let rebuilt = RuntimePaths::from_parts(original.parts());
+        assert_eq!(rebuilt, original);
+        assert_eq!(rebuilt.pid_file(), original.pid_file());
+        assert_eq!(rebuilt.log_file(), original.log_file());
+        assert_eq!(rebuilt.pg_data_dir(), original.pg_data_dir());
+    }
+
+    #[test]
+    fn service_record_lives_inside_the_restricted_runtime_dir() {
+        // It names the binary a Local System service will execute, so it must
+        // not sit anywhere another local user could rewrite it.
+        let paths = RuntimePaths::from_base(Path::new("/var/run"), "demo");
+        assert_eq!(
+            paths.service_record_file().parent(),
+            paths.pid_file().parent()
+        );
     }
 
     #[test]

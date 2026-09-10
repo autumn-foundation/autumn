@@ -209,6 +209,42 @@ fn the_guide_documents_the_windows_prerequisites_doctor_reports() {
 }
 
 #[test]
+fn the_guide_documents_the_service_elevation_prerequisite() {
+    // #1639 added it to `WINDOWS_PREREQUISITES`, so `doctor` prints it. A
+    // prerequisite doctor names and the guide does not is one an operator meets
+    // as an access-denied error halfway through a registration.
+    let source = policy_source();
+    assert!(
+        source.contains("install-service") && source.contains("Administrator"),
+        "the policy must carry the service-registration prerequisite"
+    );
+    let doc = policy_doc();
+    assert!(
+        doc.contains("install-service") && doc.contains("Administrator"),
+        "the guide must document the elevation the service journey needs"
+    );
+}
+
+#[test]
+fn the_guide_records_that_the_daemon_lifecycle_left_tier_2() {
+    // The move is the point of #1639, and a guide that still routes a Windows
+    // operator to WSL2 for it would undo the slice while every table stayed
+    // consistent.
+    let doc = policy_doc();
+    let tier_two = guide_tier("## Tier 2");
+    assert!(
+        !tier_two
+            .iter()
+            .any(|command| command.contains("serve --daemon")),
+        "the daemon lifecycle must not be listed under Tier 2: {tier_two:?}"
+    );
+    assert!(
+        doc.contains("#1639"),
+        "the guide must say where the promotion came from"
+    );
+}
+
+#[test]
 fn the_guide_assigns_the_1456_browser_probe_a_tier_with_a_workaround() {
     // AC 5: #1456 is either resolved under this target or explicitly assigned
     // to a tier with a documented workaround. It IS resolved (the Windows
