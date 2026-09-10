@@ -143,6 +143,36 @@ pub fn stop_wait_hint(drain_budget_secs: u64) -> Duration {
         .min(MAX_WAIT_HINT)
 }
 
+/// `ERROR_SERVICE_DOES_NOT_EXIST` — the Service Control Manager's "no such
+/// service".
+pub const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+/// Whether a failure to open a service means it is simply not registered.
+///
+/// Only that one error code. Everything else — `ERROR_ACCESS_DENIED` above all,
+/// which is what a non-elevated shell gets when it asks for `STOP | DELETE` —
+/// must surface as an error, because `uninstall-service` treats "not registered"
+/// as licence to delete the daemon's records. Reading a denial as an absence
+/// would remove the record of a service that is still registered `AutoStart`,
+/// and its next restart would fail with no configuration to read and no way to
+/// log why.
+///
+/// Pure, so the distinction is tested on every platform rather than only on a
+/// machine where someone happens to run it unelevated.
+#[must_use]
+pub fn open_failure_means_absent(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(ERROR_SERVICE_DOES_NOT_EXIST)
+}
+
+/// Whether a failure to open a service is an elevation problem, so the message
+/// can say what to do rather than only what went wrong.
+#[must_use]
+pub fn open_failure_is_access_denied(raw_os_error: Option<i32>) -> bool {
+    /// `ERROR_ACCESS_DENIED`.
+    const ACCESS_DENIED: i32 = 5;
+    raw_os_error == Some(ACCESS_DENIED)
+}
+
 /// Whether a stop has been asked for, given what the last poll saw.
 ///
 /// Latching, and checked BEFORE the child is reaped. `autumn serve stop` creates
@@ -679,12 +709,35 @@ mod windows_impl {
                      service needs an elevated (Administrator) shell."
             )
         })?;
-        let Ok(service) = manager.open_service(
+        let service = match manager.open_service(
             name,
             ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-        ) else {
-            // Nothing registered. Not an error: the operator asked for it gone.
-            return Ok(Deregistered::WasNotRegistered);
+        ) {
+            Ok(service) => service,
+            Err(e) => {
+                let raw = match &e {
+                    windows_service::Error::Winapi(io) => io.raw_os_error(),
+                    _ => None,
+                };
+                // Nothing registered. Not an error: the operator asked for it
+                // gone and it is gone, and the daemon state is still ours to
+                // clean up.
+                if super::open_failure_means_absent(raw) {
+                    return Ok(Deregistered::WasNotRegistered);
+                }
+                // Anything else — a denial above all — must NOT reach the
+                // cleanup path. Deleting the record of a service that is still
+                // registered `AutoStart` leaves a host that cannot read its own
+                // configuration on the next restart, and cannot log why.
+                if super::open_failure_is_access_denied(raw) {
+                    return Err(format!(
+                        "cannot open `{name}`: access denied. Removing a service \
+                         needs an elevated (Administrator) shell; nothing was \
+                         changed."
+                    ));
+                }
+                return Err(format!("cannot open `{name}`: {e}"));
+            }
         };
         let state = |service: &windows_service::service::Service| {
             service.query_status().map(|s| s.current_state)
@@ -1085,6 +1138,32 @@ mod tests {
     #[test]
     fn a_clean_exit_is_intentional_even_with_no_stop_request() {
         assert!(exit_is_intentional(false, Some(0)));
+    }
+
+    #[test]
+    fn only_a_missing_service_counts_as_absent() {
+        // `uninstall-service` treats "not registered" as licence to delete the
+        // daemon's records. A denial read as an absence would remove the record
+        // of a service still registered `AutoStart`, whose next restart then
+        // fails with no configuration to read and no way to log why.
+        assert!(open_failure_means_absent(Some(
+            ERROR_SERVICE_DOES_NOT_EXIST
+        )));
+        // ERROR_ACCESS_DENIED — what a non-elevated shell gets asking for
+        // STOP | DELETE.
+        assert!(!open_failure_means_absent(Some(5)));
+        // ERROR_INVALID_HANDLE, and an error carrying no OS code at all.
+        assert!(!open_failure_means_absent(Some(6)));
+        assert!(!open_failure_means_absent(None));
+    }
+
+    #[test]
+    fn an_access_denial_is_named_so_the_message_can_say_what_to_do() {
+        assert!(open_failure_is_access_denied(Some(5)));
+        assert!(!open_failure_is_access_denied(Some(
+            ERROR_SERVICE_DOES_NOT_EXIST
+        )));
+        assert!(!open_failure_is_access_denied(None));
     }
 
     #[test]
