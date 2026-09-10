@@ -180,6 +180,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: `autumn generate admin`'s bulk delete is now batched
+  generator-wide (statements N→1, buffers -41.5%):** three of this
+  framework's own bundled admin models (`TokenAdminModel`,
+  `FeatureFlagAdminModel`, `ExperimentAdminModel`) already got hand-written
+  `execute_action` overrides in prior Ledger PRs to close the
+  `AdminModel::execute_action` trait default's `for id in ids { self.delete(&pool,
+  id).await?; }` per-id loop — but every app's own `autumn generate admin`
+  output never got the same override, since the generator template
+  (`autumn-cli/src/generate/admin.rs`, `render_admin_file`) never emitted
+  one. Every generated admin panel's "Delete selected" bulk action therefore
+  cost one `DELETE ... WHERE id = $1` round trip per selected row, not per
+  click. The generator now also emits an `execute_action` override batching
+  the `"delete"` action into one `DELETE ... WHERE id = ANY($1)`, and
+  returns the number of rows actually removed rather than `ids.len()` — a
+  missing or duplicate id is now a safe no-op instead of aborting the whole
+  batch part-way through with `AdminError::NotFound` (the trait-default
+  loop's undocumented, order-dependent behavior; no existing test pinned
+  it). `autumn-admin-plugin` also now re-exports the shared
+  `dispatch_restore_purge_or_unhandled` helper so generated code can reach
+  the same restore/purge/unhandled-action fallback the framework's own
+  hand-written overrides use. Profiled end-to-end against a real generated
+  project (`autumn new` → `generate scaffold` → `generate admin`) driving a
+  50,000-row table through a 2,000-id bulk delete: `pg_stat_statements`
+  calls 2,000 → 1, buffers 9,683 → 5,667. Existing `generate admin`
+  generator tests and the full `autumn-admin-plugin` Docker suite pass
+  unchanged. See
+  `docs/reports/2026-09-10-ledger-admin-generator-bulk-delete-batch/`.
+
 - **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
   (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
   (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
