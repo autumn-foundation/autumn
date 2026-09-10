@@ -1805,7 +1805,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
-    in_block_doc, attr_depth = 0, 0
+    in_block_doc, attr_depth, comment_depth = 0, 0, 0
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
@@ -1827,9 +1827,16 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         if in_block_doc:
             text, in_block_doc = _block_doc_split(line, in_block_doc)
             doc_text = re.sub(r"^\s*\*\s?", "", text)
+        # An open fence does NOT disqualify a block doc comment. The guard that
+        # said so was added to stop `/**` inside a fence being read as markup,
+        # but a bare `/**` beginning a source line cannot be fence content: the
+        # fence's content arrives through `///` prefixes, and an item between
+        # two doc lines is E0753, so nothing else can sit there. `rustdoc
+        # --test` includes the middle line of `/// ```` / `/** let x = 41; */`
+        # / `/// assert_eq!(x + 1, 42);` and the doctest passes, which is how
+        # this was settled.
         elif (
-            open_char is None
-            and re.match(r"^\s*/\*[*!]", line)
+            re.match(r"^\s*/\*[*!]", line)
             and not re.match(r"^\s*/\*\*/", line)  # `/**/` is an ordinary comment
         ):
             body_after = re.sub(r"^\s*/\*[*!]\s?", "", line)
@@ -1868,6 +1875,17 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             bare = line.strip()
             if attr_depth > 0:
                 attr_depth = max(0, attr_depth + _bracket_delta(line))
+                continue
+            # An ordinary block comment is a gap like a line comment or a blank
+            # line: rustdoc concatenates the doc attributes on either side of
+            # it. Only the line forms were exempt, so `/* note */` between two
+            # `///` lines ended the fence. It may span lines, so the depth is
+            # carried — the same nesting rule as the block doc form.
+            if comment_depth > 0:
+                _, comment_depth = _block_doc_split(line, comment_depth)
+                continue
+            if bare.startswith("/*"):
+                _, comment_depth = _block_doc_split(line[line.index("/*") + 2 :], 1)
                 continue
             if not bare or bare.startswith("//"):
                 continue
@@ -2545,6 +2563,31 @@ def self_test():
         "rustdoc: an invalid escape invents nothing",
         scan_text('#[doc = "bad \\q escape"]\npub fn h() {}\n', ".rs"),
         [],
+    )
+    # Doc forms mix freely on one item: an open fence does not disqualify a
+    # block doc comment, and an ordinary block comment is a gap like any other.
+    check(
+        "rustdoc: a block doc comment continues an open fence",
+        scan_text('/// ```\n/** #[secured(policy = "x")] */\n/// ```\npub fn f() {}\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a fence survives an ordinary block comment",
+        scan_text(
+            '/// ```\n/* note */\n/// #[secured(policy = "x")]\n/// ```\n'
+            'pub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a fence survives a multi-line ordinary block comment",
+        scan_text(
+            '/// ```\n/* multi\n   line */\n/// #[secured(policy = "x")]\n/// ```\n'
+            'pub fn h() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(
