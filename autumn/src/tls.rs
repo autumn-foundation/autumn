@@ -232,7 +232,9 @@ pub enum TlsError {
     },
     /// A certificate in the bundle (at 1-based `position`) is not usable as a
     /// trust anchor.
-    #[error("CA #{position} in the mTLS client CA bundle `{path}` is not a valid trust anchor: {source}")]
+    #[error(
+        "CA #{position} in the mTLS client CA bundle `{path}` is not a valid trust anchor: {source}"
+    )]
     InvalidClientCa {
         /// Bundle path.
         path: PathBuf,
@@ -258,9 +260,7 @@ pub enum TlsError {
         source: rustls_pki_types::pem::Error,
     },
     /// The mTLS revocation list contains no CRL.
-    #[error(
-        "no revocation list found in `{path}` (expected at least one PEM X509 CRL block)"
-    )]
+    #[error("no revocation list found in `{path}` (expected at least one PEM X509 CRL block)")]
     NoCrls {
         /// Path that contained no CRL.
         path: PathBuf,

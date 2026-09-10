@@ -14,13 +14,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
-use axum::routing::get;
 use autumn_web::config::ClientAuthMode;
 use autumn_web::tls::TlsConnectInfo;
 use autumn_web::tls::client_auth::{
     ClientCert, ClientIdentity, ClientIdentityLayer, OptionalClientCert, RequireClientCertLayer,
 };
+use axum::Router;
+use axum::routing::get;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
@@ -318,7 +318,10 @@ where
     let mut byte = [0u8; 1];
     let read_exactly_one_response = async {
         loop {
-            let n = stream.read(&mut byte).await.expect("read on the held connection");
+            let n = stream
+                .read(&mut byte)
+                .await
+                .expect("read on the held connection");
             assert!(n != 0, "the connection closed mid-response: {raw:?}");
             raw.push(byte[0]);
             // Stop as soon as the headers plus a full `Content-Length` body are
@@ -351,9 +354,13 @@ async fn a_valid_client_certificate_is_accepted_and_its_identity_reaches_the_han
     let trust = TrustFixture::write(CA_PEM, None);
     let server = serve_mtls(&trust, ClientAuthMode::Required, Vec::new()).await;
 
-    let response = mtls_get(server.addr, "/whoami", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-        .await
-        .expect("a certificate from the trusted CA should complete the handshake");
+    let response = mtls_get(
+        server.addr,
+        "/whoami",
+        Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+    )
+    .await
+    .expect("a certificate from the trusted CA should complete the handshake");
     assert_eq!(response.status, 200);
     assert!(
         response.body.contains("CN=svc-orders"),
@@ -404,7 +411,12 @@ async fn a_revoked_certificate_is_rejected() {
 
     // The same CA signed both, so this proves the CRL — not the trust store —
     // is what rejects it.
-    let accepted = mtls_get(server.addr, "/open", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM))).await;
+    let accepted = mtls_get(
+        server.addr,
+        "/open",
+        Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+    )
+    .await;
     assert!(
         accepted.is_ok(),
         "the un-revoked sibling certificate must still be accepted, got {accepted:?}"
@@ -437,9 +449,13 @@ async fn optional_mode_serves_clients_with_and_without_a_certificate() {
     assert_eq!(anonymous.status, 200);
     assert_eq!(anonymous.body, "anonymous");
 
-    let identified = mtls_get(server.addr, "/whoami", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-        .await
-        .expect("optional mode must accept a valid certificate");
+    let identified = mtls_get(
+        server.addr,
+        "/whoami",
+        Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+    )
+    .await
+    .expect("optional mode must accept a valid certificate");
     assert!(identified.body.contains("CN=svc-orders"));
 
     server.shutdown().await;
@@ -576,11 +592,17 @@ async fn the_identity_carries_the_sans_a_policy_would_key_on() {
     let trust = TrustFixture::write(CA_PEM, None);
     let server = serve_mtls(&trust, ClientAuthMode::Required, Vec::new()).await;
 
-    let response = mtls_get(server.addr, "/sans", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-        .await
-        .expect("a verified client is accepted");
+    let response = mtls_get(
+        server.addr,
+        "/sans",
+        Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+    )
+    .await
+    .expect("a verified client is accepted");
     assert!(
-        response.body.contains("URI:spiffe://autumn.test/svc/orders"),
+        response
+            .body
+            .contains("URI:spiffe://autumn.test/svc/orders"),
         "the SPIFFE-style URI SAN should reach the handler, got {:?}",
         response.body
     );
@@ -624,18 +646,26 @@ async fn a_ca_rotation_lands_without_a_restart_and_without_dropping_connections(
     // The old CA still works during the overlap — that is what makes the
     // rotation non-disruptive.
     assert!(
-        mtls_get(server.addr, "/open", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-            .await
-            .is_ok(),
+        mtls_get(
+            server.addr,
+            "/open",
+            Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM))
+        )
+        .await
+        .is_ok(),
         "the outgoing CA must keep working through the overlap window"
     );
 
     // Step 2: drop the old CA.
     trust.rotate_bundle(ROTATED_CA_PEM);
     eventually("the old CA stops being trusted", async || {
-        mtls_get(server.addr, "/open", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-            .await
-            .is_err()
+        mtls_get(
+            server.addr,
+            "/open",
+            Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+        )
+        .await
+        .is_err()
     })
     .await;
     assert!(
@@ -692,11 +722,18 @@ async fn an_established_connection_survives_a_rotation_that_would_reject_it() {
 
     // Rotate the old CA out entirely while the connection is open.
     trust.rotate_bundle(ROTATED_CA_PEM);
-    eventually("the rotation takes effect for new connections", async || {
-        mtls_get(server.addr, "/open", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
+    eventually(
+        "the rotation takes effect for new connections",
+        async || {
+            mtls_get(
+                server.addr,
+                "/open",
+                Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+            )
             .await
             .is_err()
-    })
+        },
+    )
     .await;
 
     // The already-established connection still serves.
@@ -738,9 +775,13 @@ async fn publishing_a_revocation_takes_effect_without_a_restart() {
     .await;
 
     assert!(
-        mtls_get(server.addr, "/open", Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
-            .await
-            .is_ok(),
+        mtls_get(
+            server.addr,
+            "/open",
+            Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM))
+        )
+        .await
+        .is_ok(),
         "revoking one certificate must not revoke its siblings"
     );
 

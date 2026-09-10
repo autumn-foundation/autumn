@@ -101,9 +101,11 @@ impl ClientIdentity {
     pub fn from_der(der: &CertificateDer<'_>) -> Result<Self, TlsError> {
         use x509_parser::prelude::FromDer as _;
 
-        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
-            .map_err(|e| TlsError::ParsePeerCert {
-                detail: e.to_string(),
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(der.as_ref()).map_err(|e| {
+                TlsError::ParsePeerCert {
+                    detail: e.to_string(),
+                }
             })?;
 
         Ok(Self {
@@ -338,14 +340,22 @@ impl ReloadableClientVerifier {
         // A poisoned lock means a previous holder panicked while swapping; the
         // stored value is still a valid verifier, so recover rather than
         // propagate a panic into every subsequent handshake.
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = next;
     }
 
     /// The verifier currently in force.
     #[must_use]
     pub fn current(&self) -> Arc<dyn ClientCertVerifier> {
-        Arc::clone(&self.inner.read().unwrap_or_else(|e| e.into_inner()))
+        Arc::clone(
+            &self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The configured listener mode.
@@ -551,8 +561,11 @@ pub enum RejectionReason {
     NoCertificate,
     /// The certificate does not chain to any CA in the bundle.
     UntrustedCa,
-    /// The certificate is outside its validity window.
+    /// The certificate has expired.
     Expired,
+    /// The certificate's validity window has not opened yet — usually a clock
+    /// skew between the client's issuer and this host.
+    NotYetValid,
     /// The certificate is listed in the CRL.
     Revoked,
     /// The certificate's revocation status could not be determined.
@@ -569,6 +582,7 @@ impl RejectionReason {
             Self::NoCertificate => "no_certificate",
             Self::UntrustedCa => "untrusted_ca",
             Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
             Self::Revoked => "revoked",
             Self::UnknownRevocation => "unknown_revocation",
             Self::Invalid => "invalid",
@@ -576,10 +590,11 @@ impl RejectionReason {
     }
 
     /// Every reason, for pre-registering metric series and for tests.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::NoCertificate,
         Self::UntrustedCa,
         Self::Expired,
+        Self::NotYetValid,
         Self::Revoked,
         Self::UnknownRevocation,
         Self::Invalid,
@@ -591,9 +606,10 @@ impl RejectionReason {
             Self::NoCertificate => 0,
             Self::UntrustedCa => 1,
             Self::Expired => 2,
-            Self::Revoked => 3,
-            Self::UnknownRevocation => 4,
-            Self::Invalid => 5,
+            Self::NotYetValid => 3,
+            Self::Revoked => 4,
+            Self::UnknownRevocation => 5,
+            Self::Invalid => 6,
         }
     }
 
@@ -603,16 +619,19 @@ impl RejectionReason {
     /// unsupported cipher, a dropped connection), which keeps server-only TLS
     /// logging byte-for-byte #1603's.
     #[must_use]
-    pub fn classify(error: &rustls::Error) -> Option<Self> {
+    pub const fn classify(error: &rustls::Error) -> Option<Self> {
         use rustls::CertificateError;
 
         match error {
             rustls::Error::NoCertificatesPresented => Some(Self::NoCertificate),
             rustls::Error::InvalidCertificate(cert_error) => Some(match cert_error {
                 CertificateError::UnknownIssuer => Self::UntrustedCa,
-                CertificateError::Expired | CertificateError::ExpiredContext { .. } => Self::Expired,
-                CertificateError::NotValidYet
-                | CertificateError::NotValidYetContext { .. } => Self::Expired,
+                CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+                    Self::Expired
+                }
+                CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+                    Self::NotYetValid
+                }
                 CertificateError::Revoked => Self::Revoked,
                 CertificateError::UnknownRevocationStatus
                 | CertificateError::ExpiredRevocationList
@@ -646,23 +665,11 @@ impl RejectionReason {
     /// quiet.
     fn take_log_slot(self) -> Option<u64> {
         /// Last second at which each reason logged; `i64::MIN` means never.
-        static LAST_LOG_UNIX: [AtomicI64; 6] = [
-            AtomicI64::new(i64::MIN),
-            AtomicI64::new(i64::MIN),
-            AtomicI64::new(i64::MIN),
-            AtomicI64::new(i64::MIN),
-            AtomicI64::new(i64::MIN),
-            AtomicI64::new(i64::MIN),
-        ];
+        static LAST_LOG_UNIX: [AtomicI64; RejectionReason::ALL.len()] =
+            [const { AtomicI64::new(i64::MIN) }; RejectionReason::ALL.len()];
         /// Rejections suppressed since each reason last logged.
-        static SUPPRESSED: [AtomicU64; 6] = [
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-        ];
+        static SUPPRESSED: [AtomicU64; RejectionReason::ALL.len()] =
+            [const { AtomicU64::new(0) }; RejectionReason::ALL.len()];
 
         let slot = self.slot();
         let now = super::now_unix();
@@ -728,9 +735,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientCert {
             .extensions
             .get::<Arc<ClientIdentity>>()
             .map(|id| Self(Arc::clone(id)))
-            .ok_or_else(|| {
-                crate::error::AutumnError::forbidden_msg(REQUIRED_REJECTION_MESSAGE)
-            })
+            .ok_or_else(|| crate::error::AutumnError::forbidden_msg(REQUIRED_REJECTION_MESSAGE))
     }
 }
 
@@ -774,6 +779,19 @@ pub fn current_client_identity() -> Option<Arc<ClientIdentity>> {
     CURRENT_CLIENT_IDENTITY
         .try_with(Clone::clone)
         .unwrap_or_default()
+}
+
+/// Run `future` with `identity` as the ambient verified client identity.
+///
+/// The seam a test uses to exercise a policy that reads
+/// [`PolicyContext::client_identity`](crate::authorization::PolicyContext::client_identity)
+/// without booting a TLS listener. In production the same scope is established
+/// by [`ClientIdentityLayer`] for the whole downstream call.
+pub async fn with_client_identity<F: Future>(
+    identity: Option<Arc<ClientIdentity>>,
+    future: F,
+) -> F::Output {
+    CURRENT_CLIENT_IDENTITY.scope(identity, future).await
 }
 
 /// Tower [`Layer`](tower::Layer) that turns the HTTPS listener's
@@ -1185,17 +1203,23 @@ mod tests {
             "sans: {:?}",
             id.sans
         );
-        assert!(id.has_san("email:orders@autumn.test"), "sans: {:?}", id.sans);
+        assert!(
+            id.has_san("email:orders@autumn.test"),
+            "sans: {:?}",
+            id.sans
+        );
         assert_eq!(id.common_name(), Some("svc-orders"));
 
         // Fingerprint is the SHA-256 of the DER, hex, prefixed.
         let expected = {
+            use std::fmt::Write as _;
+
             use sha2::{Digest as _, Sha256};
             let digest = Sha256::digest(first_der(CLIENT_PEM).as_ref());
-            format!(
-                "sha256:{}",
-                digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
-            )
+            digest.iter().fold("sha256:".to_owned(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
         };
         assert_eq!(id.fingerprint, expected);
         assert!(!id.serial.is_empty());
@@ -1320,7 +1344,8 @@ mod tests {
             Arc::clone(&provider),
         )
         .expect("first verifier");
-        let reloadable = ReloadableClientVerifier::new(Arc::clone(&first), ClientAuthMode::Required);
+        let reloadable =
+            ReloadableClientVerifier::new(Arc::clone(&first), ClientAuthMode::Required);
         assert!(Arc::ptr_eq(&reloadable.current(), &first));
 
         let second = build_client_verifier(
@@ -1468,6 +1493,12 @@ mod tests {
                 CertificateError::Expired
             )),
             Some(RejectionReason::Expired)
+        );
+        assert_eq!(
+            RejectionReason::classify(&rustls::Error::InvalidCertificate(
+                CertificateError::NotValidYet
+            )),
+            Some(RejectionReason::NotYetValid)
         );
         assert_eq!(
             RejectionReason::classify(&rustls::Error::InvalidCertificate(

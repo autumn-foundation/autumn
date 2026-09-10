@@ -1348,7 +1348,13 @@ fn report_csrf_loss(
         });
     } else {
         for (key, (path, exempt, inheritors)) in lost {
-            let guard = postures_of(&inheritors, head_routes, head_csrf, head_bindings, head_mtls);
+            let guard = postures_of(
+                &inheritors,
+                head_routes,
+                head_csrf,
+                head_bindings,
+                head_mtls,
+            );
             let (_, method) = key;
             out.push(Finding {
                 kind: "csrf_enforcement_removed",
@@ -2002,7 +2008,12 @@ mod tests {
     }
 
     /// A manifest carrying an `mtls` dimension (schema v4, #1640).
-    fn manifest_mtls(routes: &str, mode: &str, required_paths: &[&str], mtls: &str) -> PostureManifest {
+    fn manifest_mtls(
+        routes: &str,
+        mode: &str,
+        required_paths: &[&str],
+        mtls: &str,
+    ) -> PostureManifest {
         let required = required_paths
             .iter()
             .map(|p| format!("\"{p}\""))

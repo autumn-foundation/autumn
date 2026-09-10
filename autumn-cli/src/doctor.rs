@@ -1151,6 +1151,17 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
                  on this",
             ),
         },
+        healthy @ ClientAuthDoctorData::Healthy { .. } => grade_healthy_client_auth(healthy),
+    }
+}
+
+/// Grade a loadable `[server.tls.client_auth]`, worst problem first.
+///
+/// Split out of [`check_client_auth_impl`] so each function stays readable; the
+/// caller has already handled every not-loadable state, so the fallthrough arm
+/// here is unreachable in practice.
+fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
+    match data {
         ClientAuthDoctorData::Healthy {
             expired_cas,
             ca_count,
@@ -1232,6 +1243,15 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
                 "[server.tls.client_auth] mode = \"{mode}\" with {ca_count} trusted client \
                  CA(s) and {required_path_count} required route prefix(es)"
             )),
+            hint: None,
+        },
+        // Not reachable: the caller matches every non-`Healthy` state itself.
+        // Graded as a warning rather than panicking, so a future state added to
+        // the enum surfaces as "cannot diagnose" instead of taking doctor down.
+        _ => CheckResult {
+            name: "tls_client_auth",
+            status: CheckStatus::Warn,
+            detail: Some("[server.tls.client_auth] could not be graded".into()),
             hint: None,
         },
     }
@@ -9363,9 +9383,7 @@ pub fn run(opts: DoctorOptions) {
             .and_then(|s| s.get("tls"))
             .and_then(toml::Value::as_table),
     );
-    tasks.push(Box::new(move || {
-        check_client_auth_impl(&client_auth_data)
-    }));
+    tasks.push(Box::new(move || check_client_auth_impl(&client_auth_data)));
 
     // 8a-bis. Automatic ACME provisioning (issue #1608). When [server.tls.acme]
     // is configured: always inspect the stored certificate offline (expiry), and

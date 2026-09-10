@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -1112,7 +1112,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -1127,6 +1127,11 @@ mod tests {
         assert_eq!(
             json["dimensions"]["security_headers"]["source"],
             "config:security.headers"
+        );
+        assert_eq!(json["dimensions"]["mtls"]["provenance"], "declared");
+        assert_eq!(
+            json["dimensions"]["mtls"]["source"],
+            "config:server.tls.client_auth"
         );
         assert_eq!(
             json["dimensions"]["authorization_policies"]["provenance"],
@@ -1256,7 +1261,10 @@ mod tests {
             &routes,
             Some(&security_dump_with_mtls("off", &["/internal/"])),
         ));
-        assert_eq!(json["dimensions"]["mtls"]["entries"][0]["mtls_required"], false);
+        assert_eq!(
+            json["dimensions"]["mtls"]["entries"][0]["mtls_required"],
+            false
+        );
     }
 
     #[test]
@@ -1289,15 +1297,19 @@ mod tests {
             Some(&security_dump_with_mtls("optional", &[])),
         ));
 
-        for dimension in ["routes", "csrf", "security_headers", "authorization_policies"] {
+        for dimension in [
+            "routes",
+            "csrf",
+            "security_headers",
+            "authorization_policies",
+        ] {
             assert_eq!(
                 locked["dimensions"][dimension], unlocked["dimensions"][dimension],
                 "`{dimension}` must not move when only the mTLS requirement does"
             );
         }
         assert_ne!(
-            locked["dimensions"]["mtls"],
-            unlocked["dimensions"]["mtls"],
+            locked["dimensions"]["mtls"], unlocked["dimensions"]["mtls"],
             "the mtls dimension must record the dropped requirement"
         );
     }

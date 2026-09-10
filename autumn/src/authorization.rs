@@ -124,16 +124,6 @@ pub struct PolicyContext {
     /// `Post::scope(&ctx).load(&mut db).await?` ergonomic the
     /// authorization guide documents.
     pub policy_registry: PolicyRegistry,
-
-    /// The verified mTLS client identity of the connection this request
-    /// arrived on (issue #1640), when one was presented and verified.
-    ///
-    /// Machine identity, alongside the session user and token scopes: an
-    /// `#[authorize]` policy can decide on the calling *service*, not just the
-    /// calling person. `None` for every request over a connection with no
-    /// verified client certificate.
-    #[cfg(feature = "tls")]
-    pub client_identity: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
 }
 
 impl PolicyContext {
@@ -194,13 +184,6 @@ impl PolicyContext {
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
-            // Seeded from the ambient request scope the HTTPS listener
-            // establishes (#1640), so every policy path — `#[authorize]`, a
-            // `#[repository(policy = ...)]` auto-API, or a hand-written check —
-            // sees machine identity without threading it through each call
-            // site. `None` outside a request, and on every non-mTLS connection.
-            #[cfg(feature = "tls")]
-            client_identity: crate::tls::client_auth::current_client_identity(),
         }
     }
 
@@ -291,26 +274,35 @@ impl PolicyContext {
         self
     }
 
-    /// Attach a verified mTLS client identity to the context (issue #1640).
-    /// Used by the framework when authorizing a request that arrived over a
-    /// verified client-certificate connection; tests and hand-written handlers
-    /// can also call this to inject a machine identity by hand.
+    /// The verified mTLS client identity of the connection this request arrived
+    /// on (issue #1640), when one was presented and verified.
+    ///
+    /// Machine identity, alongside the session user and token scopes: an
+    /// `#[authorize]` policy can decide on the calling *service*, not just the
+    /// calling person. `None` for every request over a connection with no
+    /// verified client certificate, and outside a request entirely.
+    ///
+    /// Read from the ambient request scope the HTTPS listener establishes
+    /// rather than carried as a field, so `PolicyContext` keeps the shape user
+    /// code constructs by hand. Like
+    /// [`Current::actor`](crate::current::Current::actor), it is scoped to the
+    /// task serving the request: a policy check moved onto a `tokio::spawn`ed
+    /// task sees `None`. A test injects one with
+    /// [`with_client_identity`](crate::tls::client_auth::with_client_identity).
     #[cfg(feature = "tls")]
     #[must_use]
-    pub fn with_client_identity(
-        mut self,
-        identity: std::sync::Arc<crate::tls::client_auth::ClientIdentity>,
-    ) -> Self {
-        self.client_identity = Some(identity);
-        self
+    pub fn client_identity(
+        &self,
+    ) -> Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>> {
+        crate::tls::client_auth::current_client_identity()
     }
 
     /// Whether the request arrived over a connection with a verified client
     /// certificate.
     #[cfg(feature = "tls")]
     #[must_use]
-    pub const fn has_client_identity(&self) -> bool {
-        self.client_identity.is_some()
+    pub fn has_client_identity(&self) -> bool {
+        self.client_identity().is_some()
     }
 
     /// Whether the verified client certificate carries `san`, e.g.
@@ -319,9 +311,7 @@ impl PolicyContext {
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn client_has_san(&self, san: &str) -> bool {
-        self.client_identity
-            .as_ref()
-            .is_some_and(|id| id.has_san(san))
+        self.client_identity().is_some_and(|id| id.has_san(san))
     }
 
     /// Build a fully-populated [`PolicyContext`] from `AppState` + `Session`,
@@ -1074,9 +1064,52 @@ mod tests {
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
-            #[cfg(feature = "tls")]
-            client_identity: None,
         }
+    }
+
+    // ── mTLS machine identity (#1640) ───────────────────────────────
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn client_identity_is_absent_outside_an_mtls_request() {
+        let c = ctx(Some("1"), None);
+        assert!(c.client_identity().is_none());
+        assert!(!c.has_client_identity());
+        assert!(!c.client_has_san("URI:spiffe://acme/svc/orders"));
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_policy_can_decide_on_the_verified_machine_identity() {
+        use std::sync::Arc;
+
+        use crate::tls::client_auth::{ClientIdentity, with_client_identity};
+
+        let identity = Arc::new(ClientIdentity {
+            subject: "CN=svc-orders, O=Acme".to_owned(),
+            issuer: "CN=Acme Internal Client CA".to_owned(),
+            sans: vec!["URI:spiffe://acme/svc/orders".to_owned()],
+            fingerprint: "sha256:deadbeef".to_owned(),
+            serial: "01".to_owned(),
+            not_after_unix: i64::MAX,
+        });
+
+        with_client_identity(Some(identity), async {
+            let c = ctx(None, None);
+            assert!(c.has_client_identity());
+            assert!(c.client_has_san("URI:spiffe://acme/svc/orders"));
+            assert!(!c.client_has_san("URI:spiffe://acme/svc/billing"));
+            assert_eq!(
+                c.client_identity()
+                    .expect("identity in scope")
+                    .common_name(),
+                Some("svc-orders")
+            );
+        })
+        .await;
+
+        // The scope ends with the request: nothing leaks to the next one.
+        assert!(!ctx(None, None).has_client_identity());
     }
 
     #[tokio::test]

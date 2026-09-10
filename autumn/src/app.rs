@@ -5299,10 +5299,8 @@ impl AppBuilder {
                     &crate::tls::client_auth::RequireClientCertLayer::for_paths(required_paths),
                     service,
                 );
-                let service = tower::Layer::layer(
-                    &crate::tls::client_auth::ClientIdentityLayer,
-                    service,
-                );
+                let service =
+                    tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         crate::tls::TlsConnectInfo,
@@ -9294,6 +9292,15 @@ fn build_tls_listener(
     Ok((listener, reload, client_reload))
 }
 
+/// The mTLS wiring `build_client_auth` hands back: the verifier the listener
+/// enforces, and the reloader that rotates its trust store. Both `None` when
+/// client auth is off.
+#[cfg(feature = "tls")]
+type ClientAuthWiring = (
+    Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    Option<crate::tls::client_auth::ClientTrustReloader>,
+);
+
 /// Build the mTLS client-certificate verifier and its trust-store reloader from
 /// `[server.tls.client_auth]` (issue #1640).
 ///
@@ -9304,13 +9311,7 @@ fn build_tls_listener(
 fn build_client_auth(
     cfg: &crate::config::TlsConfig,
     provider: &std::sync::Arc<rustls::crypto::CryptoProvider>,
-) -> Result<
-    (
-        Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
-        Option<crate::tls::client_auth::ClientTrustReloader>,
-    ),
-    crate::tls::TlsError,
-> {
+) -> Result<ClientAuthWiring, crate::tls::TlsError> {
     if !cfg.client_auth_active() {
         return Ok((None, None));
     }

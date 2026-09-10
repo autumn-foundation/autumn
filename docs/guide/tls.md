@@ -1029,7 +1029,12 @@ impl Policy<ApiKey> for ApiKeyPolicy {
 ```
 
 `ctx.has_client_identity()` asks whether the connection was verified at all;
-`ctx.client_identity` is the full record.
+`ctx.client_identity()` returns the full record.
+
+The identity is scoped to the task serving the request, like
+[`Current::actor()`](./audit-logging.md) — a policy check moved onto a
+`tokio::spawn`ed task sees `None`. To exercise such a policy in a unit test,
+wrap the call in `autumn_web::tls::client_auth::with_client_identity(...)`.
 
 ### CA rotation without a restart
 
@@ -1087,7 +1092,8 @@ distinguishing reason:
 | --- | --- |
 | `no_certificate` | Nothing presented on a `required` listener. |
 | `untrusted_ca` | Chains to no CA in the bundle. |
-| `expired` | Outside its validity window. |
+| `expired` | Past its `notAfter`. |
+| `not_yet_valid` | Its `notBefore` has not arrived — usually clock skew. |
 | `revoked` | Listed in the CRL. |
 | `unknown_revocation` | Revocation status undeterminable. |
 | `invalid` | Malformed, bad signature, or otherwise unacceptable. |

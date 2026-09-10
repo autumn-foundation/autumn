@@ -7498,7 +7498,11 @@ impl ClientAuthConfig {
             );
         }
 
-        if self.crl_path.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        if self
+            .crl_path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
             return Err(
                 "[server.tls.client_auth] crl_path is empty; set it to a PEM revocation list, \
                  or remove the key"
@@ -16422,16 +16426,22 @@ path = "/healthz"
 
     #[test]
     fn client_auth_rejects_blank_paths() {
-        let mut ca = ClientAuthConfig::default();
-        ca.mode = ClientAuthMode::Required;
-        ca.ca_bundle_path = Some(PathBuf::new());
-        let err = ca.validate().expect_err("a blank ca_bundle_path is invalid");
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
+        let err = ca
+            .validate()
+            .expect_err("a blank ca_bundle_path is invalid");
         assert!(err.contains("ca_bundle_path"), "unhelpful message: {err}");
 
-        let mut ca = ClientAuthConfig::default();
-        ca.mode = ClientAuthMode::Required;
-        ca.ca_bundle_path = Some(PathBuf::from("ca.pem"));
-        ca.crl_path = Some(PathBuf::new());
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            crl_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
         let err = ca.validate().expect_err("a blank crl_path is invalid");
         assert!(err.contains("crl_path"), "unhelpful message: {err}");
     }
@@ -16441,8 +16451,10 @@ path = "/healthz"
         // Routes declaring an mTLS requirement on a listener that never
         // requests a certificate would reject every request forever — that is a
         // misconfiguration, not a posture.
-        let mut ca = ClientAuthConfig::default();
-        ca.required_paths = vec!["/internal/".to_owned()];
+        let ca = ClientAuthConfig {
+            required_paths: vec!["/internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
         let err = ca
             .validate()
             .expect_err("required_paths with mode = off is invalid");
@@ -16451,13 +16463,13 @@ path = "/healthz"
 
     #[test]
     fn client_auth_rejects_relative_required_paths() {
-        let mut ca = ClientAuthConfig::default();
-        ca.mode = ClientAuthMode::Optional;
-        ca.ca_bundle_path = Some(PathBuf::from("ca.pem"));
-        ca.required_paths = vec!["internal/".to_owned()];
-        let err = ca
-            .validate()
-            .expect_err("a required_path must be rooted");
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Optional,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            required_paths: vec!["internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
+        let err = ca.validate().expect_err("a required_path must be rooted");
         assert!(err.contains("required_paths"), "unhelpful message: {err}");
     }
 
