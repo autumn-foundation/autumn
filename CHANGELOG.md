@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Client-sealed confidential text.** `ConfidentialText` validates opaque
+  AES-256-GCM envelopes and binds insert and read access to one authenticated
+  user or tenant. Root keys and plaintext stay on the client.
+
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
   management system.** `autumn new <name> --starter cms` now scaffolds a
   complete CMS, joining `saas` as the second curated built-in. The rendered

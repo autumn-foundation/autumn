@@ -532,6 +532,22 @@ pub trait PostRepository {}
 allow_unauthorized_repository_api = true # only when intentional
 ```
 
+### Client-sealed confidential text
+
+Use `autumn_web::confidential::ConfidentialText` when a client encrypts a text
+field and the server must store only its sealed envelope. Accept input with
+`ConfidentialText::for_insert(json, &binding, &owner_context)`. Return it with
+`value.for_owner(&owner, &owner_context)`. Both calls require exactly one
+matching authenticated user or tenant owner.
+
+The client must bind the application, model, field, owner, and record ID as
+AEAD associated data. Reserve the record ID before encryption. Keep root keys
+and decryption in the client. Do not use Autumn credentials or process-global
+state for these keys. The server cannot verify the AEAD tag; it validates the
+envelope shape and ownership before storage. See
+`docs/plans/2026-09-09-client-sealed-confidential-text.md` for the version 1
+wire format and rotation rules.
+
 ### Associations and preloading (0.6.0)
 
 Declare `#[belongs_to]` / `#[has_many]` / `#[has_one]` on a `#[model]` for
