@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add opt-in `collaboration` support for convergent plain-text model fields, offline CRDT replay, accepted-operation channels, and ephemeral cursor/selection presence.
+
 ### Added
 
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content

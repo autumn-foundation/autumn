@@ -67,6 +67,12 @@ pub use maud::{Markup, PreEscaped, html};
 // ── Extractors ───────────────────────────────────────────────────
 /// Canary traffic-routing extractor (reads the `X-Canary` header).
 pub use crate::canary::CanaryRoute;
+/// Collaborative text CRDT and server-authoritative session types.
+#[cfg(feature = "collaboration")]
+pub use crate::collaboration::{
+    ActorId, CharacterId, CollaborationSession, CollaborativeField, CollaborativeTopic, Cursor,
+    InMemoryCollaborationStore, OperationId, Selection, TextOperation, TextState,
+};
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;

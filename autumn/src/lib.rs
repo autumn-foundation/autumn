@@ -115,6 +115,8 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+#[cfg(feature = "collaboration")]
+pub mod collaboration;
 // Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
 // sustains, and the admission limit it licenses. Ungated on purpose —
 // `route_listing` and `router` consult it on every boot.

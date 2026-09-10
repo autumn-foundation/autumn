@@ -1,0 +1,5 @@
+error: duplicate `#[collaborative]` annotation
+ --> tests/compile-fail/model_collaborative_duplicate.rs:4:41
+  |
+4 | struct Note { id: i32, #[collaborative] #[collaborative] body: String }
+  |                                         ^^^^^^^^^^^^^^^^^

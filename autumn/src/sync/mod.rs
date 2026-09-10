@@ -75,6 +75,8 @@ pub mod server;
 pub mod store;
 
 pub use engine::{SyncConfig, SyncEngine, SyncReport, SyncStatus};
+#[cfg(feature = "collaboration")]
+pub use protocol::CollaborativePushRequest;
 pub use protocol::{
     Change, ChangeOutcome, MAX_PULL_LIMIT, MAX_PUSH_CHANGES, Op, PullQuery, PullResponse,
     PushRequest, PushResponse, RemoteRow, Version,

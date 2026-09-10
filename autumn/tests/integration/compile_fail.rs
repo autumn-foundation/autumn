@@ -225,6 +225,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
+    #[cfg(feature = "collaboration")]
+    t.compile_fail("tests/compile-fail/model_collaborative_non_string.rs");
+    #[cfg(feature = "collaboration")]
+    t.compile_fail("tests/compile-fail/model_collaborative_duplicate.rs");
 
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
     // enum fails with an unsatisfied `T: Lifecycle` trait bound.
@@ -584,6 +588,8 @@ fn compile_pass_tests_a() {
     // stripped — the model still generates its normal write types.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_schema_markers.rs");
+    #[cfg(feature = "collaboration")]
+    t.pass("tests/compile-pass/model_collaborative.rs");
 
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]

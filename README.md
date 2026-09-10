@@ -227,6 +227,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/cms`](examples/cms) | WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, revisions, roles, themes, plugin hooks |
+| [`examples/collaborative-notes`](examples/collaborative-notes) | Deterministic, offline-capable collaborative plain-text CRDT operations |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, actuator endpoints, and app metrics (a domain counter + timer on `/actuator/prometheus`) |
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, a two-node self-clustering substrate needing no coordination service, and Docker Compose deployment |
 | [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
@@ -332,4 +333,3 @@ how to run the Tier 2 commands under WSL2.
 ## License
 
 MIT OR Apache-2.0
-
