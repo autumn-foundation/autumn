@@ -146,13 +146,15 @@ runs `cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli
 --all-features --no-report`, a full-workspace all-features build, not the
 single-package targeted command the fix's commit message quotes. This
 role's own bar for treating a ledger entry as *closed* — not merely
-*diagnosed and fixed* — is ≥20 (≥50 for the macOS cluster's historically
-sub-10% rate) 0-failure reruns from a harness anyone can rerun, against
-the actual CI build. `manual-macos-contention-check.yml` was built toward
-that for the macOS side and still hasn't been dispatched even once — and
-even a full dispatch only reaches 20 samples (its `samples` input caps at
-`"20"`), short of the ≥50 bar on its own; no harness at all exists yet for
-either Linux/coverage signature.
+*diagnosed and fixed* — is ≥20 0-failure reruns (≥50 only for a genuinely
+low-rate, sub-10% flake — the macOS cluster's own measured rate is 3/17
+(≈17.6%), or 3/30 (exactly 10%, not below it) folding in the 13/13 clean
+samples already banked, so ≥20 is the bar that actually applies here) from
+a harness anyone can rerun, against the actual CI build.
+`manual-macos-contention-check.yml` was built toward that for the macOS
+side and still hasn't been dispatched even once — a single dispatch at its
+`samples` input's max (`"20"`) can reach that bar in one run; no harness at
+all exists yet for either Linux/coverage signature.
 
 **`cache_stampede` and `sim_fault_plan`: unchanged, still undiagnosed.** No
 new hits this pass; still short of a rerun campaign.
