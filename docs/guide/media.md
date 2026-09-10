@@ -257,6 +257,8 @@ side effect — a member-gated roster poll. Do either on any interval well under
 the idle TTL (default 15 minutes, `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS`) and the
 seat is held. Send a heartbeat as:
 
+<!-- config-key-allow: AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS — read directly by the reaper as an env-overridable constant, not a `[media]` config key; promoting it is a documented follow-up on `spawn_room_reaper_loop` -->
+
 ```http
 POST /api/media/rooms/{room_id}/heartbeat
 { "participant_id": "...", "session_token": "..." }
