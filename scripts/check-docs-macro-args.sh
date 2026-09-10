@@ -871,10 +871,12 @@ def top_level_keys(args):
 # `#[autumn_macros::model(...)]` are documented, idiomatic forms and appear in
 # shipped rustdoc (`autumn/src/aggregate.rs`, `autumn/src/classify/mod.rs`).
 # Requiring the bare name would leave every qualified invocation ungated.
+# Rust permits whitespace between an attribute path and its delimiter, so
+# `#[secured (policy = "x")]` is a valid invocation the macro still rejects.
 MACRO_OPEN = re.compile(
-    r"#\[(?:autumn_web::|autumn_macros::|autumn::)?("
+    r"#\[\s*(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\("
+    + r")\s*\("
 )
 # `cfg_attr(<pred>, <attr>, …)` applies each `<attr>` when the predicate holds,
 # so a conditionally-applied Autumn macro is a real invocation the compiler
@@ -883,11 +885,11 @@ MACRO_OPEN = re.compile(
 # (`all(feature = "a", feature = "b")`), and more than one attribute can
 # follow it (`cfg_attr(feature = "a", inline, secured(…))`), so a `[^,]+`
 # prefix stopped at the predicate's first comma and saw no later payload.
-CFG_ATTR_OPEN = re.compile(r"#\[cfg_attr\s*\(")
+CFG_ATTR_OPEN = re.compile(r"#\[\s*cfg_attr\s*\(")
 BARE_MACRO_OPEN = re.compile(
     r"\b(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\("
+    + r")\s*\("
 )
 
 
@@ -1051,7 +1053,13 @@ def find_macro_calls(text):
             # A `cfg_attr` body: every attribute it applies is a real
             # invocation, so scan it for bare macro calls.
             base = match.end()
+            # The body has its own literals: a `doc = "#[secured(…)]"` string
+            # is documentation text, not an invocation. Masking the outer
+            # match alone left this path unguarded.
+            body_masked = _masked_spans(body)
             for inner in BARE_MACRO_OPEN.finditer(body):
+                if any(s <= inner.start() < e for s, e in body_masked):
+                    continue
                 inner_end = _close_of(body, inner.end())
                 if inner_end is None:
                     continue
@@ -1245,6 +1253,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
+    open_char, open_len = "`", 3
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
@@ -1255,20 +1264,27 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             current, inside = [], False
             continue
         body = doc.group(1).strip()
-        if body.startswith("```"):
+        # Same delimiter rule as the markdown half: character and run length,
+        # not a fixed three. Fixing only that scanner left this one reading
+        # ````rust as the language "`rust" and skipping the block.
+        run = _fence_run(body)
+        if run:
+            char, length = run
             if inside:
-                collected.append(current)
-                current, inside = [], False
+                if char == open_char and length >= open_len:
+                    collected.append(current)
+                    current, inside = [], False
             else:
                 # rustdoc fences default to Rust, and the attribute-bearing
                 # ones are usually `ignore` / `no_run` / `compile_fail`.
-                lang = body[3:].strip().lower()
+                lang = body[length:].strip().lower()
                 inside = lang == "" or re.match(
                     r"^(rust|ignore|no_run|compile_fail|should_panic|edition\d+)",
                     lang,
                 ) is not None
                 if inside:
                     fences += 1
+                    open_char, open_len = char, length
             continue
         if inside:
             current.append((lineno, body))
@@ -1776,6 +1792,62 @@ def self_test():
             '```rust\nlet s = "#[job(pending = true)]";\n#[secured(policy = "x")]\n```\n',
             ".md",
         ),
+        [("secured", "policy")],
+    )
+    # …and the same masking inside a `cfg_attr` body, which is a separate scan.
+    check(
+        "markdown: attribute inside a cfg_attr doc string is not an invocation",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "docs", doc = "#[secured(policy = 1)]")]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: a real cfg_attr payload beside a quoted one is caught",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "d", doc = "#[job(pending = 1)]", secured(policy = "x"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+
+    # Rust allows whitespace between an attribute path and its delimiter.
+    check(
+        "markdown: whitespace before the delimiter is still an invocation",
+        scan_text('```rust\n#[secured (policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: whitespace inside a cfg_attr payload too",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "a", secured (policy = "x"))]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: whitespace before the delimiter",
+        scan_text('//! ```ignore\n//! #[secured (policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+
+    # The fence-delimiter rule applies to the rustdoc scanner as well.
+    check(
+        "rustdoc: four-backtick fence is scanned",
+        scan_text('//! ````ignore\n//! #[secured(policy = "x")]\n//! ````\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a shorter run does not close a longer fence",
+        scan_text(
+            '//! ````ignore\n//! ```\n//! #[secured(policy = "x")]\n//! ```\n//! ````\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: tilde fence is scanned",
+        scan_text('//! ~~~ignore\n//! #[secured(policy = "x")]\n//! ~~~\n', ".rs"),
         [("secured", "policy")],
     )
 
