@@ -325,11 +325,13 @@ pub mod route_listing;
 /// [`state_migration!`](crate::state_migration) between shapes.
 pub mod upgrade;
 
-/// Inbound (server-side) TLS support (issue #1603).
+/// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
 /// Load and validate a certificate + key, build a reloadable rustls
-/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
-/// off-by-default `tls` feature.
+/// `ServerConfig`, inspect leaf-certificate expiry, and — through
+/// [`tls::client_auth`] — verify client certificates and hand the verified
+/// machine identity to handlers and policies. Gated behind the off-by-default
+/// `tls` feature.
 #[cfg(feature = "tls")]
 pub mod tls;
 

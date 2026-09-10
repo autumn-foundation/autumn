@@ -4,10 +4,11 @@
 //! bundle of client CAs, the handshake requests — and verifies — a client
 //! certificate, and the verified identity flows to handlers and policies.
 //!
-//! (`lib.rs` carries an outer doc comment on `pub mod tls`, so links below are
-//! fully qualified.)
+//! (`lib.rs` carries an outer doc comment on `pub mod tls`, which is merged
+//! with this block, so every link below is fully qualified — a bare item name
+//! would resolve in the crate root instead of here.)
 //!
-//! Five pieces:
+//! **The trust store**
 //!
 //! 1. **Fail-fast loading** —
 //!    [`load_client_roots`](crate::tls::client_auth::load_client_roots) and
@@ -22,14 +23,37 @@
 //!    [`ClientTrustReloader`](crate::tls::client_auth::ClientTrustReloader)
 //!    polls the bundle and CRL mtimes, mirroring
 //!    [`CertReloader`](crate::tls::CertReloader).
+//!
+//! **The request surface**
+//!
 //! 4. **Identity** —
 //!    [`ClientIdentity`](crate::tls::client_auth::ClientIdentity) is the parsed
-//!    subject DN, issuer DN, SANs, fingerprint and serial handed to extractors
-//!    and the `Policy` context.
-//! 5. **Diagnostics** —
+//!    subject DN, issuer DN, SANs, fingerprint and serial.
+//! 5. **Plumbing** —
+//!    [`ClientIdentityLayer`](crate::tls::client_auth::ClientIdentityLayer)
+//!    turns the listener's
+//!    [`TlsConnectInfo`](crate::tls::TlsConnectInfo) into the per-request
+//!    surface: a re-stamped `ConnectInfo<SocketAddr>`, the identity as a
+//!    request extension, and the ambient scope
+//!    [`current_client_identity`](crate::tls::client_auth::current_client_identity)
+//!    (and so `PolicyContext`) reads.
+//! 6. **Extractors** —
+//!    [`ClientCert`](crate::tls::client_auth::ClientCert) and
+//!    [`OptionalClientCert`](crate::tls::client_auth::OptionalClientCert).
+//! 7. **Per-route enforcement** —
+//!    [`RequireClientCertLayer`](crate::tls::client_auth::RequireClientCertLayer),
+//!    which the framework applies with the configured `required_paths`.
+//!
+//! **Operations**
+//!
+//! 8. **Diagnostics** —
 //!    [`RejectionReason`](crate::tls::client_auth::RejectionReason) classifies a
 //!    rejected handshake so the operator sees *why*, rate-limited, while the
 //!    client sees only the standard TLS alert.
+//! 9. **Offline inspection** —
+//!    [`inspect_client_ca_bundle`](crate::tls::client_auth::inspect_client_ca_bundle)
+//!    and [`inspect_crl`](crate::tls::client_auth::inspect_crl) back the
+//!    `autumn doctor` checks.
 //!
 //! Revocation is a static CRL file only; OCSP is out of scope.
 
@@ -58,8 +82,14 @@ use super::TlsError;
 use crate::config::ClientAuthMode;
 
 /// Metric counting handshakes rejected by client-certificate verification,
-/// labelled `reason`. Surfaced through the usual metrics/actuator seams.
-pub const REJECTED_METRIC: &str = "autumn_tls_client_auth_rejected_total";
+/// labelled `reason`.
+///
+/// Registered through [`crate::metrics::counter`], so the actuator's Prometheus
+/// exporter renders it alongside every other application metric. No `autumn_`
+/// prefix: that namespace is reserved for the built-ins the actuator
+/// hand-renders from its own snapshot, and `metrics::counter` returns an inert
+/// handle for a name in it.
+pub const REJECTED_METRIC: &str = "tls_client_auth_rejected_total";
 
 /// Minimum seconds between two operator log lines for the same rejection
 /// reason. Rejections are attacker-triggerable, so the log is rate limited
@@ -73,11 +103,26 @@ const LOG_INTERVAL_SECS: i64 = 1;
 /// Constructed only from a certificate rustls has already path-validated
 /// against the configured trust store, so every field describes a *verified*
 /// peer, never a claim.
+///
+/// Minted only by [`from_der`](Self::from_der) from a certificate rustls has
+/// already verified, hence `#[non_exhaustive]`: an identity that did not come
+/// from a handshake is not one. Tests build one with
+/// [`new_for_test`](Self::new_for_test).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientIdentity {
-    /// Subject distinguished name, RFC 4514 order (e.g. `CN=svc-orders, O=Acme`).
+    /// Subject distinguished name, rendered with the attributes in
+    /// **certificate (DER) order** — e.g. `O=Acme, OU=Services, CN=svc-orders`,
+    /// not the reversed order `openssl -nameopt rfc2253` prints.
+    ///
+    /// For display and logging. Attribute values are **not** escaped, so a
+    /// value containing `,` or `=` is ambiguous once rendered: never parse a
+    /// field back out of this string. Match on
+    /// [`common_name`](Self::common_name) or [`has_san`](Self::has_san)
+    /// instead, both of which read the parsed certificate.
     pub subject: String,
-    /// Distinguished name of the issuing CA.
+    /// Distinguished name of the issuing CA, with the same ordering and
+    /// escaping caveats as [`subject`](Self::subject).
     pub issuer: String,
     /// Subject alternative names, each prefixed by its kind: `DNS:`, `URI:`,
     /// `IP:`, or `email:`. Other SAN kinds are omitted.
@@ -88,6 +133,12 @@ pub struct ClientIdentity {
     pub serial: String,
     /// `notAfter` as a UNIX timestamp (seconds).
     pub not_after_unix: i64,
+    /// The subject's common name (`CN`), read from the parsed certificate.
+    ///
+    /// Private, and exposed through [`common_name`](Self::common_name): it is
+    /// derived from the certificate rather than supplied, so a caller cannot
+    /// construct an identity whose `CN` disagrees with its `subject`.
+    common_name: Option<String>,
 }
 
 impl ClientIdentity {
@@ -115,23 +166,68 @@ impl ClientIdentity {
             fingerprint: sha256_fingerprint(der.as_ref()),
             serial: cert.raw_serial_as_string().replace(':', ""),
             not_after_unix: cert.validity().not_after.timestamp(),
+            // From the parsed name, never from the rendered `subject`. The
+            // parser does not escape attribute values, so an enrolment service
+            // that copies `O`/`OU` from a CSR would otherwise let a caller
+            // smuggle `CN=svc-payments` into another attribute and have a
+            // string-splitting reader believe it.
+            //
+            // The LAST `CN`, matching how a CA names the end entity when a
+            // subject carries several.
+            common_name: cert
+                .subject()
+                .iter_common_name()
+                .filter_map(|cn| cn.as_str().ok())
+                .last()
+                .map(str::to_owned),
         })
     }
 
     /// Whether `san` is one of the certificate's subject alternative names.
     /// Compare with the kind prefix, e.g. `id.has_san("DNS:svc-orders.internal")`.
+    ///
+    /// `DNS:` names compare ASCII-case-insensitively, because DNS names are.
+    /// Every other kind (`URI:`, `IP:`, `email:`) compares exactly: a SPIFFE
+    /// path and a mailbox local-part are case-sensitive.
     #[must_use]
     pub fn has_san(&self, san: &str) -> bool {
+        if let Some(host) = san.strip_prefix("DNS:") {
+            return self.sans.iter().any(|s| {
+                s.strip_prefix("DNS:")
+                    .is_some_and(|have| have.eq_ignore_ascii_case(host))
+            });
+        }
         self.sans.iter().any(|s| s == san)
     }
 
-    /// The common name (`CN`) from the subject DN, when present.
+    /// The subject's common name (`CN`), when present.
+    ///
+    /// Read from the parsed certificate, so it is safe to authorize on — unlike
+    /// scanning [`subject`](Self::subject), which cannot tell an attribute
+    /// separator from a comma inside an attribute value.
     #[must_use]
     pub fn common_name(&self) -> Option<&str> {
-        self.subject
-            .split(',')
-            .map(str::trim)
-            .find_map(|part| part.strip_prefix("CN="))
+        self.common_name.as_deref()
+    }
+
+    /// Build an identity by hand, for a test that exercises a policy or handler
+    /// without a TLS handshake.
+    ///
+    /// `subject` is rendered from `common_name`, so the two cannot disagree the
+    /// way a free-form literal could. Pair it with
+    /// [`with_client_identity`] to establish the ambient scope a
+    /// [`PolicyContext`](crate::authorization::PolicyContext) reads.
+    #[must_use]
+    pub fn new_for_test(common_name: &str, sans: Vec<String>) -> Self {
+        Self {
+            subject: format!("CN={common_name}"),
+            issuer: "CN=test".to_owned(),
+            sans,
+            fingerprint: "sha256:test".to_owned(),
+            serial: "01".to_owned(),
+            not_after_unix: i64::MAX,
+            common_name: Some(common_name.to_owned()),
+        }
     }
 }
 
@@ -382,14 +478,14 @@ impl ClientCertVerifier for ReloadableClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verifier = self.current();
-        let outcome = verifier.verify_client_cert(end_entity, intermediates, now);
-        if let Err(error) = &outcome
-            && let Some(reason) = RejectionReason::classify(error)
-        {
-            reason.record(None);
-        }
-        outcome
+        // Deliberately does not count or log a rejection. rustls returns this
+        // error out of the handshake, where `record_handshake_rejection` sees
+        // it WITH the peer address — and also sees the rejections that never
+        // reach a verifier at all (a `required` listener refusing a client that
+        // presented nothing). Counting here too would double every reason but
+        // that one.
+        self.current()
+            .verify_client_cert(end_entity, intermediates, now)
     }
 
     fn verify_tls12_signature(
@@ -412,6 +508,13 @@ impl ClientCertVerifier for ReloadableClientVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.current().supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        // Forwarded rather than left at the trait default: `new`/`store` accept
+        // any `ClientCertVerifier`, so a caller wrapping a raw-public-key
+        // verifier must not have it silently reported as X.509.
+        self.current().requires_raw_public_keys()
     }
 
     fn offer_client_auth(&self) -> bool {
@@ -483,28 +586,69 @@ impl ClientTrustReloader {
     /// Poll until `shutdown`, swapping the verifier whenever the bundle or CRL
     /// changes on disk.
     pub async fn run(mut self, shutdown: tokio_util::sync::CancellationToken) {
-        let mut ticker = tokio::time::interval(self.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A zero interval would spin the loop as fast as the runtime allows.
+        // `app.rs` clamps before constructing this, but the type is public, so
+        // enforce the invariant where it belongs — and `tokio::time::interval`
+        // panics on a zero period, which is a poor way to learn it.
+        let interval = if self.interval.is_zero() {
+            std::time::Duration::from_secs(super::DEFAULT_RELOAD_INTERVAL_SECS)
+        } else {
+            self.interval
+        };
         loop {
             tokio::select! {
+                () = tokio::time::sleep(interval) => {}
                 () = shutdown.cancelled() => break,
-                _ = ticker.tick() => self.poll_once(),
             }
+            self.poll_once().await;
         }
     }
 
     /// One poll: reload and swap iff a watched file's mtime moved.
-    fn poll_once(&mut self) {
-        let seen = trust_mtimes(&self.ca_bundle_path, self.crl_path.as_deref());
+    ///
+    /// The `stat` and the PEM read + parse both run on a blocking thread —
+    /// they touch the filesystem and must not run on a tokio worker, and a
+    /// large CA bundle makes the parse itself non-trivial. On a `JoinError`
+    /// (the blocking pool shutting down) the tick is skipped and retried.
+    async fn poll_once(&mut self) {
+        let bundle = self.ca_bundle_path.clone();
+        let crl = self.crl_path.clone();
+        let seen = match tokio::task::spawn_blocking(move || trust_mtimes(&bundle, crl.as_deref()))
+            .await
+        {
+            Ok(mtimes) => mtimes,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "mTLS trust reload: mtime read task failed; skipping tick"
+                );
+                return;
+            }
+        };
         if seen == self.baseline {
             return;
         }
-        match build_from_paths(
-            &self.ca_bundle_path,
-            self.crl_path.as_deref(),
-            self.mode,
-            &self.provider,
-        ) {
+
+        let bundle = self.ca_bundle_path.clone();
+        let crl = self.crl_path.clone();
+        let mode = self.mode;
+        let provider = Arc::clone(&self.provider);
+        let built = tokio::task::spawn_blocking(move || {
+            build_from_paths(&bundle, crl.as_deref(), mode, &provider)
+        })
+        .await;
+        let built = match built {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "mTLS trust reload: load task failed; skipping tick"
+                );
+                return;
+            }
+        };
+
+        match built {
             Ok(next) => {
                 self.verifier.store(next);
                 // Advance the baseline only on success, so a partial write is
@@ -556,6 +700,7 @@ fn trust_mtimes(
 /// Operator-side only: the client always sees the standard TLS alert, never
 /// this reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RejectionReason {
     /// No certificate was presented on a `required` listener.
     NoCertificate,
@@ -589,7 +734,8 @@ impl RejectionReason {
         }
     }
 
-    /// Every reason, for pre-registering metric series and for tests.
+    /// Every reason, in slot order. The rate limiter sizes its per-reason
+    /// arrays from this, and tests enumerate it.
     pub const ALL: [Self; 7] = [
         Self::NoCertificate,
         Self::UntrustedCa,
@@ -939,15 +1085,21 @@ impl Default for RequireClientCertLayer {
 
 /// Whether `path` equals or sits under one of `prefixes`.
 ///
-/// Same rule as CSRF exemptions: an exact match, a prefix ending in `/`, or a
-/// prefix followed by `/` — so `/internal` never matches `/internal-tools`.
+/// Segment-boundary matching, so `/internal` never captures `/internal-tools`.
+/// Unlike the CSRF *exemption* rule this mirrors, a prefix written with a
+/// trailing slash ALSO covers the bare path: `/internal/` covers `/internal`.
+/// The two rules fail in opposite directions — an exemption that matches too
+/// little still validates the request, while a requirement that matches too
+/// little leaves a route open — and an operator who writes `/internal/` and
+/// mounts an index handler at `/internal` means to protect it.
 #[must_use]
 pub fn path_matches_any(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| {
-        if path == prefix {
+        let bare = prefix.strip_suffix('/').unwrap_or(prefix);
+        if path == bare {
             true
-        } else if let Some(rest) = path.strip_prefix(prefix.as_str()) {
-            prefix.ends_with('/') || rest.starts_with('/')
+        } else if let Some(rest) = path.strip_prefix(bare) {
+            rest.starts_with('/')
         } else {
             false
         }
@@ -998,9 +1150,9 @@ where
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
         let required = match &self.scope {
             RequirementScope::AllRoutes => true,
-            // Skip normalization entirely for the common no-op case: a
-            // `[server.tls.client_auth]` with no `required_paths` costs nothing
-            // per request.
+            // Skip the path normalization for the common no-op case: a
+            // `[server.tls.client_auth]` with no `required_paths` never has to
+            // clean a path. The layer itself is still in the stack.
             RequirementScope::Paths(paths) if paths.is_empty() => false,
             RequirementScope::Paths(paths) => path_matches_any(
                 crate::security::path::clean_path(req.uri().path()).as_str(),
@@ -1030,13 +1182,44 @@ where
 }
 
 /// Metric counting requests rejected for reaching an mTLS-only route without a
-/// verified client certificate.
-pub const ROUTE_REJECTED_METRIC: &str = "autumn_tls_client_auth_route_rejected_total";
+/// verified client certificate. Named for the same reason
+/// [`REJECTED_METRIC`] is.
+pub const ROUTE_REJECTED_METRIC: &str = "tls_client_auth_route_rejected_total";
+
+/// Classify a failed handshake as a client-certificate rejection and record it.
+///
+/// Returns `true` when it was one, so the listener can leave every other
+/// handshake failure (a plaintext client, an unsupported cipher, a dropped
+/// connection) on the quiet debug path #1603 already had.
+///
+/// Called from the listener's accept loop rather than from the verifier,
+/// because that is the one place that sees BOTH the peer address and the
+/// rejections rustls raises without ever consulting a verifier — chiefly a
+/// `required` listener refusing a client that presented no certificate.
+pub fn record_handshake_rejection(error: &std::io::Error, peer: std::net::SocketAddr) -> bool {
+    // `tokio_rustls` surfaces a handshake failure as an `io::Error` whose inner
+    // error is the `rustls::Error`; anything else (a dropped socket, a timeout)
+    // is not a certificate rejection.
+    let Some(rustls_error) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    else {
+        return false;
+    };
+    match RejectionReason::classify(rustls_error) {
+        Some(reason) => {
+            reason.record(Some(peer));
+            true
+        }
+        None => false,
+    }
+}
 
 // ── Offline inspection (`autumn doctor`) ────────────────────────────────────
 
 /// One CA in the bundle, as inspected offline.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaInspection {
     /// Subject distinguished name.
     pub subject: String,
@@ -1060,20 +1243,30 @@ impl CaInspection {
     }
 }
 
-/// The configured CRL, as inspected offline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The configured CRL file, as inspected offline.
+///
+/// A file may hold several CRLs — one per issuing CA — and rustls enforces all
+/// of them, so this describes the file as a whole rather than its first entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct CrlInspection {
-    /// Issuer distinguished name of the first CRL in the file.
-    pub issuer: String,
-    /// `nextUpdate` as a UNIX timestamp, when the CRL carries one.
+    /// Issuer distinguished names, one per CRL in the file, in file order.
+    pub issuers: Vec<String>,
+    /// The EARLIEST `nextUpdate` across the file, as a UNIX timestamp; `None`
+    /// when no CRL in it carries one.
+    ///
+    /// The earliest, not the first: one stale CRL in a file makes the file
+    /// stale, because the revocations that CRL stopped publishing are the ones
+    /// no longer enforced.
     pub next_update_unix: Option<i64>,
     /// How many certificates the file revokes in total.
     pub revoked_count: usize,
 }
 
 impl CrlInspection {
-    /// Whether `nextUpdate` has passed at `now_unix`. A CRL with no
-    /// `nextUpdate` is never stale (there is nothing to have passed).
+    /// Whether any CRL in the file has passed its `nextUpdate` at `now_unix`. A
+    /// file whose CRLs carry no `nextUpdate` is never stale (there is nothing
+    /// to have passed).
     #[must_use]
     pub fn is_stale(&self, now_unix: i64) -> bool {
         self.next_update_unix.is_some_and(|next| next <= now_unix)
@@ -1130,9 +1323,7 @@ pub fn inspect_crl(path: &Path) -> Result<CrlInspection, TlsError> {
     use x509_parser::prelude::FromDer as _;
 
     let ders = load_crls(path)?;
-    let mut issuer = String::new();
-    let mut next_update_unix = None;
-    let mut revoked_count = 0usize;
+    let mut inspection = CrlInspection::default();
     for (idx, der) in ders.iter().enumerate() {
         let (_, crl) =
             x509_parser::revocation_list::CertificateRevocationList::from_der(der.as_ref())
@@ -1141,17 +1332,18 @@ pub fn inspect_crl(path: &Path) -> Result<CrlInspection, TlsError> {
                     position: idx + 1,
                     detail: e.to_string(),
                 })?;
-        revoked_count += crl.iter_revoked_certificates().count();
-        if idx == 0 {
-            issuer = crl.issuer().to_string();
-            next_update_unix = crl.next_update().map(|t| t.timestamp());
+        inspection.revoked_count += crl.iter_revoked_certificates().count();
+        inspection.issuers.push(crl.issuer().to_string());
+        if let Some(next) = crl.next_update().map(|t| t.timestamp()) {
+            // The earliest wins: one stale CRL in the file is a stale file.
+            inspection.next_update_unix = Some(
+                inspection
+                    .next_update_unix
+                    .map_or(next, |cur| cur.min(next)),
+            );
         }
     }
-    Ok(CrlInspection {
-        issuer,
-        next_update_unix,
-        revoked_count,
-    })
+    Ok(inspection)
 }
 
 #[cfg(test)]
@@ -1163,6 +1355,10 @@ mod tests {
     const CLIENT_PEM: &str = include_str!("../../tests/fixtures/tls/client/client.cert.pem");
     const CRL_PEM: &str = include_str!("../../tests/fixtures/tls/client/crl.pem");
     const CRL_EMPTY_PEM: &str = include_str!("../../tests/fixtures/tls/client/crl-empty.pem");
+    /// A certificate whose `O` attribute contains a literal `, CN=svc-payments`
+    /// — the DN-injection shape `common_name()` must not fall for.
+    const SPOOFED_CN_PEM: &str =
+        include_str!("../../tests/fixtures/tls/client/spoofed-cn.cert.pem");
 
     /// Write `contents` into a fresh tempdir as `name`, returning the dir (kept
     /// alive by the caller) and the path.
@@ -1209,6 +1405,9 @@ mod tests {
             id.sans
         );
         assert_eq!(id.common_name(), Some("svc-orders"));
+        // DNS SANs compare case-insensitively; other kinds do not.
+        assert!(id.has_san("DNS:SVC-Orders.Internal"));
+        assert!(!id.has_san("URI:SPIFFE://autumn.test/svc/orders"));
 
         // Fingerprint is the SHA-256 of the DER, hex, prefixed.
         let expected = {
@@ -1224,6 +1423,27 @@ mod tests {
         assert_eq!(id.fingerprint, expected);
         assert!(!id.serial.is_empty());
         assert!(id.not_after_unix > 0);
+    }
+
+    #[test]
+    fn common_name_cannot_be_smuggled_through_another_attribute() {
+        // `X509Name`'s Display does not escape attribute values, so a subject
+        // carrying `O=Acme, CN=svc-payments` renders indistinguishably from two
+        // real attributes. The CN must come from the PARSED name, or an
+        // enrolment service that copies `O` from a CSR lets a caller pick its
+        // own identity.
+        let id = ClientIdentity::from_der(&first_der(SPOOFED_CN_PEM))
+            .expect("parse the spoofed certificate");
+        assert!(
+            id.subject.contains("CN=svc-payments"),
+            "fixture should render an injected CN: {}",
+            id.subject
+        );
+        assert_eq!(
+            id.common_name(),
+            Some("svc-lowpriv"),
+            "the real CN must win over one smuggled into another attribute"
+        );
     }
 
     #[test]
@@ -1361,8 +1581,8 @@ mod tests {
 
     // ── rotation ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn reloader_swaps_when_the_bundle_changes() {
+    #[tokio::test]
+    async fn reloader_swaps_when_the_bundle_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle = dir.path().join("ca.pem");
         std::fs::write(&bundle, CA_PEM).expect("write bundle");
@@ -1380,7 +1600,7 @@ mod tests {
         // A rotation ships old + new in one bundle.
         std::fs::write(&bundle, format!("{CA_PEM}{OTHER_CA_PEM}")).expect("rotate");
         bump_mtime(&bundle);
-        reloader.poll_once();
+        reloader.poll_once().await;
 
         assert!(
             !Arc::ptr_eq(&verifier.current(), &before),
@@ -1388,8 +1608,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reloader_keeps_the_previous_store_when_the_new_one_is_broken() {
+    #[tokio::test]
+    async fn reloader_keeps_the_previous_store_when_the_new_one_is_broken() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle = dir.path().join("ca.pem");
         std::fs::write(&bundle, CA_PEM).expect("write bundle");
@@ -1406,7 +1626,7 @@ mod tests {
 
         std::fs::write(&bundle, "-----BEGIN CERTIFICATE-----\ngarbage\n").expect("corrupt");
         bump_mtime(&bundle);
-        reloader.poll_once();
+        reloader.poll_once().await;
 
         assert!(
             Arc::ptr_eq(&verifier.current(), &before),
@@ -1414,8 +1634,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reloader_swaps_when_only_the_crl_changes() {
+    #[tokio::test]
+    async fn reloader_swaps_when_only_the_crl_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle = dir.path().join("ca.pem");
         let crl = dir.path().join("crl.pem");
@@ -1434,7 +1654,7 @@ mod tests {
 
         std::fs::write(&crl, CRL_PEM).expect("publish a revocation");
         bump_mtime(&crl);
-        reloader.poll_once();
+        reloader.poll_once().await;
 
         assert!(
             !Arc::ptr_eq(&verifier.current(), &before),
@@ -1442,8 +1662,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reloader_is_quiet_when_nothing_changed() {
+    #[tokio::test]
+    async fn reloader_is_quiet_when_nothing_changed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle = dir.path().join("ca.pem");
         std::fs::write(&bundle, CA_PEM).expect("write bundle");
@@ -1458,7 +1678,7 @@ mod tests {
         .expect("initial load");
         let before = verifier.current();
 
-        reloader.poll_once();
+        reloader.poll_once().await;
         assert!(
             Arc::ptr_eq(&verifier.current(), &before),
             "an unchanged bundle must not swap"
@@ -1473,6 +1693,38 @@ mod tests {
     }
 
     // ── diagnostics ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_required_prefix_covers_the_bare_path_but_not_a_sibling() {
+        let prefixes = vec!["/internal/".to_owned()];
+        // The regression: an index handler mounted at exactly `/internal` was
+        // left open by a prefix written with a trailing slash.
+        assert!(path_matches_any("/internal", &prefixes));
+        assert!(path_matches_any("/internal/", &prefixes));
+        assert!(path_matches_any("/internal/keys", &prefixes));
+        assert!(!path_matches_any("/internal-tools", &prefixes));
+        assert!(!path_matches_any("/internals", &prefixes));
+        assert!(!path_matches_any("/", &prefixes));
+
+        // Written without the slash, the same three hold.
+        let bare = vec!["/internal".to_owned()];
+        assert!(path_matches_any("/internal", &bare));
+        assert!(path_matches_any("/internal/keys", &bare));
+        assert!(!path_matches_any("/internal-tools", &bare));
+    }
+
+    #[test]
+    fn a_multi_crl_file_reports_the_earliest_next_update() {
+        // rustls enforces every CRL in the file, so one stale entry makes the
+        // file stale — reporting only the first CRL's window would hide it.
+        let (_dir, path) = write_temp("crl.pem", &format!("{CRL_EMPTY_PEM}{CRL_PEM}"));
+        let crl = inspect_crl(&path).expect("multi-CRL file inspects");
+        assert_eq!(crl.issuers.len(), 2);
+        assert_eq!(crl.revoked_count, 1, "counts across every CRL in the file");
+        let earliest = crl.next_update_unix.expect("both fixtures carry one");
+        assert!(crl.is_stale(earliest + 1));
+        assert!(!crl.is_stale(earliest - 1));
+    }
 
     #[test]
     fn classifies_every_documented_rejection_reason() {
@@ -1563,7 +1815,10 @@ mod tests {
     fn inspects_a_crl_with_its_next_update_and_revocations() {
         let (_dir, path) = write_temp("crl.pem", CRL_PEM);
         let crl = inspect_crl(&path).expect("CRL inspects");
-        assert!(crl.issuer.contains("CN=Autumn Test Client CA"), "{crl:?}");
+        assert!(
+            crl.issuers[0].contains("CN=Autumn Test Client CA"),
+            "{crl:?}"
+        );
         assert_eq!(crl.revoked_count, 1);
         assert!(!crl.is_stale(super::super::now_unix()));
         // A CRL whose nextUpdate has passed is stale.

@@ -15,7 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the handshake requests and verifies a client certificate; `mode` is `off`
   (the default), `optional` (requested, verified when presented) or `required`
   (no certificate, no handshake). With the section absent the handshake is
-  byte-for-byte #1603's server-only TLS — no new dependency, no behaviour change.
+  byte-for-byte #1603's server-only TLS, and no new dependency is pulled in.
+  **Breaking:** three published types gain members — `TlsConfig` gains
+  `client_auth`, `TlsError` gains the variants that name a bad trust store (and
+  becomes `#[non_exhaustive]`, so the next one will not break you), and
+  `SecurityDump` gains `client_auth`. Only code that constructs one of those by
+  literal or matches `TlsError` exhaustively is affected, and each surfaces as a
+  compiler error, never a silent behaviour change. The HTTPS listener's
+  connect-info type also changes from `SocketAddr` to `TlsConnectInfo`, which a
+  framework layer immediately re-stamps, so `ConnectInfo<SocketAddr>`,
+  `ClientAddr`, trusted-proxy resolution and rate limiting are unchanged for
+  handlers. See [the migration guide](docs/migrations/next.md).
   `required_paths` locks individual routes, so one process serves public and
   mTLS-only routes; a request reaching one without a verified certificate gets
   `403` and the standard JSON error envelope. `RequireClientCertLayer` does the
@@ -24,10 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OptionalClientCert` extractors and sits on the `PolicyContext` beside the
   session user and token scopes, so an `#[authorize]` policy can decide on
   machine identity (`ctx.client_has_san("URI:spiffe://…")`). The trust store and
-  an optional `crl_path` hot-reload on the same modification-time poll the server
-  certificate uses, so a CA rotation — ship old+new in one bundle, later drop old
+  an optional `crl_path` hot-reload by the same modification-time polling the
+  server certificate uses — its own loop, at its own
+  `[server.tls.client_auth] reload_interval_secs` — so a CA rotation — ship old+new in one bundle, later drop old
   — needs no restart and drops no established connection. Every rejected
-  handshake is counted by reason (`autumn_tls_client_auth_rejected_total`) and
+  handshake is counted by reason (`tls_client_auth_rejected_total`) and
   logged operator-side, rate-limited to one line per second per reason, while the
   client sees only the standard TLS alert; startup fails fast, naming the path, on
   a missing, unparseable or empty bundle or CRL. `autumn doctor` grades the

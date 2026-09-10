@@ -7376,6 +7376,7 @@ impl TlsConfig {
 /// [`ClientAuthConfig::required_paths`] or the `RequireClientCert` layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ClientAuthMode {
     /// No certificate is requested. The handshake is #1603's server-only TLS.
     #[default]
@@ -7480,7 +7481,7 @@ impl ClientAuthConfig {
                         self.mode.as_str()
                     ));
                 }
-                Some(path) if path.as_os_str().is_empty() => {
+                Some(path) if path.to_str().is_none_or(|p| p.trim().is_empty()) => {
                     return Err(
                         "[server.tls.client_auth] ca_bundle_path is empty; set it to the PEM \
                          bundle of client CAs, or remove the section"
@@ -7501,7 +7502,7 @@ impl ClientAuthConfig {
         if self
             .crl_path
             .as_ref()
-            .is_some_and(|p| p.as_os_str().is_empty())
+            .is_some_and(|p| p.to_str().is_none_or(|s| s.trim().is_empty()))
         {
             return Err(
                 "[server.tls.client_auth] crl_path is empty; set it to a PEM revocation list, \

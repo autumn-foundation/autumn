@@ -995,15 +995,24 @@ async fn whoami(OptionalClientCert(client): OptionalClientCert) -> String {
 
 | Field | Example |
 | --- | --- |
-| `subject` | `CN=svc-orders, OU=Services, O=Acme` |
-| `issuer` | `CN=Acme Internal Client CA, O=Acme` |
+| `subject` | `O=Acme, OU=Services, CN=svc-orders` |
+| `issuer` | `O=Acme, CN=Acme Internal Client CA` |
 | `sans` | `["DNS:svc-orders.internal", "URI:spiffe://acme/svc/orders"]` |
 | `fingerprint` | `sha256:9f86d0…` |
 | `serial` | `139C8A13442053B0…` |
 | `not_after_unix` | `4102444800` |
 
-`common_name()` pulls the `CN` out of the subject; `has_san("URI:…")` matches a
-SAN including its kind prefix.
+`common_name()` returns the subject's `CN` and `has_san("URI:…")` matches a SAN
+including its kind prefix. Both read the **parsed** certificate.
+
+> **Authorize on `common_name()` and `has_san()`, never on `subject`.** The DN
+> strings render attributes in certificate order (not the reversed order
+> `openssl -nameopt rfc2253` prints) and do not escape attribute values, so a
+> subject whose `O` happens to contain `, CN=svc-payments` renders exactly like
+> two real attributes. A CA that copies `O` from a CSR would then let a caller
+> pick its own identity out of a string search. `common_name()` cannot be
+> spoofed that way. `DNS:` SANs compare case-insensitively; every other kind
+> compares exactly.
 
 These compose with session auth on the same router: `Auth<T>` and `RequireAuth`
 read the request, `ClientCert` reads the connection, and neither consults the
@@ -1102,12 +1111,16 @@ distinguishing reason:
 WARN rejected an mTLS client certificate reason=untrusted_ca peer=10.0.3.7:51422 suppressed=0
 ```
 
+The reason is classified where the handshake fails, so `no_certificate` — which
+rustls raises without ever consulting the trust store — is counted and logged
+like the rest.
+
 Rejections are attacker-triggerable, so the log is rate-limited to one line per
 second per reason; lines held back are reported in the next one's `suppressed`
 field. The **counters are exact** regardless:
 
-- `autumn_tls_client_auth_rejected_total{reason="…"}` — handshakes rejected.
-- `autumn_tls_client_auth_route_rejected_total` — requests that reached an
+- `tls_client_auth_rejected_total{reason="…"}` — handshakes rejected.
+- `tls_client_auth_route_rejected_total` — requests that reached an
   mTLS-only route with no verified certificate.
 
 Both surface through the usual metrics/actuator endpoints.
@@ -1164,9 +1177,12 @@ $ openssl x509 -req -in svc-orders.csr.pem \
     -days 365 -sha256 -extfile svc-orders.ext -out svc-orders.pem
 ```
 
-`mkcert` can stand in for the server certificate (see [Local development
-certificates](#local-development-certificates-mkcert)); it does not issue client
-certificates, so the CA above is the client half either way.
+`mkcert -client` can mint a client certificate from the mkcert CA if you would
+rather not run the two commands above; use `mkcert` for the *server* certificate
+either way (see [Local development
+certificates](#local-development-certificates-mkcert)). Point `ca_bundle_path`
+at whichever CA signed the client certificate — mkcert's `rootCA.pem` or the one
+generated here.
 
 Point the app at the CA, keeping `/internal/` mTLS-only:
 

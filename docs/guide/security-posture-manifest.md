@@ -16,7 +16,6 @@ runtime. Reading the manifest starts with reading these tags.
     "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
     "security_headers": { "provenance": "declared",  "source": "config:security.headers",  "entries": [ … ] },
-    "mtls":             { "provenance": "declared",  "source": "config:server.tls.client_auth", "mode": "optional", "required_paths": [ "/internal/" ], "entries": [ … ] },
     "authorization_policies": {
       "provenance": "provable",
       "source": "macro:#[authorize]",
@@ -24,7 +23,8 @@ runtime. Reading the manifest starts with reading these tags.
       "entries": [
         { "path": "/posts/{id}/edit", "method": "GET", "name": "edit_post", "action": "update", "resource": "Post", "provenance": "provable" }
       ]
-    }
+    },
+    "mtls":             { "provenance": "declared",  "source": "config:server.tls.client_auth", "mode": "optional", "required_paths": [ "/internal/" ], "entries": [ … ] }
   },
   "excluded": [
     { "dimension": "repository_policy_bindings", "eventual_provenance": "provable",     "reason": "… their presence still shows as routes.entries[].policy" },

@@ -296,6 +296,8 @@ mod repository_dependent_destroy;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "tls")]
+mod mtls_support;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]

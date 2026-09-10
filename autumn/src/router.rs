@@ -3485,6 +3485,35 @@ where
 
 /// Build the CSRF layer, or `None` when CSRF is disabled.
 ///
+/// The mTLS route-requirement layer (#1640), or `None` when no route declares
+/// one.
+///
+/// `None` whenever `[server.tls.client_auth]` is absent, its mode is `off`, or
+/// it lists no `required_paths` — the three cases in which the layer would have
+/// nothing to enforce. Built here (rather than at the serve boundary) so it
+/// sits inside the router; see the call site for why that matters.
+#[cfg(feature = "tls")]
+fn build_client_cert_requirement_layer(
+    config: &crate::config::AutumnConfig,
+) -> Option<crate::tls::client_auth::RequireClientCertLayer> {
+    let client_auth = config.server.tls.as_ref()?.client_auth.as_ref()?;
+    if !client_auth.mode.requests_certificate() || client_auth.required_paths.is_empty() {
+        return None;
+    }
+    Some(crate::tls::client_auth::RequireClientCertLayer::for_paths(
+        client_auth.required_paths.clone(),
+    ))
+}
+
+/// The `tls`-less build has no client certificates to require, so the slot is
+/// always empty. `Identity` only names a type for `option_layer`'s `None` arm.
+#[cfg(not(feature = "tls"))]
+const fn build_client_cert_requirement_layer(
+    _config: &crate::config::AutumnConfig,
+) -> Option<tower::layer::util::Identity> {
+    None
+}
+
 /// Split out of [`apply_csrf_middleware`] so the layer can join the composed
 /// ingress stack rather than costing its own nesting level (issue #2193).
 fn build_csrf_layer(
@@ -4971,6 +5000,18 @@ fn apply_middleware(
         // is not masked by CSRF's missing-token `403`, and a clear
         // `400 invalid _method` outranks "missing CSRF".
         crate::middleware::method_override::MethodOverrideRejectionLayer,
+        // mTLS route requirement (#1640). INSIDE the router, not at the
+        // `axum::serve` boundary beside `ClientIdentityLayer`, for two reasons:
+        // the MCP dispatch clone is taken from the finished router, so a
+        // `tools/call` replaying into an mTLS-only route must traverse this
+        // check; and a rejection here flows through the rest of the response
+        // stack (access log, request id, security headers, Problem Details)
+        // instead of bypassing it. Inner to rate limiting and load shedding, so
+        // an uncertified prober is throttled like any other client, and outer
+        // to CSRF, so a connection with no certificate never reaches a token
+        // check it cannot pass anyway. `None` — and so free — for every app
+        // that declares no `required_paths`.
+        tower::util::option_layer(build_client_cert_requirement_layer(config)),
         tower::util::option_layer(build_bot_protection_layer(config)),
         tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
         // Inner to the CSRF layer so CSRF is validated first on the request
@@ -5286,7 +5327,8 @@ fn apply_middleware(
     //   [user layers, non-static build — ONE slot however many are registered] ->
     //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
-    //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
+    //   MethodOverrideRejection -> RequireClientCert (mTLS, #1640) ->
+    //   BotProtection -> CSRF -> SubmitToken ->
     //   TrustedHost -> CORS -> [asset cache-control] -> handler
     // Everything from `Compression` through `CORS` is ONE `Router::layer` call:
     // the merged tuple below. `NormalizeBody` is a body-type adapter with no

@@ -793,11 +793,17 @@ async fn run_acceptor(
                     let _ = tx.send((tls, peer)).await;
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        error = %e,
-                        "TLS handshake failed; dropping connection"
-                    );
+                    // An mTLS client-certificate rejection is an operator-facing
+                    // event: counted by reason and logged at warn, rate-limited
+                    // (#1640). Everything else keeps #1603's quiet debug line.
+                    // The client sees only the standard TLS alert either way.
+                    if !client_auth::record_handshake_rejection(&e, peer) {
+                        tracing::debug!(
+                            peer = %peer,
+                            error = %e,
+                            "TLS handshake failed; dropping connection"
+                        );
+                    }
                 }
                 Err(_elapsed) => {
                     tracing::debug!(peer = %peer, "TLS handshake timed out");

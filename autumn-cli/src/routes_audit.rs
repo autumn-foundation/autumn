@@ -39,6 +39,12 @@ use crate::routes;
 /// `excluded` keeps `policy_registration` for that runtime fact and gains
 /// `repository_policy_bindings` for the auto-API guards whose policy type the
 /// macro discards. The v2 dimensions are unchanged.
+///
+/// v4 (#1640) appends the `mtls` dimension: which routes demand a verified
+/// client certificate, and the listener mode behind them, read from
+/// `[server.tls.client_auth]`. Purely additive — every v3 dimension keeps its
+/// shape, and a v3 document reads as "no route requires mTLS" rather than
+/// failing the differ.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 /// Options controlling `autumn routes audit`.
@@ -103,7 +109,7 @@ impl AuditRoute {
     }
 }
 
-// ── Manifest document (schema v3, #1627) ────────────────────────────────────
+// ── Manifest document (schema v4, #1627, #1640) ─────────────────────────────
 
 /// Provenance class of a manifest dimension. A small closed enum serialized to
 /// the exact lowercase tags used throughout the manifest.
@@ -122,7 +128,7 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v3).
+/// Top-level security manifest (schema v4).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -623,7 +629,7 @@ fn build_mtls_dimension(routes: &[AuditRoute], client_auth: &ClientAuthDump) -> 
     }
 }
 
-/// Build a stable-ordered security manifest (schema v3) from the audited routes
+/// Build a stable-ordered security manifest (schema v4) from the audited routes
 /// and the resolved security configuration.
 ///
 /// When `security` is `None` (an older dump with no security-config marker) the
@@ -1100,7 +1106,7 @@ mod tests {
         serde_json::from_str(&manifest_json(m)).unwrap()
     }
 
-    /// AC-1: the top-level document is schema v3, carries the four dimensions
+    /// AC-1: the top-level document is schema v4, carries the five dimensions
     /// with the correct provenance labels, and the `excluded` list with its
     /// closed provenance enum values.
     #[test]

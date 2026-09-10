@@ -5024,9 +5024,14 @@ impl AppBuilder {
                 https_port,
                 dns01,
                 custom_domains,
+                client_trust_reload: acme_client_trust_reload,
             } = bind_state;
             // Read before `custom_domains` is moved into the spawn below.
             let custom_domains_enabled = custom_domains.is_some();
+            // The mTLS trust store rotates on this arm too (#1640). Hoisted to
+            // the slot the static-cert arm fills, so both arms spawn one
+            // reloader from one place below.
+            client_trust_reload = acme_client_trust_reload;
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -5283,22 +5288,14 @@ impl AppBuilder {
                 // `into_make_service_with_connect_info` installs outermost), so
                 // this sees `ConnectInfo<TlsConnectInfo>` and everything below
                 // it sees `ConnectInfo<SocketAddr>` plus the identity.
-                // Route-level mTLS requirement (#1640): reject a request
-                // reaching a `required_paths` route over a connection with no
-                // verified certificate. Applied INSIDE `ClientIdentityLayer`,
-                // so the identity extension is already stamped. An empty list
-                // is a per-request no-op.
-                let required_paths = config
-                    .server
-                    .tls
-                    .as_ref()
-                    .and_then(|t| t.client_auth.as_ref())
-                    .map(|c| c.required_paths.clone())
-                    .unwrap_or_default();
-                let service = tower::Layer::layer(
-                    &crate::tls::client_auth::RequireClientCertLayer::for_paths(required_paths),
-                    service,
-                );
+                //
+                // The route-level mTLS requirement (#1640) is deliberately NOT
+                // applied here. It lives inside the router
+                // (`build_client_cert_requirement_layer`), so the MCP dispatch
+                // clone traverses it and a rejection flows through the rest of
+                // the response stack. Only the identity plumbing belongs at
+                // this boundary, because `ConnectInfo<TlsConnectInfo>` exists
+                // nowhere else.
                 let service =
                     tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
@@ -9352,6 +9349,10 @@ struct AcmeBindState {
     /// The tenant custom-domain wiring (#1635), present exactly when
     /// `[server.tls.acme.custom_domains] enabled = true`.
     custom_domains: Option<CustomDomainBindState>,
+    /// The mTLS trust-store reloader (#1640), present exactly when
+    /// `[server.tls.client_auth]` is active. Spawned beside the ACME renewal
+    /// task, so a CA rotation lands without a restart on this arm too.
+    client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader>,
 }
 
 /// Everything the custom-domain orchestrator needs, built at bind time so the
@@ -9527,9 +9528,17 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    let server_config = crate::tls::build_server_config_with_resolver(
+    // Client auth is orthogonal to how the SERVER's certificate is provisioned
+    // (#1640), so the ACME arm wires the same verifier the static-cert arm does.
+    // Without this a `[server.tls.client_auth] mode = "required"` deployment on
+    // ACME would boot, report healthy, and never request a certificate — the
+    // one misconfiguration that fails OPEN.
+    let (client_verifier, client_reload) =
+        build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
         cert_resolver,
+        client_verifier,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9568,6 +9577,7 @@ async fn build_acme_tls_listener(
             https_port,
             dns01: acme_cfg.dns.is_some(),
             custom_domains,
+            client_trust_reload: client_reload,
         },
     ))
 }

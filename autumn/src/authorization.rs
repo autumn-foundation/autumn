@@ -1085,14 +1085,10 @@ mod tests {
 
         use crate::tls::client_auth::{ClientIdentity, with_client_identity};
 
-        let identity = Arc::new(ClientIdentity {
-            subject: "CN=svc-orders, O=Acme".to_owned(),
-            issuer: "CN=Acme Internal Client CA".to_owned(),
-            sans: vec!["URI:spiffe://acme/svc/orders".to_owned()],
-            fingerprint: "sha256:deadbeef".to_owned(),
-            serial: "01".to_owned(),
-            not_after_unix: i64::MAX,
-        });
+        let identity = Arc::new(ClientIdentity::new_for_test(
+            "svc-orders",
+            vec!["URI:spiffe://acme/svc/orders".to_owned()],
+        ));
 
         with_client_identity(Some(identity), async {
             let c = ctx(None, None);
