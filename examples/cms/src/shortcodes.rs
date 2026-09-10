@@ -87,8 +87,21 @@ pub fn expand(input: &str) -> String {
             i += 1;
             continue;
         }
-        // `[[` is an escaped literal bracket, as in WordPress.
+        // `[[` is an escaped literal bracket, as in WordPress: `[[tag]]`
+        // renders the literal `[tag]`, with the shortcode left unexpanded.
+        // The paired close is consumed too — emitting `[` for the escape
+        // and then copying the rest verbatim would leave a stray `]` (#2678).
         if bytes.get(i + 1) == Some(&'[') {
+            if let Some(close) = find_close(&bytes, i + 1) {
+                if bytes.get(close + 1) == Some(&']') {
+                    let inner: String = bytes[i + 2..close].iter().collect();
+                    out.push('[');
+                    out.push_str(&inner);
+                    out.push(']');
+                    i = close + 2;
+                    continue;
+                }
+            }
             out.push('[');
             i += 2;
             continue;
@@ -262,6 +275,33 @@ mod tests {
     #[test]
     fn escaped_double_brackets_render_a_literal() {
         assert_eq!(expand("[[testbox]"), "[testbox]");
+    }
+
+    #[test]
+    fn paired_double_brackets_strip_one_bracket_from_each_side() {
+        // WordPress parity: `[[tag]]` renders the literal `[tag]`.
+        assert_eq!(expand("[[x]]"), "[x]");
+        assert_eq!(expand("[[note attr=\"v\"]]"), "[note attr=\"v\"]");
+        assert_eq!(expand("[[unregistered]]"), "[unregistered]");
+        assert_eq!(
+            expand("a [[x]] b [[y]] c"),
+            "a [x] b [y] c",
+            "the escape is uniform across the whole string"
+        );
+    }
+
+    #[test]
+    fn paired_double_brackets_suppress_expansion() {
+        add_shortcode("pairednote", |_| "<aside>expanded</aside>".to_string());
+        // The escape exists to *mention* a shortcode, so a registered name
+        // must render literally, not expand.
+        assert_eq!(expand("[[pairednote]]"), "[pairednote]");
+    }
+
+    #[test]
+    fn a_triple_opening_keeps_one_extra_bracket() {
+        // `[[[x]]]` strips one pair, leaving the outermost literal pair.
+        assert_eq!(expand("[[[x]]]"), "[[x]]");
     }
 
     #[test]

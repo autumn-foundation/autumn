@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **`cms` starter: the WordPress-style `[[tag]]` escape no longer leaves a
+  stray trailing `]` in rendered content.** `shortcodes::expand` collapsed the
+  opening `[[` to `[` but never consumed the matching second `]` at the close,
+  so `[[gallery]]` rendered as `[gallery]]` on the live page and in the Atom
+  feed — silently, with no error anywhere in the authoring flow. A paired
+  escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
+  the module's own "same syntax WordPress does" claim, and still suppresses
+  expansion of the inner shortcode (#2678).
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
