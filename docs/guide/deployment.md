@@ -1520,15 +1520,15 @@ enabled = true                 # off by default; the controller is a no-op when 
 
 When `enabled = true`, `autumn deploy up`:
 
-1. Runs **four fail-closed host preflight checks before touching the host** —
-   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
-   executable, the recordings directory is writable (or absent under a writable
-   parent, which provisioning then creates), and the MediaMTX ports are
-   free — plus two pure-config prechecks: that the configured MediaMTX listener
-   ports are distinct, and that each listener port matches the app-side
-   `[media.mediamtx] *_base` URL that calls it (so a customized port cannot
-   strand the app on an origin the daemon no longer binds). It **aborts the
-   deploy** if the host cannot serve media, rather
+1. Runs **six fail-closed preflight checks before touching the host**. Two are
+   pure config and run first: the MediaMTX listener ports are distinct, and each
+   listener port matches the app-side `[media.mediamtx] *_base` URL that calls it
+   (so a customized port cannot strand the app on an origin the daemon no longer
+   binds). Four then probe the host: FFmpeg resolves (the concrete
+   `[media.ffmpeg] bin`), the MediaMTX binary is executable, the recordings
+   directory is writable — or absent under a writable parent, which provisioning
+   then creates — and the MediaMTX ports are free. Any blocking failure
+   **aborts the deploy**, rather
    than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
    **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`

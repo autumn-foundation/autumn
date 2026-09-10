@@ -473,6 +473,37 @@ they are.
 which fields the caller meant to default, and a match arm needs a decision about
 what the new variant means for that call site.
 
+### Media rooms: `RoomStore` gains a required `heartbeat` method
+
+Mesh-room participants can now hold a seat with an explicit heartbeat, not only
+by polling the roster (see
+[the media guide](../guide/media.md)). `autumn_media_plugin::rooms::RoomStore` is
+the documented swap seam for a custom room-state backend, so the new operation is
+a required trait method with no default body: an out-of-tree `impl RoomStore`
+stops compiling until it implements
+
+```rust
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+It must verify `token` against `participant_id` in constant time and by value,
+set that participant's `last_seen_at` to now, renew `token_expires_at` to
+`now + token_ttl` **without rotating the token value**, and return the renewed
+expiry. Every miss — unknown room, namespace mismatch, unknown participant,
+wrong token — returns `RoomError::RoomNotFound`, so a heartbeat cannot probe room
+existence or membership. `InMemoryRoomStore` and `DbRoomStore` are the reference
+implementations. There is no default body on purpose: a store that silently did
+nothing would let the reaper evict live participants.
+
+**Automation:** `manual` — the body depends on how the store holds its state.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →

@@ -66,22 +66,17 @@
 //!
 //! # Known limitations
 //!
-//! - **Client-driven participant reaping**: an idle-room / stale-participant
-//!   reaper ([`spawn_room_reaper_loop`] → [`RoomStore::reap_stale`]) reclaims
-//!   seats and rooms that have gone quiet, so a client that crashes or never
-//!   sends leave no longer holds its seat until process restart. It keys on
-//!   `last_seen_at`, refreshed by two signals: an explicit
-//!   [`heartbeat`](RoomStore::heartbeat) (renewal-on-activity, which also renews
-//!   the advisory token expiry) and, as a side effect, a member-gated roster
-//!   poll. A client doing **either** on any interval under the idle TTL holds
-//!   its seat. Liveness is still client-driven, not media-derived: a participant
-//!   whose media is live but which does neither for the whole idle TTL is
-//!   reaped. That failure stays benign — reaping removes only the signaling
-//!   record (seat + advisory token), never the live `MediaMTX` `WebRTC` path, so
-//!   such a participant keeps its media flowing and can re-join; it simply stops
-//!   appearing in peers' future roster polls. Deriving liveness from `MediaMTX`
-//!   itself (publisher state, or token verification once it lands) remains the
-//!   follow-up for a guarantee that does not depend on the client.
+//! - **Client-driven participant reaping**: the reaper
+//!   ([`spawn_room_reaper_loop`] → [`RoomStore::reap_stale`]) evicts a
+//!   participant whose `last_seen_at` is older than the idle TTL, so a crashed
+//!   client no longer holds a seat until process restart. Two signals refresh
+//!   `last_seen_at`: an explicit [`heartbeat`](RoomStore::heartbeat), and a
+//!   member-gated roster poll. A client that sends either within the idle TTL
+//!   keeps its seat. Liveness is client-driven, not media-derived: a silent
+//!   client is reaped even while its media flows. Reaping removes only the
+//!   signaling record (seat + advisory token), never the live `MediaMTX`
+//!   `WebRTC` path, so that client keeps streaming and can re-join. Deriving
+//!   liveness from `MediaMTX` publisher state remains the follow-up.
 //! - **Advisory token expiry**: `token_expires_at` is returned to the joiner but
 //!   is **not** enforced anywhere yet (`MediaMTX` does not verify these tokens),
 //!   so it never gates a lifecycle operation — a participant can always leave
@@ -456,6 +451,10 @@ pub type ReapFuture<'a> = Pin<Box<dyn Future<Output = ReapStats> + Send + 'a>>;
 
 /// The pluggable room-state store — the swap seam for a shared/durable backend.
 ///
+/// **Implementors:** [`heartbeat`](RoomStore::heartbeat) is new in this release
+/// and has no default body, so an out-of-tree store must implement it (see
+/// `docs/migrations/next.md`).
+///
 /// Every method keys on the `(namespace, room_id)` pair and **fails closed**: a
 /// namespace mismatch resolves to [`RoomError::RoomNotFound`], never another
 /// namespace's room. The methods are **async** (returning [`RoomStoreFuture`]),
@@ -549,6 +548,12 @@ pub trait RoomStore: Send + Sync {
     /// heartbeating holds its seat even when it never polls the roster. The
     /// token **value is never rotated**, so an in-flight roster poll carrying
     /// the same token keeps working; only the (advisory) expiry moves.
+    ///
+    /// Renewal is **unbounded**: this never refuses an aged token and imposes no
+    /// absolute session lifetime. That is safe only while `token_expires_at`
+    /// stays advisory (nothing verifies it). The slice that makes `MediaMTX`
+    /// verify these tokens owns that policy, and must bound renewal there —
+    /// otherwise a captured token stays valid for as long as it is heartbeat.
     ///
     /// # Errors
     ///
@@ -879,11 +884,9 @@ const ROOM_REAPER_INTERVAL_SECONDS: u64 = 60;
 /// Default participant idle TTL (and empty-room grace), in seconds.
 ///
 /// 15 minutes — deliberately generous. The default room token TTL is only 300s
-/// (5 min), and a live client refreshes `last_seen_at` every few seconds anyway
-/// (a [`heartbeat`](RoomStore::heartbeat), or a roster poll for peer discovery);
-/// 15 min is 3× the token TTL and far longer than any reasonable cadence, so an
-/// active participant is never reclaimed — only a client silent for a full 15
-/// minutes (crashed / abandoned / never sent leave) ages out.
+/// (5 min), so a client that heartbeats or polls the roster on any sub-TTL
+/// cadence stays fresh with 3× that margin. Only a client silent for a full 15
+/// minutes (crashed, abandoned, or never sent leave) ages out.
 const ROOM_IDLE_TTL_SECONDS: u64 = 900;
 
 /// Upper bound (10 years, in seconds) applied to the reaper idle-TTL before it
@@ -2359,6 +2362,7 @@ mod tests {
         let stale = Utc::now() - Duration::hours(1);
         seed_room(&store, "", "room-1", stale, &[("p1", "tok", stale)]);
 
+        let before = Utc::now();
         let renewed = store
             .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
             .await
@@ -2368,10 +2372,9 @@ mod tests {
             renewed > stale,
             "expiry moved forward from the seeded value"
         );
-        assert!(
-            renewed > Utc::now(),
-            "renewed expiry is in the future: {renewed}"
-        );
+        // Renewed to `now + the supplied TTL`, not to some other horizon.
+        assert!(renewed >= before + Duration::seconds(300));
+        assert!(renewed <= Utc::now() + Duration::seconds(300));
         // The store record — not just the response — carries the new expiry.
         let stored = store
             .rooms
@@ -2427,6 +2430,28 @@ mod tests {
                 "{case} must be indistinguishable from a missing room"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_a_sibling_participants_token() {
+        // The token is verified against the named participant, not against any
+        // member of the room.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            now,
+            &[("p1", "tok-1", now), ("p2", "tok-2", now)],
+        );
+
+        assert!(matches!(
+            store
+                .heartbeat("", "room-1", "p2", "tok-1", Duration::seconds(300))
+                .await,
+            Err(RoomError::RoomNotFound)
+        ));
     }
 
     #[tokio::test]

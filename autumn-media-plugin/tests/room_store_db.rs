@@ -433,11 +433,14 @@ async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() 
     )
     .await;
 
+    let before = Utc::now();
     let renewed = store
         .heartbeat("", "room-1", "beating", "tok-a", Duration::seconds(300))
         .await
         .expect("heartbeat");
-    assert!(renewed > Utc::now(), "expiry renewed into the future");
+    // The renewal honors the supplied TTL, not some other horizon.
+    assert!(renewed >= before + Duration::seconds(300) - Duration::microseconds(1));
+    assert!(renewed <= Utc::now() + Duration::seconds(300));
 
     // The renewed expiry is persisted, so another process sees it.
     let persisted: chrono::NaiveDateTime = {
@@ -484,4 +487,50 @@ async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
             "{case} must be indistinguishable from a missing room"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_rejects_a_sibling_participants_token() {
+    // The token is verified against the named participant, not against any
+    // member of the room.
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let now = Utc::now();
+    seed(
+        &pool,
+        "",
+        "room-1",
+        now,
+        &[("p1", "tok-1", now), ("p2", "tok-2", now)],
+    )
+    .await;
+
+    assert!(matches!(
+        store
+            .heartbeat("", "room-1", "p2", "tok-1", Duration::seconds(300))
+            .await,
+        Err(RoomError::RoomNotFound)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
+    // The store reads the token, then writes. A reaper (or another process's
+    // leave) between the two renews nothing, which must not read as success.
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let stale = Utc::now() - Duration::hours(1);
+    seed(&pool, "", "room-1", stale, &[("p1", "tok", stale)]).await;
+
+    let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+    assert_eq!(stats.participants_reaped, 1);
+
+    assert!(matches!(
+        store
+            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .await,
+        Err(RoomError::RoomNotFound)
+    ));
 }

@@ -116,7 +116,7 @@ endpoint_url      = "https://t3.storage.dev"
 region            = "auto"
 access_key_id     = "${MEDIA_S3_KEY}"
 secret_access_key = "${MEDIA_S3_SECRET}"
-public_base_url   = "https://cdn.example.com/media"
+public_base_url   = "https://cdn.example.com/media"  # required unless endpoint_url is Tigris
 key_prefix        = "media"
 force_path_style  = false
 
@@ -140,8 +140,9 @@ when no `[media]` table is present:
 - `MediaConfig::from_arroyo_env()` — the migration shim (see below).
 
 Call `media.validate()?` before mounting to fail fast on cross-field problems
-(an out-of-range room cap, `backend = "s3"` without a `bucket`, or exactly one
-of the S3 access-key/secret-key pair). The pure, testable cores
+(an out-of-range room cap, `backend = "s3"` without a `bucket`, exactly one
+of the S3 access-key/secret-key pair, or a generic — non-Tigris — S3 backend
+without a `public_base_url`). The pure, testable cores
 (`from_toml_str_with_env`, `from_autumn_dir_with_env`, `from_arroyo_env_pairs`)
 take an explicit env map so config resolution can be unit-tested without
 touching process-global state.
@@ -221,8 +222,9 @@ async fn create_room(State(state): State<AppState>) -> AutumnResult<Json<serde_j
 ```
 
 `RoomService` exposes `create()`, `join(room_id, display_name)`,
-`leave(room_id, participant_id, token)`, and `roster(room_id, auth_token)` — the
-same operations the built-in routes call. It is cheap to `Clone` (the store is
+`leave(room_id, participant_id, token)`,
+`heartbeat(room_id, participant_id, token)`, and `roster(room_id, auth_token)` —
+the same operations the built-in routes call. It is cheap to `Clone` (the store is
 an `Arc`).
 
 ### Room store backends

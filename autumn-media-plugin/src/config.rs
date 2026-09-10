@@ -22,6 +22,8 @@
 //! [media.storage]
 //! backend = "s3"
 //! bucket = "${MEDIA_BUCKET}"
+//! # Required for a generic (non-Tigris) S3 backend.
+//! public_base_url = "https://cdn.example.com/media"
 //! ```
 
 use std::collections::HashMap;

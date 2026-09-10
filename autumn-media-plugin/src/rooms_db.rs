@@ -33,7 +33,7 @@
 //! pair, so reaping **never crosses namespaces** (tenant isolation), exactly
 //! like the in-memory sweep.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -492,7 +492,11 @@ impl RoomStore for DbRoomStore {
             }
 
             let now = Utc::now();
-            let renewed = now + token_ttl;
+            // Truncate to microseconds — the `Timestamp` column's resolution —
+            // so the expiry this call returns is exactly the one another process
+            // reads back, instead of a nanosecond-precise value the row cannot
+            // hold.
+            let renewed = (now + token_ttl).trunc_subsecs(6);
             let updated = diesel::update(
                 media_room_participants::table.filter(
                     media_room_participants::namespace
