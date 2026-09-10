@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `i64` minor units and a `Currency`; read them with `minor()` and
   `currency()`. An exact `Decimal` bridge; no floats.
   The `BillingProvider` trait hides Stripe types so a second provider can
-  land without a breaking change. A partial unique index keeps one mirrored
+  land later. New crate, additive only: non-breaking. A partial unique index keeps one mirrored
   customer per user across racing checkouts, every dunning settle is a
   compare-and-set, a provider transport error reschedules the same attempt
   instead of failing the job, and a production profile refuses the in-memory
