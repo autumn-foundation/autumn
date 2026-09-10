@@ -100,9 +100,12 @@ pub fn strip_nul(s: &str) -> String {
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.
 ///
-/// Implemented by `#[model]` for every generated `New*` insert struct and for
-/// the model itself. `normalize` applies each field's normalizer chain; it is a
-/// no-op for models with no `#[normalize]` columns.
+/// Implemented by `#[model]` for the model itself, and for every generated
+/// `New*` insert struct whose model declares `#[normalize]` columns (#2634:
+/// a `New*` with no normalized columns does not implement this, so the
+/// repository probe's no-clone fallback wins). `normalize` applies each
+/// field's normalizer chain; it is a no-op for models with no `#[normalize]`
+/// columns.
 pub trait Normalize {
     /// Canonicalize every `#[normalize]` field in place.
     fn normalize(&mut self);
@@ -150,11 +153,12 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 /// canonicalizes, returning the owned value; the `No` fallback returns the
 /// borrow untouched, paying no clone.
 ///
-/// In practice only a **hand-written** `New*` reaches that fallback: `#[model]`
-/// emits `impl Normalize` for every generated `New*`, empty-bodied when the
-/// model declares no `#[normalize]` columns, so the `Yes` arm wins and clones
-/// even when normalization is a no-op. The generated code unifies the two arms
-/// with `Borrow` (see
+/// In practice only a **hand-written** `New*` reaches that fallback — plus, as
+/// of #2634, a `#[model]`-generated `New*` whose model declares no
+/// `#[normalize]` columns: the macro no longer emits the empty-bodied `impl
+/// Normalize` for those, so the `Yes` arm cannot win and the `No` arm hands
+/// back the caller's borrow with no clone. The generated code unifies the two
+/// arms with `Borrow` (see
 /// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
 /// `find_or_create_by_*`).
 #[doc(hidden)]
