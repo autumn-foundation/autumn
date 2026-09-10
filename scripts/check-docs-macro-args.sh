@@ -800,12 +800,22 @@ RUSTDOC_CRATES = (
 )
 
 BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
-WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
+WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([A-Za-z_0-9]+)")
 # A keyword argument, but never a `==` comparison.
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
 BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
+# The name to the LEFT of an `=` is a key whatever its case, and no Autumn
+# macro has an upper-case one, so `#[secured(Scopes = ["a:b"])]` is a defect
+# the lower-case pattern above let through. That pattern cannot simply be
+# widened: it also decides whether a bare identifier is a flag, and there
+# `#[repository(Post, api, mcp)]`'s leading TYPE is exactly what the
+# lower-case restriction excludes. Widening it reports `Post` on a form the
+# corpus documents throughout — trading a miss for a false positive on valid
+# pages. Only the key position is case-blind; a bare identifier still has to
+# look like a flag to be judged as one.
+KEY_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Macros whose FIRST argument is positional even when written as a bare
 # identifier. `parse_authorize_args` takes the leading bare path as the action
@@ -918,7 +928,7 @@ def top_level_keys(args, macro=None):
             # else already makes the attribute unparseable for a reason this
             # gate could not name. A miss is the safe direction; a confidently
             # wrong message is not.
-            if BARE_FLAG.match(head):
+            if KEY_IDENT.match(head):
                 names.append((head, False))
         elif BARE_FLAG.match(segment):
             leading, first = first, False
@@ -1134,27 +1144,89 @@ def find_macro_calls(text):
             if pattern is MACRO_OPEN:
                 out.append((match.group(1), body, match.start()))
                 continue
-            # A `cfg_attr` body: every attribute it applies is a real
-            # invocation, so scan it for bare macro calls.
-            base = match.end()
-            # The body has its own literals: a `doc = "#[secured(…)]"` string
-            # is documentation text, not an invocation. Masking the outer
-            # match alone left this path unguarded.
-            body_masked = _masked_spans(body)
-            for inner in BARE_MACRO_OPEN.finditer(body):
-                if any(s <= inner.start() < e for s, e in body_masked):
-                    continue
-                inner_end = _close_of(body, inner.end(), inner.group(2))
-                if inner_end is None:
-                    continue
-                out.append(
-                    (
-                        inner.group(1),
-                        body[inner.end() : inner_end],
-                        base + inner.start(),
-                    )
-                )
+            # A `cfg_attr` body applies each of its attributes, so each is a
+            # real invocation — but only the attributes are. Searching the
+            # whole body for macro openers also found them inside an
+            # attribute's *value*: `doc = stringify!(secured(policy = "x"))`
+            # passes `secured(…)` to a macro as tokens and applies nothing, and
+            # reporting it forced a waiver onto valid Rust. The body is now
+            # read as what the grammar says it is — a predicate followed by
+            # attribute meta items.
+            out.extend(_cfg_attr_payloads(body, match.end()))
     return out
+
+
+def _cfg_attr_payloads(body, base):
+    """Attributes a `cfg_attr` body applies, as (macro, args, offset)."""
+    out = []
+    items = _split_top_level(body)
+    # The first item is the predicate (`all(feature = "a", …)`), never an
+    # applied attribute. Everything after it is one attribute each.
+    for start, end in items[1:]:
+        item = body[start:end]
+        opener = BARE_MACRO_OPEN.match(item.lstrip())
+        lead = len(item) - len(item.lstrip())
+        if opener is None:
+            # Either a bare marker attribute (`inline`), or a name-value one
+            # (`doc = "…"`). Neither carries an Autumn argument list. A macro
+            # name appearing later inside such an item is part of a value.
+            if item.lstrip().startswith("cfg_attr"):
+                nested = re.match(r"\s*cfg_attr\s*\(", item)
+                if nested:
+                    inner_end = _close_of(item, nested.end(), "(")
+                    if inner_end is not None:
+                        out.extend(
+                            _cfg_attr_payloads(
+                                item[nested.end() : inner_end],
+                                base + start + nested.end(),
+                            )
+                        )
+            continue
+        inner_end = _close_of(item, lead + opener.end(), opener.group(2))
+        if inner_end is None:
+            continue
+        out.append(
+            (
+                opener.group(1),
+                item[lead + opener.end() : inner_end],
+                base + start + lead + opener.start(),
+            )
+        )
+    return out
+
+
+def _split_top_level(text):
+    """Spans of `text`'s comma-separated items, ignoring nested and quoted ones."""
+    spans, depth, start, i = [], 0, 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "/":
+            nxt = skip_comment(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == '"':
+            i = skip_literal(text, i)
+            continue
+        if ch == "'":
+            nxt = _skip_rust_char(text, i)
+            i = nxt if nxt is not None else i + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            spans.append((start, i))
+            start = i + 1
+        i += 1
+    spans.append((start, len(text)))
+    return [(s, e) for s, e in spans if text[s:e].strip()]
 
 
 def is_archived(rel):
@@ -1999,6 +2071,50 @@ def self_test():
             '```rust\n#[cfg_attr(feature = "a", secured (policy = "x"))]\n```\n', ".md"
         ),
         [("secured", "policy")],
+    )
+    # A `cfg_attr` body is a predicate followed by attribute meta items, and
+    # only the items are applied. An attribute's VALUE can carry a macro name
+    # without invoking anything: `stringify!` takes `secured(…)` as tokens.
+    check(
+        "markdown: a macro name inside a cfg_attr value is not an invocation",
+        scan_text(
+            '```rust\n#[cfg_attr(all(), doc = stringify!(secured(policy = "x")))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: a predicate naming a macro is not an invocation",
+        scan_text(
+            '```rust\n#[cfg_attr(all(feature = "a"), inline)]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: a nested cfg_attr payload is still reached",
+        scan_text(
+            '```rust\n#[cfg_attr(a, cfg_attr(b, secured(policy = "x")))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # The name left of an `=` is a key whatever its case, and no macro has an
+    # upper-case one.
+    check(
+        "markdown: an upper-case keyword key is caught",
+        scan_text('```rust\n#[secured(Scopes = ["a:b"])]\n```\n', ".md"),
+        [("secured", "Scopes")],
+    )
+    check(
+        "markdown: a positional type is still not read as a flag",
+        scan_text("```rust\n#[repository(Post, api, mcp, soft_delete)]\n```\n", ".md"),
+        [],
+    )
+    check(
+        "markdown: an associated type binding is not read as a key",
+        scan_text("```rust\n#[listener(Iterator<Item = u32>, durable)]\n```\n", ".md"),
+        [],
     )
     check(
         "rustdoc: whitespace before the delimiter",
