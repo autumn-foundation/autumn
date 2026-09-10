@@ -273,6 +273,10 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+// ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
+// fails when one of them stops matching (#1186). No feature gate: it only reads
+// job.rs and ci.yml as text.
+mod redis_job_admin_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).

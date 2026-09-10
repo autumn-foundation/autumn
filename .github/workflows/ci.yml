@@ -906,6 +906,15 @@ jobs:
           cargo test -p autumn-cache-redis --lib \
             | tee "${RUNNER_TEMP}/cache-redis.log"
           assert_ran "${RUNNER_TEMP}/cache-redis.log" "autumn-cache-redis unit tests"
+          # Same reasoning, same lane: `redis_page_spans` is the pure
+          # pagination arithmetic behind the job-admin enqueued page (#1186),
+          # and it is `#[cfg(feature = "redis")]` with no Docker, so the
+          # Docker step's `--ignored` run skips it and only the same
+          # unification coincidence runs it today. Same feature set as the
+          # redis_tls run above so both share one autumn-web build.
+          cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
+            | tee "${RUNNER_TEMP}/redis-page-spans.log"
+          assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
       - name: Run direct-TLS (HTTPS) tests
         if: matrix.lane == 'tls'
         # `tls` is not a default feature, so the `test` job's workspace `cargo
@@ -1121,6 +1130,38 @@ jobs:
           # backend, which this pg-integration test requires). See #1614.
           cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
+          # The Redis job-admin dashboard suite lives in autumn-web's `--lib`
+          # test module (it drives crate-private types: RedisJobAdminBackend,
+          # claim_next_redis_job), so neither the consolidated
+          # `integration_tests` sweep below nor the workspace `test` job runs
+          # it. Named explicitly rather than as a bare `--lib -- --ignored`:
+          # `autumn/src/job.rs` carries ~36 ignored Docker tests, and turning
+          # the whole set on is its own change. #1186 added
+          # `redis_admin_enqueued_page_merges_concurrency_parked_jobs` here,
+          # which asserts the enqueued tab lists concurrency-parked jobs.
+          #
+          # Same feature set as the `integration_tests` sweep below so both
+          # share one autumn-web build. The pass-count check is there because
+          # `cargo test` exits 0 when a filter matches nothing: without it a
+          # rename turns this lane silently green-and-empty.
+          # `redis_job_admin_ci_coverage` (in the consolidated binary) is the
+          # other half of that guard — it fails when an ignored job-admin
+          # Redis test stops matching these filters.
+          #
+          # The subshell scopes `pipefail` to this one pipeline: the step's
+          # shell is `bash -e` without it, so `cargo test | tee` would report
+          # tee's status and swallow a real failure. Setting it for the whole
+          # step would re-interpret every other line here.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_admin_ \
+              job::tests::redis_job_admin_ \
+              | tee "${RUNNER_TEMP}/redis-job-admin.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
+            || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored

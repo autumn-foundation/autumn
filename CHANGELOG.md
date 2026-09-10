@@ -143,6 +143,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jobs:** the Redis `/admin/jobs` enqueued tab now lists jobs parked on a
+  full concurrency slot (issue #1186). A parked job lives in the
+  `{prefix}:blocked` zset and is promoted back to its queue every ~100 ms, so
+  a list built from `LRANGE` alone showed it blinking in and out of the table
+  even though it was never lost. The enqueued page now reads the queues and
+  the blocked zset as one logical list: the total is `LLEN` per queue plus
+  `ZCARD blocked`, and paging spans the concatenation, queue ids first. Merged
+  rows carry a new `JobAdminRecord::blocked_on_concurrency` flag and the
+  dashboard marks them "waiting on a concurrency slot", so an operator can
+  tell a job waiting for a slot from one ready to claim. Cancel still works on
+  a parked row. Enforcement, promotion cadence, the `/actuator/jobs` gauges,
+  and the local/Postgres/SQLite backends are unchanged; those backends report
+  `blocked_on_concurrency: false`. The count includes parked jobs, so the
+  dashboard's Enqueued counter can read higher than `/actuator/jobs`'s
+  `queued` gauge by the parked count — the two are separate there, `queued`
+  plus `blocked_on_concurrency`.
+  **Breaking:** `JobAdminRecord` is public and not `#[non_exhaustive]`, so a
+  struct-literal construction of it — only a custom `JobAdminBackend` builds
+  one — needs the new field. It now derives `Default`, so end the literal with
+  `..Default::default()` and the next field will not break it; see
+  [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
