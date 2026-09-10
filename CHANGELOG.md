@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **commit hooks:** an immediate after-hook failure now records the hook's
+  `AutumnError` via `message()` — the bare title, e.g. `"Validation failed"`
+  (issue #2596). All nine generated immediate-failure paths stringified the
+  error with `Display`, while the deferred commit-hook worker (migrated in
+  #2592) stores `message()`; for a validation error the two differ
+  (`"Validation failed: email: ..."` vs `"Validation failed"`), so the same
+  logical failure produced two different stored strings. Now they agree.
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
