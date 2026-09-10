@@ -186,6 +186,8 @@ mod mcp_repository;
 #[cfg(feature = "mcp")]
 mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
+mod mcp_secured_guard;
+#[cfg(feature = "mcp")]
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
