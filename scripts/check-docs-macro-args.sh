@@ -145,8 +145,12 @@
 #     and `sim_test` — and the other 30 are judged. A macro whose parser was
 #     *found* but yields no keys is a different case: it is a marker like
 #     `#[public]`, `crate` is its whole grammar, and it is judged on that
-#     alone. Knowing there is nothing is not the same as knowing nothing. The
-#     self-test
+#     alone. Knowing there is nothing is not the same as knowing nothing —
+#     though it can also be a *forwarder*: `oauth2_callback` hands its
+#     arguments to `route::route_macro`, so reading only its own file left it
+#     with `crate` alone and reported a valid `timeout_ms` as drift. A
+#     self-test checks the registry covers every macro entry a macro forwards
+#     `attr` to, rather than trusting the marker inference. The self-test
 #     holds a floor under that count so a refactor cannot quietly empty the
 #     truth set, the failure mode where a gate keeps passing because it
 #     stopped looking, and a second case fails if `lib.rs` exports a macro
@@ -276,7 +280,17 @@ OWNERS = {
     "mailer_preview": "mailer_preview.rs",
     "main": "main_macro.rs",
     "model": "model.rs",
-    "oauth2_callback": "oauth2_callback.rs",
+    # A forwarder, not a marker: `oauth2_callback_macro` hands its arguments
+    # straight to `route::route_macro` (and `edge::edge_macro`), so it accepts
+    # the whole route grammar. Reading only its own file left it with `crate`
+    # alone and reported the valid `#[oauth2_callback("/cb", timeout_ms = …)]`
+    # as drift.
+    "oauth2_callback": (
+        "oauth2_callback.rs",
+        "route.rs",
+        "parse.rs",
+        "edge.rs",
+    ),
     "patch": ("route.rs", "parse.rs"),
     "post": ("route.rs", "parse.rs"),
     "public": "public.rs",
@@ -756,8 +770,12 @@ def top_level_keys(args):
 # `#[autumn_macros::model(...)]` are documented, idiomatic forms and appear in
 # shipped rustdoc (`autumn/src/aggregate.rs`, `autumn/src/classify/mod.rs`).
 # Requiring the bare name would leave every qualified invocation ungated.
+# `cfg_attr(<pred>, <attr>)` applies `<attr>` when the predicate holds, so a
+# conditionally-applied Autumn macro is a real invocation the compiler will
+# reject on a typo. Requiring the name to sit immediately after `#[` skipped
+# every one of them.
 MACRO_OPEN = re.compile(
-    r"#\[(?:autumn_web::|autumn_macros::|autumn::)?("
+    r"#\[(?:cfg_attr\s*\([^,]+,\s*)?(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
     + r")\("
 )
@@ -1407,6 +1425,58 @@ def self_test():
         ),
         [],
     )
+    # A macro that forwards its arguments to another macro's entry accepts
+    # that macro's grammar, so its owners must include the target's files.
+    # `oauth2_callback` forwards to `route::route_macro` and `edge::edge_macro`;
+    # reading only its own file left it with `crate` alone and reported the
+    # valid `#[oauth2_callback("/cb", timeout_ms = …)]` as drift. This is the
+    # hazard behind treating a keyless macro as a marker: it may be a
+    # forwarder instead, so the registry is checked rather than assumed.
+    # Forwarding means the ARGUMENTS are passed on, so the call must carry
+    # `attr`. A bare mention of another macro's entry — guard detection,
+    # a doc comment — is not forwarding.
+    forward_call = re.compile(
+        r"\b([a-z_0-9]+)::([a-z_0-9]+)_macro\s*\([^)]*\battr\b"
+    )
+    for macro, owned in OWNERS.items():
+        names = (owned,) if isinstance(owned, str) else owned
+        have = set(names)
+        text = "\n".join(
+            (MACRO_SRC / f).read_text(encoding="utf-8", errors="replace")
+            for f in names
+            if (MACRO_SRC / f).exists()
+        )
+        for module, _ in set(forward_call.findall(text)):
+            target = f"{module}.rs"
+            if (MACRO_SRC / target).exists() and target not in have:
+                check(f"{macro} covers forwarded {target}", target, "(registered)")
+    check("oauth2_callback accepts route keys", "timeout_ms" in accepted["oauth2_callback"], True)
+    check(
+        "markdown: a forwarded route key is not drift",
+        scan_text(
+            '```rust\n#[oauth2_callback("/cb", timeout_ms = 1000)]\n```\n', ".md"
+        ),
+        [],
+    )
+
+    # A conditionally-applied macro is a real invocation.
+    check(
+        "markdown: cfg_attr payload is inspected",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "auth", secured(policy = "x"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a correct cfg_attr payload passes",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "auth", secured(scopes = ["a:b"]))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+
     check(
         "markdown: two waivers cover two fences",
         scan_text(
