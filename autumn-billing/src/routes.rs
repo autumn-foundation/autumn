@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use autumn_web::negotiate::{Format, Negotiate};
 use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::axum::extract::{FromRequestParts, State};
+use autumn_web::reexports::axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request, State};
 use autumn_web::reexports::axum::response::{IntoResponse, Redirect, Response};
 use autumn_web::reexports::axum::routing::{get, post};
 use autumn_web::reexports::axum::{Json, Router};
@@ -107,6 +107,23 @@ impl FromRequestParts<AppState> for SessionUser {
             .await
             .map(Self)
             .map_err(BillingError::into_autumn)
+    }
+}
+
+/// [`SignedWebhook`] under a nested router.
+///
+/// `nest` strips the prefix from the request URI, but the webhook registry
+/// matches the full path. Restore axum's `OriginalUri` first.
+struct NestedWebhook(SignedWebhook);
+
+impl FromRequest<AppState> for NestedWebhook {
+    type Rejection = AutumnError;
+
+    async fn from_request(mut req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        if let Some(OriginalUri(uri)) = req.extensions().get::<OriginalUri>().cloned() {
+            *req.uri_mut() = uri;
+        }
+        SignedWebhook::from_request(req, state).await.map(Self)
     }
 }
 
@@ -285,9 +302,12 @@ async fn subscription(
 /// `POST {prefix}/webhook` — verified provider events.
 ///
 /// A body the provider cannot decode answers `500`, so the replay key is
-/// released and the provider redelivers. `SignedWebhook` must stay the last
-/// argument: it consumes the body.
-async fn webhook(State(state): State<AppState>, webhook: SignedWebhook) -> AutumnResult<Json<Value>> {
+/// released and the provider redelivers. The webhook extractor must stay the
+/// last argument: it consumes the body.
+async fn webhook(
+    State(state): State<AppState>,
+    NestedWebhook(webhook): NestedWebhook,
+) -> AutumnResult<Json<Value>> {
     let service: Arc<BillingService> = BillingService::require(&state)?;
     let event = match service.provider().parse_event(webhook.raw_body()) {
         Ok(event) => event,
