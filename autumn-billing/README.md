@@ -223,7 +223,7 @@ Money fields serialize as `{"minor": 1999, "currency": "USD"}`.
 
 Five tables: `billing_customers`, `billing_subscriptions`,
 `billing_invoices`, `billing_events` (the idempotency ledger) and
-`billing_dunning`. The migration is `20260910000000_billing_mirror`, registered
+`billing_dunning`. The migration is `20260910203829_billing_mirror`, registered
 by the plugin. A partial unique index on `billing_customers.user_id` keeps
 one customer per user when two checkouts race. Applied ledger rows older than
 30 days are pruned at startup. Without a pool the plugin uses the in-memory

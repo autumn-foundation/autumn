@@ -112,7 +112,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         constructor: "BillingPlugin::new(",
         // Registered through `plugin_migrations`, so the app's own migration
         // run creates the mirror tables.
-        migrations: &["20260910000000_billing_mirror"],
+        migrations: &["20260910203829_billing_mirror"],
         // Drop order mirrors the migration's `down.sql`.
         tables: &[
             "billing_dunning",

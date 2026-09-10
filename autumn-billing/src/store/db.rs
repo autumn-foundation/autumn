@@ -2,7 +2,7 @@
 //!
 //! Backend-portable diesel only (`Text`, `BigInt`, `Timestamp`); no
 //! Postgres-only SQL, so the Postgres and `SQLite` lanes both compile. The
-//! matching migration is `migrations/20260910000000_billing_mirror`.
+//! matching migration is `migrations/20260910203829_billing_mirror`.
 //!
 //! Every guarded upsert runs select-then-write inside one transaction. The
 //! ledger claim and the dunning claim are single conditional statements, so
@@ -31,7 +31,7 @@ use crate::plan::PlanId;
 
 // ── Schema ──────────────────────────────────────────────────────────────
 //
-// Mirrors `migrations/20260910000000_billing_mirror/up.sql`. Booleans are
+// Mirrors `migrations/20260910203829_billing_mirror/up.sql`. Booleans are
 // `BigInt` 0/1 and timestamps are `Timestamp` (UTC, no zone) so both lanes
 // share one schema.
 
