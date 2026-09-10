@@ -168,6 +168,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[model]`:** no longer emits an empty-bodied `impl Normalize` for a
+  `New*` whose model declares no `#[normalize]` columns (issue #2634). The
+  repository probe's `Yes` arm used to win unconditionally, so `save`,
+  `save_many`, `save_many_skip_invalid` and `find_or_create_by_*` cloned
+  their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
+  no-op normalization. The no-clone fallback arm now wins for unnormalized
+  models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
 - **build:** renamed colliding example binary targets so no two workspace
   members produce the same output filename — `todo-app`'s `seed` is now
   `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered
