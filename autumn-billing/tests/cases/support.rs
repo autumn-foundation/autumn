@@ -185,9 +185,12 @@ impl BillingProvider for FakeProvider {
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {
         self.record(FakeCall::CreateCustomer(request));
-        let mut next = self.next_customer.lock().unwrap();
-        *next += 1;
-        let id = ProviderId::new(format!("cus_fake_{}", *next));
+        let n = {
+            let mut next = self.next_customer.lock().unwrap();
+            *next += 1;
+            *next
+        };
+        let id = ProviderId::new(format!("cus_fake_{n}"));
         Box::pin(async move { Ok(id) })
     }
 
@@ -234,9 +237,11 @@ impl BillingProvider for FakeProvider {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Ok(PaymentAttemptOutcome::Declined {
-                reason: "card_declined".to_owned(),
-            }));
+            .unwrap_or_else(|| {
+                Ok(PaymentAttemptOutcome::Declined {
+                    reason: "card_declined".to_owned(),
+                })
+            });
         Box::pin(async move { outcome })
     }
 

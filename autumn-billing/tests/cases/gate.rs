@@ -55,7 +55,7 @@ fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
 }
 
-fn hours(n: i64) -> chrono::Duration {
+const fn hours(n: i64) -> chrono::Duration {
     chrono::Duration::hours(n)
 }
 
