@@ -61,6 +61,8 @@ mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+mod confidential_boundary;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "acme")]

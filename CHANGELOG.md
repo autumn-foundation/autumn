@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Client-sealed confidential values.** `confidential::ClientKey` now creates
+  authenticated, owner-bound ciphertext envelopes and owner-scoped blind-index
+  tokens, allowing applications to persist and equality-query sensitive values
+  without receiving their plaintext. Strict wire decoding, redacted `Debug`
+  output, and an ignored PostgreSQL boundary test cover database rows/dumps,
+  logs, backup-shaped artifacts, and nested replay capsules.
+
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
   management system.** `autumn new <name> --starter cms` now scaffolds a
   complete CMS, joining `saas` as the second curated built-in. The rendered

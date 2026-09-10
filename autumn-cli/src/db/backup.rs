@@ -4433,4 +4433,32 @@ mod tests {
 
         conn.batch_execute("DROP TABLE backup_rt;").ok();
     }
+
+    #[test]
+    fn backup_manifest_contains_metadata_not_database_payloads() {
+        let canary = "confidential-plaintext-canary";
+        let manifest = Manifest {
+            autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_at: "2026-09-09T00:00:00Z".to_owned(),
+            profile: "production".to_owned(),
+            format: "custom".to_owned(),
+            targets: vec![ManifestTarget {
+                label: "control".to_owned(),
+                file: "control.dump".to_owned(),
+                database: "autumn_production".to_owned(),
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), &manifest).unwrap();
+        let bytes = std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
+        assert!(
+            !bytes
+                .windows(canary.len())
+                .any(|part| part == canary.as_bytes())
+        );
+        assert_eq!(read_manifest(dir.path()).unwrap(), manifest);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("payload").is_none());
+        assert!(value.get("rows").is_none());
+    }
 }
