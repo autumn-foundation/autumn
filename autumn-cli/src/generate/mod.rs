@@ -498,16 +498,33 @@ pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<()
 mod tests {
     use super::*;
 
-    /// Fail if `sql` carries a Postgres-only spelling, ignoring `--` comments
-    /// (which discuss both dialects).
+    /// Fail if `sql` carries a spelling that does not belong in `SQLite` DDL,
+    /// ignoring `--` comments (which discuss both dialects).
     ///
-    /// The type names are the silent half of the problem: SQLite parses an
-    /// unknown type rather than rejecting it, so only a scan catches them.
+    /// The type names are the silent half of the problem: `SQLite` parses an
+    /// unknown type rather than rejecting it, so only a scan catches them. That
+    /// cuts both ways, so the list covers two kinds of leak:
+    ///
+    /// - Spellings `SQLite` has no notion of at all (`BIGSERIAL`, `TIMESTAMPTZ`,
+    ///   `JSONB`) — silently the wrong storage class.
+    /// - Spellings `SQLite` DOES recognise but which resolve to the wrong
+    ///   affinity for the column's diesel sql-type. `TIMESTAMP` is the trap:
+    ///   `SQLite` gives it NUMERIC affinity, so an ISO-8601 string stored in it
+    ///   is not what the column claims to hold. Timestamps must be `TEXT` here,
+    ///   which is the convention `auth.rs` and `dsl.rs` already follow.
+    ///
+    /// `BIGINT` is deliberately NOT listed: it takes integer affinity, the same
+    /// as `INTEGER`, so it reads back without drift (see `counter_cache`, which
+    /// emits it on both backends on purpose).
+    ///
+    /// Matched on word boundaries, not as bare substrings: a column legitimately
+    /// named `serial_number` must not trip the `SERIAL` entry.
     fn assert_no_postgres_only_sql(label: &str, dir: &std::path::Path, sql: &str) {
-        const POSTGRES_ONLY: &[&str] = &[
+        const NOT_SQLITE: &[&str] = &[
             "BIGSERIAL",
             "SERIAL",
             "TIMESTAMPTZ",
+            "TIMESTAMP",
             "JSONB",
             "BYTEA",
             "DOUBLE PRECISION",
@@ -523,27 +540,193 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             .to_uppercase();
-        for token in POSTGRES_ONLY {
+        for token in NOT_SQLITE {
             assert!(
-                !statements.contains(token),
-                "`generate {label}` leaked Postgres-only `{token}` into the SQLite \
-                 migration at {}:\n{sql}",
+                !contains_word(&statements, token),
+                "`generate {label}` leaked `{token}`, which is not valid SQLite DDL, \
+                 into the SQLite migration at {}:\n{sql}",
                 dir.display()
             );
         }
     }
 
+    /// Whether `haystack` contains `needle` bounded by non-identifier characters
+    /// on both sides, so `SERIAL` does not match inside `serial_number`.
+    ///
+    /// A trailing `)` or `(` in the needle (`NOW()`) is already a boundary, so
+    /// only the leading edge is checked in that case.
+    fn contains_word(haystack: &str, needle: &str) -> bool {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let bounded_right = !needle.ends_with(ident);
+        haystack.match_indices(needle).any(|(at, _)| {
+            let before_ok = haystack[..at].chars().next_back().is_none_or(|c| !ident(c));
+            let after_ok = bounded_right
+                || haystack[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !ident(c));
+            before_ok && after_ok
+        })
+    }
+
+    /// A minimal Autumn project configured for `SQLite`, for the audit below.
+    ///
+    /// `src/main.rs` carries a shared 4-arg `pub fn layout` — what `autumn new`
+    /// emits, and what the `auth` and `pwa` preflights both require.
+    fn sqlite_project() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.7\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "use autumn_web::prelude::*;\n\n\
+             pub fn layout(title: &str, current_path: &str, flash: maud::Markup, \
+             content: maud::Markup) -> maud::Markup {\n\
+             \x20   let _ = (current_path, flash);\n\
+             \x20   maud::html! { title { (title) } (content) }\n\
+             }\n\n\
+             #[autumn_web::main]\n\
+             async fn main() {\n\
+             \x20   autumn_web::app().routes(routes![]).run().await;\n\
+             }\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Fail if any generated `.rs` file under `root` names a diesel construct or
+    /// type that has no `SQLite` implementation.
+    ///
+    /// The DDL is only half of "works on `SQLite`". `generate teams` shipped 19
+    /// `.for_update()` calls, and diesel implements the locking clause for
+    /// Postgres and `MySQL` only — so the migration applied while the generated
+    /// crate would not compile (issue #1927). Applying SQL cannot see that, and
+    /// building a generated crate per generator is far too slow for a unit test,
+    /// so the constructs whose absence on `SQLite` is known are scanned for
+    /// instead. Use `::autumn_web::maybe_for_update!` (a plain read on `SQLite`)
+    /// rather than `.for_update()`, and `::autumn_web::RuntimeConnection` /
+    /// `RuntimeBackend` rather than naming the Postgres ones.
+    fn assert_no_postgres_only_rust(label: &str, root: &std::path::Path) {
+        const POSTGRES_ONLY: &[(&str, &str)] = &[
+            (
+                ".for_update()",
+                "use `::autumn_web::maybe_for_update!` instead",
+            ),
+            (".skip_locked()", "SQLite has no locking clause"),
+            (".no_wait()", "SQLite has no locking clause"),
+            ("AsyncPgConnection", "use `::autumn_web::RuntimeConnection`"),
+            ("diesel::pg::", "use `::autumn_web::RuntimeBackend`"),
+            (
+                "on_constraint(",
+                "SQLite has no `ON CONFLICT ON CONSTRAINT`",
+            ),
+        ];
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for (token, remedy) in POSTGRES_ONLY {
+                        assert!(
+                            !source.contains(token),
+                            "`generate {label}` emitted `{token}`, which has no SQLite \
+                             implementation, into {} — {remedy}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plan one generator against the `SQLite` project at `root`, then apply and
+    /// roll back every migration it emits on a real in-memory `SQLite`.
+    fn audit_one_generator(
+        label: &str,
+        plan: fn(&std::path::Path) -> Result<crate::generate::emit::Plan, GenerateError>,
+        root: &std::path::Path,
+    ) {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        plan(root)
+            .unwrap_or_else(|e| panic!("`generate {label}` must plan on a SQLite app: {e}"))
+            .execute(Flags::default())
+            .unwrap_or_else(|e| panic!("`generate {label}` plan must execute: {e}"));
+
+        assert_no_postgres_only_rust(label, root);
+
+        // Diesel applies migration directories in version order, so the audit
+        // does too — and rolls back in the reverse.
+        let mut dirs: Vec<_> = std::fs::read_dir(root.join("migrations"))
+            .unwrap_or_else(|e| panic!("`generate {label}` must emit a migrations dir: {e}"))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.join("up.sql").is_file())
+            .collect();
+        dirs.sort();
+        assert!(
+            !dirs.is_empty(),
+            "`generate {label}` emitted no migration to audit"
+        );
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        for dir in &dirs {
+            let up = std::fs::read_to_string(dir.join("up.sql")).unwrap();
+            conn.batch_execute(&up).unwrap_or_else(|e| {
+                panic!(
+                    "`generate {label}` emitted up.sql that SQLite refuses ({}): {e}\n{up}",
+                    dir.display()
+                )
+            });
+            assert_no_postgres_only_sql(label, dir, &up);
+        }
+        for dir in dirs.iter().rev() {
+            let down = std::fs::read_to_string(dir.join("down.sql")).unwrap();
+            conn.batch_execute(&down).unwrap_or_else(|e| {
+                panic!(
+                    "`generate {label}` emitted down.sql that SQLite refuses ({}): {e}\n{down}",
+                    dir.display()
+                )
+            });
+        }
+    }
+
     /// The issue-#1927 audit, kept as a test rather than a one-time sweep.
     ///
-    /// Most generators derive their DDL from [`dsl`], which is backend-aware by
-    /// construction. These five instead hand-write `CREATE TABLE` literals, and
-    /// that is the shape that shipped Postgres-only SQL: `BIGSERIAL`, `NOW()`,
-    /// `TIMESTAMPTZ`. Each is planned against a SQLite app and every migration
-    /// it emits is applied — and rolled back — on a real in-memory SQLite, so a
-    /// new hand-written table cannot regress the audit unnoticed.
+    /// `auth`, `mailer --list-unsubscribe`, `teams` and `commentable` hand-write
+    /// their `CREATE TABLE` literals rather than deriving them from a model's
+    /// fields, and that is the shape that shipped Postgres-only SQL:
+    /// `BIGSERIAL`, `NOW()`, `TIMESTAMPTZ`. `notifications` and `pwa` derive
+    /// theirs through `schema_edit`, so they are backend-aware by construction;
+    /// they ride along here because a singleton table is cheap to check and the
+    /// roster is then simply "every generator that emits a migration of its own".
+    ///
+    /// Each is planned against a `SQLite` app; every migration it emits is
+    /// applied — and rolled back — on a real in-memory `SQLite`, and the Rust it
+    /// emits is scanned for constructs `SQLite` has no diesel implementation
+    /// for. A new hand-written table cannot regress the audit unnoticed.
     ///
     /// Applying the DDL is necessary but NOT sufficient, so the emitted SQL is
-    /// also scanned for Postgres-only spellings. SQLite accepts any unknown
+    /// also scanned for Postgres-only spellings. `SQLite` accepts any unknown
     /// type name (it falls back to BLOB affinity), so `id BIGSERIAL PRIMARY
     /// KEY` parses cleanly there and simply stops auto-incrementing — the exact
     /// silent breakage this issue is about. Only the Postgres-only *syntax*
@@ -551,14 +734,11 @@ mod tests {
     ///
     /// A generator added to this family belongs in this list. `counter_cache` is
     /// deliberately absent: its `ALTER TABLE … ADD COLUMN … BIGINT NOT NULL
-    /// DEFAULT 0` / `DROP COLUMN` is already portable (SQLite gives `BIGINT`
+    /// DEFAULT 0` / `DROP COLUMN` is already portable (`SQLite` gives `BIGINT`
     /// integer affinity, so it reads back without drift) and it emits no
     /// `CREATE TABLE` of its own.
     #[test]
     fn hand_written_ddl_generators_emit_applicable_sqlite_ddl() {
-        use diesel::connection::SimpleConnection as _;
-        use diesel::prelude::*;
-
         const TS: &str = "20260101000000";
 
         type Planner = fn(&std::path::Path) -> Result<crate::generate::emit::Plan, GenerateError>;
@@ -590,6 +770,17 @@ mod tests {
             ("teams", |root| {
                 crate::generate::teams::plan_teams(root, TS, false)
             }),
+            // `comments:commentable` brings the shared `comments` table and its
+            // parent-cleanup TRIGGER alongside the model's own migration — the
+            // only generated DDL in this family that is not a bare table.
+            ("model … comments:commentable", |root| {
+                crate::generate::model::plan_model(
+                    root,
+                    "Post",
+                    &["title:String".to_owned(), "comments:commentable".to_owned()],
+                    TS,
+                )
+            }),
         ];
 
         for (label, plan) in generators {
@@ -600,82 +791,8 @@ mod tests {
                     ("DATABASE_URL", None::<&str>),
                 ],
                 || {
-                    let tmp = tempfile::TempDir::new().unwrap();
-                    let root = tmp.path();
-                    std::fs::write(
-                        root.join("Cargo.toml"),
-                        "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.7\"\n",
-                    )
-                    .unwrap();
-                    std::fs::write(
-                        root.join("autumn.toml"),
-                        "[database]\nprimary_url = \"sqlite://app.db\"\n",
-                    )
-                    .unwrap();
-                    std::fs::create_dir_all(root.join("src")).unwrap();
-                    // A shared 4-arg `pub fn layout` — what `autumn new` emits,
-                    // and what the auth and pwa preflights both require.
-                    std::fs::write(
-                        root.join("src/main.rs"),
-                        "use autumn_web::prelude::*;\n\n\
-                         pub fn layout(title: &str, current_path: &str, flash: maud::Markup, \
-                         content: maud::Markup) -> maud::Markup {\n\
-                         \x20   let _ = (current_path, flash);\n\
-                         \x20   maud::html! { title { (title) } (content) }\n\
-                         }\n\n\
-                         #[autumn_web::main]\n\
-                         async fn main() {\n\
-                         \x20   autumn_web::app().routes(routes![]).run().await;\n\
-                         }\n",
-                    )
-                    .unwrap();
-
-                    plan(root)
-                        .unwrap_or_else(|e| {
-                            panic!("`generate {label}` must plan on a SQLite app: {e}")
-                        })
-                        .execute(Flags::default())
-                        .unwrap_or_else(|e| panic!("`generate {label}` plan must execute: {e}"));
-
-                    // Diesel applies migration directories in version order, so
-                    // the audit does too — and rolls back in the reverse.
-                    let mut dirs: Vec<_> = std::fs::read_dir(root.join("migrations"))
-                        .unwrap_or_else(|e| {
-                            panic!("`generate {label}` must emit a migrations dir: {e}")
-                        })
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.join("up.sql").is_file())
-                        .collect();
-                    dirs.sort();
-                    assert!(
-                        !dirs.is_empty(),
-                        "`generate {label}` emitted no migration to audit"
-                    );
-
-                    let mut conn =
-                        diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
-                    for dir in &dirs {
-                        let up = std::fs::read_to_string(dir.join("up.sql")).unwrap();
-                        conn.batch_execute(&up).unwrap_or_else(|e| {
-                            panic!(
-                                "`generate {label}` emitted up.sql that SQLite refuses \
-                                 ({}): {e}\n{up}",
-                                dir.display()
-                            )
-                        });
-                        assert_no_postgres_only_sql(label, dir, &up);
-                    }
-                    for dir in dirs.iter().rev() {
-                        let down = std::fs::read_to_string(dir.join("down.sql")).unwrap();
-                        conn.batch_execute(&down).unwrap_or_else(|e| {
-                            panic!(
-                                "`generate {label}` emitted down.sql that SQLite refuses \
-                                 ({}): {e}\n{down}",
-                                dir.display()
-                            )
-                        });
-                    }
+                    let tmp = sqlite_project();
+                    audit_one_generator(label, *plan, tmp.path());
                 },
             );
         }

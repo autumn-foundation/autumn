@@ -197,9 +197,14 @@ published support contract**. Available **today**:
   app's dialect. The portable parts are shared: the `role` / `status` `CHECK`
   enums, the `UNIQUE (tenant_id, user_id)` constraint, and the partial
   `idx_invitations_pending_email` unique index (SQLite has had partial indexes
-  since 3.8.0). Its Rust templates needed no fork — `#[repository]` binds
-  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
-  sql-types both diesel backends carry.
+  since 3.8.0). Its `#[repository]`/`#[model]` templates needed no fork —
+  `#[repository]` binds `::autumn_web::RuntimeConnection`, and
+  `src/teams/schema.rs` uses only sql-types both diesel backends carry — but its
+  route handlers' 19 `.for_update()` row locks now go through
+  `::autumn_web::maybe_for_update!` (diesel implements the locking clause for
+  Postgres and MySQL only), and the generator now selects the SQLite dependency
+  set and enables `autumn-web`'s `sqlite` feature, without which the app would
+  refuse its own `sqlite://` URL at boot.
 - **DB-backed sessions store on SQLite (#1908)** — the `generate auth`
   tracked-sessions store bounds its query functions by
   `::autumn_web::RuntimeBackend` instead of a hard-coded `diesel::pg::Pg`, so the
@@ -730,19 +735,35 @@ Additional generator shapes are refused on SQLite:
 > refused, it emits its organizations / memberships / invitations migration in
 > the app's dialect. The `role` / `status` `CHECK` enums, the
 > `UNIQUE (tenant_id, user_id)` constraint and the partial
-> `idx_invitations_pending_email` unique index are portable and shared. Nothing
-> else in the generator needed forking: the `#[repository]` macro binds
-> `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
-> sql-types both diesel backends carry.
+> `idx_invitations_pending_email` unique index are portable and shared. Its
+> `#[repository]`/`#[model]` templates needed no forking either — the
+> `#[repository]` macro binds `::autumn_web::RuntimeConnection`, and
+> `src/teams/schema.rs` uses only sql-types both diesel backends carry.
 >
-> These five — `auth`, `mailer --list-unsubscribe`, `notifications`, `pwa`,
-> `teams` — are every generator that hand-writes `CREATE TABLE` DDL rather than
-> deriving it from a model's fields, which is the shape #1927 was opened about.
-> A guard plans each against a SQLite app, applies and rolls back every
-> migration it emits on a real in-memory SQLite, and scans the SQL for
-> Postgres-only spellings. That scan is not redundant: SQLite accepts an unknown
-> type name (falling back to BLOB affinity), so `id BIGSERIAL PRIMARY KEY`
-> applies cleanly there and simply stops auto-incrementing.
+> DDL was not the whole of it. The generated route handlers took 19 pessimistic
+> row locks with `.for_update()`, which diesel implements for Postgres and MySQL
+> only; they now go through `::autumn_web::maybe_for_update!`, which is a plain
+> read on SQLite. Write-write correctness then rests on SQLite's single-writer
+> transaction: a second writer that read the same snapshot fails closed with
+> `SQLITE_BUSY_SNAPSHOT` rather than losing the update, so the "don't remove the
+> sole Owner" and "don't accept one invitation twice" invariants still hold —
+> but under contention a request errors instead of queueing behind a row lock.
+> The generator also now writes the SQLite dependency set (no `pq-sys`, and the
+> `returning_clauses_for_sqlite_3_35` the generated inserts need) and enables
+> `autumn-web`'s `sqlite` feature, without which the app compiles but refuses
+> its own `sqlite://` URL at boot.
+>
+> `auth`, `mailer --list-unsubscribe`, `teams` and `commentable` hand-write
+> their `CREATE TABLE` DDL rather than deriving it from a model's fields, which
+> is the shape #1927 was opened about; `notifications` and `pwa` derive theirs
+> through `schema_edit`. A guard covers all six: it plans each against a SQLite
+> app, applies and rolls back every migration it emits on a real in-memory
+> SQLite, scans the SQL for Postgres-only spellings, and scans the generated
+> Rust for constructs SQLite has no diesel implementation for. Neither scan is
+> redundant. SQLite accepts an unknown type name (falling back to BLOB
+> affinity), so `id BIGSERIAL PRIMARY KEY` applies cleanly there and simply
+> stops auto-incrementing; and applying SQL cannot see a generated crate that
+> would not compile.
 
 > **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —
