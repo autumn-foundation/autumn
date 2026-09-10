@@ -78,13 +78,30 @@
 # structurally rather than by name: the function whose signature takes the raw
 # `attr: TokenStream` but NOT `item: TokenStream`. That is the dedicated arg
 # parser; the one taking both is the macro entry point, which reaches the
-# entire implementation. From there the reader follows calls transitively into
-# other functions and `impl` blocks, so a grammar split across helpers
-# (`job.rs`'s `parse_basic_arg` / `parse_uniqueness_arg` /
-# `parse_concurrency_arg`) is read whole.
+# entire implementation. Failing that, a `syn::Parse` impl's
+# `fn parse(input: ParseStream)` — `api_doc` and `agent_operable` parse that
+# way and have no attr-taking function at all, so without it `api_doc` had no
+# readable grammar across 53 guide examples and `agent_operable` fell back to
+# its whole macro entry and accepted `cfg`, `fn` and `jobs` as keys. Only when
+# neither exists does the macro entry serve as the root.
 #
-# Two things bound that walk, each because ignoring it produced a wrong answer
-# on this corpus:
+# From the root the reader follows calls transitively into other functions and
+# `impl` blocks, so a grammar split across helpers (`job.rs`'s
+# `parse_basic_arg` / `parse_uniqueness_arg` / `parse_concurrency_arg`) is read
+# whole.
+#
+# Three things bound that walk, each because ignoring it produced a wrong
+# answer on this corpus:
+#
+#   - **A block parsing a nested group's grammar is not read.**
+#     `Attribute::parse_nested_meta` parses an attribute's own arguments;
+#     `ParseNestedMeta::parse_nested_meta` descends into a group, and the
+#     receiver says which. Reading the descents promoted `action` (inside
+#     `dependent(…)`) and `after`/`basis` (inside `retention(…)`) to top-level
+#     `#[repository]` keys and let `#[repository(Post, action = true)]` pass.
+#     Nesting *depth* could not tell them apart: `parse_repo_args` enters its
+#     own top level through `syn::meta::parser`, not through a
+#     `parse_nested_meta` call, so every such call in it is already a descent.
 #
 #   - **A callee is followed only if it receives the attribute** in some syn
 #     form (`ParseNestedMeta`, `Meta`, `TokenStream`, `Attribute`, …). One
@@ -115,9 +132,9 @@
 #   - **A macro whose grammar the extractor cannot read is skipped, not
 #     failed.** If the scope yields zero keys, this gate cannot judge that
 #     macro's arguments and says so under `--list` rather than reporting every
-#     key its pages use. Six are skipped today — `api_doc`, `mailer_preview`,
+#     key its pages use. Five are skipped today — `mailer_preview`,
 #     `oauth2_callback`, `public`, `service` and `sim_test`, none of which
-#     takes keyword arguments — and the other 27 are judged. The self-test
+#     takes keyword arguments — and the other 28 are judged. The self-test
 #     holds a floor under that count so a refactor cannot quietly empty the
 #     truth set, the failure mode where a gate keeps passing because it
 #     stopped looking, and a second case fails if `lib.rs` exports a macro
@@ -139,11 +156,11 @@
 #     in `#[secured("admin")]` and the value in `resource = Post` are
 #     positional, so literals and nested groups are collapsed to a placeholder
 #     before the split and a segment carrying `=` yields only its left side.
-#   - **A delimiter inside a literal is data, not structure.** The depth scan
-#     skips `"…"`, `'…'` and `r#"…"#` before counting, so
-#     `#[secured("admin)", policy = "x")]` no longer ends at the `)` inside the
-#     role string. Any argument carrying a route pattern, regex or glob has the
-#     same shape.
+#   - **A delimiter inside a literal or a comment is data, not structure.** The
+#     depth scan skips `"…"`, `'…'`, `r#"…"#`, `// …` and (nesting) `/* … */`
+#     before counting, so neither `#[secured("admin)", policy = "x")]` nor
+#     `#[secured(/* ) */ policy = "x")]` ends at that `)`. Any argument
+#     carrying a route pattern, regex or glob has the same shape.
 #
 # ── Corpus ───────────────────────────────────────────────────────────────────
 #
@@ -289,8 +306,12 @@ KEY_PATTERNS = (
 # So match arms are collected only from blocks whose scrutinee reads as a key
 # and not as a value.
 MATCH_BLOCK = re.compile(r"\bmatch\s+([^{\n]{0,120}?)\s*\{")
-KEYISH_SCRUTINEE = re.compile(r"\b(key|path|ident|name)\b")
-VALUEISH_SCRUTINEE = re.compile(r"\b(value|val|action|kind|lit)\b")
+# Loose on the trailing edge, and symmetrically so: the scrutinee is as often
+# `key_str.as_str()` as `key.as_str()`, and as often `value_str` as `value`.
+# An exact-word match missed `api_doc`'s `match key_str.as_str()` and left its
+# four real keys out of the truth set.
+KEYISH_SCRUTINEE = re.compile(r"\b(key|path|ident|name)\w*")
+VALUEISH_SCRUTINEE = re.compile(r"\b(value|val|action|kind|lit)\w*")
 MATCH_ARM = re.compile(r'"([a-z_0-9]+)"\s*(?:\||=>)')
 
 
@@ -361,6 +382,7 @@ ITEM_PARAM = re.compile(r"\bitem\s*:\s*(?:proc_macro2::)?TokenStream")
 # `#[model(...)]` itself. Following it made `#[model(delete_all = true)]` pass.
 # `job.rs`'s three helpers take `ParseNestedMeta` and must stay reachable, so
 # the test is on the parameter types rather than on the function name.
+PARSE_STREAM_PARAM = re.compile(r":\s*(?:syn::)?(?:parse::)?ParseStream\b")
 ARG_PARAM = re.compile(
     r":\s*&?\s*(?:mut\s+)?(?:syn::)?(?:meta::)?"
     r"(ParseNestedMeta|Meta|MetaList|TokenStream|Attribute|ParseStream|ExprLit|Expr|Lit)\b"
@@ -377,6 +399,43 @@ def _balanced(src, open_idx, opener="{", closer="}"):
             depth -= 1
         i += 1
     return src[open_idx + 1 : i - 1], i
+
+
+# `Attribute::parse_nested_meta` parses an attribute's OWN arguments;
+# `ParseNestedMeta::parse_nested_meta` descends into a nested group. The
+# receiver is which of the two this is, and the two call sites read
+# `attr.parse_nested_meta(…)` and `meta.parse_nested_meta(…)` accordingly.
+NESTED_META_DESCENT = re.compile(r"\b(?!attr\b|input\b)([a-z_0-9]+)\.parse_nested_meta\s*\(")
+
+
+def strip_nested_group_parsers(text):
+    """Drop the bodies of blocks that parse a *nested group's* grammar.
+
+    `#[repository(…, dependent(fk = …, action = …), retention(after = …,
+    basis = …))]` parses its own keys through `syn::meta::parser(|meta| …)` and
+    each group's keys through `meta.parse_nested_meta(|nested| …)`. Reading the
+    inner blocks promoted `action`, `after` and `basis` to top-level keys and
+    let `#[repository(Post, action = true)]` pass.
+
+    Depth alone could not tell them apart: `parse_repo_args` enters its top
+    level through `syn::meta::parser`, not through a `parse_nested_meta` call,
+    so every such call in it is already a descent. The receiver is what
+    distinguishes them.
+
+    This is the truth-set mirror of `top_level_keys`, which already declines to
+    judge a nested group's keys on the documentation side. Both sides now stop
+    at the same boundary.
+    """
+    out, cursor = [], 0
+    for match in NESTED_META_DESCENT.finditer(text):
+        if match.start() < cursor:
+            continue
+        _, end = _balanced(text, match.end() - 1, "(", ")")
+        out.append(text[cursor : match.end()])
+        out.append(")")
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def code_blocks(src):
@@ -421,17 +480,24 @@ def accepted_keys():
             continue
         src = "\n".join(sources)
         blocks = code_blocks(src)
-        takes_attr, arg_parsers = [], []
+        takes_attr, arg_parsers, parse_impls = [], [], []
         for name, defs in blocks.items():
             for _, params in defs:
+                if PARSE_STREAM_PARAM.search(params) and name == "parse":
+                    parse_impls.append(name)
                 if not ATTR_PARAM.search(params):
                     continue
                 takes_attr.append(name)
                 if not ITEM_PARAM.search(params):
                     arg_parsers.append(name)
-        # Prefer the dedicated parser; fall back to the macro entry for the
-        # macros that parse their arguments inline.
-        roots = arg_parsers or takes_attr
+        # Prefer the dedicated `fn(attr: TokenStream)` parser. Failing that,
+        # a `syn::Parse` impl for the argument type — `api_doc` and
+        # `agent_operable` parse that way and have no attr-taking function at
+        # all, so the first left `api_doc` with no readable grammar (53 guide
+        # examples, wholly ungated) and rooted `agent_operable` at its whole
+        # macro entry, which accepted `cfg`, `fn` and `jobs` as keys. Only if
+        # neither exists does the macro entry serve as the root.
+        roots = arg_parsers or parse_impls or takes_attr
         seen, queue, scoped = set(), list(roots), []
         while queue:
             name = queue.pop()
@@ -448,7 +514,7 @@ def accepted_keys():
                 for ident in set(IDENT.findall(body)):
                     if ident in blocks and ident not in seen:
                         queue.append(ident)
-        text = "\n".join(scoped)
+        text = strip_nested_group_parsers("\n".join(scoped))
         keys = set()
         for pattern in KEY_PATTERNS:
             keys |= set(re.findall(pattern, text))
@@ -540,6 +606,11 @@ def top_level_keys(args):
     buf, depth, i = [], 0, 0
     while i < len(args):
         ch = args[i]
+        if ch == "/":
+            nxt = skip_comment(args, i)
+            if nxt is not None:
+                i = nxt
+                continue
         if ch in "\"'":
             i = skip_literal(args, i)
             if depth == 0:
@@ -606,6 +677,33 @@ def skip_literal(text, i):
     return i
 
 
+def skip_comment(text, i):
+    """Index just past a `//` or `/* */` comment at `i`, or None if not one.
+
+    Rust allows a comment inside an attribute's argument list, and a `)` in
+    one is not structure: `#[secured(/* ) */ policy = "x")]` ended the scan
+    before `policy`. Block comments nest in Rust, so the scan counts them.
+    """
+    pair = text[i : i + 2]
+    if pair == "//":
+        end = text.find("\n", i)
+        return len(text) if end == -1 else end
+    if pair != "/*":
+        return None
+    depth, j = 1, i + 2
+    while j < len(text) and depth:
+        if text[j : j + 2] == "/*":
+            depth += 1
+            j += 2
+            continue
+        if text[j : j + 2] == "*/":
+            depth -= 1
+            j += 2
+            continue
+        j += 1
+    return j
+
+
 def skip_raw_literal(text, i):
     """Index just past a `r"…"` / `r#"…"#` literal at `i`, or None if not one."""
     j = i + 1
@@ -641,6 +739,11 @@ def find_macro_calls(text):
         i, depth = match.end(), 1
         while i < len(text) and depth:
             ch = text[i]
+            if ch == "/":
+                nxt = skip_comment(text, i)
+                if nxt is not None:
+                    i = nxt
+                    continue
             if ch in "\"'":
                 i = skip_literal(text, i)
                 continue
@@ -937,11 +1040,11 @@ def self_test():
     # nothing rather than reporting every key the macro's pages use. The floor
     # guards against a refactor quietly emptying the truth set wholesale — the
     # failure mode where a gate keeps passing because it stopped looking.
-    check("most macros are judgeable", len(judgeable) >= 25, True)
+    check("most macros are judgeable", len(judgeable) >= 26, True)
     check(
         "skipped macros are named",
         sorted(set(OWNERS) - judgeable),
-        ["api_doc", "mailer_preview", "oauth2_callback", "public", "service", "sim_test"],
+        ["mailer_preview", "oauth2_callback", "public", "service", "sim_test"],
     )
     # The route verbs parse their keys in `parse.rs`, not the file they
     # dispatch from. Reading only one file reported `api_version` as drift.
@@ -1017,6 +1120,60 @@ def self_test():
             "```rust\n#[authorize(\"update\", resource = Post, from = post)]\n```\n", ".md"
         ),
         [],
+    )
+
+    # A macro parsing through a `syn::Parse` impl has no `fn(attr: TokenStream)`
+    # at all. Rooting at the whole macro entry instead made `agent_operable`
+    # accept `cfg`/`fn`/`jobs`; finding nothing left `api_doc` unjudged across
+    # 53 guide examples.
+    check("api_doc is judgeable", "api_doc" in judgeable, True)
+    check("api_doc accepts summary", "summary" in accepted["api_doc"], True)
+    check("api_doc accepts operation_id", "operation_id" in accepted["api_doc"], True)
+    check("agent_operable accepts grant", "grant" in accepted["agent_operable"], True)
+    check("agent_operable rejects an implementation term", "cfg" in accepted["agent_operable"], False)
+    check(
+        "markdown: an api_doc typo is caught",
+        scan_text('```rust\n#[api_doc(summry = "typo")]\n```\n', ".md"),
+        [("api_doc", "summry")],
+    )
+    check(
+        "markdown: real api_doc keys pass",
+        scan_text(
+            '```rust\n#[api_doc(summary = "S", description = "D", status = 200)]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+
+    # A nested group's keys belong to the group on the truth-set side too.
+    check("repository rejects a nested-group key", "action" in accepted["repository"], False)
+    check("repository still accepts a real key", "table" in accepted["repository"], True)
+    check(
+        "markdown: a nested-only key is not a top-level key",
+        scan_text("```rust\n#[repository(Post, action = true)]\n```\n", ".md"),
+        [("repository", "action")],
+    )
+    check(
+        "markdown: the nested group itself still passes",
+        scan_text(
+            '```rust\n#[repository(Post, dependent(Comment, fk = "c", on_delete = destroy))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+
+    # A delimiter inside a comment is not structure either.
+    check(
+        "markdown: paren inside a block comment does not end the attribute",
+        scan_text('```rust\n#[secured(/* ) */ policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: paren inside a line comment does not end the attribute",
+        scan_text(
+            '```rust\n#[secured(\n    // )\n    policy = "x",\n)]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
     )
 
     # A bad key inside a fence is a defect.
