@@ -78,12 +78,16 @@
 # structurally rather than by name: the function whose signature takes the raw
 # `attr: TokenStream` but NOT `item: TokenStream`. That is the dedicated arg
 # parser; the one taking both is the macro entry point, which reaches the
-# entire implementation. Failing that, a `syn::Parse` impl's
-# `fn parse(input: ParseStream)` — `api_doc` and `agent_operable` parse that
+# entire implementation. Alongside it, the `syn::Parse` impl for the type the
+# macro parses its arguments into — `api_doc` and `agent_operable` parse that
 # way and have no attr-taking function at all, so without it `api_doc` had no
 # readable grammar across 53 guide examples and `agent_operable` fell back to
-# its whole macro entry and accepted `cfg`, `fn` and `jobs` as keys. Only when
-# neither exists does the macro entry serve as the root.
+# its whole macro entry and accepted `cfg`, `fn` and `jobs` as keys. The two
+# are additive, not a fallback chain: `static_get` has both, and taking only
+# the first lost `params`. A `Parse` root is the implementing TYPE, never the
+# bare method name — `code_blocks` groups same-named methods together, so
+# rooting at `parse` dragged `EffectSpec::parse` in beside
+# `OperableAttr::parse`. Only when neither exists does the macro entry serve.
 #
 # From the root the reader follows calls transitively into other functions and
 # `impl` blocks, so a grammar split across helpers (`job.rs`'s
@@ -132,9 +136,12 @@
 #   - **A macro whose grammar the extractor cannot read is skipped, not
 #     failed.** If the scope yields zero keys, this gate cannot judge that
 #     macro's arguments and says so under `--list` rather than reporting every
-#     key its pages use. Five are skipped today — `mailer_preview`,
-#     `oauth2_callback`, `public`, `service` and `sim_test`, none of which
-#     takes keyword arguments — and the other 28 are judged. The self-test
+#     key its pages use. Three are skipped today — `mailer_preview`, `service`
+#     and `sim_test` — and the other 30 are judged. A macro whose parser was
+#     *found* but yields no keys is a different case: it is a marker like
+#     `#[public]`, `crate` is its whole grammar, and it is judged on that
+#     alone. Knowing there is nothing is not the same as knowing nothing. The
+#     self-test
 #     holds a floor under that count so a refactor cannot quietly empty the
 #     truth set, the failure mode where a gate keeps passing because it
 #     stopped looking, and a second case fails if `lib.rs` exports a macro
@@ -370,6 +377,8 @@ def strip_test_mods(src):
 
 FN_OPEN = re.compile(r"\bfn\s+([a-z_0-9]+)\s*(?:<[^>]*>)?\s*\(")
 IMPL_OPEN = re.compile(r"\bimpl\b[^{;]*?\bfor\s+([A-Za-z][A-Za-z0-9_]*)\s*\{")
+# Any impl block, inherent or trait — used only to find method spans.
+IMPL_BLOCK = re.compile(r"\bimpl\b[^{;()]{0,120}?\{")
 IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 ATTR_PARAM = re.compile(r"\battr\s*:\s*(?:proc_macro2::)?TokenStream")
 ITEM_PARAM = re.compile(r"\bitem\s*:\s*(?:proc_macro2::)?TokenStream")
@@ -383,6 +392,18 @@ ITEM_PARAM = re.compile(r"\bitem\s*:\s*(?:proc_macro2::)?TokenStream")
 # `job.rs`'s three helpers take `ParseNestedMeta` and must stay reachable, so
 # the test is on the parameter types rather than on the function name.
 PARSE_STREAM_PARAM = re.compile(r":\s*(?:syn::)?(?:parse::)?ParseStream\b")
+# An `impl Parse` body, recognised by the method it must define.
+PARSE_IMPL_BODY = re.compile(
+    r"\bfn\s+parse\s*\(\s*[a-z_0-9]+\s*:\s*(?:syn::)?(?:parse::)?ParseStream"
+)
+# The type a macro parses its ARGUMENTS into. Both forms are anchored on
+# `attr`: without that anchor `parse_args::<EffectSpec>` matched too, making
+# `#[agent_effect]`'s grammar a second root for `#[agent_operable]` and handing
+# it `cross_tenant`, `writes` and `jobs`.
+PARSED_INTO = re.compile(
+    r"(?:parse2::<\s*([A-Za-z][A-Za-z0-9_]*)\s*>\s*\(\s*attr\b"
+    r"|\battr\s*\.\s*parse_args::<\s*([A-Za-z][A-Za-z0-9_]*)\s*>)"
+)
 ARG_PARAM = re.compile(
     r":\s*&?\s*(?:mut\s+)?(?:syn::)?(?:meta::)?"
     r"(ParseNestedMeta|Meta|MetaList|TokenStream|Attribute|ParseStream|ExprLit|Expr|Lit)\b"
@@ -439,9 +460,31 @@ def strip_nested_group_parsers(text):
 
 
 def code_blocks(src):
-    """`name -> [(body, signature)]` for every fn and trait `impl` in `src`."""
+    """`name -> [(body, signature)]` for every free fn and trait `impl`.
+
+    A method defined inside an `impl` is deliberately NOT registered under its
+    bare name. Doing so grouped every same-named method in the file together,
+    and since traversal follows any identifier that names a block, reaching the
+    word `parse` inside `OperableAttr::parse` pulled in `EffectSpec::parse`
+    too — handing `#[agent_operable]` the `#[agent_effect]` keys
+    (`cross_tenant`, `writes`, `jobs`). Trait impls are reachable by their
+    implementing type instead, which is unambiguous.
+    """
+    impl_spans = []
+    for match in IMPL_BLOCK.finditer(src):
+        brace = src.find("{", match.start())
+        if brace == -1:
+            continue
+        _, end = _balanced(src, brace)
+        impl_spans.append((brace, end))
+
+    def inside_impl(pos):
+        return any(start < pos < end for start, end in impl_spans)
+
     out = collections.defaultdict(list)
     for match in FN_OPEN.finditer(src):
+        if inside_impl(match.start()):
+            continue
         params, after = _balanced(src, match.end() - 1, "(", ")")
         brace = src.find("{", after)
         semi = src.find(";", after)
@@ -480,24 +523,49 @@ def accepted_keys():
             continue
         src = "\n".join(sources)
         blocks = code_blocks(src)
-        takes_attr, arg_parsers, parse_impls = [], [], []
+        takes_attr, arg_parsers = [], []
         for name, defs in blocks.items():
             for _, params in defs:
-                if PARSE_STREAM_PARAM.search(params) and name == "parse":
-                    parse_impls.append(name)
                 if not ATTR_PARAM.search(params):
                     continue
                 takes_attr.append(name)
                 if not ITEM_PARAM.search(params):
                     arg_parsers.append(name)
-        # Prefer the dedicated `fn(attr: TokenStream)` parser. Failing that,
-        # a `syn::Parse` impl for the argument type — `api_doc` and
+        # A `syn::Parse` impl is rooted at the implementing TYPE, never at the
+        # bare method name: `code_blocks` groups every same-named method
+        # together, so rooting at `parse` pulled `EffectSpec::parse` in beside
+        # `OperableAttr::parse` and handed `#[agent_operable]` the
+        # `#[agent_effect]` keys (`cross_tenant`, `writes`, `jobs`).
+        parse_impls = [
+            name
+            for name, defs in blocks.items()
+            for body, _ in defs
+            if PARSE_IMPL_BODY.search(body)
+        ]
+        # When the macro names the type it parses into — `syn::parse2::<T>(attr)`
+        # or `attr.parse_args::<T>()` — that is the one, and its siblings are
+        # some other attribute's grammar.
+        named = [
+            t
+            for pair in PARSED_INTO.findall(src)
+            for t in pair
+            if t and t in parse_impls
+        ]
+        # Prefer the dedicated `fn(attr: TokenStream)` parser. Failing that, the
+        # `syn::Parse` impl for the argument type — `api_doc` and
         # `agent_operable` parse that way and have no attr-taking function at
-        # all, so the first left `api_doc` with no readable grammar (53 guide
-        # examples, wholly ungated) and rooted `agent_operable` at its whole
-        # macro entry, which accepted `cfg`, `fn` and `jobs` as keys. Only if
-        # neither exists does the macro entry serve as the root.
-        roots = arg_parsers or parse_impls or takes_attr
+        # all, so without it `api_doc` had no readable grammar (53 guide
+        # examples, wholly ungated) and `agent_operable` fell back to its whole
+        # macro entry and accepted `cfg`, `fn` and `jobs`. Only if neither
+        # exists does the macro entry serve as the root.
+        # Additive, not a fallback chain: a macro can have both. `static_get`
+        # parses the shared route grammar in `parse_route_attr(attr)` and its
+        # own extras in `impl Parse for StaticGetAttrs`, so taking only the
+        # first lost `params` and reported five correct pages as drift. When
+        # the parsed-into type is named explicitly, its siblings are some other
+        # attribute's grammar and are left out.
+        roots = list(dict.fromkeys(arg_parsers + (named or parse_impls)))
+        roots = roots or takes_attr
         seen, queue, scoped = set(), list(roots), []
         while queue:
             name = queue.pop()
@@ -519,7 +587,13 @@ def accepted_keys():
         for pattern in KEY_PATTERNS:
             keys |= set(re.findall(pattern, text))
         keys |= match_arm_keys(text)
-        out[macro] = (keys | UNIVERSAL_KEYS) if keys else set()
+        # A macro whose parser was FOUND but yields no keys of its own is a
+        # marker like `#[public]`: `crate` is then its entire grammar, and it
+        # is judgeable on that alone — otherwise `#[public(crtae = "renamed")]`
+        # passed. A macro whose parser could not be found at all is a different
+        # case and stays skipped: knowing nothing is not the same as knowing
+        # there is nothing.
+        out[macro] = (keys | UNIVERSAL_KEYS) if roots else set()
     return out
 
 
@@ -572,6 +646,7 @@ RUSTDOC_CRATES = (
     "autumn-media-plugin",
 )
 
+BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
 WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
 # A keyword argument, but never a `==` comparison.
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
@@ -625,8 +700,12 @@ def top_level_keys(args):
                 continue
         if ch in "([{":
             depth += 1
-            if depth == 1:
-                buf.append("\x00")  # a nested group was here
+            # The group's *interior* is its own grammar, but the identifier
+            # introducing it is an argument of this attribute and is left in
+            # place to be judged: `#[get("/", soe(title = "T"))]` misspells
+            # `seo`, and replacing the whole group — name included — with a
+            # placeholder reported zero defects. Same for `dependent`,
+            # `retention` and `invalidates`.
         elif ch in ")]}":
             depth -= 1
         elif depth == 0:
@@ -875,7 +954,11 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, found, current = False, 0, [], []
     for lineno, line in enumerate(lines, 1):
-        stripped = line.lstrip()
+        # A fenced example inside a block quote is still an example a reader
+        # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
+        # one, and without stripping the CommonMark `>` prefix the scanner
+        # never entered the fence at all.
+        stripped = BLOCKQUOTE.sub("", line).lstrip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
             if inside:
                 found.extend(judge_fences(rel, current, accepted, judgeable, waived))
@@ -887,7 +970,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                     fences += 1
             continue
         if inside:
-            current.append((lineno, line))
+            current.append((lineno, BLOCKQUOTE.sub("", line)))
     found.extend(judge_fences(rel, current, accepted, judgeable, waived))
     return found, fences
 
@@ -1040,11 +1123,11 @@ def self_test():
     # nothing rather than reporting every key the macro's pages use. The floor
     # guards against a refactor quietly emptying the truth set wholesale — the
     # failure mode where a gate keeps passing because it stopped looking.
-    check("most macros are judgeable", len(judgeable) >= 26, True)
+    check("most macros are judgeable", len(judgeable) >= 28, True)
     check(
         "skipped macros are named",
         sorted(set(OWNERS) - judgeable),
-        ["mailer_preview", "oauth2_callback", "public", "service", "sim_test"],
+        ["mailer_preview", "service", "sim_test"],
     )
     # The route verbs parse their keys in `parse.rs`, not the file they
     # dispatch from. Reading only one file reported `api_version` as drift.
@@ -1173,6 +1256,69 @@ def self_test():
         scan_text(
             '```rust\n#[secured(\n    // )\n    policy = "x",\n)]\n```\n', ".md"
         ),
+        [("secured", "policy")],
+    )
+
+    # A `syn::Parse` root is the implementing TYPE. Rooting at the bare method
+    # name grouped every `parse` in the file together, so `OperableAttr::parse`
+    # dragged in `EffectSpec::parse` and `#[agent_operable]` inherited the
+    # `#[agent_effect]` keys.
+    check("agent_operable accepts only its own key", sorted(accepted["agent_operable"]), ["crate", "grant"])
+    check(
+        "markdown: a sibling attribute's key is not accepted",
+        scan_text("```rust\n#[agent_operable(cross_tenant)]\n```\n", ".md"),
+        [("agent_operable", "cross_tenant")],
+    )
+    # …while a macro that genuinely has both an arg parser and a Parse impl
+    # keeps both. `static_get` parses the shared route grammar in one and its
+    # own extras in the other.
+    check("static_get keeps params (Parse impl)", "params" in accepted["static_get"], True)
+    check("static_get keeps api_version (arg parser)", "api_version" in accepted["static_get"], True)
+
+    # A marker macro's whole grammar is the universal key, and it is judgeable
+    # on that alone.
+    check("public is judgeable", "public" in judgeable, True)
+    check(
+        "markdown: a typo'd crate override on a marker macro is caught",
+        scan_text('```rust\n#[public(crtae = "renamed")]\n```\n', ".md"),
+        [("public", "crtae")],
+    )
+    check(
+        "markdown: a bare marker macro passes",
+        scan_text("```rust\n#[public]\nfn f() {}\n```\n", ".md"),
+        [],
+    )
+
+    # The identifier introducing a nested group is an argument of this
+    # attribute, even though the group's interior is not.
+    check(
+        "markdown: a misspelled group name is caught",
+        scan_text('```rust\n#[get("/", soe(title = "T"))]\n```\n', ".md"),
+        [("get", "soe")],
+    )
+    check(
+        "markdown: a correct group name passes",
+        scan_text('```rust\n#[get("/", seo(title = "T"))]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: repository group names pass",
+        scan_text(
+            '```rust\n#[repository(Post, dependent(Comment, fk = "c"), retention(after = "30d"))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+
+    # A fenced example inside a block quote is still an example.
+    check(
+        "markdown: fence inside a block quote is scanned",
+        scan_text('> ```rust\n> #[secured(policy = "x")]\n> ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: nested block quote is scanned",
+        scan_text('> > ```rust\n> > #[secured(policy = "x")]\n> > ```\n', ".md"),
         [("secured", "policy")],
     )
 

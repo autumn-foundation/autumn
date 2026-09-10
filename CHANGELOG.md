@@ -70,10 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. Every
   `#[proc_macro_attribute]` the crate exports is registered, checked against
   `lib.rs` by the self-test; a macro whose grammar cannot be read is skipped
-  rather than reported against, and 28 of 33 are judged. Only an attribute's
-  own keys are judged, since a nested group such as `seo(…)` carries its own
-  grammar, and both keyword arguments and bare flags (`#[job(unique)]`) are
-  checked while positional arguments are not. Carries `--list` and a 73-case
+  rather than reported against, and 30 of 33 are judged. Only an attribute's
+  own keys are judged — the identifier introducing a nested group included,
+  since a nested group such as `seo(…)` carries its own interior grammar — and both keyword arguments and bare flags (`#[job(unique)]`) are
+  checked while positional arguments are not. Carries `--list` and an 85-case
   `--self-test`. The baseline run found five defects.
 
 - **Migration version gate: starter templates no longer collide with their
