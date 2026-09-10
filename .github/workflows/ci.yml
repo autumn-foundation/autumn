@@ -2360,6 +2360,11 @@ jobs:
           $endpoint = $env:DAEMON_ENDPOINT
           $pgPid = "$env:AUTUMN_MANAGED_PG_DATA_DIR\postmaster.pid"
           if (-not (Test-Path $pgPid)) { throw "managed Postgres was not running before the stop" }
+          # Prove the daemon resolved the 8s grace the previous step's `env:` set,
+          # so the timing assertion below cannot pass or fail for another reason.
+          $addrBefore = Get-Content $env:DAEMON_ADDR_FILE -Raw
+          if ($addrBefore -notmatch 'stop_budget_secs\s*=\s*(\d+)') { throw "the daemon recorded no stop budget: $addrBefore" }
+          if ([int]$Matches[1] -lt 8) { throw "the daemon resolved a $($Matches[1])s drain budget; the 8s prestop grace did not reach it, so the timing below proves nothing" }
 
           # Probe from a background job so the requests are genuinely concurrent
           # with the stop, recording a timestamp and outcome per attempt.
@@ -2498,8 +2503,24 @@ jobs:
           # Flags belong to `serve`, before the subcommand: `--bundled-pg` is
           # an argument of `serve`, not of `install-service`, and clap gives
           # everything after a subcommand name to that subcommand.
+          # The prestop grace has to be in the app's CONFIG, not this shell's
+          # environment: the Service Control Manager starts the host with the
+          # system environment block, so `$env:` here never reaches the app the
+          # service runs. Written under the dev profile because the service is
+          # installed without `--release`.
+          Add-Content -Path "$env:JOURNEY_DIR\tier1_app\autumn.toml" -Value "`n[profile.dev.server]`nprestop_grace_secs = 8`n"
+
           & $autumn serve --bundled-pg install-service
           if ($LASTEXITCODE -ne 0) { throw "autumn serve install-service failed with $LASTEXITCODE" }
+
+          # Prove the app actually resolved that budget before timing anything
+          # against it. Without this the drain assertion below could fail on a
+          # zero grace, or pass because a cold managed-Postgres teardown happened
+          # to be slow — either way testing nothing.
+          $svcAddr = Get-Content $env:DAEMON_ADDR_FILE -Raw
+          Write-Host "--- service serve.addr ---`n$svcAddr"
+          if ($svcAddr -notmatch 'stop_budget_secs\s*=\s*(\d+)') { throw "the service's daemon recorded no stop budget: $svcAddr" }
+          if ([int]$Matches[1] -lt 8) { throw "the service's app resolved a $($Matches[1])s drain budget, so the drain timing below would prove nothing" }
 
           # `doctor` must report the service — AC-6. Take the name from there
           # rather than re-deriving autumn's own naming, so a mismatch between
@@ -2531,8 +2552,8 @@ jobs:
           # service manager asking, and the host must translate it into the SAME
           # cooperative drain `autumn serve stop` triggers — not a termination.
           # Graded the way the CLI-stop step is: by wall clock against the
-          # configured prestop grace, which a hard kill cannot satisfy.
-          $env:AUTUMN_SERVER__PRESTOP_GRACE_SECS = "8"
+          # prestop grace the app was just proved to have resolved, which a hard
+          # kill cannot satisfy.
           $scmStopBegan = Get-Date
           & sc.exe stop $svc | Write-Host
           $deadline = (Get-Date).AddMinutes(5)

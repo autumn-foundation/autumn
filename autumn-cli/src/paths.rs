@@ -353,10 +353,15 @@ fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
 /// The `icacls` arguments that restrict `dir` to `owner`, `SYSTEM` and the local
 /// `Administrators` group.
 ///
-/// `/inheritance:r` drops inherited ACEs first, so a permissive parent (an
-/// `AUTUMN_RUNTIME_DIR` under a shared root) cannot leak access in, and
-/// `/grant:r` *replaces* rather than adds, so a pre-existing ACE for another
-/// user is removed rather than kept alongside ours. `(OI)(CI)F` grants full
+/// `/inheritance:r` drops inherited ACEs, and `/grant:r` *replaces* rather than
+/// adds — but only for the trustees it names. Neither touches an **explicit** ACE
+/// belonging to some other SID, which is exactly what a local user who
+/// pre-created this directory under a shared root would leave behind. So the
+/// caller runs [`reset_dacl_args`] first: `/reset` drops every explicit ACE (and
+/// restores inheritance), then this call strips the inherited ones and installs
+/// our three as the entire DACL. Without that first step the directory keeps a
+/// stranger's write access to `serve.service.toml` — the file naming the binary
+/// a Local System service executes. `(OI)(CI)F` grants full
 /// control and marks the ACE inheritable by files and subdirectories, which is
 /// how the daemon log, address file and managed-Postgres cluster inherit the
 /// same restriction without a per-file call.
@@ -393,6 +398,28 @@ fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
     // Suppress the per-file success chatter; failures still print.
     args.push("/Q".into());
     args
+}
+
+/// The `icacls` arguments that drop every **explicit** ACE on `dir`.
+///
+/// `/reset` replaces the DACL with the parent's inherited one, which is the only
+/// icacls operation that removes an ACE belonging to a trustee we cannot name in
+/// advance. It is a step, not a destination: it leaves the directory as
+/// permissive as its parent, and [`owner_only_acl_args`] runs immediately after
+/// to strip those inherited entries and install ours. Under the default
+/// `%LOCALAPPDATA%` root the intermediate state is already owner-only, so the
+/// window this opens is real only where the operator pointed
+/// `AUTUMN_RUNTIME_DIR` somewhere shared — and there it replaces a state that
+/// was strictly worse.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the Windows hardening arm, compiled and tested everywhere"
+    )
+)]
+fn reset_dacl_args(dir: &Path) -> Vec<std::ffi::OsString> {
+    vec![dir.as_os_str().to_os_string(), "/reset".into(), "/Q".into()]
 }
 
 /// The trustee to grant, parsed from `whoami /user /fo csv /nh` output.
@@ -505,7 +532,8 @@ fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
     let owner = current_owner_sid()?;
     let icacls = system32_tool("icacls.exe");
     // Ownership first: a DACL written on a directory someone else owns is not a
-    // restriction, because the owner can rewrite it.
+    // restriction, because the owner can rewrite it — and rewriting it needs to
+    // succeed at all, which for a foreign directory it will not.
     let take_ownership = vec![
         dir.as_os_str().to_os_string(),
         "/setowner".into(),
@@ -513,6 +541,10 @@ fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
         "/Q".into(),
     ];
     run_icacls(&icacls, dir, &take_ownership, &owner)?;
+    // Then clear every explicit ACE. `/grant:r` below replaces grants only for
+    // the trustees it names, so without this a stranger's pre-created ACE
+    // survives the "hardening" and keeps write access to daemon state.
+    run_icacls(&icacls, dir, &reset_dacl_args(dir), &owner)?;
     run_icacls(&icacls, dir, &owner_only_acl_args(dir, &owner), &owner)
 }
 
@@ -664,6 +696,30 @@ mod tests {
         );
         assert!(
             rendered.contains(&"*S-1-5-21-1-2-3-1001:(OI)(CI)F".to_owned()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_dacl_is_cleared_before_it_is_rebuilt() {
+        // `/inheritance:r` removes only INHERITED entries and `/grant:r` replaces
+        // grants only for the trustees it names, so neither touches an explicit
+        // ACE left by a local user who pre-created the directory. `/reset` is the
+        // only icacls operation that removes an ACE for a trustee we cannot name,
+        // and without it the "owner-only" directory keeps that user's write
+        // access to `serve.service.toml` — the file naming the binary a Local
+        // System service runs.
+        let args = reset_dacl_args(Path::new(r"C:\state\demo"));
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rendered[0], r"C:\state\demo");
+        assert!(rendered.contains(&"/reset".to_owned()), "{rendered:?}");
+        // It must not also grant: `/reset` restores INHERITED access, so it is a
+        // step toward the owner-only DACL, never the DACL itself.
+        assert!(
+            !rendered.iter().any(|a| a.starts_with("/grant")),
             "{rendered:?}"
         );
     }

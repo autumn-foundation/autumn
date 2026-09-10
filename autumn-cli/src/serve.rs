@@ -1264,7 +1264,28 @@ pub fn running_daemon_summary(package: Option<&str>) -> Option<(u32, String)> {
     Some((rec.pid, where_it_serves))
 }
 
-/// The profile selected by this shell's environment, for recording at install.
+/// The role a daemon started here would actually run, folding in an
+/// `AUTUMN_ROLE` selected through the environment.
+///
+/// `install-service` records this rather than the bare `--role` flag: a service
+/// runs as Local System and inherits none of the installing shell's
+/// environment, so `AUTUMN_ROLE=worker autumn serve install-service` would
+/// otherwise register a service that silently runs the combined role.
+#[must_use]
+pub fn effective_role_for_record(explicit: Option<String>) -> Option<String> {
+    effective_role_from(explicit, std::env::var("AUTUMN_ROLE").ok())
+}
+
+/// The queue pin a daemon started here would actually run, folding in an
+/// `AUTUMN_JOBS__PIN` selected through the environment. Same reasoning as
+/// [`effective_role_for_record`]: without it a pinned worker tier is registered
+/// as a service that drains every queue.
+#[must_use]
+pub fn effective_pin_for_record(explicit: Option<Vec<String>>) -> Option<Vec<String>> {
+    effective_pin_from(explicit, std::env::var("AUTUMN_JOBS__PIN").ok())
+}
+
+/// The profile selected by this shell's environment, for recording at install./// The profile selected by this shell's environment, for recording at install.
 #[must_use]
 pub fn env_profile_for_record() -> Option<String> {
     env_profile()

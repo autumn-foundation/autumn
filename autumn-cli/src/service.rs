@@ -366,8 +366,28 @@ mod windows_impl {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{service_control_handler, service_dispatcher};
 
-    /// How long to wait for the Service Control Manager to report a state change.
-    const SCM_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Floor on how long to wait for the Service Control Manager to report a
+    /// state change.
+    ///
+    /// A floor, not a fixed budget: the host waits the app's own drain budget
+    /// plus a grace buffer before it force-kills, so a service with a 60-second
+    /// budget is still behaving correctly at 65 — and abandoning it at a fixed
+    /// 60 would fail `uninstall-service` on a healthy service and leave it
+    /// registered. [`scm_stop_timeout`] derives the real deadline from what the
+    /// daemon recorded.
+    const SCM_TRANSITION_FLOOR: Duration = Duration::from_secs(60);
+
+    /// How long to wait for a stop the Service Control Manager is driving.
+    ///
+    /// The same hint the host reports to the SCM, so the two agree on what
+    /// "still draining" means, floored so a daemon that recorded nothing useful
+    /// still gets a reasonable wait.
+    fn scm_stop_timeout(paths: Option<&RuntimePaths>) -> Duration {
+        let budget = paths
+            .and_then(serve::recorded_stop_budget)
+            .unwrap_or(super::FALLBACK_DRAIN_BUDGET_SECS);
+        stop_wait_hint(budget).max(SCM_TRANSITION_FLOOR)
+    }
 
     /// Where the running service host finds its record. Set before the dispatcher
     /// starts, because the SCM's `service_main` takes no arguments this process
@@ -436,8 +456,14 @@ mod windows_impl {
             profile: opts.profile.clone().or_else(serve::env_profile_for_record),
             release: opts.release,
             bundled_pg: opts.bundled_pg,
-            role: opts.role.clone(),
-            pin: opts.pin.clone(),
+            // The EFFECTIVE role and pin, not the bare flags. A service runs as
+            // Local System and inherits none of the installing shell's
+            // environment, so `AUTUMN_ROLE=worker autumn serve install-service`
+            // would otherwise register a service that quietly runs combined —
+            // and an `AUTUMN_JOBS__PIN` one that drains every queue. This is the
+            // same recovery `serve restart` already does through `serve.mode`.
+            role: serve::effective_role_for_record(opts.role.clone()),
+            pin: serve::effective_pin_for_record(opts.pin.clone()),
         };
         let record_path = paths.service_record_file();
         match record.to_toml() {
@@ -597,7 +623,7 @@ mod windows_impl {
         let name = service_name(&identity);
         let paths = RuntimePaths::resolve(&identity).ok();
 
-        let deregistered = match deregister(&name) {
+        let deregistered = match deregister(&name, scm_stop_timeout(paths.as_ref())) {
             Ok(Deregistered::Removed | Deregistered::WasNotRegistered) => true,
             Err(e) => {
                 eprintln!("autumn serve uninstall-service: {e}");
@@ -645,7 +671,7 @@ mod windows_impl {
         WasNotRegistered,
     }
 
-    fn deregister(name: &str) -> Result<Deregistered, String> {
+    fn deregister(name: &str, stop_timeout: Duration) -> Result<Deregistered, String> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| {
             format!(
@@ -672,13 +698,13 @@ mod windows_impl {
             service
                 .stop()
                 .map_err(|e| format!("cannot stop `{name}`: {e}"))?;
-            let deadline = Instant::now() + SCM_TRANSITION_TIMEOUT;
+            let deadline = Instant::now() + stop_timeout;
             while state(&service).unwrap_or(ServiceState::Stopped) != ServiceState::Stopped {
                 if Instant::now() >= deadline {
                     return Err(format!(
                         "`{name}` did not stop within {}s; it was left registered \
                          so its state is not removed under a running service",
-                        SCM_TRANSITION_TIMEOUT.as_secs()
+                        stop_timeout.as_secs()
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(250));
@@ -1021,6 +1047,20 @@ mod tests {
         );
         // Real budgets are untouched.
         assert!(stop_wait_hint(35) < MAX_WAIT_HINT);
+    }
+
+    #[test]
+    fn an_scm_stop_waits_at_least_as_long_as_the_host_will_drain() {
+        // The host waits the app's budget plus a grace buffer before force-
+        // killing. A shorter uninstall deadline abandons a service that is still
+        // draining correctly and leaves it registered — the very state
+        // `uninstall-service` was asked to remove.
+        for budget in [0, 35, 60, 600] {
+            assert!(
+                stop_wait_hint(budget) >= Duration::from_secs(budget),
+                "budget {budget}"
+            );
+        }
     }
 
     #[test]
