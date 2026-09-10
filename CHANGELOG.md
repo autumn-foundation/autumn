@@ -268,6 +268,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saw a field named as failing with no reason given, while the same error's
   logged `Display` output correctly omitted it. `errors` now filters
   empty-message fields the same way `Display` does.
+- **Constela: parse, validate and server-render LLM-generated UI (`constela`
+  feature):** an app can now serve an interface a language model wrote, without
+  ever handing that model a code path. [Constela] is a constrained JSON UI
+  language — the model emits a *description*, not code, and there is no
+  expression form that calls a function, no attribute that holds script, and no
+  way to spell `eval`. `autumn_web::constela` parses a document, validates it,
+  and renders it to `maud::Markup` on the server.
+
+  The safety guarantee (`constela::policy`) is the UI-tree counterpart of the
+  user-submitted rich-text path's, with four independent controls: an
+  allowlisted tag set (every script-, style- and document-structure element
+  rejected), an allowlisted attribute set (every `on*` handler rejected first
+  and explicitly, `style` absent), an allowlisted URL scheme set checked after
+  stripping the whitespace and control characters a browser ignores — so
+  `java\tscript:` falls with the plain spelling — and every byte of
+  document-derived output routed through one of the renderer's two escape
+  functions, with tag and attribute names written only after clearing those
+  allowlists so they are fixed strings from a fixed set. Literal URLs
+  are checked at validation and **every computed URL is checked again at
+  render time**, where its value is finally known. Unlike the rich-text path,
+  `id` is not banned but *prefixed*: every element id a document writes, and
+  every attribute referencing one (`for`, `aria-labelledby`, …), is rewritten
+  with `RenderContext::id_prefix` — as is a same-document fragment link, so
+  `href="#x"` and `id="x"` stay a matched pair rather than the link escaping to
+  a host-page element of that name — so `<label for>` keeps working inside the
+  fragment while collision with — or clobbering of — a host-page id becomes
+  impossible. `target="_blank"` gets `rel="noopener noreferrer"` whether the
+  document asked or not.
+
+  Validation collects **every** violation rather than returning at the first,
+  and each carries a path into the submitted JSON plus a stable code;
+  `ConstelaError::to_json` renders the list as the repair prompt to hand back
+  to the generator, so a bad document converges in one round rather than six.
+  A `ConstelaError` surfaces as `422`, not `500`.
+
+  Interactivity runs on the server, over htmx: an event binding renders as
+  `data-constela-on-{event}` for the app to wire, and `Document::dispatch` runs
+  an action's pure state steps (`set`, `update`, `setPath`, `if`) against state
+  the app owns. Browser-side steps are **reported** as `Effect`s rather than
+  performed — running a model-authored `fetch` from inside the app would give a
+  prompt injection the app's own network position, which is SSRF by
+  construction. Dispatch **stops** at the first effect
+  (`Dispatched::suspended_at` names where): an effect can bind a `result` that
+  later steps read, the server has no value to bind, and running on would
+  evaluate those reads as `null` and commit the answer — a `fetch` followed by
+  `set data = var(res)` would write `null` over good data. Autumn ships no
+  Constela client runtime and generates no JavaScript.
+
+  Parse bounds (`Limits`: 512 KiB, depth 64, 20 000 nodes) are applied before
+  and around deserialization, so a document engineered to overflow the stack in
+  serde's recursive descent is rejected before it can; render bounds
+  (`RenderLimits`) separately cap the expansion of a small document against a
+  large runtime list, and a `setPath` step's path is capped at that same depth —
+  not because the walk over it would be deep (it is iterative) but because
+  `serde_json::Value` drops *recursively*, so a document that wrote two hundred
+  thousand levels down would overflow the stack whenever that state was next
+  freed, with no visible connection to the request that built it.
+  `RenderLimits::max_output_bytes` (4 MiB) is a separate budget from the node
+  and iteration counts because those do not imply it: one text node can emit as
+  much as `RenderContext::state` holds, so a large string rendered from a
+  5 000-iteration `each` is a few dozen nodes and gigabytes of markup. It spans
+  the body and every portal together, and also caps what a single expression may
+  *build* — `concat`/`array`/`obj`/`+` assemble a finished value inside the
+  evaluator before any of it reaches the output buffer. `max_depth` likewise
+  caps the shape of state on **every** mutation, not only `setPath`: state
+  persists between dispatches, so `set x = array(state x)` adds a level per
+  request until `serde_json::Value`'s recursive drop overflows the stack. Component
+  cycle detection is iterative for the mirror-image reason — components are
+  sibling map entries, so a chain thousands deep is shallow JSON that clears
+  every parse bound, and a recursive walk would overflow during *validation*.
+  All nine
+  modules are enrolled in the #1611 request-path panic gate, so an out-of-range
+  index or an unchecked add in this path is a build failure rather than a 500
+  someone can trigger with a crafted document.
+  Adds **no new dependencies** — `serde`, `serde_json` and `maud` are already
+  in the graph. See `docs/guide/constela.md`; the adversarial corpus is
+  `autumn/tests/integration/constela.rs`.
+
+  [Constela]: https://github.com/yuuichieguchi/constela
 
 ### Security
 
