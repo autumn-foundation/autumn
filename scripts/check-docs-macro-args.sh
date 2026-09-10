@@ -88,8 +88,12 @@
 # way and have no attr-taking function at all, so without it `api_doc` had no
 # readable grammar across 53 guide examples and `agent_operable` fell back to
 # its whole macro entry and accepted `cfg`, `fn` and `jobs` as keys. The two
-# are additive, not a fallback chain: `static_get` has both, and taking only
-# the first lost `params`. A `Parse` root is the implementing TYPE, never the
+# are additive rather than a fallback chain. No macro in the corpus currently
+# has both — `static_get`, the case that motivated the union, turned out not
+# to use the shared route parser at all — so the union is inert today and is
+# kept for its failure direction: a dropped root narrows the accepted set and
+# reports correct pages as drift, while a superfluous one only widens it and
+# costs a miss. A `Parse` root is the implementing TYPE, never the
 # bare method name — `code_blocks` groups same-named methods together, so
 # rooting at `parse` dragged `EffectSpec::parse` in beside
 # `OperableAttr::parse`. Only when neither exists does the macro entry serve.
@@ -298,7 +302,14 @@ OWNERS = {
     "secured": "secured.rs",
     "service": "service.rs",
     "sim_test": "sim_test.rs",
-    "static_get": ("static_route.rs", "parse.rs"),
+    # NOT a route alias either: `StaticGetAttrs::parse` accepts `params`,
+    # `revalidate` and `seo` and nothing else, and `static_get_macro` never
+    # hands `attr` to `route::route_macro` — it only borrows
+    # `crate::parse::SeoAttrArgs` for the nested `seo(...)` group. Registering
+    # the shared route parser made `timeout_ms`, `api_version` and `name` look
+    # valid here. (In round nine I kept `parse.rs` believing `params` came from
+    # it; `params` is in `static_route.rs`, so that reasoning was wrong.)
+    "static_get": "static_route.rs",
     "step_up": "step_up.rs",
     "task": "one_off_task.rs",
     "throttle": "throttle.rs",
@@ -698,11 +709,12 @@ def accepted_keys():
         # examples, wholly ungated) and `agent_operable` fell back to its whole
         # macro entry and accepted `cfg`, `fn` and `jobs`. Only if neither
         # exists does the macro entry serve as the root.
-        # Additive, not a fallback chain: a macro can have both. `static_get`
-        # parses the shared route grammar in `parse_route_attr(attr)` and its
-        # own extras in `impl Parse for StaticGetAttrs`, so taking only the
-        # first lost `params` and reported five correct pages as drift. When
-        # the parsed-into type is named explicitly, its siblings are some other
+        # Additive, not a fallback chain, so that a macro splitting its grammar
+        # across both forms keeps all of it. Nothing in the corpus does today
+        # (see the header note on `static_get`); the union is kept because
+        # dropping a root narrows the accepted set and turns correct pages into
+        # reported drift, while an extra root only costs a miss. When the
+        # parsed-into type is named explicitly, its siblings are some other
         # attribute's grammar and are left out.
         roots = list(dict.fromkeys(arg_parsers + (named or parse_impls)))
         roots = roots or takes_attr
@@ -840,10 +852,23 @@ def top_level_keys(args, macro=None):
             if nxt is not None:
                 i = nxt
                 continue
-        if ch in "\"'":
+        if ch == '"':
             i = skip_literal(args, i)
             if depth == 0:
                 buf.append("\x00")  # a literal was here
+            continue
+        if ch == "'":
+            # `'a` is a lifetime and consumes nothing; only `'x'` is a literal.
+            # Reading `#[listener(Event<'static>, …)]`'s lifetime as an unclosed
+            # literal ran to the end of the argument list, so every key after it
+            # went unread.
+            nxt = _skip_rust_char(args, i)
+            if nxt is None:
+                i += 1
+                continue
+            i = nxt
+            if depth == 0:
+                buf.append("\x00")
             continue
         if ch == "r" and args[i + 1 : i + 2] in ('"', "#"):
             nxt = skip_raw_literal(args, i)
@@ -872,13 +897,18 @@ def top_level_keys(args, macro=None):
         segment = segment.strip()
         if not segment:
             continue
-        leading = first
-        first = False
         if "=" in segment.replace("==", ""):
             head = segment.split("=", 1)[0].strip()
+            # `crate = "…"` is stripped before the macro's parser runs and is
+            # accepted in any position, so it never occupies the positional
+            # slot: `#[authorize(crate = "x", update, …)]` still has `update`
+            # as its action verb.
+            if head not in UNIVERSAL_KEYS:
+                first = False
             if BARE_FLAG.match(head):
                 names.append((head, False))
         elif BARE_FLAG.match(segment):
+            leading, first = first, False
             if leading and macro in POSITIONAL_FIRST_IDENT:
                 continue  # the action verb, not a flag
             names.append((segment, True))
@@ -999,6 +1029,7 @@ def _masked_spans(text):
                 spans.append((i, end))
                 i = end
                 continue
+            # a lifetime — consumes nothing
         i += 1
     return spans
 
@@ -1023,8 +1054,19 @@ def _close_of(text, start, opener="("):
             if nxt is not None:
                 i = nxt
                 continue
-        if ch in "\"'":
+        if ch == '"':
             i = skip_literal(text, i)
+            continue
+        if ch == "'":
+            # A lifetime is not a literal: `Event<'static>` must consume
+            # nothing, or the scan runs to EOF and the attribute is never
+            # closed. `_skip_rust_char` already drew this distinction for the
+            # source balancer; the documentation scanners needed it too.
+            nxt = _skip_rust_char(text, i)
+            if nxt is not None:
+                i = nxt
+            else:
+                i += 1
             continue
         if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
             nxt = skip_raw_literal(text, i)
@@ -1526,6 +1568,26 @@ def self_test():
         ),
         [],
     )
+    # `crate = "…"` is stripped by `extract_crate_override` before the macro's
+    # own parser sees the tokens, so it is legal in any position and does not
+    # occupy the positional slot. Counting it as the first argument promoted
+    # the action verb to a bare flag and reported this correct form as drift.
+    check(
+        "markdown: a crate override before a positional action passes",
+        scan_text(
+            '```rust\n#[authorize(crate = "autumn_web_05", update, resource = Post)]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: a bad flag after a crate override is still caught",
+        scan_text(
+            '```rust\n#[job(crate = "autumn_web_05", uniqe)]\n```\n',
+            ".md",
+        ),
+        [("job", "uniqe")],
+    )
 
     # A macro parsing through a `syn::Parse` impl has no `fn(attr: TokenStream)`
     # at all. Rooting at the whole macro entry instead made `agent_operable`
@@ -1591,11 +1653,23 @@ def self_test():
         scan_text("```rust\n#[agent_operable(cross_tenant)]\n```\n", ".md"),
         [("agent_operable", "cross_tenant")],
     )
-    # …while a macro that genuinely has both an arg parser and a Parse impl
-    # keeps both. `static_get` parses the shared route grammar in one and its
-    # own extras in the other.
-    check("static_get keeps params (Parse impl)", "params" in accepted["static_get"], True)
-    check("static_get keeps api_version (arg parser)", "api_version" in accepted["static_get"], True)
+    # `static_get` is NOT a route alias. It reads like one — same `#[get]`
+    # shape, same file neighbourhood — and I registered the shared route
+    # parser for it on that resemblance. `StaticGetAttrs::parse` takes
+    # `params`, `revalidate` and `seo`, its `other =>` arm rejects the rest,
+    # and `static_get_macro` never hands `attr` to `route::route_macro`. The
+    # shared parser blessed `api_version`, `timeout_ms` and `name` here, so a
+    # doc page writing one of those would have passed the gate.
+    check(
+        "static_get accepts exactly its own grammar",
+        sorted(accepted["static_get"]),
+        ["crate", "params", "revalidate", "seo"],
+    )
+    check(
+        "markdown: a route-only key on static_get is caught",
+        scan_text('```rust\n#[static_get("/", api_version = "v1")]\n```\n', ".md"),
+        [("static_get", "api_version")],
+    )
 
     # A marker macro's whole grammar is the universal key, and it is judgeable
     # on that alone.
@@ -2122,6 +2196,20 @@ def self_test():
         "markdown: escaped quote does not end the literal",
         scan_text('```rust\n#[secured("a\\")x", bogus = 1)]\n```\n', ".md"),
         [("secured", "bogus")],
+    )
+    # A `'` opens a char literal or a lifetime, and only the first has a
+    # closing quote. Treating `'static` as a literal ran the scan to the end of
+    # the passage looking for one, so the attribute never closed and every key
+    # after the lifetime went unread.
+    check(
+        "markdown: a lifetime does not swallow the rest of the attribute",
+        scan_text("```rust\n#[listener(Event<'static>, bogus = 1)]\n```\n", ".md"),
+        [("listener", "bogus")],
+    )
+    check(
+        "markdown: a char literal is still skipped whole",
+        scan_text("```rust\n#[throttle(key = ')', bogus = 1)]\n```\n", ".md"),
+        [("throttle", "bogus")],
     )
 
     # A waiver reaches the passage it introduces, and no further.
