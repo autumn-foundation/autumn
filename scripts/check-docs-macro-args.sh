@@ -62,15 +62,35 @@
 # takes `table` and `managed`.
 #
 # So extraction is scoped to the macro's own argument parser, found
-# structurally rather than by name: the function in the owning file whose
-# signature takes the raw `attr: TokenStream` but NOT `item: TokenStream`. That
-# is the dedicated arg parser; the one taking both is the macro entry point,
-# which reaches the entire implementation. From there the reader follows calls
-# transitively into other functions and `impl` blocks in the same file, so a
-# grammar split across helpers (`job.rs`'s `parse_basic_arg` /
-# `parse_uniqueness_arg` / `parse_concurrency_arg`) is read whole. Twelve of
-# the twenty macros resolve to such a parser; the other eight parse their
-# arguments inline in the macro entry, and fall back to reading that.
+# structurally rather than by name: the function whose signature takes the raw
+# `attr: TokenStream` but NOT `item: TokenStream`. That is the dedicated arg
+# parser; the one taking both is the macro entry point, which reaches the
+# entire implementation. From there the reader follows calls transitively into
+# other functions and `impl` blocks, so a grammar split across helpers
+# (`job.rs`'s `parse_basic_arg` / `parse_uniqueness_arg` /
+# `parse_concurrency_arg`) is read whole.
+#
+# Two things bound that walk, each because ignoring it produced a wrong answer
+# on this corpus:
+#
+#   - **A callee is followed only if it receives the attribute** in some syn
+#     form (`ParseNestedMeta`, `Meta`, `TokenStream`, `Attribute`, …). One
+#     taking a bare `&str` is parsing a *value* already handed to it, and its
+#     literals are values: `DependentAction::parse(action: &str)` matches
+#     `delete_all`, `destroy`, `nullify` and `restrict`, which are spellings
+#     accepted *after* `dependent =`, never keys of `#[model(...)]`. Following
+#     it let `#[model(delete_all = true)]` pass.
+#   - **A macro's grammar may span files.** The route verbs dispatch from
+#     `route.rs` but parse their keys in the shared `parse.rs`, so a
+#     single-file read reported `#[get(api_version = "v1")]` — three correct
+#     pages of `docs/guide/api-versioning.md` — as drift. `OWNERS` therefore
+#     takes a tuple where one file is not the whole story.
+#
+# Symmetrically, only the attribute's **own** keys are judged: a nested group
+# carries its own grammar, so `#[get("/about", seo(title = …, og_type = …))]`
+# names `title` and `og_type` as keys of `seo(...)`. Judging them against
+# `#[get]` reported three correct SEO pages as drift. Nested grammars are not
+# checked at all, which is the safe direction.
 #
 # The union is still deliberately permissive within that scope. A gate that
 # reports a key the macro does accept is worse than one that misses a key it
@@ -82,10 +102,14 @@
 #   - **A macro whose grammar the extractor cannot read is skipped, not
 #     failed.** If the scope yields zero keys, this gate cannot judge that
 #     macro's arguments and says so under `--list` rather than reporting every
-#     key its pages use. `api_doc` and `service` are skipped today; the other
-#     18 are judged, and the self-test holds a floor under that count so a
-#     refactor cannot quietly empty the truth set — the failure mode where a
-#     gate keeps passing because it stopped looking.
+#     key its pages use. Six are skipped today — `api_doc`, `mailer_preview`,
+#     `oauth2_callback`, `public`, `service` and `sim_test`, none of which
+#     takes keyword arguments — and the other 27 are judged. The self-test
+#     holds a floor under that count so a refactor cannot quietly empty the
+#     truth set, the failure mode where a gate keeps passing because it
+#     stopped looking, and a second case fails if `lib.rs` exports a macro
+#     `OWNERS` does not name: an unregistered macro is not a permissive read
+#     but no read at all.
 #   - **Only fenced Rust is read.** `docs/guide/agent-authority.md` discusses a
 #     `#[repository(.., grant = X)]` key in prose as an explicitly-named
 #     follow-up that does not exist yet. That is a correct sentence about a
@@ -95,6 +119,11 @@
 #   - **`==` is not a keyword argument.** `#[cfg(feature = "db")]`-style keys
 #     are matched by `key =` but a comparison inside a macro argument is not,
 #     hence the `=(?!=)` lookahead.
+#   - **A delimiter inside a literal is data, not structure.** The depth scan
+#     skips `"…"`, `'…'` and `r#"…"#` before counting, so
+#     `#[secured("admin)", policy = "x")]` no longer ends at the `)` inside the
+#     role string. Any argument carrying a route pattern, regex or glob has the
+#     same shape.
 #
 # ── Corpus ───────────────────────────────────────────────────────────────────
 #
@@ -132,6 +161,13 @@
 # `<macro>.<key>` so a waiver for one macro's key cannot silently bless
 # another's.
 #
+# "Beside the passage" is enforced, not merely advised: a marker covers the
+# fence it introduces (within `WAIVER_REACH` lines above it, or inside it) and
+# nothing else. Collapsing every marker in a file to one `(macro, key)` set
+# would mean a single legitimate waiver near the top of a long guide silently
+# accepting every later use of that key on the page, including an unrelated
+# typo — a waiver that reads as local but behaves as a file-wide opt-out.
+#
 # Run locally with:
 #
 #   scripts/check-docs-macro-args.sh             # the gate
@@ -163,27 +199,48 @@ MACRO_SRC = ROOT / "autumn-macros" / "src"
 
 # The source file that owns each attribute macro's argument grammar. Keyed by
 # the macro name as it is written at a call site.
+#
+# Every `#[proc_macro_attribute]` `autumn-macros` exports is registered, and
+# `registry_covers_every_exported_macro` in the self-test reads that list out of
+# `lib.rs` and fails if one is missing. An unregistered macro is not a
+# permissive read, it is no read at all: its pages go completely ungated while
+# the gate still reports a clean run. The route verbs and `#[task]` were absent
+# from the first draft, which left documented keys like
+# `#[get(…, api_version = …)]` and `#[task(name = …)]` unchecked.
 OWNERS = {
     "agent_operable": "agent_authority.rs",
     "api_doc": "api_doc.rs",
     "authorize": "authorize.rs",
     "cached": "cached.rs",
+    "delete": ("route.rs", "parse.rs"),
     "edge": "edge.rs",
     "event": "event.rs",
     "feature_flag": "feature_flag.rs",
+    "get": ("route.rs", "parse.rs"),
     "inbound_mail": "inbound_mail.rs",
     "job": "job.rs",
     "lifecycle": "lifecycle.rs",
     "listener": "listener.rs",
     "mailer": "mailer.rs",
+    "mailer_preview": "mailer_preview.rs",
+    "main": "main_macro.rs",
     "model": "model.rs",
+    "oauth2_callback": "oauth2_callback.rs",
+    "patch": ("route.rs", "parse.rs"),
+    "post": ("route.rs", "parse.rs"),
+    "public": "public.rs",
+    "put": ("route.rs", "parse.rs"),
     "query_budget": "query_budget.rs",
     "repository": "repository.rs",
     "scheduled": "scheduled.rs",
     "secured": "secured.rs",
     "service": "service.rs",
+    "sim_test": "sim_test.rs",
+    "static_get": ("static_route.rs", "parse.rs"),
     "step_up": "step_up.rs",
+    "task": "one_off_task.rs",
     "throttle": "throttle.rs",
+    "ws": ("ws.rs", "parse.rs"),
 }
 
 # Every shape a macro source uses to name an argument key it accepts. See the
@@ -233,6 +290,19 @@ IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 ATTR_PARAM = re.compile(r"\battr\s*:\s*(?:proc_macro2::)?TokenStream")
 ITEM_PARAM = re.compile(r"\bitem\s*:\s*(?:proc_macro2::)?TokenStream")
 
+# A function that parses attribute *arguments* receives the attribute in some
+# syn form. One that receives only a `&str` is parsing a *value* already handed
+# to it, and its string literals are values, not keys — `DependentAction::parse
+# (action: &str)` in `model.rs` matches `delete_all`, `destroy`, `nullify` and
+# `restrict`, which are spellings accepted *after* `dependent =`, never keys of
+# `#[model(...)]` itself. Following it made `#[model(delete_all = true)]` pass.
+# `job.rs`'s three helpers take `ParseNestedMeta` and must stay reachable, so
+# the test is on the parameter types rather than on the function name.
+ARG_PARAM = re.compile(
+    r":\s*&?\s*(?:mut\s+)?(?:syn::)?(?:meta::)?"
+    r"(ParseNestedMeta|Meta|MetaList|TokenStream|Attribute|ParseStream|ExprLit|Expr|Lit)\b"
+)
+
 
 def _balanced(src, open_idx, opener="{", closer="}"):
     """Text between `open_idx`'s delimiter and its match."""
@@ -273,12 +343,20 @@ def accepted_keys():
     within the file so a grammar split across helpers is read whole.
     """
     out = {}
-    for macro, filename in OWNERS.items():
-        path = MACRO_SRC / filename
-        if not path.exists():
+    for macro, owned in OWNERS.items():
+        # A macro's grammar may span files: the route verbs dispatch into
+        # `route.rs` but parse their keys in the shared `parse.rs`, so reading
+        # only the first left `#[get(api_version = …)]` reported as drift.
+        filenames = (owned,) if isinstance(owned, str) else owned
+        sources = [
+            strip_test_mods((MACRO_SRC / f).read_text(encoding="utf-8", errors="replace"))
+            for f in filenames
+            if (MACRO_SRC / f).exists()
+        ]
+        if not sources:
             out[macro] = set()
             continue
-        src = strip_test_mods(path.read_text(encoding="utf-8", errors="replace"))
+        src = "\n".join(sources)
         blocks = code_blocks(src)
         takes_attr, arg_parsers = [], []
         for name, defs in blocks.items():
@@ -297,7 +375,12 @@ def accepted_keys():
             if name in seen:
                 continue
             seen.add(name)
-            for body, _ in blocks.get(name, []):
+            for body, params in blocks.get(name, []):
+                # A root is read whatever it takes; a callee is read only if it
+                # receives the attribute in some syn form. One taking a bare
+                # `&str` is parsing a value, and its literals are values.
+                if name not in roots and params and not ARG_PARAM.search(params):
+                    continue
                 scoped.append(body)
                 for ident in set(IDENT.findall(body)):
                     if ident in blocks and ident not in seen:
@@ -364,6 +447,36 @@ WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
+def top_level_keys(args):
+    """The keyword-argument names at the attribute's own nesting level.
+
+    A nested group carries its own grammar: `#[get("/about", seo(title = …,
+    og_type = …))]` names `title` and `og_type` as keys of `seo(...)`, not of
+    `#[get]`. Judging them against the outer macro's key set reported three
+    correct SEO pages as drift. Nested grammars are simply not checked, which
+    is the safe direction — a miss, not a false alarm.
+    """
+    buf, depth, i = [], 0, 0
+    while i < len(args):
+        ch = args[i]
+        if ch in "\"'":
+            i = skip_literal(args, i)
+            continue
+        if ch == "r" and args[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(args, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0:
+            buf.append(ch)
+        i += 1
+    return KEYWORD_ARG.findall("".join(buf))
+
+
 # A call site may qualify the macro: `#[autumn_web::repository(...)]` and
 # `#[autumn_macros::model(...)]` are documented, idiomatic forms and appear in
 # shipped rustdoc (`autumn/src/aggregate.rs`, `autumn/src/classify/mod.rs`).
@@ -373,6 +486,39 @@ MACRO_OPEN = re.compile(
     + "|".join(sorted(OWNERS))
     + r")\("
 )
+
+
+def skip_literal(text, i):
+    """Index just past the `"…"` or `'…'` literal opening at `i`.
+
+    A delimiter inside a literal is data, not structure: `#[secured("admin)",
+    policy = "x")]` closed the attribute on the `)` inside the role string and
+    never reached `policy`. Any argument carrying a route pattern, regex or
+    glob has the same shape.
+    """
+    quote, i = text[i], i + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == quote:
+            return i + 1
+        i += 1
+    return i
+
+
+def skip_raw_literal(text, i):
+    """Index just past a `r"…"` / `r#"…"#` literal at `i`, or None if not one."""
+    j = i + 1
+    hashes = 0
+    while j < len(text) and text[j] == "#":
+        hashes += 1
+        j += 1
+    if j >= len(text) or text[j] != '"':
+        return None
+    close = '"' + "#" * hashes
+    end = text.find(close, j + 1)
+    return len(text) if end == -1 else end + len(close)
 
 
 def find_macro_calls(text):
@@ -396,6 +542,14 @@ def find_macro_calls(text):
         i, depth = match.end(), 1
         while i < len(text) and depth:
             ch = text[i]
+            if ch in "\"'":
+                i = skip_literal(text, i)
+                continue
+            if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
+                nxt = skip_raw_literal(text, i)
+                if nxt is not None:
+                    i = nxt
+                    continue
             if ch in "([":
                 depth += 1
             elif ch in ")]":
@@ -462,23 +616,54 @@ def judge_fences(rel, fence_lines, accepted, judgeable, waived):
                 break
         return found
 
+    fence_start, fence_end = fence_lines[0][0], fence_lines[-1][0]
     out = []
     for macro, args, offset in find_macro_calls(text):
         if macro not in judgeable:
             continue
-        for key in KEYWORD_ARG.findall(args):
-            if key in accepted[macro] or (macro, key) in waived:
+        for key in top_level_keys(args):
+            if key in accepted[macro]:
+                continue
+            if waiver_covers(waived, macro, key, fence_start, fence_end):
                 continue
             out.append((macro, key, f"{rel}:{line_of(offset)}"))
     return out
 
 
 def collect_waivers(lines):
-    waived = set()
-    for line in lines:
+    """`(macro, key) -> [waiver line numbers]`.
+
+    Positions are kept, not flattened to a set. A waiver is documented as
+    sitting *beside the passage*, and a file-global one does not behave that
+    way: one legitimate `secured.policy` waiver near the top of a long guide
+    would silently accept every later `#[secured(policy = …)]` on the page,
+    including an unrelated typo. `waiver_covers` below turns a position into
+    the single fence it introduces.
+    """
+    waived = collections.defaultdict(list)
+    for lineno, line in enumerate(lines, 1):
         for macro, key in WAIVER.findall(line):
-            waived.add((macro, key))
+            waived[(macro, key)].append(lineno)
     return waived
+
+
+def waiver_covers(waived, macro, key, fence_start, fence_end):
+    """True when a waiver for `macro.key` introduces this fence.
+
+    "Beside the passage" means the marker sits in the run of lines immediately
+    before the fence opens, or inside the fence itself. A marker further up the
+    page belongs to some other passage and does not reach this one.
+    """
+    for lineno in waived.get((macro, key), ()):
+        if fence_start - WAIVER_REACH <= lineno <= fence_end:
+            return True
+    return False
+
+
+# How far above a fence a waiver may sit and still be "beside" it: enough for a
+# marker plus the blank line and a wrapped comment, not enough to reach the
+# previous passage.
+WAIVER_REACH = 6
 
 
 def scan_markdown(path, accepted, judgeable, _calls=None):
@@ -652,8 +837,32 @@ def self_test():
     # nothing rather than reporting every key the macro's pages use. The floor
     # guards against a refactor quietly emptying the truth set wholesale — the
     # failure mode where a gate keeps passing because it stopped looking.
-    check("most macros are judgeable", len(judgeable) >= 17, True)
-    check("skipped macros are named", sorted(set(OWNERS) - judgeable), ["api_doc", "service"])
+    check("most macros are judgeable", len(judgeable) >= 25, True)
+    check(
+        "skipped macros are named",
+        sorted(set(OWNERS) - judgeable),
+        ["api_doc", "mailer_preview", "oauth2_callback", "public", "service", "sim_test"],
+    )
+    # The route verbs parse their keys in `parse.rs`, not the file they
+    # dispatch from. Reading only one file reported `api_version` as drift.
+    check("get accepts api_version (cross-file grammar)", "api_version" in accepted["get"], True)
+    check("static_get accepts params", "params" in accepted["static_get"], True)
+    # A nested group's keys belong to the group, not the outer macro.
+    check(
+        "markdown: nested group keys are not judged against the outer macro",
+        scan_text(
+            '```rust\n#[get("/about", seo(title = "T", og_type = "website"))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: a bad top-level key beside a nested group is still caught",
+        scan_text(
+            '```rust\n#[get("/a", seo(title = "T"), bogus = 1)]\n```\n', ".md"
+        ),
+        [("get", "bogus")],
+    )
 
     # A bad key inside a fence is a defect.
     check(
@@ -751,6 +960,74 @@ def self_test():
         "markdown: multiline defect reports the opening line",
         scan_text_lines("pad\n```rust\n#[model(\n    bogus = 1,\n)]\n```\n", ".md"),
         ["3"],
+    )
+
+    # Every exported attribute macro is registered. An unregistered one is not
+    # a permissive read but no read at all: its pages go ungated while the gate
+    # still reports a clean run.
+    lib = (MACRO_SRC / "lib.rs").read_text(encoding="utf-8", errors="replace")
+    exported = set()
+    for block in lib.split("#[proc_macro_attribute]")[1:]:
+        found = re.search(r"pub fn ([a-z_0-9]+)\s*\(", block)
+        if found:
+            exported.add(found.group(1))
+    check("registry covers every exported macro", sorted(exported - set(OWNERS)), [])
+    check("route verbs are registered", "get" in OWNERS and "post" in OWNERS, True)
+
+    # A value spelling reachable from the parser is not a key. `delete_all`,
+    # `destroy`, `nullify` and `restrict` are accepted *after* `dependent =`,
+    # never as `#[model(...)]` keys.
+    check("model rejects a dependent-action value", "delete_all" in accepted["model"], False)
+    check(
+        "markdown: a parser value is not an accepted key",
+        scan_text('```rust\n#[model(delete_all = true)]\n```\n', ".md"),
+        [("model", "delete_all")],
+    )
+    # …while a grammar genuinely split across helper parsers stays reachable.
+    check("job still accepts unique_by", "unique_by" in accepted["job"], True)
+
+    # A delimiter inside a literal is data, not structure.
+    check(
+        "markdown: paren inside a string does not end the attribute",
+        scan_text('```rust\n#[secured("admin)", policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: bracket inside a string does not end the attribute",
+        scan_text('```rust\n#[secured("a]b", bogus = 1)]\n```\n', ".md"),
+        [("secured", "bogus")],
+    )
+    check(
+        "markdown: raw string is skipped whole",
+        scan_text('```rust\n#[secured(r#"a)b"#, bogus = 1)]\n```\n', ".md"),
+        [("secured", "bogus")],
+    )
+    check(
+        "markdown: escaped quote does not end the literal",
+        scan_text('```rust\n#[secured("a\\")x", bogus = 1)]\n```\n', ".md"),
+        [("secured", "bogus")],
+    )
+
+    # A waiver reaches the passage it introduces, and no further.
+    check(
+        "markdown: waiver covers the fence it introduces",
+        scan_text(
+            "<!-- macro-arg-allow: secured.policy — another framework's name -->\n"
+            '```rust\n#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: waiver does not reach a distant later passage",
+        scan_text(
+            "<!-- macro-arg-allow: secured.policy -->\n"
+            '```rust\n#[secured(policy = "x")]\n```\n'
+            + "\nfiller\n" * 12
+            + '```rust\n#[secured(policy = "typo")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
     )
     # `==` is a comparison, not a keyword argument.
     check(

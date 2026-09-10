@@ -67,10 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extraction is scoped to each macro's own argument parser — located
   structurally as the function taking `attr: TokenStream` but not
   `item: TokenStream` — rather than to its whole source file, so `model.rs`'s
-  ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. A macro
-  whose grammar cannot be read that way is skipped rather than reported
-  against; 18 of 20 are judged. Carries `--list` and a 34-case `--self-test`.
-  The baseline run found five defects.
+  ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. Every
+  `#[proc_macro_attribute]` the crate exports is registered, checked against
+  `lib.rs` by the self-test; a macro whose grammar cannot be read is skipped
+  rather than reported against, and 27 of 33 are judged. Only an attribute's
+  own keys are judged, since a nested group such as `seo(…)` carries its own
+  grammar. Carries `--list` and a 49-case `--self-test`. The baseline run found
+  five defects.
 
 - **Migration version gate: starter templates no longer collide with their
   examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
