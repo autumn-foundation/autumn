@@ -124,6 +124,16 @@ pub struct PolicyContext {
     /// `Post::scope(&ctx).load(&mut db).await?` ergonomic the
     /// authorization guide documents.
     pub policy_registry: PolicyRegistry,
+
+    /// The verified mTLS client identity of the connection this request
+    /// arrived on (issue #1640), when one was presented and verified.
+    ///
+    /// Machine identity, alongside the session user and token scopes: an
+    /// `#[authorize]` policy can decide on the calling *service*, not just the
+    /// calling person. `None` for every request over a connection with no
+    /// verified client certificate.
+    #[cfg(feature = "tls")]
+    pub client_identity: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
 }
 
 impl PolicyContext {
@@ -184,6 +194,13 @@ impl PolicyContext {
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
+            // Seeded from the ambient request scope the HTTPS listener
+            // establishes (#1640), so every policy path — `#[authorize]`, a
+            // `#[repository(policy = ...)]` auto-API, or a hand-written check —
+            // sees machine identity without threading it through each call
+            // site. `None` outside a request, and on every non-mTLS connection.
+            #[cfg(feature = "tls")]
+            client_identity: crate::tls::client_auth::current_client_identity(),
         }
     }
 
@@ -272,6 +289,39 @@ impl PolicyContext {
     pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
         self.scopes = scopes;
         self
+    }
+
+    /// Attach a verified mTLS client identity to the context (issue #1640).
+    /// Used by the framework when authorizing a request that arrived over a
+    /// verified client-certificate connection; tests and hand-written handlers
+    /// can also call this to inject a machine identity by hand.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_client_identity(
+        mut self,
+        identity: std::sync::Arc<crate::tls::client_auth::ClientIdentity>,
+    ) -> Self {
+        self.client_identity = Some(identity);
+        self
+    }
+
+    /// Whether the request arrived over a connection with a verified client
+    /// certificate.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub const fn has_client_identity(&self) -> bool {
+        self.client_identity.is_some()
+    }
+
+    /// Whether the verified client certificate carries `san`, e.g.
+    /// `ctx.client_has_san("URI:spiffe://acme/svc/orders")`. `false` when there
+    /// is no verified identity.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn client_has_san(&self, san: &str) -> bool {
+        self.client_identity
+            .as_ref()
+            .is_some_and(|id| id.has_san(san))
     }
 
     /// Build a fully-populated [`PolicyContext`] from `AppState` + `Session`,
@@ -1024,6 +1074,8 @@ mod tests {
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
+            #[cfg(feature = "tls")]
+            client_identity: None,
         }
     }
 

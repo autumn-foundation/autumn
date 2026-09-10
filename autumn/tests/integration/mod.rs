@@ -387,6 +387,8 @@ mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_app_surface;
 #[cfg(feature = "tls")]
+mod tls_client_auth;
+#[cfg(feature = "tls")]
 mod tls_serving;
 #[cfg(feature = "tls")]
 mod tls_support;

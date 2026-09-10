@@ -151,6 +151,7 @@ impl HeadersOnly for SecurityDump {
                 exempt_paths: Vec::new(),
             },
             headers: self.headers.clone(),
+            client_auth: self.client_auth.clone(),
         }
     }
 }
