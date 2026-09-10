@@ -50,11 +50,16 @@
 # of shapes, and the extractor reads all of them:
 #
 #   meta.path.is_ident("ttl")            `#[cached(ttl = …)]`
-#   key != "grant" / ident == "table"    `#[agent_operable(grant = …)]`
+#   key != "grant"                       `#[agent_operable(grant = …)]`
 #   key.as_deref() != Some("max_age")    `#[step_up(max_age = …)]`
 #   match key.as_str() { "resource" =>   `#[authorize(resource = …)]`
 #
-# That last one is read only where the scrutinee is a *key*. The same shape
+# The last two are read only where the thing being tested is a *key*. A
+# comparison needs a positively key-ish left side rather than merely a
+# not-value-ish one: `window != "pending"` in `job.rs` tests what follows
+# `unique_window =`, and `basis == "deleted_at"` in `repository.rs` tests a
+# retention basis. Neither comparand reads as a value, so defaulting the
+# unknown case to "key" admitted both and let `#[job(pending = true)]` pass. The same shape
 # spells out values elsewhere — `repository.rs` matches `"destroy"`,
 # `"delete_all"`, `"nullify"` and `"restrict"` as the spellings accepted after
 # `on_delete =`, inside `parse_repo_args` itself — and reading those arms let
@@ -206,8 +211,10 @@
 # another's.
 #
 # "Beside the passage" is enforced, not merely advised: a marker covers the
-# fence it introduces (within `WAIVER_REACH` lines above it, or inside it) and
-# nothing else. Collapsing every marker in a file to one `(macro, key)` set
+# fence it is inside, or else the next one to open within `WAIVER_REACH` lines,
+# and is then spent. Applying that window independently to every fence let one
+# marker waive several — two consecutive one-line fences both sit within six
+# lines of a marker written for the first. Collapsing every marker in a file to one `(macro, key)` set
 # would mean a single legitimate waiver near the top of a long guide silently
 # accepting every later use of that key on the page, including an unrelated
 # typo — a waiver that reads as local but behaves as a file-wide opt-out.
@@ -291,9 +298,27 @@ OWNERS = {
 # header for why the union is deliberately permissive.
 KEY_PATTERNS = (
     r'is_ident\("([a-z_0-9]+)"\)',
-    r'[!=]=\s*"([a-z_0-9]+)"',
     r'Some\("([a-z_0-9]+)"\)',
 )
+
+# `x == "…"` names a key only when `x` is one. The same shape compares values:
+# `window != "pending"` in `job.rs` tests what follows `unique_window =`, and
+# `value == "fetch"` / `basis == "deleted_at"` in `repository.rs` do the same
+# for `validate_on_update` and the retention basis. Reading them let
+# `#[job(pending = true)]` and `#[repository(Post, deleted_at = true)]` pass.
+#
+# Unlike the match-arm reader this requires a positively key-ish left side
+# rather than merely a not-value-ish one: `window` and `basis` are neither, and
+# defaulting an unknown comparand to "key" is what admitted them.
+COMPARISON = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[!=]=\s*\"([a-z_0-9]+)\"")
+
+
+def comparison_keys(text):
+    return {
+        value
+        for lhs, value in COMPARISON.findall(text)
+        if KEYISH_SCRUTINEE.match(lhs)
+    }
 
 # Some grammars dispatch keys through a `match` rather than `is_ident`, so the
 # arms carry real keys — `authorize.rs` does exactly that for `resource` and
@@ -587,6 +612,7 @@ def accepted_keys():
         for pattern in KEY_PATTERNS:
             keys |= set(re.findall(pattern, text))
         keys |= match_arm_keys(text)
+        keys |= comparison_keys(text)
         # A macro whose parser was FOUND but yields no keys of its own is a
         # marker like `#[public]`: `crate` is then its entire grammar, and it
         # is judgeable on that alone — otherwise `#[public(crtae = "renamed")]`
@@ -897,15 +923,12 @@ def judge_fences(rel, fence_lines, accepted, judgeable, waived):
                 break
         return found
 
-    fence_start, fence_end = fence_lines[0][0], fence_lines[-1][0]
     out = []
     for macro, args, offset in find_macro_calls(text):
         if macro not in judgeable:
             continue
         for key, is_flag in top_level_keys(args):
-            if key in accepted[macro]:
-                continue
-            if waiver_covers(waived, macro, key, fence_start, fence_end):
+            if key in accepted[macro] or (macro, key) in waived:
                 continue
             out.append((macro, key, f"{rel}:{line_of(offset)}", is_flag))
     return out
@@ -928,17 +951,28 @@ def collect_waivers(lines):
     return waived
 
 
-def waiver_covers(waived, macro, key, fence_start, fence_end):
-    """True when a waiver for `macro.key` introduces this fence.
+def assign_waivers(waived, fences):
+    """Bind each waiver marker to exactly ONE fence: the one it introduces.
 
-    "Beside the passage" means the marker sits in the run of lines immediately
-    before the fence opens, or inside the fence itself. A marker further up the
-    page belongs to some other passage and does not reach this one.
+    Applying a proximity window independently to every fence let a single
+    marker waive several: two consecutive one-line fences both sit inside the
+    six-line reach of a marker written for the first, so both invalid examples
+    passed. A marker waives the fence it is inside, otherwise the *next* fence
+    to open, and then it is spent.
+
+    `fences` is a list of `(start, end)` line pairs in document order. Returns
+    a list of `set[(macro, key)]`, one per fence.
     """
-    for lineno in waived.get((macro, key), ()):
-        if fence_start - WAIVER_REACH <= lineno <= fence_end:
-            return True
-    return False
+    per_fence = [set() for _ in fences]
+    for (macro, key), linenos in waived.items():
+        for lineno in linenos:
+            for index, (start, end) in enumerate(fences):
+                inside = start <= lineno <= end
+                introduces = start - WAIVER_REACH <= lineno < start
+                if inside or introduces:
+                    per_fence[index].add((macro, key))
+                    break  # spent on this fence, and no other
+    return per_fence
 
 
 # How far above a fence a waiver may sit and still be "beside" it: enough for a
@@ -947,12 +981,27 @@ def waiver_covers(waived, macro, key, fence_start, fence_end):
 WAIVER_REACH = 6
 
 
+def _judge_collected(rel, collected, accepted, judgeable, waived):
+    """Judge every collected fence, each with only the waivers bound to it."""
+    spans = [(block[0][0], block[-1][0]) for block in collected if block]
+    bound = assign_waivers(waived, spans)
+    found, index = [], 0
+    for block in collected:
+        if not block:
+            continue
+        found.extend(
+            judge_fences(rel, block, accepted, judgeable, bound[index])
+        )
+        index += 1
+    return found
+
+
 def scan_markdown(path, accepted, judgeable, _calls=None):
-    """Yield (macro, key, line) for keyword args inside fenced Rust."""
+    """Yield (macro, key, line, is_flag) for arguments inside fenced Rust."""
     rel = path.relative_to(ROOT)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
-    inside, fences, found, current = False, 0, [], []
+    inside, fences, collected, current = False, 0, [], []
     for lineno, line in enumerate(lines, 1):
         # A fenced example inside a block quote is still an example a reader
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
@@ -961,7 +1010,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         stripped = BLOCKQUOTE.sub("", line).lstrip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
             if inside:
-                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+                collected.append(current)
                 current, inside = [], False
             else:
                 lang = stripped[3:].strip().lower()
@@ -971,8 +1020,8 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
             continue
         if inside:
             current.append((lineno, BLOCKQUOTE.sub("", line)))
-    found.extend(judge_fences(rel, current, accepted, judgeable, waived))
-    return found, fences
+    collected.append(current)
+    return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
 
 def scan_rustdoc(path, accepted, judgeable, _calls=None):
@@ -980,20 +1029,20 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     rel = path.relative_to(ROOT)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
-    inside, fences, found, current = False, 0, [], []
+    inside, fences, collected, current = False, 0, [], []
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
             # A non-doc line ends any fence: an unterminated fence must not
             # swallow the rest of the file.
             if inside:
-                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+                collected.append(current)
             current, inside = [], False
             continue
         body = doc.group(1).strip()
         if body.startswith("```"):
             if inside:
-                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+                collected.append(current)
                 current, inside = [], False
             else:
                 # rustdoc fences default to Rust, and the attribute-bearing
@@ -1008,8 +1057,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             continue
         if inside:
             current.append((lineno, body))
-    found.extend(judge_fences(rel, current, accepted, judgeable, waived))
-    return found, fences
+    collected.append(current)
+    return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
 
 def run_scan():
@@ -1320,6 +1369,54 @@ def self_test():
         "markdown: nested block quote is scanned",
         scan_text('> > ```rust\n> > #[secured(policy = "x")]\n> > ```\n', ".md"),
         [("secured", "policy")],
+    )
+
+    # `x == "…"` names a key only when `x` is one. `window != "pending"` and
+    # `basis == "deleted_at"` compare values.
+    check("job rejects a compared value", "pending" in accepted["job"], False)
+    check("repository rejects a compared value", "deleted_at" in accepted["repository"], False)
+    check("agent_operable keeps its compared key", "grant" in accepted["agent_operable"], True)
+    check(
+        "markdown: a compared value is not an accepted key",
+        scan_text("```rust\n#[job(pending = true)]\n```\n", ".md"),
+        [("job", "pending")],
+    )
+    check(
+        "markdown: real job keys still pass",
+        scan_text('```rust\n#[job(queue = "mail", max_attempts = 3)]\n```\n', ".md"),
+        [],
+    )
+
+    # A waiver is spent on the one fence it introduces.
+    check(
+        "markdown: waiver does not carry to the next fence",
+        scan_text(
+            "<!-- macro-arg-allow: secured.policy -->\n"
+            '```rust\n#[secured(policy = "x")]\n```\n'
+            '```rust\n#[secured(policy = "typo")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: waiver still covers its own fence",
+        scan_text(
+            "<!-- macro-arg-allow: secured.policy -->\n"
+            '```rust\n#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: two waivers cover two fences",
+        scan_text(
+            "<!-- macro-arg-allow: secured.policy -->\n"
+            '```rust\n#[secured(policy = "x")]\n```\n'
+            "<!-- macro-arg-allow: secured.policy -->\n"
+            '```rust\n#[secured(policy = "y")]\n```\n',
+            ".md",
+        ),
+        [],
     )
 
     # A bad key inside a fence is a defect.
