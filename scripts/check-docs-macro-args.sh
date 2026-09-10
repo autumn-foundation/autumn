@@ -1407,6 +1407,31 @@ WAIVER_REACH = 6
 FENCE_INDENT_MAX = 3
 
 
+def _fence_body(line):
+    """A line with its block-quote prefix removed, unless it is over-indented.
+
+    The quote marker is itself subject to the indentation rule: at four spaces
+    `    > ```rust` is an indented code block DISPLAYING a quoted fence, not a
+    quote containing one. Stripping the prefix first also stripped the
+    indentation that says so, and the display was judged as live Rust.
+    """
+    if len(line) - len(line.lstrip(" ")) > FENCE_INDENT_MAX:
+        return line
+    return BLOCKQUOTE.sub("", line)
+
+
+def _fence_lang(suffix):
+    """The info string's first token, lower-cased.
+
+    An info string is arbitrary text, so `rust` has to match as a whole token
+    rather than a prefix: ```rustic is not Rust, and judging it as Rust failed
+    the gate on a fence that is not even claiming to be an Autumn example. The
+    corpus writes `rust`, `rust,ignore` and `rust,no_run`, all of which this
+    reads as `rust`.
+    """
+    return re.split(r"[,\s]", suffix.strip().lower())[0]
+
+
 def _fence_at(body):
     """`(char, length, suffix)` when `body` is a fence line, else None.
 
@@ -1451,7 +1476,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
-        body = BLOCKQUOTE.sub("", line)
+        body = _fence_body(line)
         fence = _fence_at(body)
         handled = False
         if fence:
@@ -1461,9 +1486,8 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                 # displaying a literal ```rust example is documentation ABOUT
                 # a fence; treating the inner delimiter as live structure made
                 # the displayed attribute fail the gate.
-                lang = suffix.strip().lower()
                 open_char, open_len = char, length
-                inside = lang.startswith("rust")
+                inside = _fence_lang(suffix) == "rust"
                 if inside:
                     fences += 1
                 handled = True
@@ -1526,7 +1550,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # Indentation is kept, not stripped: the same CommonMark rules decide a
         # fence here as in markdown, and both the four-space limit and the
         # closing-suffix check need it.
-        body = BLOCKQUOTE.sub("", doc.group(1))
+        body = _fence_body(doc.group(1))
         fence = _fence_at(body)
         handled = False
         if fence:
@@ -1535,12 +1559,13 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 # rustdoc fences default to Rust, and the attribute-bearing
                 # ones are usually `ignore` / `no_run` / `compile_fail`. A
                 # `text` fence is still tracked so a Rust fence displayed
-                # inside it is not read as live structure.
-                lang = suffix.strip().lower()
+                # inside it is not read as live structure. The token has to
+                # match whole here too, or ```rustic reads as Rust.
+                token = _fence_lang(suffix)
                 open_char, open_len = char, length
-                inside = lang == "" or re.match(
-                    r"^(rust|ignore|no_run|compile_fail|should_panic|edition\d+)",
-                    lang,
+                inside = token == "" or re.fullmatch(
+                    r"rust|ignore|no_run|compile_fail|should_panic|edition\d+",
+                    token,
                 ) is not None
                 if inside:
                     fences += 1
@@ -1959,6 +1984,46 @@ def self_test():
             '//!     ```rust\n//!     #[secured(policy = "x")]\n//!     ```\n', ".rs"
         ),
         [],
+    )
+    # The quote marker is itself subject to the indentation rule, so the
+    # prefix cannot be stripped before the rule is applied.
+    check(
+        "markdown: an indented display of a quoted fence is not a fence",
+        scan_text(
+            '    > ```rust\n    > #[secured(policy = "x")]\n    > ```\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: a quoted fence within the allowance is still scanned",
+        scan_text('  > ```rust\n  > #[secured(policy = "x")]\n  > ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # An info string is arbitrary text, so `rust` matches as a whole token.
+    check(
+        "markdown: a language merely starting with rust is not Rust",
+        scan_text('```rustic\n#[secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: rust,ignore is Rust",
+        scan_text('```rust,ignore\n#[secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: rust,no_run is Rust",
+        scan_text('```rust,no_run\n#[secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a language merely starting with rust is not Rust",
+        scan_text('//! ```rustic\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [],
+    )
+    check(
+        "rustdoc: a bare ignore fence is still Rust",
+        scan_text('//! ```ignore\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
     )
     # A closing fence may be followed only by whitespace. Closing on any
     # same-length run truncated the block at a `​```not-a-close` line inside a
