@@ -257,9 +257,20 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
     }
+    // A live owner already holds the lock: say so before anything else. That is
+    // the answer the caller acts on, it does not depend on our own pid, and
+    // reporting it here keeps a doomed acquire from spending the start-time
+    // retry budget below only to fail with a less useful error. This is a fast
+    // path, not the claim — `acquire_via_link` re-checks atomically, so a lock
+    // released between here and there is still reclaimed correctly.
+    if let Some(existing) = read_pidfile(path)
+        && is_record_alive(&existing)
+    {
+        return Err(AcquireError::AlreadyRunning(existing.pid));
+    }
     // Record `<pid> <start_time>` so a later reader can reject a reused PID
     // (0 = start time unknown on this platform).
-    let start = process_start_time(pid).unwrap_or(0);
+    let start = record_start_time(pid)?;
     // A private temp sibling, distinct per source file *and* per launcher pid so
     // two concurrent acquirers never share one (and a `serve.pid` acquire can't
     // collide with a `serve.startlock` acquire).
@@ -280,6 +291,61 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
     let result = acquire_via_link(&temp, path);
     let _ = std::fs::remove_file(&temp);
     result
+}
+
+/// How many times to re-ask for a just-spawned process's start time, and how
+/// long to wait between attempts.
+///
+/// Windows enumerates processes from a `ToolHelp` snapshot that can transiently
+/// miss a child spawned moments ago. One miss used to be recorded as "unknown",
+/// and an unknown recorded time is not merely weaker — it is *wrong* in a
+/// specific way: a later `confirmed_running` sees `(None, Some(current))`, has
+/// no endpoint to fall back to on Windows, and concludes the pidfile is stale.
+/// `status` then reports a live daemon as stopped and `stop` deletes its records
+/// without stopping it.
+const START_TIME_ATTEMPTS: u32 = 5;
+const START_TIME_RETRY: Duration = Duration::from_millis(50);
+
+/// The start time to write into a pidfile for `pid`.
+///
+/// Retries, because the caller has just spawned this process and it must exist.
+/// `0` (unknown) is only ever recorded on a platform that genuinely cannot
+/// report one — macOS. Where the platform *can* report one and still does not
+/// after retrying, the acquire fails rather than write a record that a later
+/// reader would misclassify as stale.
+///
+/// # Errors
+///
+/// Returns [`AcquireError::Io`] when the platform reports start times but would
+/// not report this one.
+fn record_start_time(pid: u32) -> Result<u64, AcquireError> {
+    for attempt in 0..START_TIME_ATTEMPTS {
+        if let Some(start) = process_start_time(pid) {
+            return Ok(start);
+        }
+        // A platform that never reports one (macOS) records the documented
+        // "unknown" and relies on the endpoint checks instead; retrying there
+        // would just add latency to every acquire.
+        if !platform_reports_start_times() {
+            return Ok(0);
+        }
+        if attempt + 1 < START_TIME_ATTEMPTS {
+            std::thread::sleep(START_TIME_RETRY);
+        }
+    }
+    Err(AcquireError::Io(std::io::Error::other(format!(
+        "could not read the start time of process {pid}, so its lockfile would \
+         be indistinguishable from a stale one"
+    ))))
+}
+
+/// Whether this platform reports process start times at all.
+///
+/// Linux reads `/proc/<pid>/stat` and Windows the creation `FILETIME`; macOS and
+/// the BSDs report nothing, and the lifecycle's identity checks fall back to
+/// endpoint ownership there.
+const fn platform_reports_start_times() -> bool {
+    cfg!(any(target_os = "linux", windows))
 }
 
 /// Hard-link `temp` (already holding the full record) into `path` as the lock,
@@ -771,13 +837,23 @@ mod windows_impl {
     const PG_SIGNAL_ATTEMPTS: u32 = 10;
     const PG_SIGNAL_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
-    /// `SECURITY_IDENTIFICATION`, for `dwSecurityQosFlags`.
+    /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, for
+    /// `dwSecurityQosFlags`.
     ///
     /// Without an explicit level, opening a named pipe grants the pipe's server
     /// `SecurityImpersonation` — it may call `ImpersonateNamedPipeClient` and
     /// act as us. `stop_postmaster` is reached from the Local System service
     /// host, so a squatter on the pipe path would inherit SYSTEM. Identification
     /// lets the server learn who we are and nothing more.
+    ///
+    /// `SECURITY_SQOS_PRESENT` is the bit that makes Windows *read* the level at
+    /// all. `OpenOptionsExt::security_qos_flags` already ORs it in (std has to,
+    /// since `SECURITY_ANONYMOUS` is `0` and would otherwise be
+    /// indistinguishable from "unset"), so passing it here is redundant today —
+    /// but that is an implementation detail the public documentation does not
+    /// promise, and this is the one line standing between a Local System reaper
+    /// and an impersonation. Stating it costs nothing and cannot be read wrong.
+    const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     /// Load just `pid`'s row, or every row when `pid` is `None`.
@@ -922,7 +998,7 @@ mod windows_impl {
             let delivered = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
                 .open(&path)
                 .and_then(|mut pipe| pipe.write_all(&[signal]).and_then(|()| pipe.flush()))
                 .is_ok();
@@ -1038,7 +1114,11 @@ mod tests {
     fn create_new_rejects_live_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("serve.pid");
-        // Our own PID is alive; a second acquire must be rejected.
+        // Our own PID is alive; a second acquire must be rejected — and must be
+        // rejected AS `AlreadyRunning`, not as some earlier failure. The second
+        // acquire below names a pid that does not exist, which is exactly the
+        // shape of a caller whose child died mid-start: the live owner is still
+        // the more useful answer.
         acquire_pidfile(&path, std::process::id()).expect("first acquire");
         match acquire_pidfile(&path, std::process::id() + 1) {
             Err(AcquireError::AlreadyRunning(pid)) => assert_eq!(pid, std::process::id()),
@@ -1095,6 +1175,45 @@ mod tests {
         assert!(wait_with_timeout(&mut child, Duration::from_millis(100)).is_err());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ── Pidfile start-time capture (#1639) ───────────────────────────────
+
+    #[test]
+    fn a_pidfile_records_a_real_start_time_where_the_platform_has_one() {
+        // An "unknown" recorded time is not just weaker on Windows — it is read
+        // as *stale*, because there is no endpoint to fall back to. `status`
+        // would call a live daemon stopped and `stop` would delete its records
+        // without stopping it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.pid");
+        acquire_pidfile(&path, std::process::id()).expect("acquire");
+        let rec = read_pidfile(&path).expect("record");
+        assert_eq!(
+            rec.start_time.is_some(),
+            platform_reports_start_times(),
+            "a platform that reports start times must not record `unknown`"
+        );
+    }
+
+    #[test]
+    fn a_start_time_for_a_process_that_does_not_exist_fails_the_acquire() {
+        // Better a loud failure at start than a lockfile a later reader
+        // misclassifies as stale.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.pid");
+        let outcome = acquire_pidfile(&path, 2_147_483_640);
+        if platform_reports_start_times() {
+            assert!(
+                matches!(outcome, Err(AcquireError::Io(_))),
+                "expected an Io error, got {outcome:?}"
+            );
+            assert!(!path.exists(), "no lockfile may be left behind");
+        } else {
+            // macOS reports no start time for anything, so `unknown` is correct
+            // there and the endpoint checks carry the identity instead.
+            assert!(outcome.is_ok());
+        }
     }
 
     // ── Portable stop request (#1639) ────────────────────────────────────
