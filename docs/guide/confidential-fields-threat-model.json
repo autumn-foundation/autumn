@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "slice": "confidential-fields-slice-one",
+  "protected_assets": [
+    "confidential_field_plaintext",
+    "client_root_keys"
+  ],
+  "protected_sinks": [
+    { "id": "postgresql", "description": "PostgreSQL data at rest" },
+    { "id": "logs", "description": "application and infrastructure logs" },
+    { "id": "backups", "description": "database and application backups" },
+    { "id": "replay_capsules", "description": "failure replay capsules" },
+    { "id": "server_managed_key_stores", "description": "server-managed key stores" }
+  ],
+  "permitted_leakage": [
+    "ciphertext_size",
+    "access_timing",
+    "owner_identifiers",
+    "tenant_identifiers",
+    "equality_patterns",
+    "traffic_metadata",
+    "schema",
+    "application_controlled_plaintext_fields"
+  ],
+  "excluded_attacks": [
+    "malicious_server_changing_client_code",
+    "active_endpoint_compromise",
+    "client_compromise",
+    "traffic_analysis",
+    "denial_of_service",
+    "authenticated_owner_disclosure"
+  ],
+  "leak_sentinel_test": "autumn/tests/integration/confidential_fields_leak_sentinel.rs"
+}

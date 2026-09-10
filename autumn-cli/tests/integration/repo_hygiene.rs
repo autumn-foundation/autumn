@@ -33,6 +33,37 @@ fn normalize_hygiene_doc(content: &str) -> String {
     content.replace("\r\n", "\n").replace("//! ", "")
 }
 
+#[test]
+fn confidential_fields_protected_sinks_are_in_the_leak_sentinel_test() {
+    let root = workspace_root();
+    let manifest_path = root.join("docs/guide/confidential-fields-threat-model.json");
+    let manifest_text = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .unwrap_or_else(|err| panic!("{} must be valid JSON: {err}", manifest_path.display()));
+
+    let test_path = manifest["leak_sentinel_test"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} must name leak_sentinel_test", manifest_path.display()));
+    let test_source = std::fs::read_to_string(root.join(test_path))
+        .unwrap_or_else(|err| panic!("failed to read {test_path}: {err}"));
+    let sinks = manifest["protected_sinks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{} must contain protected_sinks", manifest_path.display()));
+    assert!(!sinks.is_empty(), "protected_sinks must not be empty");
+
+    for sink in sinks {
+        let id = sink["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every protected sink must have a string id"));
+        let marker = format!("protected-sink:{id}");
+        assert!(
+            test_source.contains(&format!("\"{marker}\"")),
+            "protected sink `{id}` is missing marker `{marker}` from {test_path}"
+        );
+    }
+}
+
 fn workspace_package_value(root_toml: &toml::Value, key: &str) -> String {
     root_toml
         .get("workspace")
