@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **deploy: a live-safe `server.port` change on an existing deployment (issue
+  #2073, Option C).** #2071 refused a redeploy that changed `server.port`
+  because the reboot-durability restart (#2070) could not move the proxy's
+  public listener safely mid-cutover. `autumn deploy` now supports it directly,
+  in four phases: stand the candidate up on a loopback port derived from the
+  OLD public port (so it never collides with the still-live release), flip
+  traffic to it, drain the old release, then rebind the proxy's public listener
+  to the NEW port. That last step is its own failure boundary — a failed rebind
+  rolls the proxy back to the OLD port, and the release stays live and
+  reachable there; retry the port change alone in a separate deploy. The rare
+  case where the rollback itself fails reports that the proxy's public bind is
+  now unknown and needs a human, rather than silently guessing. [no-plugin]
+
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
