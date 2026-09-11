@@ -11,8 +11,10 @@ WHAT THE INVARIANT IS
   `Test (windows-latest)`.
 
 WHAT IT CHECKS
-  For every member of the workspace rooted at the repo root, it enumerates the
-  binary target names cargo would build:
+  For every member of the workspace rooted at the repo root — the listed
+  `[workspace].members` plus in-tree path dependencies, which cargo
+  automatically treats as members even when `members` does not name them —
+  it enumerates the binary target names cargo would build:
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
   - auto-discovered targets whenever `[package] autobins` is not `false`:
@@ -42,6 +44,7 @@ stops catching things fails loud rather than going green on an empty scan.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import sys
 import tempfile
 import tomllib
@@ -51,10 +54,80 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _in_tree_dep_paths(manifest: dict) -> list[str]:
+    """`path = ...` dependencies declared in one member's manifest."""
+    paths: list[str] = []
+    tables: list[dict] = [manifest]
+    targets = manifest.get("target", {})
+    if isinstance(targets, dict):
+        tables += [t for t in targets.values() if isinstance(t, dict)]
+    for table in tables:
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            deps = table.get(section, {})
+            if not isinstance(deps, dict):
+                continue
+            for spec in deps.values():
+                if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                    paths.append(spec["path"])
+    return paths
+
+
 def workspace_members(root: Path) -> list[Path]:
+    """Cargo's effective workspace members for the gate.
+
+    The listed `[workspace].members` plus in-tree path dependencies, which
+    cargo automatically treats as workspace members even when `members` does
+    not name them (Codex review on #2712): a bin-name collision inside such a
+    dependency breaks the Windows link exactly like a listed member's would,
+    so the gate must scan it too. `[workspace].exclude` is honored, and a
+    path dependency that is itself a workspace root (nested workspace) is not
+    recursed into.
+    """
     manifest = tomllib.loads((root / "Cargo.toml").read_text())
-    members = manifest["workspace"]["members"]
-    return [root / m for m in members]
+    ws = manifest.get("workspace", {})
+    exclude = ws.get("exclude", [])
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+
+    def note(member_dir: Path) -> None:
+        if member_dir not in seen:
+            seen.add(member_dir)
+            ordered.append(member_dir)
+
+    def is_excluded(member_dir: Path) -> bool:
+        rel = member_dir.relative_to(root).as_posix()
+        return any(fnmatch.fnmatchcase(rel, pat) for pat in exclude)
+
+    queue: list[Path] = []
+    for m in ws.get("members", []):
+        member_dir = (root / m).resolve()
+        if (member_dir / "Cargo.toml").is_file() and not is_excluded(member_dir):
+            note(member_dir)
+            queue.append(member_dir)
+
+    while queue:
+        member_dir = queue.pop(0)
+        try:
+            member_manifest = tomllib.loads((member_dir / "Cargo.toml").read_text())
+        except OSError:
+            continue
+        for dep_path in _in_tree_dep_paths(member_manifest):
+            dep_dir = (member_dir / dep_path).resolve()
+            try:
+                dep_dir.relative_to(root)
+            except ValueError:
+                continue  # outside the workspace root: never a member
+            if dep_dir in seen or is_excluded(dep_dir):
+                continue
+            if not (dep_dir / "Cargo.toml").is_file():
+                continue
+            dep_manifest = tomllib.loads((dep_dir / "Cargo.toml").read_text())
+            if "workspace" in dep_manifest:
+                continue  # nested workspace root: a separate workspace
+            note(dep_dir)
+            queue.append(dep_dir)
+    return ordered
 
 
 def explicit_bins(member_dir: Path) -> tuple[list[str], set[Path]]:
@@ -162,12 +235,13 @@ def _make_member(tmp: Path, name: str, manifest: str, bins: dict[str, str] | Non
         path.write_text(body)
 
 
-def _make_workspace(tmp: Path, members: list[str]) -> Path:
+def _make_workspace(tmp: Path, members: list[str], exclude: list[str] | None = None) -> Path:
     root = tmp / "root"
     root.mkdir()
-    (root / "Cargo.toml").write_text(
-        "[workspace]\nmembers = [\n" + "".join(f'  "{m}",\n' for m in members) + "]\n"
-    )
+    manifest = "[workspace]\nmembers = [\n" + "".join(f'  "{m}",\n' for m in members) + "]\n"
+    if exclude:
+        manifest += "exclude = [\n" + "".join(f'  "{e}",\n' for e in exclude) + "]\n"
+    (root / "Cargo.toml").write_text(manifest)
     return root
 
 
@@ -340,12 +414,85 @@ def self_test() -> int:
             bin_target_names(root / "app") == ["main"],
         )
 
+    # Case 11 (Codex review): an in-tree path dependency not named in
+    # `[workspace].members` is still a workspace member to cargo, so its bins
+    # are scanned — a collision between it and a listed member is caught.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app", "other"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ndep = { path = "../dep" }\n',
+            {},
+        )
+        _make_member(
+            tmp / "root", "other",
+            '[package]\nname = "other"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "dep",
+            '[package]\nname = "dep"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        expect(
+            "unlisted in-tree path dependency is scanned as a member",
+            any((root / "dep").resolve() == m for m in workspace_members(root)),
+        )
+        total, collisions = check(root)
+        expect(
+            "collision inside unlisted path dependency caught",
+            "clash" in collisions,
+        )
+
+    # Case 12: `[workspace].exclude` keeps an in-tree path dependency out of
+    # the scan, matching cargo.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app", "other"], exclude=["dep"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ndep = { path = "../dep" }\n',
+            {},
+        )
+        _make_member(
+            tmp / "root", "other",
+            '[package]\nname = "other"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "dep",
+            '[package]\nname = "dep"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect("excluded path dependency not scanned", not collisions and total == 1)
+
+    # Case 13: a path dependency outside the workspace root is never a member.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app"])
+        outside = tmp / "outside"
+        (outside / "src" / "bin").mkdir(parents=True)
+        (outside / "Cargo.toml").write_text('[package]\nname = "outside"\nversion = "0.1.0"\n')
+        (outside / "src" / "bin" / "clash.rs").write_text("fn main() {}\n")
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\noutside = { path = "../../outside" }\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "out-of-tree path dependency not scanned",
+            not collisions and total == 1,
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 10 cases passed")
+    print("self-test: all 13 cases passed")
     return 0
 
 
