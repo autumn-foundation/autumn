@@ -359,7 +359,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checker now enumerates both classes — honoring `autobins = false`, covering
   the `src/bin/<name>/main.rs` form, and excluding only paths an explicit
   `[[bin]]` actually claims (its `path`, or the default
-  `src/bin/<name>.rs`) — and carries a synthetic `--self-test` (7 cases) that
+  `src/bin/<name>.rs`) — plus the package-named `src/main.rs` binary cargo
+  auto-discovers (a review finding: an explicit `[[bin]]` named like another
+  member's package would otherwise collide on the linker output undetected) —
+  and carries a synthetic `--self-test` (10 cases) that
   the default invocation runs first, matching the other manifest gates. The
   checker was previously invoked by nothing — no workflow, no pre-push script,
   no test — so a reintroduced duplicate would have passed every enforced check

@@ -15,16 +15,14 @@ WHAT IT CHECKS
   binary target names cargo would build:
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
-  - auto-discovered `src/bin/*.rs` and `src/bin/*/main.rs` targets whenever
-    `[package] autobins` is not `false`.
+  - auto-discovered targets whenever `[package] autobins` is not `false`:
+    `src/main.rs` (named after the package), `src/bin/*.rs` (named after the
+    file stem), and `src/bin/<name>/main.rs` (named after the directory).
 
   An explicit `[[bin]]` does NOT disable auto-discovery (autumn #2690): only
   `autobins = false` does. Auto-discovered paths already claimed by an
   explicit entry — via its `path`, or the default `src/bin/<name>.rs` when no
   `path` is given — are excluded so one target is not counted twice.
-
-  (`src/main.rs` is only ever a target when an explicit `[[bin]]` claims it,
-  named after the package — unique by construction, so it can never collide.)
 
   It fails if the same name is claimed by more than one member.
 
@@ -76,24 +74,40 @@ def explicit_bins(member_dir: Path) -> tuple[list[str], set[Path]]:
 
 def bin_target_names(member_dir: Path) -> list[str]:
     manifest = tomllib.loads((member_dir / "Cargo.toml").read_text())
+    package = manifest.get("package", {})
     explicit_names, claimed_paths = explicit_bins(member_dir)
 
     discovered: list[str] = []
     # #2690: explicit [[bin]] entries do NOT disable auto-discovery — only
     # `[package] autobins = false` does. Enumerate both classes.
-    if manifest.get("package", {}).get("autobins", True) is not False:
-        src_bin = member_dir / "src" / "bin"
+    if package.get("autobins", True) is not False:
+        src = member_dir / "src"
+        # `src/main.rs` is auto-discovered as a binary named after the package
+        # (cargo `inferred_bins`): it is NOT limited to explicit [[bin]]
+        # claims, so an explicit `[[bin]]` named like another member's package
+        # would collide on the linker output and must be caught.
+        package_name = package.get("name")
+        main_rs = src / "main.rs"
+        if (
+            package_name
+            and main_rs.is_file()
+            and main_rs.resolve() not in claimed_paths
+        ):
+            discovered.append(package_name)
+        src_bin = src / "bin"
         if src_bin.is_dir():
-            candidates = sorted(src_bin.glob("*.rs"))
-            candidates += sorted(
-                d / "main.rs"
-                for d in src_bin.iterdir()
-                if d.is_dir() and (d / "main.rs").is_file()
-            )
-            for path in candidates:
+            for path in sorted(src_bin.glob("*.rs")):
                 if path.resolve() in claimed_paths:
                     continue  # same target, declared explicitly
-                discovered.append(path.parent.name if path.name == "main.rs" else path.stem)
+                # cargo names these after the file stem — including the odd
+                # `src/bin/main.rs`, which becomes a target literally named
+                # "main", NOT the package name.
+                discovered.append(path.stem)
+            for d in sorted(src_bin.iterdir()):
+                main = d / "main.rs"
+                if d.is_dir() and main.is_file() and main.resolve() not in claimed_paths:
+                    # `src/bin/<name>/main.rs` is named after the directory.
+                    discovered.append(d.name)
 
     # Deduplicated per member: an explicit bin and an unclaimed auto-discovered
     # file can only share a name when cargo itself would reject the package
@@ -260,8 +274,8 @@ def self_test() -> int:
         total, collisions = check(root)
         expect("distinct names pass", not collisions and total == 2)
 
-    # Case 7: src/main.rs targets are never counted (named after the package,
-    # unique by construction).
+    # Case 7: an explicit [[bin]] claiming `src/main.rs` is counted once — the
+    # auto-discovery pass excludes the claimed path.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         root = _make_workspace(tmp, ["app"])
@@ -271,8 +285,59 @@ def self_test() -> int:
             {"src/main.rs": "fn main() {}\n"},
         )
         expect(
-            "src/main.rs target skipped",
+            "explicit bin claiming src/main.rs counted once",
             bin_target_names(root / "app") == ["app"],
+        )
+
+    # Case 8 (Codex review): an unclaimed `src/main.rs` is auto-discovered as a
+    # binary named after the package.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["widget"])
+        _make_member(
+            tmp / "root", "widget",
+            '[package]\nname = "widget"\nversion = "0.1.0"\n',
+            {"src/main.rs": "fn main() {}\n"},
+        )
+        expect(
+            "unclaimed src/main.rs enumerated under the package name",
+            bin_target_names(root / "widget") == ["widget"],
+        )
+
+    # Case 9 (Codex review): an explicit bin named like another member's package
+    # collides with that member's auto-discovered `src/main.rs` binary.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["widget", "tools"])
+        _make_member(
+            tmp / "root", "widget",
+            '[package]\nname = "widget"\nversion = "0.1.0"\n',
+            {"src/main.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "tools",
+            '[package]\nname = "tools"\nversion = "0.1.0"\n\n[[bin]]\nname = "widget"\npath = "src/bin/widget.rs"\n',
+            {"src/bin/widget.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "explicit bin vs another member's src/main.rs collision caught",
+            "widget" in collisions,
+        )
+
+    # Case 10: `src/bin/main.rs` is named after the file stem ("main"), matching
+    # cargo's auto-discovery — not the parent directory.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n',
+            {"src/bin/main.rs": "fn main() {}\n"},
+        )
+        expect(
+            "src/bin/main.rs named 'main' like cargo",
+            bin_target_names(root / "app") == ["main"],
         )
 
     if failures:
@@ -280,7 +345,7 @@ def self_test() -> int:
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 7 cases passed")
+    print("self-test: all 10 cases passed")
     return 0
 
 
