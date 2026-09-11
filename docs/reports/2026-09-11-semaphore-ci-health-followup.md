@@ -165,21 +165,31 @@ comments (`autumn/src/job.rs:16704-16707`) already document this choice
 explicitly ("`pg_cleanup_expired_tracking_rows` compares against
 Postgres's real `NOW()`"), so it is deliberate design, not an oversight —
 this test independently re-derives a comparison the product already makes
-elsewhere, it doesn't invent a comparison production never makes. The
-distinction that still holds: the *read* path this test also exercises
-(`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`) does
-`WHERE expires_at > $2` against `self.clock.now()` — same-clock, unlike the
-cleanup sweep — so only a genuine clock *step* (not cross-process skew)
-would make that specific read path misbehave, per the same lack of
-monotonicity guarantee
-`autumn/src/time.rs:105-108` documents for wall-clock comparisons generally
-("a wall-clock/NTP jump ... can never make an elapsed duration negative or
-absurd [via `MonotonicInstant`]. Comparing wall-clock timestamps has no
-such guarantee."). A backward clock step between the write and a later
-read would make production's own TTL read stale-live too, not just this
-test's assertion — a real, if rare, product-relevant robustness question,
-not dismissible as a test artifact. This pass does not claim the observed
-failure *was* a clock step (the worker-refresh mechanism below remains the
+elsewhere, it doesn't invent a comparison production never makes.
+
+**Correction (post-review, via a tenth Codex review comment on PR #2711,
+carrying the ledger's own already-fixed correction into this report,
+which still had the stale claim): the *read* path this test also
+exercises is not reliably same-clock in production either — that was
+only true for this test's single-process shape.** `docs/guide/jobs.md`
+documents `web` and `worker` as separate process roles sharing one
+Postgres backend; a `web` replica's `job::enqueue_tracked` can stamp
+`expires_at` from its own `SystemClock` while a *different* `worker`
+replica's `mark_running`/`settle_success` later calls
+`PgJobTrackingStore::update` (`autumn/src/job_tracking.rs:1896-1902`)
+using that host's own `self.clock.now()` — genuine cross-host skew, the
+same shape as the cleanup sweep, no clock step required. Only this test's
+own `combined`-role (single-process) shape makes the read path same-clock;
+a discrete clock step is not the only way it can disagree with an
+`expires_at` stamped elsewhere. `autumn/src/time.rs:105-108`'s point about
+wall-clock comparisons lacking a monotonic guarantee still applies and
+still matters for the single-host clock-step case, but it is not the only
+source of read-path risk. A backward clock step, or ordinary web/worker
+skew, between the write and a later read would make production's own TTL
+read stale-live too, not just this test's assertion — a real,
+product-relevant robustness question, not dismissible as a test artifact.
+This pass does not claim the observed failure *was* a clock-related race
+of any kind (the worker-refresh mechanism below remains the
 better-supported explanation for this specific incident), only that the
 scenario's product-vs-test classification was wrong as originally stated.
 Refreshing `expires_at` on worker activity is deliberate, sensible
