@@ -43,6 +43,26 @@ It also prints a warning reminding you to configure `[tenancy]` in
 `autumn.toml` if you haven't already (see below) — that file's shape varies
 too much across projects/profiles for the generator to safely edit for you.
 
+The migration and the Cargo dependency set are emitted for your app's own
+database backend (#1927). A SQLite app gets `INTEGER PRIMARY KEY AUTOINCREMENT`
+ids, `INTEGER` user-id columns, `TEXT ... DEFAULT CURRENT_TIMESTAMP` timestamps,
+and diesel on its `sqlite` feature; a Postgres app gets the DDL it always got.
+The `role`/`status` `CHECK` constraints, the `UNIQUE (tenant_id, user_id)`
+constraint and the partial unique index on pending invitations are portable and
+identical on both. The `#[model]`/`#[repository]` code under
+`src/teams/` does not differ by backend: `#[repository]` binds
+`autumn_web::RuntimeConnection`, and `schema.rs` uses only sql-types both diesel
+backends carry. On SQLite the generator also enables `autumn-web`'s `sqlite`
+feature, which is what points `RuntimeConnection` at the SQLite connection.
+
+One behavioural difference is worth knowing about. The route handlers take
+pessimistic row locks before mutating memberships and invitations, and SQLite
+has no `SELECT … FOR UPDATE`, so on SQLite those reads go through
+`autumn_web::maybe_for_update!` and are plain reads. Correctness still holds —
+SQLite allows one writer at a time, and a second transaction that read the same
+snapshot fails closed rather than losing an update — but under contention a
+request errors instead of waiting for a lock.
+
 ## The composition boundary with your own auth
 
 `teams` deliberately does **not** generate a `routes/auth.rs`: your app's

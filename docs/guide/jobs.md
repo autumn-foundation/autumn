@@ -666,7 +666,9 @@ Semantics:
   `total_deduplicated` in `/actuator/jobs` and recorded with the
   `deduplicated` job-admin status.
 - Jobs over the concurrency cap **wait** (they stay enqueued/parked and run
-  when a slot frees) — they are never dropped.
+  when a slot frees) — they are never dropped. They stay on the admin
+  dashboard's enqueued tab; Redis also marks the row "waiting on a concurrency
+  slot".
 - Keys and slots are released on success, terminal failure, **and worker
   crash**: Postgres ties them to row status recovered by the visibility
   timeout; Redis settles them in the claim-validated transition and

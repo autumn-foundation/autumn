@@ -4590,6 +4590,12 @@ impl AppBuilder {
         #[cfg(feature = "acme")]
         let mut acme_bind_state: Option<AcmeBindState> = None;
 
+        // Where the app actually bound, as the readiness protocol spells it
+        // (`<transport> <address>`) — distinct from `bound_desc`, which is a
+        // human-facing log line carrying a scheme and any TLS note. The
+        // supervisor reads this to write its address-discovery file, so it must
+        // be the resolved address, not the configured one.
+        let bound_endpoint: String;
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
             String,
@@ -4659,6 +4665,7 @@ impl AppBuilder {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
                 };
+                bound_endpoint = format!("unix {socket_path}");
                 (
                     BoundListener::Unix(listener),
                     format!("unix:{socket_path}"),
@@ -4701,6 +4708,7 @@ impl AppBuilder {
             let addr = listener
                 .local_addr()
                 .map_or(configured_addr, |bound| bound.to_string());
+            bound_endpoint = format!("tcp {}", dialable_endpoint(&addr));
             // When `[server.tls]` is set (and the `tls` feature is built in),
             // wrap the just-bound TCP listener in a rustls acceptor so the same
             // host:port serves HTTPS. Fail fast on any cert/key problem — the
@@ -5532,6 +5540,7 @@ impl AppBuilder {
                     .server
                     .prestop_grace_secs
                     .saturating_add(config.server.shutdown_timeout_secs),
+                &bound_endpoint,
             );
         }
 
@@ -9826,17 +9835,24 @@ async fn stamp_loopback_connect_info(
 /// middleware (the startup barrier, maintenance mode, rate limiting, or custom
 /// health paths, which an HTTP readiness probe would all have to thread).
 ///
-/// The file's contents are the app's *resolved* graceful-drain budget in seconds
+/// Line one is the app's *resolved* graceful-drain budget in seconds
 /// (`prestop_grace_secs + shutdown_timeout_secs`). The supervisor records this so
 /// `autumn serve stop` waits for the budget the app will actually drain for —
 /// even when a custom `with_config_loader` set it — instead of reconstructing it
 /// from TOML/env and risking a premature `SIGKILL`.
 ///
+/// Line two is where the app *actually* bound, as `<transport> <address>`. The
+/// supervisor cannot derive this: `server.port = 0` resolves in the kernel, a
+/// socket adopted from a predecessor keeps that process's port, and a custom
+/// `with_config_loader` can put the app anywhere. Reporting it is what lets
+/// `autumn serve --daemon` write an address-discovery file on Windows, where
+/// there is no Unix socket path to hand the app in advance.
+///
 /// Best-effort: a write failure only delays readiness detection until the
 /// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
 ///
 /// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
-fn signal_serve_ready(drain_budget_secs: u64) {
+fn signal_serve_ready(drain_budget_secs: u64, bound_endpoint: &str) {
     let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
         return;
     };
@@ -9850,13 +9866,62 @@ fn signal_serve_ready(drain_budget_secs: u64) {
     // contents. A plain `write` would make the path exist before the bytes land.
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
-    if let Err(e) = std::fs::write(&tmp, drain_budget_secs.to_string())
+    if let Err(e) = std::fs::write(&tmp, serve_ready_payload(drain_budget_secs, bound_endpoint))
         .and_then(|()| std::fs::rename(&tmp, &path))
     {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!(error = %e, path = %path.display(),
             "could not write serve readiness file");
     }
+}
+
+/// Turn a bound address into one a client can actually dial.
+///
+/// A wildcard bind is a *bind*, never a dial address — the same rule
+/// `[cluster] advertise_addr` already enforces, for the same reason: handing a
+/// peer `0.0.0.0` gives it something nothing can reach, and the failure then
+/// looks like a network fault rather than the address it is. The production
+/// smart default binds `0.0.0.0`, so without this a `--release` daemon publishes
+/// an undialable `serve.addr` while reporting a successful start.
+///
+/// Only the *host* is rewritten, to loopback of the matching family; the
+/// resolved port is what the supervisor could not have known and is preserved
+/// exactly. An address that is already specific passes through untouched, and so
+/// does one that will not parse — better to publish what we bound than to invent
+/// something.
+fn dialable_endpoint(addr: &str) -> String {
+    let Ok(parsed) = addr.parse::<std::net::SocketAddr>() else {
+        return addr.to_owned();
+    };
+    if !parsed.ip().is_unspecified() {
+        return addr.to_owned();
+    }
+    match parsed {
+        std::net::SocketAddr::V4(_) => format!("127.0.0.1:{}", parsed.port()),
+        std::net::SocketAddr::V6(_) => format!("[::1]:{}", parsed.port()),
+    }
+}
+
+/// The readiness file's contents: the drain budget, then the bound endpoint.
+///
+/// Two lines rather than one structured value so the first line stays exactly
+/// what it has always been — a bare integer — and the endpoint is additive. The
+/// endpoint is `<transport> <address>` split on the FIRST space only, so a Unix
+/// socket path containing spaces survives the round trip. An empty endpoint
+/// emits no second line at all, rather than a blank one a reader could mistake
+/// for an address.
+///
+/// Public because it *is* the wire format between the app and its supervisor:
+/// `autumn-cli`'s `parse_ready_payload` round-trips against this exact function,
+/// so the two cannot drift into disagreement the way two hand-written parsers
+/// would.
+#[must_use]
+pub fn serve_ready_payload(drain_budget_secs: u64, bound_endpoint: &str) -> String {
+    let endpoint = bound_endpoint.trim();
+    if endpoint.is_empty() {
+        return drain_budget_secs.to_string();
+    }
+    format!("{drain_budget_secs}\n{endpoint}")
 }
 
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
@@ -13522,7 +13587,50 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Received SIGTERM, starting graceful shutdown");
     };
 
-    #[cfg(not(unix))]
+    // Windows has no `SIGTERM`. What a supervisor, a service host, or the OS
+    // itself actually delivers is a console control event, and every one of them
+    // means the same thing `SIGTERM` means: this process is going away, drain
+    // now. Handling them is what makes a supervisor-stopped Windows server run
+    // its readiness flip, prestop grace, in-flight drain and `on_shutdown` hooks
+    // instead of dying mid-request (#1639).
+    //
+    // How much time each event actually buys differs, and the difference
+    // matters enough to be exact about:
+    //
+    // * `CTRL_C` and `CTRL_BREAK` do not terminate the process at all. The drain
+    //   runs to completion.
+    // * `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` are told-not-asked: the
+    //   OS-imposed budget is how long the *handler routine* may run, and tokio's
+    //   handler returns immediately (which is what lets this future wake), so
+    //   the drain then races process termination. It is best-effort, and on a
+    //   long budget it will lose.
+    //
+    // That is why a supervisor should stop an Autumn app through
+    // `autumn serve stop` or the Service Control Manager, both of which wait for
+    // the app's own recorded budget. `docs/guide/daemon.md` says so where an
+    // operator will read it. These arms are still worth having: they turn the
+    // common console cases into a real drain, and cost nothing in the rest.
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows;
+        let mut close = windows::ctrl_close().expect("Failed to install CTRL_CLOSE handler");
+        let mut logoff = windows::ctrl_logoff().expect("Failed to install CTRL_LOGOFF handler");
+        let mut shutdown =
+            windows::ctrl_shutdown().expect("Failed to install CTRL_SHUTDOWN handler");
+        let mut brk = windows::ctrl_break().expect("Failed to install CTRL_BREAK handler");
+        let event = tokio::select! {
+            _ = close.recv() => "CTRL_CLOSE",
+            _ = logoff.recv() => "CTRL_LOGOFF",
+            _ = shutdown.recv() => "CTRL_SHUTDOWN",
+            _ = brk.recv() => "CTRL_BREAK",
+        };
+        tracing::info!(
+            event,
+            "Received a console control event, starting graceful shutdown"
+        );
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     let canary_rollback = async {
@@ -14172,6 +14280,76 @@ mod tests {
             ..AppState::test_default()
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    // ── Serve readiness payload (#1639) ────────────────────────────────────
+    //
+    // The supervisor learns two things from this file: how long the app will
+    // drain for, and where it actually bound. The second is what lets
+    // `autumn serve --daemon` write an address-discovery file on a platform
+    // with no Unix socket to name in advance.
+
+    #[test]
+    fn a_wildcard_bind_is_published_as_a_dialable_loopback_address() {
+        // The production smart default binds `0.0.0.0`, and `local_addr()`
+        // faithfully reports it. Publishing that in `serve.addr` would hand a
+        // thin client an address nothing can dial while the start reported
+        // success — the same trap `[cluster] advertise_addr` already rejects.
+        assert_eq!(dialable_endpoint("0.0.0.0:3000"), "127.0.0.1:3000");
+        assert_eq!(dialable_endpoint("[::]:3000"), "[::1]:3000");
+    }
+
+    #[test]
+    fn a_specific_bind_is_published_exactly_as_bound() {
+        // Rewriting one would be worse than the bug: the supervisor would
+        // advertise an interface the app is not on.
+        assert_eq!(dialable_endpoint("192.168.1.10:3000"), "192.168.1.10:3000");
+        assert_eq!(dialable_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(dialable_endpoint("[::1]:8080"), "[::1]:8080");
+    }
+
+    #[test]
+    fn the_resolved_port_survives_the_rewrite() {
+        // The port is the half the supervisor could not have known — `port = 0`
+        // resolves in the kernel — so losing it would defeat the whole report.
+        assert_eq!(dialable_endpoint("0.0.0.0:49152"), "127.0.0.1:49152");
+    }
+
+    #[test]
+    fn an_unparseable_address_is_published_unchanged() {
+        // Better to publish what was bound than to invent something.
+        assert_eq!(dialable_endpoint("not-an-address"), "not-an-address");
+    }
+
+    #[test]
+    fn serve_ready_payload_leads_with_the_drain_budget() {
+        // Line one stays a bare integer so a supervisor that predates the
+        // address line still reads the budget it always read.
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().next(), Some("35"));
+    }
+
+    #[test]
+    fn serve_ready_payload_carries_the_bound_endpoint_on_line_two() {
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().nth(1), Some("tcp 127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn serve_ready_payload_survives_a_socket_path_containing_spaces() {
+        // A Unix socket under a directory with a space is legal, so the format
+        // has to split on the FIRST separator only, never on every one.
+        let payload = serve_ready_payload(1, "unix /home/a b/serve.sock");
+        let line = payload.lines().nth(1).expect("endpoint line");
+        assert_eq!(line.split_once(' '), Some(("unix", "/home/a b/serve.sock")));
+    }
+
+    #[test]
+    fn serve_ready_payload_never_emits_a_bare_newline_for_an_unknown_endpoint() {
+        // An empty endpoint must not leave a blank second line a reader could
+        // mistake for an address.
+        let payload = serve_ready_payload(7, "");
+        assert_eq!(payload.lines().count(), 1, "{payload:?}");
     }
 
     // ── Cooperative external shutdown (#1616) ──────────────────────────────

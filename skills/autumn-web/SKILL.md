@@ -109,6 +109,7 @@ after checking this table and `docs/guide/`.
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
 | Search plugin crate | `autumn-search` |
+| Billing plugin crate | `autumn-billing` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -1770,8 +1771,8 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the five first-party crates (`autumn-admin-plugin`,
-`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`list` covers the six first-party crates (`autumn-admin-plugin`,
+`autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
 `autumn-storage-s3`) plus community crates found on crates.io under the
 documented `autumn-plugin-<name>` convention.
 
@@ -2841,7 +2842,12 @@ user pins 0.5.x:
 
 ```bash
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
+                                 # native on Windows too (#1639): TCP transport,
+                                 # file-requested graceful drain, same serve.addr
 autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
+autumn serve install-service     # Windows only, elevated: register as a boot-start,
+                                 # crash-restarting service; uninstall-service removes it
+                                 # (flags go BEFORE the subcommand: serve --bundled-pg install-service)
 autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
 autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
 autumn generate scaffold Post title:String --live --live-validation
@@ -3539,6 +3545,22 @@ Fleet-unsafe topologies fail closed in the prologue, before any remote command:
 = true` (each host would ACME the same hostname from behind the LB — terminate
 TLS at the load balancer instead). `[database] auto_migrate` on a fleet is a loud
 warning, not a refusal.
+
+On a SINGLE host, `[media.mediamtx] enabled = true` provisions MediaMTX as its
+own systemd unit, after the app cutover commits. Six fail-closed preflight
+checks run first. Two are pure config and need no host: the listener ports must
+be distinct, and each `*_port` must match the app-side `[media.mediamtx] *_base`
+URL that calls it. Tell users that customizing a port means updating its base
+URL — a mismatch blocks the deploy when the base addresses loopback, a proxied
+or CDN-fronted base is skipped (its public port is its own), and an unset base
+only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
+(unreleased, issue #1974). `deploy up` creates the config parent and
+`recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
+passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
+host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
+`POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
+under the idle TTL (default 15 min); a client that does neither is reaped from
+signaling, though its live WebRTC path survives and it can re-join.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`
