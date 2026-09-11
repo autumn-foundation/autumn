@@ -208,7 +208,11 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         id: "0.6.0-repository-with-pool-untracked",
         version: "0.6.0",
         title: "repository constructor `with_pool` is renamed to `with_pool_untracked`",
-        confidence: Confidence::Auto,
+        // `review`, not `auto` (issue #2234): the receiver check is textual,
+        // not name resolution, so it can miss a hand-written type or a
+        // foreign `#[repository]`. Every site is still rewritten; each one is
+        // also flagged for a human to read.
+        confidence: Confidence::Review,
         guide: "docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked",
         rewrite: Rewrite::CallRename {
             from: "with_pool",
@@ -836,7 +840,10 @@ mod tests {
             .iter()
             .find(|m| m.id == "0.6.0-repository-with-pool-untracked")
             .expect("the with_pool rename is the first shipped codemod (issue #1629)");
-        assert_eq!(migration.confidence, Confidence::Auto);
+        // `review`, not `auto` (issue #2234): receiver identification is
+        // textual, not name resolution, so a flagged rewrite a human reads is
+        // the safer default until that gap closes.
+        assert_eq!(migration.confidence, Confidence::Review);
         assert_eq!(
             migration.rewrite,
             Rewrite::CallRename {

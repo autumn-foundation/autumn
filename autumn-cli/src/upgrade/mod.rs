@@ -710,6 +710,12 @@ fn collect_manifests(
 ///
 /// `CARGO_TARGET_DIR` overrides every config file's `target-dir`, but has no
 /// equivalent for vendoring, so the config walk runs either way.
+///
+/// The root's own target directory is asked of `cargo metadata` first (issue
+/// #2234): it resolves the env vars and config hierarchy the way Cargo
+/// actually does. The hand-rolled walk still runs, both as the fallback when
+/// the subprocess fails and as the only source for vendoring and for any
+/// nested crate's own `target-dir` redirect.
 fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     // `CARGO_TARGET_DIR` is the dedicated variable; `CARGO_BUILD_TARGET_DIR` is
     // the generic `CARGO_BUILD_<key>` form Cargo documents for `build.target-dir`.
@@ -725,7 +731,6 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     let target_dir_from_config = forced_target_dir.is_none();
 
     let mut found = BTreeSet::new();
-    found.extend(forced_target_dir);
     let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
     // Cargo's hierarchy is the invocation directory upward, then Cargo home.
@@ -734,7 +739,8 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     // rest are overridden — unioning them pruned directories that are really
     // app source. The `[source.*]` tables merge into one table across every
     // level, so `replace-with` in one file can name a source another defines;
-    // resolving each file alone found neither half.
+    // resolving each file alone found neither half. `cargo metadata` (below)
+    // does not report `[source.*]`, so this half stays hand-rolled either way.
     let mut levels: Vec<(PathBuf, PathBuf)> = absolute_root
         .ancestors()
         .map(|ancestor| (ancestor.join(".cargo"), ancestor.to_path_buf()))
@@ -752,11 +758,46 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
         }
         merge_sources(&mut sources, declared);
     }
-    found.extend(nearest_target);
+
+    // Cargo's own answer for the root, in preference to the hand-rolled walk
+    // above (issue #2234): `cargo metadata` resolves the same env vars and
+    // config hierarchy the way Cargo actually does, without the divergences
+    // hand-rolling it kept reintroducing. Fall back to the walk when the
+    // subprocess is unavailable or fails.
+    let root_target_dir = cargo_metadata_target_dir(&absolute_root)
+        .or(forced_target_dir)
+        .or(nearest_target);
+    found.extend(root_target_dir);
     found.extend(active_vendor_dirs(&sources));
 
     collect_target_dirs(&absolute_root, target_dir_from_config, &sources, &mut found);
     found
+}
+
+/// The root's build-output directory, straight from Cargo.
+///
+/// `cargo metadata --no-deps` resolves `CARGO_TARGET_DIR` and the whole
+/// `.cargo/config.toml` hierarchy without fetching or resolving dependencies,
+/// so it needs no network access. `None` when `root` has no manifest, `cargo`
+/// is not on `PATH`, or the subprocess fails for any other reason — the
+/// caller falls back to the hand-rolled walk in that case.
+fn cargo_metadata_target_dir(root: &Path) -> Option<PathBuf> {
+    if !root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let target_directory = metadata.get("target_directory")?.as_str()?;
+    std::fs::canonicalize(target_directory).ok()
 }
 
 /// One `[source.*]` entry: where it points, and what it is replaced with.
@@ -1914,6 +1955,38 @@ mod tests {
             report.review.is_empty(),
             "auto sites are not flagged one by one"
         );
+    }
+
+    #[test]
+    fn cargo_metadata_names_the_real_target_directory() {
+        // Issue #2234: ask Cargo instead of hand-rolling its config
+        // resolution. `cargo metadata` already applies `CARGO_TARGET_DIR`
+        // and the whole `.cargo/config.toml` hierarchy the way Cargo does.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(root.path().join("src")).expect("src");
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").expect("source");
+        // `resolve_against` elsewhere in this module canonicalizes too, and
+        // that requires the directory to exist — a target directory nothing
+        // has built into yet holds nothing a source walk needs pruned anyway.
+        std::fs::create_dir_all(root.path().join("target")).expect("target");
+
+        let expected = std::fs::canonicalize(root.path())
+            .expect("canonicalize")
+            .join("target");
+        assert_eq!(cargo_metadata_target_dir(root.path()), Some(expected));
+    }
+
+    #[test]
+    fn cargo_metadata_target_dir_is_none_without_a_manifest() {
+        // No `Cargo.toml` to ask about — the caller falls back to the walk
+        // without paying for a subprocess that can only fail.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(cargo_metadata_target_dir(root.path()), None);
     }
 
     #[test]

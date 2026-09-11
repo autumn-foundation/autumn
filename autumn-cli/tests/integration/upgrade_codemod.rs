@@ -380,7 +380,10 @@ fn json_output_is_machine_readable() {
         .iter()
         .map(|m| m["confidence"].as_str().expect("confidence label"))
         .collect();
-    assert!(confidences.contains(&"auto"), "{confidences:?}");
+    // `0.6.0-repository-with-pool-untracked` is `review`, not `auto` (issue
+    // #2234): receiver identification is textual, so every rewritten site is
+    // flagged for a human to read.
+    assert!(confidences.contains(&"review"), "{confidences:?}");
     assert!(confidences.contains(&"manual"), "{confidences:?}");
 }
 
@@ -394,7 +397,8 @@ fn list_migrations_prints_the_registry_without_scanning() {
         out.contains("0.6.0-repository-with-pool-untracked"),
         "{out}"
     );
-    assert!(out.contains("auto"), "{out}");
+    // `review`, not `auto` (issue #2234) — see `json_output_is_machine_readable`.
+    assert!(out.contains("review"), "{out}");
     assert!(out.contains("docs/migrations/0.6.0.md#"), "{out}");
 }
 
