@@ -3546,6 +3546,22 @@ Fleet-unsafe topologies fail closed in the prologue, before any remote command:
 TLS at the load balancer instead). `[database] auto_migrate` on a fleet is a loud
 warning, not a refusal.
 
+On a SINGLE host, `[media.mediamtx] enabled = true` provisions MediaMTX as its
+own systemd unit, after the app cutover commits. Six fail-closed preflight
+checks run first. Two are pure config and need no host: the listener ports must
+be distinct, and each `*_port` must match the app-side `[media.mediamtx] *_base`
+URL that calls it. Tell users that customizing a port means updating its base
+URL — a mismatch blocks the deploy when the base addresses loopback, a proxied
+or CDN-fronted base is skipped (its public port is its own), and an unset base
+only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
+(unreleased, issue #1974). `deploy up` creates the config parent and
+`recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
+passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
+host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
+`POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
+under the idle TTL (default 15 min); a client that does neither is reaped from
+signaling, though its live WebRTC path survives and it can re-join.
+
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`
 code, maintenance flag, proxy port, last deploy result, drift reasons) plus
