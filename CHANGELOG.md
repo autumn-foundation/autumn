@@ -334,8 +334,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
-  admin Users screen (error-path 0/5 → 5/5, entered values preserved)
-  [no-plugin]:** an error-path inventory of `POST /admin/users` — the
+  admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
+  an error-path inventory of `POST /admin/users` — the
   account-creation half of `cms`'s user/role management screen, the `#[state_machine]`
   post lifecycle example's "roles"/"moderate" journey (`supported`-tier per
   EXAMPLES.md) — found all 5 of the handler's recoverable failure modes (a
