@@ -550,6 +550,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-billing"
+version = "0.7.0"
+dependencies = [
+ "autumn-web",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 1.1.5+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "autumn-cache-redis"
 version = "0.7.0"
 dependencies = [

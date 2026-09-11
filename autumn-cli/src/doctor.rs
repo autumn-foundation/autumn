@@ -539,9 +539,11 @@ fn resolve_plugin_wirings(
     // Reading the migration history costs a `diesel` subprocess and a database
     // round trip, so it happens ONLY when the answer could change something:
     // some plugin is absent from the code *and* declares migrations that could
-    // still be applied. On the overwhelmingly common project — no departed
-    // plugin, or none that owns schema — `autumn doctor` pays nothing for this
-    // check beyond the file reads it already did.
+    // still be applied. Nothing on disk records a past install, so an absent
+    // schema-owning plugin that was never installed is indistinguishable from
+    // a departed one; the read is therefore at most one `diesel migration
+    // list` per run, only with a database configured, and never on a project
+    // that carries every schema-owning first-party plugin.
     let candidates: Vec<(usize, Vec<String>)> = wirings
         .iter()
         .enumerate()
@@ -20336,25 +20338,40 @@ redirect_uri = "http://localhost/callback"
 
     /// The migration history costs a subprocess and a database round trip, so
     /// it must not be read when no departed plugin could possibly have left
-    /// one — which is every ordinary project.
+    /// one. Nothing on disk records a past install, so "could have left one"
+    /// is approximated as "declares migrations and is absent from the app":
+    /// a project carrying every schema-owning first-party plugin never reads
+    /// the history. The manifest and the mounts are built from the catalog
+    /// so that a new schema-owning plugin cannot silently turn this project
+    /// into one that queries the database.
     #[test]
     fn plugin_wirings_do_not_read_the_migration_history_without_a_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\nautumn-media-plugin = \"0.7.0\"\n",
-        )
-        .unwrap();
+        let schema_owners: Vec<&crate::plugin::catalog::CatalogEntry> =
+            crate::plugin::catalog::FIRST_PARTY
+                .iter()
+                .filter(|entry| !entry.migrations.is_empty())
+                .collect();
+        assert!(
+            !schema_owners.is_empty(),
+            "no schema-owning plugin to install"
+        );
+        let mut manifest =
+            String::from("[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n");
+        let mut main_rs = String::from("fn main() {\n    autumn_web::app()\n");
+        for entry in &schema_owners {
+            manifest.push_str(entry.crate_name);
+            manifest.push_str(" = \"0.7.0\"\n");
+            main_rs.push_str(entry.mount);
+        }
+        main_rs.push_str("        ;\n}\n");
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/main.rs"),
-            "fn main() { autumn_web::app().plugin(autumn_media_plugin::MediaPlugin::new()); }\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/main.rs"), main_rs).unwrap();
 
-        // The closure panics if called: the plugin is installed, so there is
-        // no orphan to look for.
+        // The closure panics if called: every plugin that owns schema is
+        // installed, so there is no orphan to look for.
         let wirings = resolve_plugin_wirings(root, || panic!("must not query the database"));
         assert_eq!(
             check_plugin_residue_impl(&wirings).status,
