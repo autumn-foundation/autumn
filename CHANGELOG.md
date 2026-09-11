@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
+  README.md's `## Example` and the four `rust,no_run` snippets in
+  `docs/guide/getting-started.md` (a CSRF form handler plus three
+  runtime-tuning examples) — the "first run" journey's flagship, most-copied
+  code — were never actually compiled by anything;
+  `scripts/check-docs-macro-args.sh` already named this gap directly ("the
+  markdown fences are not compiled by anything at all"). A fence can drift
+  out from under a signature change the same way the CLI scaffold template
+  drifted from `inject_consent_banner`'s widened `Option<&str>` parameter
+  (#2459, #2620) — silent to every existing docs-corpus gate, which check
+  that a name *resolves*, not that the call still typechecks. A new
+  `doc_getting_started_snippets_compile` test
+  (`autumn/tests/integration/compile_fail.rs`) extracts every
+  `rust,no_run` fence from those two files into a throwaway crate and
+  runs `cargo check` on it — real compilation against the in-tree crate,
+  with no server binary ever executed; a new tagged fence is picked up
+  automatically, no test edit required. All 5 fences currently in scope
+  compile clean — this is a harness, not a fix, so there is nothing else to
+  report.
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the

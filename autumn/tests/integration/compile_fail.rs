@@ -994,3 +994,156 @@ fn agent_authority_guide_matches_the_real_diagnostics() {
         );
     }
 }
+
+/// The "first run" journey's flagship code — README.md's `## Example` and the
+/// runtime-tuning snippets in `docs/guide/getting-started.md` — was never
+/// actually compiled by anything. `scripts/check-docs-macro-args.sh` names the
+/// gap directly: "the markdown fences are not compiled by anything at all."
+/// The docs corpus's other gates check that a fence's *names* resolve (a
+/// link, a CLI flag, a config key, an import path); none of them catch a
+/// signature that has drifted out from under a fence that still typechecks
+/// against nothing, the way `inject_consent_banner`'s `csrf_cookie_name`
+/// drifted from `&str` to `Option<&str>` underneath the CLI scaffold template
+/// (#2459, #2620) — a widened-parameter class of break a string-equality
+/// check can never see.
+///
+/// Some authors already reached for rustdoc's own "compiles, don't execute"
+/// convention by hand on these fences (`rust,no_run`) even though nothing
+/// here has ever enforced it — a `#[autumn_web::main]` snippet binds a real
+/// port and blocks forever, exactly what `no_run` exists to avoid running.
+/// That rules out `trybuild::TestCases::pass`, which this module uses
+/// everywhere else: a `pass` fixture is a real compiled binary that trybuild
+/// then *executes* to check its exit status, so pointing it at one of these
+/// snippets would compile clean and then hang the test suite on the running
+/// server, forever, on purpose.
+///
+/// Also unlike every other fixture in this file, not every `no_run` fence is
+/// a complete program: one (the CSRF form handler) is a bare `async fn`, the
+/// same "elide the surrounding main for brevity" shape rustdoc itself accepts
+/// because it wraps a mainless doctest in one automatically. Nothing here
+/// does that wrapping, and a fence with `fn main` and one without cannot both
+/// be a `src/bin/*.rs` (a binary with no `main` is `E0601`, forcing a
+/// has-main/has-not branch this test would then have to maintain by hand).
+/// Nesting every fence in its own `mod` of one shared `src/lib.rs` sidesteps
+/// the branch entirely: a library crate never requires `main`, an ordinary
+/// function that happens to be *named* `main` is legal inside a module, and
+/// each fence's identifiers (also-named-`index` handlers, `main` itself) stay
+/// isolated from its neighbors.
+///
+/// Extracts every `rust,no_run` fence from the two files this way and
+/// `cargo check`s the result — real compilation against the in-tree crate,
+/// with no linked binary ever run. A new `no_run` fence in either file is
+/// picked up automatically; nothing here needs updating when one is added,
+/// renamed, or removed — only a fence that drops the tag silently opts back
+/// out, which is the same trust the tag already carries for rustdoc itself.
+#[test]
+fn doc_getting_started_snippets_compile() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+
+    let mut fixtures = Vec::new();
+    for (doc, slug) in [
+        ("README.md", "readme"),
+        ("docs/guide/getting-started.md", "getting_started"),
+    ] {
+        let path = root.join(doc);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        for (start_line, body) in extract_rust_no_run_fences(&text) {
+            fixtures.push((format!("{slug}_l{start_line}"), body));
+        }
+    }
+
+    // A parser regression that silently matched nothing would make this test
+    // trivially green without compiling a single snippet. 5 is today's known
+    // count (README's one `## Example`, the CSRF form handler, and three
+    // runtime-tuning snippets, all in the guide) — the assertion only guards
+    // against the extractor going quietly blind, not against that count
+    // changing.
+    assert!(
+        fixtures.len() >= 5,
+        "expected at least 5 `rust,no_run` fences across README.md and \
+         docs/guide/getting-started.md, found {}. Either a fence lost its \
+         `no_run` tag or extract_rust_no_run_fences is broken.",
+        fixtures.len()
+    );
+
+    // A throwaway crate, checked once. Its own `[workspace]` keeps it from
+    // being folded into this checkout's workspace no matter where the temp
+    // dir lands. Dependencies mirror what `autumn new` actually writes
+    // (`autumn-cli/src/templates/Cargo.toml.tmpl`) rather than only what
+    // `autumn-web` re-exports: `maud`'s `html!` macro expands to code that
+    // names the `maud` crate directly, so a generated app depends on it too,
+    // and a fence exercising it needs the same direct dependency here.
+    let scratch = std::env::temp_dir().join("autumn-doc-snippet-check");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("scratch crate directories");
+
+    let autumn_web_path = root.join("autumn");
+    std::fs::write(
+        scratch.join("Cargo.toml"),
+        format!(
+            "[package]\n\
+             name = \"autumn-doc-snippet-check\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\
+             publish = false\n\
+             \n\
+             [dependencies]\n\
+             autumn-web = {{ path = {autumn_web_path:?} }}\n\
+             axum = \"0.8\"\n\
+             maud = {{ version = \"0.27\", features = [\"axum\"] }}\n\
+             \n\
+             [workspace]\n"
+        ),
+    )
+    .expect("write scratch Cargo.toml");
+
+    let mut lib_rs = String::from("#![allow(dead_code, unused_variables, unused_imports)]\n\n");
+    for (name, body) in &fixtures {
+        use std::fmt::Write as _;
+        let _ = write!(lib_rs, "mod {name} {{\n{body}\n}}\n\n");
+    }
+    std::fs::write(src.join("lib.rs"), lib_rs).expect("write scratch src/lib.rs");
+
+    let output = std::process::Command::new(env!("CARGO"))
+        .arg("check")
+        .current_dir(&scratch)
+        .output()
+        .expect("failed to run cargo check on the extracted doc snippets");
+
+    assert!(
+        output.status.success(),
+        "one or more `rust,no_run` snippets in README.md / \
+         docs/guide/getting-started.md no longer compile against the in-tree \
+         autumn-web crate:\n\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Pulls the body of every ` ```rust,no_run ` fence out of a markdown
+/// document, paired with the 1-indexed source line its body starts on (used
+/// only to name the extracted fixture — a compile failure is reported against
+/// that copy, not the original file, so tracking it down still means
+/// `grep -n 'rust,no_run'` in the doc).
+fn extract_rust_no_run_fences(markdown: &str) -> Vec<(usize, String)> {
+    let mut fences = Vec::new();
+    let mut lines = markdown.lines().enumerate();
+    while let Some((i, line)) = lines.next() {
+        if line.trim() != "```rust,no_run" {
+            continue;
+        }
+        let start_line = i + 2;
+        let mut body = String::new();
+        for (_, body_line) in lines.by_ref() {
+            if body_line.trim() == "```" {
+                break;
+            }
+            body.push_str(body_line);
+            body.push('\n');
+        }
+        fences.push((start_line, body));
+    }
+    fences
+}
