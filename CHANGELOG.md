@@ -352,6 +352,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **aws-ecs:** the generated ECS "migrate" task definition now carries the
+  full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
+  `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
+  Redis is enabled) instead of just the database URL (#2255). CI
+  (`aws-deploy.yml`) and the manual walkthrough in
+  `docs/guide/deployment.md` both copy the migrate task's secrets onto the
+  "app" task definition when registering the real image, so a narrower
+  migrate secret list silently stripped the signing secret from every real
+  app deploy, and the app failed fast on startup.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
