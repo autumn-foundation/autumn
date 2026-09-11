@@ -127,6 +127,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Docs gate: the drift gates must now agree on which pages are reader-facing.**
+  `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
+  each read "the reader-facing corpus", and four of them spell that set out
+  themselves as tuples of path prefixes; three carry a comment promising the
+  spellings are kept identical, "since a page covered by one gate and not the
+  other is how a page ends up with no owner." Nothing checked that, and they had
+  drifted. `.claude/skills/` — a second skill tree the agent machinery loads by
+  name, where `run-autumn` lives — had been added to `check-docs-routes.sh` and
+  to `check-docs-orphans.sh`'s entry surfaces and never to the other three, so
+  five of the eight gates read that tree and three did not. Its SKILL.md is
+  copy-and-run text end to end, and its `autumn seed --package`, `autumn routes
+  --bin`, `-p autumn-web`, `AUTUMN_SERVER__PORT` and `AUTUMN_DATABASE__URL` were
+  ungated for command, config-key and symbol drift alike — while the same file
+  already carried `route-surface-allow` waivers for the one gate that did read
+  it. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
+  take the tree in this change (corpus 198→199, 199→200 and 199→200), and all
+  eight gates stay green over it. The new gate compares the four declarations
+  rather than the corpus, so it fails when a scope is edited rather than when
+  the pages that scope stopped covering finally rot. A difference between gates
+  is allowed but must be recorded in the script's `DECLARED_DIFFERENCES` table
+  with its reason — the rule that catches what a superset check cannot, namely
+  one gate widening alone while its siblings still agree with each other, which
+  is exactly how this drift passed unnoticed. One difference is declared today:
+  the routes gate reads all of `examples/` rather than only the `README.md`
+  under it, because `examples/wiki/content/` is embedded and served, an argument
+  about URLs that does not carry to commands or config keys. A declaration that
+  no longer describes a real difference is itself reported, so the table cannot
+  accumulate stale reasons.
+
 - **Docs gate: Autumn macro arguments are checked against the macros.**
   `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
   seventh thing a reader copies off a page: the keyword arguments inside an

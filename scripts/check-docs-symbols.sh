@@ -684,7 +684,19 @@ class Surface:
 # Spelled the same in `check-docs-cli.sh`, `check-docs-config.sh` and
 # `check-docs-toml.sh`: a page covered by one gate and not the others is how a
 # page ends up with no owner.
-INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
+# `.claude/skills/` is a SECOND skill tree, not a copy of `skills/`: the agent
+# machinery loads a `SKILL.md` there by name, which is why
+# `check-docs-orphans.sh` seeds both trees as reader entry surfaces and why
+# `check-docs-routes.sh` reads both for `/actuator/…` paths. `run-autumn` lives
+# only here, and its SKILL.md is copy-and-run text end to end — `autumn seed
+# --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`,
+# `AUTUMN_DATABASE__URL`, `-p autumn-web`. It already carries
+# `route-surface-allow` waivers for the routes gate, so the tree was reader-
+# facing to one gate and invisible to this one: exactly the split the note
+# above says these definitions exist to prevent. Corpus 199 -> 200 here, and
+# this gate stays green over it.
+INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/',
+                '.claude/skills/')
 INCLUDE_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
                  'docs/plugins.md')
 INCLUDE_README_DIRS = ('examples/',)
