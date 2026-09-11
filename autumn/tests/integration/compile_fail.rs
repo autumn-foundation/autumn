@@ -1135,10 +1135,18 @@ fn doc_getting_started_snippets_compile() {
     // instead of the templated `{{autumn_version}}` placeholder (this test
     // checks against the in-tree crate, not a published version) — the
     // template's own line carries no features/extra detail beyond that
-    // placeholder, so a presence check is enough for it alone.
+    // placeholder, so a presence check is enough for it alone. Must still go
+    // through the same active-line test `template_dep_line` uses rather than
+    // a plain substring search: the template also carries a *commented*
+    // example (`# autumn-web = { ..., features = [...] }`) right above the
+    // real line, which a bare `.contains("autumn-web")` would match even if
+    // the real line were removed or commented out too (Codex review, PR
+    // #2707).
     assert!(
-        template_manifest.contains("autumn-web"),
-        "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares `autumn-web`"
+        template_manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with("autumn-web =")),
+        "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares an active `autumn-web` dependency"
     );
 
     let autumn_web_path = root.join("autumn");
