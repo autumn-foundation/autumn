@@ -89,16 +89,30 @@ Windows machine. Read its `detail` rather than its status:
   Windows prerequisites — notably that `autumn generate auth --passkeys` needs
   OpenSSL via `vcpkg` with `VCPKG_ROOT` set.
 
-When a user reports that `autumn serve --daemon` (or `stop`/`status`/`restart`),
-`autumn deploy up` (or `rollback`/`status`/`maintenance`), or a `scripts/*.sh`
-gate fails on Windows, that is the **documented Tier 2 refusal, not a bug**:
-those are built on Unix domain sockets, POSIX signals, `ssh`, and bash. Tell
-them to run it from a WSL2 shell. `autumn deploy check` and `autumn deploy plan`
-are the exception and Tier 1 — they are local-only, so a Windows developer can
-validate a deploy config natively before switching to WSL2 to run it.
-Note `autumn serve --bundled-pg` implies `--daemon`, so it is Tier 2 too — on
-Windows use `autumn dev` for a managed-Postgres app. See
+When a user reports that `autumn deploy up` (or `rollback`/`status`/
+`maintenance`) or a `scripts/*.sh` gate fails on Windows, that is the
+**documented Tier 2 refusal, not a bug**: those reach a host over `ssh`, stage
+secrets with Unix file modes, or are bash. Tell them to run it from a WSL2
+shell. `autumn deploy check` and `autumn deploy plan` are the exception and
+Tier 1 — they are local-only, so a Windows developer can validate a deploy
+config natively before switching to WSL2 to run it.
+
+`autumn serve --daemon` / `stop` / `status` / `restart` left that set on
+trunk-dev (issue #1639) and now run **natively** on Windows, `--bundled-pg`
+included — a refusal there is a bug, not the policy. See
 `docs/guide/platform-support.md`.
+
+## Daemon and service readiness (unreleased — trunk-dev)
+
+`autumn doctor` runs a `daemon_service` check (issue #1639). Read its `detail`:
+it says whether a daemon is running for this project and on what endpoint,
+and — on Windows — whether an OS service is registered and its Service Control
+Manager state. It **warns** (never fails, so `--strict` still passes) when the
+service journey is missing a prerequisite, which in practice means the shell is
+not elevated enough to register or remove a service.
+
+A stopped daemon and an unregistered service are both normal: plenty of projects
+never want either. Do not read the check as a defect on that basis.
 
 ## Operator alert checks (unreleased — trunk-dev)
 

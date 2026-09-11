@@ -473,6 +473,37 @@ they are.
 which fields the caller meant to default, and a match arm needs a decision about
 what the new variant means for that call site.
 
+### Media rooms: `RoomStore` gains a required `heartbeat` method
+
+Mesh-room participants can now hold a seat with an explicit heartbeat, not only
+by polling the roster (see
+[the media guide](../guide/media.md)). `autumn_media_plugin::rooms::RoomStore` is
+the documented swap seam for a custom room-state backend, so the new operation is
+a required trait method with no default body: an out-of-tree `impl RoomStore`
+stops compiling until it implements
+
+```rust
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+It must verify `token` against `participant_id` in constant time and by value,
+set that participant's `last_seen_at` to now, renew `token_expires_at` to
+`now + token_ttl` **without rotating the token value**, and return the renewed
+expiry. Every miss — unknown room, namespace mismatch, unknown participant,
+wrong token — returns `RoomError::RoomNotFound`, so a heartbeat cannot probe room
+existence or membership. `InMemoryRoomStore` and `DbRoomStore` are the reference
+implementations. There is no default body on purpose: a store that silently did
+nothing would let the reaper evict live participants.
+
+**Automation:** `manual` — the body depends on how the store holds its state.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -502,6 +533,75 @@ literal would silently paper over a genuinely missing value on a later field
 addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
+
+### Jobs: `JobAdminRecord` gains a `blocked_on_concurrency` field
+
+**Why:** On the Redis backend a job that waits for a free concurrency slot is
+parked in a `{prefix}:blocked` zset and promoted back to its queue every
+~100 ms. The `/admin/jobs` enqueued tab read the queue lists only, so a parked
+job blinked in and out of the table (issue #1186). The tab now lists the queues
+and the parked set as one page, and the new field tells the two apart, so the
+dashboard can mark a row "waiting on a concurrency slot" instead of showing it
+as ready to claim.
+
+`JobAdminRecord` is public and not `#[non_exhaustive]`, so **struct-literal
+construction** of it no longer compiles. Only a custom `JobAdminBackend` builds
+one; reading a field, and every built-in backend, are unaffected. The built-in
+local, Postgres and SQLite backends report `false`: they keep an over-cap job in
+`enqueued` status, so it never leaves the tab in the first place.
+
+`JobAdminRecord` now derives `Default`, so the fix is to end the literal with
+`..Default::default()` — and that form survives the next field too.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    enqueued_at: None,
+    scheduled_for: None,
+    started_at: None,
+    finished_at: None,
+    attempt: 1,
+    max_attempts: 5,
+    last_error: None,
+    principal_id: None,
+    correlation_id: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    attempt: 1,
+    max_attempts: 5,
+    // Set it to `true` only for a job your backend parks on a full
+    // concurrency slot.
+    blocked_on_concurrency: false,
+    ..Default::default()
+};
+```
+
+`JobAdminStatus` also derives `Default` now (`Enqueued`), which is what makes
+the spread work. Both derives are additive.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical, but a rewrite cannot tell a literal that means to name every
+field from one that simply predates this one, and appending a rest pattern to
+the wrong literal would hide a genuinely missing value on a later field
+addition.
 
 ### Scrub: a `DELETE` trigger or rule on a table `autumn db scrub` empties is refused
 

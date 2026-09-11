@@ -1,0 +1,51 @@
+[package]
+name = "autumn-billing"
+description = "Subscription billing plugin (Stripe checkout, portal, webhook mirror, dunning) for autumn-web applications"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn"
+readme = "README.md"
+keywords = ["web", "billing", "stripe", "subscriptions", "axum"]
+categories = ["web-programming"]
+
+[dependencies]
+autumn-web = { version = "0.7.0", path = "../autumn" }
+chrono = { workspace = true }
+# Diesel is used ONLY by the optional DB-backed mirror (`store::db`). Backend
+# selection is inherited from autumn-web's `db` feature. This crate never
+# enables a backend or the `sqlite` lane itself (see the FEATURE-UNIFICATION
+# HAZARD in `autumn/src/db.rs`); queries target `RuntimeConnection`.
+diesel = { workspace = true, optional = true }
+diesel-async = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Stripe's REST API takes form-encoded bodies.
+serde_urlencoded = "0.7"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+[features]
+default = ["db"]
+db = ["autumn-web/db", "dep:diesel", "dep:diesel-async"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "mirror_db"
+path = "tests/mirror_db.rs"
+
+[lints]
+workspace = true

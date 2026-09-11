@@ -114,7 +114,14 @@ and the generated auth session store is typed against
 store's query functions also bind `::autumn_web::RuntimeBackend` rather than
 `diesel::pg::Pg` (#1908), so the tracked-sessions store compiles and runs on the
 SQLite connection; the scaffolded session-management and OAuth guides emit their
-operator SQL in the app's dialect too.
+operator SQL in the app's dialect too. `generate teams` is backend-aware as of
+the same issue: its organizations/memberships/invitations migration is emitted
+in the app's dialect, and its Rust templates never needed forking (the
+`#[repository]` macro binds `::autumn_web::RuntimeConnection`, and its
+`schema.rs` uses only sql-types both backends carry). Together with
+`notifications` and `pwa` these five are every generator that hand-writes
+`CREATE TABLE` DDL, and a guard applies each one's emitted migration to a real
+SQLite so a new hand-written table cannot regress that.
 **Every** field kind now has a working diesel SQLite conversion (#1924): a
 SQLite app's `Cargo.toml` gets the SQLite dependency set (diesel on `sqlite`,
 bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated

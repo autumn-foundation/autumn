@@ -203,6 +203,7 @@ impl SqliteJobRow {
             last_error: self.last_error.clone(),
             principal_id,
             correlation_id,
+            blocked_on_concurrency: false,
         }
     }
 }

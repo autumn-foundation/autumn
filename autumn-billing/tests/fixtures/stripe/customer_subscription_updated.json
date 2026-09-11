@@ -1,0 +1,53 @@
+{
+  "id": "evt_test_sub_updated_1",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1789257600,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "customer.subscription.updated",
+  "data": {
+    "object": {
+      "id": "sub_test_1",
+      "object": "subscription",
+      "cancel_at": null,
+      "cancel_at_period_end": true,
+      "canceled_at": null,
+      "collection_method": "charge_automatically",
+      "created": 1788998400,
+      "currency": "usd",
+      "current_period_end": 1791590400,
+      "current_period_start": 1788998400,
+      "customer": "cus_test_1",
+      "items": {
+        "object": "list",
+        "data": [
+          {
+            "id": "si_test_1",
+            "object": "subscription_item",
+            "price": {
+              "id": "price_pro_monthly",
+              "object": "price",
+              "currency": "usd",
+              "recurring": { "interval": "month", "interval_count": 1 },
+              "unit_amount": 1999
+            },
+            "quantity": 3,
+            "subscription": "sub_test_1"
+          }
+        ],
+        "has_more": false,
+        "total_count": 1,
+        "url": "/v1/subscription_items?subscription=sub_test_1"
+      },
+      "latest_invoice": "in_test_1",
+      "livemode": false,
+      "metadata": {},
+      "start_date": 1788998400,
+      "status": "past_due",
+      "trial_end": null
+    },
+    "previous_attributes": { "status": "active", "cancel_at_period_end": false }
+  }
+}
