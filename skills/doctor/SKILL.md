@@ -201,6 +201,22 @@ configuration:
 
 See issue #1852.
 
+## mTLS client-auth check (unreleased — trunk-dev, issue #1640)
+
+On trunk-dev, `autumn doctor` adds a `tls_client_auth` check that grades the
+`[server.tls.client_auth]` trust store offline — no server boot, no network:
+
+- **Pass** — the section is absent or `mode = "off"` (the listener requests no
+  client certificate), or the bundle loads with every CA comfortably in date.
+- **Warn** — a CA in the bundle expires within 30 days; the CRL's `nextUpdate`
+  has passed (autumn keeps honouring a stale list rather than failing every
+  handshake, so this is otherwise silent); `mode = "optional"` with no route in
+  `required_paths` (client auth configured and enforcing nothing); or the CLI
+  was built without the `tls` feature.
+- **Fail** — the CA bundle or CRL is missing, unparseable, or empty, a CA in
+  the bundle has expired, or `client_auth` is present but is not a table. These are the conditions the runtime refuses to boot
+  on, so a Fail here means the app will not start.
+
 ## ACME preflight checks (unreleased — trunk-dev, issue #1608)
 
 On trunk-dev, `autumn doctor --online` (alias `--preflight`) runs active network
