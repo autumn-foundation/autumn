@@ -428,6 +428,28 @@ pub fn normalize_profile_name(profile: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+/// The single source of truth for "is this profile dev-like?", used by every
+/// dev-only surface (the request inspector, the HTML dev error overlay, …).
+///
+/// Fails closed: an unset profile (`None`) is NOT dev. A [`ConfigLoader`]
+/// other than the default [`TomlEnvConfigLoader`] is free to build an
+/// [`AutumnConfig`] however it wants (see `docs/guide/custom-subsystems.md`),
+/// and nothing requires it to populate `profile` — `resolve_profile` (which
+/// always resolves to a concrete profile, defaulting to `"dev"`) only runs
+/// inside `TomlEnvConfigLoader`. A dev-only surface must never treat that
+/// absence as an invitation to guess `cfg!(debug_assertions)` instead: a
+/// production deployment running a debug build (forgetting `--release`, or a
+/// misconfigured Docker multi-stage build, is an easy operational mistake)
+/// would otherwise get the dev error overlay — internal error messages,
+/// headers, cookies, and SQL query text — on every 5xx, even though the app
+/// author never opted into `profile = "dev"`.
+///
+/// [`ConfigLoader`]: crate::config::ConfigLoader
+#[must_use]
+pub(crate) fn profile_is_dev(profile: Option<&str>) -> bool {
+    matches!(profile, Some("dev" | "development"))
+}
+
 /// Profile names to check for inline/file overrides.
 ///
 /// For canonical profiles, include legacy aliases for compatibility so

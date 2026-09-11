@@ -829,7 +829,7 @@ pub(crate) fn append_framework_routes(
     }
 
     // Dev request inspector routes.
-    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+    if crate::config::profile_is_dev(config.profile.as_deref()) {
         let inspector_path = &config.dev.inspector_path;
         let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
         for (path, handler) in [
