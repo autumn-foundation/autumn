@@ -532,6 +532,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark's total past a flat percentage floor — the case for shipping
   it is the function-level number plus zero behavior change and zero new
   dependencies.
+- **⚡ Bolt: drop four needless `Service::clone()`s from the ingress
+  middleware fast paths (instructions -5.5%, allocation bytes -10.6%):**
+  `autumn/benches/request_pipeline.rs` (the committed ingress-pipeline
+  profiler, issue #2193) profiled under `valgrind --tool=dhat` showed
+  `TrustedProxiesService`, `MethodOverrideService`, `SubmitTokenService` and
+  `idempotency::IdempotencyReplayService` each allocating on effectively
+  every request — 2.7 MB of the run's 17.6 MB marginal allocation bytes —
+  from `tower::util::boxed_clone_sync::CloneService::clone_box`. Each of
+  these `call()`s did a `let mut inner = self.inner.clone(); std::mem::swap(
+  &mut self.inner, &mut inner);` before `Box::pin`-ing the result, a pattern
+  copied from sibling middlewares that genuinely need to move an owned `S`
+  into an `async move` block. These four don't: on their common-case path
+  (no CAPTCHA/replay/override/guard applicable — every GET, every non-form
+  POST) nothing runs between entry and the delegating call, so
+  `self.inner.call(req)` can be boxed directly with `&mut self.inner`,
+  never touching `Clone`. `self.inner` is, at this point in the stack, a
+  `BoxCloneSyncService` whose `Clone` impl allocates a fresh
+  `Box<dyn CloneService>` to duplicate the remaining downstream stack — the
+  exact cost issue #2214 already eliminated from four *other* middlewares by
+  converting their `from_fn` closures to named-future `Service`s; this
+  targets the same mechanism on the four `Service`s #2214 didn't touch
+  (`SubmitTokenService`/`IdempotencyReplayService` split their existing
+  branch structure so only the guarded/replay path still clones;
+  `TrustedProxiesService` and `MethodOverrideService`'s ineligible-request
+  branch never needed the clone at all). Behavior is unchanged: all 98
+  existing unit tests across the four modules and all 105 existing
+  CSRF/idempotency/submit-token/trusted-proxy/`ingress_named_futures`
+  integration tests pass unmodified. Independently corroborated by two
+  pre-existing gates neither of which this change touches:
+  `tests/config_alloc_gate.rs`'s exact in-process `allocation-counter`
+  measurement of a single `/ping` request through the production stack
+  (140 → 132 blocks, 27,982 → 25,022 bytes) and
+  `tests/integration/middleware_stack_depth.rs`'s clone-event probe (9 → 7
+  traversals, still inside its documented `6..=9` window — the same counter
+  #2214 introduced for exactly this class of fix). Measured end to end via
+  `request_pipeline.rs` (`valgrind --tool=callgrind`, base-subtracted,
+  mean of 3 runs each side to bound run-to-run hash-seed variance):
+  marginal instructions/3000-request run 289,823,338 → 273,790,211 (-5.53%);
+  via `valgrind --tool=dhat`: marginal allocation bytes 17,617,058 →
+  16,108,256 (-8.56%), blocks 90,507 → 86,307 (-4.64%).
 
 ### Fixed
 
