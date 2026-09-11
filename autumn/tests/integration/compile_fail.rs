@@ -1021,14 +1021,17 @@ fn agent_authority_guide_matches_the_real_diagnostics() {
 /// a complete program: one (the CSRF form handler) is a bare `async fn`, the
 /// same "elide the surrounding main for brevity" shape rustdoc itself accepts
 /// because it wraps a mainless doctest in one automatically. Nothing here
-/// does that wrapping, and a fence with `fn main` and one without cannot both
-/// be a `src/bin/*.rs` (a binary with no `main` is `E0601`, forcing a
-/// has-main/has-not branch this test would then have to maintain by hand).
-/// Nesting every fence in its own `mod` of one shared `src/lib.rs` sidesteps
-/// the branch entirely: a library crate never requires `main`, an ordinary
-/// function that happens to be *named* `main` is legal inside a module, and
-/// each fence's identifiers (also-named-`index` handlers, `main` itself) stay
-/// isolated from its neighbors.
+/// does that wrapping, so a fence containing `fn main` becomes its own
+/// `src/bin/*.rs` — the same binary-crate shape a reader actually pastes a
+/// complete example into — and every other fence is nested in its own `mod`
+/// of one shared `src/lib.rs`, where a bare function is legal without one.
+/// The split matters, not just the bookkeeping: a binary's `fn main` obeys
+/// real entry-point rules a library `mod` does not enforce — an `async fn
+/// main` with no `#[autumn_web::main]` is `E0752` at the crate root of a
+/// binary, but merely an ordinary (unremarkable, silently-compiling) async
+/// function nested in a module (Codex review, PR #2707, round 3). Treating
+/// every fence as a library item would have let that exact class of typo
+/// through the gate uncaught.
 ///
 /// Extracts every `rust,no_run` fence from the two files this way and
 /// `cargo check`s the result — real compilation against the in-tree crate,
@@ -1085,8 +1088,8 @@ fn doc_getting_started_snippets_compile() {
         .join("target/doc-snippet-check")
         .join(std::process::id().to_string());
     let _cleanup = RemoveDirOnDrop(scratch.clone());
-    let src = scratch.join("src");
-    std::fs::create_dir_all(&src).expect("scratch crate directories");
+    let src_bin = scratch.join("src/bin");
+    std::fs::create_dir_all(&src_bin).expect("scratch crate directories");
 
     // Dependencies mirror what `autumn new` actually writes
     // (`autumn-cli/src/templates/Cargo.toml.tmpl`), not a guess at what a
@@ -1138,12 +1141,23 @@ fn doc_getting_started_snippets_compile() {
     )
     .expect("write scratch Cargo.toml");
 
+    // Fences containing `fn main` are complete programs — the same shape a
+    // reader pastes into `src/main.rs` — so each becomes its own binary
+    // target, where rustc enforces the real entry-point rules (`E0752` on an
+    // async `main` missing `#[autumn_web::main]`, etc.). Everything else is a
+    // bare-item fragment nested in its own `mod` of one shared `src/lib.rs`,
+    // where no `main` is required (Codex review, PR #2707, round 3).
     let mut lib_rs = String::from("#![allow(dead_code, unused_variables, unused_imports)]\n\n");
     for (name, body) in &fixtures {
-        use std::fmt::Write as _;
-        let _ = write!(lib_rs, "mod {name} {{\n{body}\n}}\n\n");
+        if body.contains("fn main(") {
+            std::fs::write(src_bin.join(format!("{name}.rs")), body)
+                .unwrap_or_else(|e| panic!("write scratch src/bin/{name}.rs: {e}"));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(lib_rs, "mod {name} {{\n{body}\n}}\n\n");
+        }
     }
-    std::fs::write(src.join("lib.rs"), lib_rs).expect("write scratch src/lib.rs");
+    std::fs::write(scratch.join("src/lib.rs"), lib_rs).expect("write scratch src/lib.rs");
 
     // Seed the scratch crate's lockfile from the real workspace's (Codex
     // review, round 2): with no `Cargo.lock` of its own, `cargo check` has to
