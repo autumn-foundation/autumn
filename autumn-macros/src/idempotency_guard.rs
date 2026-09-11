@@ -1271,6 +1271,102 @@ mod tests {
         assert!(block_has_replay_guard(&block));
     }
 
+    /// Counts real `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` markers left in the
+    /// final program after a `#[secured("admin")]` + `#[authorize(...)]`
+    /// stack fully expands, in the given attribute order. `#[secured]`
+    /// keeps its own checks in a sibling `FromRequestParts` gate item (issue
+    /// #1668), never in `input_fn`'s own block, so the count must total the
+    /// LAST stage's output plus any earlier gate item verbatim -- the
+    /// earlier stage's function item is superseded, not additive.
+    fn final_replay_marker_count(gate_item: &str, final_fn: &proc_macro2::TokenStream) -> usize {
+        format!("{gate_item} {final_fn}")
+            .matches("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD")
+            .count()
+    }
+
+    #[test]
+    fn secured_above_authorize_emits_exactly_one_replay_guard() {
+        // Issue #2233: `#[secured("admin")]` above `#[authorize(...)]` above
+        // the route macro. Secured is topmost, so it expands FIRST -- with
+        // `#[authorize]` still a pending attribute, `should_own_replay` must
+        // defer (`has_pending_authorize_attr`) and leave its gate free of any
+        // replay check. Authorize expands SECOND, on secured's already
+        // gate-wrapped output, and must be the one guard that owns replay.
+        //
+        // This composition is already safe on trunk: #[secured] moved its
+        // checks into a sibling `FromRequestParts` gate item (issue #1668),
+        // never into `input_fn`'s own block, so the duplicate-guard risk the
+        // issue describes cannot reach this stacking order any more. This
+        // test is the end-to-end proof the issue's suggested fix direction
+        // asked for, run against real macro output in both stacking orders.
+        let secured_input = quote::quote! {
+            #[authorize("update", resource = Note)]
+            async fn update_note(note: Note) -> &'static str { "ok" }
+        };
+        let after_secured = crate::secured::secured_macro(quote::quote! { "admin" }, secured_input);
+        let mut fn_after_secured: syn::ItemFn =
+            crate::param_helpers::extract_fn_item(after_secured.clone(), "update_note");
+        // Rustc strips a live attribute from the item before invoking its
+        // macro; `extract_fn_item` alone does not, so mirror that here.
+        fn_after_secured
+            .attrs
+            .retain(|a| !a.path().is_ident("authorize"));
+        let after_authorize = crate::authorize::authorize_macro(
+            quote::quote! { "update", resource = Note },
+            quote::quote! { #fn_after_secured },
+        );
+        let gate_item = after_secured
+            .to_string()
+            .split("async fn update_note")
+            .next()
+            .expect("the gate struct+impl precedes the fn in secured's output")
+            .to_string();
+
+        assert_eq!(
+            final_replay_marker_count(&gate_item, &after_authorize),
+            1,
+            "exactly one guard must own replay-serving end to end: \
+             gate:\n{gate_item}\n\nfinal fn:\n{after_authorize}"
+        );
+    }
+
+    #[test]
+    fn authorize_above_secured_emits_exactly_one_replay_guard() {
+        // Issue #2233, the other stacking order: `#[authorize(...)]` above
+        // `#[secured("admin")]`. Authorize is topmost and expands FIRST,
+        // claiming replay ownership in its own in-body check (nothing else
+        // has claimed it yet). Secured expands SECOND, on authorize's
+        // already-expanded body, and must recognize authorize's replay
+        // guard there (past its policy-check failure branch and sunset
+        // check) so its own gate stays free of a second one.
+        let authorize_input = quote::quote! {
+            #[secured("admin")]
+            async fn update_note(note: Note) -> &'static str { "ok" }
+        };
+        let after_authorize = crate::authorize::authorize_macro(
+            quote::quote! { "update", resource = Note },
+            authorize_input,
+        );
+        let mut fn_after_authorize: syn::ItemFn =
+            crate::param_helpers::extract_fn_item(after_authorize, "update_note");
+        fn_after_authorize
+            .attrs
+            .retain(|a| !a.path().is_ident("secured"));
+        let after_secured = crate::secured::secured_macro(
+            quote::quote! { "admin" },
+            quote::quote! { #fn_after_authorize },
+        );
+
+        assert_eq!(
+            after_secured
+                .to_string()
+                .matches("__AUTUMN_IDEMPOTENCY_REPLAY_GUARD")
+                .count(),
+            1,
+            "exactly one guard must own replay-serving end to end: {after_secured}"
+        );
+    }
+
     #[test]
     fn should_own_replay_defers_to_authorize_across_the_sunset_check() {
         // Real stacking order `#[authorize("update", resource = Post)]` above

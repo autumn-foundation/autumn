@@ -352,6 +352,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **auth:** confirmed, with new end-to-end tests, that stacking
+  `#[secured("admin")]` with `#[authorize(...)]` never emits two idempotency
+  replay guards in either attribute order (issue #2233). `#[secured]`'s
+  checks moved into a sibling `FromRequestParts` gate item well before this
+  investigation (issue #1668), so `should_own_replay`'s existing
+  `has_pending_authorize_attr`/`has_any_guard_gate_param` checks already
+  keep the two guards from double-claiming replay-serving — no scan or
+  runtime behavior needed to change. The new tests run real
+  `secured_macro`/`authorize_macro` output through both stacking orders and
+  assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
+  the final program, closing out the issue's suggested composition-test
+  coverage.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
