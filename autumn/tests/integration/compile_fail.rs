@@ -1284,7 +1284,7 @@ fn declares_fn_main(body: &str) -> bool {
 /// what target the outer test suite happens to be exercising elsewhere.
 fn resolve_cargo_target_dir() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("resolve the running test binary's own path");
-    let dir = exe
+    let mut dir = exe
         .ancestors()
         .nth(3)
         .unwrap_or_else(|| {
@@ -1294,12 +1294,23 @@ fn resolve_cargo_target_dir() -> std::path::PathBuf {
             )
         })
         .to_path_buf();
-    if dir.join("CACHEDIR.TAG").exists() {
-        dir
-    } else {
-        let up_one = dir.parent().map(std::path::Path::to_path_buf);
-        up_one.unwrap_or(dir)
+    if !dir.join("CACHEDIR.TAG").exists()
+        && let Some(parent) = dir.parent()
+    {
+        dir = parent.to_path_buf();
     }
+    // Cargo stamps CACHEDIR.TAG in a `--target <triple>` build's per-triple
+    // artifact subdirectory (`target/<triple>/`) as well as at the real
+    // target root (`target/`) — confirmed by probing `cargo build --target
+    // <host-triple>`, which left the marker in both places. So the marker
+    // alone can't tell `target/<triple>/` and `target/` apart; if our
+    // directory's parent also carries it, we're one level too deep.
+    if let Some(parent) = dir.parent()
+        && parent.join("CACHEDIR.TAG").exists()
+    {
+        dir = parent.to_path_buf();
+    }
+    dir
 }
 
 /// Recursively removes the wrapped directory when dropped, pass or fail
