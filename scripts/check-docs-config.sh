@@ -5812,35 +5812,75 @@ def _published(pkg, workspace):
     return True
 
 
+def _workspace_of(rel, tracked, parsed):
+    """The manifest whose `[workspace.package]` this one inherits from.
+
+    Cargo walks UP from the package directory to the nearest ancestor manifest
+    carrying a `[workspace]` table, and `package.workspace = "…"` names one
+    explicitly. A manifest with its own `[workspace]` table is its own root,
+    which is how five standalone workspaces sit inside this repository without
+    belonging to the root one: `fuzz/`, `examples/island-flock/`,
+    `examples/reddit-clone/src-tauri/` and the two benchmark harnesses.
+
+    Always reading the repository-root manifest instead would resolve an
+    inherited value from a workspace the package is not in — the right answer
+    only by coincidence, and only for packages in the root workspace.
+    """
+    data = parsed(rel)
+    named = (data.get('package') or {}).get('workspace')
+    if isinstance(named, str):
+        here = str(pathlib.PurePosixPath(rel).parent)
+        for suffix in (named, os.path.join(named, 'Cargo.toml')):
+            cand = os.path.normpath(os.path.join(here, suffix))
+            cand = cand.replace(os.sep, '/')
+            if cand in tracked and 'workspace' in parsed(cand):
+                return cand
+    if 'workspace' in data:
+        return rel
+    parts = rel.split('/')[:-1]
+    while parts:
+        parts.pop()
+        cand = '/'.join(parts + ['Cargo.toml'])
+        if cand in tracked and 'workspace' in parsed(cand):
+            return cand
+    return None
+
+
 def package_readmes(root):
     """Every file a `Cargo.toml` publishes as its crate's README.
 
     PARSED AS TOML, not matched with a regex, and that is the point. Review
     found four ways a hand-rolled matcher misread a manifest: it took only
     double-quoted values, then only explicit keys, then ignored `publish`, then
-    missed `readme = { workspace = true }` — the inline-table spelling of the
-    dotted key it did match. Each fix was correct and each left the next corner
-    of the same grammar uncovered, because the thing being approximated is a
-    TOML parser. `tomllib` is standard library and already used by
-    `check-docs-toml.sh` and by `check-example-bin-names.sh`, the latter on
-    `Cargo.toml` exactly like this. Both inheritance spellings are the same
-    TOML, so a parser cannot tell them apart and cannot miss one.
+    missed the inline-table spelling of the inheritance it did match. Each fix
+    was correct and each left the next corner of the same grammar uncovered,
+    because the thing being approximated is a TOML parser. `tomllib` is
+    standard library and already used by `check-docs-toml.sh` and by
+    `check-example-bin-names.sh`, the latter on `Cargo.toml` exactly like this.
+
+    `cargo metadata` would be more authoritative still, and is deliberately not
+    used: every docs gate shares a CI job that carries no Rust toolchain and no
+    cache, on purpose, so that it reports in seconds and cannot be blocked by a
+    compile failure elsewhere. Reading the manifests keeps that property.
 
     What Cargo does, and so does this: `readme = false` means none; a string is
-    a path relative to the manifest; `workspace = true` takes
-    `[workspace.package]`'s, relative to the workspace root; and an ABSENT key
-    discovers `README.md`, `README.txt` or `README` beside the manifest, in
-    that order. A package that does not publish is skipped — it has no landing
-    page to keep true, and enrolling its working notes made the drift gates
-    fail on the illustrative commands such a page may contain.
+    a path relative to the manifest; `workspace = true` takes the
+    `[workspace.package]` value of the package's OWN workspace, relative to
+    that workspace's root; and an ABSENT key discovers `README.md`,
+    `README.txt` or `README` beside the manifest, in that order. A package that
+    does not publish is skipped — it has no landing page to keep true, and
+    enrolling its working notes made the drift gates fail on the illustrative
+    commands such a page may contain.
     """
     tracked = tracked_files(root)
     root_path = pathlib.Path(root)
-    workspace = {}
-    if 'Cargo.toml' in tracked:
-        workspace = tomllib.loads(
-            (root_path / 'Cargo.toml').read_text(encoding='utf-8')
-        ).get('workspace', {}).get('package', {})
+    cache = {}
+
+    def parsed(rel):
+        if rel not in cache:
+            cache[rel] = tomllib.loads(
+                (root_path / rel).read_text(encoding='utf-8'))
+        return cache[rel]
 
     out = set()
     for rel in sorted(f for f in tracked
@@ -5848,18 +5888,28 @@ def package_readmes(root):
         manifest = pathlib.PurePosixPath(rel)
         parent = str(manifest.parent)
         parent = '' if parent == '.' else parent + '/'
-        pkg = tomllib.loads(
-            (root_path / rel).read_text(encoding='utf-8')).get('package')
-        if not isinstance(pkg, dict) or not _published(pkg, workspace):
+        pkg = parsed(rel).get('package')
+        if not isinstance(pkg, dict):
+            continue
+
+        ws_manifest = _workspace_of(rel, tracked, parsed)
+        workspace, ws_dir = {}, ''
+        if ws_manifest:
+            workspace = parsed(ws_manifest).get('workspace', {}).get(
+                'package', {})
+            ws_dir = str(pathlib.PurePosixPath(ws_manifest).parent)
+            ws_dir = '' if ws_dir == '.' else ws_dir
+
+        if not _published(pkg, workspace):
             continue
 
         named = pkg.get('readme')
         if _inherited(named):
-            # An inherited path is relative to the WORKSPACE root, so it needs
-            # no rebasing onto the inheriting manifest's directory.
+            # An inherited path is relative to ITS workspace's root.
             named = workspace.get('readme')
             if isinstance(named, str):
-                out.add(os.path.normpath(named).replace(os.sep, '/'))
+                resolved = os.path.normpath(os.path.join(ws_dir, named))
+                out.add(resolved.replace(os.sep, '/'))
             continue
         if named is False:
             continue
