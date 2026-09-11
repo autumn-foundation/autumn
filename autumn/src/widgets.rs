@@ -807,12 +807,14 @@ pub fn transition_controls(
 /// An edge with no override keeps autumn-web's default English text.
 /// Build with [`TransitionLabels::new`] and chain the `const` builder
 /// methods.
+#[cfg(feature = "maud")]
 #[derive(Clone, Copy, Default)]
 pub struct TransitionLabels<'a> {
     group: Option<&'a str>,
     buttons: &'a [(&'a str, &'a str)],
 }
 
+#[cfg(feature = "maud")]
 impl<'a> TransitionLabels<'a> {
     /// Make labels with no overrides.
     #[must_use]
