@@ -5763,6 +5763,33 @@ def source_tokens(root):
     return tokens
 
 
+# `readme = "…"` in a crate manifest names that crate's crates.io landing page.
+# It is reader-facing by PUBLICATION rather than by where it sits in the tree,
+# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# reads the manifests for exactly this reason, and its argument carries here
+# unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
+# the same way they carry `/actuator/…` URLs.
+CARGO_README = re.compile(r'^\s*readme\s*=\s*"([^"]+)"', re.M)
+
+
+def package_readmes(root):
+    """Every file a `Cargo.toml` publishes as its crate's README."""
+    listing = subprocess.run(
+        ['git', 'ls-files', '-z', '*Cargo.toml'],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    out = set()
+    for rel in filter(None, listing.split('\0')):
+        manifest = pathlib.PurePosixPath(rel)
+        text = (pathlib.Path(root) / rel).read_text(
+            encoding='utf-8', errors='ignore')
+        for named in CARGO_README.findall(text):
+            # `readme = "../README.md"` points at the workspace root's page.
+            resolved = os.path.normpath(str(manifest.parent / named))
+            out.add(resolved.replace(os.sep, '/'))
+    return out
+
+
 def corpus(root):
     """The reader-facing pages, including the ones written into a new project.
 
@@ -5776,8 +5803,10 @@ def corpus(root):
     # NUL-delimited so a path containing whitespace is not split into fragments.
     out = subprocess.run(['git', 'ls-files', '-z', '*.md', '*.md.tmpl'],
                          cwd=root, capture_output=True, text=True).stdout
+    published = package_readmes(root)
     return [f for f in out.split('\0')
-            if f and (reader_facing(f) or f.endswith('.md.tmpl'))]
+            if f and (reader_facing(f) or f.endswith('.md.tmpl')
+                      or f in published)]
 
 
 # -------------------------------------------------------------- resolution
@@ -9035,8 +9064,25 @@ def self_test():
     return 1 if failures else 0
 
 
+
+def print_corpus():
+    """Print this gate's resolved corpus, one path per line.
+
+    `scripts/check-docs-scope.sh` compares these lists across the four gates
+    that share a reader-facing corpus. It asks each gate what it reads rather
+    than re-deriving it from this file's source, because a corpus is widened in
+    several places at once — the `git ls-files` globs, the scope tuples, the
+    `.md.tmpl` clause, the crate `readme =` manifests — and a checker that
+    models some of those rules reports agreement over the rest. Asking cannot
+    drift from the answer; modelling can, and did.
+    """
+    for f in sorted(corpus(ROOT)):
+        print(f)
+    return 0
+
 sys.exit(self_test() if MODE == '--self-test'
          else list_surface() if MODE == '--list'
+         else print_corpus() if MODE == '--corpus'
          else main())
 PYEOF
 }
@@ -9045,6 +9091,7 @@ case "${1:-}" in
   "")          echo "Checking AUTUMN_* config keys across the reader-facing docs..."
                run_py "" "$root" ;;
   --list)      run_py --list "$root" ;;
+  --corpus)    run_py --corpus "$root" ;;
   --self-test) run_py --self-test "$root" ;;
-  *)           echo "usage: $0 [--list|--self-test]" >&2; exit 2 ;;
+  *)           echo "usage: $0 [--list|--corpus|--self-test]" >&2; exit 2 ;;
 esac

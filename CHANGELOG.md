@@ -143,14 +143,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ungated for command, config-key and symbol drift alike — while the same file
   already carried `route-surface-allow` waivers for the one gate that did read
   it. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
-  take the tree in this change (corpus 198→199, 199→200 and 199→200), and all
-  eight gates stay green over it. The new gate compares the four declarations
-  rather than the corpus, so it fails when a scope is edited rather than when
-  the pages that scope stopped covering finally rot. A difference between gates
+  take the tree in this change, and all eight gates stay green over it. Review
+  of the gate found two further divergences of the same shape, both fixed here:
+  `check-docs-cli.sh` passed `*.md` to `git ls-files` where its siblings passed
+  `*.md` and `*.md.tmpl`, leaving `autumn-cli/src/templates/README.md.tmpl` —
+  the README `autumn new` writes into every scaffolded project, carrying a
+  reference table of `autumn dev`, `autumn migrate`, `autumn doctor`, `autumn
+  routes`, `autumn generate scaffold` and `autumn release init` — outside the
+  one gate that exists to check `autumn …` commands; and `check-docs-routes.sh`
+  read the `readme = "…"` page of every crate manifest, a crates.io landing page
+  being reader-facing by publication rather than by where it sits, while its
+  siblings did not, leaving the seven published plugin and subcrate READMEs
+  ungated for the 18 `autumn_web::…` occurrences and 3 `AUTUMN_*` variables they
+  carry. The three siblings' corpus goes 198→207, 199→207 and 199→207, with no
+  drift found in the pages newly covered. Each of the four gates gains a
+  `--corpus` mode that prints its own resolved corpus, and the new gate compares
+  those lists rather than re-deriving them: a corpus is widened in several
+  places at once — the `ls-files` globs, the scope tuples, the `.md.tmpl`
+  clause, the crate manifests — and a checker that models some of those rules
+  reports agreement over the rest, which is how the first version of it passed
+  two of these three. It therefore fails when a scope is edited rather than when
+  the pages that scope stopped covering finally rot, and a gate whose `--corpus`
+  fails or prints nothing is a failure rather than a skip. A difference between gates
   is allowed but must be recorded in the script's `DECLARED_DIFFERENCES` table
   with its reason — the rule that catches what a superset check cannot, namely
   one gate widening alone while its siblings still agree with each other, which
-  is exactly how this drift passed unnoticed. One difference is declared today:
+  is exactly how this drift passed unnoticed, and the direction a difference
+  runs in is part of its key, so a note cannot outlive what it describes and
+  waive its own opposite. One difference is declared today:
   the routes gate reads all of `examples/` rather than only the `README.md`
   under it, because `examples/wiki/content/` is embedded and served, an argument
   about URLs that does not carry to commands or config keys. A declaration that

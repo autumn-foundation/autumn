@@ -1002,7 +1002,24 @@ def self_test():
     return 0 if failed == 0 else 1
 
 
-sys.exit({"--self-test": self_test, "--list": list_surface}.get(MODE, main)())
+
+def print_corpus():
+    """Print this gate's resolved corpus, one path per line.
+
+    `scripts/check-docs-scope.sh` compares these lists across the four gates
+    that share a reader-facing corpus. It asks each gate what it reads rather
+    than re-deriving it from this file's source, because a corpus is widened in
+    several places at once — the `git ls-files` globs, the scope tuples, the
+    `.md.tmpl` clause, the crate `readme =` manifests — and a checker that
+    models some of those rules reports agreement over the rest. Asking cannot
+    drift from the answer; modelling can, and did.
+    """
+    for f in sorted(corpus(ROOT)):
+        print(f)
+    return 0
+
+sys.exit({"--self-test": self_test, "--list": list_surface,
+          "--corpus": print_corpus}.get(MODE, main)())
 PYEOF
 }
 
@@ -1012,6 +1029,9 @@ case "${1-}" in
     ;;
   --list)
     run_py --list "$root"
+    ;;
+  --corpus)
+    run_py --corpus "$root"
     ;;
   "")
     echo "Checking actuator paths across the reader-facing docs..."

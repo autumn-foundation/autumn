@@ -29,16 +29,40 @@
 # The drift was invisible because it lives in four files that are never read
 # side by side. This gate reads them side by side.
 #
-# THE INVARIANT, in two halves:
+# Two more divergences turned up once this gate existed, and they are the reason
+# it compares the file lists the gates REPORT rather than rules read out of their
+# source. A corpus is widened in several places at once, so a checker that models
+# some of them reports agreement over the rest:
+#
+#   - `check-docs-cli.sh` passed `*.md` to `git ls-files` where its three
+#     siblings passed `*.md` AND `*.md.tmpl`, so
+#     `autumn-cli/src/templates/README.md.tmpl` — the README `autumn new` writes
+#     into every scaffolded project, carrying a reference table of `autumn dev`,
+#     `autumn migrate`, `autumn doctor`, `autumn routes`, `autumn generate
+#     scaffold` and `autumn release init` — sat outside the one gate that exists
+#     to check `autumn …` commands. Identical tuples, different corpora.
+#
+#   - `check-docs-routes.sh` reads the `readme = "…"` page of every crate
+#     manifest, because a crates.io landing page is reader-facing by PUBLICATION
+#     rather than by where it sits in the tree. Its three siblings did not, so
+#     the seven published plugin and subcrate READMEs were ungated for the
+#     `autumn_web::…` paths and `AUTUMN_*` variables they carry — 18 symbol
+#     occurrences and 3 variables, none of them drifted yet.
+#
+# Both are fixed in the same change as this gate: the siblings' corpus goes
+# 200 -> 207, and all four gates stay green over it.
+#
+# THE INVARIANT, in two halves, over the set of files each gate actually reads:
 #
 #   1. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
-#      declare the SAME corpus. These three ask about three different things a
+#      read the SAME PAGES. These three ask about three different things a
 #      reader copies off one page; a page that is reader-facing for one of them
-#      is reader-facing for all three. Their `INCLUDE_DIRS`, `INCLUDE_FILES` and
-#      `INCLUDE_README_DIRS` must match exactly.
+#      is reader-facing for all three.
 #
-#   2. Every way `check-docs-routes.sh` differs from those three is DECLARED
-#      below, in `DECLARED_DIFFERENCES`, with the reason.
+#   2. Every page `check-docs-routes.sh` reads that those three do not, or the
+#      reverse, is DECLARED below in `DECLARED_DIFFERENCES` — with the DIRECTION
+#      the difference runs in, so a note cannot outlive the thing it describes
+#      and waive its own opposite.
 #
 # Half 2 is the half that catches the drift described above, and it is why this
 # gate does not simply require the routes corpus to be a superset. A superset
@@ -58,22 +82,30 @@
 # argument is about URLs and does not carry to commands or config keys, so the
 # difference is deliberate and stays.
 #
-# This gate does NOT read the corpus. It reads the four scripts' own scope
-# declarations, so it fails at the moment a scope is edited rather than when a
-# page that scope stopped covering finally rots.
+# This gate reads no page's CONTENT. It runs each of the four gates with the
+# `--corpus` mode this change adds to them, which prints that gate's own
+# resolved corpus one path per line, and compares the lists. It therefore fails
+# at the moment a scope is edited rather than when a page that scope stopped
+# covering finally rots.
 #
-# SCOPE CONSTANTS ARE PARSED, NOT IMPORTED: the gates are bash wrappers around
-# embedded Python, so there is nothing to import. The three tuple literals are
-# read out of each file's source with a parser that tolerates the inline
-# comments `check-docs-routes.sh` interleaves between its entries (it is the one
-# file that explains each addition in place). A file whose constants cannot be
-# parsed is a FAILURE, not a skip: a gate that silently stops being checked is
-# the defect this gate exists to catch, one level up.
+# THE GATES ARE ASKED, NOT MODELLED. The first version of this script re-derived
+# each corpus by parsing the gate's source, and was wrong twice over in exactly
+# the way a model is always eventually wrong: it compared the scope tuples and
+# reported agreement while the `ls-files` globs differed, and once the globs
+# were modelled too it still had no idea the routes gate reads crate manifests.
+# Every rule a corpus is built from would have had to be mirrored here and kept
+# mirrored — a second implementation with its own drift, gating the first. So a
+# gate answers for itself.
+#
+# A gate whose `--corpus` fails, or prints nothing, is a FAILURE and never a
+# skip: an empty corpus compares equal to another empty corpus, and a gate that
+# silently stops being checked is the defect this gate exists to catch, one
+# level up.
 #
 # Run locally with:
 #
-#     scripts/check-docs-scope.sh              # gate the declarations
-#     scripts/check-docs-scope.sh --self-test  # synthetic-source tests
+#     scripts/check-docs-scope.sh              # gate the corpora
+#     scripts/check-docs-scope.sh --self-test  # synthetic-gate tests
 
 set -euo pipefail
 
@@ -81,8 +113,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 read -r -d '' PYSRC <<'PYEOF' || true
-import ast
-import pathlib
+import subprocess
 import sys
 
 # The three gates that must agree, and the one that must contain them.
@@ -94,165 +125,127 @@ SIBLINGS = (
 SUPERSET = 'scripts/check-docs-routes.sh'
 SELF = 'scripts/check-docs-scope.sh'
 
-# The tuples that spell a corpus. `INCLUDE_README_DIRS` is absent from
-# `check-docs-routes.sh` on purpose — it takes those directories WHOLE via
-# `INCLUDE_DIRS`, which is a wider claim, not a missing one — so a gate that
-# does not declare it reads as the empty tuple rather than as an error.
-NAMES = ('INCLUDE_DIRS', 'INCLUDE_FILES', 'INCLUDE_README_DIRS')
+# Every page the routes gate reads that its siblings do not, or vice versa, must
+# appear here with the DIRECTION the difference runs in and the reason it does
+# not propagate. An undeclared difference is a defect: see the note on half 2 in
+# this file's header.
+#
+# `side` is the half of the invariant that keeps a declaration from outliving
+# the thing it describes. A note keyed by path alone waives that path in EITHER
+# direction, so removing `examples/` from the routes gate — which would make it
+# narrower than its siblings, the reverse of what is written here, and a real
+# loss of coverage — would still find this entry and pass.
+DECLARED_DIFFERENCES = (
+    {
+        'prefix': 'examples/',
+        'side': 'routes-only',
+        'why': (
+            "the routes gate takes all of `examples/` while its siblings take "
+            "only the `README.md` under it. `examples/wiki/content/` is "
+            "embedded and SERVED, so a stale `/actuator/…` URL there is a page "
+            "the running example shows a reader rather than one they might "
+            "open. That argument is about URLs and does not carry to `autumn "
+            "…` commands, `AUTUMN_*` variables or `autumn_web::…` paths, none "
+            "of which those files carry."
+        ),
+    },
+)
 
-# Every entry the routes gate has that its siblings do not, or vice versa, must
-# appear here with the reason it does not propagate. Keyed by the path prefix or
-# filename that differs; the value is why. An undeclared difference is a defect:
-# see the note on half 2 in this file's header.
-DECLARED_DIFFERENCES = {
-    'examples/': (
-        "the routes gate takes all of `examples/` while its siblings take only "
-        "the `README.md` under it. `examples/wiki/content/` is embedded and "
-        "SERVED, so a stale `/actuator/…` URL there is a page the running "
-        "example shows a reader rather than one they might open. That argument "
-        "is about URLs and does not carry to `autumn …` commands, `AUTUMN_*` "
-        "variables or `autumn_web::…` paths, none of which those files carry."
-    ),
-}
 
+def corpus(path):
+    """Ask one gate for the pages it reads.
 
-def constants(path):
-    """Read the scope tuples out of one gate's source.
-
-    The assignment is found by name at the start of a line, and its right-hand
-    side is handed to `ast.literal_eval` — which parses a tuple spanning several
-    lines and interleaved with `#` comments exactly as Python would, so the
-    parser never has to model the comment style of a file that explains each
-    entry in place.
+    Each gate answers `--corpus` by running its own `corpus()` and printing the
+    result, so this comparison is over what the gates ACTUALLY read. The first
+    version of this script re-derived each corpus from the gate's source
+    instead, and that was wrong in the way a model is always eventually wrong:
+    a corpus is widened in several places at once, and the model knew about
+    some of them. It compared the three scope tuples and reported agreement
+    while `check-docs-cli.sh` was passing a narrower `git ls-files` glob than
+    its siblings; once the globs were modelled too, it still missed the crate
+    `readme = "…"` manifests that `check-docs-routes.sh` reads. Asking cannot
+    drift from the answer.
     """
-    text = pathlib.Path(path).read_text(encoding='utf-8')
-    out = {}
-    for name in NAMES:
-        # Anchored at a line start so a mention inside a comment or a docstring
-        # is not mistaken for the declaration. The first line of a file is a
-        # line start too: searching only for `\n` + name would miss a constant
-        # declared at offset 0, which is how the self-test's synthetic gates are
-        # written and, one day, how a real one might be.
-        marker = name + ' = '
-        start = 0 if text.startswith(marker) else text.find('\n' + marker)
-        if start < 0:
-            out[name] = ()
-            continue
-        # Walk forward from the `=` until the parenthesis that opened the tuple
-        # closes. Counting depth rather than searching for `)` keeps a nested
-        # parenthesis inside a comment from ending the literal early.
-        i = text.index('(', start)
-        depth, j = 0, i
-        while j < len(text):
-            if text[j] == '#':                       # a comment runs to the
-                j = text.find('\n', j)               # end of its line and can
-                if j < 0:                            # hold any parenthesis
-                    break
-            elif text[j] == '(':
-                depth += 1
-            elif text[j] == ')':
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        else:
-            raise ValueError(f'{path}: {name} tuple never closes')
-        try:
-            value = ast.literal_eval(text[i:j + 1])
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(f'{path}: {name} is not a literal tuple: {exc}')
-        out[name] = tuple(value) if isinstance(value, tuple) else (value,)
-    if not out['INCLUDE_DIRS']:
-        # An empty `INCLUDE_DIRS` means the parse found nothing, not that the
-        # gate reads nothing. Refuse to pass on it.
+    out = subprocess.run(['bash', path, '--corpus'],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
         raise ValueError(
-            f'{path}: parsed an empty INCLUDE_DIRS — the scope declaration '
-            f'moved or changed shape, and this gate cannot tell agreement '
-            f'from a parser failure. Fix the parser.')
-    return out
-
-
-# How wide a claim each tuple makes over the paths it names.
-BREADTH = {'INCLUDE_DIRS': 'whole tree',
-           'INCLUDE_FILES': 'this file',
-           'INCLUDE_README_DIRS': 'README.md only'}
-
-
-def flatten(scope):
-    """One set of `(entry, breadth)` pairs across all three tuples.
-
-    Breadth is part of the comparison, not erased by it: `examples/` under
-    `INCLUDE_DIRS` and `examples/` under `INCLUDE_README_DIRS` name the same
-    directory but claim different amounts of it, and that difference is
-    precisely the kind worth declaring out loud. Erasing it would make the one
-    difference this corpus actually has invisible, and leave the declaration
-    mechanism untested against anything real.
-    """
-    return {(e, BREADTH[name]) for name in NAMES for e in scope[name]}
+            f'{path} --corpus exited {out.returncode}: '
+            f'{out.stderr.strip()[:200]}')
+    files = {line for line in out.stdout.splitlines() if line.strip()}
+    if not files:
+        # An empty corpus means the mode broke, not that the gate reads
+        # nothing. Refuse to pass on it: a gate that silently stops being
+        # checked is the defect this gate exists to catch, one level up.
+        raise ValueError(
+            f'{path} --corpus printed nothing — the mode moved or changed '
+            f'shape, and this gate cannot tell agreement from a broken call. '
+            f'Fix it rather than letting an empty corpus compare equal.')
+    return files
 
 
 def main():
     try:
-        scopes = {p: constants(p) for p in SIBLINGS + (SUPERSET,)}
-    except (ValueError, OSError) as exc:
+        corpora = {p: corpus(p) for p in SIBLINGS + (SUPERSET,)}
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f'ERROR: {exc}')
         return 1
 
     defects = []
 
-    # Half 1: the three siblings are identical, compared against the first as
-    # the reference so a divergence is reported once per file, not once per pair.
-    reference = scopes[SIBLINGS[0]]
+    # Half 1: the three siblings read the same pages, compared against the first
+    # as the reference so a divergence is reported once per file, not per pair.
+    reference = corpora[SIBLINGS[0]]
     for path in SIBLINGS[1:]:
-        for name in NAMES:
-            mine, theirs = scopes[path][name], reference[name]
-            if set(mine) != set(theirs):
-                only_mine = sorted(set(mine) - set(theirs))
-                only_ref = sorted(set(theirs) - set(mine))
-                if only_mine:
-                    defects.append(
-                        f'{path}: {name} has {only_mine} which '
-                        f'{SIBLINGS[0]} does not')
-                if only_ref:
-                    defects.append(
-                        f'{path}: {name} is missing {only_ref}, which '
-                        f'{SIBLINGS[0]} has')
+        only_mine = sorted(corpora[path] - reference)
+        only_ref = sorted(reference - corpora[path])
+        if only_mine:
+            defects.append(f'{path} reads {only_mine} and {SIBLINGS[0]} '
+                           f'does not.')
+        if only_ref:
+            defects.append(f'{SIBLINGS[0]} reads {only_ref} and {path} '
+                           f'does not.')
 
     # Half 2: every difference between the routes gate and the siblings is
-    # declared. Both directions are checked — an entry the routes gate gained
-    # alone is the drift this gate was built for, and one it lost alone would
-    # leave a page gated for commands and ungated for URLs.
-    wide = flatten(scopes[SUPERSET])
-    narrow = flatten(reference)
-    declared = set()
-    for entry, breadth in sorted(wide ^ narrow):
-        if entry in DECLARED_DIFFERENCES:
-            declared.add(entry)
+    # declared, WITH THE DIRECTION IT RUNS IN. Keying a declaration by path
+    # alone lets an old note waive a new and opposite divergence: with
+    # `examples/` removed from the routes gate, those pages become
+    # siblings-only — the reverse of what is declared, and a real scope loss —
+    # yet a path-keyed lookup still finds a match and passes.
+    wide, narrow = corpora[SUPERSET], reference
+    used = set()
+    for f in sorted(wide ^ narrow):
+        side = 'routes-only' if f in wide else 'siblings-only'
+        match = next((d for d in DECLARED_DIFFERENCES
+                      if f.startswith(d['prefix']) and d['side'] == side), None)
+        if match:
+            used.add(match['prefix'])
             continue
-        if (entry, breadth) in wide:
+        if side == 'routes-only':
             defects.append(
-                f'{SUPERSET} gates {entry!r} ({breadth}) and {SIBLINGS[0]} '
-                f'does not. Either add it to all three siblings, or record why '
-                f'the argument for it does not carry to them, in '
-                f'DECLARED_DIFFERENCES in {SELF}.')
+                f'{SUPERSET} reads {f!r} and {SIBLINGS[0]} does not. Either '
+                f'add it to all three siblings, or record why the argument for '
+                f'it does not carry to them, in DECLARED_DIFFERENCES in '
+                f'{SELF}.')
         else:
             defects.append(
-                f'{SIBLINGS[0]} gates {entry!r} ({breadth}) and {SUPERSET} '
-                f'does not. Either add it there, or record why in '
-                f'DECLARED_DIFFERENCES in {SELF}.')
+                f'{SIBLINGS[0]} reads {f!r} and {SUPERSET} does not. Either '
+                f'add it there, or record why in DECLARED_DIFFERENCES in '
+                f'{SELF}.')
 
     # A declaration that no longer describes a real difference is stale: the
     # difference was resolved and the note outlived it. Report it, so the table
     # cannot quietly accumulate reasons for differences that are gone.
-    for entry in DECLARED_DIFFERENCES:
-        if entry not in declared:
+    for d in DECLARED_DIFFERENCES:
+        if d['prefix'] not in used:
             defects.append(
-                f'DECLARED_DIFFERENCES in {SELF} records {entry!r}, but the '
-                f'gates no longer differ over it. Remove the entry.')
+                f'DECLARED_DIFFERENCES in {SELF} records {d["prefix"]!r} as '
+                f'{d["side"]}, but the gates no longer differ that way over '
+                f'it. Remove the entry.')
 
     print(f'gates compared: {len(SIBLINGS)} siblings + {SUPERSET}')
-    print(f'scope entries per sibling: {len(narrow)}')
-    print(f'declared differences: {len(declared)}/{len(DECLARED_DIFFERENCES)}')
+    print(f'pages in the sibling corpus: {len(reference)}')
+    print(f'declared differences: {len(used)}/{len(DECLARED_DIFFERENCES)}')
     print(f'defects: {len(defects)}')
     if defects:
         print()
@@ -272,31 +265,39 @@ PYEOF
 
 case "${1-}" in
   --self-test)
-    # The gate reads source files, so a synthetic test is a directory of
-    # synthetic sources: four files carrying only the tuples that matter.
+    # The gate asks each gate for its corpus, so a synthetic test is a directory
+    # of four stub gates: tiny scripts that answer `--corpus` with a page list.
+    # Stubbing the ANSWER rather than the rules is the point — this script no
+    # longer cares how a corpus is built, only that the four agree on it.
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
     fails=0
 
+    # $1 dir, $2 extra page for the siblings, $3 extra page for routes.
     make_gates() {
-      local dir="$1" claude_in_siblings="$2"
+      local dir="$1" sibling_extra="${2-}" routes_extra="${3-}"
       mkdir -p "$dir/scripts"
-      local extra=""
-      [ "$claude_in_siblings" = "yes" ] && extra=", '.claude/skills/'"
+      local base=$'docs/guide/a.md\nskills/s.md\nREADME.md'
+      # `if`, not `[ -n … ] && echo`: a `&&` whose test is false leaves the
+      # group's status at 1, which under `set -u -e` ends the whole self-test at
+      # the first fixture built with no extra page — silently, having reported
+      # every case up to it as ok.
       for g in cli config symbols; do
-        cat > "$dir/scripts/check-docs-$g.sh" <<EOF
-INCLUDE_DIRS = ('docs/guide/', 'skills/'$extra)
-INCLUDE_FILES = ('README.md',)
-INCLUDE_README_DIRS = ('examples/',)
-EOF
+        {
+          echo '#!/usr/bin/env bash'
+          echo "printf '%s\\n' $(printf '%q' "$base")"
+          if [ -n "$sibling_extra" ]; then
+            echo "echo $(printf '%q' "$sibling_extra")"
+          fi
+        } > "$dir/scripts/check-docs-$g.sh"
       done
-      cat > "$dir/scripts/check-docs-routes.sh" <<'EOF'
-INCLUDE_DIRS = ("docs/guide/", "skills/",
-                # a comment holding a stray ( parenthesis
-                ".claude/skills/",
-                "examples/")
-INCLUDE_FILES = ("README.md",)
-EOF
+      {
+        echo '#!/usr/bin/env bash'
+        echo "printf '%s\\n' $(printf '%q' "$base")"
+        if [ -n "$routes_extra" ]; then
+          echo "echo $(printf '%q' "$routes_extra")"
+        fi
+      } > "$dir/scripts/check-docs-routes.sh"
     }
 
     check() {
@@ -312,48 +313,56 @@ EOF
       fi
     }
 
-    c1="$tmp/c1"; make_gates "$c1" yes
-    check "agreeing gates pass (comments and mixed quotes parsed)" pass "$c1"
+    # The declared `examples/` difference must be present for a corpus to be
+    # clean, since a declaration with nothing to describe is itself reported.
+    c1="$tmp/c1"; make_gates "$c1" "" "examples/wiki/content/p.md"
+    check "four gates agreeing, with the declared difference, pass" pass "$c1"
 
-    # The real defect: one sibling loses a directory the others keep.
-    c2="$tmp/c2"; make_gates "$c2" yes
-    sed -i.bak "s/, '.claude\/skills\/'//" "$c2/scripts/check-docs-config.sh"
-    check "a sibling that drops a directory fails" fail "$c2"
+    # A sibling reading a page the other two do not.
+    c2="$tmp/c2"; make_gates "$c2" "" "examples/wiki/content/p.md"
+    echo 'echo docs/guide/extra.md' >> "$c2/scripts/check-docs-config.sh"
+    check "a sibling reading a page the others do not fails" fail "$c2"
 
-    # The reverse: a sibling gains one the others lack.
-    c3="$tmp/c3"; make_gates "$c3" no
-    sed -i.bak "s/'skills\/')/'skills\/', 'docs\/perf\/')/" \
+    # A sibling missing a page the other two read.
+    c3="$tmp/c3"; make_gates "$c3" "" "examples/wiki/content/p.md"
+    sed -i.bak 's/^printf.*$/printf "%s\\n" docs\/guide\/a.md skills\/s.md/' \
       "$c3/scripts/check-docs-cli.sh"
-    check "a sibling that adds a directory alone fails" fail "$c3"
+    check "a sibling missing a page the others read fails" fail "$c3"
 
-    # The declared-difference half, and the regression this gate exists for:
-    # `.claude/skills/` in the routes gate ALONE. The three siblings still agree
-    # with each other, which is exactly why a superset rule passed this state.
-    c4="$tmp/c4"; make_gates "$c4" no
-    check "a directory the routes gate gained alone fails" fail "$c4"
+    # The regression this gate exists for: the routes gate gains a page alone,
+    # and the three siblings still agree with each other — which is exactly why
+    # a superset rule passed this state.
+    c4="$tmp/c4"; make_gates "$c4" "" "examples/wiki/content/p.md"
+    echo 'echo .claude/skills/run/SKILL.md' \
+      >> "$c4/scripts/check-docs-routes.sh"
+    check "a page the routes gate gained alone fails" fail "$c4"
 
-    # The reverse direction: routes narrower than its siblings.
-    c5="$tmp/c5"; make_gates "$c5" yes
-    sed -i.bak 's/"docs\/guide\/", //' "$c5/scripts/check-docs-routes.sh"
-    check "a routes corpus narrower than its siblings fails" fail "$c5"
+    # The reverse: the siblings read a page the routes gate does not.
+    c5="$tmp/c5"; make_gates "$c5" "autumn-search/README.md" \
+      "examples/wiki/content/p.md"
+    check "a page the siblings gained alone fails" fail "$c5"
 
-    # `examples/` differs in BREADTH — whole tree vs README only — and is the
-    # one difference declared in this script, so it must not be reported.
-    c8="$tmp/c8"; make_gates "$c8" yes
-    check "the declared examples/ breadth difference is not a defect" pass "$c8"
+    # The declaration must not waive its own OPPOSITE. `examples/` moves to the
+    # siblings — routes losing coverage the others keep, the reverse of what is
+    # declared. A note keyed by path alone matched here and passed.
+    c6="$tmp/c6"; make_gates "$c6" "examples/wiki/content/p.md" ""
+    check "the declared difference does not waive its opposite" fail "$c6"
 
-    # A scope that cannot be parsed must fail, never silently pass.
-    c6="$tmp/c6"; make_gates "$c6" yes
-    cat > "$c6/scripts/check-docs-cli.sh" <<'EOF'
-# the constant was renamed and this gate can no longer see it
-CORPUS_DIRS = ('docs/guide/',)
-EOF
-    check "an unparseable scope fails rather than passing" fail "$c6"
+    # A declaration with nothing left to describe is stale and reported.
+    c7="$tmp/c7"; make_gates "$c7" "" ""
+    check "a declaration describing no live difference fails" fail "$c7"
 
-    # `INCLUDE_README_DIRS` absent from routes is not a defect: it takes those
-    # directories whole instead, which is the wider claim.
-    c7="$tmp/c7"; make_gates "$c7" yes
-    check "routes omitting INCLUDE_README_DIRS is not a defect" pass "$c7"
+    # A gate whose --corpus fails must fail the gate, never be skipped.
+    c8="$tmp/c8"; make_gates "$c8" "" "examples/wiki/content/p.md"
+    printf '#!/usr/bin/env bash\nexit 3\n' \
+      > "$c8/scripts/check-docs-symbols.sh"
+    check "a gate whose --corpus exits non-zero fails" fail "$c8"
+
+    # An EMPTY corpus compares equal to another empty one, so it must fail
+    # rather than pass quietly.
+    c9="$tmp/c9"; make_gates "$c9" "" "examples/wiki/content/p.md"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$c9/scripts/check-docs-cli.sh"
+    check "a gate whose --corpus prints nothing fails" fail "$c9"
 
     echo ""
     if [ "$fails" -eq 0 ]; then
