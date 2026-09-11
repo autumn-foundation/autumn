@@ -9,11 +9,12 @@
 
 #![cfg(feature = "tls")]
 
+// Both helpers are included whole: this binary exercises only the rejection
+// counters, so most of each is unused here. The consolidated
+// `integration_tests` binary is what covers the rest.
+#[allow(dead_code)]
 #[path = "integration/mtls_support.rs"]
 mod mtls_support;
-// Included whole because `mtls_support` needs its fixtures and parser; this
-// binary exercises only the rejection counters, so most of it is unused here.
-// The consolidated `integration_tests` binary is what covers the rest.
 #[allow(dead_code)]
 #[path = "integration/tls_support.rs"]
 mod tls_support;
