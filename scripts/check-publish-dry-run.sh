@@ -42,6 +42,7 @@ CRATES=(
   autumn-storage-s3
   autumn-cache-redis
   autumn-search
+  autumn-billing
 )
 
 # Assets that MUST appear in a crate's packaged file list. `--list` does not

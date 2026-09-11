@@ -1000,11 +1000,14 @@ pub fn cutover_ops(
     //
     // The live upstream re-registered on a change is the release serving right now,
     // targeted at the derived live-slot port (`plan.live_port`). That derived port is
-    // correct here because the redeploy path refuses a concurrent `server.port` change at
-    // pre-flight (#2073, `refuse_concurrent_public_port_change`), so the public port is
-    // unchanged and the derived live port necessarily equals the port the live release
-    // binds; a live-safe port change is future work. The candidate and flip below use the
-    // new derived candidate port, which the new release genuinely binds.
+    // correct here because `plan.public_port` is always the port the live release was
+    // ACTUALLY deployed under: on a redeploy carrying a concurrent `server.port` change
+    // (#2073, `PublicPortMove`), the caller builds `plan` from the OLD installed port, not
+    // the new requested one, so this refresh call sees no port change and stays a no-op
+    // through phase 3. The move to the new public port is a separate, later phase
+    // (`execute_public_port_rebind`), run only after the candidate is live and the old
+    // release has drained. The candidate and flip below use the new derived candidate
+    // port, which the new release genuinely binds.
     //
     // The re-register carries `reregister_options` — the old release's own TLS and host,
     // recovered from the `shared/proxy-options` marker (#2074) — not the new config's, so
@@ -2266,23 +2269,42 @@ fn parse_proxy_options(section: &str) -> ProxyOptionsMarker {
 
 /// The `--http-port` state of the currently-installed kamal-proxy systemd unit,
 /// captured in the same deploy-start probe round-trip (#2073). The redeploy path
-/// uses it to REFUSE a concurrent `server.port` change before touching the proxy:
-/// the reboot-durability restart-refresh (#2070) re-execs `kamal-proxy run` and
-/// re-registers the still-live upstream at its DERIVED port, which is only correct
-/// when the public port is unchanged — so a mismatch must fail the pre-flight
-/// rather than strand `:80` mid-cutover. Supporting a live-safe port change is
-/// tracked separately (Option C).
+/// compares it against the requested `server.port` to detect a concurrent public-
+/// port change BEFORE touching the proxy: the reboot-durability restart-refresh
+/// (#2070) re-execs `kamal-proxy run` and re-registers the still-live upstream at
+/// its DERIVED port, which is only correct when computed from the port the proxy
+/// is ACTUALLY installed on. A detected change resolves to a [`PublicPortMove`]
+/// (Option C) — the OLD port drives every op through the drain of the old release,
+/// and the move to the NEW port is deferred to its own post-cutover phase
+/// ([`execute_public_port_rebind`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstalledProxyPort {
     /// No proxy unit file on disk (a first-deploy shape — the durability refresh
-    /// writes it fresh). The refuse guard treats this as "nothing to conflict with".
+    /// writes it fresh). Nothing to compare against, so no move is detected.
     Absent,
     /// The unit file is present but its `run --http-port {N}` value could not be
     /// read/parsed (missing flag, non-numeric, out of range, or ambiguous). The
-    /// refuse guard FAILS CLOSED here — derived correctness can't be guaranteed.
+    /// redeploy path FAILS CLOSED here — a move can't be proven safe without
+    /// knowing the actual installed port.
     Unreadable,
     /// The port the installed unit's `ExecStart … run --http-port {N}` binds.
     Port(u16),
+}
+
+/// A `server.port` change detected between the installed kamal-proxy unit and the
+/// requested config, on the redeploy path (issue #2073, Option C).
+///
+/// Every op through the drain of the old release (phases 1-3: standing the
+/// candidate up on the OLD port's non-colliding slot, the health-gated flip, and
+/// draining the old release) runs as if `server.port` were still `old_port` — the
+/// public port itself does not move until [`execute_public_port_rebind`]'s own,
+/// separate failure boundary (phase 4), which rolls back to `old_port` on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicPortMove {
+    /// The port the installed kamal-proxy unit actually binds right now.
+    pub old_port: u16,
+    /// The port the config requests.
+    pub new_port: u16,
 }
 
 /// Delimiter appended by the deploy-start probe between the first-vs-redeploy
@@ -2335,7 +2357,7 @@ pub fn release_id_from_dir(dir: &str) -> Option<&str> {
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
 /// marker can be reconciled against the live proxy and a concurrent `server.port`
-/// change refused, both without a second probe.
+/// change detected, both without a second probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProbe {
     /// First-vs-redeploy decision (parsed exactly as before from the marker).
@@ -2344,7 +2366,8 @@ pub struct DeployProbe {
     /// the reconcile then falls back to the marker, fail-safe).
     pub proxy_list: String,
     /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
-    /// path to refuse a concurrent `server.port` change before touching the proxy.
+    /// path to detect a concurrent `server.port` change before touching the proxy
+    /// and resolve it to a [`PublicPortMove`].
     pub installed_proxy_port: InstalledProxyPort,
     /// The proxy TLS/host options the last forward deploy recorded (#2074), used by
     /// the redeploy path to PRESERVE the old release's options on the durability
@@ -2509,9 +2532,11 @@ pub fn probe_deploy_state(
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
             // the slot is the FIRST tab-separated field either way. The persisted port
             // (SECOND field, when present) is not read here — the cutover re-register
-            // uses the DERIVED port, which the pre-flight refuse guard (#2073) proves
-            // equals the actual live port by rejecting any concurrent `server.port`
-            // change. The marker keeps persisting the port for forward-compatibility.
+            // uses the DERIVED port, computed from the EFFECTIVE public port (the
+            // installed proxy's OLD port across a detected `server.port` change, #2073
+            // `PublicPortMove`), which the caller threads through so the derived port
+            // always equals the actual live port. The marker keeps persisting the port
+            // for forward-compatibility.
             let live_slot = canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE));
             DeployMode::Redeploy { live_slot }
         });
@@ -3363,6 +3388,147 @@ pub fn execute_rollback(
     )
 }
 
+/// Per-deploy scratch path for [`execute_public_port_rebind`]'s content-hash
+/// snapshot (Option C, issue #2073) — distinct from [`proxy_unit_snapshot_path`]
+/// so the phase-4 rebind never shares a scratch file with the cutover's own
+/// durability-refresh snapshot, even though both run sequentially in one deploy.
+fn public_port_rebind_snapshot_path(release_id: &str) -> String {
+    format!("/tmp/autumn-kamal-proxy-portmove-{release_id}.sha256")
+}
+
+/// Build the ops that (re)bind kamal-proxy's public HTTP listener to
+/// `target_public_port` and re-register the now-live release at `live_port`
+/// (Option C phase 4, issue #2073).
+///
+/// Reuses [`ProxyController::refresh_installed_ops`] — the same content-hash-gated
+/// restart-and-reregister the reboot-durability upgrade (#2070) uses — since
+/// moving `--http-port` is just another unit content change from that
+/// mechanism's point of view. [`execute_public_port_rebind`] calls this TWICE:
+/// once forward, to the new public port, and — only on failure — again, to the
+/// old public port, to roll back.
+#[must_use]
+pub fn public_port_rebind_ops(
+    cfg: &ResolvedDeployConfig,
+    proxy: &impl ProxyController,
+    release_id: &str,
+    live_port: u16,
+    reregister_options: &ProxyServiceOptions,
+    target_public_port: u16,
+) -> Vec<DeployOp> {
+    proxy.refresh_installed_ops(
+        target_public_port,
+        &cfg.service_name,
+        &loopback_upstream(live_port),
+        &public_port_rebind_snapshot_path(release_id),
+        reregister_options,
+    )
+}
+
+/// How [`execute_public_port_rebind`] (Option C phase 4, issue #2073) ended when
+/// moving the public port did not simply succeed.
+///
+/// Distinct from [`DeployExecError`] because this phase runs strictly AFTER a
+/// successful [`execute_redeploy`]: the release has already gone live, so a
+/// failure here can never mean "never served" the way most `DeployExecError`
+/// variants do. Both variants carry the OLD and NEW port so an operator-facing
+/// message never has to re-derive which is which.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicPortRebindError {
+    /// The move to `new_port` failed and rolling back to `old_port` succeeded —
+    /// the release is still live, reachable at `old_port`. The public port did
+    /// not move; retry the change alone in a separate deploy.
+    #[error(
+        "server.port could not be moved from {old_port} to {new_port} (`{failed_step}` \
+         failed: {source}) — rolled back, and the release is still live and reachable at \
+         {old_port}. Retry the port change alone in a separate deploy."
+    )]
+    RolledBack {
+        /// The port the release is still reachable at.
+        old_port: u16,
+        /// The port the move to which failed.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+    },
+    /// The move to `new_port` failed AND rolling back to `old_port` also failed.
+    /// The proxy's public bind on this host is now unknown — this needs a human,
+    /// not a retry.
+    #[error(
+        "server.port move from {old_port} to {new_port} failed (`{failed_step}`: {source}) \
+         AND the rollback to {old_port} ALSO failed ({rollback_source}) — the proxy's public \
+         bind on this host is now UNKNOWN. Check `systemctl status kamal-proxy` and \
+         `kamal-proxy list` on the host by hand before retrying."
+    )]
+    RollbackFailed {
+        /// The port the rollback tried, and failed, to restore.
+        old_port: u16,
+        /// The port the original move tried to reach.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The move's underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+        /// The rollback attempt's own underlying failure.
+        rollback_source: Box<DeployExecError>,
+    },
+}
+
+/// Execute Option C's phase 4 (issue #2073): move kamal-proxy's public listener
+/// from `old_port` to `new_port`, run strictly AFTER [`execute_redeploy`] has
+/// already put the new release live on `old_port` — phases 1-3 (standing the
+/// candidate up on a non-colliding loopback port, the health-gated flip, and
+/// draining the old release) are unchanged and already committed by the time this
+/// runs.
+///
+/// This is its own failure boundary, deliberately separate from
+/// [`execute_with_teardown`]'s: the release is ALREADY live, so nothing here is
+/// ever torn down. A step failure instead rolls the proxy back to `old_port`
+/// (`rollback`) and reports which of the two outcomes landed — see
+/// [`PublicPortRebindError`].
+///
+/// # Errors
+///
+/// Returns [`PublicPortRebindError::RolledBack`] when the move failed and the
+/// rollback to `old_port` succeeded, or [`PublicPortRebindError::RollbackFailed`]
+/// when the rollback itself failed too.
+pub fn execute_public_port_rebind(
+    ops: &[DeployOp],
+    rollback: &[DeployOp],
+    old_port: u16,
+    new_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<(), PublicPortRebindError> {
+    for op in ops {
+        if let Err(source) = run_one(op, exec) {
+            let failed_step = op.label();
+            eprintln!(
+                "  \u{2717} {failed_step} failed \u{2014} rolling the public port back to \
+                 {old_port}\u{2026}"
+            );
+            return match run_ops(rollback, exec) {
+                Ok(()) => Err(PublicPortRebindError::RolledBack {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                }),
+                Err(rollback_source) => Err(PublicPortRebindError::RollbackFailed {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                    rollback_source: Box::new(rollback_source),
+                }),
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Shared driver for the deploy entrypoints: gate on preflight, then run `ops`
 /// one at a time; if a step fails at or before `boundary_label` run `teardown`
 /// (best-effort — its own errors are swallowed so they can't mask the real
@@ -3692,6 +3858,11 @@ pub(crate) mod test_support {
         /// failure (fail closed) where a `CommandFailed` on the same step might be
         /// mere housekeeping.
         transport_fail_labels: Vec<&'static str>,
+        /// Labels whose `run` should fail on one SPECIFIC 1-indexed occurrence only
+        /// — for a label that runs more than once in a sequence (Option C's phase-4
+        /// rebind reuses the SAME labels for its forward attempt and its rollback),
+        /// which `fail_labels` (every occurrence) cannot express.
+        fail_on_occurrence: Vec<(&'static str, usize)>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
         /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
@@ -3730,6 +3901,17 @@ pub(crate) mod test_support {
         /// than one label (a fleet script needs per-host failure injection).
         pub(crate) fn failing(mut self, label: &'static str) -> Self {
             self.fail_labels.push(label);
+            self
+        }
+
+        /// Chainable: fail `label`'s `occurrence`-th call only (1-indexed), leaving
+        /// every other call to that label — earlier or later — scripted to succeed.
+        pub(crate) fn failing_on_occurrence(
+            mut self,
+            label: &'static str,
+            occurrence: usize,
+        ) -> Self {
+            self.fail_on_occurrence.push((label, occurrence));
             self
         }
 
@@ -3815,6 +3997,16 @@ pub(crate) mod test_support {
 
     impl DeployExecutor for RecordingExecutor {
         fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
+            // 1-indexed: how many times `cmd.label` has already run, BEFORE this call
+            // is recorded below — so `failing_on_occurrence(label, 1)` means "the
+            // first call to this label", not "the second".
+            let occurrence = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.run_label() == Some(cmd.label))
+                .count()
+                + 1;
             self.record(RecordedCall::Run {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
@@ -3825,7 +4017,9 @@ pub(crate) mod test_support {
                     source: std::io::Error::other("scripted transport failure"),
                 });
             }
-            if self.fail_labels.contains(&cmd.label) {
+            if self.fail_labels.contains(&cmd.label)
+                || self.fail_on_occurrence.contains(&(cmd.label, occurrence))
+            {
                 return Err(DeployExecError::CommandFailed {
                     label: cmd.label,
                     message: "scripted failure".to_owned(),
@@ -3960,8 +4154,10 @@ mod tests {
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
     /// green (loopback 3002). The cutover re-registers the still-live OLD release at
     /// the DERIVED live-slot port (`plan.live_port`, blue = 3001) — correct because
-    /// the redeploy path refuses a concurrent `server.port` change at pre-flight
-    /// (#2073), so the public port is unchanged and derived == actual.
+    /// `plan.public_port` here IS the port the live release was actually deployed
+    /// under (#2073's `PublicPortMove` is the caller's job to resolve BEFORE
+    /// building this `plan`; this helper builds it already-resolved, as if
+    /// unchanged), so derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
         sample_cutover_ops_with(env, MigrateStep::Run)
     }
@@ -5303,6 +5499,183 @@ mod tests {
             "no remote call may run when preflight fails: {:?}",
             exec.calls()
         );
+    }
+
+    // --- Option C phase 4: live public-port rebind (issue #2073) --------------
+
+    #[test]
+    fn public_port_rebind_ops_threads_the_target_port_live_loopback_and_release_id() {
+        // A thin wrapper over `refresh_installed_ops` — the exact mechanism the
+        // reboot-durability upgrade (#2070) uses to restart the proxy on a changed
+        // unit — bound to the phase-4 target port and the now-live release's
+        // loopback port instead of the cutover's own `plan` fields.
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
+
+        let DeployOp::Run(snapshot) = &ops[0] else {
+            panic!("op 0 must be the snapshot Run op");
+        };
+        assert!(
+            snapshot
+                .shell
+                .contains(&format!("autumn-kamal-proxy-portmove-{RELEASE_ID}.sha256")),
+            "the snapshot path is keyed on release_id, in its OWN scratch namespace \
+             (distinct from the cutover's own durability-refresh snapshot): {}",
+            snapshot.shell,
+        );
+
+        let DeployOp::WriteFile {
+            contents: FileContents::Plain(unit),
+            ..
+        } = &ops[1]
+        else {
+            panic!("op 1 must re-write the proxy unit");
+        };
+        assert!(
+            unit.contains("--http-port 8080\n"),
+            "the rewritten unit binds the TARGET public port: {unit}"
+        );
+
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--target '127.0.0.1:3002'"),
+            "the re-register targets the NOW-LIVE release's loopback port: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn public_port_rebind_ops_threads_tls_and_host_through_the_reregister() {
+        // The phase-4 rebind must carry the now-live release's OWN TLS/host, exactly
+        // as `refresh_installed_ops` does for any other re-register (#2074's own TLS
+        // tests exhaustively cover the underlying mechanism; this only confirms the
+        // wrapper forwards `reregister_options` unchanged).
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        };
+        let controller = super::super::proxy::KamalProxyController::new(60)
+            .with_tls_host(Some("app.example.com".to_owned()));
+        let ops = public_port_rebind_ops(&cfg, &controller, RELEASE_ID, 3002, &options, 8080);
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--host 'app.example.com' --tls"),
+            "the phase-4 re-register carries the release's own TLS/host: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_succeeds_without_touching_rollback() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        let exec = RecordingExecutor::new();
+
+        execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect("a healthy rebind succeeds");
+
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed"
+            ],
+            "a healthy rebind runs only the forward ops, never the rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_rolls_back_to_the_old_port_on_failure() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // The forward attempt's restart fails once; the rollback's own restart (the
+        // SAME op label) is left unscripted, so it succeeds on its turn — the new
+        // port could not bind, but the old one still can.
+        let exec = RecordingExecutor::new().failing_on_occurrence("proxy-restart-if-changed", 1);
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a failed rebind must roll back");
+        match err {
+            PublicPortRebindError::RolledBack {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RollbackFailed { .. } => {
+                panic!("expected RolledBack, got {other:?}")
+            }
+        }
+        // Both the forward attempt AND the rollback ran their full sequence.
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+            ],
+            "a rolled-back rebind runs the forward attempt then the full rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_reports_when_the_rollback_itself_fails() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // BOTH the forward restart and the rollback's restart fail — the proxy's
+        // public bind is now genuinely unknown.
+        let exec = RecordingExecutor::failing_on("proxy-restart-if-changed");
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a doubly-failed rebind must report RollbackFailed");
+        match err {
+            PublicPortRebindError::RollbackFailed {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RolledBack { .. } => {
+                panic!("expected RollbackFailed, got {other:?}")
+            }
+        }
     }
 
     #[test]

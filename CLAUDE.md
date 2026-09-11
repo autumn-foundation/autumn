@@ -185,6 +185,17 @@ respectively. `autumn-cli/tests/integration/repo_hygiene.rs`'s
 generator-conformance.yml half for the tests #1945 added; extend its list
 when adding another.
 
+##### The sweep guarantee stops at `tests/` binaries
+
+Both sweeps run a `--test <binary>` target. A `#[ignore]`d Docker test written
+as a `--lib` unit test — the right home when it drives crate-private types, as
+`autumn/src/job.rs`'s Redis job-admin suite does — is reached by neither, and
+`autumn/src/job.rs` alone carries ~36 such tests that run nowhere. A new `--lib`
+Docker test must be named in ci.yml's "Run Docker-dependent tests" step, behind
+a non-zero-pass-count check (a filter that matches nothing still exits 0).
+`autumn/tests/integration/redis_job_admin_ci_coverage.rs` is the pattern: it
+fails when an ignored job-admin Redis test stops matching the ci.yml filters.
+
 #### 2. Isolated Integration Tests (Separate Binaries)
 
 Only create separate test binaries if the test:

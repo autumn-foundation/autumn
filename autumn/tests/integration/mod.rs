@@ -247,6 +247,8 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+#[cfg(feature = "maud")]
+mod profile_conditional_surfaces;
 // The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
 // runtime) and `test-support` (the shared WAT escape corpus), neither of which
 // the Docker sweep's feature set enables — so the ignored timing benchmark in
@@ -275,6 +277,10 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+// ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
+// fails when one of them stops matching (#1186). No feature gate: it only reads
+// job.rs and ci.yml as text.
+mod redis_job_admin_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
@@ -298,6 +304,8 @@ mod repository_dependent_destroy;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "tls")]
+mod mtls_support;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]
@@ -388,6 +396,8 @@ mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_app_surface;
+#[cfg(feature = "tls")]
+mod tls_client_auth;
 #[cfg(feature = "tls")]
 mod tls_serving;
 #[cfg(feature = "tls")]

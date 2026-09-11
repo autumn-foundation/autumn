@@ -6,12 +6,10 @@ local MCP server). It is the production, non-watch counterpart to
 [`autumn dev`](./getting-started.md): no file watching, no hot reload, plus a
 managed lifecycle and a no-fuss local database story.
 
-> **Windows:** the daemon lifecycle (`--daemon`, `stop`, `status`, `restart`) is
-> **Tier 2 — supported via WSL2**. It is built on Unix domain sockets and POSIX
-> signals, so on native Windows these commands fail fast with a message pointing
-> at the policy rather than half-working. Foreground `autumn serve` and the whole
-> `autumn dev` loop — managed Postgres included — are Tier 1 and run natively.
-> See [Platform support](./platform-support.md).
+> **Windows:** the whole lifecycle runs natively, and can be registered as a
+> Windows service that starts at boot and restarts after a crash. The contract is
+> the same; the transport and the stop signal are not. See
+> [Windows](#windows) below.
 
 ## Quick start
 
@@ -35,17 +33,20 @@ two minutes with **zero externally-installed dependencies**.
 | `autumn serve --release` | Build an optimized release binary first. |
 | `autumn serve --daemon` | Build and run detached in the background. |
 | `autumn serve status` | `running (pid, address)` (exit 0) or `stopped` (exit 3). |
-| `autumn serve stop` | `SIGTERM` (graceful drain), then `SIGKILL` on timeout. |
+| `autumn serve stop` | Graceful drain, then a force-kill of the process tree on timeout. |
 | `autumn serve restart` | `stop` (if running) then `--daemon`. |
+| `autumn serve install-service` | Windows only: register the daemon as a boot-start, crash-restarting service. |
+| `autumn serve uninstall-service` | Windows only: stop it, deregister it, remove its state. |
 
 A second `--daemon` start is **rejected** with a clear message rather than
 double-binding, guarded by a PID lockfile.
 
 ## Transport and discovery
 
-The daemon binds a **Unix domain socket** (mode `0600`), never a public
-interface. A client discovers the address from a small TOML file written next
-to the socket:
+On Unix the daemon binds a **Unix domain socket** (mode `0600`), never a public
+interface; on Windows it binds its configured `server.host` / `server.port` (see
+[Windows](#windows)). Either way a client discovers where from a small TOML file
+beside the pidfile:
 
 ```toml
 # <runtime-dir>/<project>/serve.addr
@@ -67,6 +68,108 @@ directories — XDG (`$XDG_RUNTIME_DIR`, `$XDG_DATA_HOME`, `$XDG_STATE_HOME`) on
 Linux, `~/Library/Application Support` on macOS, `%APPDATA%`/`%LOCALAPPDATA%` on
 Windows — never the current directory, `/tmp`, or `/etc`. Set
 `AUTUMN_RUNTIME_DIR` to override the base (used in tests).
+
+Access is restricted to you. On Unix the directories are `0700` and the files
+`0600`. Windows has no mode bits, so the directories get the equivalent ACL —
+your account (by SID, so it resolves on a domain-joined or Entra-joined machine
+too), `SYSTEM` and the local `Administrators` group, with inheritance broken so
+nothing wider leaks in from a parent directory. Everything created inside (the
+log, the address file, the managed-Postgres cluster) inherits it. Autumn also
+takes ownership of the directory, because an object's owner can rewrite its ACL
+no matter what it says. If any of that cannot be applied — including on a
+directory another user already owns — the daemon **refuses to start** rather
+than run with its records reachable by other local users.
+
+On Windows this is `%LOCALAPPDATA%`, never roaming `%APPDATA%`: a pidfile is
+machine-specific, and a managed-Postgres cluster must not be synced at logoff or
+placed on a redirected network share.
+
+## Windows
+
+The lifecycle runs natively: `--daemon`, `stop`, `status` and `restart` behave
+as they do on Unix, with a single-instance guard, a readiness-gated start, the
+same `serve.addr` discovery file, and the same `status` exit codes (0 running,
+3 stopped). Three things differ, because the platforms differ.
+
+**Transport.** There is no Unix socket, so a Windows daemon binds its configured
+`server.host` / `server.port` — which is also what you want when the point is to
+self-host the app. It reports the address it actually bound back to the CLI,
+which records it:
+
+```toml
+# %LOCALAPPDATA%\autumn\<project>\data\run\serve.addr   (never Roaming)
+pid = 4242
+transport = "tcp"
+address = "127.0.0.1:3000"
+```
+
+`autumn serve status` prints `tcp:127.0.0.1:3000` where Unix prints
+`unix:/run/.../serve.sock`. A client reads the transport and address from the
+same two fields either way.
+
+**Stop.** Windows has no `SIGTERM`. `autumn serve stop` asks for the drain by
+creating `serve.stop`, which the daemon watches (the app is started with
+`AUTUMN_SHUTDOWN_SIGNAL_FILE` pointing at it). That runs the *identical*
+sequence a signal runs: readiness flips to draining, the prestop grace elapses,
+in-flight requests finish, `on_shutdown` hooks run — so a managed Postgres child
+is stopped cleanly, not orphaned. Only once the daemon's recorded budget expires
+does `stop` escalate, and then it force-kills the whole process tree rather than
+just the app.
+
+A foreground `autumn serve` also drains on a console control event —
+`CTRL_C` and `CTRL_BREAK` run the full graceful path, and `CTRL_CLOSE`,
+`CTRL_LOGOFF` and `CTRL_SHUTDOWN` start it. Be aware of what the last three
+really buy: Windows *tells* a process about them rather than asking, and the
+grace period applies to the handler, not to the work the handler starts — so a
+drain longer than a second or two will lose that race. **Stop an Autumn app
+through `autumn serve stop` or the Service Control Manager**, both of which wait
+for the app's own recorded budget. Closing a console window is a fallback, not
+the supported stop.
+
+### Running as a Windows service
+
+Two commands, from an **elevated (Administrator)** shell:
+
+```powershell
+autumn serve install-service     # build, register, start
+autumn serve uninstall-service   # stop, deregister, clean up
+```
+
+`install-service` builds the app, registers a service named
+`autumn-<project>-<dirhash>`, sets it to start automatically at boot, arms a
+restart-on-failure policy (5s, then 15s, then 60s, with the failure count
+resetting after a quiet day), and starts it. The service appears in
+`services.msc` and answers `sc.exe query`, `sc.exe stop` and `sc.exe start` like
+any other.
+
+It is not a separate lifecycle. The service hosts the same app child
+`--daemon` hosts and writes the same pidfile, address file and log, so
+`autumn serve status` and `autumn serve stop` keep working against it, and a
+`sc.exe stop` runs the same cooperative drain. `autumn serve restart` restarts
+the *service* through the Service Control Manager rather than starting a loose
+daemon beside it, so the app that comes back is still supervised. An app that exits cleanly, or one
+an operator stopped, is left stopped; an app that crashes or fails to boot is
+restarted by the Service Control Manager.
+
+`uninstall-service` stops the service (draining it), deregisters it, reaps a
+managed Postgres cluster it may have left running, and removes the daemon's
+state files. **Your database is not deleted** — the managed-Postgres data
+directory is kept, and the command prints its path.
+
+The service runs as `Local System`, the default account, which is what keeps
+registration to one command with no credentials to store. It reads and writes
+the state directory the installing user created, which is why that directory's
+ACL admits `SYSTEM`. Non-default service accounts are not configured by these
+commands; use `sc.exe config` if you need one.
+
+> **What the service trusts.** `install-service` records the built binary's path
+> and your project directory, and the Service Control Manager runs that binary as
+> `Local System` at every boot. Anyone who can write to either can therefore run
+> code as `SYSTEM`. Keep the project under a directory only you and
+> administrators can write — your user profile is fine, a folder created at the
+> root of `C:\` is not. `install-service` also **builds** your project, so run
+> it from an elevated shell only for a project you would be willing to build
+> there.
 
 ## Databases
 
@@ -332,6 +435,9 @@ slice.
 
 ## Out of scope
 
-SQLite as an app backend, in-process Postgres, and system-service installation
-(systemd unit / launchd plist / Windows Service) are intentionally not part of
-daemon mode — see issue #1119 for rationale.
+SQLite as an app backend, in-process Postgres, and *Unix* system-service
+installation (systemd unit / launchd plist) are intentionally not part of daemon
+mode — see issue #1119 for rationale. Windows Service registration **is** part
+of it (see [Windows](#windows)): WSL2 was the previous answer there and it is
+not an operator's answer, since it is unavailable on many Windows Server
+installs and offers no boot start or crash supervision.

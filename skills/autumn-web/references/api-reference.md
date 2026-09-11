@@ -22,6 +22,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 | `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
+| `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
 together at `0.7.0`. This table lists the same crates, in the same order, as
@@ -1582,6 +1583,42 @@ In-process HTTPS termination on the same host:port (off by default).
   `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
+
+### `[server.tls.client_auth]` (feature `tls`, unreleased, #1640)
+
+Mutual TLS: verify the *caller's* certificate, not just prove the server's.
+Absent, the handshake is byte-for-byte the server-only TLS above.
+
+- `mode` — `off` (default), `optional` (certificate requested; verified when
+  presented), `required` (no valid certificate, no handshake). `optional` still
+  verifies a certificate that IS offered; the option is whether offering one is
+  mandatory.
+- `ca_bundle_path` (required unless `off`) — PEM bundle of one or more client
+  CAs. `crl_path` — optional PEM revocation list. Both hot-reload on their own
+  `reload_interval_secs` (default `60`) poll, so a CA rotation (ship old+new in
+  one bundle, later drop old) needs no restart and drops no established
+  connection.
+- `required_paths` — rooted path prefixes whose routes demand a certificate,
+  matched against the raw request path and the normalized one (either match
+  requires a certificate, so normalization cannot drop a requirement). A trailing-slash prefix also
+  covers the bare route: `/internal/` covers `/internal`. A request reaching one
+  over an uncertified connection gets `403` with the standard problem+json body.
+- Handlers extract `autumn_web::tls::client_auth::ClientCert` (rejects `403`) or
+  `OptionalClientCert`. `ClientIdentity` carries `subject`, `issuer`, `sans`
+  (`DNS:`/`URI:`/`IP:`/`email:` prefixed), `fingerprint`, `serial` and
+  `common_name()`. **Authorize on `common_name()` / `has_san()`, never by
+  string-searching `subject`:** DN rendering does not escape attribute values.
+- Policies read the same identity: `ctx.client_identity()`,
+  `ctx.has_client_identity()`, `ctx.client_has_san("URI:spiffe://…")`. It is
+  ambient to the request task, so a `tokio::spawn`ed check sees `None`.
+- `RequireClientCertLayer::new()` locks a sub-router in code.
+- Rejections: `tls_client_auth_rejected_total{reason}` (`no_certificate`,
+  `untrusted_ca`, `expired`, `not_yet_valid`, `revoked`,
+  `unknown_revocation`, `invalid`) and `tls_client_auth_route_rejected_total`,
+  plus a rate-limited operator log. The client sees only the TLS alert.
+- Fail-fast at startup on a missing / unparseable / empty bundle or CRL, on a
+  non-`off` mode with no `ca_bundle_path`, on `required_paths` under
+  `mode = "off"`, and on a noncanonical prefix (`//`, `.` or `..` segment). Revocation is CRL-only — no OCSP. See `docs/guide/tls.md`.
 
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 

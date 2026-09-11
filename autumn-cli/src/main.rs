@@ -63,6 +63,7 @@ mod schema;
 mod search;
 mod seed;
 mod serve;
+mod service;
 mod setup;
 mod shard;
 mod starters;
@@ -2770,6 +2771,44 @@ enum ServeCommands {
     Status,
     /// Stop the daemon (if running) and start it again in the background.
     Restart,
+    /// Windows only: build the app and register it as a Windows service that
+    /// starts at boot and restarts after a crash.
+    ///
+    /// The service runs the same app `--daemon` runs and leaves the same
+    /// pidfile, address file and logs, so `autumn serve status` and
+    /// `autumn serve stop` keep working against it. It is an ordinary entry in
+    /// `services.msc` and `sc.exe`.
+    InstallService,
+    /// Windows only: stop the registered service, deregister it, and remove the
+    /// daemon's state. The managed-Postgres data directory is kept.
+    UninstallService,
+    /// Internal: run as the Windows Service Control Manager's hosted process.
+    ///
+    /// Registered as the service's command line by `install-service`; running it
+    /// by hand does nothing useful.
+    #[command(hide = true)]
+    RunService {
+        /// Path to the record `install-service` wrote.
+        #[arg(long = "service-record")]
+        service_record: Option<std::path::PathBuf>,
+    },
+}
+
+/// Normalize a repeated/comma-separated `--pin` into what the app parses.
+///
+/// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
+/// `[jobs] pin` from its own config; `--pin ""` is a deliberate unpin and must
+/// stay distinguishable from that, so presence is carried by the `Option`, not
+/// by the list being non-empty. Trimming and dropping blanks here means the pin
+/// `serve restart` recovers and the pin the app parses are the same list.
+fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
+    (!pin.is_empty()).then(|| {
+        pin.iter()
+            .map(|q| q.trim())
+            .filter(|q| !q.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// Process role selector for `autumn serve --role`.
@@ -4433,41 +4472,39 @@ fn run_command(command: Commands) {
             role,
             pin,
         } => {
-            let action = action.map(|a| match a {
-                ServeCommands::Stop => serve::ServeAction::Stop,
-                ServeCommands::Status => serve::ServeAction::Status,
-                ServeCommands::Restart => serve::ServeAction::Restart,
-            });
-            serve::run(
-                action,
-                &serve::ServeOptions {
-                    package,
-                    // --bundled-pg implies --daemon.
-                    daemon: daemon || bundled_pg,
-                    release,
-                    bundled_pg,
-                    // Normal start: the child inherits this shell's env. Only
-                    // `restart` sets this, to restore a lost profile.
-                    profile: None,
-                    // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
-                    // the child pick its default (combined) or read its own env.
-                    role: role.map(|r| r.as_str().to_owned()),
-                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
-                    // at all leaves the variable untouched so the child reads
-                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
-                    // stay distinguishable from that, so presence is carried by
-                    // the `Option`, not by the list being non-empty. Normalized
-                    // here (trim, drop blanks) so the recorded pin and the pin
-                    // the app parses are the same list.
-                    pin: (!pin.is_empty()).then(|| {
-                        pin.iter()
-                            .map(|q| q.trim())
-                            .filter(|q| !q.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    }),
-                },
-            );
+            // The service journeys are their own command family: they build
+            // and register rather than start, so they never reach `serve::run`.
+            let service_action = match action {
+                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
+                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
+                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
+                _ => None,
+            };
+            let lifecycle = match action {
+                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
+                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
+                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
+                _ => None,
+            };
+            let opts = serve::ServeOptions {
+                package,
+                // --bundled-pg implies --daemon, and a service always hosts one.
+                daemon: daemon || bundled_pg || service_action.is_some(),
+                release,
+                bundled_pg,
+                // Normal start: the child inherits this shell's env. Only
+                // `restart` sets this, to restore a lost profile.
+                profile: None,
+                // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
+                // the child pick its default (combined) or read its own env.
+                role: role.map(|r| r.as_str().to_owned()),
+                // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
+                pin: normalize_pin(&pin),
+            };
+            if let Some(service_action) = service_action {
+                std::process::exit(service::run(service_action, &opts));
+            }
+            serve::run(lifecycle, &opts);
         }
         Commands::Schema { action } => schema::run(action),
         Commands::Migrate {
@@ -7130,6 +7167,89 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn serve_service_subcommands_parse() {
+        for (argv, expected) in [
+            (["autumn", "serve", "install-service"].as_slice(), "install"),
+            (
+                ["autumn", "serve", "uninstall-service"].as_slice(),
+                "uninstall",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Commands::Serve { action, .. } => {
+                    let got = match action {
+                        Some(ServeCommands::InstallService) => "install",
+                        Some(ServeCommands::UninstallService) => "uninstall",
+                        _ => "other",
+                    };
+                    assert_eq!(got, expected, "{argv:?}");
+                }
+                _ => panic!("expected Serve for {argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_flags_belong_to_serve_not_to_the_service_subcommand() {
+        // clap gives everything after a subcommand NAME to that subcommand, and
+        // `install-service` takes no arguments — so `serve install-service
+        // --bundled-pg` is a parse error, not a bundled install. The supported
+        // spelling puts the flag before the subcommand, exactly as `--pin` and
+        // `--role` already do for `restart`. Pinned here because the failure is
+        // silent in a script: exit 2 with a usage message.
+        let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "install-service"])
+            .expect("flags before the subcommand must parse");
+        match cli.command {
+            Commands::Serve {
+                action, bundled_pg, ..
+            } => {
+                assert!(matches!(action, Some(ServeCommands::InstallService)));
+                assert!(bundled_pg);
+            }
+            _ => panic!("expected Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "serve", "install-service", "--bundled-pg"]).is_err(),
+            "a flag after the subcommand is a parse error, so callers must not \
+             be told that spelling works"
+        );
+    }
+
+    #[test]
+    fn run_service_carries_the_record_path_the_scm_was_registered_with() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "run-service",
+            "--service-record",
+            "C:\\state\\serve.service.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { action, .. } => assert!(matches!(
+                action,
+                Some(ServeCommands::RunService {
+                    service_record: Some(_)
+                })
+            )),
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn normalize_pin_distinguishes_unpinned_from_absent() {
+        // `--pin ""` is a deliberate unpin and must stay distinguishable from no
+        // `--pin` at all, which leaves the app reading `[jobs] pin` itself.
+        assert_eq!(normalize_pin(&[]), None);
+        assert_eq!(normalize_pin(&[String::new()]), Some(vec![]));
+        assert_eq!(
+            normalize_pin(&[" critical ".to_owned(), String::new(), "default".to_owned()]),
+            Some(vec!["critical".to_owned(), "default".to_owned()])
+        );
     }
 
     #[test]

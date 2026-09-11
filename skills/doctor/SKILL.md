@@ -89,16 +89,30 @@ Windows machine. Read its `detail` rather than its status:
   Windows prerequisites — notably that `autumn generate auth --passkeys` needs
   OpenSSL via `vcpkg` with `VCPKG_ROOT` set.
 
-When a user reports that `autumn serve --daemon` (or `stop`/`status`/`restart`),
-`autumn deploy up` (or `rollback`/`status`/`maintenance`), or a `scripts/*.sh`
-gate fails on Windows, that is the **documented Tier 2 refusal, not a bug**:
-those are built on Unix domain sockets, POSIX signals, `ssh`, and bash. Tell
-them to run it from a WSL2 shell. `autumn deploy check` and `autumn deploy plan`
-are the exception and Tier 1 — they are local-only, so a Windows developer can
-validate a deploy config natively before switching to WSL2 to run it.
-Note `autumn serve --bundled-pg` implies `--daemon`, so it is Tier 2 too — on
-Windows use `autumn dev` for a managed-Postgres app. See
+When a user reports that `autumn deploy up` (or `rollback`/`status`/
+`maintenance`) or a `scripts/*.sh` gate fails on Windows, that is the
+**documented Tier 2 refusal, not a bug**: those reach a host over `ssh`, stage
+secrets with Unix file modes, or are bash. Tell them to run it from a WSL2
+shell. `autumn deploy check` and `autumn deploy plan` are the exception and
+Tier 1 — they are local-only, so a Windows developer can validate a deploy
+config natively before switching to WSL2 to run it.
+
+`autumn serve --daemon` / `stop` / `status` / `restart` left that set on
+trunk-dev (issue #1639) and now run **natively** on Windows, `--bundled-pg`
+included — a refusal there is a bug, not the policy. See
 `docs/guide/platform-support.md`.
+
+## Daemon and service readiness (unreleased — trunk-dev)
+
+`autumn doctor` runs a `daemon_service` check (issue #1639). Read its `detail`:
+it says whether a daemon is running for this project and on what endpoint,
+and — on Windows — whether an OS service is registered and its Service Control
+Manager state. It **warns** (never fails, so `--strict` still passes) when the
+service journey is missing a prerequisite, which in practice means the shell is
+not elevated enough to register or remove a service.
+
+A stopped daemon and an unregistered service are both normal: plenty of projects
+never want either. Do not read the check as a defect on that basis.
 
 ## Operator alert checks (unreleased — trunk-dev)
 
@@ -186,6 +200,22 @@ configuration:
   expired/not-yet-valid leaf or intermediate certificate.
 
 See issue #1852.
+
+## mTLS client-auth check (unreleased — trunk-dev, issue #1640)
+
+On trunk-dev, `autumn doctor` adds a `tls_client_auth` check that grades the
+`[server.tls.client_auth]` trust store offline — no server boot, no network:
+
+- **Pass** — the section is absent or `mode = "off"` (the listener requests no
+  client certificate), or the bundle loads with every CA comfortably in date.
+- **Warn** — a CA in the bundle expires within 30 days; the CRL's `nextUpdate`
+  has passed (autumn keeps honouring a stale list rather than failing every
+  handshake, so this is otherwise silent); `mode = "optional"` with no route in
+  `required_paths` (client auth configured and enforcing nothing); or the CLI
+  was built without the `tls` feature.
+- **Fail** — the CA bundle or CRL is missing, unparseable, or empty, a CA in
+  the bundle has expired, or `client_auth` is present but is not a table. These are the conditions the runtime refuses to boot
+  on, so a Fail here means the app will not start.
 
 ## ACME preflight checks (unreleased — trunk-dev, issue #1608)
 

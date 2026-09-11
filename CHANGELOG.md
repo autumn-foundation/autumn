@@ -9,6 +9,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mutual TLS: client-certificate verification on the native listener (#1640):**
+  a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
+  not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
+  and the handshake requests and verifies a client certificate; `mode` is `off`
+  (the default), `optional` (requested, verified when presented) or `required`
+  (no certificate, no handshake). With the section absent the handshake is
+  byte-for-byte #1603's server-only TLS, and no new dependency is pulled in.
+  **Breaking:** three published types gain members — `TlsConfig` gains
+  `client_auth`, `TlsError` gains the variants that name a bad trust store (and
+  becomes `#[non_exhaustive]`, so the next one will not break you), and
+  `SecurityDump` gains `client_auth`. Only code that constructs one of those by
+  literal or matches `TlsError` exhaustively is affected, and each surfaces as a
+  compiler error, never a silent behaviour change. The HTTPS listener's
+  connect-info type also changes from `SocketAddr` to `TlsConnectInfo`, which a
+  framework layer immediately re-stamps, so `ConnectInfo<SocketAddr>`,
+  `ClientAddr`, trusted-proxy resolution and rate limiting are unchanged for
+  handlers. See [the migration guide](docs/migrations/next.md).
+  `required_paths` locks individual routes, so one process serves public and
+  mTLS-only routes; a request reaching one without a verified certificate gets
+  `403` and the standard JSON error envelope. `RequireClientCertLayer` does the
+  same for a sub-router in code. The verified identity — subject DN, issuer,
+  SANs, SHA-256 fingerprint, serial — reaches handlers through the `ClientCert` /
+  `OptionalClientCert` extractors and sits on the `PolicyContext` beside the
+  session user and token scopes, so an `#[authorize]` policy can decide on
+  machine identity (`ctx.client_has_san("URI:spiffe://…")`). The trust store and
+  an optional `crl_path` hot-reload by the same modification-time polling the
+  server certificate uses — its own loop, at its own
+  `[server.tls.client_auth] reload_interval_secs` — so a CA rotation — ship old+new in one bundle, later drop old
+  — needs no restart and drops no established connection. Every rejected
+  handshake is counted by reason (`tls_client_auth_rejected_total`) and
+  logged operator-side, rate-limited to one line per second per reason, while the
+  client sees only the standard TLS alert; startup fails fast, naming the path, on
+  a missing, unparseable or empty bundle or CRL. `autumn doctor` grades the
+  surface offline as `tls_client_auth`, and a route's mTLS requirement is a new
+  `mtls` dimension of the security-posture manifest (schema v4), so
+  `autumn routes posture diff` blocks on a route that silently drops it. Revocation is a
+  static CRL plus short-lived certificates; OCSP is not in this slice. A listener
+  with client auth active also disables TLS session resumption: rustls restores a
+  resumed connection's peer certificate from the stored session without re-running
+  the verifier, so a revoked client could otherwise reconnect until its session
+  expired. Server-only TLS keeps resumption untouched. See the
+  [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+- **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
+  README.md's `## Example` and the four `rust,no_run` snippets in
+  `docs/guide/getting-started.md` (a CSRF form handler plus three
+  runtime-tuning examples) — the "first run" journey's flagship, most-copied
+  code — were never actually compiled by anything;
+  `scripts/check-docs-macro-args.sh` already named this gap directly ("the
+  markdown fences are not compiled by anything at all"). A fence can drift
+  out from under a signature change the same way the CLI scaffold template
+  drifted from `inject_consent_banner`'s widened `Option<&str>` parameter
+  (#2459, #2620) — silent to every existing docs-corpus gate, which check
+  that a name *resolves*, not that the call still typechecks. A new
+  `doc_getting_started_snippets_compile` test
+  (`autumn/tests/integration/compile_fail.rs`) extracts every
+  `rust,no_run` fence from those two files into a throwaway crate and
+  runs `cargo check` on it — real compilation against the in-tree crate,
+  with no server binary ever executed; a new tagged fence is picked up
+  automatically, no test edit required. All 5 fences currently in scope
+  compile clean — this is a harness, not a fix, so there is nothing else to
+  report.
+- **autumn-media: room participants can hold a seat with a heartbeat (#1974):**
+  `POST /api/media/rooms/{room_id}/heartbeat` refreshes a participant's liveness
+  and renews its advisory `token_expires_at` to `now + room_token_ttl_seconds`.
+  Previously the only liveness signal was a member-gated roster poll, so a client
+  that used its join response and its own peer connections — but never re-polled
+  — lost its seat to the idle reaper. The token value never rotates, so an
+  in-flight roster poll keeps working. Like the roster it is fail-closed: an
+  unknown room, unknown participant and wrong token are one indistinguishable
+  `404`, so a heartbeat is not a membership oracle. Both the in-memory and
+  DB-backed stores implement it; the DB store verifies the token in constant time
+  and then renews in one `UPDATE` that treats a concurrently-reaped seat as gone.
+  **Breaking:** `RoomStore` gains a required `heartbeat` method, so an
+  out-of-tree store must implement it — see the
+  [migration guide](docs/migrations/next.md).
+
+- **`autumn deploy` grades MediaMTX listener ports against the app's base URLs
+  (#1974):** a new pure-config preflight compares each `[media.mediamtx] *_port`
+  with the `*_base` URL that calls it. Customizing a port without updating its
+  base URL used to deploy cleanly and fail every request at runtime. Only a base
+  the operator set in TOML, on loopback, naming a port can block — a proxied or
+  CDN-fronted base publishes its own port and is skipped, and an unset base
+  (which the app may take from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`) warns without
+  blocking, as an indirected `[media.ffmpeg] bin` does.
+- **`autumn-billing` plugin (#1190):** first-party subscription billing for
+  Stripe. One `.plugin(BillingPlugin::new().config(cfg).plans(&plans))` mounts
+  hosted checkout (`POST /billing/checkout`), the customer portal
+  (`POST /billing/portal`), a read-only `GET /billing/subscription`, and a
+  `POST /billing/webhook` receiver built on `SignedWebhook`. Provider events
+  are reconciled into a local mirror (`billing_customers`,
+  `billing_subscriptions`, `billing_invoices`) through an event ledger, so a
+  redelivered event applies once and out-of-order events converge (an older
+  event never overwrites newer state; a canceled subscription is terminal).
+  `Entitled<R: PlanRequirement>` and `Billing::require` gate handlers on
+  local state, default-deny. Failed payments open a durable dunning schedule
+  (`billing_dunning`) driven by a `#[job]`; the schedule row is the source of
+  truth, so the job survives a restart and re-arms on startup, and every step
+  notifies through the in-app notification store (#1148). `Money` holds
+  `i64` minor units and a `Currency`; read them with `minor()` and
+  `currency()`. An exact `Decimal` bridge; no floats.
+  The `BillingProvider` trait hides Stripe types so a second provider can
+  land later. New crate, additive only: non-breaking. A partial unique index keeps one mirrored
+  customer per user across racing checkouts, every dunning settle is a
+  compare-and-set, a provider transport error reschedules the same attempt
+  instead of failing the job, and a production profile refuses the in-memory
+  mirror unless `billing.allow_memory_store_in_production = true`.
+- **Native Windows daemon lifecycle and Windows Service registration (#1639):**
+  `autumn serve --daemon`, `stop`, `status` and `restart` now run natively on
+  Windows instead of failing fast with a WSL2 pointer, and the daemon lifecycle
+  moves from Tier 2 to Tier 1 in the platform-support policy. The contract is the
+  one Unix has: a single-instance guard, a readiness-gated start, a `serve.addr`
+  discovery file, and `status` exit codes 0/3. A Windows daemon binds its
+  configured `server.host`/`server.port` and reports the address it actually
+  bound back through the readiness file, which the CLI records as
+  `transport = "tcp"` — that report also fixes the address file on Unix for
+  `server.port = 0` and for a socket adopted during an in-place upgrade.
+  `autumn serve stop` on Windows requests a graceful drain through the
+  cooperative-shutdown file rather than force-killing, so in-flight requests
+  finish, `on_shutdown` hooks run and a managed Postgres child is stopped
+  cleanly; only once the daemon's recorded budget expires does it escalate, and
+  then it reaps the whole process tree. `stop` now also says which of those
+  happened, on both platforms — a force-kill after an overrun, or one that could
+  not ask at all, is no longer reported as a plain "stopped". A foreground server
+  drains on a console control event too (`CTRL_C` and `CTRL_BREAK` fully;
+  `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` best-effort, since Windows tells
+  rather than asks). Two new commands, `autumn serve
+  install-service` and `autumn serve uninstall-service`, register the daemon as
+  a Windows service that starts at boot and restarts after a crash and remove it
+  again cleanly; the service hosts the same app the daemon does, so `status` and
+  `stop` keep working against it. Daemon state under `%LOCALAPPDATA%` is created
+  with an owner-only ACL (the owning user, `SYSTEM` and `Administrators`, with
+  inheritance broken), the Windows analog of the Unix `0700`/`0600` posture, and
+  the daemon refuses to start if it cannot be applied — including on a directory
+  another local user owns, since an owner can rewrite any ACL. Windows daemon
+  state moves from roaming `%APPDATA%` to `%LOCALAPPDATA%`, which is what the
+  guide always documented: a pidfile is machine-specific and a managed-Postgres
+  cluster must not be synced at logoff or land on a redirected network share. `autumn doctor` gains a
+  `daemon_service` check reporting whether a daemon or a registered service is
+  running for this project and what the service journey still needs. See
+  [the daemon guide](docs/guide/daemon.md#windows).
+- **cli/generate:** `autumn generate teams` is now **backend-aware on SQLite**
+  (#1927). It was refused at generate time because its migration was fixed
+  Postgres DDL; it now emits the organizations/memberships/invitations tables in
+  the app's own dialect — `INTEGER PRIMARY KEY AUTOINCREMENT`, `INTEGER`
+  user-id columns, and `TEXT ... DEFAULT CURRENT_TIMESTAMP` timestamps. The
+  portable parts are shared and unchanged: the `role`/`status` `CHECK` enums,
+  the `UNIQUE (tenant_id, user_id)` idempotency constraint, and the partial
+  `idx_invitations_pending_email` unique index. Everything else the generator
+  emits was already backend-neutral — `#[repository]` binds
+  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+  sql-types both diesel backends carry. Postgres SQL is unchanged.
+
+  Three things beyond the DDL were needed for the generated app to actually
+  build and boot on SQLite. Its route handlers took 19 pessimistic row locks
+  with `.for_update()`, which diesel implements for Postgres and MySQL only;
+  they now go through `::autumn_web::maybe_for_update!`, the framework's
+  existing seam, which is a plain read on SQLite (write-write correctness then
+  rests on SQLite's single-writer transaction, which fails closed with
+  `SQLITE_BUSY_SNAPSHOT` rather than losing an update). Its Cargo dependency
+  set was unconditionally Postgres — `diesel`/`diesel-async` on `"postgres"`
+  plus a direct `pq-sys`, and no `returning_clauses_for_sqlite_3_35`, which the
+  generated `.returning(...).get_result(conn)` inserts need on SQLite — and is
+  now selected per backend like `generate model`'s. And it never enabled
+  `autumn-web`'s own `sqlite` feature, without which `RuntimeConnection` stays
+  the Postgres connection and the app refuses its own `sqlite://` URL at boot.
+
+  This closes the generator audit #1927 asked for: `auth`,
+  `mailer --list-unsubscribe`, `teams` and `commentable` hand-write their
+  `CREATE TABLE` DDL, while `notifications` and `pwa` derive theirs through
+  `schema_edit`; all six are now covered by a guard that plans each against a
+  SQLite app, applies and rolls back every migration it emits on a real
+  in-memory SQLite, scans the SQL for Postgres-only spellings, and scans the
+  generated Rust for constructs SQLite has no diesel implementation for. Both
+  scans matter: SQLite accepts an unknown type name (so `id BIGSERIAL PRIMARY
+  KEY` applies cleanly and merely stops auto-incrementing), and applying SQL
+  cannot see a generated crate that would not compile. `counter_cache` was
+  audited and left alone: its
+  `ALTER TABLE ... ADD COLUMN ... BIGINT NOT NULL DEFAULT 0` / `DROP COLUMN` is
+  already portable, since SQLite gives `BIGINT` integer affinity and so reads
+  back without schema drift.
+- **cli/generate:** the scaffolded `docs/guide/authentication.md` is now
+  **backend-aware** (#1927). `generate auth` made its two sibling guides
+  dialect-aware under #1908 (`session-management.md`, the OAuth guide) but left
+  this one emitting unconditional Postgres SQL: two `ALTER TABLE ... ADD COLUMN
+  IF NOT EXISTS ...` retrofit blocks (lockout columns, email-confirmation
+  columns), their `DROP COLUMN IF EXISTS` rollbacks, and an
+  `email_confirmed_at = NOW()` backfill. SQLite rejects all of those outright —
+  `IF NOT EXISTS` is a syntax error on `ADD COLUMN`, only one column may be
+  added per statement, and there is no `NOW()` — so an operator copy-pasting
+  from the guide got a migration that would not apply. A SQLite app now gets one
+  `ALTER TABLE` per column, `TEXT` timestamps, and `CURRENT_TIMESTAMP`. Postgres
+  output is unchanged.
+- **deploy: a live-safe `server.port` change on an existing deployment (issue
+  #2073, Option C).** #2071 refused a redeploy that changed `server.port`
+  because the reboot-durability restart (#2070) could not move the proxy's
+  public listener safely mid-cutover. `autumn deploy` now supports it directly,
+  in four phases: stand the candidate up on a loopback port derived from the
+  OLD public port (so it never collides with the still-live release), flip
+  traffic to it, drain the old release, then rebind the proxy's public listener
+  to the NEW port. That last step is its own failure boundary — a failed rebind
+  rolls the proxy back to the OLD port, and the release stays live and
+  reachable there; retry the port change alone in a separate deploy. The rare
+  case where the rollback itself fails reports that the proxy's public bind is
+  now unknown and needs a human, rather than silently guessing. [no-plugin]
+
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
@@ -187,6 +392,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about URLs that does not carry to commands or config keys. A declaration that
   no longer describes a real difference is itself reported, so the table cannot
   accumulate stale reasons.
+- **`autumn deploy` now creates the MediaMTX recordings directory it preflights
+  (#1974).** `deploy up` fail-closed on a missing `[media.mediamtx]
+  recordings_dir` while provisioning only created the config file's parent, so a
+  fresh host was blocked from the very step that would have created the
+  directory. Provisioning now creates both, the recordings root mode `0750`
+  (applied only to a directory it creates, so an existing one keeps the mode the
+  operator gave it). The preflight passes a directory that is absent under a
+  writable ancestor, reports "exists but not writable" and "ancestor is not
+  writable" apart, and still fails closed on anything it cannot verify —
+  including a dangling symlink or symlink loop, which the earlier `test -e` walk
+  stepped past as if the path were absent. An empty or relative `recordings_dir`
+  is now rejected outright: the probe, the `mkdir` and the daemon each resolved
+  it against a different directory. A `${...}` path is deferred to runtime.
+
+- **`MediaConfig::validate` rejects a generic S3 backend with no
+  `public_base_url` (#1974).** `MediaStorage::from_config` already enforced this
+  — only a Tigris endpoint has a derivable public base — so validation and
+  storage construction now agree instead of failing at first upload. An app
+  using a non-Tigris S3 backend without `public_base_url` and calling
+  `validate()?` at boot now fails there.
 
 - **Docs gate: Autumn macro arguments are checked against the macros.**
   `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
@@ -229,6 +454,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **auth:** `api_token_error_response` now renders through the canonical
+  problem classification — the rendered status/problem type (including the
+  query-timeout reclassification) and the validation field map — instead of
+  rebuilding the body from `status()` alone. A `query_timeout` from an
+  `ApiTokenStore` previously rendered as `autumn.service_unavailable` and a
+  validation failure as `autumn.unprocessable_entity` with an empty `errors`
+  array; both now agree with `AutumnError::code()` and the standard response,
+  and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
+  exception filters. Server-error `detail` is redacted in the body (the
+  store's message remains in `AutumnErrorInfo.message` for logging and
+  filters), matching the production exception-filter render (issue #2635).
+- **docs:** `strict_config` and a plugin-owned `[media]` table are no longer
+  documented as mutually exclusive (#1974). The deployment guide still carried
+  the pre-#2061/#2063 workaround telling operators to turn `strict_config` off.
+  Both paths accept the table now: the app declares the section via
+  `AppBuilder::config_section`, and `autumn deploy` accepts unknown top-level
+  roots opaque-with-a-warning while keeping every known section strict. Also
+  corrects the `[media.mediamtx] rtmp_port` docs, which said "RTMP/WHIP ingest" —
+  WHIP publishes on `webrtc_port`.
+- **jobs:** the Redis `/admin/jobs` enqueued tab now lists jobs parked on a
+  full concurrency slot (issue #1186). A parked job lives in the
+  `{prefix}:blocked` zset and is promoted back to its queue every ~100 ms, so
+  a list built from `LRANGE` alone showed it blinking in and out of the table
+  even though it was never lost. The enqueued page now reads the queues and
+  the blocked zset as one logical list: the total is `LLEN` per queue plus
+  `ZCARD blocked`, and paging spans the concatenation, queue ids first. Merged
+  rows carry a new `JobAdminRecord::blocked_on_concurrency` flag and the
+  dashboard marks them "waiting on a concurrency slot", so an operator can
+  tell a job waiting for a slot from one ready to claim. Cancel still works on
+  a parked row. Enforcement, promotion cadence, the `/actuator/jobs` gauges,
+  and the local/Postgres/SQLite backends are unchanged; those backends report
+  `blocked_on_concurrency: false`. The count includes parked jobs, so the
+  dashboard's Enqueued counter can read higher than `/actuator/jobs`'s
+  `queued` gauge by the parked count — the two are separate there, `queued`
+  plus `blocked_on_concurrency`.
+  **Breaking:** `JobAdminRecord` is public and not `#[non_exhaustive]`, so a
+  struct-literal construction of it — only a custom `JobAdminBackend` builds
+  one — needs the new field. It now derives `Default`, so end the literal with
+  `..Default::default()` and the next field will not break it; see
+  [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind
@@ -409,7 +674,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Removed dead `autumn/templates/build.rs.template` (#2694):** an
+  unreferenced leftover from before the Tailwind build script moved to
+  `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
+  actually scaffolds via `include_str!`). Zero code references anywhere in
+  the tree — only historical sprint docs and old CHANGELOG entries mention
+  it. This covers the dead-code sub-item of #2694; the clone-class merge
+  across the nine example `build.rs` copies still needs a human call per
+  that issue. Note: `autumn/templates/static/` also appears unreferenced and
+  was left in place — flagging for a separate decision.
+- **SQLite decimal `CHECK` now enforces canonical form (#2636):** the
+  generated `CHECK` for `decimal{p,s}` `TEXT` columns on SQLite enforced the
+  text *shape* (digit budgets, one decimal literal) but not its
+  canonicality, so text written outside the wrapper — raw SQL, an import, a
+  hand-written migration — passed the constraint while being a spelling
+  `SqliteDecimal::to_sql` (`Decimal::normalize`) would never produce.
+  `INSERT INTO invoices (price) VALUES ('19.90')` succeeded, and the row was
+  then invisible to the equality lookup a generated `find_by_price` issues
+  for `'19.9'`; a `:unique` index would admit both spellings as distinct
+  while Rust equality says they are the same value. Three conditions added to
+  `sqlite_decimal_check` in `autumn-cli/src/generate/schema_edit.rs`: the
+  integer part is a lone `0` or starts `1`-`9` (rejects `007.5`, `0019`, and
+  the missing integer part in `.5`), a fractional part never ends in `0` and
+  a bare trailing `.` is rejected (`19.90`, `0.10`, `19.00` → `19`), and
+  negative zero is rejected (`-0`; `Decimal::normalize` converts -0 to 0, so
+  the wrapper never writes it). The existing
+  `sqlite_decimal_check_enforces_precision_scale_and_shape` test gains the
+  issue's reproduction matrix plus adversarial spellings. Note: this makes
+  the constraint stricter and interacts with #2598 — a table created or
+  rebuilt by `autumn schema diff` carries no `CHECK` at all today, and that
+  path should emit the same constraint when it lands.
+- **SSG/ISR:** the `Content-Type` equivalence check now decodes quoted-pairs
+  inside quoted MIME parameter values (RFC 9110 §5.6.4), so `boundary="a\b"`
+  and `boundary="ab"` compare equal. Previously a layer or proxy that merely
+  reserialized the header between `autumn build` and ISR regeneration —
+  changing `"a\b"` to `"ab"` or vice versa — made `regenerate_page` refuse
+  every refresh for that route (with an `error!` each cooldown) even though
+  the two spellings mean the same value (issue #2404).
+
 ### Security
+
+- **The dev error overlay no longer falls back to `cfg!(debug_assertions)`
+  when `profile` is unset (🛡 Warden):** `apply_middleware`'s `is_dev` (the
+  flag that gates the HTML dev error badge — internal error messages, request
+  headers, cookies, and, when available, SQL query text and stack frames)
+  disagreed with the request inspector's own gate (`is_dev_profile`) about
+  what an absent profile means. The inspector already failed closed
+  (`None` is not dev); the error overlay instead fell back to
+  `cfg!(debug_assertions)`, so a debug build (an ordinary `cargo build`/
+  `cargo run` with no `--release`) running under a profile-less config served
+  the full overlay on every 5xx. `AutumnConfig::profile` is `Option<String>`
+  with no forced default, and a custom `ConfigLoader`
+  (`docs/guide/custom-subsystems.md` documents writing one) is not required
+  to set it — only the default `TomlEnvConfigLoader`'s `resolve_profile`
+  defaults an absent profile to `"dev"`. An app using a documented custom
+  loader whose backing file has no `profile` key got the dev overlay on a
+  debug-built deployment even though its author never opted into
+  `profile = "dev"`. Both gates now derive from one function,
+  `crate::config::profile_is_dev`, which fails closed on `None` with no
+  build-mode fallback; `route_listing.rs`'s inspector-route listing (used by
+  `autumn routes audit`) was converted to the same helper to remove the last
+  duplicate copy of this check. See
+  `docs/security/2026-09-11-profile-conditional-dev-overlay/`.
 
 - **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
   (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
@@ -512,6 +838,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: `autumn generate admin`'s bulk delete is now batched
+  generator-wide (statements N→1, buffers -41.5%):** three of this
+  framework's own bundled admin models (`TokenAdminModel`,
+  `FeatureFlagAdminModel`, `ExperimentAdminModel`) already got hand-written
+  `execute_action` overrides in prior Ledger PRs to close the
+  `AdminModel::execute_action` trait default's `for id in ids { self.delete(&pool,
+  id).await?; }` per-id loop — but every app's own `autumn generate admin`
+  output never got the same override, since the generator template
+  (`autumn-cli/src/generate/admin.rs`, `render_admin_file`) never emitted
+  one. Every generated admin panel's "Delete selected" bulk action therefore
+  cost one `DELETE ... WHERE id = $1` round trip per selected row, not per
+  click. The generator now also emits an `execute_action` override batching
+  the `"delete"` action into one `DELETE ... WHERE id = ANY($1)`, and
+  returns the number of rows actually removed rather than `ids.len()` — a
+  missing or duplicate id is now a safe no-op instead of aborting the whole
+  batch part-way through with `AdminError::NotFound` (the trait-default
+  loop's undocumented, order-dependent behavior; no existing test pinned
+  it). `autumn-admin-plugin` also now re-exports the shared
+  `dispatch_restore_purge_or_unhandled` helper so generated code can reach
+  the same restore/purge/unhandled-action fallback the framework's own
+  hand-written overrides use. Profiled end-to-end against a real generated
+  project (`autumn new` → `generate scaffold` → `generate admin`) driving a
+  50,000-row table through a 2,000-id bulk delete: `pg_stat_statements`
+  calls 2,000 → 1, buffers 9,683 → 5,667. Existing `generate admin`
+  generator tests and the full `autumn-admin-plugin` Docker suite pass
+  unchanged. See
+  `docs/reports/2026-09-10-ledger-admin-generator-bulk-delete-batch/`.
+
 - **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
   (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
   (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
@@ -593,6 +947,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark's total past a flat percentage floor — the case for shipping
   it is the function-level number plus zero behavior change and zero new
   dependencies.
+- **⚡ Bolt: drop four needless `Service::clone()`s from the ingress
+  middleware fast paths (instructions -5.5%, allocation bytes -10.6%):**
+  `autumn/benches/request_pipeline.rs` (the committed ingress-pipeline
+  profiler, issue #2193) profiled under `valgrind --tool=dhat` showed
+  `TrustedProxiesService`, `MethodOverrideService`, `SubmitTokenService` and
+  `idempotency::IdempotencyReplayService` each allocating on effectively
+  every request — 2.7 MB of the run's 17.6 MB marginal allocation bytes —
+  from `tower::util::boxed_clone_sync::CloneService::clone_box`. Each of
+  these `call()`s did a `let mut inner = self.inner.clone(); std::mem::swap(
+  &mut self.inner, &mut inner);` before `Box::pin`-ing the result, a pattern
+  copied from sibling middlewares that genuinely need to move an owned `S`
+  into an `async move` block. These four don't: on their common-case path
+  (no CAPTCHA/replay/override/guard applicable — every GET, every non-form
+  POST) nothing runs between entry and the delegating call, so
+  `self.inner.call(req)` can be boxed directly with `&mut self.inner`,
+  never touching `Clone`. `self.inner` is, at this point in the stack, a
+  `BoxCloneSyncService` whose `Clone` impl allocates a fresh
+  `Box<dyn CloneService>` to duplicate the remaining downstream stack — the
+  exact cost issue #2214 already eliminated from four *other* middlewares by
+  converting their `from_fn` closures to named-future `Service`s; this
+  targets the same mechanism on the four `Service`s #2214 didn't touch
+  (`SubmitTokenService`/`IdempotencyReplayService` split their existing
+  branch structure so only the guarded/replay path still clones;
+  `TrustedProxiesService` and `MethodOverrideService`'s ineligible-request
+  branch never needed the clone at all). Behavior is unchanged: all 98
+  existing unit tests across the four modules and all 105 existing
+  CSRF/idempotency/submit-token/trusted-proxy/`ingress_named_futures`
+  integration tests pass unmodified. Independently corroborated by two
+  pre-existing gates neither of which this change touches:
+  `tests/config_alloc_gate.rs`'s exact in-process `allocation-counter`
+  measurement of a single `/ping` request through the production stack
+  (140 → 132 blocks, 27,982 → 25,022 bytes) and
+  `tests/integration/middleware_stack_depth.rs`'s clone-event probe (9 → 7
+  traversals, still inside its documented `6..=9` window — the same counter
+  #2214 introduced for exactly this class of fix). Measured end to end via
+  `request_pipeline.rs` (`valgrind --tool=callgrind`, base-subtracted,
+  mean of 3 runs each side to bound run-to-run hash-seed variance):
+  marginal instructions/3000-request run 289,823,338 → 273,790,211 (-5.53%);
+  via `valgrind --tool=dhat`: marginal allocation bytes 17,617,058 →
+  16,108,256 (-8.56%), blocks 90,507 → 86,307 (-4.64%).
 
 ### Fixed
 

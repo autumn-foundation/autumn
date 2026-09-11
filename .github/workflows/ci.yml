@@ -991,6 +991,15 @@ jobs:
           cargo test -p autumn-cache-redis --lib \
             | tee "${RUNNER_TEMP}/cache-redis.log"
           assert_ran "${RUNNER_TEMP}/cache-redis.log" "autumn-cache-redis unit tests"
+          # Same reasoning, same lane: `redis_page_spans` is the pure
+          # pagination arithmetic behind the job-admin enqueued page (#1186),
+          # and it is `#[cfg(feature = "redis")]` with no Docker, so the
+          # Docker step's `--ignored` run skips it and only the same
+          # unification coincidence runs it today. Same feature set as the
+          # redis_tls run above so both share one autumn-web build.
+          cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
+            | tee "${RUNNER_TEMP}/redis-page-spans.log"
+          assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
       - name: Run direct-TLS (HTTPS) tests
         if: matrix.lane == 'tls'
         # `tls` is not a default feature, so the `test` job's workspace `cargo
@@ -1206,6 +1215,38 @@ jobs:
           # backend, which this pg-integration test requires). See #1614.
           cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
+          # The Redis job-admin dashboard suite lives in autumn-web's `--lib`
+          # test module (it drives crate-private types: RedisJobAdminBackend,
+          # claim_next_redis_job), so neither the consolidated
+          # `integration_tests` sweep below nor the workspace `test` job runs
+          # it. Named explicitly rather than as a bare `--lib -- --ignored`:
+          # `autumn/src/job.rs` carries ~36 ignored Docker tests, and turning
+          # the whole set on is its own change. #1186 added
+          # `redis_admin_enqueued_page_merges_concurrency_parked_jobs` here,
+          # which asserts the enqueued tab lists concurrency-parked jobs.
+          #
+          # Same feature set as the `integration_tests` sweep below so both
+          # share one autumn-web build. The pass-count check is there because
+          # `cargo test` exits 0 when a filter matches nothing: without it a
+          # rename turns this lane silently green-and-empty.
+          # `redis_job_admin_ci_coverage` (in the consolidated binary) is the
+          # other half of that guard — it fails when an ignored job-admin
+          # Redis test stops matching these filters.
+          #
+          # The subshell scopes `pipefail` to this one pipeline: the step's
+          # shell is `bash -e` without it, so `cargo test | tee` would report
+          # tee's status and swallow a real failure. Setting it for the whole
+          # step would re-interpret every other line here.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_admin_ \
+              job::tests::redis_job_admin_ \
+              | tee "${RUNNER_TEMP}/redis-job-admin.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
+            || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
@@ -1214,14 +1255,20 @@ jobs:
           # reap set, its boundary cases (created_at / last_seen_at exactly ON
           # the cutoff), and its namespace isolation against a
           # production-shaped fixture. Testcontainer-managed, so no `services:`
-          # block. NOTE: autumn-media-plugin has no crate-wide `--ignored`
-          # sweep, so `tests/room_store_db.rs`'s own Docker tests still run
-          # nowhere in CI — a pre-existing gap, not addressed here.
+          # block.
           cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
+          # The DB-backed RoomStore lifecycle suite (create/join/roster/leave
+          # persistence, member-gating, heartbeat renewal, the reap sweep).
+          # autumn-media-plugin has no crate-wide `--ignored` sweep, so each of
+          # its Docker test targets is named here (#1974).
+          cargo test -p autumn-media-plugin --test room_store_db -- --ignored
           cargo test -p autumn-cache-redis -- --ignored
           # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
           # suites are testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-search -- --ignored
+          # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
+          # is testcontainer-managed, so no `services:` block is needed.
+          cargo test -p autumn-billing --test mirror_db -- --ignored
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
@@ -1655,6 +1702,7 @@ jobs:
             --test experiment_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
+          cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
@@ -2309,6 +2357,389 @@ jobs:
             Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
           }
 
+      - name: "Journey: the daemon starts, is discoverable, and serves"
+        # AC-1 of #1639. Every clause of the daemon contract the guide promises,
+        # asserted where a Windows operator would meet it: a readiness-gated
+        # start, a discovery file naming the transport and address, a status exit
+        # code, a served request, and a single-instance guard.
+        #
+        # Plain `--daemon`, not `--bundled-pg`: the CLI only overrides
+        # AUTUMN_MANAGED_PG_DATA_DIR for a bundled start, so this reuses the
+        # cluster the earlier steps already provisioned instead of paying for a
+        # second initdb. The app still supervises it, which is what makes the
+        # clean-teardown assertion in the next step mean something.
+        env:
+          # Long enough that a stop is observably a DRAIN rather than a kill —
+          # the next step measures against it.
+          AUTUMN_SERVER__PRESTOP_GRACE_SECS: "8"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+          Add-Content -Path $env:GITHUB_ENV -Value "AUTUMN_RUNTIME_DIR=$env:RUNNER_TEMP\daemon-state"
+          $env:AUTUMN_RUNTIME_DIR = "$env:RUNNER_TEMP\daemon-state"
+
+          & $autumn serve --daemon
+          if ($LASTEXITCODE -ne 0) { throw "autumn serve --daemon failed with $LASTEXITCODE" }
+
+          # The address file is the discovery contract. Find it without
+          # re-deriving autumn's namespacing, which would make this test agree
+          # with a bug rather than catch one.
+          $addrFile = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'serve.addr' |
+            Select-Object -First 1
+          if (-not $addrFile) { throw "no serve.addr was written under $env:AUTUMN_RUNTIME_DIR" }
+          $addr = Get-Content $addrFile.FullName -Raw
+          Write-Host "--- serve.addr ---`n$addr"
+          if ($addr -notmatch 'transport\s*=\s*"tcp"') { throw "serve.addr did not record a tcp transport: $addr" }
+          if ($addr -notmatch 'address\s*=\s*"([^"]+)"') { throw "serve.addr recorded no address: $addr" }
+          $endpoint = $Matches[1]
+          Add-Content -Path $env:GITHUB_ENV -Value "DAEMON_ADDR_FILE=$($addrFile.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "DAEMON_ENDPOINT=$endpoint"
+
+          # `status` must agree, and exit 0 while running.
+          $status = & $autumn serve status 2>&1 | Out-String
+          Write-Host $status
+          if ($LASTEXITCODE -ne 0) { throw "serve status exited $LASTEXITCODE while running" }
+          if ($status -notmatch 'running') { throw "serve status did not report running: $status" }
+          if ($status -notmatch [regex]::Escape($endpoint)) { throw "serve status did not name the recorded endpoint: $status" }
+
+          # The decisive one: the daemon actually serves at the address it
+          # published. Readiness is gated on startup completion, so this needs no
+          # retry loop — if it does, the gate is broken.
+          $r = Invoke-WebRequest "http://$endpoint/health" -UseBasicParsing -TimeoutSec 10
+          if ($r.StatusCode -ne 200) { throw "GET /health returned $($r.StatusCode)" }
+
+          # Single-instance guard: a second start is refused, and says so.
+          $second = & $autumn serve --daemon 2>&1 | Out-String
+          Write-Host $second
+          if ($LASTEXITCODE -eq 0) { throw "a second `--daemon` start must be rejected" }
+          if ($second -notmatch 'already running') { throw "the rejection did not say why: $second" }
+          exit 0
+
+      - name: "Journey: stop drains in-flight requests and stops Postgres cleanly"
+        # AC-2 of #1639, and the issue's success metric ("a graceful stop under
+        # external probing records 0 failed in-flight requests").
+        #
+        # Graded four ways, because each alone has a hole: the elapsed time must
+        # cover the configured prestop grace (a hard kill returns instantly),
+        # APPLICATION requests issued AFTER the stop began must still succeed for
+        # that whole window (proving the server kept serving through the drain
+        # rather than dropping its listener), readiness must flip to 503 while it
+        # does (proving this is a drain and not just a slow death), and the
+        # managed cluster's postmaster.pid must be gone (proving the app's
+        # on_shutdown hook ran rather than being skipped).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+          $endpoint = $env:DAEMON_ENDPOINT
+          $pgPid = "$env:AUTUMN_MANAGED_PG_DATA_DIR\postmaster.pid"
+          if (-not (Test-Path $pgPid)) { throw "managed Postgres was not running before the stop" }
+          # Prove the daemon resolved the 8s grace the previous step's `env:` set,
+          # so the timing assertion below cannot pass or fail for another reason.
+          $addrBefore = Get-Content $env:DAEMON_ADDR_FILE -Raw
+          if ($addrBefore -notmatch 'stop_budget_secs\s*=\s*(\d+)') { throw "the daemon recorded no stop budget: $addrBefore" }
+          if ([int]$Matches[1] -lt 8) { throw "the daemon resolved a $($Matches[1])s drain budget; the 8s prestop grace did not reach it, so the timing below proves nothing" }
+
+          # Pre-flight: the route the drain is graded on must be serving 200
+          # BEFORE the stop. Without this, a scaffold whose sample route moved
+          # would fail below as though the drain were broken, which is the most
+          # expensive kind of wrong error message.
+          $pre = Invoke-WebRequest "http://$endpoint/hello" -UseBasicParsing -TimeoutSec 10 -SkipHttpErrorCheck
+          if ($pre.StatusCode -ne 200) {
+            throw "GET /hello returned $($pre.StatusCode) before any stop — the drain probe would grade the wrong thing"
+          }
+
+          # Probe from a background job so the requests are genuinely concurrent
+          # with the stop, recording a timestamp and both outcomes per attempt.
+          #
+          # `/hello` — a scaffolded APPLICATION route — is what grades the drain,
+          # not `/health`. `/health` is a documented alias for the readiness
+          # probe, and phase 2 of the shutdown sequence flips readiness to 503
+          # deliberately, "strictly before the listener closes", so a load
+          # balancer deregisters this replica while real traffic keeps being
+          # served. Probing `/health` therefore grades the readiness flip and
+          # calls a correct drain a failure.
+          #
+          # `-SkipHttpErrorCheck` for the same reason: a 503 is an ANSWER, and
+          # without it Invoke-WebRequest throws on any non-2xx, making a serving
+          # listener indistinguishable from a refused connection.
+          $probeLog = "$env:JOURNEY_DIR\drain-probe.log"
+          Remove-Item -Force -ErrorAction SilentlyContinue $probeLog
+          $probe = Start-Job -ScriptBlock {
+            param($endpoint, $log)
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+              $stamp = (Get-Date).ToString('o')
+              try {
+                $r = Invoke-WebRequest "http://$endpoint/hello" -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                $helloCode = $r.StatusCode
+              } catch {
+                $helloCode = 'REFUSED'
+              }
+              try {
+                $r = Invoke-WebRequest "http://$endpoint/health" -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                $healthCode = $r.StatusCode
+              } catch {
+                $healthCode = 'REFUSED'
+              }
+              Add-Content -Path $log -Value "$stamp,hello=$helloCode,health=$healthCode"
+              Start-Sleep -Milliseconds 200
+            }
+          } -ArgumentList $endpoint, $probeLog
+          # Let the probe establish a baseline of successes before the stop.
+          Start-Sleep -Seconds 2
+
+          $stopBegan = Get-Date
+          & $autumn serve stop
+          $stopCode = $LASTEXITCODE
+          $elapsed = (Get-Date) - $stopBegan
+          Stop-Job $probe -ErrorAction SilentlyContinue
+          Receive-Job $probe -ErrorAction SilentlyContinue | Out-Null
+          Remove-Job $probe -Force -ErrorAction SilentlyContinue
+
+          if ($stopCode -ne 0) { throw "autumn serve stop exited $stopCode" }
+          Write-Host "stop took $($elapsed.TotalSeconds)s"
+
+          # A hard kill returns in milliseconds. Draining cannot: the app owes at
+          # least its configured prestop grace before it stops accepting.
+          if ($elapsed.TotalSeconds -lt 7) {
+            throw "stop returned in $($elapsed.TotalSeconds)s, faster than the 8s prestop grace — it did not drain"
+          }
+
+          $probes = @(Get-Content $probeLog -ErrorAction SilentlyContinue)
+          Write-Host "::group::drain probe log"
+          $probes | Write-Host
+          Write-Host "::endgroup::"
+          # `@(...)` on every pipeline: PowerShell unrolls a single-element
+          # result to a scalar, and the indexing below would then slice a STRING.
+          $during = @($probes | Where-Object {
+            $parts = $_ -split ','
+            ([datetime]::Parse($parts[0], $null, [System.Globalization.DateTimeStyles]::RoundtripKind)) -gt $stopBegan
+          })
+          $servedDuring = @($during | Where-Object { $_ -match 'hello=200,' })
+          if ($servedDuring.Count -lt 1) {
+            throw "no application request succeeded after the stop began — the server stopped accepting immediately instead of draining"
+          }
+
+          # The issue's success metric: 0 failed in-flight requests. Graded as a
+          # CONTIGUOUS run of successes from the moment the stop began until the
+          # drain closes the listener — after which failures are correct and
+          # expected. One success somewhere in the window would be far too weak,
+          # so the real assertion is that the run COVERS the prestop grace: the
+          # server has to keep answering for the whole window it promised.
+          $firstFailureIndex = -1
+          for ($i = 0; $i -lt $during.Count; $i++) {
+            if ($during[$i] -notmatch 'hello=200,') { $firstFailureIndex = $i; break }
+          }
+          $servedRun = if ($firstFailureIndex -lt 0) { $during } else { @($during[0..$firstFailureIndex]) | Select-Object -SkipLast 1 }
+          $servedRun = @($servedRun)
+          if ($servedRun.Count -lt 1) {
+            throw "the very first request after the stop began failed — the listener was dropped, not drained"
+          }
+          $lastServed = [datetime]::Parse(($servedRun[-1] -split ',')[0], $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+          $servedFor = ($lastServed - $stopBegan).TotalSeconds
+          Write-Host "served for $servedFor s after the stop began ($($servedRun.Count) requests, 0 failed in flight)"
+          if ($servedFor -lt 6) {
+            throw "the server stopped accepting $servedFor s into an 8s prestop grace — in-flight requests were cut"
+          }
+
+          # The other half of the phase ordering, and the reason `/health` is
+          # still probed: readiness must flip to 503 DURING the grace, while the
+          # listener is still accepting. Without this the timing above could be
+          # satisfied by a server that simply took 8s to die, and the drain that
+          # lets a load balancer deregister would go ungraded.
+          $flipped = @($during | Where-Object { $_ -match 'health=503' })
+          if ($flipped.Count -lt 1) {
+            throw "readiness never flipped to 503 during the drain — the prestop deregistration window did not happen"
+          }
+          Write-Host "readiness reported 503 on $($flipped.Count) probes during the drain"
+
+          # The app's on_shutdown hook ran, so the cluster stopped itself and
+          # removed its pidfile. A survivor is the orphan #1616/#1639 forbid.
+          if (Test-Path $pgPid) { throw "managed Postgres was left running: $pgPid still exists after stop" }
+          if (-not (Test-Path "$env:AUTUMN_MANAGED_PG_DATA_DIR\PG_VERSION")) {
+            throw "the managed cluster's data dir did not survive the stop"
+          }
+          # State is cleaned up and `status` reports the documented stopped code.
+          if (Test-Path $env:DAEMON_ADDR_FILE) { throw "serve.addr survived the stop" }
+          & $autumn serve status | Write-Host
+          if ($LASTEXITCODE -ne 3) { throw "serve status must exit 3 when stopped, got $LASTEXITCODE" }
+          exit 0
+
+      - name: "Journey: restart brings the daemon back as a new process"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+
+          & $autumn serve --daemon
+          if ($LASTEXITCODE -ne 0) { throw "serve --daemon failed with $LASTEXITCODE" }
+          $before = (Get-Content $env:DAEMON_ADDR_FILE -Raw)
+          if ($before -notmatch 'pid\s*=\s*(\d+)') { throw "no pid in serve.addr: $before" }
+          $pidBefore = $Matches[1]
+
+          & $autumn serve restart
+          if ($LASTEXITCODE -ne 0) { throw "serve restart failed with $LASTEXITCODE" }
+          $after = (Get-Content $env:DAEMON_ADDR_FILE -Raw)
+          if ($after -notmatch 'pid\s*=\s*(\d+)') { throw "no pid in serve.addr after restart: $after" }
+          $pidAfter = $Matches[1]
+          # A restart that reported success without replacing the process would
+          # pass every other assertion here.
+          if ($pidAfter -eq $pidBefore) { throw "restart left the original process (pid $pidBefore) running" }
+
+          if ($after -notmatch 'address\s*=\s*"([^"]+)"') { throw "no address after restart: $after" }
+          $r = Invoke-WebRequest "http://$($Matches[1])/health" -UseBasicParsing -TimeoutSec 10
+          if ($r.StatusCode -ne 200) { throw "the restarted daemon returned $($r.StatusCode)" }
+
+          & $autumn serve stop
+          if ($LASTEXITCODE -ne 0) { throw "serve stop after restart exited $LASTEXITCODE" }
+          exit 0
+
+      - name: "Journey: register a boot-start service that survives a crash"
+        # AC-4 and AC-6 of #1639: the one-command service journey, its boot-start
+        # and crash-restart configuration, what `doctor` reports about it, and a
+        # clean removal.
+        #
+        # `--bundled-pg` here (unlike the daemon steps above) on purpose: it makes
+        # the service host point the app at a data dir under the state directory
+        # the INSTALLING USER created, so the run also proves that a Local System
+        # service can reach state an ordinary user's ACL protects. That means a
+        # first-boot initdb, hence the generous readiness budget.
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+
+          # Flags belong to `serve`, before the subcommand: `--bundled-pg` is
+          # an argument of `serve`, not of `install-service`, and clap gives
+          # everything after a subcommand name to that subcommand.
+          # The prestop grace has to be in the app's CONFIG, not this shell's
+          # environment: the Service Control Manager starts the host with the
+          # system environment block, so `$env:` here never reaches the app the
+          # service runs. Written under the dev profile because the service is
+          # installed without `--release`.
+          Add-Content -Path "$env:JOURNEY_DIR\tier1_app\autumn.toml" -Value "`n[profile.dev.server]`nprestop_grace_secs = 8`n"
+
+          & $autumn serve --bundled-pg install-service
+          if ($LASTEXITCODE -ne 0) { throw "autumn serve install-service failed with $LASTEXITCODE" }
+
+          # Prove the app actually resolved that budget before timing anything
+          # against it. Without this the drain assertion below could fail on a
+          # zero grace, or pass because a cold managed-Postgres teardown happened
+          # to be slow — either way testing nothing.
+          $svcAddr = Get-Content $env:DAEMON_ADDR_FILE -Raw
+          Write-Host "--- service serve.addr ---`n$svcAddr"
+          if ($svcAddr -notmatch 'stop_budget_secs\s*=\s*(\d+)') { throw "the service's daemon recorded no stop budget: $svcAddr" }
+          if ([int]$Matches[1] -lt 8) { throw "the service's app resolved a $($Matches[1])s drain budget, so the drain timing below would prove nothing" }
+
+          # `doctor` must report the service — AC-6. Take the name from there
+          # rather than re-deriving autumn's own naming, so a mismatch between
+          # what install registered and what doctor looks for fails here.
+          $json = & $autumn doctor --json | Out-String
+          $report = $json | ConvertFrom-Json
+          $check = $report.checks | Where-Object { $_.name -eq 'daemon_service' }
+          if (-not $check) { throw "doctor did not run the daemon_service check" }
+          Write-Host "daemon_service: $($check.detail)"
+          if ($check.detail -notmatch 'service `(autumn-[^`]+)` is (\w+)') {
+            throw "doctor did not report a registered service: $($check.detail)"
+          }
+          $svc = $Matches[1]
+          if ($Matches[2] -ne 'Running') { throw "doctor reports `$svc as $($Matches[2]), not Running" }
+          # `-notmatch 'daemon running'` would never fire: the negative detail
+          # is "no daemon running for this project", which contains it.
+          if ($check.detail -match 'no daemon running') { throw "doctor did not see the service's app: $($check.detail)" }
+
+          # (a) starts at boot, and (c) is visible to native Windows tooling.
+          $qc = & sc.exe qc $svc | Out-String
+          Write-Host $qc
+          if ($qc -notmatch 'AUTO_START') { throw "the service is not configured to start at boot: $qc" }
+          # (b) restarts automatically after a crash.
+          $qf = & sc.exe qfailure $svc | Out-String
+          Write-Host $qf
+          if ($qf -notmatch 'RESTART') { throw "no restart-on-failure action is configured: $qf" }
+
+          # AC-3: a supervisor-stopped server drains. `sc.exe stop` is the OS
+          # service manager asking, and the host must translate it into the SAME
+          # cooperative drain `autumn serve stop` triggers — not a termination.
+          # Graded the way the CLI-stop step is: by wall clock against the
+          # prestop grace the app was just proved to have resolved, which a hard
+          # kill cannot satisfy.
+          $scmStopBegan = Get-Date
+          & sc.exe stop $svc | Write-Host
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((& sc.exe query $svc | Out-String) -notmatch 'STOPPED') {
+            if ((Get-Date) -gt $deadline) { throw "the service did not reach STOPPED after sc.exe stop" }
+            Start-Sleep -Milliseconds 500
+          }
+          $scmStopTook = ((Get-Date) - $scmStopBegan).TotalSeconds
+          Write-Host "sc.exe stop took $scmStopTook s"
+          # A host that force-killed its app would reach STOPPED in well under
+          # the grace the app owes before it stops accepting.
+          if ($scmStopTook -lt 6) {
+            throw "sc.exe stop returned in $scmStopTook s, faster than the 8s prestop grace — the app was terminated, not drained"
+          }
+          # The app's own on_shutdown hook ran, so the cluster stopped itself.
+          $svcPgAfterStop = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'postmaster.pid' -ErrorAction SilentlyContinue
+          if ($svcPgAfterStop) { throw "an SCM stop orphaned the managed cluster: $($svcPgAfterStop.FullName)" }
+          # Back up for the crash test below.
+          & sc.exe start $svc | Write-Host
+          $deadline = (Get-Date).AddMinutes(10)
+          while ((& sc.exe query $svc | Out-String) -notmatch 'RUNNING') {
+            if ((Get-Date) -gt $deadline) { throw "the service did not restart after sc.exe start" }
+            Start-Sleep -Seconds 2
+          }
+
+          # The forced crash. Kill the APP, not the host: that is what exercises
+          # the host's own supervision reporting a failure to the SCM, which is
+          # what makes the restart policy fire.
+          $addr = Get-Content $env:DAEMON_ADDR_FILE -Raw
+          if ($addr -notmatch 'pid\s*=\s*(\d+)') { throw "no pid in serve.addr: $addr" }
+          $crashPid = [int]$Matches[1]
+          Write-Host "force-killing the service's app (pid $crashPid)"
+          Stop-Process -Id $crashPid -Force
+
+          # Supervised restart observed: a NEW pid recorded by a NEW app process.
+          # The first restart delay is 5s, plus a cold managed-Postgres boot.
+          $deadline = (Get-Date).AddMinutes(15)
+          $restarted = $false
+          while (-not $restarted -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            $now = Get-Content $env:DAEMON_ADDR_FILE -Raw -ErrorAction SilentlyContinue
+            if ($now -and $now -match 'pid\s*=\s*(\d+)' -and [int]$Matches[1] -ne $crashPid) {
+              $restarted = $true
+              Write-Host "supervised restart observed: pid $($Matches[1]) replaced $crashPid"
+            }
+          }
+          if (-not $restarted) {
+            Write-Host (& sc.exe query $svc | Out-String)
+            throw "the service did not restart the app after it was killed"
+          }
+
+          # Clean removal: no orphaned service entry, no leftover state, and the
+          # operator's database left where it was.
+          & $autumn serve uninstall-service
+          if ($LASTEXITCODE -ne 0) { throw "autumn serve uninstall-service failed with $LASTEXITCODE" }
+          $after = & sc.exe query $svc 2>&1 | Out-String
+          Write-Host $after
+          # 1060 = ERROR_SERVICE_DOES_NOT_EXIST.
+          if ($after -notmatch '1060') { throw "the service entry survived uninstall: $after" }
+          if (Test-Path $env:DAEMON_ADDR_FILE) { throw "serve.addr survived uninstall" }
+          $records = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'serve.service.toml' -ErrorAction SilentlyContinue
+          if ($records) { throw "the service record survived uninstall: $($records.FullName)" }
+          # The AC's third clause: no orphaned managed-Postgres cluster. The
+          # service ran `--bundled-pg`, so its cluster lives under the runtime
+          # dir; a surviving postmaster.pid is the orphan, and a missing
+          # PG_VERSION would mean uninstall deleted the operator's database —
+          # which the command explicitly promises not to do.
+          $svcPg = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'postmaster.pid' -ErrorAction SilentlyContinue
+          if ($svcPg) { throw "uninstall left a managed Postgres running: $($svcPg.FullName)" }
+          $svcData = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'PG_VERSION' -ErrorAction SilentlyContinue
+          if (-not $svcData) { throw "uninstall removed the managed cluster's data dir; the operator's database must survive" }
+          Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | ForEach-Object { throw "a postgres process survived uninstall (pid $($_.Id))" }
+          exit 0
+
       - name: "Policy: Tier 2 commands fail fast, not silently"
         # AC-2's other half. A Tier 2 command on native Windows must exit
         # non-zero with a message naming the tier and the policy — the failure
@@ -2318,12 +2749,14 @@ jobs:
           $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
           Set-Location "$env:JOURNEY_DIR\tier1_app"
 
-          $output = & $autumn serve --daemon 2>&1 | Out-String
+          # The daemon lifecycle was Tier 2 until #1639 and is now Tier 1, proved
+          # end to end by the journey steps above. Assert the REFUSAL IS GONE:
+          # a leftover fail-fast would take the journey away on the platform it
+          # was just built for, and every other assertion here would still pass.
+          $output = & $autumn serve status 2>&1 | Out-String
           Write-Host $output
-          if ($LASTEXITCODE -eq 0) { throw "autumn serve --daemon must not succeed on native Windows" }
-          if ($output -notmatch 'Tier 2') { throw "the daemon refusal did not name the tier: $output" }
-          if ($output -notmatch 'WSL2') { throw "the daemon refusal did not name WSL2: $output" }
-          if ($output -notmatch 'platform-support') { throw "the daemon refusal did not link the policy: $output" }
+          if ($output -match 'Tier 2') { throw "the daemon lifecycle must not refuse on native Windows: $output" }
+          if ($output -match 'WSL2') { throw "the daemon lifecycle must not point at WSL2: $output" }
 
           $output = & $autumn deploy up 2>&1 | Out-String
           Write-Host $output
@@ -2367,5 +2800,7 @@ jobs:
             ${{ runner.temp }}\journey\dev.out
             ${{ runner.temp }}\journey\app.out
             ${{ runner.temp }}\journey\app.err
+            ${{ runner.temp }}\journey\drain-probe.log
             ${{ runner.temp }}\tier1-pg\log\*
+            ${{ runner.temp }}\daemon-state\**\serve.log
           if-no-files-found: ignore

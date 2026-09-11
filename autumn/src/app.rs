@@ -4584,12 +4584,23 @@ impl AppBuilder {
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
         let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
+        // The mTLS trust-store reloader (#1640), when
+        // `[server.tls.client_auth]` is active. Spawned beside the certificate
+        // reloader below so a CA rotation lands without a restart.
+        #[cfg(feature = "tls")]
+        let mut client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader> = None;
 
         // Carries the ACME challenge listener + renewal task wiring from the TLS
         // bind path to the sibling tasks spawned once `server_shutdown` exists.
         #[cfg(feature = "acme")]
         let mut acme_bind_state: Option<AcmeBindState> = None;
 
+        // Where the app actually bound, as the readiness protocol spells it
+        // (`<transport> <address>`) — distinct from `bound_desc`, which is a
+        // human-facing log line carrying a scheme and any TLS note. The
+        // supervisor reads this to write its address-discovery file, so it must
+        // be the resolved address, not the configured one.
+        let bound_endpoint: String;
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
             String,
@@ -4659,6 +4670,7 @@ impl AppBuilder {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
                 };
+                bound_endpoint = format!("unix {socket_path}");
                 (
                     BoundListener::Unix(listener),
                     format!("unix:{socket_path}"),
@@ -4701,6 +4713,7 @@ impl AppBuilder {
             let addr = listener
                 .local_addr()
                 .map_or(configured_addr, |bound| bound.to_string());
+            bound_endpoint = format!("tcp {}", dialable_endpoint(&addr));
             // When `[server.tls]` is set (and the `tls` feature is built in),
             // wrap the just-bound TCP listener in a rustls acceptor so the same
             // host:port serves HTTPS. Fail fast on any cert/key problem — the
@@ -4745,8 +4758,9 @@ impl AppBuilder {
                         }
                     } else {
                         match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                            Ok((tls_listener, reload)) => {
+                            Ok((tls_listener, reload, client_reload)) => {
                                 tls_reload_state = Some(reload);
+                                client_trust_reload = client_reload;
                                 (
                                     BoundListener::Tls(tls_listener),
                                     format!("https://{addr}"),
@@ -4763,8 +4777,9 @@ impl AppBuilder {
                     }
                     #[cfg(not(feature = "acme"))]
                     match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                        Ok((tls_listener, reload)) => {
+                        Ok((tls_listener, reload, client_reload)) => {
                             tls_reload_state = Some(reload);
+                            client_trust_reload = client_reload;
                             (
                                 BoundListener::Tls(tls_listener),
                                 format!("https://{addr}"),
@@ -4990,6 +5005,18 @@ impl AppBuilder {
             });
         }
 
+        // mTLS trust-store hot reload (#1640): poll the client-CA bundle and
+        // CRL and swap the verifier when either changes, so a CA rotation — or
+        // a newly published revocation — lands without a restart and without
+        // dropping established connections.
+        #[cfg(feature = "tls")]
+        if let Some(reload) = client_trust_reload.take() {
+            let reload_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                reload.run(reload_shutdown).await;
+            });
+        }
+
         // ACME (issue #1608): bind the `:80` HTTP-01 challenge + HTTP→HTTPS
         // redirect listener and spawn the renewal loop, each a child of
         // `server_shutdown` so they tear down with the main server. The renewal
@@ -5005,9 +5032,21 @@ impl AppBuilder {
                 https_port,
                 dns01,
                 custom_domains,
+                client_trust_reload: acme_client_trust_reload,
             } = bind_state;
             // Read before `custom_domains` is moved into the spawn below.
             let custom_domains_enabled = custom_domains.is_some();
+            // The mTLS trust store rotates on this arm too (#1640). Spawned
+            // HERE, not hoisted into the slot the static-cert arm fills: that
+            // slot is drained above this block, so an assignment to it would
+            // never be read and the ACME arm's reloader would never run.
+            #[cfg(feature = "tls")]
+            if let Some(reload) = acme_client_trust_reload {
+                let reload_shutdown = server_shutdown.child_token();
+                tokio::spawn(async move {
+                    reload.run(reload_shutdown).await;
+                });
+            }
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -5250,21 +5289,33 @@ impl AppBuilder {
                         .await
                 })
             }
-            // HTTPS arm: mirrors the TCP arm. The peer is a real TCP
-            // `SocketAddr`, so the same `ConnectInfo<SocketAddr>`,
-            // `TrustedProxiesLayer`/`ClientAddr` resolution, SSE and wss
-            // streaming, and shutdown wiring apply unchanged; only the rustls
-            // handshake inside the listener's `accept` differs. The no-op `tap_io`
-            // wrapper lets axum's blanket `Connected<IncomingStream<TapIo<L, F>>>
-            // for L::Addr` supply the peer `SocketAddr`, because the concrete
-            // `SocketAddr: Connected` impl exists only for `tokio::net::TcpListener`.
+            // HTTPS arm: mirrors the TCP arm. The connect info is
+            // `TlsConnectInfo` rather than a bare `SocketAddr` so the verified
+            // mTLS client identity (#1640) rides along with the peer address;
+            // `ClientIdentityLayer` immediately re-stamps
+            // `ConnectInfo<SocketAddr>` from it, so `TrustedProxiesLayer` /
+            // `ClientAddr` resolution, SSE and wss streaming, rate limiting and
+            // shutdown wiring all behave exactly as on plain TCP. Only the
+            // rustls handshake inside the listener's `accept` differs.
             #[cfg(feature = "tls")]
             BoundListener::Tls(listener) => {
-                use axum::serve::ListenerExt as _;
-                let listener = listener.tap_io(|_io| {});
+                // Applied inside the connect-info layer (which
+                // `into_make_service_with_connect_info` installs outermost), so
+                // this sees `ConnectInfo<TlsConnectInfo>` and everything below
+                // it sees `ConnectInfo<SocketAddr>` plus the identity.
+                //
+                // The route-level mTLS requirement (#1640) is deliberately NOT
+                // applied here. It lives inside the router
+                // (`build_client_cert_requirement_layer`), so the MCP dispatch
+                // clone traverses it and a rejection flows through the rest of
+                // the response stack. Only the identity plumbing belongs at
+                // this boundary, because `ConnectInfo<TlsConnectInfo>` exists
+                // nowhere else.
+                let service =
+                    tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                        std::net::SocketAddr,
+                        crate::tls::TlsConnectInfo,
                     >(service);
                 tokio::spawn(async move {
                     axum::serve(listener, make_service)
@@ -5532,6 +5583,7 @@ impl AppBuilder {
                     .server
                     .prestop_grace_secs
                     .saturating_add(config.server.shutdown_timeout_secs),
+                &bound_endpoint,
             );
         }
 
@@ -9208,7 +9260,14 @@ fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, crate::tls::CertReloader), crate::tls::TlsError> {
+) -> Result<
+    (
+        crate::tls::TlsListener,
+        crate::tls::CertReloader,
+        Option<crate::tls::client_auth::ClientTrustReloader>,
+    ),
+    crate::tls::TlsError,
+> {
     let provider = crate::tls::crypto_provider();
     // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
     // static-cert mode (the only mode that reaches this function; ACME mode is
@@ -9233,15 +9292,62 @@ fn build_tls_listener(
         // A zero interval would busy-loop; clamp to at least one second.
         std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
     )?;
-    let server_config = crate::tls::build_server_config(
+    let (client_verifier, client_reload) = build_client_auth(cfg, &provider)?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver),
+        std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+        client_verifier,
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
     // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    Ok((listener, reload))
+    Ok((listener, reload, client_reload))
+}
+
+/// The mTLS wiring `build_client_auth` hands back: the verifier the listener
+/// enforces, and the reloader that rotates its trust store. Both `None` when
+/// client auth is off.
+#[cfg(feature = "tls")]
+type ClientAuthWiring = (
+    Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    Option<crate::tls::client_auth::ClientTrustReloader>,
+);
+
+/// Build the mTLS client-certificate verifier and its trust-store reloader from
+/// `[server.tls.client_auth]` (issue #1640).
+///
+/// `(None, None)` — the identical #1603 server-only path — whenever the section
+/// is absent or `mode = "off"`. Any problem with the bundle or CRL is returned
+/// so the caller fails fast at boot with the path in the message.
+#[cfg(feature = "tls")]
+fn build_client_auth(
+    cfg: &crate::config::TlsConfig,
+    provider: &std::sync::Arc<rustls::crypto::CryptoProvider>,
+) -> Result<ClientAuthWiring, crate::tls::TlsError> {
+    if !cfg.client_auth_active() {
+        return Ok((None, None));
+    }
+    // `client_auth_active()` is true only for a present section with a mode
+    // other than `off`, and `ClientAuthConfig::validate()` (run pre-bind)
+    // guarantees such a section names a bundle.
+    let client_auth = cfg
+        .client_auth
+        .as_ref()
+        .expect("validated: an active client_auth section is present");
+    let bundle = client_auth
+        .ca_bundle_path
+        .clone()
+        .expect("validated: an active client_auth section sets ca_bundle_path");
+    let (verifier, reloader) = crate::tls::client_auth::ClientTrustReloader::load(
+        bundle,
+        client_auth.crl_path.clone(),
+        client_auth.mode,
+        std::sync::Arc::clone(provider),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(client_auth.reload_interval_secs.max(1)),
+    )?;
+    Ok((Some(verifier), Some(reloader)))
 }
 
 /// Carries the ACME challenge-listener + renewal-task wiring from the bind path
@@ -9259,6 +9365,10 @@ struct AcmeBindState {
     /// The tenant custom-domain wiring (#1635), present exactly when
     /// `[server.tls.acme.custom_domains] enabled = true`.
     custom_domains: Option<CustomDomainBindState>,
+    /// The mTLS trust-store reloader (#1640), present exactly when
+    /// `[server.tls.client_auth]` is active. Spawned beside the ACME renewal
+    /// task, so a CA rotation lands without a restart on this arm too.
+    client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader>,
 }
 
 /// Everything the custom-domain orchestrator needs, built at bind time so the
@@ -9434,9 +9544,17 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    let server_config = crate::tls::build_server_config_with_resolver(
+    // Client auth is orthogonal to how the SERVER's certificate is provisioned
+    // (#1640), so the ACME arm wires the same verifier the static-cert arm does.
+    // Without this a `[server.tls.client_auth] mode = "required"` deployment on
+    // ACME would boot, report healthy, and never request a certificate — the
+    // one misconfiguration that fails OPEN.
+    let (client_verifier, client_reload) =
+        build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
         cert_resolver,
+        client_verifier,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9475,6 +9593,7 @@ async fn build_acme_tls_listener(
             https_port,
             dns01: acme_cfg.dns.is_some(),
             custom_domains,
+            client_trust_reload: client_reload,
         },
     ))
 }
@@ -9826,17 +9945,24 @@ async fn stamp_loopback_connect_info(
 /// middleware (the startup barrier, maintenance mode, rate limiting, or custom
 /// health paths, which an HTTP readiness probe would all have to thread).
 ///
-/// The file's contents are the app's *resolved* graceful-drain budget in seconds
+/// Line one is the app's *resolved* graceful-drain budget in seconds
 /// (`prestop_grace_secs + shutdown_timeout_secs`). The supervisor records this so
 /// `autumn serve stop` waits for the budget the app will actually drain for —
 /// even when a custom `with_config_loader` set it — instead of reconstructing it
 /// from TOML/env and risking a premature `SIGKILL`.
 ///
+/// Line two is where the app *actually* bound, as `<transport> <address>`. The
+/// supervisor cannot derive this: `server.port = 0` resolves in the kernel, a
+/// socket adopted from a predecessor keeps that process's port, and a custom
+/// `with_config_loader` can put the app anywhere. Reporting it is what lets
+/// `autumn serve --daemon` write an address-discovery file on Windows, where
+/// there is no Unix socket path to hand the app in advance.
+///
 /// Best-effort: a write failure only delays readiness detection until the
 /// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
 ///
 /// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
-fn signal_serve_ready(drain_budget_secs: u64) {
+fn signal_serve_ready(drain_budget_secs: u64, bound_endpoint: &str) {
     let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
         return;
     };
@@ -9850,13 +9976,62 @@ fn signal_serve_ready(drain_budget_secs: u64) {
     // contents. A plain `write` would make the path exist before the bytes land.
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
-    if let Err(e) = std::fs::write(&tmp, drain_budget_secs.to_string())
+    if let Err(e) = std::fs::write(&tmp, serve_ready_payload(drain_budget_secs, bound_endpoint))
         .and_then(|()| std::fs::rename(&tmp, &path))
     {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!(error = %e, path = %path.display(),
             "could not write serve readiness file");
     }
+}
+
+/// Turn a bound address into one a client can actually dial.
+///
+/// A wildcard bind is a *bind*, never a dial address — the same rule
+/// `[cluster] advertise_addr` already enforces, for the same reason: handing a
+/// peer `0.0.0.0` gives it something nothing can reach, and the failure then
+/// looks like a network fault rather than the address it is. The production
+/// smart default binds `0.0.0.0`, so without this a `--release` daemon publishes
+/// an undialable `serve.addr` while reporting a successful start.
+///
+/// Only the *host* is rewritten, to loopback of the matching family; the
+/// resolved port is what the supervisor could not have known and is preserved
+/// exactly. An address that is already specific passes through untouched, and so
+/// does one that will not parse — better to publish what we bound than to invent
+/// something.
+fn dialable_endpoint(addr: &str) -> String {
+    let Ok(parsed) = addr.parse::<std::net::SocketAddr>() else {
+        return addr.to_owned();
+    };
+    if !parsed.ip().is_unspecified() {
+        return addr.to_owned();
+    }
+    match parsed {
+        std::net::SocketAddr::V4(_) => format!("127.0.0.1:{}", parsed.port()),
+        std::net::SocketAddr::V6(_) => format!("[::1]:{}", parsed.port()),
+    }
+}
+
+/// The readiness file's contents: the drain budget, then the bound endpoint.
+///
+/// Two lines rather than one structured value so the first line stays exactly
+/// what it has always been — a bare integer — and the endpoint is additive. The
+/// endpoint is `<transport> <address>` split on the FIRST space only, so a Unix
+/// socket path containing spaces survives the round trip. An empty endpoint
+/// emits no second line at all, rather than a blank one a reader could mistake
+/// for an address.
+///
+/// Public because it *is* the wire format between the app and its supervisor:
+/// `autumn-cli`'s `parse_ready_payload` round-trips against this exact function,
+/// so the two cannot drift into disagreement the way two hand-written parsers
+/// would.
+#[must_use]
+pub fn serve_ready_payload(drain_budget_secs: u64, bound_endpoint: &str) -> String {
+    let endpoint = bound_endpoint.trim();
+    if endpoint.is_empty() {
+        return drain_budget_secs.to_string();
+    }
+    format!("{drain_budget_secs}\n{endpoint}")
 }
 
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
@@ -13522,7 +13697,50 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Received SIGTERM, starting graceful shutdown");
     };
 
-    #[cfg(not(unix))]
+    // Windows has no `SIGTERM`. What a supervisor, a service host, or the OS
+    // itself actually delivers is a console control event, and every one of them
+    // means the same thing `SIGTERM` means: this process is going away, drain
+    // now. Handling them is what makes a supervisor-stopped Windows server run
+    // its readiness flip, prestop grace, in-flight drain and `on_shutdown` hooks
+    // instead of dying mid-request (#1639).
+    //
+    // How much time each event actually buys differs, and the difference
+    // matters enough to be exact about:
+    //
+    // * `CTRL_C` and `CTRL_BREAK` do not terminate the process at all. The drain
+    //   runs to completion.
+    // * `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` are told-not-asked: the
+    //   OS-imposed budget is how long the *handler routine* may run, and tokio's
+    //   handler returns immediately (which is what lets this future wake), so
+    //   the drain then races process termination. It is best-effort, and on a
+    //   long budget it will lose.
+    //
+    // That is why a supervisor should stop an Autumn app through
+    // `autumn serve stop` or the Service Control Manager, both of which wait for
+    // the app's own recorded budget. `docs/guide/daemon.md` says so where an
+    // operator will read it. These arms are still worth having: they turn the
+    // common console cases into a real drain, and cost nothing in the rest.
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows;
+        let mut close = windows::ctrl_close().expect("Failed to install CTRL_CLOSE handler");
+        let mut logoff = windows::ctrl_logoff().expect("Failed to install CTRL_LOGOFF handler");
+        let mut shutdown =
+            windows::ctrl_shutdown().expect("Failed to install CTRL_SHUTDOWN handler");
+        let mut brk = windows::ctrl_break().expect("Failed to install CTRL_BREAK handler");
+        let event = tokio::select! {
+            _ = close.recv() => "CTRL_CLOSE",
+            _ = logoff.recv() => "CTRL_LOGOFF",
+            _ = shutdown.recv() => "CTRL_SHUTDOWN",
+            _ = brk.recv() => "CTRL_BREAK",
+        };
+        tracing::info!(
+            event,
+            "Received a console control event, starting graceful shutdown"
+        );
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     let canary_rollback = async {
@@ -14172,6 +14390,76 @@ mod tests {
             ..AppState::test_default()
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    // ── Serve readiness payload (#1639) ────────────────────────────────────
+    //
+    // The supervisor learns two things from this file: how long the app will
+    // drain for, and where it actually bound. The second is what lets
+    // `autumn serve --daemon` write an address-discovery file on a platform
+    // with no Unix socket to name in advance.
+
+    #[test]
+    fn a_wildcard_bind_is_published_as_a_dialable_loopback_address() {
+        // The production smart default binds `0.0.0.0`, and `local_addr()`
+        // faithfully reports it. Publishing that in `serve.addr` would hand a
+        // thin client an address nothing can dial while the start reported
+        // success — the same trap `[cluster] advertise_addr` already rejects.
+        assert_eq!(dialable_endpoint("0.0.0.0:3000"), "127.0.0.1:3000");
+        assert_eq!(dialable_endpoint("[::]:3000"), "[::1]:3000");
+    }
+
+    #[test]
+    fn a_specific_bind_is_published_exactly_as_bound() {
+        // Rewriting one would be worse than the bug: the supervisor would
+        // advertise an interface the app is not on.
+        assert_eq!(dialable_endpoint("192.168.1.10:3000"), "192.168.1.10:3000");
+        assert_eq!(dialable_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(dialable_endpoint("[::1]:8080"), "[::1]:8080");
+    }
+
+    #[test]
+    fn the_resolved_port_survives_the_rewrite() {
+        // The port is the half the supervisor could not have known — `port = 0`
+        // resolves in the kernel — so losing it would defeat the whole report.
+        assert_eq!(dialable_endpoint("0.0.0.0:49152"), "127.0.0.1:49152");
+    }
+
+    #[test]
+    fn an_unparseable_address_is_published_unchanged() {
+        // Better to publish what was bound than to invent something.
+        assert_eq!(dialable_endpoint("not-an-address"), "not-an-address");
+    }
+
+    #[test]
+    fn serve_ready_payload_leads_with_the_drain_budget() {
+        // Line one stays a bare integer so a supervisor that predates the
+        // address line still reads the budget it always read.
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().next(), Some("35"));
+    }
+
+    #[test]
+    fn serve_ready_payload_carries_the_bound_endpoint_on_line_two() {
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().nth(1), Some("tcp 127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn serve_ready_payload_survives_a_socket_path_containing_spaces() {
+        // A Unix socket under a directory with a space is legal, so the format
+        // has to split on the FIRST separator only, never on every one.
+        let payload = serve_ready_payload(1, "unix /home/a b/serve.sock");
+        let line = payload.lines().nth(1).expect("endpoint line");
+        assert_eq!(line.split_once(' '), Some(("unix", "/home/a b/serve.sock")));
+    }
+
+    #[test]
+    fn serve_ready_payload_never_emits_a_bare_newline_for_an_unknown_endpoint() {
+        // An empty endpoint must not leave a blank second line a reader could
+        // mistake for an address.
+        let payload = serve_ready_payload(7, "");
+        assert_eq!(payload.lines().count(), 1, "{payload:?}");
     }
 
     // ── Cooperative external shutdown (#1616) ──────────────────────────────
