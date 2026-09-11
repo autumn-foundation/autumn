@@ -438,28 +438,43 @@ without also filling in the intake form above.
   way. **This worker-refresh mechanism is now the primary candidate**;
   neither it nor a discrete clock step is confirmed.
 - **Test-vs-product**: not yet rendered, under either candidate mechanism.
-  The store's actual lazy-expiry behavior (a request-path read filtering
-  on `expires_at > now`, e.g. `autumn/src/job_tracking.rs:1899`) uses the
-  *same* `self.clock.now()` on both the write and the read side inside the
-  application — it never compares against Postgres's own `NOW()` the way
-  this test independently does, so the specific *cross-process* framing
-  this entry originally proposed would have been a test-only artifact.
-  **Correction (post-review, via a third Codex review comment on PR
-  #2711): the demoted discrete-clock-step scenario is not test-only.**
-  `PgJobTrackingStore::update`'s own read (`autumn/src/job_tracking.rs:
-  1896-1902`) does `WHERE expires_at > $2` against `self.clock.now()` — a
-  plain wall-clock `DateTime<Utc>` comparison, and `autumn/src/time.rs:
-  105-108` documents exactly this gap: `MonotonicInstant` is guaranteed
-  monotonic even across a backward NTP jump, but "comparing wall-clock
-  timestamps has no such guarantee." A backward host clock step between a
-  write and a later read would extend a tracked job's effective TTL in
-  production, not just in this test — a real, if rare, product-relevant
+  **Correction (post-review, via a fourth Codex review comment on PR
+  #2711): "production never compares against Postgres's own `NOW()`" was
+  flatly wrong — a separate production code path does exactly that,
+  deliberately.** `pg_cleanup_expired_tracking_rows`
+  (`autumn/src/job.rs:9333-9358`), run periodically off a
+  `tracking_cleanup_interval.tick()`, executes `DELETE FROM
+  autumn_job_tracking WHERE expires_at <= NOW()` — the same cross-process
+  shape (an app-clock-stamped `expires_at` against Postgres's own `NOW()`)
+  this test's assertion uses, and the codebase's own test comments
+  (`autumn/src/job.rs:16704-16707`) already document the choice
+  explicitly. So this test doesn't invent a comparison production never
+  makes; it re-derives one production already makes elsewhere. What
+  distinguishes the two: the cleanup sweep's interval is presumably
+  minutes-scale in a real deployment, so ordinary clock disagreement is
+  immaterial to it, whereas this test's ~200ms margin makes it far more
+  exposed to the same comparison shape.
+
+  The *read* path this test also exercises
+  (`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`)
+  is different in kind: it does `WHERE expires_at > $2` against
+  `self.clock.now()` — same-clock, unlike the cleanup sweep — so only a
+  genuine clock *step*, not cross-process skew, could make that
+  particular path misbehave. `autumn/src/time.rs:105-108` documents
+  exactly this gap: `MonotonicInstant` is guaranteed monotonic even across
+  a backward NTP jump, but "comparing wall-clock timestamps has no such
+  guarantee." A backward host clock step between a write and a later read
+  would extend a tracked job's effective TTL in production via this path
+  too, not just in this test — a real, if rare, product-relevant
   characteristic of using wall-clock timestamps for TTL comparisons, not
-  dismissible as a test artifact. This does not mean the observed failure
-  *was* a clock step — the worker-refresh mechanism above remains the
-  better-supported explanation for this specific incident — only that the
-  scenario's test-vs-product classification was wrong as originally
-  written. Refreshing `expires_at` on `mark_running`/`settle_success` (the
+  dismissible as a test artifact. None of this means the observed failure
+  *was* a clock step or a cleanup-sweep-style race — the worker-refresh
+  mechanism above remains the better-supported explanation for this
+  specific incident — only that the scenario's test-vs-product
+  classification was wrong as originally written, twice over: once for
+  treating the cross-process comparison itself as production-absent, and
+  once for treating even a clock step as test-only. Refreshing
+  `expires_at` on `mark_running`/`settle_success` (the
   worker-refresh hypothesis) is deliberate, sensible production behavior
   in its own right — a job still being worked on should not expire out
   from under it — so if that mechanism is the one actually firing here,

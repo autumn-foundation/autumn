@@ -34,7 +34,17 @@ movement, while the investigation it exists to verify has had a fix land
 Sampled the ~23h since the 2026-09-10 follow-up's cutoff
 (2026-09-10T10:30:30Z–2026-09-11T09:09:24Z): 100 `pull_request`-triggered
 `ci.yml` runs, 61 cancelled (superseded pushes, not a health signal), 25
-success, **14 failure**. Triaged each by job/log inspection:
+success, **14 failure**. **Correction (post-review, via a fifth Codex
+review comment on PR #2711): this window silently left a 42-minute gap.**
+The 2026-09-10 report's own recorded cutoff was `2026-09-10T09:48:19Z`,
+not `10:30:30Z` — checked directly against that report rather than
+re-typed from memory. Queried the gap itself
+(`2026-09-10T09:48:19Z`–`10:30:30Z`): 9 `pull_request`-triggered `ci.yml`
+runs, **all 9 cancelled** (superseded pushes on two WIP branches), zero
+successes and zero failures. The gap doesn't change the 14-failure tally
+or any conclusion below, but it should have been queried and stated
+rather than silently skipped. Triaged each of the 14 by job/log
+inspection:
 
 - **10 are ordinary WIP-branch `Clippy` failures**, not CI health issues:
   8 on a single branch (`claude/upbeat-allen-qn9aoo`, runs between
@@ -142,15 +152,26 @@ notes the Redis sibling test also permits in principle, though no organic
 hit has been observed there — that clean history doesn't help isolate
 this hypothesis either way.
 
-The production code path this test is meant to verify never makes the
-*cross-process* comparison the original hypothesis described (the test
-queries Postgres's `NOW()` directly; production never does) — that specific
-framing would have been a test-only artifact. **Correction (post-review,
-via a third Codex review comment on PR #2711): the demoted clock-step
-scenario is not test-only.** Production's own read path
+**Correction (post-review, via a fourth Codex review comment on PR #2711):
+"production never makes the cross-process comparison" was flatly wrong —
+a separate production code path makes exactly that comparison,
+deliberately.** `pg_cleanup_expired_tracking_rows`
+(`autumn/src/job.rs:9333-9358`), run periodically off a
+`tracking_cleanup_interval.tick()`, executes `DELETE FROM
+autumn_job_tracking WHERE expires_at <= NOW()` — Postgres's own `NOW()`
+against an `expires_at` stamped by the app's `SystemClock`, the same
+cross-process shape this test's assertion uses. The codebase's own test
+comments (`autumn/src/job.rs:16704-16707`) already document this choice
+explicitly ("`pg_cleanup_expired_tracking_rows` compares against
+Postgres's real `NOW()`"), so it is deliberate design, not an oversight —
+this test independently re-derives a comparison the product already makes
+elsewhere, it doesn't invent a comparison production never makes. The
+distinction that still holds: the *read* path this test also exercises
 (`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`) does
-`WHERE expires_at > $2` against `self.clock.now()` — a plain wall-clock
-`DateTime<Utc>` comparison with the same lack of monotonicity guarantee
+`WHERE expires_at > $2` against `self.clock.now()` — same-clock, unlike the
+cleanup sweep — so only a genuine clock *step* (not cross-process skew)
+would make that specific read path misbehave, per the same lack of
+monotonicity guarantee
 `autumn/src/time.rs:105-108` documents for wall-clock comparisons generally
 ("a wall-clock/NTP jump ... can never make an elapsed duration negative or
 absurd [via `MonotonicInstant`]. Comparing wall-clock timestamps has no
