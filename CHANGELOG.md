@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
+  README.md's `## Example` and the four `rust,no_run` snippets in
+  `docs/guide/getting-started.md` (a CSRF form handler plus three
+  runtime-tuning examples) — the "first run" journey's flagship, most-copied
+  code — were never actually compiled by anything;
+  `scripts/check-docs-macro-args.sh` already named this gap directly ("the
+  markdown fences are not compiled by anything at all"). A fence can drift
+  out from under a signature change the same way the CLI scaffold template
+  drifted from `inject_consent_banner`'s widened `Option<&str>` parameter
+  (#2459, #2620) — silent to every existing docs-corpus gate, which check
+  that a name *resolves*, not that the call still typechecks. A new
+  `doc_getting_started_snippets_compile` test
+  (`autumn/tests/integration/compile_fail.rs`) extracts every
+  `rust,no_run` fence from those two files into a throwaway crate and
+  runs `cargo check` on it — real compilation against the in-tree crate,
+  with no server binary ever executed; a new tagged fence is picked up
+  automatically, no test edit required. All 5 fences currently in scope
+  compile clean — this is a harness, not a fix, so there is nothing else to
+  report.
 - **autumn-media: room participants can hold a seat with a heartbeat (#1974):**
   `POST /api/media/rooms/{room_id}/heartbeat` refreshes a participant's liveness
   and renews its advisory `token_expires_at` to `now + room_token_ttl_seconds`.
@@ -341,6 +360,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
   the module's own "same syntax WordPress does" claim, and still suppresses
   expansion of the inner shortcode (#2678).
+- **auth:** `api_token_error_response` now renders through the canonical
+  problem classification — the rendered status/problem type (including the
+  query-timeout reclassification) and the validation field map — instead of
+  rebuilding the body from `status()` alone. A `query_timeout` from an
+  `ApiTokenStore` previously rendered as `autumn.service_unavailable` and a
+  validation failure as `autumn.unprocessable_entity` with an empty `errors`
+  array; both now agree with `AutumnError::code()` and the standard response,
+  and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
+  exception filters. Server-error `detail` is redacted in the body (the
+  store's message remains in `AutumnErrorInfo.message` for logging and
+  filters), matching the production exception-filter render (issue #2635).
 - **docs:** `strict_config` and a plugin-owned `[media]` table are no longer
   documented as mutually exclusive (#1974). The deployment guide still carried
   the pre-#2061/#2063 workaround telling operators to turn `strict_config` off.
@@ -550,6 +580,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Removed dead `autumn/templates/build.rs.template` (#2694):** an
+  unreferenced leftover from before the Tailwind build script moved to
+  `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
+  actually scaffolds via `include_str!`). Zero code references anywhere in
+  the tree — only historical sprint docs and old CHANGELOG entries mention
+  it. This covers the dead-code sub-item of #2694; the clone-class merge
+  across the nine example `build.rs` copies still needs a human call per
+  that issue. Note: `autumn/templates/static/` also appears unreferenced and
+  was left in place — flagging for a separate decision.
+- **SQLite decimal `CHECK` now enforces canonical form (#2636):** the
+  generated `CHECK` for `decimal{p,s}` `TEXT` columns on SQLite enforced the
+  text *shape* (digit budgets, one decimal literal) but not its
+  canonicality, so text written outside the wrapper — raw SQL, an import, a
+  hand-written migration — passed the constraint while being a spelling
+  `SqliteDecimal::to_sql` (`Decimal::normalize`) would never produce.
+  `INSERT INTO invoices (price) VALUES ('19.90')` succeeded, and the row was
+  then invisible to the equality lookup a generated `find_by_price` issues
+  for `'19.9'`; a `:unique` index would admit both spellings as distinct
+  while Rust equality says they are the same value. Three conditions added to
+  `sqlite_decimal_check` in `autumn-cli/src/generate/schema_edit.rs`: the
+  integer part is a lone `0` or starts `1`-`9` (rejects `007.5`, `0019`, and
+  the missing integer part in `.5`), a fractional part never ends in `0` and
+  a bare trailing `.` is rejected (`19.90`, `0.10`, `19.00` → `19`), and
+  negative zero is rejected (`-0`; `Decimal::normalize` converts -0 to 0, so
+  the wrapper never writes it). The existing
+  `sqlite_decimal_check_enforces_precision_scale_and_shape` test gains the
+  issue's reproduction matrix plus adversarial spellings. Note: this makes
+  the constraint stricter and interacts with #2598 — a table created or
+  rebuilt by `autumn schema diff` carries no `CHECK` at all today, and that
+  path should emit the same constraint when it lands.
+- **SSG/ISR:** the `Content-Type` equivalence check now decodes quoted-pairs
+  inside quoted MIME parameter values (RFC 9110 §5.6.4), so `boundary="a\b"`
+  and `boundary="ab"` compare equal. Previously a layer or proxy that merely
+  reserialized the header between `autumn build` and ISR regeneration —
+  changing `"a\b"` to `"ab"` or vice versa — made `regenerate_page` refuse
+  every refresh for that route (with an `error!` each cooldown) even though
+  the two spellings mean the same value (issue #2404).
+
 ### Security
 
 - **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
@@ -652,6 +720,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
 ### Performance
+
+- **🗃️ Ledger: `autumn generate admin`'s bulk delete is now batched
+  generator-wide (statements N→1, buffers -41.5%):** three of this
+  framework's own bundled admin models (`TokenAdminModel`,
+  `FeatureFlagAdminModel`, `ExperimentAdminModel`) already got hand-written
+  `execute_action` overrides in prior Ledger PRs to close the
+  `AdminModel::execute_action` trait default's `for id in ids { self.delete(&pool,
+  id).await?; }` per-id loop — but every app's own `autumn generate admin`
+  output never got the same override, since the generator template
+  (`autumn-cli/src/generate/admin.rs`, `render_admin_file`) never emitted
+  one. Every generated admin panel's "Delete selected" bulk action therefore
+  cost one `DELETE ... WHERE id = $1` round trip per selected row, not per
+  click. The generator now also emits an `execute_action` override batching
+  the `"delete"` action into one `DELETE ... WHERE id = ANY($1)`, and
+  returns the number of rows actually removed rather than `ids.len()` — a
+  missing or duplicate id is now a safe no-op instead of aborting the whole
+  batch part-way through with `AdminError::NotFound` (the trait-default
+  loop's undocumented, order-dependent behavior; no existing test pinned
+  it). `autumn-admin-plugin` also now re-exports the shared
+  `dispatch_restore_purge_or_unhandled` helper so generated code can reach
+  the same restore/purge/unhandled-action fallback the framework's own
+  hand-written overrides use. Profiled end-to-end against a real generated
+  project (`autumn new` → `generate scaffold` → `generate admin`) driving a
+  50,000-row table through a 2,000-id bulk delete: `pg_stat_statements`
+  calls 2,000 → 1, buffers 9,683 → 5,667. Existing `generate admin`
+  generator tests and the full `autumn-admin-plugin` Docker suite pass
+  unchanged. See
+  `docs/reports/2026-09-10-ledger-admin-generator-bulk-delete-batch/`.
 
 - **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
   (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade

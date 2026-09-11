@@ -705,11 +705,14 @@ pub trait AdminModel: Send + Sync + 'static {
     }
 }
 
-/// Dispatch the built-in `"restore"`/`"purge"` bulk actions (and the
-/// fallback error for anything else). Shared by `AdminModel::execute_action`'s
-/// default and by models that override it to special-case `"delete"` with a
-/// batched query — see `TokenAdminModel` and `FeatureFlagAdminModel` — so
-/// that fallthrough behaves identically without copying the loop.
+/// Dispatch the built-in `"restore"`/`"purge"` bulk actions and the fallback
+/// error for anything else.
+///
+/// Shared by `AdminModel::execute_action`'s default and by models (or
+/// generated `#[model]` admin adapters) that override it to special-case
+/// `"delete"` with a batched query — see `TokenAdminModel` and
+/// `FeatureFlagAdminModel` — so that fallthrough behaves identically without
+/// copying the loop.
 pub fn dispatch_restore_purge_or_unhandled<'a>(
     model: &'a (impl AdminModel + ?Sized),
     pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,

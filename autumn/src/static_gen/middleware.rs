@@ -4,6 +4,7 @@
 //! pre-rendered HTML files from the `dist/` directory if they exist. It acts as a
 //! lightning-fast cache layer in front of your dynamic routes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -501,8 +502,8 @@ fn build_isr_state(manifest: &StaticManifest) -> HashMap<String, IsrRouteState> 
 /// desync this check exists to prevent. `charset` is the one exception: RFC 2046
 /// §4.1.2 defines its values as case-insensitive.
 ///
-/// Quoted values are unquoted so `boundary="x"` and `boundary=x` agree, and `;`
-/// inside quotes does not split a parameter.
+/// Quoted values are unquoted (decoding quoted-pairs, so `boundary="a\b"` and
+/// `boundary=ab` agree), and `;` inside quotes does not split a parameter.
 fn content_type_equivalent(a: &str, b: &str) -> bool {
     normalize_content_type(a) == normalize_content_type(b)
 }
@@ -529,9 +530,46 @@ fn split_unquoted_semicolons(value: &str) -> Vec<&str> {
     parts
 }
 
+/// Decode quoted-pairs inside a quoted MIME parameter value (RFC 9110 §5.6.4).
+///
+/// Inside a quoted-string, `\` followed by any character denotes that
+/// character alone, so `boundary="a\b"` and `boundary="ab"` are the *same*
+/// value. Decoding here keeps the normalizer from letting the escape
+/// backslash make two spellings of one value compare unequal — an ISR
+/// freeze on a route whose header was merely reserialized between
+/// `autumn build` and regeneration.
+///
+/// Only quoted values are touched; an unquoted value is returned as-is so a
+/// backslash that is genuinely part of a token never gets rewritten. A lone
+/// trailing `\` escapes nothing and is dropped; it must neither panic nor
+/// discard the rest of the value.
+fn decode_quoted_pairs(raw_value: &str) -> Cow<'_, str> {
+    let Some(inner) = raw_value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+    else {
+        return Cow::Borrowed(raw_value);
+    };
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
+    }
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                decoded.push(escaped);
+            }
+        } else {
+            decoded.push(c);
+        }
+    }
+    Cow::Owned(decoded)
+}
+
 /// Canonical form of a `Content-Type` for comparison: the lowercased media type
 /// followed by its parameters as sorted `name=value` pairs, names lowercased and
-/// values left alone (see [`content_type_equivalent`]).
+/// values left alone apart from unquoting (see [`content_type_equivalent`]).
 fn normalize_content_type(value: &str) -> Vec<String> {
     let mut segments = split_unquoted_semicolons(value).into_iter();
     let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
@@ -551,10 +589,9 @@ fn normalize_content_type(value: &str) -> Vec<String> {
             };
             let name = name.trim().to_ascii_lowercase();
             let raw_value = raw_value.trim();
-            let unquoted = raw_value
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(raw_value);
+            // Unquote quoted values, decoding quoted-pairs so e.g.
+            // `boundary="a\b"` and `boundary="ab"` normalize the same.
+            let unquoted = decode_quoted_pairs(raw_value);
             if name == "charset" {
                 format!("{name}={}", unquoted.to_ascii_lowercase())
             } else {
@@ -1278,6 +1315,41 @@ mod tests {
         // A malformed segment with no `=` has no value to protect, so it *is*
         // case-folded — the branch the quoted cases above must not reach.
         assert!(content_type_equivalent("text/html; FOO", "text/html; foo"));
+    }
+
+    /// Quoted-pairs decode when a parameter value is unquoted (RFC 9110 §5.6.4),
+    /// so a header that merely gets reserialized — `boundary="a\b"` becoming
+    /// `boundary="ab"` — between `autumn build` and ISR regeneration does not
+    /// make `regenerate_page` refuse the refresh. The decoder only removes
+    /// escape backslashes: it must not fold case or interior spacing, which
+    /// `content_type_equivalent_preserves_parameter_value_case_and_spacing`
+    /// covers.
+    #[test]
+    fn content_type_equivalent_decodes_quoted_pairs_in_parameter_values() {
+        // `\"` and `\b` inside quotes denote the character alone, so `"a\b"`
+        // is the same value as `ab`.
+        assert!(content_type_equivalent(
+            r#"multipart/mixed; boundary="a\b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // An escaped quote is really a quote: it must not make the value
+        // compare equal to one without it.
+        assert!(!content_type_equivalent(
+            r#"multipart/mixed; boundary="a\"b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // An escaped backslash is a literal backslash, so `boundary="a\\b"` is
+        // the value `a\b`, not `ab`.
+        assert!(!content_type_equivalent(
+            r#"multipart/mixed; boundary="a\\b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // A trailing lone `\` escapes nothing: it is dropped without panicking
+        // and without discarding the rest of the value.
+        assert!(content_type_equivalent(
+            r#"multipart/mixed; boundary="abc\""#,
+            "multipart/mixed; boundary=abc"
+        ));
     }
 
     /// A manifest whose recorded type the serve path refuses to honour must not

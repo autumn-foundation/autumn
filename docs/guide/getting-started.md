@@ -1402,6 +1402,11 @@ async fn index() -> &'static str { "ok" }
 
 #[autumn_web::main]
 async fn main() {
+    // A generated app has no direct `axum` dependency (`autumn-web` pulls it
+    // in transitively) — go through `autumn_web::reexports::axum` rather
+    // than adding one just to spell this.
+    use autumn_web::reexports::axum;
+
     let graphql = axum::Router::<AppState>::new()
         .route("/graphql", axum::routing::get(|| async { "graphql endpoint" }));
 
