@@ -24,6 +24,12 @@ pub struct NewItem {
     pub name: String,
     /// Price in cents. Required.
     pub price_cents: u32,
+    /// Idempotency key. Required by the service — and dropped from the body
+    /// when it is empty, which is what makes it the one field a call site has
+    /// to set for itself. A `..rest` initializer would leave it empty, the
+    /// body would go out without it, and the service would reject the request.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
     /// Optional note. Absent from a request body is fine.
     #[serde(default)]
     pub note: Option<String>,

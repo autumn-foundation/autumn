@@ -1,0 +1,5 @@
+error: #[derive(WireShape)] refuses `#[serde(transparent)]`: the type serializes as its one field's value, so there is no object on the wire to describe
+ --> tests/compile-fail/wire_shape_rejects_transparent.rs:7:12
+  |
+7 | pub struct Token {
+  |            ^^^^^

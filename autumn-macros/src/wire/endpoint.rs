@@ -67,19 +67,30 @@ impl syn::parse::Parse for Args {
                 "#[endpoint] needs a service name: #[endpoint(service = \"catalog\")]",
             )
         })?;
-        // Both reach a descriptor's file name, so anything outside this set
-        // could steer the write out of the contract directory.
-        for (label, value) in [("service", Some(&service)), ("name", name.as_ref())] {
-            let Some(value) = value else { continue };
-            if value.is_empty() || !value.chars().all(is_name_char) {
-                return Err(syn::Error::new(
-                    Span::call_site(),
-                    format!(
-                        "#[endpoint] {label} must be a non-empty name of letters, digits, `_` \
-                         or `-`, and is `{value}`"
-                    ),
-                ));
-            }
+        // A service name reaches a descriptor's file name, so anything outside
+        // this set could steer the write out of the contract directory.
+        if service.is_empty() || !service.chars().all(is_name_char) {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                format!(
+                    "#[endpoint] service must be a non-empty name of letters, digits, `_` or \
+                     `-`, and is `{service}`"
+                ),
+            ));
+        }
+        // An endpoint name reaches the file name too, AND becomes the marker
+        // type's identifier — so it has to be identifier-shaped, not merely
+        // file-safe. A `-` or a leading digit would otherwise panic the macro.
+        if let Some(name) = &name
+            && !is_identifier(name)
+        {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                format!(
+                    "#[endpoint] name must be a Rust identifier — it becomes the `{name}_endpoint` \
+                     marker type — and is `{name}`"
+                ),
+            ));
         }
         Ok(Self { service, name })
     }
@@ -89,6 +100,15 @@ impl syn::parse::Parse for Args {
 /// a file name on every platform the workspace builds on.
 const fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+/// Whether `name` can be used as a Rust identifier.
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub fn endpoint_macro(attr: TokenStream, item: &TokenStream) -> TokenStream {
@@ -180,13 +200,19 @@ fn route_of(func: &ItemFn) -> Result<(String, String), syn::Error> {
         else {
             continue;
         };
-        let path: LitStr = attr.parse_args_with(|input: syn::parse::ParseStream<'_>| {
-            let lit: LitStr = input.parse()?;
-            // A route attribute carries more than a path (`seo(...)`, and so
-            // on). Only the first literal is wanted here.
-            input.parse::<TokenStream>()?;
-            Ok(lit)
-        })?;
+        // `#[cfg_attr(predicate, get("/items"))]` is a supported spelling
+        // elsewhere, and its own argument list starts with the predicate — so
+        // the route's tokens are nested one level down, not where a bare
+        // `#[get(...)]` keeps them.
+        let route_tokens = if attr.path().is_ident("cfg_attr") {
+            let Some(tokens) = nested_route_tokens(attr) else {
+                continue;
+            };
+            tokens
+        } else {
+            attr.parse_args_with(|input: syn::parse::ParseStream<'_>| input.parse::<TokenStream>())?
+        };
+        let path = syn::parse2::<RoutePath>(route_tokens)?.0;
         return Ok(((*method).to_owned(), path.value()));
     }
     Err(syn::Error::new_spanned(
@@ -195,6 +221,39 @@ fn route_of(func: &ItemFn) -> Result<(String, String), syn::Error> {
          `#[put]`, `#[patch]`, `#[delete]`): it reads the method and path from it, and \
          the handler's signature before the route macro rewrites it",
     ))
+}
+
+/// A route attribute's own argument list: a path literal, then anything else.
+struct RoutePath(LitStr);
+
+impl syn::parse::Parse for RoutePath {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let path: LitStr = input.parse()?;
+        // A route attribute carries more than a path (`seo(...)`, and so on).
+        // Only the first literal is wanted here.
+        input.parse::<TokenStream>()?;
+        Ok(Self(path))
+    }
+}
+
+/// The route attribute's own tokens from inside a `#[cfg_attr(pred, route(…))]`.
+fn nested_route_tokens(attr: &syn::Attribute) -> Option<TokenStream> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let nested = list
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .ok()?;
+    nested.into_iter().find_map(|meta| match meta {
+        syn::Meta::List(inner)
+            if ROUTE_ATTRS
+                .iter()
+                .any(|(name, _)| inner.path.is_ident(name)) =>
+        {
+            Some(inner.tokens)
+        }
+        _ => None,
+    })
 }
 
 /// Write this endpoint's JSON descriptor, if a contract directory resolves.
@@ -344,13 +403,36 @@ mod tests {
         }
     }
 
+    /// The name becomes a Rust identifier, so anything else would panic the
+    /// macro rather than produce a diagnostic.
     #[test]
-    fn an_endpoint_name_that_could_steer_a_file_write_is_refused() {
+    fn an_endpoint_name_that_is_not_an_identifier_is_refused() {
+        for bad in ["../oops", "get-item", "2fast", "", "get item"] {
+            let out = expand_str(
+                &format!("service = \"catalog\", name = \"{bad}\""),
+                "#[get(\"/items\")] async fn get_item() -> Json<Item> { todo!() }",
+            );
+            assert!(
+                out.contains("must be a Rust identifier"),
+                "`{bad}` must be refused: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_attribute_behind_cfg_attr_still_yields_its_method_and_path() {
         let out = expand_str(
-            "service = \"catalog\", name = \"../oops\"",
-            "#[get(\"/items\")] async fn get_item() -> Json<Item> { todo!() }",
+            "service = \"catalog\"",
+            "#[cfg_attr(feature = \"x\", get(\"/items/{id}\"))] async fn get_item(id: Path<String>) -> Json<Item> { todo!() }",
         );
-        assert!(out.contains("must be a non-empty name"), "{out}");
+        assert!(
+            out.contains("const METHOD : & 'static str = \"GET\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("const PATH : & 'static str = \"/items/{id}\""),
+            "{out}"
+        );
     }
 
     #[test]

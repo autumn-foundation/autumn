@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One field of a request or response type, as serde treats it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireFieldDescriptor {
     /// The field's Rust identifier — what a call site writes.
     pub rust_name: String,
@@ -28,6 +28,12 @@ pub struct WireFieldDescriptor {
     /// For a request: the callee rejects a body that omits it. For a response:
     /// the callee always produces it, so a caller may read it unconditionally.
     pub required: bool,
+    /// Extra keys `#[serde(alias = "…")]` also accepts, deserialize side only.
+    ///
+    /// Carried so a later version diff reads a rename-plus-alias — the standard
+    /// non-breaking field rename — as the compatible change it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// The serde-visible shape of one request or response type.
@@ -39,6 +45,12 @@ pub struct WireTypeDescriptor {
     pub serialized: Vec<WireFieldDescriptor>,
     /// Fields this type accepts off the wire when deserialized.
     pub deserialized: Vec<WireFieldDescriptor>,
+    /// Whether `#[serde(deny_unknown_fields)]` closes the object.
+    ///
+    /// Adding it is a breaking change across a deploy window — an older
+    /// caller's extra key starts being rejected — so the artifact records it.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 impl WireTypeDescriptor {

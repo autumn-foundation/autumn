@@ -89,6 +89,37 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         }
     };
 
+    // A container attribute that replaces or reshapes the object makes every
+    // field row below a fiction. The module's rule is to refuse what it cannot
+    // read rather than guess, and these cannot be read off the struct at all.
+    if let Some(word) = schema::serde_bare_word(&input.attrs, &["transparent"]) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "#[derive(WireShape)] refuses `#[serde({word})]`: the type serializes as its one \
+                 field's value, so there is no object on the wire to describe"
+            ),
+        ));
+    }
+    if let Some(key) = schema::serde_valued_key(&input.attrs, &["into", "from", "try_from"]) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "#[derive(WireShape)] refuses `#[serde({key} = …)]`: the wire shape is the other \
+                 type's, and this struct's fields are not on the wire"
+            ),
+        ));
+    }
+    if let Some(key) = schema::serde_valued_key(&input.attrs, &["tag"]) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "#[derive(WireShape)] refuses `#[serde({key} = …)]` on a struct: it adds a tag key \
+                 to the wire that is not a field of this type"
+            ),
+        ));
+    }
+
     for key in ["rename", "rename_all"] {
         if schema::serde_split_rename(&input.attrs, key).is_some() {
             return Err(syn::Error::new_spanned(
@@ -104,11 +135,13 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
 
     let rename_all = schema::serde_rename_all_serialize_rule(&input.attrs);
     let container_default = schema::has_serde_default(&input.attrs);
+    let closed = schema::serde_bare_word(&input.attrs, &["deny_unknown_fields"]).is_some();
     let Some(named) = named else {
         return Ok(WireTypeDescriptor {
             name: input.ident.to_string(),
             serialized: Vec::new(),
             deserialized: Vec::new(),
+            closed,
         });
     };
     let (serialized, deserialized) = directions(named, rename_all.as_deref(), container_default)?;
@@ -116,6 +149,7 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         name: input.ident.to_string(),
         serialized: serialized.fields,
         deserialized: deserialized.fields,
+        closed,
     })
 }
 
@@ -129,6 +163,21 @@ fn directions(
     let mut deserialized = Vec::new();
 
     for field in &named.named {
+        // `skip` first: `#[serde(skip, flatten)]` is a plain skip to serde —
+        // the field is on neither wire — so there is nothing to refuse.
+        // Asked one word at a time on purpose: `schema::serde_bare_word`
+        // returns only the LAST word it matched, so asking it for both at once
+        // cannot tell "one of them" from "both" — and both together is exactly
+        // `skip`, a field on neither wire.
+        let skip_serializing =
+            schema::serde_bare_word(&field.attrs, &["skip_serializing"]).is_some();
+        let skip_deserializing =
+            schema::serde_bare_word(&field.attrs, &["skip_deserializing"]).is_some();
+        if schema::serde_bare_word(&field.attrs, &["skip"]).is_some()
+            || (skip_serializing && skip_deserializing)
+        {
+            continue;
+        }
         if schema::serde_bare_word(&field.attrs, &["flatten"]).is_some() {
             return Err(syn::Error::new_spanned(
                 field,
@@ -143,9 +192,6 @@ fn directions(
                  deserialize = …))]`: the two directions carry different wire names",
             ));
         }
-        if schema::serde_bare_word(&field.attrs, &["skip"]).is_some() {
-            continue;
-        }
         let Some(rust_name) = field.ident.as_ref().map(ToString::to_string) else {
             continue;
         };
@@ -157,10 +203,17 @@ fn directions(
             continue;
         };
         let ty = render_type(&field.ty);
-        let directional = schema::variant_directional_skip_on_field(field);
         let optional = schema::is_option_type(&field.ty);
+        let defaulted = container_default || schema::has_serde_default(&field.attrs);
+        // `#[serde(with)]` / `#[serde(deserialize_with)]` replace the whole
+        // field deserializer, and serde's generated code then returns
+        // `missing_field` for an absent key instead of the `Option` shortcut.
+        // So the key is mandatory even on an `Option<T>`, unless a default
+        // fills it in.
+        let custom_de =
+            schema::serde_valued_key(&field.attrs, &["with", "deserialize_with"]).is_some();
 
-        if directional != Some("skip_serializing") {
+        if !skip_serializing {
             serialized.push(WireFieldDescriptor {
                 rust_name: rust_name.clone(),
                 wire_name: wire_name.clone(),
@@ -168,18 +221,19 @@ fn directions(
                 // A conditionally-skipped field may be absent from a response,
                 // so a caller cannot count on it arriving.
                 required: !schema::field_has_skip_serializing_if(field),
+                aliases: Vec::new(),
             });
         }
-        if directional != Some("skip_deserializing") {
+        if !skip_deserializing {
             deserialized.push(WireFieldDescriptor {
                 rust_name,
                 wire_name,
                 ty,
                 // `Option<T>`, a field default, or a container default each
-                // let the key be absent from a request body.
-                required: !optional
-                    && !container_default
-                    && !schema::has_serde_default(&field.attrs),
+                // let the key be absent from a request body — but a custom
+                // deserializer takes the `Option` shortcut away.
+                required: !defaulted && (custom_de || !optional),
+                aliases: serde_aliases(field),
             });
         }
     }
@@ -190,6 +244,30 @@ fn directions(
             fields: deserialized,
         },
     ))
+}
+
+/// Every `#[serde(alias = "…")]` on a field, in source order.
+fn serde_aliases(field: &syn::Field) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("alias") {
+                if let Ok(value) = meta.value()
+                    && let Ok(syn::Lit::Str(lit)) = value.parse::<syn::Lit>()
+                {
+                    aliases.push(lit.value());
+                }
+            } else if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: proc_macro2::TokenStream = content.parse()?;
+            }
+            Ok(())
+        });
+    }
+    aliases
 }
 
 /// A field's type as written, normalized to one canonical spelling.

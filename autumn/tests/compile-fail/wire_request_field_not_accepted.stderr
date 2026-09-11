@@ -2,4 +2,4 @@ error[E0080]: evaluation panicked: wire contract broken in `create` at `create_i
   --> tests/compile-fail/wire_request_field_not_accepted.rs:34:10
    |
 34 |         .create_item(NewItem {
-   |          ^^^^^^^^^^^ evaluation of `create::{closure#0}::_` failed here
+   |          ^^^^^^^^^^^ evaluation of `_` failed here

@@ -42,13 +42,16 @@ async fn show_item(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 #[public]
 async fn add_item(http: Client) -> AutumnResult<Markup> {
     let catalog = CatalogClient::new(catalog_base_url(), http);
-    // A `..rest` initializer is the shape the contract check exists for: it
-    // keeps compiling when the catalog adds a required field, and 400s in
-    // production. The check turns that into a build failure here.
+    // `request_id` is required by the catalog AND dropped from the body when
+    // it is empty, so a `..rest` initializer that left it out would send a
+    // body the catalog rejects. Setting it is what the contract check insists
+    // on; the fields the catalog always serializes may safely come from the
+    // rest.
     let created = catalog
         .create_item(mesh_catalog::NewItem {
             name: "Kettle".to_owned(),
             price_cents: 2499,
+            request_id: "storefront-1".to_owned(),
             ..Default::default()
         })
         .await?;

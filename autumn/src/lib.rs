@@ -1182,18 +1182,26 @@ pub use autumn_macros::service;
 
 /// Mark a typed handler as a service endpoint (issue #1755).
 ///
+/// **Experimental** — see `STABILITY.md`.
+///
 /// See the [`wire`] module for the mechanism and
 /// `docs/guide/wire-contracts.md` for the guide.
 pub use autumn_macros::endpoint;
 
 /// Check every service call in a function against the callee's contract
 /// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
 pub use autumn_macros::contract_checked;
 
 /// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
 pub use autumn_macros::WireShape;
 
 /// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
 ///
 /// The generated methods call through [`http_client::Client`], so this needs
 /// the `http-client` feature.

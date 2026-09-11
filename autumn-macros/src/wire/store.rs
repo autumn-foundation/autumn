@@ -208,8 +208,10 @@ mod tests {
                     wire_name: "id".to_owned(),
                     ty: "String".to_owned(),
                     required: true,
+                    aliases: Vec::new(),
                 }],
                 deserialized: Vec::new(),
+                closed: false,
             },
         }
     }

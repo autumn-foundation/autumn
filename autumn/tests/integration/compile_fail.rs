@@ -508,8 +508,9 @@ fn cache_coherence_compile_fail_tests() {
 ///
 /// The first three are the falsification the issue asks for: each is a change
 /// that keeps the callee compiling and the caller type-checking, and each must
-/// still turn the build red at the caller's call site. The last four are the
-/// refusals that keep the check from ever passing vacuously.
+/// still turn the build red at the caller's call site. The rest are the
+/// refusals that keep the check from ever passing vacuously, or from
+/// describing a wire shape it cannot actually read.
 #[test]
 fn compile_fail_wire_contract_tests() {
     let t = trybuild::TestCases::new();
@@ -519,7 +520,10 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_missing_required_request_field.rs");
     t.compile_fail("tests/compile-fail/wire_endpoint_below_route_attribute.rs");
     t.compile_fail("tests/compile-fail/wire_contract_checked_client_not_found.rs");
+    t.compile_fail("tests/compile-fail/wire_endpoint_name_is_not_an_identifier.rs");
     t.compile_fail("tests/compile-fail/wire_shape_rejects_flatten.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_transparent.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
 }
 

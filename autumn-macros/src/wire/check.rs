@@ -29,10 +29,6 @@ pub struct CallSite {
     /// Request fields the caller sets, or `None` when the request is not an
     /// inline struct literal and the write-set is therefore unknowable.
     pub writes: Option<Vec<String>>,
-    /// Whether the request literal lists every field (no `..rest`). When it
-    /// does, rustc already forces every field to be present, so the
-    /// missing-required check has nothing left to catch.
-    pub writes_exhaustive: bool,
 }
 
 /// What a call site and an endpoint disagree about.
@@ -42,7 +38,8 @@ pub enum ViolationKind {
     ResponseFieldMissing(String),
     /// The caller sets a request field the service does not accept.
     RequestFieldUnknown(String),
-    /// The caller omits a request field the service requires.
+    /// The caller leaves a required request field to whatever the rest of the
+    /// literal supplies, and the request type may not put it on the wire.
     RequestFieldMissing(String),
 }
 
@@ -80,7 +77,10 @@ impl Violation {
                 "sets request field `{f}`, which endpoint `{endpoint}` ({route}) does not accept"
             ),
             ViolationKind::RequestFieldMissing(f) => {
-                format!("omits request field `{f}`, which endpoint `{endpoint}` ({route}) requires")
+                format!(
+                    "does not set request field `{f}`, which endpoint `{endpoint}` ({route}) \
+                     requires and the request type does not always put on the wire"
+                )
             }
         };
         format!("wire contract broken in `{caller}` at `{snippet}`: {detail}")
@@ -115,15 +115,19 @@ pub fn check(site: &CallSite, endpoint: &ResolvedEndpoint) -> Vec<Violation> {
             report(ViolationKind::RequestFieldUnknown(write.clone()));
         }
     }
-    // An exhaustive literal names every field of the struct, so rustc has
-    // already rejected an omission. Only a `..rest` initializer can hide one.
-    if !site.writes_exhaustive {
-        for required in endpoint.request.deserialized.iter().filter(|f| f.required) {
-            if !writes.contains(&required.rust_name) {
-                report(ViolationKind::RequestFieldMissing(
-                    required.rust_name.clone(),
-                ));
-            }
+    // Both ends share the request type, so serialization emits every field: a
+    // `..rest` initializer sends a DEFAULT VALUE, not nothing, and leaving a
+    // field out of the literal is not by itself a wire break. The exception is
+    // a field the request type may keep off the wire — `skip_serializing_if`,
+    // or `skip_serializing` outright — while the callee still demands it.
+    for required in endpoint.request.deserialized.iter().filter(|f| f.required) {
+        let sent = endpoint.request.produced(&required.rust_name);
+        let never_sent = sent.is_none();
+        let sometimes_sent = sent.is_some_and(|f| !f.required);
+        if never_sent || (sometimes_sent && !writes.contains(&required.rust_name)) {
+            report(ViolationKind::RequestFieldMissing(
+                required.rust_name.clone(),
+            ));
         }
     }
     out
@@ -140,6 +144,7 @@ mod tests {
             wire_name: rust_name.to_owned(),
             ty: "String".to_owned(),
             required,
+            aliases: Vec::new(),
         }
     }
 
@@ -159,8 +164,9 @@ mod tests {
             },
             request: WireTypeDescriptor {
                 name: "NewItem".to_owned(),
-                serialized: vec![field("name", true), field("price_cents", false)],
-                deserialized: vec![field("name", true), field("price_cents", false)],
+                serialized: vec![field("name", true), field("price_cents", true)],
+                deserialized: vec![field("name", true), field("price_cents", true)],
+                closed: false,
             },
             response: WireTypeDescriptor {
                 name: "Item".to_owned(),
@@ -174,24 +180,24 @@ mod tests {
                     field("name", true),
                     field("price_cents", true),
                 ],
+                closed: false,
             },
         }
     }
 
-    fn site(reads: &[&str], writes: Option<&[&str]>, exhaustive: bool) -> CallSite {
+    fn site(reads: &[&str], writes: Option<&[&str]>) -> CallSite {
         CallSite {
             caller: "show_item".to_owned(),
             snippet: "catalog.get_item(req)".to_owned(),
             method: "get_item".to_owned(),
             reads: reads.iter().map(|s| (*s).to_owned()).collect(),
             writes: writes.map(|w| w.iter().map(|s| (*s).to_owned()).collect()),
-            writes_exhaustive: exhaustive,
         }
     }
 
     #[test]
     fn agreeing_call_site_has_no_violations() {
-        let v = check(&site(&["id", "name"], Some(&["name"]), false), &endpoint());
+        let v = check(&site(&["id", "name"], Some(&["name"])), &endpoint());
         assert!(
             v.is_empty(),
             "compatible call site must not be rejected: {v:?}"
@@ -200,7 +206,7 @@ mod tests {
 
     #[test]
     fn reading_a_field_the_service_does_not_produce_is_a_violation() {
-        let v = check(&site(&["id", "sku"], Some(&["name"]), false), &endpoint());
+        let v = check(&site(&["id", "sku"], Some(&["name"])), &endpoint());
         assert_eq!(
             v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
             vec![ViolationKind::ResponseFieldMissing("sku".to_owned())]
@@ -209,38 +215,59 @@ mod tests {
 
     #[test]
     fn setting_a_field_the_service_does_not_accept_is_a_violation() {
-        let v = check(
-            &site(&["id"], Some(&["name", "colour"]), false),
-            &endpoint(),
-        );
+        let v = check(&site(&["id"], Some(&["name", "colour"])), &endpoint());
         assert_eq!(
             v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
             vec![ViolationKind::RequestFieldUnknown("colour".to_owned())]
         );
     }
 
-    /// The `..Default::default()` case: compiles, 400s at runtime. This is the
-    /// break rustc cannot see, so it is the one the check exists for.
+    /// Both ends share the request type, so a `..rest` initializer sends a
+    /// default VALUE for an unnamed field, not nothing. Flagging that would be
+    /// a false positive on a well-formed request.
     #[test]
-    fn omitting_a_required_request_field_behind_a_rest_initializer_is_a_violation() {
-        let v = check(&site(&["id"], Some(&["price_cents"]), false), &endpoint());
-        assert_eq!(
-            v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
-            vec![ViolationKind::RequestFieldMissing("name".to_owned())]
+    fn leaving_an_always_sent_required_field_out_of_the_literal_is_not_a_violation() {
+        let v = check(&site(&["id"], Some(&["price_cents"])), &endpoint());
+        assert!(
+            v.is_empty(),
+            "`name` is always serialized, so the body carries it: {v:?}"
         );
     }
 
-    /// An exhaustive literal has no `..rest`, so rustc already forces every
-    /// field to be present. Reporting it again would be a false positive.
+    /// The shape that really can drop a field: the request type may keep it off
+    /// the wire, and the callee demands it.
     #[test]
-    fn exhaustive_literal_is_not_checked_for_missing_required_fields() {
-        let v = check(&site(&["id"], Some(&["price_cents"]), true), &endpoint());
-        assert!(v.is_empty(), "rustc already covers this: {v:?}");
+    fn not_setting_a_required_field_the_request_may_omit_is_a_violation() {
+        let mut e = endpoint();
+        e.request.serialized.push(field("sku", false));
+        e.request.deserialized.push(field("sku", true));
+        let v = check(&site(&["id"], Some(&["name"])), &e);
+        assert_eq!(
+            v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
+            vec![ViolationKind::RequestFieldMissing("sku".to_owned())]
+        );
+        // Naming it at the call site settles it.
+        assert!(check(&site(&["id"], Some(&["name", "sku"])), &e).is_empty());
+    }
+
+    /// `#[serde(skip_serializing)]` on a field the callee requires: the request
+    /// type can never send it, so no call site can fix it.
+    #[test]
+    fn a_required_field_the_request_never_sends_is_a_violation_however_it_is_called() {
+        let mut e = endpoint();
+        e.request.deserialized.push(field("sku", true));
+        for writes in [Some(["name"].as_slice()), Some(["name", "sku"].as_slice())] {
+            let v = check(&site(&["id"], writes), &e);
+            assert_eq!(
+                v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
+                vec![ViolationKind::RequestFieldMissing("sku".to_owned())]
+            );
+        }
     }
 
     #[test]
     fn unknown_write_set_checks_reads_only() {
-        let v = check(&site(&["sku"], None, false), &endpoint());
+        let v = check(&site(&["sku"], None), &endpoint());
         assert_eq!(
             v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
             vec![ViolationKind::ResponseFieldMissing("sku".to_owned())]
@@ -249,7 +276,7 @@ mod tests {
 
     #[test]
     fn message_names_the_call_site_the_endpoint_and_the_field() {
-        let v = check(&site(&["sku"], None, false), &endpoint());
+        let v = check(&site(&["sku"], None), &endpoint());
         let msg = v[0].message();
         assert!(msg.contains("catalog.get_item(req)"), "{msg}");
         assert!(msg.contains("show_item"), "{msg}");
@@ -259,12 +286,12 @@ mod tests {
 
     /// The success metric from issue #1755, at checker speed.
     ///
-    /// `examples/mesh-storefront/contract-sweep.py` proves the same thing
+    /// `scripts/wire-contract-sweep.py` proves the same thing
     /// through real `cargo build`s; this proves it in microseconds, so a
     /// regression in the rules themselves shows up in the ordinary test lane.
     /// Each case mutates the descriptor the way a callee edit would, against
-    /// one fixed call site: reads `id` and `name`, sets `name` through a
-    /// `..rest` initializer.
+    /// one fixed call site: reads `id` and `name`, and sets `name` through a
+    /// `..rest` initializer (so `price_cents` is left to the rest).
     #[test]
     // A flat table of mutations, one line per guarantee. Splitting it would
     // separate a case from the list it is measured against.
@@ -290,7 +317,7 @@ mod tests {
             e
         }
 
-        let site = site(&["id", "name"], Some(&["name"]), false);
+        let site = site(&["id", "name"], Some(&["name"]));
 
         let breaking: Vec<(&str, ResolvedEndpoint)> = vec![
             ("response field removed", {
@@ -323,12 +350,14 @@ mod tests {
                 e.request.deserialized.retain(|f| f.rust_name != "name");
                 e
             }),
-            ("optional request field became required", {
+            ("required request field became conditionally sent", {
+                // `skip_serializing_if` added to a field the callee requires
+                // and the call site does not name.
                 let mut e = endpoint();
-                e.request.deserialized[1].required = true;
+                e.request.serialized[1].required = false;
                 e
             }),
-            ("new required request field", {
+            ("new required request field the type never sends", {
                 let mut e = endpoint();
                 e.request.deserialized.push(field("sku", true));
                 e
@@ -353,7 +382,16 @@ mod tests {
             }),
             ("new optional request field", {
                 let mut e = endpoint();
+                e.request.serialized.push(field("coupon", true));
                 e.request.deserialized.push(field("coupon", false));
+                e
+            }),
+            ("new required request field the type always sends", {
+                // Both ends share the type, so the body carries a default
+                // value for it. Wire-valid, and must not be rejected.
+                let mut e = endpoint();
+                e.request.serialized.push(field("sku", true));
+                e.request.deserialized.push(field("sku", true));
                 e
             }),
             ("required request field became optional", {
@@ -361,6 +399,15 @@ mod tests {
                 e.request.deserialized[0].required = false;
                 e
             }),
+            (
+                "unset request field became optional and conditionally sent",
+                {
+                    let mut e = endpoint();
+                    e.request.serialized[1].required = false;
+                    e.request.deserialized[1].required = false;
+                    e
+                },
+            ),
             ("response field renamed on the wire only", {
                 let mut e = endpoint();
                 e.response.serialized[0].wire_name = "itemId".to_owned();
@@ -420,14 +467,7 @@ mod tests {
 
     #[test]
     fn every_violation_is_reported_not_just_the_first() {
-        let v = check(
-            &site(&["sku", "colour"], Some(&["shade"]), false),
-            &endpoint(),
-        );
-        assert_eq!(
-            v.len(),
-            4,
-            "two bad reads, one bad write, one missing required: {v:?}"
-        );
+        let v = check(&site(&["sku", "colour"], Some(&["shade"])), &endpoint());
+        assert_eq!(v.len(), 3, "two bad reads and one bad write: {v:?}");
     }
 }

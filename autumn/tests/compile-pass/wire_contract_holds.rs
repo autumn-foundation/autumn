@@ -16,6 +16,9 @@ pub struct Item {
 #[derive(Default, serde::Serialize, serde::Deserialize, WireShape)]
 pub struct NewItem {
     pub name: String,
+    // Required, and always on the wire: both ends share the type, so a
+    // `..rest` initializer sends a default value for it rather than nothing.
+    pub price_cents: u32,
     #[serde(default)]
     pub note: Option<String>,
 }

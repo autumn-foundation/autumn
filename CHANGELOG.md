@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[serde(skip_serializing)]` on a response field a caller reads, and a
   `#[serde(skip_deserializing)]` on a request field a caller sets — each of
   which compiles today and fails in production. Against the seeded mutation set
-  in `examples/mesh-storefront/contract-sweep.py`, all 12 wire-breaking changes
+  in `scripts/wire-contract-sweep.py`, all 12 wire-breaking changes
   turn `cargo build` red with a caller-named error and none of the 10 compatible
   changes is rejected. Worked two-service example in `examples/mesh-catalog` and
   `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. First

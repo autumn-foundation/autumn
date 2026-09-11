@@ -88,27 +88,52 @@ pub async fn call<E: Endpoint>(
         .map_err(|source| WireError::Transport { endpoint, source })?;
     let status = response.status().as_u16();
     if !response.is_success() {
-        let mut body = response.text();
-        body.truncate(MAX_ERROR_BODY);
         return Err(WireError::Status {
             endpoint,
             status,
-            body,
+            body: truncate_on_boundary(response.text(), MAX_ERROR_BODY),
         });
     }
     decode::<E::Response>(response).map_err(|source| WireError::Transport { endpoint, source })
 }
 
+/// Cut `body` to at most `max` bytes, at a character boundary.
+///
+/// The body is a failing service's own output — `String::from_utf8_lossy` over
+/// whatever it sent, so a cut at a fixed byte offset lands mid-character
+/// whenever the response is CJK, emoji, or binary turned into U+FFFD runs.
+/// `String::truncate` panics there, which would turn a 502 into a panic the
+/// upstream service controls.
+fn truncate_on_boundary(mut body: String, max: usize) -> String {
+    if body.len() <= max {
+        return body;
+    }
+    let cut = (0..=max)
+        .rev()
+        .find(|&i| body.is_char_boundary(i))
+        .unwrap_or(0);
+    body.truncate(cut);
+    body
+}
+
 /// Start the request for this endpoint's declared method.
 fn request_builder<E: Endpoint>(http: &Client, url: &str) -> Option<RequestBuilder> {
-    Some(match E::METHOD {
+    let builder = match E::METHOD {
         "GET" => http.get(url),
         "POST" => http.post(url),
         "PUT" => http.put(url),
         "PATCH" => http.patch(url),
         "DELETE" => http.delete(url),
+        // Unreachable from generated code: `#[endpoint]` accepts exactly these
+        // five route attributes. Kept so adding a sixth there is a 502 with a
+        // named cause rather than a silently wrong request.
         _ => return None,
-    })
+    };
+    // A typed RPC call has one destination. Following a `Location` would let a
+    // compromised or confused callee steer the caller at an arbitrary host —
+    // the SSRF guard cannot help, because an internal service legitimately
+    // lives on a private address.
+    Some(builder.no_redirect())
 }
 
 /// Decode a success body, treating an empty one as JSON `null`.
@@ -124,7 +149,12 @@ fn decode<T: DeserializeOwned>(response: crate::http_client::Response) -> Result
 }
 
 /// Join a base URL and a route path with exactly one slash between them.
+///
+/// A base is an origin plus an optional path prefix. Anything from a `?` or `#`
+/// on is dropped rather than concatenated, which would otherwise push the whole
+/// route path into the base's query string and send every call to the base path.
 fn join_url(base: &str, path: &str) -> String {
+    let base = base.split(['?', '#']).next().unwrap_or(base);
     let base = base.trim_end_matches('/');
     if path.starts_with('/') {
         format!("{base}{path}")
@@ -143,5 +173,34 @@ mod tests {
         assert_eq!(join_url("http://a/", "/items"), "http://a/items");
         assert_eq!(join_url("http://a/", "items"), "http://a/items");
         assert_eq!(join_url("http://a/v1/", "/items"), "http://a/v1/items");
+    }
+
+    #[test]
+    fn join_url_drops_a_query_or_fragment_on_the_base() {
+        assert_eq!(
+            join_url("http://a/?trace=1", "/items/7"),
+            "http://a/items/7"
+        );
+        assert_eq!(join_url("http://a#frag", "/items/7"), "http://a/items/7");
+    }
+
+    #[test]
+    fn an_error_body_is_cut_at_a_character_boundary() {
+        // 'é' is two bytes, so a cut at 512 lands inside it.
+        let body = format!("{}\u{e9}tail", "a".repeat(511));
+        let cut = truncate_on_boundary(body, 512);
+        assert_eq!(cut.len(), 511, "must step back to the boundary");
+        assert!(cut.is_char_boundary(cut.len()));
+    }
+
+    #[test]
+    fn a_short_error_body_is_untouched() {
+        assert_eq!(truncate_on_boundary("short".to_owned(), 512), "short");
+    }
+
+    #[test]
+    fn an_error_body_that_is_one_huge_character_run_cuts_to_empty_rather_than_panicking() {
+        let body = "\u{1f600}".repeat(4);
+        assert!(truncate_on_boundary(body, 2).is_empty());
     }
 }

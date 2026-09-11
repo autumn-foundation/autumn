@@ -1,5 +1,10 @@
 //! Build-checked typed contracts between two Autumn services (issue #1755).
 //!
+//! **Experimental.** Everything in this module, the input syntax of its four
+//! macros, and the JSON descriptor format under `target/autumn-contracts/` may
+//! change in any release — see `STABILITY.md`. This is a first slice: one
+//! workspace, synchronous request/response, JSON over HTTP.
+//!
 //! Two Autumn services in one Cargo workspace share one compiler-checked
 //! contract: the callee's handler signatures. Nothing is hand-maintained, and
 //! nothing is generated from a parallel IDL.
@@ -133,8 +138,80 @@ pub trait Endpoint {
 
     /// Fields the endpoint accepts in its request body.
     const REQUEST_FIELDS: &'static [WireField] = <Self::Request as WireShape>::DESERIALIZED;
+    /// Fields the request type puts on the wire when a caller sends one.
+    ///
+    /// Differs from [`Endpoint::REQUEST_FIELDS`] under a directional serde
+    /// attribute: a field can be demanded by the callee and still be one the
+    /// request type sometimes — or never — sends.
+    const REQUEST_SENT_FIELDS: &'static [WireField] = <Self::Request as WireShape>::SERIALIZED;
     /// Fields the endpoint produces in its response body.
     const RESPONSE_FIELDS: &'static [WireField] = <Self::Response as WireShape>::SERIALIZED;
+}
+
+/// One endpoint of a generated client, as its const table records it.
+///
+/// `wire_client!` emits the table; `#[contract_checked]` asserts against it by
+/// method name. Going through the table rather than naming each endpoint type
+/// directly is what lets a call to a method the client does NOT declare — one
+/// someone added in their own extension trait — cost nothing instead of naming
+/// a type that does not exist.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientEndpoint {
+    /// The generated method's name.
+    pub method: &'static str,
+    /// Fields the endpoint produces in its response body.
+    pub response: &'static [WireField],
+    /// Fields the endpoint accepts in its request body.
+    pub request: &'static [WireField],
+    /// Fields the request type puts on the wire.
+    pub request_sent: &'static [WireField],
+}
+
+/// The entry for `method`, if the client declares it as an endpoint.
+const fn entry_of<'a>(table: &'a [ClientEndpoint], method: &str) -> Option<&'a ClientEndpoint> {
+    let mut i = 0;
+    while i < table.len() {
+        if str_eq(table[i].method, method) {
+            return Some(&table[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether the endpoint produces `field` — vacuously true when `method` is not
+/// one of this client's endpoints.
+#[must_use]
+pub const fn client_produces(table: &[ClientEndpoint], method: &str, field: &str) -> bool {
+    match entry_of(table, method) {
+        Some(entry) => has_field(entry.response, field),
+        None => true,
+    }
+}
+
+/// Whether the endpoint accepts `field` — vacuously true when `method` is not
+/// one of this client's endpoints.
+#[must_use]
+pub const fn client_accepts(table: &[ClientEndpoint], method: &str, field: &str) -> bool {
+    match entry_of(table, method) {
+        Some(entry) => has_field(entry.request, field),
+        None => true,
+    }
+}
+
+/// Whether the call site names every request field the endpoint requires and
+/// the request type may keep off the wire — vacuously true when `method` is not
+/// one of this client's endpoints.
+#[must_use]
+pub const fn client_request_covered(
+    table: &[ClientEndpoint],
+    method: &str,
+    supplied: &[&str],
+) -> bool {
+    match entry_of(table, method) {
+        Some(entry) => omittable_required_covered(entry.request_sent, entry.request, supplied),
+        None => true,
+    }
 }
 
 /// Whether `fields` contains one named `rust_name`.
@@ -153,20 +230,56 @@ pub const fn has_field(fields: &[WireField], rust_name: &str) -> bool {
     false
 }
 
-/// Whether every required field in `fields` appears in `supplied`.
+/// Whether every request field that the callee requires but the request type
+/// may leave off the wire is named at the call site.
 ///
-/// Used for a request built with a `..rest` initializer, which is the one shape
-/// that can omit a field without the type checker noticing.
+/// Both ends share the request type, so serialization normally emits every
+/// field — a `..rest` initializer sends a default value, not nothing, and
+/// omitting a field from the literal is therefore NOT a wire break. One shape
+/// is different: a field carrying `#[serde(skip_serializing_if = …)]`, or
+/// `#[serde(skip_serializing)]`, can be absent from the body while the callee
+/// still demands it. Those are the fields a call site has to name.
+///
+/// `serialized` and `deserialized` are the request type's two tables;
+/// `supplied` is what the call site sets explicitly.
 #[must_use]
-pub const fn required_covered(fields: &[WireField], supplied: &[&str]) -> bool {
+pub const fn omittable_required_covered(
+    serialized: &[WireField],
+    deserialized: &[WireField],
+    supplied: &[&str],
+) -> bool {
     let mut i = 0;
-    while i < fields.len() {
-        if fields[i].required && !contains_str(supplied, fields[i].rust_name) {
-            return false;
+    while i < deserialized.len() {
+        let field = &deserialized[i];
+        if field.required {
+            // Never serialized at all: the request type can no more send this
+            // field than the call site can, so naming it would not help.
+            if !has_field(serialized, field.rust_name) {
+                return false;
+            }
+            // Conditionally serialized: only a call site that sets it can be
+            // sure it goes out.
+            if !always_serialized(serialized, field.rust_name)
+                && !contains_str(supplied, field.rust_name)
+            {
+                return false;
+            }
         }
         i += 1;
     }
     true
+}
+
+/// Whether `fields` produces `rust_name` on every serialization.
+const fn always_serialized(fields: &[WireField], rust_name: &str) -> bool {
+    let mut i = 0;
+    while i < fields.len() {
+        if str_eq(fields[i].rust_name, rust_name) {
+            return fields[i].required;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether `template`'s `{…}` placeholders are exactly `declared`, in order.
@@ -185,8 +298,11 @@ pub const fn path_params_are(template: &str, declared: &[&str]) -> bool {
                 end += 1;
             }
             if end >= bytes.len() {
-                // An unterminated placeholder is not a parameter.
-                return seen == declared.len();
+                // An unterminated placeholder is a malformed template, not a
+                // parameter list that happens to be shorter. Refusing it here
+                // is what keeps `render_path` from emitting the stray `{` into
+                // a URL.
+                return false;
             }
             if seen >= declared.len() || !str_eq(declared[seen], slice_str(template, start, end)) {
                 return false;
@@ -224,7 +340,9 @@ const fn slice_str(s: &str, start: usize, end: usize) -> &str {
 /// Substitute `{name}` placeholders in a route path.
 ///
 /// Values are percent-encoded as a single path segment, so a value containing
-/// `/` or `?` cannot reshape the URL.
+/// `/` or `?` cannot reshape the URL — and `.`, `..` and the empty string are
+/// encoded too, because a URL parser resolves those away and would otherwise
+/// let a caller-supplied value retarget the call at a sibling route.
 #[must_use]
 pub fn render_path(template: &str, params: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(template.len());
@@ -254,8 +372,22 @@ pub fn render_path(template: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// Percent-encode one URL path segment, keeping only the unreserved set.
+///
+/// `.` is in that set, so a bare `.` or `..` would survive as a dot segment and
+/// `remove_dot_segments` would then resolve it away: `/items/../reviews`
+/// becomes `/reviews`. Those two values, and the empty string, are therefore
+/// encoded whole — the segment stays one segment whatever the value is.
 fn encode_segment(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if value.is_empty() {
+        return "%20".to_owned();
+    }
+    if value == "." {
+        return "%2E".to_owned();
+    }
+    if value == ".." {
+        return "%2E%2E".to_owned();
+    }
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -329,18 +461,52 @@ mod tests {
         assert!(!has_field(FIELDS, "names"));
     }
 
+    /// `name` is required and always serialized; `price_cents` is optional.
+    /// Neither has to be named at a call site.
     #[test]
-    fn required_covered_ignores_optional_fields() {
-        assert!(required_covered(FIELDS, &["name"]));
-        assert!(!required_covered(FIELDS, &["price_cents"]));
-        assert!(required_covered(&[], &[]));
+    fn an_always_serialized_field_never_has_to_be_named_at_a_call_site() {
+        assert!(omittable_required_covered(FIELDS, FIELDS, &[]));
+        assert!(omittable_required_covered(&[], &[], &[]));
+    }
+
+    #[test]
+    fn a_required_field_the_request_may_omit_must_be_named() {
+        // `sku` is required off the wire but conditionally serialized, so a
+        // call site that does not set it can send a body without it.
+        const SER: &[WireField] = &[WireField {
+            rust_name: "sku",
+            wire_name: "sku",
+            ty: "String",
+            required: false,
+        }];
+        const DE: &[WireField] = &[WireField {
+            rust_name: "sku",
+            wire_name: "sku",
+            ty: "String",
+            required: true,
+        }];
+        assert!(!omittable_required_covered(SER, DE, &[]));
+        assert!(omittable_required_covered(SER, DE, &["sku"]));
+    }
+
+    #[test]
+    fn a_required_field_the_request_can_never_send_is_uncoverable() {
+        const DE: &[WireField] = &[WireField {
+            rust_name: "sku",
+            wire_name: "sku",
+            ty: "String",
+            required: true,
+        }];
+        // `#[serde(skip_serializing)]`: absent from the serialized table, so
+        // naming it at the call site cannot put it on the wire either.
+        assert!(!omittable_required_covered(&[], DE, &[]));
+        assert!(!omittable_required_covered(&[], DE, &["sku"]));
     }
 
     // The checks must hold in const context — that is the whole mechanism.
     const _: () = assert!(has_field(FIELDS, "name"));
     const _: () = assert!(!has_field(FIELDS, "sku"));
-    const _: () = assert!(required_covered(FIELDS, &["name"]));
-    const _: () = assert!(!required_covered(FIELDS, &[]));
+    const _: () = assert!(omittable_required_covered(FIELDS, FIELDS, &[]));
 
     #[test]
     fn path_params_are_matches_name_and_order() {
@@ -351,6 +517,8 @@ mod tests {
         assert!(!path_params_are("/items/{id}", &[]));
         assert!(!path_params_are("/items", &["id"]));
         assert!(!path_params_are("/items/{sku}", &["id"]));
+        // A malformed template is refused rather than read as a short list.
+        assert!(!path_params_are("/a/{x}/b/{y", &["x"]));
     }
 
     const _: () = assert!(path_params_are("/items/{id}", &["id"]));
@@ -363,6 +531,14 @@ mod tests {
             render_path("/items/{id}", &[("id", "../admin")]),
             "/items/..%2Fadmin"
         );
+        // A dot segment would be resolved away by a URL parser, retargeting
+        // the call at a sibling route.
+        assert_eq!(
+            render_path("/items/{id}/reviews", &[("id", "..")]),
+            "/items/%2E%2E/reviews"
+        );
+        assert_eq!(render_path("/items/{id}", &[("id", ".")]), "/items/%2E");
+        assert_eq!(render_path("/items/{id}", &[("id", "")]), "/items/%20");
         assert_eq!(render_path("/items", &[]), "/items");
         assert_eq!(
             render_path("/a/{x}/b/{y}", &[("x", "1"), ("y", "2")]),

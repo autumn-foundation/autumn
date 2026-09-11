@@ -1604,6 +1604,8 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Mark a typed handler as a service endpoint (issue #1755).
 ///
+/// **Experimental** — see `STABILITY.md`.
+///
 /// Emits a marker type — `<name>_endpoint` — implementing
 /// `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire
 /// descriptor as a build artifact. The handler itself is untouched.
@@ -1643,6 +1645,8 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Generate a typed client for another Autumn service's endpoints (issue #1755).
 ///
+/// **Experimental** — see `STABILITY.md`.
+///
 /// ```rust,ignore
 /// wire_client! {
 ///     name = CatalogClient,
@@ -1665,6 +1669,8 @@ pub fn wire_client(input: TokenStream) -> TokenStream {
 
 /// Check every service call in a function against the callee's contract
 /// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
 ///
 /// ```rust,ignore
 /// #[contract_checked(client = CatalogClient)]
@@ -1693,6 +1699,8 @@ pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
 ///
 /// Emits two const field tables — what the type puts on the wire and what it
 /// takes off it — and writes the type's JSON descriptor as a build artifact.

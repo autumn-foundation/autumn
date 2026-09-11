@@ -15,6 +15,7 @@ pr_description.md
 # see issue #1797's determinism gate.) The older scripts predate the rule and
 # were already tracked, which is exactly why the trap went unnoticed.
 !scripts/*.sh
+!scripts/*.py
 !scripts/lib/*.sh
 !scripts/self-hosted-runner/*.sh
 !.claude/skills/**/*.sh

@@ -337,7 +337,7 @@ Boots with no database; the companion narrative is `docs/guide/wire-contracts.md
 | **Key capabilities** | `wire_client!`, `#[contract_checked]`, `autumn_web::wire::Endpoint`, `NoBody` |
 | **Prerequisites** | Rust 1.88.0+ and `examples/mesh-catalog` in the same workspace |
 | **Run command** | `CATALOG_URL=http://127.0.0.1:3001 cargo run -p mesh-storefront` |
-| **Success proof** | `python3 examples/mesh-storefront/contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
+| **Success proof** | `python3 scripts/wire-contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
 | **Rationale for the tier** | Its proof is a build that must *fail*, which no Chromium smoke can express. The sweep script is the dedicated proof. |
 
 Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.

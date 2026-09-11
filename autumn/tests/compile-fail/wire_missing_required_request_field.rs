@@ -1,5 +1,7 @@
-// The caller builds its request with `..Default::default()` and omits a field
-// the service requires. This compiles; the request 400s in production.
+// The caller leaves a required request field to `..Default::default()`, and the
+// request type drops that field from the body when it is empty — so the body
+// goes out without it and the service rejects the request. This compiles, and
+// the type checker has nothing to say about it.
 use autumn_web::http::Client;
 use autumn_web::prelude::*;
 
@@ -11,7 +13,9 @@ pub struct Item {
 #[derive(Default, serde::Serialize, serde::Deserialize, WireShape)]
 pub struct NewItem {
     pub name: String,
-    pub price_cents: u32,
+    // Required by the service, and absent from the body when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
 }
 
 #[endpoint(service = "catalog")]

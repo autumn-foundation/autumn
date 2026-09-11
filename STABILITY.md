@@ -105,6 +105,19 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   in any release. The protocol carries a version field precisely so a host and
   an artifact built from different Autumn versions degrade to origin-serving
   instead of guessing.
+- **The wire-contract lane (issue #1755).** `autumn_web::wire` in full —
+  `Endpoint`, `WireShape`, `WireField`, `ClientEndpoint`, `NoBody`, `WireError`,
+  `call`, and the const checkers `has_field` / `omittable_required_covered` /
+  `client_produces` / `client_accepts` / `client_request_covered` /
+  `path_params_are` / `render_path` — together with the **input syntax** of
+  `#[endpoint]`, `#[derive(WireShape)]`, `wire_client!` and
+  `#[contract_checked]`, and the JSON **descriptor format** written under
+  `target/autumn-contracts/`. All of it is experimental and may change in any
+  release, including a patch. This is a first slice: one workspace, synchronous
+  request/response, JSON over HTTP. The descriptor is a build artifact, not an
+  interchange format — nothing outside this workspace should read it yet, and
+  the cross-version work the format exists to enable will reshape it.
+
 - **The capability-sandboxed plugin lane (issue #1609).** Everything behind the
   `plugin-sandbox` feature — `autumn_web::plugin_sandbox` in full, including the
   sandbox **wire protocol** (`WIRE_VERSION`, its NDJSON frames), the
