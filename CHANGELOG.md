@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
+  `rich_text_area` and its five siblings in `autumn::form` hardcoded English
+  chrome — the toolbar's aria-label, its per-control names and syntax hints,
+  the hint under the editor, and the "Preview" heading — with no way for a
+  caller to override them. A new `RichTextLabels` builder carries all four,
+  and a `_with_labels` sibling of each existing function
+  (`rich_text_area_with_labels`, `rich_text_area_htmx_with_labels`,
+  `rich_text_area_htmx_with_token_field_with_labels`, and the three
+  `required_*` counterparts) takes one, so an app can translate the editor's
+  chrome without touching the rest of the form. Additive and
+  backward-compatible: every existing function keeps rendering the default
+  English labels unchanged.
+- **`IntoChangeset::into_changeset_with` resolves a validation message by
+  field and code (#2227):** when a `#[validate(...)]` rule has no explicit
+  `message`, the changeset used to always fall back to the hardcoded English
+  `"validation failed: {code}"`. `into_changeset_with` takes a
+  `resolve: impl Fn(&str, &str) -> Option<String>` closure that gets first
+  crack at that fallback — return `Some(message)` to supply a translated
+  message for a `(field, code)` pair, or `None` to keep the default. An
+  explicit `message` on the validator attribute always wins and is never
+  passed through the resolver. `into_changeset` is unchanged and keeps
+  producing the same default messages as before.
 - **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
   README.md's `## Example` and the four `rust,no_run` snippets in
   `docs/guide/getting-started.md` (a CSRF form handler plus three

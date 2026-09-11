@@ -790,9 +790,95 @@ pub fn transition_controls(
     csrf: Option<&crate::security::CsrfToken>,
     csrf_field: Option<&crate::security::CsrfFormField>,
 ) -> maud::Markup {
+    transition_controls_with_labels(
+        action,
+        field,
+        current,
+        transitions,
+        can,
+        csrf,
+        csrf_field,
+        &TransitionLabels::new(),
+    )
+}
+
+/// Group and per-edge button labels for [`transition_controls`].
+///
+/// An edge with no override keeps autumn-web's default English text.
+/// Build with [`TransitionLabels::new`] and chain the `const` builder
+/// methods.
+#[derive(Clone, Copy, Default)]
+pub struct TransitionLabels<'a> {
+    group: Option<&'a str>,
+    buttons: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> TransitionLabels<'a> {
+    /// Make labels with no overrides.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            group: None,
+            buttons: &[],
+        }
+    }
+
+    /// Set the group label. Replaces `"{field} transitions"`.
+    #[must_use]
+    pub const fn group(mut self, label: &'a str) -> Self {
+        self.group = Some(label);
+        self
+    }
+
+    /// Set button labels by target state.
+    ///
+    /// Each pair is `(target_state, label)`. A state not listed keeps
+    /// `"Mark as {state}"`.
+    #[must_use]
+    pub const fn buttons(mut self, buttons: &'a [(&'a str, &'a str)]) -> Self {
+        self.buttons = buttons;
+        self
+    }
+
+    /// Get the group label for the given field.
+    fn group_label(&self, field: &str) -> String {
+        self.group
+            .map_or_else(|| format!("{field} transitions"), ToString::to_string)
+    }
+
+    /// Get the button label for the given target state.
+    fn button_label(&self, to: &str) -> String {
+        self.buttons
+            .iter()
+            .find(|(state, _)| *state == to)
+            .map_or_else(
+                || format!("Mark as {to}"),
+                |(_, label)| (*label).to_string(),
+            )
+    }
+}
+
+/// Same as [`transition_controls`], with the group and button text open to
+/// override via `labels`.
+///
+/// Pass [`TransitionLabels::new`] for the same output as
+/// [`transition_controls`]. See [`TransitionLabels`] for the override fields.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::too_many_arguments)] // Same shape as `transition_controls`, plus `labels`.
+pub fn transition_controls_with_labels(
+    action: &str,
+    field: &str,
+    current: &str,
+    transitions: &[(&str, &str, Option<&str>)],
+    can: impl Fn(&str) -> bool,
+    csrf: Option<&crate::security::CsrfToken>,
+    csrf_field: Option<&crate::security::CsrfFormField>,
+    labels: &TransitionLabels<'_>,
+) -> maud::Markup {
     let csrf_field_name = csrf_field.map_or("_csrf", |f| f.0.as_str());
     maud::html! {
-        div class="autumn-transition-controls" role="group" aria-label=(format!("{field} transitions")) {
+        div class="autumn-transition-controls" role="group" aria-label=(labels.group_label(field)) {
             @for (from, to, _guard) in transitions {
                 @if *from == current {
                     form method="post" action=(action) class="autumn-transition" {
@@ -800,7 +886,7 @@ pub fn transition_controls(
                             input type="hidden" name=(csrf_field_name) value=(tok.token());
                         }
                         input type="hidden" name=(field) value=(to);
-                        button type="submit" disabled[!can(to)] { (format!("Mark as {to}")) }
+                        button type="submit" disabled[!can(to)] { (labels.button_label(to)) }
                     }
                 }
             }
@@ -6484,6 +6570,77 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_with_labels_overrides_the_group_label() {
+        let html = transition_controls_with_labels(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+            &TransitionLabels::new().group("Passer à"),
+        )
+        .into_string();
+        assert!(html.contains("Passer à"), "{html}");
+        assert!(!html.contains("status transitions"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_with_labels_overrides_a_single_button_by_state() {
+        // current = "pending" has two edges here, so one override leaves the
+        // other edge's button on the default text.
+        let transitions: &[(&str, &str, Option<&str>)] =
+            &[("pending", "approved", None), ("pending", "rejected", None)];
+        let html = transition_controls_with_labels(
+            "/orders/42/transitions/status",
+            "status",
+            "pending",
+            transitions,
+            |_to| true,
+            None,
+            None,
+            &TransitionLabels::new().buttons(&[("approved", "Approve it")]),
+        )
+        .into_string();
+        assert!(
+            html.contains("<button type=\"submit\">Approve it</button>"),
+            "{html}"
+        );
+        // "rejected" has no override: it keeps the default "Mark as {state}" text.
+        assert!(
+            html.contains("<button type=\"submit\">Mark as rejected</button>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn transition_controls_with_labels_default_is_byte_identical_to_transition_controls() {
+        let plain = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        let with_labels = transition_controls_with_labels(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+            &TransitionLabels::new(),
+        )
+        .into_string();
+        assert_eq!(plain, with_labels);
     }
 
     // ── reaction_controls CSRF sugar ───────────────────────────────────
