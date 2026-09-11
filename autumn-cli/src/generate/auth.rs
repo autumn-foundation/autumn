@@ -881,7 +881,7 @@ fn plan_auth_with_providers_ex_impl(
     let docs_dir = project_root.join("docs").join("guide");
     plan.create(
         docs_dir.join("authentication.md"),
-        render_docs_file(&pascal_name, totp, magic_link),
+        render_docs_file(backend, &pascal_name, totp, magic_link),
     );
     plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
     plan.create(
@@ -7314,13 +7314,65 @@ them against a live server.
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_docs_file(pascal_name: &str, totp: bool, magic_link: bool) -> String {
+fn render_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    pascal_name: &str,
+    totp: bool,
+    magic_link: bool,
+) -> String {
     let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
     let magic_link_docs = if magic_link {
         MAGIC_LINK_DOCS_SECTION
     } else {
         ""
     };
+    // The lockout retrofit DDL and the confirm-existing-accounts statement are
+    // copy-paste SQL for the operator, so both must be in the app's own dialect
+    // (issue #1927), matching `render_sessions_docs_file` /
+    // `render_oauth_docs_file`. `SQLite` takes one `ADD COLUMN` per `ALTER
+    // TABLE`, has no `IF NOT EXISTS` / `IF EXISTS` on either, and no `NOW()`.
+    let (lockout_up, lockout_down, confirmed_now, confirm_up, confirm_down) = match backend {
+        // `{table}` stays a literal placeholder for the reader, exactly as the
+        // template emitted it before this fork — these fragments are inserted
+        // as data, so they are NOT format-escaped the way `{{table}}` was.
+        autumn_web::config::DatabaseBackend::Postgres => (
+            "ALTER TABLE {table}\n  \
+             ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,\n  \
+             ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;",
+            "ALTER TABLE {table}\n  \
+             DROP COLUMN IF EXISTS failed_attempts,\n  \
+             DROP COLUMN IF EXISTS locked_at;",
+            "NOW()",
+            "ALTER TABLE {table}\n  \
+             ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,\n  \
+             ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,\n  \
+             ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,\n  \
+             ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;",
+            "ALTER TABLE {table}\n  \
+             DROP COLUMN IF EXISTS confirm_token_digest,\n  \
+             DROP COLUMN IF EXISTS confirm_token_expires_at,\n  \
+             DROP COLUMN IF EXISTS email_confirmed_at,\n  \
+             DROP COLUMN IF EXISTS pending_email;",
+        ),
+        // `SQLite` takes one `ADD COLUMN` per `ALTER TABLE`, has no
+        // `IF NOT EXISTS` / `IF EXISTS` on either, and no `NOW()`.
+        autumn_web::config::DatabaseBackend::Sqlite => (
+            "ALTER TABLE {table} ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;\n\
+             ALTER TABLE {table} ADD COLUMN locked_at TEXT NULL;",
+            "ALTER TABLE {table} DROP COLUMN failed_attempts;\n\
+             ALTER TABLE {table} DROP COLUMN locked_at;",
+            "CURRENT_TIMESTAMP",
+            "ALTER TABLE {table} ADD COLUMN confirm_token_digest TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN confirm_token_expires_at TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN email_confirmed_at TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN pending_email TEXT NULL;",
+            "ALTER TABLE {table} DROP COLUMN confirm_token_digest;\n\
+             ALTER TABLE {table} DROP COLUMN confirm_token_expires_at;\n\
+             ALTER TABLE {table} DROP COLUMN email_confirmed_at;\n\
+             ALTER TABLE {table} DROP COLUMN pending_email;",
+        ),
+    };
+
     format!(
         r#"# Authentication Guide
 
@@ -7476,16 +7528,12 @@ autumn generate migration add_lockout_to_{{table}}
 
 ```sql
 -- migrations/<timestamp>_add_lockout_to_{{table}}/up.sql
-ALTER TABLE {{table}}
-  ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;
+{lockout_up}
 ```
 
 ```sql
 -- migrations/<timestamp>_add_lockout_to_{{table}}/down.sql
-ALTER TABLE {{table}}
-  DROP COLUMN IF EXISTS failed_attempts,
-  DROP COLUMN IF EXISTS locked_at;
+{lockout_down}
 ```
 
 ```sh
@@ -7639,20 +7687,12 @@ autumn generate migration add_email_confirmation_to_{{table}}
 
 ```sql
 -- migrations/<timestamp>_add_email_confirmation_to_{{table}}/up.sql
-ALTER TABLE {{table}}
-  ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,
-  ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,
-  ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,
-  ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;
+{confirm_up}
 ```
 
 ```sql
 -- migrations/<timestamp>_add_email_confirmation_to_{{table}}/down.sql
-ALTER TABLE {{table}}
-  DROP COLUMN IF EXISTS confirm_token_digest,
-  DROP COLUMN IF EXISTS confirm_token_expires_at,
-  DROP COLUMN IF EXISTS email_confirmed_at,
-  DROP COLUMN IF EXISTS pending_email;
+{confirm_down}
 ```
 
 ```sh
@@ -7674,7 +7714,7 @@ they can log in immediately (opt-in migration), run:
 
 ```sql
 -- Only run this if you trust all existing accounts (no spam/abuse backlog).
-UPDATE {{table}} SET email_confirmed_at = NOW() WHERE email_confirmed_at IS NULL;
+UPDATE {{table}} SET email_confirmed_at = {confirmed_now} WHERE email_confirmed_at IS NULL;
 ```
 
 No behaviour changes for existing accounts until the migration is applied and
@@ -11239,6 +11279,82 @@ mod tests {
     // deleted, and every shared-file edit recorded via `plan.push_revert(...)`
     // is undone. These tests assert the round trip is byte-identical for the
     // base scaffold plus each optional feature flag.
+
+    /// The scaffolded `docs/guide/authentication.md` hands the operator
+    /// copy-paste SQL, so it must be in the app's own dialect too (issue
+    /// #1927) — the same rule `render_sessions_docs_file` and
+    /// `render_oauth_docs_file` already follow.
+    #[test]
+    fn authentication_docs_sql_is_backend_aware() {
+        use autumn_web::config::DatabaseBackend;
+
+        let pg = render_docs_file(DatabaseBackend::Postgres, "User", true, true);
+        let sqlite = render_docs_file(DatabaseBackend::Sqlite, "User", true, true);
+
+        // Postgres output is unchanged by the fork: each retrofit block verbatim.
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,\n  \
+                 ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 DROP COLUMN IF EXISTS failed_attempts,\n  \
+                 DROP COLUMN IF EXISTS locked_at;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "UPDATE {table} SET email_confirmed_at = NOW() WHERE email_confirmed_at IS NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(pg.contains("email_confirmed_at = NOW()"), "{pg}");
+
+        // SQLite has none of those: no `IF NOT EXISTS` on ADD COLUMN, one
+        // column per `ALTER TABLE`, and `CURRENT_TIMESTAMP` for the clock.
+        for leak in [
+            "IF NOT EXISTS",
+            "IF EXISTS",
+            "NOW()",
+            "TIMESTAMP NULL",
+            "INT NOT NULL",
+        ] {
+            assert!(
+                !sqlite.contains(leak),
+                "SQLite authentication.md leaked Postgres-only `{leak}`:\n{sqlite}"
+            );
+        }
+        assert!(
+            sqlite.contains(
+                "ALTER TABLE {table} ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;"
+            ),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("ALTER TABLE {table} ADD COLUMN locked_at TEXT NULL;"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("email_confirmed_at = CURRENT_TIMESTAMP"),
+            "{sqlite}"
+        );
+    }
 
     /// Backend-aware DDL (issue #1927): `generate auth` on a `SQLite` app now
     /// scaffolds its migrations in `SQLite` dialect (`INTEGER PRIMARY KEY
@@ -14979,7 +15095,12 @@ mod tests {
         // disambiguation + email-change flow), so the documented "adoption path"
         // migration for existing apps must add that column in up.sql and drop it in
         // down.sql — otherwise the regenerated app queries a missing column.
-        let docs = render_docs_file("User", false, false);
+        let docs = render_docs_file(
+            autumn_web::config::DatabaseBackend::Postgres,
+            "User",
+            false,
+            false,
+        );
         let up_marker = "-- migrations/<timestamp>_add_email_confirmation_to_{table}/up.sql";
         let down_marker = "-- migrations/<timestamp>_add_email_confirmation_to_{table}/down.sql";
         let up_pos = docs.find(up_marker).expect("adoption up.sql block present");

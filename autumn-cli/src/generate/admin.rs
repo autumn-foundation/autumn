@@ -852,6 +852,54 @@ impl AdminModel for {pascal_name}Admin {{
             Ok(())
         }})
     }}
+
+    fn execute_action(
+        &self,
+        pool: &Pool<AsyncPgConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {{
+        // `{pascal_name}Admin` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (autumn-admin-plugin's `traits.rs`) only ever offers
+        // `"delete"` -- the admin UI can't reach `"restore"` or `"purge"` for
+        // this model. Only `"delete"` needs the batched fast path below;
+        // `"restore"`, `"purge"`, and any other action name fall through to
+        // the shared `dispatch_restore_purge_or_unhandled` helper, which
+        // gives a direct or out-of-band call the same "does not support soft
+        // delete" (or "unhandled action") error the trait default always did.
+        if action == "delete" {{
+            let pool = pool.clone();
+            return Box::pin(async move {{
+                // One round trip for the whole selection instead of the
+                // trait default's one-`DELETE`-per-id loop (an operator
+                // selecting hundreds of rows in the admin list and clicking
+                // "Delete selected" otherwise costs hundreds of statements
+                // and pool checkouts for what is, on the wire, one
+                // predicate).
+                //
+                // The returned count is the number of rows the `DELETE`
+                // actually matched, not `ids.len()`: unlike `delete()`
+                // above, a missing id here is silently a no-op rather than
+                // an `AdminError::NotFound` that aborts the whole batch --
+                // the same "missing selection is a no-op" contract the
+                // scaffolded (`autumn generate scaffold`) bulk-delete route
+                // and this crate's own `TokenAdminModel`/
+                // `FeatureFlagAdminModel` overrides already use, and a
+                // strictly better-defined outcome than the loop this
+                // replaces, whose partial application on a missing id
+                // depended on where in the id list the miss fell.
+                let mut conn = pool.get().await.map_err(Self::pool_error)?;
+                let deleted = diesel::delete({plural}::table.filter({plural}::id.eq_any(&ids)))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(Self::pool_error)?;
+                Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+            }});
+        }}
+
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
+    }}
 }}
 "#
     )

@@ -78,6 +78,7 @@ database is its own business, and it happens later:
 | `autumn-media-plugin` | `media_rooms`, `media_room_participants` | its `migrations/20260720000000_media_rooms` — **you** apply it, and only if you set `[media] room_store_backend = "db"` |
 | `autumn-search` | `autumn_search_documents`, `autumn_search_deletes` | created at runtime by the Postgres engine (`CREATE TABLE IF NOT EXISTS`) the first time it starts |
 | `autumn-admin-plugin` | none of its own | reads framework-owned tables that `autumn-web`'s own migrations create |
+| `autumn-billing` | `billing_customers`, `billing_subscriptions`, `billing_invoices`, `billing_events`, `billing_dunning` | its `migrations/20260910203829_billing_mirror`, registered through `plugin_migrations` so the app's normal migration run applies it |
 | `autumn-cache-redis` | none | entries live in Redis |
 | `autumn-storage-s3` | none | blobs live in the bucket |
 
@@ -270,6 +271,7 @@ run.
 | `autumn-storage-s3` | S3-backed object storage | [Storage](./guide/storage.md) |
 | `autumn-cache-redis` | Redis-backed shared cache | [Cache stampede](./guide/cache-stampede.md) |
 | `autumn-search` | Keyword **and** vector search with lifecycle-synced indexes | [Search](./guide/search.md) |
+| `autumn-billing` | Stripe subscriptions: checkout, portal, webhook mirror, plan gate, dunning | [Billing](./guide/billing.md) |
 
 ## Trust model: native plugins are full-trust
 
