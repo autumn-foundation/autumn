@@ -89,9 +89,16 @@ the tally separately.
 first version of this bullet list only accounted for 13 of the 14 failed
 runs.** Reconciled: 10 Clippy + 1 `cargo-deny` + 1 `api_token_error_response`
 + 1 `crate_path` rename regression (added above) + 1 `job_tracking` = 14.
-The missing run was 34512432068, mischaracterized in the original pass as
-one of the "2 more" Clippy failures without actually checking its job log —
-it fails a `Test (windows-latest)` unit test, not `Clippy`. Fixed above.
+**Correction (post-review, via a second Codex review comment on PR #2711):
+the missing run's provenance was stated wrong in the first fix.** Run
+34512432068 was not mischaracterized as one of the "2 more" Clippy
+failures — those two were explicitly named as the `issue-1751` and
+`shortcode-escape` branches, and the ten-run Clippy count is still exactly
+those two plus the eight `upbeat-allen` runs. 34512432068 (branch
+`codex/plan-and-fix-model-registration-issue`) was simply omitted from the
+tally altogether — not checked, not bucketed as anything — which is why
+the stated 14 only broke down to 13. It fails a `Test (windows-latest)`
+unit test, not `Clippy`; added as its own bucket above.
 
 No hits this pass on `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
 the three signatures the ongoing macOS/coverage investigation is tracking.
@@ -168,14 +175,19 @@ being proposed.
 
 **`live_upgrade`/`cache_stampede`/`sim_fault_plan`: unchanged.** Zero new
 organic hits this pass. `manual-macos-contention-check.yml` — macOS-only,
-plain `cargo test --workspace` — is still undispatched; dispatching it
-could plausibly close `cache_stampede` and `sim_fault_plan` outright (both
-observed macOS-only so far), but per the ledger's own corrected accounting
-it cannot close `live_upgrade` on its own even with a clean run — that
-entry has two Linux/`Coverage (workspace)` signatures this harness cannot
-reproduce (no Linux leg, no `cargo llvm-cov`), needing a still-unbuilt
-second harness. (An earlier version of this line implied the one harness
-could close all three; corrected per a Codex review comment.)
+plain `cargo test --workspace` — is still undispatched. **Correction
+(post-review, via a third Codex review comment on PR #2711): a clean
+dispatch would not "close" `cache_stampede` or `sim_fault_plan` either,
+even setting the Linux gap aside.** Both are still undiagnosed — no named
+mechanism, no test-vs-product verdict, no fix — and this role's own hard
+gate requires a diagnosis and a fix verified against a baseline before an
+entry closes; a 0/20 baseline rerun of an undiagnosed test is a data point
+toward triage, not the after-measurement half of a fix that doesn't exist
+yet. Dispatching the harness would supply exactly that: a same-commit
+baseline for both, and (per the ledger's own corrected accounting) partial
+evidence for `live_upgrade`'s macOS-observed signature — worth doing on
+all three counts, but "close" overstated what a clean run alone can do for
+any of them.
 
 ## 🔧 Treatment
 
