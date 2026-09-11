@@ -612,6 +612,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The dev error overlay no longer falls back to `cfg!(debug_assertions)`
+  when `profile` is unset (🛡 Warden):** `apply_middleware`'s `is_dev` (the
+  flag that gates the HTML dev error badge — internal error messages, request
+  headers, cookies, and, when available, SQL query text and stack frames)
+  disagreed with the request inspector's own gate (`is_dev_profile`) about
+  what an absent profile means. The inspector already failed closed
+  (`None` is not dev); the error overlay instead fell back to
+  `cfg!(debug_assertions)`, so a debug build (an ordinary `cargo build`/
+  `cargo run` with no `--release`) running under a profile-less config served
+  the full overlay on every 5xx. `AutumnConfig::profile` is `Option<String>`
+  with no forced default, and a custom `ConfigLoader`
+  (`docs/guide/custom-subsystems.md` documents writing one) is not required
+  to set it — only the default `TomlEnvConfigLoader`'s `resolve_profile`
+  defaults an absent profile to `"dev"`. An app using a documented custom
+  loader whose backing file has no `profile` key got the dev overlay on a
+  debug-built deployment even though its author never opted into
+  `profile = "dev"`. Both gates now derive from one function,
+  `crate::config::profile_is_dev`, which fails closed on `None` with no
+  build-mode fallback; `route_listing.rs`'s inspector-route listing (used by
+  `autumn routes audit`) was converted to the same helper to remove the last
+  duplicate copy of this check. See
+  `docs/security/2026-09-11-profile-conditional-dev-overlay/`.
+
 - **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
   (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
   tenant (🛡 Warden):** the key was built as `principal:<id>` from whatever
