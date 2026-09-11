@@ -3,18 +3,41 @@
 //! `autumn build` shells out to `cargo`, so the *compiler* is the enforcement
 //! point for "this handler cannot run at the edge". [`EdgeHandler`] is the
 //! bound that turns an unavailable extractor into an actionable message
-//! instead of a wall of trait-resolution noise: the handler is required to be
-//! an axum handler over [`EdgeState`] — a unit state — so any extractor that
-//! needs real application state (`Db`, `Session`, `Clock`, `Rng`, …) simply
-//! does not fit, and the diagnostic explains why.
+//! instead of a wall of trait-resolution noise.
+//!
+//! ## Why a whitelist, not just `EdgeState`
+//!
+//! An early version bounded a handler on `axum::handler::Handler<T,
+//! EdgeState>` alone — "must be an axum handler over the unit state" — and
+//! nothing more. That bound is too open: axum's `Extension<T>` extractor
+//! works for *any* state, so it satisfies `Handler<_, EdgeState>` too, even
+//! though the capsule installs no request extensions except [`EdgeCache`](crate::extract::EdgeCache).
+//! The same is true of the whole-`Request` extractor: it also works for any
+//! state, and a handler that takes it can call `.extensions()` on it by hand.
+//! Either shape compiles, passes locally against the origin (where the real
+//! extension *is* present), and only diverges at the edge — a silent gap
+//! between the two substrates, exactly what this crate exists to close.
+//!
+//! [`EdgeExtract`] closes it with a positive list instead: an edge handler's
+//! parameters must each be one of the few extractors that behave the same
+//! way on both substrates. Nothing outside that list satisfies
+//! [`EdgeHandler`], whatever name or wrapper hides it — a type alias for
+//! `Extension<T>` is still `Extension<T>` to the compiler, and the
+//! whole-`Request` extractor is simply not on the list.
 
 use crate::route::EdgeState;
 
 mod sealed {
     /// Not nameable outside this crate, so [`super::EdgeHandler`] cannot be
     /// implemented downstream: the set of edge-eligible handlers is exactly
-    /// the set of axum handlers over [`super::EdgeState`], by construction.
+    /// the set of axum handlers over [`super::EdgeState`] whose extractors are
+    /// each [`super::EdgeExtract`], by construction.
     pub trait Sealed<T> {}
+
+    /// Not nameable outside this crate, so [`super::EdgeExtract`] cannot be
+    /// implemented downstream: the whitelist is exactly the types this module
+    /// lists, and nothing else.
+    pub trait ExtractSealed {}
 }
 
 impl<H, T> sealed::Sealed<T> for H where H: axum::handler::Handler<T, EdgeState> {}
@@ -25,12 +48,78 @@ impl<H, T> sealed::Sealed<T> for H where H: axum::handler::Handler<T, EdgeState>
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot serve as an `#[edge]` handler",
     label = "this handler uses an extractor or return type unavailable at the edge",
-    note = "edge handlers may use extractors that work for any state (e.g. `Path`, `Query`, `HeaderMap`, `EdgeCache`) and must not use native-only extractors (e.g. `Db`, `Session`, `Clock`, `Rng`)",
+    note = "edge handlers may use only `Path`, `Query`, `HeaderMap`, `EdgeCache`, and tuples of \
+            these — nothing else, including `Extension<T>` (even through a type alias) and the \
+            whole-`Request` extractor, satisfies this bound",
     note = "remove `#[edge]` from this route, or replace the offending extractor; see docs/guide/edge.md"
 )]
 pub trait EdgeHandler<T>: sealed::Sealed<T> {}
 
-impl<H, T> EdgeHandler<T> for H where H: axum::handler::Handler<T, EdgeState> {}
+impl<H, T> EdgeHandler<T> for H
+where
+    H: axum::handler::Handler<T, EdgeState>,
+    T: EdgeExtract,
+{
+}
+
+/// The fixed set of extractors an `#[edge]` handler may take.
+///
+/// Sealed and blanket-implemented for exactly [`axum::extract::Path`],
+/// [`axum::extract::Query`], [`http::HeaderMap`], [`EdgeCache`](crate::extract::EdgeCache),
+/// the empty tuple (a handler with no extractors), and tuples of up to eight
+/// of these — nothing else. This is what makes [`EdgeHandler`] a whitelist
+/// rather than a blacklist: a new native-only extractor needs no refusal
+/// added here, because it was never on the list to begin with.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
+    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`, and tuples of these"
+)]
+pub trait EdgeExtract: sealed::ExtractSealed {}
+
+// axum's zero-argument `Handler` impl uses `T = ((),)`, a one-element tuple
+// wrapping unit — not bare `()` — see `impl_handler!`'s neighbor in
+// `axum::handler` for the exact shape.
+impl sealed::ExtractSealed for ((),) {}
+impl EdgeExtract for ((),) {}
+
+impl<T> sealed::ExtractSealed for axum::extract::Path<T> {}
+impl<T> EdgeExtract for axum::extract::Path<T> {}
+
+impl<T> sealed::ExtractSealed for axum::extract::Query<T> {}
+impl<T> EdgeExtract for axum::extract::Query<T> {}
+
+impl sealed::ExtractSealed for http::HeaderMap {}
+impl EdgeExtract for http::HeaderMap {}
+
+impl sealed::ExtractSealed for crate::extract::EdgeCache {}
+impl EdgeExtract for crate::extract::EdgeCache {}
+
+/// Implement [`EdgeExtract`] for a tuple of extractor types that are each
+/// `EdgeExtract`.
+///
+/// axum's own `Handler<T, S>` blanket impl (see `impl_handler!` in
+/// `axum::handler`) does not use `T = (E1, .., En)` — it prepends a private
+/// marker type that records whether the last extractor reads the body or
+/// only the request parts, so `T = (M, E1, .., En)`. `M` is not nameable
+/// outside axum, so it is left as a free type parameter here: this trait
+/// only judges the extractor types, and axum's own bound (required
+/// alongside this one everywhere `EdgeHandler` is used) already proves the
+/// tuple is a real, valid handler signature.
+macro_rules! impl_edge_extract_for_handler_arity {
+    ($($t:ident),+) => {
+        impl<M, $($t: EdgeExtract),+> sealed::ExtractSealed for (M, $($t,)+) {}
+        impl<M, $($t: EdgeExtract),+> EdgeExtract for (M, $($t,)+) {}
+    };
+}
+
+impl_edge_extract_for_handler_arity!(T1);
+impl_edge_extract_for_handler_arity!(T1, T2);
+impl_edge_extract_for_handler_arity!(T1, T2, T3);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8);
 
 /// Adapt a `GET` handler into the `MethodRouter` an
 /// [`EdgeRoute`](crate::route::EdgeRoute) carries.
