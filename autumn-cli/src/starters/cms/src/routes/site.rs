@@ -633,6 +633,17 @@ impl Csrf {
     pub fn token(&self) -> &str {
         self.token.as_ref().map_or("", CsrfToken::token)
     }
+
+    /// A `Csrf` as seen with the layer unmounted — the same shape
+    /// `from_request_parts` produces then. Lets a route module's own unit
+    /// tests render a page's markup functions without standing up a request.
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            token: None,
+            field: None,
+        }
+    }
 }
 
 /// The one-time submit token, absent when `SubmitTokenLayer` is not mounted.
