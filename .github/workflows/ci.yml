@@ -1917,6 +1917,13 @@ jobs:
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
+        # CARGO_TARGET_DIR matches examples/edge-greeting/tests/conformance.rs's
+        # own build_capsule(), which builds the same target into
+        # `<workspace target dir>/edge-conformance` — so this build and the
+        # suite's build land in one target-dir subtree. Cargo then finds its
+        # own build already fresh and does not compile the capsule twice.
+        env:
+          CARGO_TARGET_DIR: target/edge-conformance
         run: cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule
       - name: Nothing native may reach the capsule
         # `autumn-edge`'s manifest guard asserts this at the source level (one
