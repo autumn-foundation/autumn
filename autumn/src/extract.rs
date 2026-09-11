@@ -131,6 +131,100 @@ where
     }
 }
 
+/// CSV request body extractor and response type.
+///
+/// When used as a handler parameter, deserializes the request body as a CSV list of records.
+/// When returned from a handler, serializes the value as CSV with
+/// `Content-Type: text/csv; charset=utf-8`.
+///
+/// Requires the `csv` feature.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Deserialize, Serialize)]
+/// struct Item { id: i64, name: String }
+///
+/// #[post("/items/import")]
+/// async fn import(Csv(items): Csv<Vec<Item>>) -> Csv<Vec<Item>> {
+///     Csv(items)
+/// }
+/// ```
+#[cfg(feature = "csv")]
+pub struct Csv<T>(pub T);
+
+#[cfg(feature = "csv")]
+impl_extractor_deref!(Csv);
+
+#[cfg(feature = "csv")]
+impl<S, T> FromRequest<S> for Csv<Vec<T>>
+where
+    S: Send + Sync,
+    T: for<'de> serde::Deserialize<'de>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .map_err(|err| {
+                crate::AutumnError::bad_request_msg(format!("Failed to read body: {err}"))
+            })?;
+
+        let mut reader = ::csv::Reader::from_reader(bytes.as_ref());
+        let mut results = Vec::new();
+        for result in reader.deserialize::<T>() {
+            let record = result.map_err(|err| {
+                crate::AutumnError::bad_request_msg(format!("CSV parse error: {err}"))
+            })?;
+            results.push(record);
+        }
+        Ok(Self(results))
+    }
+}
+
+#[cfg(feature = "csv")]
+impl<T> IntoResponse for Csv<Vec<T>>
+where
+    T: serde::Serialize,
+{
+    fn into_response(self) -> Response {
+        let mut writer = ::csv::Writer::from_writer(Vec::new());
+        for record in &self.0 {
+            if let Err(e) = writer.serialize(record) {
+                return rejection_to_error(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("CSV serialization failed: {e}"),
+                )
+                .into_response();
+            }
+        }
+        let bytes = match writer.into_inner() {
+            Ok(b) => b,
+            Err(e) => {
+                return rejection_to_error(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("CSV writer flush failed: {e}"),
+                )
+                .into_response();
+            }
+        };
+
+        let mut res = bytes.into_response();
+        res.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/csv; charset=utf-8"),
+        );
+        res
+    }
+}
+
 /// Extract typed path parameters from the URL.
 ///
 /// Wraps [`axum::extract::Path`] so path parse failures use Autumn's
@@ -906,6 +1000,71 @@ mod tests {
     use super::*;
     use axum::extract::FromRequest;
     use axum::http::Request;
+
+    #[cfg(feature = "csv")]
+    #[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
+    struct TestCsvRecord {
+        id: i32,
+        name: String,
+    }
+
+    #[cfg(feature = "csv")]
+    #[tokio::test]
+    async fn csv_extractor_and_response() {
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        async fn csv_handler(Csv(payload): Csv<Vec<TestCsvRecord>>) -> impl IntoResponse {
+            Csv(payload)
+        }
+
+        let app = axum::Router::new().route("/csv", axum::routing::post(csv_handler));
+        let body = "id,name\n1,foo\n2,bar\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/csv")
+            .header("Content-Type", "text/csv")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let content_type = resp.headers().get("Content-Type").unwrap();
+        assert_eq!(content_type, "text/csv; charset=utf-8");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(text, "id,name\n1,foo\n2,bar\n");
+    }
+
+    #[cfg(feature = "csv")]
+    #[tokio::test]
+    async fn csv_extractor_invalid_csv() {
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        async fn csv_handler(Csv(payload): Csv<Vec<TestCsvRecord>>) -> impl IntoResponse {
+            Csv(payload)
+        }
+
+        let app = axum::Router::new().route("/csv", axum::routing::post(csv_handler));
+        // Missing name column
+        let body = "id\n1\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/csv")
+            .header("Content-Type", "text/csv")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // CSV parse errors map to AutumnError::bad_request_msg (400)
+        assert_eq!(resp.status(), 400);
+    }
 
     #[tokio::test]
     async fn test_multipart_field_bytes_limited_success() {
