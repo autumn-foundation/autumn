@@ -649,38 +649,53 @@ fn a_positional_path_migrates_that_directory_not_the_working_one() {
 }
 
 #[test]
-fn a_positional_paths_own_target_directory_config_is_still_honoured() {
+fn a_positional_paths_ancestor_target_directory_config_is_still_honoured() {
     // Cargo discovers `.cargo/config.toml` from the invoking process's
     // working directory, not from `--manifest-path` — so asking `cargo
     // metadata` about the positional path's target directory has to run
     // *from* that path, not from wherever `autumn upgrade` itself was
-    // launched. Getting this wrong either misses the redirect below (and
-    // `--apply` rewrites build output) or, worse, picks up `outside`'s own
-    // unrelated config instead.
-    let outside = TempDir::new().expect("tempdir");
-    let tmp = app("0.5.0");
-    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    // launched. The redirect here is declared in an *ancestor* of the app,
+    // not the app's own `.cargo/config.toml`: `collect_target_dirs` already
+    // re-reads the app's own directory directly (no subprocess involved), so
+    // only a redirect declared above it can expose a cwd-dependent answer.
+    let outer = TempDir::new().expect("tempdir");
     write(
-        tmp.path(),
-        ".cargo/config.toml",
-        "[build]\ntarget-dir = \"out\"\n",
+        outer.path(),
+        "app/Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nautumn-web = \"0.5.0\"\n",
     );
-    write(tmp.path(), "out/debug/build/generated.rs", USES_WITH_POOL);
+    write(outer.path(), "app/src/main.rs", USES_WITH_POOL);
+    write(
+        outer.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"app/out\"\n",
+    );
+    write(outer.path(), "app/out/debug/generated.rs", USES_WITH_POOL);
+    // The un-redirected default `target/` also has to exist on disk: without
+    // it, a wrong answer from the bug this test guards against still fails
+    // `canonicalize` and falls back to the (correct) hand-rolled walk,
+    // masking the very bug it is meant to catch.
+    fs::create_dir_all(outer.path().join("app/target")).expect("decoy target dir");
 
+    let outside = TempDir::new().expect("tempdir");
+    let app_path = outer.path().join("app");
     let output = Command::new(autumn_bin())
-        .args(["upgrade", tmp.path().to_str().expect("utf-8 path")])
+        .args(["upgrade", app_path.to_str().expect("utf-8 path")])
         .args(["--to", "0.6.0", "--apply"])
         .current_dir(outside.path())
         .output()
         .expect("failed to run autumn upgrade");
     assert!(output.status.success(), "{}", report(&output));
     assert!(
-        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
-        "app source is still migrated"
+        read(&app_path, "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated:\n{}",
+        stdout_of(&output)
     );
     assert!(
-        read(tmp.path(), "out/debug/build/generated.rs").contains("with_pool(pool.clone())"),
-        "the positional path's own target-dir redirect is still build output"
+        read(&app_path, "out/debug/generated.rs").contains("with_pool(pool.clone())"),
+        "the ancestor's target-dir redirect is still build output:\n{}",
+        stdout_of(&output)
     );
 }
 
