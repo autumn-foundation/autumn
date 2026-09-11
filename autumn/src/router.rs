@@ -773,7 +773,7 @@ fn build_router_pre_state(
 
     // Dev request inspector: mount UI and apply recording middleware.
     // Only active when profile = "dev"; returns 404 for all other profiles.
-    let is_dev_profile = matches!(config.profile.as_deref(), Some("dev" | "development"));
+    let is_dev_profile = crate::config::profile_is_dev(config.profile.as_deref());
     if is_dev_profile {
         // Capture the matched route pattern for the dev error overlay.
         // Applied as a route_layer so MatchedPath is already set when this runs.
@@ -5275,10 +5275,12 @@ fn apply_middleware(
     #[cfg(not(feature = "db"))]
     let ryw_layer = tower::layer::util::Identity::new();
 
-    let is_dev = config
-        .profile
-        .as_deref()
-        .map_or(cfg!(debug_assertions), |p| p == "dev");
+    // Must agree with `is_dev_profile` above (the request inspector's own
+    // gate) on what "dev" means: both derive it from
+    // `crate::config::profile_is_dev`, which fails closed on an unset
+    // profile rather than falling back to `cfg!(debug_assertions)` — see its
+    // doc comment for why that fallback was a dev-overlay disclosure bug.
+    let is_dev = crate::config::profile_is_dev(config.profile.as_deref());
 
     // Error page filter: renders HTML error pages for browser requests.
     // Always registered (uses default renderer if no custom one is provided).
