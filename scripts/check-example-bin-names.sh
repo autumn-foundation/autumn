@@ -12,10 +12,12 @@ WHAT THE INVARIANT IS
 
 WHAT IT CHECKS
   For every member of the workspace rooted at the repo root — the listed
-  `[workspace].members` (globs expanded) plus in-tree path dependencies, which
+  `[workspace].members` (globs expanded), the root package itself when the
+  root manifest carries `[package]`, plus in-tree path dependencies, which
   cargo automatically treats as members even when `members` does not name them
   (including `[workspace.dependencies]`-inherited paths) —
-  it enumerates the binary target names cargo would build:
+  it enumerates the binary target names cargo would build, honoring cargo's
+  auto-discovery rules (including the edition-2015 manual-target opt-out):
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
   - auto-discovered targets whenever `[package] autobins` is not `false`:
@@ -47,8 +49,8 @@ stops catching things fails loud rather than going green on an empty scan.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import glob
+import re
 import sys
 import tempfile
 import tomllib
@@ -91,6 +93,42 @@ def _in_tree_dep_paths(manifest: dict, workspace_deps: dict) -> list[tuple[str, 
                     ):
                         paths.append((inherited["path"], True))
     return paths
+
+
+def _cargo_glob_match(rel: str, pattern: str) -> bool:
+    """Match a workspace-relative path against an `exclude` glob, cargo-style.
+
+    Cargo treats `exclude` entries as glob patterns where `*` and `?` do not
+    match `/` (only `**` crosses directories); `fnmatch.fnmatchcase` instead
+    lets `*` swallow `/`, so `examples/*` would wrongly exclude
+    `examples/x/nested`. Translate to a regex with separator-aware wildcards.
+    """
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = pattern.find("]", i + 1)
+            if j == -1:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                out.append(pattern[i : j + 1])
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.fullmatch("".join(out), rel) is not None
 
 
 def _expand_member_pattern(root: Path, pattern: str) -> list[Path]:
@@ -136,7 +174,7 @@ def workspace_members(root: Path) -> list[Path]:
 
     def is_excluded(member_dir: Path) -> bool:
         rel = member_dir.relative_to(root).as_posix()
-        return any(fnmatch.fnmatchcase(rel, pat) for pat in exclude)
+        return any(_cargo_glob_match(rel, pat) for pat in exclude)
 
     queue: list[Path] = []
     for m in ws.get("members", []):
@@ -144,6 +182,11 @@ def workspace_members(root: Path) -> list[Path]:
             if (member_dir / "Cargo.toml").is_file() and not is_excluded(member_dir):
                 note(member_dir)
                 queue.append(member_dir)
+    if "package" in manifest and not is_excluded(root):
+        # Root package: a root Cargo.toml with both [package] and [workspace]
+        # is automatically a member even when `members` omits ".".
+        note(root)
+        queue.append(root)
 
     while queue:
         member_dir = queue.pop(0)
@@ -194,9 +237,14 @@ def bin_target_names(member_dir: Path) -> list[str]:
     explicit_names, claimed_paths = explicit_bins(member_dir)
 
     discovered: list[str] = []
-    # #2690: explicit [[bin]] entries do NOT disable auto-discovery — only
-    # `[package] autobins = false` does. Enumerate both classes.
-    if package.get("autobins", True) is not False:
+    # Auto-discovery is on unless `[package] autobins = false` — EXCEPT in
+    # edition 2015 (also the default when `edition` is omitted), where any
+    # manually specified target ([[bin]] or [lib]) disables auto-discovery
+    # entirely. (In edition 2018+ explicit [[bin]] entries do NOT disable it.)
+    auto = package.get("autobins", True) is not False
+    if auto and str(package.get("edition", "2015")) == "2015":
+        auto = not ("bin" in manifest or "lib" in manifest)
+    if auto:
         src = member_dir / "src"
         # `src/main.rs` is auto-discovered as a binary named after the package
         # (cargo `inferred_bins`): it is NOT limited to explicit [[bin]]
@@ -311,12 +359,14 @@ def self_test() -> int:
 
     # Case 1 (#2690): explicit [[bin]] plus an auto-discovered helper in the
     # SAME member — the old script returned early on `explicit` and missed it.
+    # (Edition 2021: explicit targets do not disable auto-discovery there;
+    # case 19 covers the edition-2015 opt-out.)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         root = _make_workspace(tmp, ["app"])
         _make_member(
             tmp / "root", "app",
-            '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
             '[[bin]]\nname = "app-seed"\npath = "src/bin/seed.rs"\n',
             {"src/bin/seed.rs": "fn main() {}\n", "src/bin/helper.rs": "fn main() {}\n"},
         )
@@ -611,12 +661,97 @@ def self_test() -> int:
         total, collisions = check(root)
         expect("case-only name collision caught", "seed" in collisions or "Seed" in collisions)
 
+    # Case 17 (Codex review): `exclude` globs are cargo-style — `*` does not
+    # match `/`, so `examples/*` excludes `examples/x` but NOT the deeper
+    # in-tree path dependency `examples/x/nested`, which must still be scanned.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app", "other", "examples/x"], exclude=["examples/*"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+            '[dependencies]\nnested = { path = "../examples/x/nested" }\n',
+            {},
+        )
+        _make_member(
+            tmp / "root", "examples/x",
+            '[package]\nname = "x"\nversion = "0.1.0"\n',
+            {"src/bin/shadowed.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "examples/x/nested",
+            '[package]\nname = "nested"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "other",
+            '[package]\nname = "other"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        members = [m.relative_to(root).as_posix() for m in workspace_members(root)]
+        expect(
+            "exclude glob matches first level",
+            "examples/x" not in members,
+        )
+        expect(
+            "exclude glob does not cross '/'; nested dep scanned, collision caught",
+            "examples/x/nested" in members and "clash" in collisions,
+        )
+
+    # Case 18 (Codex review): a root Cargo.toml with both [package] and
+    # [workspace] makes the root package itself a member.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = tmp / "root"
+        root.mkdir()
+        (root / "Cargo.toml").write_text(
+            '[package]\nname = "rootpkg"\nversion = "0.1.0"\n\n'
+            "[workspace]\nmembers = [\n  \"app\",\n]\n"
+        )
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "main.rs").write_text("fn main() {}\n")
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+            '[[bin]]\nname = "rootpkg"\npath = "src/bin/rootpkg.rs"\n',
+            {"src/bin/rootpkg.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "root package scanned; collision with its src/main.rs bin caught",
+            "rootpkg" in collisions,
+        )
+
+    # Case 19 (Codex review): edition 2015 (the default when `edition` is
+    # omitted) plus any explicit target disables auto-discovery entirely —
+    # `src/bin/extra.rs` is NOT a target, so no false collision is reported.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "edition-2015 explicit target disables auto-discovery; no false collision",
+            not collisions and sorted(bin_target_names(root / "a")) == ["real"],
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 16 cases passed")
+    print("self-test: all 19 cases passed")
     return 0
 
 
