@@ -352,6 +352,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **cli:** `autumn upgrade` bounds the two approximations behind its codemod
+  safety posture (issue #2234, follow-up to #2231). `0.6.0-repository-with-pool-untracked`
+  now ships as `review` rather than `auto`: it still rewrites every call site,
+  but flags each one, since receiver identification is textual and can be
+  fooled by a hand-written type or a `#[repository]` from another crate. A
+  hand-written type declared inside a function body no longer vouches
+  module-wide against a call elsewhere in the file — the same block-scope fix
+  already applied to generated repository types. `configured_target_dirs` now
+  asks `cargo metadata --no-deps` for the app's build-output directory
+  instead of hand-rolling Cargo's config resolution, falling back to the
+  hand-rolled walk when the subprocess is unavailable; vendor-directory and
+  nested-crate resolution are unchanged, since `cargo metadata` reports
+  neither.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of

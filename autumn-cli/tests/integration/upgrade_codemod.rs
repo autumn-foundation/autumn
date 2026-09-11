@@ -649,6 +649,42 @@ fn a_positional_path_migrates_that_directory_not_the_working_one() {
 }
 
 #[test]
+fn a_positional_paths_own_target_directory_config_is_still_honoured() {
+    // Cargo discovers `.cargo/config.toml` from the invoking process's
+    // working directory, not from `--manifest-path` — so asking `cargo
+    // metadata` about the positional path's target directory has to run
+    // *from* that path, not from wherever `autumn upgrade` itself was
+    // launched. Getting this wrong either misses the redirect below (and
+    // `--apply` rewrites build output) or, worse, picks up `outside`'s own
+    // unrelated config instead.
+    let outside = TempDir::new().expect("tempdir");
+    let tmp = app("0.5.0");
+    write(tmp.path(), "src/main.rs", USES_WITH_POOL);
+    write(
+        tmp.path(),
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"out\"\n",
+    );
+    write(tmp.path(), "out/debug/build/generated.rs", USES_WITH_POOL);
+
+    let output = Command::new(autumn_bin())
+        .args(["upgrade", tmp.path().to_str().expect("utf-8 path")])
+        .args(["--to", "0.6.0", "--apply"])
+        .current_dir(outside.path())
+        .output()
+        .expect("failed to run autumn upgrade");
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        read(tmp.path(), "src/main.rs").contains("with_pool_untracked("),
+        "app source is still migrated"
+    );
+    assert!(
+        read(tmp.path(), "out/debug/build/generated.rs").contains("with_pool(pool.clone())"),
+        "the positional path's own target-dir redirect is still build output"
+    );
+}
+
+#[test]
 fn an_unreadable_path_is_a_failure_not_an_empty_report() {
     // A path typo must not read as "your app is already migrated".
     let tmp = app("0.5.0");

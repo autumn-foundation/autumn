@@ -790,6 +790,12 @@ fn cargo_metadata_target_dir(root: &Path) -> Option<PathBuf> {
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
+        // Cargo's `.cargo/config.toml` hierarchy is discovered from the
+        // invoking process's *working directory*, not from `--manifest-path`
+        // — without this, a `path` argument that differs from this process's
+        // own cwd (`autumn upgrade ../other-app`) reads the wrong project's
+        // config, or misses `root`'s own.
+        .current_dir(root)
         .output()
         .ok()?;
     if !output.status.success() {
