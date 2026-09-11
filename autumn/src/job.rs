@@ -787,10 +787,11 @@ enum JobAdminStartDecision {
 pub type JobAdminFuture<'a, T> = Pin<Box<dyn Future<Output = AutumnResult<T>> + Send + 'a>>;
 
 /// Human-facing lifecycle status for a background job entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobAdminStatus {
     /// Waiting to be picked up by a worker.
+    #[default]
     Enqueued,
     /// Enqueued with a future due time (delayed/one-shot scheduled work).
     /// Not visible to workers until the due time passes.
@@ -833,7 +834,10 @@ impl JobAdminStatus {
 }
 
 /// A job row exposed to the admin dashboard.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Fields are added over time. Build one with `..Default::default()` so a
+/// later field does not break the literal.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct JobAdminRecord {
     /// Stable runtime id for this job attempt.
     pub id: String,
@@ -861,6 +865,12 @@ pub struct JobAdminRecord {
     pub principal_id: Option<String>,
     /// Correlation/request id extracted from common payload fields, if present.
     pub correlation_id: Option<String>,
+    /// True when the job waits for a free concurrency slot rather than being
+    /// ready to claim. Approximate: a parked job returns to its queue every
+    /// ~100 ms to retry, so a read can catch a waiting job as `false`. Only
+    /// the Redis backend tracks a parked set; every other backend reports
+    /// `false` even for a job that is waiting.
+    pub blocked_on_concurrency: bool,
 }
 
 /// Paginated records for one job status group.
@@ -1057,6 +1067,7 @@ impl JobAdminStoredRecord {
             last_error: self.last_error.clone(),
             principal_id: self.principal_id.clone(),
             correlation_id: self.correlation_id.clone(),
+            blocked_on_concurrency: false,
         }
     }
 }
@@ -5597,6 +5608,7 @@ impl RedisJobAdminBackend {
         let enqueued = redis_admin_active_list_page(
             &mut connection,
             &self.queue_keys,
+            &self.blocked_key,
             &self.record_prefix,
             JobAdminStatus::Enqueued,
             query.enqueued_page,
@@ -5941,7 +5953,11 @@ fn redis_record_sort_time(record: &RedisJobRecord) -> u64 {
 }
 
 #[cfg(feature = "redis")]
-fn redis_record_to_admin_record(record: &RedisJobRecord, status: JobAdminStatus) -> JobAdminRecord {
+fn redis_record_to_admin_record(
+    record: &RedisJobRecord,
+    status: JobAdminStatus,
+    blocked: bool,
+) -> JobAdminRecord {
     let (principal_id, correlation_id) = job_payload_identity(&record.payload);
     JobAdminRecord {
         id: record.id.clone(),
@@ -5957,6 +5973,7 @@ fn redis_record_to_admin_record(record: &RedisJobRecord, status: JobAdminStatus)
         last_error: record.last_error.clone(),
         principal_id,
         correlation_id,
+        blocked_on_concurrency: blocked,
     }
 }
 
@@ -5981,10 +5998,84 @@ async fn redis_records_for_ids(
         .collect())
 }
 
+/// One ordered source of enqueued job ids.
+///
+/// The priority-ordered queue lists and the concurrency-parked zset page as a
+/// single logical list, so a parked job stays on the enqueued tab instead of
+/// blinking out of it each time it cycles back to a queue (#1186).
+#[cfg(feature = "redis")]
+enum RedisIdSource<'a> {
+    /// Queue list: `LLEN` for the length, `LRANGE` for a slice.
+    Queue(&'a str),
+    /// Concurrency-parked zset: `ZCARD` for the length, `ZRANGE` for a slice.
+    Blocked(&'a str),
+}
+
+#[cfg(feature = "redis")]
+impl RedisIdSource<'_> {
+    const fn key(&self) -> &str {
+        match self {
+            Self::Queue(key) | Self::Blocked(key) => key,
+        }
+    }
+
+    const fn len_command(&self) -> &'static str {
+        match self {
+            Self::Queue(_) => "LLEN",
+            Self::Blocked(_) => "ZCARD",
+        }
+    }
+
+    const fn range_command(&self) -> &'static str {
+        match self {
+            Self::Queue(_) => "LRANGE",
+            Self::Blocked(_) => "ZRANGE",
+        }
+    }
+
+    const fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked(_))
+    }
+}
+
+/// Slice each id source contributes to one page of the concatenated list.
+///
+/// `lens` holds the sources' lengths in concatenation order. Returns
+/// `(source index, offset within that source, id count)` for every source the
+/// page touches, skipping the ones it does not.
+#[cfg(feature = "redis")]
+fn redis_page_spans(lens: &[u64], start: u64, per_page: u64) -> Vec<(usize, u64, u64)> {
+    let mut spans = Vec::new();
+    let mut taken = 0_u64;
+    let mut offset = 0_u64;
+    for (index, &len) in lens.iter().enumerate() {
+        if taken >= per_page {
+            break;
+        }
+        // Global indices this source covers: [offset, offset + len).
+        let end = offset.saturating_add(len);
+        if start >= end {
+            offset = end;
+            continue;
+        }
+        let local_start = start.saturating_sub(offset);
+        let count = len
+            .saturating_sub(local_start)
+            .min(per_page.saturating_sub(taken));
+        if count > 0 {
+            spans.push((index, local_start, count));
+            taken = taken.saturating_add(count);
+        }
+        offset = end;
+    }
+    spans
+}
+
 #[cfg(feature = "redis")]
 async fn redis_admin_active_list_page(
     connection: &mut redis::aio::ConnectionManager,
     queue_keys: &[String],
+    blocked_key: &str,
     record_prefix: &str,
     status: JobAdminStatus,
     page: u64,
@@ -5993,13 +6084,18 @@ async fn redis_admin_active_list_page(
     let page = page.max(1);
     let start = page.saturating_sub(1).saturating_mul(per_page);
 
-    // Per-queue lengths so we can paginate across the priority-ordered queues as
-    // one logical list (highest-priority queue first).
-    let mut lens = Vec::with_capacity(queue_keys.len());
+    // Queues first (highest priority first), then the parked jobs.
+    let mut sources: Vec<RedisIdSource<'_>> = queue_keys
+        .iter()
+        .map(|key| RedisIdSource::Queue(key))
+        .collect();
+    sources.push(RedisIdSource::Blocked(blocked_key));
+
+    let mut lens = Vec::with_capacity(sources.len());
     let mut total = 0_u64;
-    for queue_key in queue_keys {
-        let len: u64 = redis::cmd("LLEN")
-            .arg(queue_key)
+    for source in &sources {
+        let len: u64 = redis::cmd(source.len_command())
+            .arg(source.key())
             .query_async(connection)
             .await
             .map_err(|error| redis_admin_error("read enqueued length", &error))?;
@@ -6008,35 +6104,45 @@ async fn redis_admin_active_list_page(
     }
 
     let mut ids: Vec<String> = Vec::new();
-    let mut global_offset = 0_u64;
-    for (queue_key, len) in queue_keys.iter().zip(lens) {
-        if u64::try_from(ids.len()).unwrap_or(u64::MAX) >= per_page {
-            break;
-        }
-        // Global indices covered by this queue: [global_offset, global_offset+len).
-        if start >= global_offset.saturating_add(len) {
-            global_offset = global_offset.saturating_add(len);
+    let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, local_start, count) in redis_page_spans(&lens, start, per_page) {
+        // `lens` is built from `sources`, so the index always resolves.
+        let Some(source) = sources.get(index) else {
             continue;
-        }
-        let local_start = start.saturating_sub(global_offset);
-        let remaining = per_page.saturating_sub(u64::try_from(ids.len()).unwrap_or(u64::MAX));
-        let local_stop = local_start.saturating_add(remaining).saturating_sub(1);
-        let chunk: Vec<String> = redis::cmd("LRANGE")
-            .arg(queue_key)
+        };
+        let stop = local_start.saturating_add(count).saturating_sub(1);
+        let chunk: Vec<String> = redis::cmd(source.range_command())
+            .arg(source.key())
             .arg(local_start)
-            .arg(local_stop)
+            .arg(stop)
             .query_async(connection)
             .await
             .map_err(|error| redis_admin_error("read enqueued page", &error))?;
-        ids.extend(chunk);
-        global_offset = global_offset.saturating_add(len);
+        let blocked = source.is_blocked();
+        for id in chunk {
+            // The queue and zset reads are not one atomic snapshot, and the
+            // queues are read first: a job parked out of a queue in between
+            // lands in both slices. (The reverse — promoted out of the zset —
+            // cannot: promotion ZREMs before it LPUSHes.) List it once, as
+            // queued; reordering the sources would flip which occurrence wins.
+            if ids.contains(&id) {
+                continue;
+            }
+            if blocked {
+                blocked_ids.insert(id.clone());
+            }
+            ids.push(id);
+        }
     }
 
     let records = redis_records_for_ids(connection, record_prefix, &ids)
         .await
         .map_err(|error| redis_admin_error("read enqueued records", &error))?
         .into_iter()
-        .map(|record| redis_record_to_admin_record(&record, status))
+        .map(|record| {
+            let blocked = blocked_ids.contains(&record.id);
+            redis_record_to_admin_record(&record, status, blocked)
+        })
         .collect();
     Ok(JobAdminPage::new(records, total, page, per_page))
 }
@@ -6074,7 +6180,7 @@ async fn redis_admin_delayed_page(
         .map_err(|error| redis_admin_error("read scheduled records", &error))?
         .into_iter()
         .map(|record| {
-            let mut admin = redis_record_to_admin_record(&record, JobAdminStatus::Scheduled);
+            let mut admin = redis_record_to_admin_record(&record, JobAdminStatus::Scheduled, false);
             if let Some(score) = due_by_id.get(&record.id) {
                 // ZSET scores are due-time-in-ms; clamp the f64 back to u64.
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -6112,7 +6218,7 @@ async fn redis_admin_running_page(
         .await
         .map_err(|error| redis_admin_error("read running records", &error))?
         .into_iter()
-        .map(|record| redis_record_to_admin_record(&record, JobAdminStatus::Running))
+        .map(|record| redis_record_to_admin_record(&record, JobAdminStatus::Running, false))
         .collect();
     records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     Ok(JobAdminPage::new(records, total, page, per_page))
@@ -6153,7 +6259,7 @@ async fn redis_admin_encoded_list_page(
         .into_iter()
         .skip(start)
         .take(take)
-        .map(|record| redis_record_to_admin_record(&record, status))
+        .map(|record| redis_record_to_admin_record(&record, status, false))
         .collect();
     Ok(JobAdminPage::new(page_records, total, page, per_page))
 }
@@ -8251,6 +8357,7 @@ impl PgJobRow {
             last_error: self.last_error.clone(),
             principal_id,
             correlation_id,
+            blocked_on_concurrency: false,
         }
     }
 }
@@ -10407,6 +10514,9 @@ mod tests {
             snapshot.enqueued.records[0].correlation_id.as_deref(),
             Some("req-123")
         );
+        // The local backend keeps an over-cap job in `enqueued` status, so it
+        // never reports the Redis-only parked marker (#1186).
+        assert!(!snapshot.enqueued.records[0].blocked_on_concurrency);
         assert_eq!(snapshot.running.records[0].id, running_id);
         assert_eq!(snapshot.completed.records[0].id, completed_id);
         assert_eq!(snapshot.failed.records[0].id, failed_id);
@@ -12261,10 +12371,25 @@ mod tests {
         client: &redis::Client,
         worker_config: &RedisWorkerConfig,
     ) -> RedisJobAdminBackend {
+        redis_admin_test_backend_with_queues(
+            client,
+            worker_config,
+            vec![worker_config.queue_key.clone()],
+        )
+    }
+
+    /// Same backend with an explicit priority-ordered queue set, for the
+    /// multi-queue paging the single-queue helper cannot reach.
+    #[cfg(feature = "redis")]
+    fn redis_admin_test_backend_with_queues(
+        client: &redis::Client,
+        worker_config: &RedisWorkerConfig,
+        queue_keys: Vec<String>,
+    ) -> RedisJobAdminBackend {
         let admin_connection = new_redis_connection_manager(client, "test redis admin").unwrap();
         RedisJobAdminBackend::new(
             admin_connection,
-            vec![worker_config.queue_key.clone()],
+            queue_keys,
             worker_config.key_prefix.clone(),
             worker_config.delayed_key.clone(),
             worker_config.processing_key.clone(),
@@ -13033,6 +13158,35 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_page_spans_walk_sources_in_order() {
+        // One logical list: queue A (3 ids), queue B (2), blocked zset (2).
+        let lens = [3_u64, 2, 2];
+
+        // Page 1 of 4 takes all of A and the first id of B.
+        assert_eq!(redis_page_spans(&lens, 0, 4), vec![(0, 0, 3), (1, 0, 1)]);
+
+        // Page 2 starts inside B and spills into the blocked zset, so a parked
+        // job is reachable by paging instead of being cut off (#1186).
+        assert_eq!(redis_page_spans(&lens, 4, 4), vec![(1, 1, 1), (2, 0, 2)]);
+
+        // A page past the end reads nothing.
+        assert!(redis_page_spans(&lens, 7, 4).is_empty());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_page_spans_skip_empty_sources() {
+        // Empty queues must consume no offset and issue no range read.
+        let lens = [0_u64, 0, 5];
+        assert_eq!(redis_page_spans(&lens, 0, 2), vec![(2, 0, 2)]);
+        assert_eq!(redis_page_spans(&lens, 4, 2), vec![(2, 4, 1)]);
+
+        // A zero-width page reads nothing.
+        assert!(redis_page_spans(&lens, 0, 0).is_empty());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_requeue_unique_action_matches_window() {
         let mut record = redis_test_record(1, 3);
         assert_eq!(redis_requeue_unique_action(&record), "");
@@ -13145,6 +13299,173 @@ mod tests {
             .cancel_enqueued_redis(&parked_id[0])
             .await
             .expect("parked jobs must be cancelable");
+    }
+
+    /// #1186: a job parked in the blocked zset must stay listed on the
+    /// enqueued tab instead of blinking out of it every promotion cycle.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    #[allow(clippy::too_many_lines)]
+    async fn redis_admin_enqueued_page_merges_concurrency_parked_jobs() {
+        use redis::AsyncCommands as _;
+
+        // `admin.cancel` settles the process-global tracking store, as the
+        // sibling cancel/retry tests do.
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let prefix = "autumn:test:parked";
+        let worker_config = redis_test_worker_config(prefix, "worker-p", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis parked").unwrap();
+        // Two queues, highest priority first, so the page proves the merge
+        // lands after *every* queue rather than after a single one.
+        let critical_key = redis_queue_key(prefix, "critical");
+        let admin = redis_admin_test_backend_with_queues(
+            &client,
+            &worker_config,
+            vec![critical_key.clone(), worker_config.queue_key.clone()],
+        );
+
+        let limited = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: Some(1),
+            concurrency_scope: None,
+        };
+        for id in ["p1", "p2", "p3"] {
+            redis_enqueue_with_constraints(&client, &worker_config, id, "recalculate", &limited)
+                .await;
+        }
+        let queue_keys = std::slice::from_ref(&worker_config.queue_key);
+        // The first claim takes the single slot; the second walks the rest of
+        // the queue and parks both remaining jobs in the blocked zset.
+        claim_next_redis_job(&mut connection, &worker_config, queue_keys)
+            .await
+            .unwrap()
+            .expect("first job claimed");
+        assert!(
+            claim_next_redis_job(&mut connection, &worker_config, queue_keys)
+                .await
+                .unwrap()
+                .is_none(),
+            "the cap must park the rest instead of claiming them"
+        );
+        let queue_len: u64 = connection.llen(&worker_config.queue_key).await.unwrap();
+        assert_eq!(queue_len, 0, "parked jobs leave the queue list");
+
+        // One ready job per queue, so the merge has to page both before the
+        // parked pair.
+        redis_enqueue_with_constraints(
+            &client,
+            &worker_config,
+            "ready",
+            "send_email",
+            &ResolvedJobConstraints::default(),
+        )
+        .await;
+        let mut urgent = redis_test_record(1, 3);
+        urgent.id = "urgent".to_string();
+        urgent.queue = "critical".to_string();
+        connection
+            .set::<_, _, ()>(
+                redis_record_key(&worker_config.record_prefix, &urgent.id),
+                encode_redis_record(&urgent).unwrap(),
+            )
+            .await
+            .unwrap();
+        connection
+            .lpush::<_, _, ()>(&critical_key, &urgent.id)
+            .await
+            .unwrap();
+
+        let query = |page: u64, per_page: u64| JobAdminQuery {
+            enqueued_page: page,
+            scheduled_page: 1,
+            running_page: 1,
+            completed_page: 1,
+            failed_page: 1,
+            per_page,
+        };
+        let snapshot = admin.snapshot(query(1, 10)).await.expect("snapshot");
+        assert_eq!(
+            snapshot.enqueued.total, 4,
+            "total is LLEN per queue + ZCARD blocked"
+        );
+        let ids: Vec<&str> = snapshot
+            .enqueued
+            .records
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            &ids[..2],
+            &["urgent", "ready"],
+            "queue ids page ahead of parked ids, highest-priority queue first: {ids:?}"
+        );
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains(&"p2") && ids.contains(&"p3"), "{ids:?}");
+
+        // Parked rows are annotated; the ready rows are not.
+        for record in &snapshot.enqueued.records {
+            assert_eq!(record.status, JobAdminStatus::Enqueued);
+            assert_eq!(
+                record.blocked_on_concurrency,
+                record.id != "urgent" && record.id != "ready",
+                "wrong concurrency annotation for {}",
+                record.id
+            );
+        }
+
+        // Paging spans the concatenation: page 3 of 1 lands on the zset.
+        let page_three = admin.snapshot(query(3, 1)).await.expect("page three");
+        assert_eq!(page_three.enqueued.total, 4);
+        assert_eq!(page_three.enqueued.records.len(), 1);
+        let parked = page_three.enqueued.records[0].clone();
+        assert!(parked.id == "p2" || parked.id == "p3", "{}", parked.id);
+        assert!(parked.blocked_on_concurrency);
+
+        // A job caught mid-park is in a queue and the zset at once (the claim
+        // script RPOPs before it ZADDs). It must render once, as queued.
+        connection
+            .lpush::<_, _, ()>(&worker_config.queue_key, &parked.id)
+            .await
+            .unwrap();
+        let racing = admin.snapshot(query(1, 10)).await.expect("racing snapshot");
+        let racing_ids: Vec<&str> = racing
+            .enqueued
+            .records
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            racing_ids.iter().filter(|id| **id == parked.id).count(),
+            1,
+            "a job in both slices must be listed once: {racing_ids:?}"
+        );
+        assert!(
+            !racing
+                .enqueued
+                .records
+                .iter()
+                .find(|r| r.id == parked.id)
+                .expect("the racing row")
+                .blocked_on_concurrency,
+            "the queue occurrence wins, so the row is not marked parked"
+        );
+        connection
+            .lrem::<_, _, ()>(&worker_config.queue_key, 0, &parked.id)
+            .await
+            .unwrap();
+
+        // A parked row's Cancel button still works.
+        admin
+            .cancel(&parked.id)
+            .await
+            .expect("parked jobs stay cancelable");
+        let after = admin.snapshot(query(1, 10)).await.expect("snapshot after");
+        assert_eq!(after.enqueued.total, 3);
     }
 
     #[cfg(feature = "redis")]
