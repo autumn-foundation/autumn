@@ -602,10 +602,16 @@ where
             });
         }
 
-        let mut inner = self.inner.clone();
-        std::mem::swap(&mut self.inner, &mut inner);
-
-        Box::pin(inner.call(req))
+        // No `.await` happens in this middleware itself — everything above is
+        // synchronous prep on `req` — so the `Self::Future`'s `'static` bound
+        // is satisfied by `self.inner.call(req)` directly: no need to clone
+        // `self.inner` into an owned value first. `inner`'s previous
+        // clone-then-swap dance cloned `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) on every request purely to satisfy a
+        // move that was never required, since nothing here captures `self`
+        // past this statement.
+        Box::pin(self.inner.call(req))
     }
 }
 

@@ -109,6 +109,7 @@ pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
     diff_authorization_policies(base, head, &mut findings);
     diff_csrf(base, head, &mut findings);
     diff_headers(base, head, &mut findings);
+    diff_mtls(base, head, &mut findings);
     bind_to_effective_posture(&mut findings, base, head);
     findings.sort_by(|a, b| {
         a.severity
@@ -142,6 +143,7 @@ fn bind_to_effective_posture(
     let routes = route_index(head);
     let csrf = csrf_index(head);
     let bindings = authz_index(head);
+    let mtls = mtls_index(head);
     let base_keys = route_keys(base);
     let head_keys = route_keys(head);
 
@@ -150,7 +152,7 @@ fn bind_to_effective_posture(
         .filter(|f| f.severity == Severity::Widening)
     {
         let key = (normalize_captures(&finding.path), finding.method.clone());
-        let posture = match effective_posture(&key, &routes, &csrf, &bindings) {
+        let posture = match effective_posture(&key, &routes, &csrf, &bindings, &mtls) {
             Some(own) => own,
             // The route the finding names is gone at head. Its URLs went
             // somewhere, and *that* is what the reviewer is approving — so bind
@@ -162,7 +164,7 @@ fn bind_to_effective_posture(
                 let mut inherited: Vec<String> = takers((&key.0, &key.1), &base_keys, &head_keys)
                     .iter()
                     .filter_map(|taker| {
-                        effective_posture(taker, &routes, &csrf, &bindings).map(|posture| {
+                        effective_posture(taker, &routes, &csrf, &bindings, &mtls).map(|posture| {
                             escape_list(&[taker.1.clone(), taker.0.clone(), posture])
                         })
                     })
@@ -197,6 +199,7 @@ fn effective_posture(
     routes: &BTreeMap<RouteKey, RouteEntry>,
     csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
     bindings: &BTreeMap<AuthzKey, String>,
+    mtls: &BTreeSet<RouteKey>,
 ) -> Option<String> {
     let entry = routes.get(key)?;
     let enforced = csrf
@@ -208,11 +211,30 @@ fn effective_posture(
             },
         )
         .to_owned();
-    Some(escape_list(&[
+    let mut parts = vec![
         posture_fingerprint(entry),
         enforced,
         escape_list(&checks_at(key, bindings)),
-    ]))
+    ];
+    // Appended only when the route requires mTLS (#1640), so an app that uses
+    // none fingerprints byte-for-byte as it did before this dimension existed
+    // and its acknowledgments survive the schema bump. Where it IS required,
+    // dropping the requirement after an acknowledgment moves the digest.
+    if mtls.contains(key) {
+        parts.push("mtls".to_owned());
+    }
+    Some(escape_list(&parts))
+}
+
+/// The routes that demand a verified client certificate, by `(path, method)`.
+fn mtls_index(m: &PostureManifest) -> BTreeSet<RouteKey> {
+    m.dimensions
+        .mtls
+        .entries
+        .iter()
+        .filter(|e| e.mtls_required)
+        .map(super::model::MtlsEntry::key)
+        .collect()
 }
 
 /// The postures of every route that inherits a URL set, as one ordered string.
@@ -225,11 +247,12 @@ fn postures_of(
     routes: &BTreeMap<RouteKey, RouteEntry>,
     csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
     bindings: &BTreeMap<AuthzKey, String>,
+    mtls: &BTreeSet<RouteKey>,
 ) -> String {
     let mut each: Vec<String> = keys
         .iter()
         .filter_map(|key| {
-            effective_posture(key, routes, csrf, bindings)
+            effective_posture(key, routes, csrf, bindings, mtls)
                 .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
         })
         .collect();
@@ -1277,6 +1300,7 @@ fn report_csrf_loss(
     head_routes: &BTreeMap<RouteKey, RouteEntry>,
     head_csrf: &BTreeMap<RouteKey, (bool, bool, String)>,
     head_bindings: &BTreeMap<AuthzKey, String>,
+    head_mtls: &BTreeSet<RouteKey>,
     collapse: bool,
     out: &mut Vec<Finding>,
 ) {
@@ -1299,7 +1323,7 @@ fn report_csrf_loss(
                 escape_list(&[
                     method.clone(),
                     path.clone(),
-                    postures_of(inheritors, head_routes, head_csrf, head_bindings),
+                    postures_of(inheritors, head_routes, head_csrf, head_bindings, head_mtls),
                 ])
             })
             .collect();
@@ -1324,7 +1348,13 @@ fn report_csrf_loss(
         });
     } else {
         for (key, (path, exempt, inheritors)) in lost {
-            let guard = postures_of(&inheritors, head_routes, head_csrf, head_bindings);
+            let guard = postures_of(
+                &inheritors,
+                head_routes,
+                head_csrf,
+                head_bindings,
+                head_mtls,
+            );
             let (_, method) = key;
             out.push(Finding {
                 kind: "csrf_enforcement_removed",
@@ -1403,11 +1433,12 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         let routes = route_index(head);
         let csrf = csrf_index(head);
         let bindings = authz_index(head);
+        let mtls = mtls_index(head);
         let mut guards: Vec<String> = routes
             .keys()
             .filter(|(path, _)| added.iter().any(|prefix| exempts_shape(prefix, path)))
             .filter_map(|key| {
-                effective_posture(key, &routes, &csrf, &bindings)
+                effective_posture(key, &routes, &csrf, &bindings, &mtls)
                     .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
             })
             .collect();
@@ -1646,6 +1677,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
         &head_routes,
         &after,
         &authz_index(head),
+        &mtls_index(head),
         collapse,
         out,
     );
@@ -1661,6 +1693,245 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             fingerprint: "csrf-added".to_owned(),
             detail: "CSRF enforcement gained".to_owned(),
         });
+    }
+}
+
+/// Compare the mTLS dimension (#1640).
+///
+/// Two things can weaken it, and both block:
+/// - a route that demanded a verified client certificate stops demanding one —
+///   the regression this dimension exists to catch;
+/// - the listener mode itself weakens (`required` → `optional` → `off`), which
+///   no per-route row shows on its own.
+///
+/// A route that merely *left* the manifest is not reported here: it is already
+/// a route finding, and reporting the lost requirement too would double-count
+/// one deletion.
+fn diff_mtls(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
+    diff_mtls_mode(base, head, out);
+    diff_mtls_required_paths(base, head, out);
+
+    let before = mtls_index(base);
+    let after = mtls_index(head);
+    let head_routes = route_index(head);
+    let head_csrf = csrf_index(head);
+    let head_bindings = authz_index(head);
+
+    for key in before.difference(&after) {
+        // Still mounted, but no longer requiring a certificate. A route that is
+        // gone entirely is the route dimension's finding, not this one's.
+        if !head_routes.contains_key(key) {
+            continue;
+        }
+        let (path, method) = key;
+        out.push(Finding {
+            kind: "mtls_requirement_removed",
+            severity: Severity::Widening,
+            method: method.clone(),
+            path: path.clone(),
+            before: "mtls required".to_owned(),
+            after: "mtls not required".to_owned(),
+            // What still guards the route, for the same reason every other
+            // widening carries it: losing mTLS behind a newly required scope is
+            // not the decision that losing it with the scope gone again is.
+            fingerprint: format!(
+                "mtls-removed:{}",
+                postures_of(
+                    std::slice::from_ref(key),
+                    &head_routes,
+                    &head_csrf,
+                    &head_bindings,
+                    &after,
+                )
+            ),
+            detail: "this route no longer requires a verified client certificate".to_owned(),
+        });
+    }
+
+    for key in after.difference(&before) {
+        let (path, method) = key;
+        out.push(Finding {
+            kind: "mtls_requirement_added",
+            severity: Severity::Narrowing,
+            method: method.clone(),
+            path: path.clone(),
+            before: "mtls not required".to_owned(),
+            after: "mtls required".to_owned(),
+            fingerprint: "mtls-added".to_owned(),
+            detail: "this route now requires a verified client certificate".to_owned(),
+        });
+    }
+}
+
+/// Compare the configured `required_paths` themselves, not just the per-route
+/// rows they produce.
+///
+/// The rows answer whether a route TEMPLATE matches a prefix; the runtime
+/// answers it of the concrete request path. A prefix that protects only part of
+/// a parameterized route — `/users/admin` against a route mounted at
+/// `/users/{id}` — therefore flags no row in either manifest, so dropping it
+/// moves nothing the per-route pass can see while the live listener stops
+/// protecting `/users/admin`. The `csrf` dimension carries `exempt_paths` for
+/// exactly this reason; this is the same rule in the opposite direction.
+///
+/// Coverage, not spelling: replacing `/internal` with `/internal/keys` still
+/// requires a certificate for everything the narrower prefix names, so only the
+/// coverage the narrower set LOSES is reported.
+fn diff_mtls_required_paths(
+    base: &PostureManifest,
+    head: &PostureManifest,
+    out: &mut Vec<Finding>,
+) {
+    // A listener that stopped requesting certificates has already been reported
+    // by `diff_mtls_mode` in the strongest terms available; enumerating the
+    // prefixes it also stopped honouring would add a row without adding
+    // information.
+    if !base.dimensions.mtls.requests_certificate() {
+        return;
+    }
+    let head_requests = head.dimensions.mtls.requests_certificate();
+    let before: BTreeSet<&String> = base.dimensions.mtls.required_paths.iter().collect();
+    let after: BTreeSet<&String> = head.dimensions.mtls.required_paths.iter().collect();
+
+    // Dropped when the head no longer requests certificates at all (every
+    // prefix is then uncovered), or when no remaining prefix covers it.
+    let dropped: Vec<String> = before
+        .iter()
+        .filter(|p| !head_requests || !after.iter().any(|new| covers_prefix(new, p)))
+        .map(|p| (*p).clone())
+        .collect();
+    let added: Vec<String> = after
+        .iter()
+        .filter(|p| !before.iter().any(|old| covers_prefix(old, p)))
+        .map(|p| (*p).clone())
+        .collect();
+
+    if !dropped.is_empty() {
+        // The fingerprint carries the surviving prefixes too. Narrowing
+        // `/internal` to `/internal/admin` leaves `added` empty, so `dropped`
+        // and `added` alone hash the same as a later swap to
+        // `/internal/public` — and one acknowledgment would then cover two
+        // different sets of URLs.
+        let mut surviving: Vec<String> = after.iter().map(|p| (*p).clone()).collect();
+        surviving.sort();
+        out.push(Finding {
+            kind: "mtls_required_path_removed",
+            severity: Severity::Widening,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: dropped.join(", "),
+            after: if surviving.is_empty() {
+                "not required".to_owned()
+            } else {
+                format!("still required: {}", surviving.join(", "))
+            },
+            fingerprint: format!(
+                "mtls-required-path-removed:{}",
+                escape_list(&[
+                    escape_list(&dropped),
+                    escape_list(&added),
+                    escape_list(&surviving),
+                ])
+            ),
+            detail: format!(
+                "a verified client certificate is no longer required for {}, which the \
+                 per-route rows cannot show: the audit matches a prefix against a route \
+                 template, the runtime against the request path",
+                dropped.join(", ")
+            ),
+        });
+    }
+    if !added.is_empty() {
+        out.push(Finding {
+            kind: "mtls_required_path_added",
+            severity: Severity::Narrowing,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: "not required".to_owned(),
+            after: added.join(", "),
+            fingerprint: format!("mtls-required-path-added:{}", escape_list(&added)),
+            detail: format!(
+                "a verified client certificate is now required for {}",
+                added.join(", ")
+            ),
+        });
+    }
+}
+
+/// Whether requirement prefix `outer` covers everything `inner` does.
+///
+/// The runtime's rule (`client_auth::path_matches_any`): a trailing slash is
+/// stripped before matching, and the boundary must be a segment break — so
+/// `/internal` covers `/internal/keys` but not `/internal-tools`.
+fn covers_prefix(outer: &str, inner: &str) -> bool {
+    let outer = outer.strip_suffix('/').unwrap_or(outer);
+    let inner = inner.strip_suffix('/').unwrap_or(inner);
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|r| r.starts_with('/'))
+}
+
+/// Compare the listener-wide mTLS mode.
+///
+/// Ranked `off` < `optional` < `required`: dropping a rank means the listener
+/// asks for less than it did, which no per-route row reports.
+fn diff_mtls_mode(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
+    let before = mtls_mode_rank(&base.dimensions.mtls.mode);
+    let after = mtls_mode_rank(&head.dimensions.mtls.mode);
+    if before == after {
+        return;
+    }
+    let label = |m: &str| {
+        if m.is_empty() {
+            "off".to_owned()
+        } else {
+            m.to_owned()
+        }
+    };
+    let (before_label, after_label) = (
+        label(&base.dimensions.mtls.mode),
+        label(&head.dimensions.mtls.mode),
+    );
+    let (kind, severity, detail) = if after < before {
+        (
+            "mtls_mode_weakened",
+            Severity::Widening,
+            format!(
+                "the listener's client-certificate mode weakened from `{before_label}` to \
+                 `{after_label}`"
+            ),
+        )
+    } else {
+        (
+            "mtls_mode_strengthened",
+            Severity::Narrowing,
+            format!(
+                "the listener's client-certificate mode strengthened from `{before_label}` to \
+                 `{after_label}`"
+            ),
+        )
+    };
+    out.push(Finding {
+        kind,
+        severity,
+        method: "*".to_owned(),
+        path: "*".to_owned(),
+        before: before_label,
+        after: after_label.clone(),
+        fingerprint: format!("mtls-mode:{after_label}"),
+        detail,
+    });
+}
+
+/// Rank an mTLS mode by how much it demands. An empty or unknown spelling ranks
+/// as `off`: a manifest that predates this dimension asks for nothing, and an
+/// unreadable mode must never be treated as protection.
+fn mtls_mode_rank(mode: &str) -> u8 {
+    match mode {
+        "required" => 2,
+        "optional" => 1,
+        _ => 0,
     }
 }
 
@@ -1844,6 +2115,292 @@ mod tests {
             "expected exactly one finding: {findings:#?}"
         );
         findings.into_iter().next().expect("one finding")
+    }
+
+    /// A manifest carrying an `mtls` dimension (schema v4, #1640).
+    fn manifest_mtls(
+        routes: &str,
+        mode: &str,
+        required_paths: &[&str],
+        mtls: &str,
+    ) -> PostureManifest {
+        let required = required_paths
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"schema_version":4,"dimensions":{{
+                 "routes":{{"provenance":"provable","source":"m","entries":[{routes}]}},
+                 "csrf":{{"provenance":"declared","source":"c","exempt_paths":[],"entries":[]}},
+                 "security_headers":{{"provenance":"declared","source":"c","entries":[]}},
+                 "authorization_policies":{{"provenance":"provable","source":"m","runtime_caveat":"x","entries":[]}},
+                 "mtls":{{"provenance":"declared","source":"config:server.tls.client_auth",
+                          "mode":"{mode}","required_paths":[{required}],"entries":[{mtls}]}}
+               }},"excluded":[]}}"#
+        );
+        PostureManifest::parse(&json, "test.json").expect("fixture parses")
+    }
+
+    /// One mTLS entry.
+    fn mtls_entry(path: &str, method: &str, required: bool) -> String {
+        format!(r#"{{"path":"{path}","method":"{method}","mtls_required":{required}}}"#)
+    }
+
+    // ── mtls dimension (#1640) ──────────────────────────────────────────────
+
+    /// The regression this dimension exists to catch: a route silently drops
+    /// its mTLS requirement.
+    #[test]
+    fn a_route_dropping_its_mtls_requirement_is_a_widening_that_names_it() {
+        let routes = route("/internal/keys", "GET", "gated", &["admin"], &[], false);
+        let base = manifest_mtls(
+            &routes,
+            "optional",
+            &["/internal/"],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+        let head = manifest_mtls(
+            &routes,
+            "optional",
+            &[],
+            &mtls_entry("/internal/keys", "GET", false),
+        );
+
+        // Two findings, deliberately: the route row that lost its requirement,
+        // and the configured prefix that stopped being honoured. They catch
+        // different regressions — see `diff_mtls_required_paths`.
+        let findings = diff(&base, &head);
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "mtls_requirement_removed")
+            .unwrap_or_else(|| panic!("expected a per-route finding: {findings:#?}"));
+        assert_eq!(finding.severity, Severity::Widening);
+        assert_eq!(finding.path, "/internal/keys");
+        assert_eq!(finding.method, "GET");
+        assert!(kinds(&findings).contains(&"mtls_required_path_removed"));
+    }
+
+    #[test]
+    fn adding_an_mtls_requirement_is_narrowing() {
+        let routes = route("/internal/keys", "GET", "gated", &[], &[], false);
+        let base = manifest_mtls(
+            &routes,
+            "optional",
+            &[],
+            &mtls_entry("/internal/keys", "GET", false),
+        );
+        let head = manifest_mtls(
+            &routes,
+            "optional",
+            &["/internal/"],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+
+        let findings = diff(&base, &head);
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "mtls_requirement_added")
+            .unwrap_or_else(|| panic!("expected a per-route finding: {findings:#?}"));
+        assert_eq!(finding.severity, Severity::Narrowing);
+        assert!(kinds(&findings).contains(&"mtls_required_path_added"));
+    }
+
+    #[test]
+    fn weakening_the_listener_mode_is_a_widening() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let base = manifest_mtls(&routes, "required", &[], &mtls_entry("/a", "GET", false));
+        let head = manifest_mtls(&routes, "optional", &[], &mtls_entry("/a", "GET", false));
+
+        let finding = only(diff(&base, &head));
+        assert_eq!(finding.kind, "mtls_mode_weakened");
+        assert_eq!(finding.severity, Severity::Widening);
+        assert_eq!(finding.before, "required");
+        assert_eq!(finding.after, "optional");
+    }
+
+    #[test]
+    fn strengthening_the_listener_mode_is_narrowing() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let base = manifest_mtls(&routes, "optional", &[], &mtls_entry("/a", "GET", false));
+        let head = manifest_mtls(&routes, "required", &[], &mtls_entry("/a", "GET", false));
+
+        let finding = only(diff(&base, &head));
+        assert_eq!(finding.kind, "mtls_mode_strengthened");
+        assert_eq!(finding.severity, Severity::Narrowing);
+    }
+
+    /// A deleted route is the route dimension's finding. Reporting its lost
+    /// mTLS requirement too would double-count one deletion.
+    #[test]
+    fn deleting_a_route_does_not_also_report_a_lost_mtls_requirement() {
+        let base = manifest_mtls(
+            &route("/internal/keys", "GET", "gated", &[], &[], false),
+            "optional",
+            &["/internal/"],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+        let head = manifest_mtls("", "optional", &["/internal/"], "");
+
+        assert!(
+            !kinds(&diff(&base, &head)).contains(&"mtls_requirement_removed"),
+            "a removed route must not raise a second, mTLS-shaped finding"
+        );
+    }
+
+    /// The per-route rows answer whether a route TEMPLATE matches a prefix; the
+    /// runtime answers it of the request path. A prefix protecting part of a
+    /// parameterized route flags no row in either manifest, so only comparing
+    /// the configured prefixes catches it being dropped.
+    #[test]
+    fn dropping_a_required_prefix_that_matches_no_route_template_is_a_widening() {
+        let routes = route("/users/{id}", "GET", "gated", &[], &[], false);
+        let entry = mtls_entry("/users/{id}", "GET", false);
+        let base = manifest_mtls(&routes, "optional", &["/users/admin"], &entry);
+        let head = manifest_mtls(&routes, "optional", &[], &entry);
+
+        let finding = only(diff(&base, &head));
+        assert_eq!(finding.kind, "mtls_required_path_removed");
+        assert_eq!(finding.severity, Severity::Widening);
+        assert!(finding.before.contains("/users/admin"), "{finding:?}");
+    }
+
+    #[test]
+    fn narrowing_a_required_prefix_reports_only_the_coverage_lost() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        // `/internal/keys` still requires a certificate, so replacing
+        // `/internal/keys` with the WIDER `/internal` loses nothing.
+        let widened = diff(
+            &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+        );
+        assert!(
+            !kinds(&widened).contains(&"mtls_required_path_removed"),
+            "widening a prefix loses no coverage: {widened:#?}"
+        );
+
+        // The reverse DOES lose coverage: everything under `/internal` that is
+        // not under `/internal/keys` stops requiring one.
+        let narrowed = diff(
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
+        );
+        assert!(kinds(&narrowed).contains(&"mtls_required_path_removed"));
+    }
+
+    /// Replacing a broad prefix with a narrower one leaves `added` empty (the
+    /// old prefix already covered the replacement), so the fingerprint has to
+    /// carry what SURVIVES or two different narrowings hash alike and the first
+    /// acknowledgment silently covers the second.
+    #[test]
+    fn two_different_narrowings_of_one_prefix_do_not_share_a_fingerprint() {
+        let routes = route("/internal/{id}", "GET", "gated", &[], &[], false);
+        let entry = mtls_entry("/internal/{id}", "GET", false);
+        let base = manifest_mtls(&routes, "optional", &["/internal"], &entry);
+
+        let fingerprint = |head_prefix: &str| {
+            let head = manifest_mtls(&routes, "optional", &[head_prefix], &entry);
+            let found = diff(&base, &head)
+                .into_iter()
+                .find(|f| f.kind == "mtls_required_path_removed");
+            let Some(finding) = found else {
+                panic!("expected a removal finding for {head_prefix}");
+            };
+            finding.fingerprint
+        };
+
+        assert_ne!(
+            fingerprint("/internal/admin"),
+            fingerprint("/internal/public"),
+            "two narrowings protecting different URLs must not share an acknowledgment"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_a_prefix_change() {
+        // The runtime strips it before matching, so the two spellings cover the
+        // same URLs and must not raise a finding either way.
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal/"], &entry),
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn turning_the_listener_off_does_not_double_report_every_prefix() {
+        // `mtls_mode_weakened` already says it in the strongest terms.
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "required", &["/internal"], &entry),
+            &manifest_mtls(&routes, "off", &[], &entry),
+        );
+        let kinds = kinds(&findings);
+        assert!(kinds.contains(&"mtls_mode_weakened"), "{findings:#?}");
+        assert!(
+            kinds.contains(&"mtls_required_path_removed"),
+            "the prefixes it stopped honouring are still named: {findings:#?}"
+        );
+    }
+
+    /// The v3→v4 bump adds a dimension and changes nothing else, so an app that
+    /// uses no client auth must diff — and hash — exactly as it did before.
+    #[test]
+    fn the_schema_bump_alone_is_not_a_posture_change() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let v3 = routes_only(&routes);
+        let v4 = manifest_mtls(&routes, "off", &[], &mtls_entry("/a", "GET", false));
+
+        assert!(
+            diff(&v3, &v4).is_empty(),
+            "reading a v3 manifest against a v4 one with client auth off must be a no-op: {:#?}",
+            diff(&v3, &v4)
+        );
+        assert_eq!(
+            v3.posture_digest(),
+            v4.posture_digest(),
+            "an app with no client auth must keep its posture digest across the bump"
+        );
+    }
+
+    /// An acknowledgment of some *other* widening must not survive the mTLS
+    /// requirement being dropped in the same change.
+    #[test]
+    fn dropping_mtls_moves_the_fingerprint_of_a_coincident_widening() {
+        let locked = |classification: &str| {
+            manifest_mtls(
+                &route("/internal/keys", "GET", classification, &[], &[], false),
+                "optional",
+                &["/internal/"],
+                &mtls_entry("/internal/keys", "GET", true),
+            )
+        };
+        let unlocked = manifest_mtls(
+            &route("/internal/keys", "GET", "public", &[], &[], false),
+            "optional",
+            &[],
+            &mtls_entry("/internal/keys", "GET", false),
+        );
+
+        // Same class widening, once with the mTLS requirement intact and once
+        // with it dropped alongside.
+        let with_mtls = diff(&locked("gated"), &locked("public"));
+        let without = diff(&locked("gated"), &unlocked);
+        let class_change = |findings: &[Finding]| {
+            findings
+                .iter()
+                .find(|f| f.kind == "classification_downgraded")
+                .map(|f| f.fingerprint.clone())
+        };
+        assert_ne!(
+            class_change(&with_mtls),
+            class_change(&without),
+            "an acknowledgment of the class change must not also cover losing mTLS"
+        );
     }
 
     // ── the falsifiability trio from the issue ──────────────────────────────
