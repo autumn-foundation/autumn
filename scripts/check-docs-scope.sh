@@ -182,10 +182,14 @@ SELF = 'scripts/check-docs-scope.sh'
 #     gone. Hence the claims, which are CHECKED against the tracked tree rather
 #     than trusted: a declaration has to keep being true, not merely keep
 #     matching something.
+# Cargo's README names, so a published `README.txt` under a declared prefix
+# counts as a README rather than as an unexplained extra.
+README_NAMES = ('README.md', 'README.txt', 'README')
+
 CLAIMS = {
     'every page': lambda under: under,
     'the READMEs': lambda under: {f for f in under
-                                  if f.rsplit('/', 1)[-1] == 'README.md'},
+                                  if f.rsplit('/', 1)[-1] in README_NAMES},
 }
 
 DECLARED_DIFFERENCES = (
@@ -207,12 +211,26 @@ DECLARED_DIFFERENCES = (
 )
 
 
-def tracked_markdown():
-    """Every markdown-ish file in the tree, as the four gates' globs see it."""
+def universe(corpora):
+    """The pages a declaration's claim is measured against.
+
+    Two sources, and both are needed. The TREE contributes every markdown-ish
+    file, which is what the gates' globs are shaped around. The GATES contribute
+    any path all four of them report — a page they unanimously treat as corpus
+    is part of the subject matter, whatever it is named.
+
+    That second half is not a loophole for the check in `main`. A path only SOME
+    gates report stays outside, so it still surfaces as something read but not
+    accounted for; it is unanimity that makes a page legitimate here. Without
+    it, a published `README.txt` under a declared prefix — which every gate
+    resolves and agrees on — was reported as an unexplained extra on both sides
+    at once, failing the gate over a corpus that was entirely consistent.
+    """
     out = subprocess.run(
         ['git', 'ls-files', '-z', '*.md', '*.md.tmpl'],
         capture_output=True, text=True, check=True).stdout
-    return {f for f in out.split('\0') if f}
+    tracked = {f for f in out.split('\0') if f}
+    return tracked | set.intersection(*(set(c) for c in corpora.values()))
 
 
 def corpus(path):
@@ -323,7 +341,7 @@ def main():
 
     try:
         corpora = {p: corpus(p) for p in SIBLINGS + (SUPERSET,)}
-        tracked = tracked_markdown()
+        tracked = universe(corpora)
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f'ERROR: {exc}')
         return 1
@@ -556,6 +574,16 @@ examples/todo/NOTES.md"
     c13="$tmp/c13"; make_gates "$c13" "$SIB_OK" "$RTS_OK
 examples/notes.txt"
     check "an untracked path under a declared prefix is not waived" fail "$c13"
+
+    # The mirror of the case above: a page ALL FOUR gates report is part of the
+    # subject matter whatever it is named, and must not be reported as an
+    # unexplained extra. A published `README.txt` under a declared prefix is
+    # exactly that, and failed the gate on both sides at once over a corpus
+    # that was entirely consistent.
+    c14="$tmp/c14"; make_gates "$c14" "$SIB_OK
+examples/x/README.txt" "$RTS_OK
+examples/x/README.txt"
+    check "a page every gate reports is not an unexplained extra" pass "$c14"
 
     # A SECOND declaration over the same prefix, for the opposite direction and
     # describing nothing, must still be reported stale. Bookkeeping keyed by the

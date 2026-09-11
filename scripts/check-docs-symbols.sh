@@ -729,6 +729,10 @@ README_CANDIDATES = ('README.md', 'README.txt', 'README')
 CARGO_README = re.compile(r"""^\s*readme\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.M)
 CARGO_README_FALSE = re.compile(r'^\s*readme\s*=\s*false\b', re.M)
 CARGO_README_INHERIT = re.compile(r'^\s*readme\.workspace\s*=\s*true\b', re.M)
+CARGO_PUBLISH_FALSE = re.compile(
+    r'^\s*publish\s*=\s*(?:false\b|\[\s*\])', re.M)
+CARGO_PUBLISH_INHERIT = re.compile(r'^\s*publish\.workspace\s*=\s*true\b',
+                                   re.M)
 PACKAGE_SECTION = re.compile(r'^\[package\]\s*$(.*?)(?=^\[|\Z)', re.M | re.S)
 
 
@@ -736,6 +740,25 @@ def _named_readme(section):
     """The explicit `readme = "..."` in a `[package]` body, in either quote."""
     found = [dq or sq for dq, sq in CARGO_README.findall(section)]
     return found[0] if found else None
+
+
+def not_published(body, root, tracked):
+    """Whether a `[package]` body opts out of publication.
+
+    `publish = false` and the equivalent empty registry list `publish = []`
+    both mean never published; a non-empty list means published somewhere.
+    `publish.workspace = true` defers to `[workspace.package]`, and an absent
+    key anywhere means published, which is Cargo's default.
+    """
+    if CARGO_PUBLISH_FALSE.search(body):
+        return True
+    if CARGO_PUBLISH_INHERIT.search(body) and 'Cargo.toml' in tracked:
+        text = (pathlib.Path(root) / 'Cargo.toml').read_text(
+            encoding='utf-8', errors='ignore')
+        m = re.search(r'^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)', text,
+                      re.M | re.S)
+        return bool(m and CARGO_PUBLISH_FALSE.search(m.group(1)))
+    return False
 
 
 def workspace_readme(root, tracked):
@@ -788,6 +811,15 @@ def package_readmes(root):
         if not section:
             continue
         body = section.group(1)
+        if not_published(body, root, tracked):
+            # `publish = false` means there is no crates.io landing page to
+            # keep true. Without this, adding an internal `README.md` to an
+            # unpublished package — a benchmark harness, a fixture crate —
+            # silently enrolled those working notes in all four drift gates,
+            # which then failed on the illustrative commands such a page is
+            # entitled to contain. Discovery made that automatic: before it,
+            # only an explicit `readme` key could do it.
+            continue
         if CARGO_README_FALSE.search(body):
             continue
         named = _named_readme(body)
