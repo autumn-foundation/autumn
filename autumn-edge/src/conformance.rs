@@ -102,6 +102,21 @@ pub fn project_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     canonicalize_headers(&kept)
 }
 
+/// Count how many times each `(name, value)` pair occurs.
+///
+/// Plain equality (`Vec::contains`) only checks presence, not count. A pair
+/// that appears twice on one side and once on the other must show up as a
+/// difference, so `compare` counts occurrences instead.
+fn count_pairs(
+    headers: &[(String, String)],
+) -> std::collections::BTreeMap<(String, String), usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for pair in headers {
+        *counts.entry(pair.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// The result of comparing two responses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -134,17 +149,25 @@ pub fn compare(native: &EdgeResponse, edge: &EdgeResponse) -> Verdict {
     let native_headers = project_headers(&native.headers);
     let edge_headers = project_headers(&edge.headers);
     if native_headers != edge_headers {
+        let native_counts = count_pairs(&native_headers);
+        let edge_counts = count_pairs(&edge_headers);
         let mut differences = Vec::new();
-        for pair in &native_headers {
-            if !edge_headers.contains(pair) {
+        for (pair, native_count) in &native_counts {
+            let edge_count = edge_counts.get(pair).copied().unwrap_or(0);
+            if edge_count == 0 {
                 differences.push(format!(
                     "origin has `{}: {}` and the edge does not",
                     pair.0, pair.1
                 ));
+            } else if edge_count != *native_count {
+                differences.push(format!(
+                    "origin has `{}: {}` {} time(s) and the edge has it {} time(s)",
+                    pair.0, pair.1, native_count, edge_count
+                ));
             }
         }
-        for pair in &edge_headers {
-            if !native_headers.contains(pair) {
+        for pair in edge_counts.keys() {
+            if !native_counts.contains_key(pair) {
                 differences.push(format!(
                     "the edge has `{}: {}` and the origin does not",
                     pair.0, pair.1
@@ -266,6 +289,25 @@ mod tests {
         };
         assert!(detail.contains("200"), "{detail}");
         assert!(detail.contains("404"), "{detail}");
+    }
+
+    #[test]
+    fn a_pure_multiplicity_difference_diverges_with_a_non_empty_detail() {
+        // Same `(name, value)` pair, different counts: `Vec::contains` alone
+        // cannot tell these apart, so the divergence detail must not come out
+        // empty here.
+        let native = response(&[("x-zed", "1"), ("x-zed", "1")], "hi");
+        let edge = response(&[("x-zed", "1")], "hi");
+        let Verdict::Diverged { detail } = compare(&native, &edge) else {
+            panic!("expected divergence");
+        };
+        assert_ne!(
+            detail, "headers: ",
+            "the detail must not be empty: {detail}"
+        );
+        assert!(detail.contains("x-zed"), "{detail}");
+        assert!(detail.contains('2'), "{detail}");
+        assert!(detail.contains('1'), "{detail}");
     }
 
     #[test]

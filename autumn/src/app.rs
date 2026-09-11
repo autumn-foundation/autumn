@@ -74,7 +74,7 @@ use crate::state::AppState;
 /// ```
 #[must_use]
 pub fn app() -> AppBuilder {
-    AppBuilder {
+    let builder = AppBuilder {
         routes: Vec::new(),
         api_versions: Vec::new(),
         route_sources: Vec::new(),
@@ -162,7 +162,39 @@ pub fn app() -> AppBuilder {
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
         inbound_mail_router: None,
-    }
+    };
+    // Strip the edge lane's internal fallthrough-sentinel header from every
+    // outbound response, for every app — not only apps that call
+    // `with_edge_kv`. `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) sets
+    // this header on its 500 so the EDGE CAPSULE runtime knows to fall
+    // through to the origin; the same handler code also runs at the origin,
+    // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
+    // bug — hits that same 500 at the origin. Without this layer the internal
+    // header would leak straight to a real HTTP client. See
+    // `strip_edge_fallthrough_sentinel` below.
+    #[cfg(feature = "edge")]
+    let builder = builder.layer(axum::middleware::from_fn(strip_edge_fallthrough_sentinel));
+    builder
+}
+
+/// Remove [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
+///
+/// `autumn-edge` is substrate-agnostic on purpose: `extract.rs` cannot tell
+/// whether it is running at the edge or at the origin, so it always sets the
+/// sentinel on an `EdgeCacheUnavailable` response. Only the origin knows it is
+/// the origin, so only the origin strips the header before a real client ever
+/// sees it. The response body's actionable message is left untouched — only
+/// the internal signaling header is removed.
+#[cfg(feature = "edge")]
+async fn strip_edge_fallthrough_sentinel(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .remove(autumn_edge::FALLTHROUGH_SENTINEL);
+    response
 }
 
 /// Count the raw routers omitted from `autumn routes` output because their
@@ -16602,6 +16634,95 @@ mod tests {
                 "Accept-Language: {accept_language}"
             );
         }
+    }
+
+    // ── The origin never leaks the edge lane's internal sentinel (issue
+    //    #2244, item 4) ────────────────────────────────────────────────────
+    //
+    // `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) answers with the
+    // fallthrough sentinel header so the EDGE CAPSULE runtime knows to fall
+    // through to the origin. The same handler code also runs at the origin —
+    // `extract.rs` cannot special-case which substrate it is on — so an app
+    // that forgets to call `with_edge_kv` (a wiring bug) hits this same 500
+    // at the origin, and a real HTTP client must never see the internal
+    // header.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn an_uninjected_edge_seam_never_leaks_the_fallthrough_sentinel_to_a_real_client() {
+        async fn note(_cache: autumn_edge::EdgeCache) -> &'static str {
+            "never reached: extraction fails first"
+        }
+
+        // The real `app()` entry point, `with_edge_kv` NEVER called — the
+        // wiring bug this test is about.
+        let custom_layers = app().custom_layers;
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/edge/note",
+                handler: axum::routing::get(note),
+                name: "note",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/edge/note",
+                    operation_id: "note",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &AutumnConfig::default(),
+            AppState::for_test(),
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        let request = axum::http::Request::builder()
+            .uri("/edge/note")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.expect("response");
+
+        // Existing behavior, unchanged: still a 500 with an actionable body.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The fix: the internal sentinel never reaches a real client.
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL),
+            "the origin must strip the internal fallthrough sentinel: {:?}",
+            response.headers()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("with_edge_kv"),
+            "the actionable message must survive: {body}"
+        );
     }
 
     #[cfg(feature = "i18n")]

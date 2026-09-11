@@ -31,8 +31,18 @@
 //!
 //! Fixing the clock and the entropy is what turns "byte-identical" from a hope
 //! into a property: a capsule that reads the time will read the same time
-//! twice, and the conformance run's self-equality check catches the handler
-//! that managed to be nondeterministic anyway.
+//! twice.
+//!
+//! The conformance run's self-equality check (it runs the capsule twice for
+//! each case and compares) proves the clock and general handler determinism
+//! through a real request. It does **not** exercise `random_get` in a
+//! meaningful way: the reference example avoids relying on randomness in any
+//! handler on purpose (see its notes on using a `BTreeMap`, not a `HashMap`),
+//! so no handler output there depends on the PRNG's bytes. Entropy
+//! reproducibility is instead verified directly, at the source, by this
+//! module's own `random_bytes_are_reproducible_across_states` unit test,
+//! which reads `HostState::next_random_byte()` straight from two fresh
+//! states and checks they agree.
 //!
 //! # Everything a capsule does wrong is a fallthrough
 //!
