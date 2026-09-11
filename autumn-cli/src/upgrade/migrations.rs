@@ -21,6 +21,10 @@
 pub enum Confidence {
     /// Safe by construction — a rename or import move. Rewritten sites are
     /// reported as a count plus the diff.
+    // No shipped migration currently earns this label (issue #2234); kept for
+    // the next one that does. Tests construct it, so production code alone
+    // does not.
+    #[cfg_attr(not(test), allow(dead_code))]
     Auto,
     /// Rewritten, but each site is listed individually in the summary for a
     /// human to read before committing.
