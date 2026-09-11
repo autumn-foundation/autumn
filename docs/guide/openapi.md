@@ -127,30 +127,31 @@ Several places where the generated document can describe a request the handler
 will not accept. None of them fails the build:
 
 > **An array-of-objects `Query<T>` field has no OpenAPI `style`.** A `Query<T>`
-> with `#[derive(OpenApiSchema)]` documents one parameter per field, each with
-> the `style` that matches how
+> with `#[derive(OpenApiSchema)]` documents one parameter per field. Each
+> field's `style` matches how
 > [`query_string`](https://docs.rs/autumn-web/latest/autumn_web/query_string/)
 > decodes it: `form`/`explode` for a scalar or scalar-array field
-> (`?tags=a&tags=b`), `deepObject` for a nested-object field
+> (`?tags=a&tags=b`); `deepObject` for a nested-object field
 > (`?filter[status]=open`). Neither RFC 6570 nor OAS 3.x define a `style` for
-> an **array of objects** (`?items[0][sku]=A-1`) — that parameter carries no
-> `style` at all, only a `description` naming the bracketed encoding a client
-> must use. Document that encoding for external consumers, or take deeply
+> an **array of objects** (`?items[0][sku]=A-1`). That parameter carries no
+> `style`, only a `description` naming the bracketed encoding a client must
+> use. Document that encoding for external consumers, or take deeply
 > structured input as a JSON body instead. MCP `tools/call` dispatch is not
-> affected either way: it renders the bracketed form directly, independent of
-> what the OpenAPI document says.
+> affected: it renders the bracketed form directly, regardless of what the
+> OpenAPI document says.
 >
 > A `Query<T>` that does **not** derive `OpenApiSchema` still documents one
 > opaque `style: form, explode: true` parameter for the whole struct — accurate
 > only for scalar and scalar-array fields, same as before this per-field
 > breakdown existed. Add the derive to get per-field accuracy.
 
-> **The query parameter is always `required: false`.** That flag is emitted
-> unconditionally, whatever `T` looks like. If `T` has a non-`Option` field, a
-> client that follows the spec and omits the query string entirely gets a
-> deserialization failure. Make genuinely-optional query fields `Option<T>`,
-> and say so in the operation's `description` when the query is in fact
-> mandatory.
+> **A field's `required` is only accurate when `Query<T>` derives
+> `OpenApiSchema`.** Then a non-`Option` field is correctly `required: true`.
+> The whole-struct fallback parameter (an undecorated `T`) is always
+> `required: false` regardless of `T`'s fields — a client that follows the
+> spec and omits the query string entirely then gets a deserialization
+> failure. Add the derive for accurate `required`, or say so in the
+> operation's `description` when the query is in fact mandatory.
 
 > **Path parameters are always untyped strings.** Every `{…}` segment is
 > emitted as `type: string`; the generator never looks at the `Path<T>` in the

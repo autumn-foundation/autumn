@@ -1241,6 +1241,56 @@ async fn nested_search_route(_q: Query<query_shapes::SearchQuery>) -> &'static s
     "ok"
 }
 
+mod query_required_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredFilter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredSearchQuery {
+        pub filter: RequiredFilter,
+    }
+}
+
+#[get("/api/required-search")]
+async fn required_search_route(
+    _q: Query<query_required_shapes::RequiredSearchQuery>,
+) -> &'static str {
+    "ok"
+}
+
+mod unregistered_ref_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    // Deliberately does NOT derive `OpenApiSchema` — a plain enum that
+    // serializes as a string (`?dir=asc`), same as any type a caller never
+    // opted into field-accurate schemas for.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    pub enum Sort {
+        Asc,
+        Desc,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct UnregisteredRefQuery {
+        pub dir: Sort,
+    }
+}
+
+#[get("/api/unregistered-ref-search")]
+async fn unregistered_ref_search_route(
+    _q: Query<unregistered_ref_shapes::UnregisteredRefQuery>,
+) -> &'static str {
+    "ok"
+}
+
 fn nested_search_spec() -> autumn_web::openapi::OpenApiSpec {
     let route = __autumn_route_info_nested_search_route();
     let config = OpenApiConfig::new("Demo", "1.0.0");
@@ -1324,6 +1374,67 @@ fn nested_object_query_field_uses_deep_object() {
         !reference.contains("::"),
         "the $ref must be the collision-resolved display key, not a raw type_name: {reference}"
     );
+    let key = reference.trim_start_matches("#/components/schemas/");
+    let components = spec
+        .components
+        .as_ref()
+        .expect("components must be present");
+    let resolved = components
+        .schemas
+        .get(key)
+        .unwrap_or_else(|| panic!("$ref {reference} must resolve to a real component"));
+    assert!(
+        resolved["properties"].get("status").is_some(),
+        "the resolved component must carry Filter's real fields: {resolved}"
+    );
+}
+
+#[test]
+fn required_nested_object_query_field_is_required() {
+    // `filter` on `RequiredSearchQuery` is NOT `Option`-wrapped, so it must be
+    // `required: true` on its own parameter — the old whole-struct fallback
+    // could never say this (issue #2251).
+    let route = __autumn_route_info_required_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/required-search"].get.as_ref().unwrap();
+    let filter = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "filter")
+        .expect("a query parameter named filter");
+    assert!(
+        filter.required,
+        "a non-Option nested field must be required: true"
+    );
+    assert_eq!(filter.style.as_deref(), Some("deepObject"));
+}
+
+#[test]
+fn unregistered_ref_field_keeps_form_explode_not_deep_object() {
+    // `Sort` derives no `OpenApiSchema`, so its own shape can't be read. A
+    // plain enum serializes as a string (?dir=asc), so defaulting an
+    // unresolvable $ref to "flat" must win over guessing "object" — the old
+    // whole-struct fallback got this right by luck (everything was form), and
+    // the per-field split must not regress it (issue #2251).
+    let route = __autumn_route_info_unregistered_ref_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/unregistered-ref-search"]
+        .get
+        .as_ref()
+        .unwrap();
+    let dir = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "dir")
+        .expect("a query parameter named dir");
+    assert_eq!(
+        dir.style.as_deref(),
+        Some("form"),
+        "an unregistered $ref must default to flat, not deepObject: {dir:?}"
+    );
+    assert_eq!(dir.explode, Some(true));
 }
 
 #[test]

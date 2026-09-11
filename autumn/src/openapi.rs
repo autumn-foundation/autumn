@@ -694,7 +694,12 @@ pub struct Operation {
 
 #[cfg(feature = "openapi")]
 /// Describes a single operation parameter.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// **Breaking (issue #2251):** carries a new `description` field. A
+/// struct-literal `Parameter { .. }` built outside this crate needs a
+/// `description: None`, or `..Default::default()` for every field it
+/// does not set.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Parameter {
     /// The name of the parameter.
     pub name: String,
@@ -1508,10 +1513,10 @@ fn query_parameters_from_body(
             .iter()
             .map(|(name, field_schema)| {
                 let (style, explode, description) = query_field_style(field_schema);
-                // Nested `$ref`s in a derived schema body carry the raw
-                // `type_name` identity (not yet the display key) until the
-                // finalize pass rewrites `components_map` — this parameter's
-                // schema is never part of that map, so rewrite it here.
+                // A field's $ref here still names the raw type_name, not the
+                // display key. The finalize pass fixes that up everywhere it
+                // tracks — but not in this parameter's schema, since it lives
+                // outside components_map. Rewrite it here instead.
                 let mut schema = field_schema.clone();
                 rewrite_identity_refs(&mut schema, index);
                 Parameter {
@@ -1539,9 +1544,10 @@ fn query_field_style(schema: &serde_json::Value) -> (Option<String>, Option<bool
             None,
             None,
             Some(
-                "Bracketed array-of-objects query encoding, e.g. \
-                 ?field[0][prop]=value. No OpenAPI style expresses this; see \
-                 the query-string guide."
+                "Bracketed nested-array query encoding, e.g. \
+                 ?field[0][prop]=value for an array of objects, or \
+                 ?field[0][0]=value for an array of arrays. No OpenAPI \
+                 style expresses this; see the query-string guide."
                     .to_owned(),
             ),
         ),
@@ -1569,6 +1575,12 @@ fn query_field_shape(schema: &serde_json::Value) -> QueryFieldShape {
             QueryFieldShape::Flat
         };
     }
+    // An object schema inlined at the field site, not behind a $ref — a
+    // #[translatable] field is the one case the macro emits today
+    // (autumn-macros/src/schema.rs, emit_json_schema_tokens_for_field).
+    if effective.get("type").and_then(serde_json::Value::as_str) == Some("object") {
+        return QueryFieldShape::Object;
+    }
     if effective.get("type").and_then(serde_json::Value::as_str) == Some("array")
         && let Some(items) = effective.get("items")
     {
@@ -1584,16 +1596,21 @@ fn query_field_shape(schema: &serde_json::Value) -> QueryFieldShape {
     QueryFieldShape::Flat
 }
 
-/// Unwrap a nullable `{"oneOf": [<real>, {"type": "null"}]}` wrapper — the
-/// shape `emit_json_schema_tokens_for_field` emits for every `Option<T>`
-/// field — down to `<real>`. Returns `schema` unchanged for anything else.
+/// Unwrap `{"oneOf": [<real>, {"type": "null"}]}` down to `<real>`, repeating
+/// for a doubly-wrapped `Option<Option<T>>`. `emit_json_schema_tokens_for_field`
+/// emits this shape for every `Option<T>` field. Returns `schema` unchanged
+/// once nothing more unwraps.
 #[cfg(feature = "openapi")]
 fn unwrap_nullable_schema(schema: &serde_json::Value) -> &serde_json::Value {
-    schema
+    let mut current = schema;
+    while let Some(real) = current
         .get("oneOf")
         .and_then(serde_json::Value::as_array)
         .and_then(|branches| branches.first())
-        .unwrap_or(schema)
+    {
+        current = real;
+    }
+    current
 }
 
 /// The raw `$ref` target identity, when `schema` is a bare reference.
@@ -1607,13 +1624,19 @@ fn ref_target(schema: &serde_json::Value) -> Option<&str> {
 
 /// Does the schema `identity` names describe a JSON object?
 ///
-/// An identity with no registered schema defaults to `true`: the back-fill
-/// placeholder for an unregistered type is itself `{"type": "object", ...}`
-/// (see the back-fill loop in `generate_spec_at`), so an opaque `$ref` is
-/// assumed nested rather than silently mis-described as flat.
+/// An identity with no registered schema defaults to `false` (flat). Most
+/// unregistered `$ref` targets are a plain enum or newtype that never opted
+/// into `#[derive(OpenApiSchema)]` — describing one as `deepObject` would
+/// send `?dir[...]=...` for a field the handler reads as `?dir=asc`. This
+/// matches what the OLD whole-struct fallback did for every field, so an
+/// unregistered type is never worse off than before this per-field split
+/// (issue #2251). The cost falls on an unregistered field that genuinely IS
+/// nested (e.g. `HashMap<String, V>`) — add `#[derive(OpenApiSchema)]` to a
+/// wrapping type, or accept the field as `form`-styled and document the real
+/// shape by hand.
 #[cfg(feature = "openapi")]
 fn ref_is_object(identity: &str) -> bool {
-    registered_derived_schema(identity).is_none_or(|schema| {
+    registered_derived_schema(identity).is_some_and(|schema| {
         schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
     })
 }
