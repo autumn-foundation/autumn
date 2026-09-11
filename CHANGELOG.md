@@ -352,6 +352,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **query strings:** an append (`tags[]=`) after an out-of-range explicit
+  index no longer sorts wrong or collides with it (#2253). `Segment::Index`
+  saturates an absurd index to `usize::MAX` for ordering only; an append
+  derived its position from `saturating_add(1)` on the current maximum, so
+  once that maximum was already `usize::MAX` the append could not advance
+  past it. Two symptoms followed: the append's canonical raw spelling then
+  lost a lexicographic tiebreak against the explicit spelling (wrong order),
+  and when the explicit index was spelled as literally `usize::MAX` the two
+  keys were byte-identical and merged into one node (a spurious duplicate-value
+  error for a scalar field, or a silent collapse of two elements into one for
+  a nested sequence). `SeqKey`'s tiebreak is now a `SeqKeyTie` enum —
+  `Explicit(raw)` or `Appended(insert_count)` — instead of a plain string, so
+  an append can never byte-match an explicit index, and two appends at a
+  saturated position stay distinct via their insert count. The same collision
+  also reached a `Node::Seq` promoted to a named object (mixing `k[N]=` with
+  `k[name]=`): an append there recomputed a decimal key that could byte-match
+  a saturated explicit key already in the map. That path now probes for a
+  free key instead of reusing one.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
