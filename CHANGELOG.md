@@ -348,6 +348,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Removed dead `autumn/templates/build.rs.template` (#2694):** an
+  unreferenced leftover from before the Tailwind build script moved to
+  `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
+  actually scaffolds via `include_str!`). Zero code references anywhere in
+  the tree — only historical sprint docs and old CHANGELOG entries mention
+  it. This covers the dead-code sub-item of #2694; the clone-class merge
+  across the nine example `build.rs` copies still needs a human call per
+  that issue. Note: `autumn/templates/static/` also appears unreferenced and
+  was left in place — flagging for a separate decision.
+
 ### Security
 
 - **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
