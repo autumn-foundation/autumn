@@ -3210,6 +3210,225 @@ pub fn check_platform_support_impl(os: &str) -> CheckResult {
     }
 }
 
+// ─── Daemon and Windows-service readiness (issue #1639) ──────────────────────
+
+/// What `autumn doctor` found about this project's daemon and, on Windows, its
+/// registered service.
+///
+/// A plain data snapshot so [`check_daemon_service_impl`] is pure and the
+/// Windows branch — the one this project's CI almost never runs — is exercised
+/// by tests on every host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonServiceReport {
+    /// Whether this platform can register an OS service through `autumn`.
+    pub service_capable: bool,
+    /// The running daemon's pid and endpoint, when one is running.
+    pub daemon: Option<(u32, String)>,
+    /// The registered service's name and Service Control Manager state.
+    pub service: Option<(String, String)>,
+    /// Prerequisites the service journey needs that are not satisfied here.
+    pub missing_prerequisites: Vec<String>,
+}
+
+/// Report whether a daemon or a registered service is running for this project,
+/// and what the service journey still needs.
+///
+/// An operator's first question after `autumn serve install-service` is "is it
+/// actually up?", and their first question when it is not is "what is missing?".
+/// Answering both here means neither is discovered by reading the event log.
+#[must_use]
+pub fn check_daemon_service_impl(report: &DaemonServiceReport) -> CheckResult {
+    let mut parts = Vec::new();
+    match &report.daemon {
+        Some((pid, endpoint)) => parts.push(format!("daemon running (pid {pid}) on {endpoint}")),
+        None => parts.push("no daemon running for this project".to_owned()),
+    }
+    if report.service_capable {
+        match &report.service {
+            Some((name, state)) => parts.push(format!("service `{name}` is {state}")),
+            None => parts.push(
+                "no OS service registered (`autumn serve install-service` registers one)"
+                    .to_owned(),
+            ),
+        }
+    }
+    if !report.missing_prerequisites.is_empty() {
+        parts.push(format!(
+            "for the service journey you would also need: {}",
+            report.missing_prerequisites.join("; ")
+        ));
+    }
+    CheckResult {
+        name: "daemon_service",
+        // **Pass, always.** Every clause here is a normal state, not a defect: a
+        // project that never wants a daemon, a service nobody registered, and —
+        // the one that matters — an ordinary non-elevated shell, which cannot
+        // open the Service Control Manager with `CREATE_SERVICE`.
+        //
+        // That last one is why this is not a warning. `exit_code` treats any
+        // warning as a failure under `--strict`, so warning about elevation
+        // would make `autumn doctor --strict` — itself a Tier 1 command, used in
+        // scripts and pre-commit gates — exit 1 on every unelevated Windows
+        // shell, for a service the user may have no intention of installing.
+        // `platform_support` right above carries the same reasoning for the same
+        // reason; this check reintroduced the failure mode that one was written
+        // to avoid, and must not do it again.
+        //
+        // The prerequisite is still *reported*, in the detail, so a developer
+        // meets it before an access-denied error rather than after.
+        status: CheckStatus::Pass,
+        detail: Some(parts.join(". ")),
+        // `format_check_line` prints a hint only on warn/fail, so the pointer
+        // lives in the detail above rather than being silently dropped here.
+        hint: None,
+    }
+}
+
+/// Gather [`DaemonServiceReport`] for the project in the current directory.
+fn resolve_daemon_service_report() -> DaemonServiceReport {
+    let identity = crate::serve::project_identity_for(None);
+    let daemon = crate::serve::running_daemon_summary(None);
+    #[cfg(windows)]
+    {
+        DaemonServiceReport {
+            service_capable: true,
+            daemon,
+            service: crate::service::registered_service_state(&identity),
+            missing_prerequisites: crate::service::missing_prerequisites(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = identity;
+        DaemonServiceReport {
+            // Autumn registers OS services only on Windows; on Unix the answer
+            // is a systemd unit or a launchd plist, which is not this tool's to
+            // write, so reporting a missing one would be noise.
+            service_capable: false,
+            daemon,
+            service: None,
+            missing_prerequisites: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod daemon_service_tests {
+    use super::{CheckStatus, DaemonServiceReport, check_daemon_service_impl};
+
+    #[test]
+    fn a_running_daemon_is_reported_with_its_pid_and_endpoint() {
+        let detail = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: true,
+            daemon: Some((4242, "tcp:127.0.0.1:3000".to_owned())),
+            service: None,
+            missing_prerequisites: Vec::new(),
+        })
+        .detail
+        .expect("detail");
+        assert!(detail.contains("4242"), "{detail}");
+        assert!(detail.contains("tcp:127.0.0.1:3000"), "{detail}");
+    }
+
+    #[test]
+    fn a_registered_service_is_reported_with_its_name_and_state() {
+        let detail = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: true,
+            daemon: None,
+            service: Some(("autumn-demo-a1b2c3d4".to_owned(), "Running".to_owned())),
+            missing_prerequisites: Vec::new(),
+        })
+        .detail
+        .expect("detail");
+        assert!(detail.contains("autumn-demo-a1b2c3d4"), "{detail}");
+        assert!(detail.contains("Running"), "{detail}");
+    }
+
+    #[test]
+    fn an_unregistered_service_names_the_command_that_registers_one() {
+        let detail = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: true,
+            ..DaemonServiceReport::default()
+        })
+        .detail
+        .expect("detail");
+        assert!(detail.contains("install-service"), "{detail}");
+    }
+
+    #[test]
+    fn a_platform_without_os_services_says_nothing_about_them() {
+        // On Linux/macOS the answer is a systemd unit or a launchd plist, which
+        // autumn does not write. Reporting a missing service would be noise.
+        let detail = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: false,
+            ..DaemonServiceReport::default()
+        })
+        .detail
+        .expect("detail");
+        assert!(!detail.contains("service"), "{detail}");
+    }
+
+    #[test]
+    fn a_missing_prerequisite_is_reported_without_failing_strict() {
+        // `exit_code` treats any warning as a failure under `--strict`, and an
+        // ordinary non-elevated shell ALWAYS lacks the SCM access a service
+        // registration needs. Warning here would make `autumn doctor --strict`
+        // exit 1 on every unelevated Windows machine, for a service the user may
+        // never want — the exact trap `platform_support` documents avoiding.
+        let result = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: true,
+            missing_prerequisites: vec!["administrator rights".to_owned()],
+            ..DaemonServiceReport::default()
+        });
+        assert_eq!(result.status, CheckStatus::Pass);
+        // Reported, though — a developer should meet it here, not in an
+        // access-denied error halfway through an install.
+        assert!(result.detail.as_deref().unwrap().contains("administrator"));
+    }
+
+    #[test]
+    fn the_check_never_warns_so_strict_cannot_fail_on_it() {
+        // Belt and braces over the case above: no combination of these inputs
+        // may produce a warning, because every one of them is a normal state.
+        for service_capable in [true, false] {
+            for prerequisites in [vec![], vec!["administrator rights".to_owned()]] {
+                for daemon in [None, Some((42, "tcp:127.0.0.1:3000".to_owned()))] {
+                    let result = check_daemon_service_impl(&DaemonServiceReport {
+                        service_capable,
+                        daemon,
+                        service: None,
+                        missing_prerequisites: prerequisites.clone(),
+                    });
+                    assert_eq!(
+                        result.status,
+                        CheckStatus::Pass,
+                        "capable={service_capable} prereqs={prerequisites:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stopped_daemon_is_not_a_failure() {
+        // Plenty of projects never run a daemon, and `doctor --strict` is used
+        // in pre-commit gates — a hard failure here would break them all.
+        let result = check_daemon_service_impl(&DaemonServiceReport {
+            service_capable: true,
+            ..DaemonServiceReport::default()
+        });
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn the_check_keeps_one_stable_name() {
+        assert_eq!(
+            check_daemon_service_impl(&DaemonServiceReport::default()).name,
+            "daemon_service"
+        );
+    }
+}
+
 #[cfg(test)]
 mod platform_support_tests {
     use super::{CheckStatus, check_platform_support_impl};
@@ -8420,6 +8639,12 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(|| {
         check_platform_support_impl(std::env::consts::OS)
     }));
+
+    // 0b. Daemon / OS-service readiness (#1639). Next to the tier report,
+    // because "which journeys are native here" and "is this project's daemon up"
+    // are the same question asked twice.
+    let daemon_service = resolve_daemon_service_report();
+    tasks.push(Box::new(move || check_daemon_service_impl(&daemon_service)));
 
     // 1. Rust toolchain
     tasks.push(Box::new(move || check_rust_toolchain(&msrv)));
