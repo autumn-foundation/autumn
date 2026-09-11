@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a missing, unparseable or empty bundle or CRL. `autumn doctor` grades the
   surface offline as `tls_client_auth`, and a route's mTLS requirement is a new
   `mtls` dimension of the security-posture manifest (schema v4), so
-  `autumn posture diff` blocks on a route that silently drops it. Revocation is a
+  `autumn routes posture diff` blocks on a route that silently drops it. Revocation is a
   static CRL plus short-lived certificates; OCSP is not in this slice. See the
   [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
 

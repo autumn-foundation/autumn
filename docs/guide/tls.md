@@ -1144,7 +1144,7 @@ nobody.
 ### Posture manifest
 
 A route's mTLS requirement is a dimension of the [security posture
-manifest](./security-posture-manifest.md): `autumn posture diff` raises
+manifest](./security-posture-manifest.md): `autumn routes posture diff` raises
 `mtls_requirement_removed` (**widening**, blocks until acknowledged) when a
 route that demanded a certificate stops demanding one, and `mtls_mode_weakened`
 when the listener mode itself drops a rank. So a refactor cannot quietly unlock

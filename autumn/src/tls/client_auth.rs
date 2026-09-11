@@ -1196,6 +1196,7 @@ pub const ROUTE_REJECTED_METRIC: &str = "tls_client_auth_route_rejected_total";
 /// because that is the one place that sees BOTH the peer address and the
 /// rejections rustls raises without ever consulting a verifier — chiefly a
 /// `required` listener refusing a client that presented no certificate.
+#[must_use]
 pub fn record_handshake_rejection(error: &std::io::Error, peer: std::net::SocketAddr) -> bool {
     // `tokio_rustls` surfaces a handshake failure as an `io::Error` whose inner
     // error is the `rustls::Error`; anything else (a dropped socket, a timeout)
@@ -1206,13 +1207,10 @@ pub fn record_handshake_rejection(error: &std::io::Error, peer: std::net::Socket
     else {
         return false;
     };
-    match RejectionReason::classify(rustls_error) {
-        Some(reason) => {
-            reason.record(Some(peer));
-            true
-        }
-        None => false,
-    }
+    RejectionReason::classify(rustls_error).is_some_and(|reason| {
+        reason.record(Some(peer));
+        true
+    })
 }
 
 // ── Offline inspection (`autumn doctor`) ────────────────────────────────────

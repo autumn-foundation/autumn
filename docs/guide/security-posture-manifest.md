@@ -252,7 +252,7 @@ route, `mtls_required: true` when the listener requests client certificates
 
 Every route gets a row, not just the required ones — the diff's job is to notice
 a route that *stopped* requiring a certificate, which needs the negative rows
-too. `autumn posture diff` raises `mtls_requirement_removed` (**widening**) for
+too. `autumn routes posture diff` raises `mtls_requirement_removed` (**widening**) for
 exactly that, and `mtls_mode_weakened` when the listener's own mode drops a rank
 (`required` → `optional` → `off`), which no per-route row shows on its own. See
 the [TLS guide](./tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
