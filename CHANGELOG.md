@@ -177,7 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   described, and the lookup still matched. Keyed by path and direction it
   survived on a replacement: the routes gate could stop reading the served
   pages the note exists for and pick up some unrelated file under the same
-  prefix instead. One difference is declared today:
+  prefix instead. The declarations are themselves checked before any corpus is
+  read — a prefix, a direction, a claim per side from a fixed vocabulary, and a
+  non-empty reason. The reason is enforced rather than conventional because the
+  gate's premise is that a difference gets written down, and nothing had been
+  reading it. One difference is declared today:
   the routes gate reads all of `examples/` rather than only the `README.md`
   under it, because `examples/wiki/content/` is embedded and served, an argument
   about URLs that does not carry to commands or config keys. A declaration that

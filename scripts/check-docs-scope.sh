@@ -102,6 +102,15 @@
 # silently stops being checked is the defect this gate exists to catch, one
 # level up.
 #
+# THE DECLARATIONS ARE CHECKED TOO, before any corpus is read: a prefix, a
+# direction, a claim per side drawn from a fixed vocabulary, and a NON-EMPTY
+# REASON. The reason is enforced rather than merely conventional because this
+# gate's premise is that a difference gets written down — and for three
+# revisions `why` was decorative, so deleting the prose while keeping the keys
+# left the gate green and the exception unexplained. A rule that is never
+# checked is a rule that is eventually not followed, which is the observation
+# this whole script is built on.
+#
 # Run locally with:
 #
 #     scripts/check-docs-scope.sh              # gate the corpora
@@ -113,6 +122,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 read -r -d '' PYSRC <<'PYEOF' || true
+import json
+import os
 import subprocess
 import sys
 
@@ -213,7 +224,74 @@ def corpus(path):
     return files
 
 
+# The shape a declaration must have. `why` is in here because this gate's whole
+# premise is that a difference gets WRITTEN DOWN — and until review pointed it
+# out, `why` was decorative: nothing read it, so deleting the prose and keeping
+# the keys left the gate green and the exception unexplained. A rule that is
+# never checked is a rule that is eventually not followed.
+REQUIRED = ('prefix', 'side', 'routes', 'siblings', 'why')
+SIDES = ('routes-only', 'siblings-only')
+
+
+def validate(declarations):
+    """Defects in the declarations themselves, before any corpus is compared.
+
+    Checked first and separately: a malformed declaration is a bug in the
+    exception, not evidence about the gates, and reporting it alongside corpus
+    differences would bury it. An unknown claim name is caught here too, where
+    it reads as a defect, rather than in the comparison as a KeyError traceback.
+    """
+    defects = []
+    for i, d in enumerate(declarations):
+        where = f'DECLARED_DIFFERENCES[{i}]'
+        missing = [k for k in REQUIRED if k not in d]
+        if missing:
+            defects.append(f'{where} in {SELF} is missing {missing}. Every '
+                           f'declaration names a prefix, the direction the '
+                           f'difference runs in, what each side reads under it, '
+                           f'and why that does not propagate.')
+            continue
+        where = f'DECLARED_DIFFERENCES[{i}] ({d["prefix"]!r})'
+        if not str(d['prefix']).strip():
+            defects.append(f'{where} in {SELF} has an empty prefix.')
+        if d['side'] not in SIDES:
+            defects.append(f'{where} in {SELF} has side {d["side"]!r}; '
+                           f'expected one of {list(SIDES)}.')
+        for key in ('routes', 'siblings'):
+            if d[key] not in CLAIMS:
+                defects.append(
+                    f'{where} in {SELF} claims {d[key]!r} for {key}; expected '
+                    f'one of {sorted(CLAIMS)}. A difference whose shape none of '
+                    f'those expresses needs a new claim added deliberately, not '
+                    f'an existing one stretched.')
+        if not str(d.get('why') or '').strip():
+            defects.append(
+                f'{where} in {SELF} has no reason. An exception to the corpus '
+                f'invariant has to say why the argument for it does not carry '
+                f'to the other gates — that sentence is the whole point of '
+                f'declaring it rather than silently diverging.')
+    return defects
+
+
 def main():
+    # A self-test seam, and the only way in: the shape rules are data-driven, so
+    # testing them means handing in a synthetic table rather than a synthetic
+    # repository. Absent in every real run.
+    probe = os.environ.get('SCOPE_SELFTEST_DECLARATIONS')
+    if probe is not None:
+        problems = validate(json.loads(probe))
+        for d in problems:
+            print(f'  {d}')
+        return 1 if problems else 0
+
+    shape = validate(DECLARED_DIFFERENCES)
+    if shape:
+        print(f'defects: {len(shape)}')
+        print()
+        for d in shape:
+            print(f'  {d}')
+        return 1
+
     try:
         corpora = {p: corpus(p) for p in SIBLINGS + (SUPERSET,)}
         tracked = tracked_markdown()
@@ -424,6 +502,36 @@ examples/todo/NOTES.md"
     # A declaration with nothing left to describe is stale and reported.
     c8="$tmp/c8"; make_gates "$c8" "$RTS_OK" "$RTS_OK"
     check "a declaration describing no live difference fails" fail "$c8"
+
+    # ── The declarations' own shape ──────────────────────────────────────────
+    # Handed in as a synthetic table, since these rules are about the table
+    # rather than about any repository.
+    shape() {
+      local label="$1" want="$2" table="$3"
+      local got=0
+      SCOPE_SELFTEST_DECLARATIONS="$table" python3 -c "$PYSRC" >/dev/null 2>&1 \
+        || got=$?
+      if { [ "$want" = pass ] && [ "$got" -eq 0 ]; } \
+        || { [ "$want" = fail ] && [ "$got" -ne 0 ]; }; then
+        echo "  ok   $label"
+      else
+        echo "  FAIL $label (wanted $want, exit $got)"
+        fails=$((fails + 1))
+      fi
+    }
+
+    WHOLE='[{"prefix":"examples/","side":"routes-only","routes":"every page","siblings":"the READMEs","why":"served pages, URLs only"}]'
+    shape "a complete declaration validates" pass "$WHOLE"
+    shape "a declaration with no why fails" fail \
+      '[{"prefix":"examples/","side":"routes-only","routes":"every page","siblings":"the READMEs"}]'
+    shape "a declaration with an empty why fails" fail \
+      '[{"prefix":"examples/","side":"routes-only","routes":"every page","siblings":"the READMEs","why":"   "}]'
+    shape "a declaration with an unknown side fails" fail \
+      '[{"prefix":"examples/","side":"either","routes":"every page","siblings":"the READMEs","why":"x"}]'
+    shape "a declaration with an unknown claim fails" fail \
+      '[{"prefix":"examples/","side":"routes-only","routes":"most pages","siblings":"the READMEs","why":"x"}]'
+    shape "a declaration with an empty prefix fails" fail \
+      '[{"prefix":"  ","side":"routes-only","routes":"every page","siblings":"the READMEs","why":"x"}]'
 
     # A gate whose --corpus fails must fail the gate, never be skipped.
     c9="$tmp/c9"; make_gates "$c9" "$SIB_OK" "$RTS_OK"
