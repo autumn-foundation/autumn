@@ -11999,11 +11999,6 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
-/// A required numeric carrying a `{min,max}` range (issue #1388) that is
-/// represented as `Option<T>` on the form struct (issue #1748). Extracted so
-/// both the struct/`into_new` emission in [`render_model_form`] and the
-/// empty-pair drop set in [`render_nullable_field_match`] agree on which fields
-/// are the synthetic Options.
 /// The error code the `validator` crate reports for one `#[validate(…)]` rule,
 /// or `None` when the rule carries its own `message` (issue #2227).
 ///
@@ -12080,6 +12075,11 @@ fn render_changeset_build(
     )
 }
 
+/// A required numeric carrying a `{min,max}` range (issue #1388) that is
+/// represented as `Option<T>` on the form struct (issue #1748). Extracted so
+/// both the struct/`into_new` emission in [`render_model_form`] and the
+/// empty-pair drop set in [`render_nullable_field_match`] agree on which fields
+/// are the synthetic Options.
 const fn is_constrained_required_numeric(f: &Field) -> bool {
     !f.nullable
         && matches!(

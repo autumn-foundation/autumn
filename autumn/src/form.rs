@@ -433,8 +433,16 @@ pub trait IntoChangeset: Sized {
     /// error code.
     /// Return `None` from `resolve` to keep autumn-web's default English
     /// message.
-    fn into_changeset_with(self, resolve: impl Fn(&str, &str) -> Option<String>)
-    -> Changeset<Self>;
+    ///
+    /// The default implementation ignores `resolve` and defers to
+    /// [`into_changeset`](Self::into_changeset), so a hand-rolled `IntoChangeset`
+    /// impl that predates this method keeps compiling unchanged.
+    fn into_changeset_with(
+        self,
+        _resolve: impl Fn(&str, &str) -> Option<String>,
+    ) -> Changeset<Self> {
+        self.into_changeset()
+    }
 }
 
 impl<T: validator::Validate> IntoChangeset for T {
