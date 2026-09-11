@@ -108,6 +108,71 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### TLS: `TlsConfig`, `TlsError` and `SecurityDump` gain mTLS members (#1640)
+
+**Why:** mutual TLS needs a trust store in `[server.tls]`, error variants that
+name what went wrong with it, and a posture-manifest field for the routes that
+require it. Each is additive at the *config* and *document* level — an absent
+`[server.tls.client_auth]` section and a v3 manifest both behave exactly as
+before — but each also widens a Rust type that user code can name.
+
+Three types moved. You are affected only if your code constructs or matches one
+of them exhaustively; none of them changes meaning.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // an exhaustive match over every variant
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+    client_auth: None,   // new: no client-certificate verification
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // `TlsError` is now `#[non_exhaustive]`; add a catch-all arm
+    _ => …,
+}
+```
+
+`autumn_web::route_listing::SecurityDump` gains `client_auth`, the snapshot the
+security-posture manifest reads. Fill it with `ClientAuthDump::off()` unless you
+are modelling an mTLS deployment. The type exists to carry the dump across the
+`autumn routes audit` boundary, so a literal construction is rare outside tests.
+
+`TlsError`, `ClientAuthMode`, `RejectionReason`, `CaInspection` and
+`CrlInspection` are all `#[non_exhaustive]` from this release, so the next
+variant or field added to any of them will not break you again.
+
+**Automation:** `manual` — the fix is a field initializer or a match arm whose
+correct value depends on what the surrounding code is modelling, so no codemod
+can choose it. Both shapes surface as a compiler error (`E0063` for the missing
+field, `E0004` for the non-exhaustive match), never as a silent behaviour change.
+
 ### Audit: `AuditEvent` gains a `metadata` field
 
 **Why:** A retention sweep has to record three facts — which dataset, what
@@ -1138,6 +1203,26 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
+**New `[server.tls.client_auth]` section** (additive; absent means the listener
+requests no client certificate, exactly as before). It turns #1603's TLS
+listener into a mutual-TLS one, verifying the caller against a PEM bundle of
+client CAs:
+
+```toml
+[server.tls.client_auth]
+mode           = "required"                          # off (default) | optional | required
+ca_bundle_path = "/etc/autumn/tls/client-ca.pem"     # one or more PEM CAs
+crl_path       = "/etc/autumn/tls/client-ca.crl.pem" # optional revocation list
+required_paths = ["/internal/"]                      # routes that demand a certificate
+```
+
+Startup fails, naming the path, when the bundle or CRL is missing, unparseable
+or empty; when `mode` is not `off` and no `ca_bundle_path` is set; and when
+`required_paths` is non-empty under `mode = "off"` (those routes would reject
+every request). Like the sibling `[server.tls.acme]` table, these keys have no
+`AUTUMN_SERVER__TLS__*` environment override. See the
+[TLS guide](../guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+
 **New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
 as before). It names a DNS provider and the *credentials-store key* holding that
 provider's API credential — never the credential itself. The section is
@@ -1196,6 +1281,36 @@ how fast an idle worker sees work another process enqueued. See
 `scheduler.lease_ttl_secs` and `scheduler.key_prefix`.
 
 ## Behavior changes
+
+### HTTPS: the listener's connect-info type changed (#1640)
+
+Only the **in-process TLS listener** (`[server.tls]`) is affected; the plain-TCP
+and Unix-socket paths are untouched.
+
+The HTTPS serve arm now hands axum a `TlsConnectInfo` (peer address plus the
+verified client identity, when there is one) instead of a bare `SocketAddr`, and
+a new framework layer immediately re-stamps `ConnectInfo<SocketAddr>` from it.
+So `ClientAddr`, trusted-proxy resolution, IP-keyed rate limiting, SSE and
+`wss://` all behave exactly as before, and a handler extracting
+`ConnectInfo<SocketAddr>` keeps compiling and keeps resolving the real peer.
+
+One case needs a change: a handler that extracted the HTTPS connect-info by some
+other route — say a custom layer reading `ConnectInfo<SocketAddr>` *outside* the
+framework stack, or a test that wires `axum::serve` over
+`autumn_web::tls::TlsListener` by hand. Wire such a test the way the framework
+does:
+
+```rust
+use autumn_web::tls::{TlsConnectInfo, client_auth::ClientIdentityLayer};
+
+let service = tower::Layer::layer(&ClientIdentityLayer, router);
+let make_service =
+    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+        TlsConnectInfo,
+    >(service);
+```
+
+The previous `listener.tap_io(|_io| {})` wrapper is no longer needed.
 
 ### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
 
