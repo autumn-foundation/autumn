@@ -205,7 +205,92 @@ pub enum TlsError {
         /// Underlying rustls error.
         source: rustls::Error,
     },
+    /// The mTLS client-CA bundle could not be read (issue #1640).
+    #[error("failed to read the mTLS client CA bundle `{path}`: {source}")]
+    ReadClientCa {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The mTLS client-CA bundle is not parseable PEM.
+    #[error("failed to parse a PEM certificate in the mTLS client CA bundle `{path}`: {source}")]
+    ParseClientCa {
+        /// Path whose PEM failed to parse.
+        path: PathBuf,
+        /// Underlying PEM parse error.
+        source: rustls_pki_types::pem::Error,
+    },
+    /// The mTLS client-CA bundle contains no certificate.
+    #[error(
+        "no CAs found in the mTLS client CA bundle `{path}` (expected at least one PEM \
+         CERTIFICATE block)"
+    )]
+    NoClientCas {
+        /// Path that contained no certificate.
+        path: PathBuf,
+    },
+    /// A certificate in the bundle (at 1-based `position`) is not usable as a
+    /// trust anchor.
+    #[error(
+        "CA #{position} in the mTLS client CA bundle `{path}` is not a valid trust anchor: {source}"
+    )]
+    InvalidClientCa {
+        /// Bundle path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the bundle.
+        position: usize,
+        /// Underlying rustls error.
+        source: Box<rustls::Error>,
+    },
+    /// The mTLS revocation list could not be read.
+    #[error("failed to read the mTLS revocation list `{path}`: {source}")]
+    ReadCrl {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The mTLS revocation list is not parseable PEM.
+    #[error("failed to parse a PEM block in the mTLS revocation list `{path}`: {source}")]
+    ParseCrl {
+        /// Path whose PEM failed to parse.
+        path: PathBuf,
+        /// Underlying PEM parse error.
+        source: rustls_pki_types::pem::Error,
+    },
+    /// The mTLS revocation list contains no CRL.
+    #[error("no revocation list found in `{path}` (expected at least one PEM X509 CRL block)")]
+    NoCrls {
+        /// Path that contained no CRL.
+        path: PathBuf,
+    },
+    /// A CRL in the file (at 1-based `position`) is not valid DER.
+    #[error("CRL #{position} in `{path}` is malformed: {detail}")]
+    ParseCrlDer {
+        /// Revocation-list path.
+        path: PathBuf,
+        /// 1-based position of the offending CRL in the file.
+        position: usize,
+        /// Human-readable parse detail.
+        detail: String,
+    },
+    /// Building the rustls client-certificate verifier failed.
+    #[error("failed to build the mTLS client certificate verifier: {source}")]
+    BuildClientVerifier {
+        /// Underlying rustls error.
+        source: rustls::server::VerifierBuilderError,
+    },
+    /// A verified peer certificate could not be parsed into an identity.
+    #[error("failed to parse the verified client certificate: {detail}")]
+    ParsePeerCert {
+        /// Human-readable parse detail.
+        detail: String,
+    },
 }
+
+/// Mutual-TLS client-certificate verification (issue #1640).
+pub mod client_auth;
 
 /// The `ring` crypto provider used for all inbound TLS. Built once per call;
 /// callers that build many configs should cache the returned `Arc`.
@@ -476,12 +561,103 @@ pub fn build_server_config_with_resolver(
     provider: Arc<CryptoProvider>,
     resolver: Arc<dyn ResolvesServerCert>,
 ) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    let config = rustls::ServerConfig::builder_with_provider(provider)
+    build_server_config_with_client_auth(provider, resolver, None)
+}
+
+/// [`build_server_config_with_resolver`], additionally verifying client
+/// certificates against `client_verifier` (issue #1640).
+///
+/// `None` takes the identical `with_no_client_auth()` path as before, so a
+/// deployment with no `[server.tls.client_auth]` section handshakes exactly as
+/// it did under #1603.
+///
+/// # Errors
+///
+/// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
+/// versions for the provider.
+pub fn build_server_config_with_client_auth(
+    provider: Arc<CryptoProvider>,
+    resolver: Arc<dyn ResolvesServerCert>,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|source| TlsError::BuildConfig { source })?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .map_err(|source| TlsError::BuildConfig { source })?;
+    let mut config = match client_verifier {
+        Some(verifier) => {
+            let mut config = builder
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(resolver);
+            // Turn OFF session resumption for a client-authenticating listener.
+            //
+            // rustls restores a resumed connection's `peer_certificates` from
+            // the stored session and never calls the verifier again
+            // (`server/tls13.rs`, `server/tls12.rs`). So a client whose CA was
+            // rotated out — or whose certificate was just added to the CRL —
+            // would keep reconnecting on a resumed session until it expired,
+            // and would keep presenting a verified-looking identity to
+            // handlers. That is the one hole a swap-the-verifier design cannot
+            // close by swapping, because the check it swaps is not run.
+            //
+            // The cost is a full handshake per connection, which is the right
+            // trade for a listener whose whole purpose is deciding who may
+            // connect. Server-only TLS keeps resumption untouched.
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config
+        }
+        None => builder.with_no_client_auth().with_cert_resolver(resolver),
+    };
+    // `config` is only reassigned in the client-auth arm above; silence the
+    // unused-mut in the server-only build without splitting the match.
+    let _ = &mut config;
     Ok(Arc::new(config))
+}
+
+/// Connection info for a request served over the mTLS-capable HTTPS listener
+/// (issue #1640).
+///
+/// axum's `into_make_service_with_connect_info::<C>` requires `C:
+/// Connected<IncomingStream>`; this carries the peer `SocketAddr` — so the rest
+/// of the serve stack behaves exactly as on plain TCP — plus the verified
+/// client identity, when the handshake produced one.
+///
+/// The identity is parsed once per *connection*, not per request.
+#[derive(Clone, Debug)]
+pub struct TlsConnectInfo {
+    /// The peer's TCP address, identical to the plain-TCP path's connect info.
+    pub peer: std::net::SocketAddr,
+    /// The verified client identity, when the peer presented a certificate that
+    /// passed verification. Always `None` on a listener with client auth off.
+    pub client: Option<Arc<client_auth::ClientIdentity>>,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for TlsConnectInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        let peer = *stream.remote_addr();
+        // rustls exposes the peer chain only after a successful handshake, so
+        // anything here has already passed the configured verifier — the parse
+        // turns a verified certificate into a usable identity, it does not
+        // decide trust.
+        let client = stream
+            .io()
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(<[rustls_pki_types::CertificateDer<'_>]>::first)
+            .and_then(|leaf| match client_auth::ClientIdentity::from_der(leaf) {
+                Ok(identity) => Some(Arc::new(identity)),
+                Err(e) => {
+                    // Verified but unparseable: drop the identity rather than
+                    // fabricate one. Routes that require mTLS then reject.
+                    tracing::warn!(peer = %peer, error = %e, "could not parse the verified client certificate");
+                    None
+                }
+            });
+        Self { peer, client }
+    }
 }
 
 /// Upper bound on TLS handshakes running concurrently at any instant.
@@ -639,11 +815,17 @@ async fn run_acceptor(
                     let _ = tx.send((tls, peer)).await;
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        error = %e,
-                        "TLS handshake failed; dropping connection"
-                    );
+                    // An mTLS client-certificate rejection is an operator-facing
+                    // event: counted by reason and logged at warn, rate-limited
+                    // (#1640). Everything else keeps #1603's quiet debug line.
+                    // The client sees only the standard TLS alert either way.
+                    if !client_auth::record_handshake_rejection(&e, peer) {
+                        tracing::debug!(
+                            peer = %peer,
+                            error = %e,
+                            "TLS handshake failed; dropping connection"
+                        );
+                    }
                 }
                 Err(_elapsed) => {
                     tracing::debug!(peer = %peer, "TLS handshake timed out");

@@ -468,6 +468,31 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-macro-args.sh --self-test && ./scripts/check-docs-macro-args.sh
+      - name: Corpus scope agreement gate
+        # The gates above each read "the reader-facing corpus", and each spells
+        # that set itself. Three of them carry a comment promising the spellings
+        # are kept identical, "since a page covered by one gate and not the
+        # other is how a page ends up with no owner" — and nothing checked it.
+        #
+        # They had drifted. `.claude/skills/` is a second skill tree the agent
+        # machinery loads by name; `run-autumn` lives only there, and its
+        # SKILL.md is copy-and-run text throughout. It went into the routes gate
+        # and the orphan gate's entry surfaces and never into the other three,
+        # so five of the eight docs gates read that tree and three did not. Its
+        # `autumn seed --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`
+        # and `AUTUMN_DATABASE__URL` were ungated while the same file already
+        # carried `route-surface-allow` waivers for the gate that did read it.
+        #
+        # This step compares the four declarations rather than the corpus, so it
+        # fails when a scope is edited rather than when the pages that scope
+        # stopped covering finally rot. A difference between them is allowed but
+        # must be written down, which is the rule that catches the case a
+        # superset check does not: one gate widening alone, its siblings still
+        # agreeing with each other.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
