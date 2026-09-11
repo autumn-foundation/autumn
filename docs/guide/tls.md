@@ -949,10 +949,14 @@ Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
 segment (`//`) or a `.` / `..` segment — because it would protect less than it
 appears to. Write the resolved prefix.
 
-**Per-route requirements** come from `required_paths`, matched against the
-normalized request path exactly as CSRF exemptions are — so `/internal/` covers
-`/internal/keys` but not `/internal-tools`, and `/open/../internal/keys` cannot
-slip past. A request reaching one of these over a connection with no verified
+**Per-route requirements** come from `required_paths`, matched at segment
+boundaries — so `/internal/` covers `/internal/keys` but not `/internal-tools`.
+A requirement matches the raw request path AND the normalized one, and demands
+a certificate if either matches: `/open/../internal/keys` cannot slip in, and
+`/internal/%2e%2e` — which normalizes to `/` but which the router still
+dispatches to `/internal/{id}` — cannot slip out.
+
+A request reaching one of these over a connection with no verified
 certificate is rejected with **`403 Forbidden`** and the standard JSON error
 envelope:
 

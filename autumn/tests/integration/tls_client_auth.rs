@@ -254,6 +254,44 @@ async fn a_required_prefix_does_not_leak_onto_a_sibling_path() {
     server.shutdown().await;
 }
 
+/// Normalization resolves dot segments, so `/internal/%2e%2e` cleans to `/`
+/// and stops matching the `/internal` prefix — while axum's router matches the
+/// RAW path and still dispatches it to `/internal/{id}`. Matching only the
+/// normalized path therefore let an anonymous client reach a protected
+/// handler.
+#[tokio::test]
+async fn an_encoded_dot_segment_cannot_escape_a_required_prefix() {
+    let trust = TrustFixture::write(CA_PEM, None);
+    let server = serve_mtls(
+        &trust,
+        ClientAuthMode::Optional,
+        vec!["/internal".to_owned()],
+    )
+    .await;
+
+    let denied = mtls_get(server.addr, "/internal/%2e%2e", None)
+        .await
+        .expect("connection succeeds");
+    assert_eq!(
+        denied.status, 403,
+        "an encoded dot-segment must not normalize its way out of the requirement"
+    );
+
+    // The route still serves a verified client, so the guard refuses the
+    // request rather than breaking the path.
+    let allowed = mtls_get(
+        server.addr,
+        "/internal/%2e%2e",
+        Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)),
+    )
+    .await
+    .expect("connection succeeds");
+    assert_eq!(allowed.status, 200);
+    assert_eq!(allowed.body, "param");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_trailing_slash_prefix_still_covers_the_bare_route() {
     // `required_paths = ["/internal/"]` with a handler at exactly `/internal`.

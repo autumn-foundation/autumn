@@ -144,6 +144,10 @@ pub fn test_router() -> Router {
         .route("/internal", get(|| async { "index" }))
         // A sibling that must NOT be captured by the `/internal` prefix.
         .route("/internal-tools", get(|| async { "tools" }))
+        // A parameterized route under the prefix. axum matches the RAW path,
+        // so `/internal/%2e%2e` reaches this handler even though normalizing
+        // that path resolves it to `/`.
+        .route("/internal/{id}", get(|| async { "param" }))
 }
 
 /// Boot the router over a real mTLS listener, wired exactly as `app.rs` wires

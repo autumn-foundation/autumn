@@ -1154,10 +1154,16 @@ where
             // `[server.tls.client_auth]` with no `required_paths` never has to
             // clean a path. The layer itself is still in the stack.
             RequirementScope::Paths(paths) if paths.is_empty() => false,
-            RequirementScope::Paths(paths) => path_matches_any(
-                crate::security::path::clean_path(req.uri().path()).as_str(),
-                paths,
-            ),
+            // Match the RAW path as well as the normalized one. Normalization
+            // resolves dot segments, so `/internal/%2e%2e` cleans to `/` and
+            // stops matching `/internal` — but axum's router matches the raw
+            // path, so it still dispatches that request to `/internal/{id}`.
+            // A requirement must fail closed: match either spelling.
+            RequirementScope::Paths(paths) => {
+                let raw = req.uri().path();
+                path_matches_any(raw, paths)
+                    || path_matches_any(crate::security::path::clean_path(raw).as_str(), paths)
+            }
         };
         let verified = req.extensions().get::<Arc<ClientIdentity>>().is_some();
 

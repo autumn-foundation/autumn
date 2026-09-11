@@ -1599,7 +1599,8 @@ Absent, the handshake is byte-for-byte the server-only TLS above.
   one bundle, later drop old) needs no restart and drops no established
   connection.
 - `required_paths` — rooted path prefixes whose routes demand a certificate,
-  matched against the normalized request path. A trailing-slash prefix also
+  matched against the raw request path and the normalized one (either match
+  requires a certificate, so normalization cannot drop a requirement). A trailing-slash prefix also
   covers the bare route: `/internal/` covers `/internal`. A request reaching one
   over an uncertified connection gets `403` with the standard problem+json body.
 - Handlers extract `autumn_web::tls::client_auth::ClientCert` (rejects `403`) or
