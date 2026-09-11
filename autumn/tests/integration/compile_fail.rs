@@ -1073,12 +1073,17 @@ fn doc_getting_started_snippets_compile() {
     // `target/` rather than the system-wide temp dir — two checkouts (or two
     // users) sharing `/tmp` would otherwise race to write the same
     // `Cargo.toml`/`src/lib.rs` and could compile one checkout's snippets
-    // against another's `autumn-web` path (Codex review, PR #2707). Its own
-    // `[workspace]` keeps it from being folded into this checkout's real
-    // workspace despite living under `target/`. Removed on the way out, pass
-    // or fail, so a later run never inherits a stale lockfile or build
-    // artifact from this one.
-    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/doc-snippet-check");
+    // against another's `autumn-web` path (Codex review, PR #2707). Suffixed
+    // with this process's PID so two invocations of the same checkout (an
+    // IDE test run overlapping a pre-push check) get separate directories
+    // too, rather than one's `RemoveDirOnDrop` deleting files the other is
+    // still using (Codex review, round 2). Its own `[workspace]` keeps it
+    // from being folded into this checkout's real workspace despite living
+    // under `target/`. Removed on the way out, pass or fail, so a later run
+    // never inherits a stale lockfile or build artifact from this one.
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/doc-snippet-check")
+        .join(std::process::id().to_string());
     let _cleanup = RemoveDirOnDrop(scratch.clone());
     let src = scratch.join("src");
     std::fs::create_dir_all(&src).expect("scratch crate directories");
@@ -1140,8 +1145,25 @@ fn doc_getting_started_snippets_compile() {
     }
     std::fs::write(src.join("lib.rs"), lib_rs).expect("write scratch src/lib.rs");
 
+    // Seed the scratch crate's lockfile from the real workspace's (Codex
+    // review, round 2): with no `Cargo.lock` of its own, `cargo check` has to
+    // resolve autumn-web's entire dependency graph from scratch, and without
+    // `--offline` that means an index/registry round trip for every
+    // transitive crate — reproduced hanging on an `aes-gcm` fetch — even
+    // though every one of those versions was already downloaded and built
+    // moments earlier compiling `autumn-web` itself for the outer test
+    // binary. Copying the workspace's lock in (not asserted immutable via
+    // `--locked`, since this crate's own root package has no entry in it)
+    // gives the resolver every version it needs already pinned; the only
+    // node left to add is this crate itself, which introduces no new
+    // external requirement, so `--offline` never has to leave the local
+    // cache.
+    std::fs::copy(root.join("Cargo.lock"), scratch.join("Cargo.lock"))
+        .expect("seed the scratch crate's Cargo.lock from the workspace's");
+
     let output = std::process::Command::new(env!("CARGO"))
         .arg("check")
+        .arg("--offline")
         .current_dir(&scratch)
         .output()
         .expect("failed to run cargo check on the extracted doc snippets");
