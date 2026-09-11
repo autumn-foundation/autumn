@@ -3086,6 +3086,17 @@ fn render_model_file(
         if f.is_translatable() {
             out.push_str("    #[translatable]\n");
         }
+        // Issue #2597: the declared `decimal{p,s}` shape rides into `#[model]`
+        // on a field attribute the macro parses (`field_decimal_shape`), so
+        // the factory `.fake()` draws values that fit the column by
+        // construction (`fake::decimal_with(p, s)`). Absent for non-decimal
+        // fields — that no-op path keeps their output byte-identical.
+        if let FieldKind::Decimal { precision, scale } = f.kind {
+            let _ = writeln!(
+                out,
+                "    #[decimal_shape(precision = {precision}, scale = {scale})]"
+            );
+        }
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
         // distinguish it. Emit a marker doc comment that (a) tells a human
@@ -4521,6 +4532,32 @@ mod tests {
 
     /// Postgres keeps the real `NUMERIC(p,s)`, which enforces this natively —
     /// no `CHECK` may appear there.
+    #[test]
+    fn decimal_field_emits_decimal_shape_attr_for_model_macro() {
+        // Issue #2597: the declared `decimal{p,s}` rides into `#[model]` on a
+        // `#[decimal_shape(precision = p, scale = s)]` field attribute, so the
+        // factory `.fake()` draws values that fit the column by construction.
+        let fields = parse_fields(&["price:decimal{10,2}".to_owned()]).expect("parse");
+        let model = render_model_file_for_test("Invoice", "invoices", &fields);
+        assert!(
+            model.contains("#[decimal_shape(precision = 10, scale = 2)]"),
+            "decimal field must carry its shape into #[model]: {model}"
+        );
+        assert!(
+            model.contains("pub price: rust_decimal::Decimal,"),
+            "decimal field still renders as rust_decimal::Decimal: {model}"
+        );
+
+        // Non-decimal fields are untouched — the no-op path keeps their
+        // output byte-identical (no new attribute appears).
+        let plain = parse_fields(&["title:String".to_owned()]).expect("parse");
+        let plain_model = render_model_file_for_test("Post", "posts", &plain);
+        assert!(
+            !plain_model.contains("decimal_shape"),
+            "non-decimal fields must not gain the attribute: {plain_model}"
+        );
+    }
+
     #[test]
     fn postgres_decimal_column_has_no_check_constraint() {
         with_no_db_env(|| {
