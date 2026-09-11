@@ -352,6 +352,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **repository:** `retention(...)` and `upsert_many` no longer bypass
+  `position(...)`'s single-row batching guard (#2240). A `#[repository(...,
+  position(...), retention(after = ...))]` sweep could batch several
+  same-scope rows into one DELETE/UPDATE statement — each row's compaction
+  trigger only sees its own pre-statement position, so a sweep could leave a
+  gap in the ordered sequence, the same root cause already fixed for
+  `delete_many`/`update_many` (#1358). `retention(...)` now rejects
+  `position(...)` at compile time (mirroring the existing `sharded`/
+  `dependent(...)` rejections) rather than risk corrupting the sequence.
+  Separately, `upsert_many`'s generated `INSERT ... ON CONFLICT DO UPDATE`
+  chunking could reassign several same-scope rows' `position` scope column
+  in one statement, hitting the identical race already fixed for
+  `update_many`'s scope reassignment. `upsert_many` now forces a chunk size
+  of 1 whenever the repository declares `position(...)`, matching
+  `delete_many`/`update_many`'s existing fix.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
