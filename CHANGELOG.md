@@ -51,6 +51,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the verifier, so a revoked client could otherwise reconnect until its session
   expired. Server-only TLS keeps resumption untouched. See the
   [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+- **autumn-media: room participants can hold a seat with a heartbeat (#1974):**
+  `POST /api/media/rooms/{room_id}/heartbeat` refreshes a participant's liveness
+  and renews its advisory `token_expires_at` to `now + room_token_ttl_seconds`.
+  Previously the only liveness signal was a member-gated roster poll, so a client
+  that used its join response and its own peer connections — but never re-polled
+  — lost its seat to the idle reaper. The token value never rotates, so an
+  in-flight roster poll keeps working. Like the roster it is fail-closed: an
+  unknown room, unknown participant and wrong token are one indistinguishable
+  `404`, so a heartbeat is not a membership oracle. Both the in-memory and
+  DB-backed stores implement it; the DB store verifies the token in constant time
+  and then renews in one `UPDATE` that treats a concurrently-reaped seat as gone.
+  **Breaking:** `RoomStore` gains a required `heartbeat` method, so an
+  out-of-tree store must implement it — see the
+  [migration guide](docs/migrations/next.md).
+
+- **`autumn deploy` grades MediaMTX listener ports against the app's base URLs
+  (#1974):** a new pure-config preflight compares each `[media.mediamtx] *_port`
+  with the `*_base` URL that calls it. Customizing a port without updating its
+  base URL used to deploy cleanly and fail every request at runtime. Only a base
+  the operator set in TOML, on loopback, naming a port can block — a proxied or
+  CDN-fronted base publishes its own port and is skipped, and an unset base
+  (which the app may take from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`) warns without
+  blocking, as an indirected `[media.ffmpeg] bin` does.
 - **`autumn-billing` plugin (#1190):** first-party subscription billing for
   Stripe. One `.plugin(BillingPlugin::new().config(cfg).plans(&plans))` mounts
   hosted checkout (`POST /billing/checkout`), the customer portal
@@ -290,6 +313,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`autumn deploy` now creates the MediaMTX recordings directory it preflights
+  (#1974).** `deploy up` fail-closed on a missing `[media.mediamtx]
+  recordings_dir` while provisioning only created the config file's parent, so a
+  fresh host was blocked from the very step that would have created the
+  directory. Provisioning now creates both, the recordings root mode `0750`
+  (applied only to a directory it creates, so an existing one keeps the mode the
+  operator gave it). The preflight passes a directory that is absent under a
+  writable ancestor, reports "exists but not writable" and "ancestor is not
+  writable" apart, and still fails closed on anything it cannot verify —
+  including a dangling symlink or symlink loop, which the earlier `test -e` walk
+  stepped past as if the path were absent. An empty or relative `recordings_dir`
+  is now rejected outright: the probe, the `mkdir` and the daemon each resolved
+  it against a different directory. A `${...}` path is deferred to runtime.
+
+- **`MediaConfig::validate` rejects a generic S3 backend with no
+  `public_base_url` (#1974).** `MediaStorage::from_config` already enforced this
+  — only a Tigris endpoint has a derivable public base — so validation and
+  storage construction now agree instead of failing at first upload. An app
+  using a non-Tigris S3 backend without `public_base_url` and calling
+  `validate()?` at boot now fails there.
+
 - **Docs gate: Autumn macro arguments are checked against the macros.**
   `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
   seventh thing a reader copies off a page: the keyword arguments inside an
@@ -331,6 +375,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs:** `strict_config` and a plugin-owned `[media]` table are no longer
+  documented as mutually exclusive (#1974). The deployment guide still carried
+  the pre-#2061/#2063 workaround telling operators to turn `strict_config` off.
+  Both paths accept the table now: the app declares the section via
+  `AppBuilder::config_section`, and `autumn deploy` accepts unknown top-level
+  roots opaque-with-a-warning while keeping every known section strict. Also
+  corrects the `[media.mediamtx] rtmp_port` docs, which said "RTMP/WHIP ingest" —
+  WHIP publishes on `webrtc_port`.
 - **jobs:** the Redis `/admin/jobs` enqueued tab now lists jobs parked on a
   full concurrency slot (issue #1186). A parked job lives in the
   `{prefix}:blocked` zset and is promoted back to its queue every ~100 ms, so
