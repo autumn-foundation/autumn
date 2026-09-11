@@ -1299,18 +1299,37 @@ fn resolve_cargo_target_dir() -> std::path::PathBuf {
     {
         dir = parent.to_path_buf();
     }
-    // Cargo stamps CACHEDIR.TAG in a `--target <triple>` build's per-triple
-    // artifact subdirectory (`target/<triple>/`) as well as at the real
-    // target root (`target/`) — confirmed by probing `cargo build --target
-    // <host-triple>`, which left the marker in both places. So the marker
-    // alone can't tell `target/<triple>/` and `target/` apart; if our
-    // directory's parent also carries it, we're one level too deep.
-    if let Some(parent) = dir.parent()
-        && parent.join("CACHEDIR.TAG").exists()
+    // A `--target <triple>` build inserts an extra `<target-dir>/<triple>/`
+    // level that also carries CACHEDIR.TAG (confirmed by probing `cargo
+    // build --target <host-triple>`, which stamped the marker in both
+    // `target/` and `target/<triple>/`) — so "parent also has CACHEDIR.TAG"
+    // can't tell that inserted level apart from a deliberately nested
+    // `--target-dir` (e.g. `--target-dir target/doc-tests`, itself sitting
+    // under a marked `target/`), which must NOT be climbed past. Resolve it
+    // by asking rustc for its own list of valid target triples: only an
+    // actual `--target` subdirectory can be named one.
+    if let Some(name) = dir.file_name().and_then(std::ffi::OsStr::to_str)
+        && is_rustc_target_triple(name)
+        && let Some(parent) = dir.parent()
     {
         dir = parent.to_path_buf();
     }
     dir
+}
+
+/// Whether `name` is one of rustc's own recognized `--target` triples,
+/// distinguishing a `--target <triple>`-inserted artifact directory from an
+/// arbitrary user-chosen `--target-dir` path component of the same shape.
+fn is_rustc_target_triple(name: &str) -> bool {
+    let Ok(output) = std::process::Command::new("rustc")
+        .args(["--print", "target-list"])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == name)
 }
 
 /// Recursively removes the wrapped directory when dropped, pass or fail
