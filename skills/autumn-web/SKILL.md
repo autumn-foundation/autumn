@@ -2842,7 +2842,12 @@ user pins 0.5.x:
 
 ```bash
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
+                                 # native on Windows too (#1639): TCP transport,
+                                 # file-requested graceful drain, same serve.addr
 autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
+autumn serve install-service     # Windows only, elevated: register as a boot-start,
+                                 # crash-restarting service; uninstall-service removes it
+                                 # (flags go BEFORE the subcommand: serve --bundled-pg install-service)
 autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
 autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
 autumn generate scaffold Post title:String --live --live-validation

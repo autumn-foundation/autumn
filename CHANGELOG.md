@@ -31,6 +31,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compare-and-set, a provider transport error reschedules the same attempt
   instead of failing the job, and a production profile refuses the in-memory
   mirror unless `billing.allow_memory_store_in_production = true`.
+- **Native Windows daemon lifecycle and Windows Service registration (#1639):**
+  `autumn serve --daemon`, `stop`, `status` and `restart` now run natively on
+  Windows instead of failing fast with a WSL2 pointer, and the daemon lifecycle
+  moves from Tier 2 to Tier 1 in the platform-support policy. The contract is the
+  one Unix has: a single-instance guard, a readiness-gated start, a `serve.addr`
+  discovery file, and `status` exit codes 0/3. A Windows daemon binds its
+  configured `server.host`/`server.port` and reports the address it actually
+  bound back through the readiness file, which the CLI records as
+  `transport = "tcp"` — that report also fixes the address file on Unix for
+  `server.port = 0` and for a socket adopted during an in-place upgrade.
+  `autumn serve stop` on Windows requests a graceful drain through the
+  cooperative-shutdown file rather than force-killing, so in-flight requests
+  finish, `on_shutdown` hooks run and a managed Postgres child is stopped
+  cleanly; only once the daemon's recorded budget expires does it escalate, and
+  then it reaps the whole process tree. `stop` now also says which of those
+  happened, on both platforms — a force-kill after an overrun, or one that could
+  not ask at all, is no longer reported as a plain "stopped". A foreground server
+  drains on a console control event too (`CTRL_C` and `CTRL_BREAK` fully;
+  `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` best-effort, since Windows tells
+  rather than asks). Two new commands, `autumn serve
+  install-service` and `autumn serve uninstall-service`, register the daemon as
+  a Windows service that starts at boot and restarts after a crash and remove it
+  again cleanly; the service hosts the same app the daemon does, so `status` and
+  `stop` keep working against it. Daemon state under `%LOCALAPPDATA%` is created
+  with an owner-only ACL (the owning user, `SYSTEM` and `Administrators`, with
+  inheritance broken), the Windows analog of the Unix `0700`/`0600` posture, and
+  the daemon refuses to start if it cannot be applied — including on a directory
+  another local user owns, since an owner can rewrite any ACL. Windows daemon
+  state moves from roaming `%APPDATA%` to `%LOCALAPPDATA%`, which is what the
+  guide always documented: a pidfile is machine-specific and a managed-Postgres
+  cluster must not be synced at logoff or land on a redirected network share. `autumn doctor` gains a
+  `daemon_service` check reporting whether a daemon or a registered service is
+  running for this project and what the service journey still needs. See
+  [the daemon guide](docs/guide/daemon.md#windows).
+- **cli/generate:** `autumn generate teams` is now **backend-aware on SQLite**
+  (#1927). It was refused at generate time because its migration was fixed
+  Postgres DDL; it now emits the organizations/memberships/invitations tables in
+  the app's own dialect — `INTEGER PRIMARY KEY AUTOINCREMENT`, `INTEGER`
+  user-id columns, and `TEXT ... DEFAULT CURRENT_TIMESTAMP` timestamps. The
+  portable parts are shared and unchanged: the `role`/`status` `CHECK` enums,
+  the `UNIQUE (tenant_id, user_id)` idempotency constraint, and the partial
+  `idx_invitations_pending_email` unique index. Everything else the generator
+  emits was already backend-neutral — `#[repository]` binds
+  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+  sql-types both diesel backends carry. Postgres SQL is unchanged.
+
+  Three things beyond the DDL were needed for the generated app to actually
+  build and boot on SQLite. Its route handlers took 19 pessimistic row locks
+  with `.for_update()`, which diesel implements for Postgres and MySQL only;
+  they now go through `::autumn_web::maybe_for_update!`, the framework's
+  existing seam, which is a plain read on SQLite (write-write correctness then
+  rests on SQLite's single-writer transaction, which fails closed with
+  `SQLITE_BUSY_SNAPSHOT` rather than losing an update). Its Cargo dependency
+  set was unconditionally Postgres — `diesel`/`diesel-async` on `"postgres"`
+  plus a direct `pq-sys`, and no `returning_clauses_for_sqlite_3_35`, which the
+  generated `.returning(...).get_result(conn)` inserts need on SQLite — and is
+  now selected per backend like `generate model`'s. And it never enabled
+  `autumn-web`'s own `sqlite` feature, without which `RuntimeConnection` stays
+  the Postgres connection and the app refuses its own `sqlite://` URL at boot.
+
+  This closes the generator audit #1927 asked for: `auth`,
+  `mailer --list-unsubscribe`, `teams` and `commentable` hand-write their
+  `CREATE TABLE` DDL, while `notifications` and `pwa` derive theirs through
+  `schema_edit`; all six are now covered by a guard that plans each against a
+  SQLite app, applies and rolls back every migration it emits on a real
+  in-memory SQLite, scans the SQL for Postgres-only spellings, and scans the
+  generated Rust for constructs SQLite has no diesel implementation for. Both
+  scans matter: SQLite accepts an unknown type name (so `id BIGSERIAL PRIMARY
+  KEY` applies cleanly and merely stops auto-incrementing), and applying SQL
+  cannot see a generated crate that would not compile. `counter_cache` was
+  audited and left alone: its
+  `ALTER TABLE ... ADD COLUMN ... BIGINT NOT NULL DEFAULT 0` / `DROP COLUMN` is
+  already portable, since SQLite gives `BIGINT` integer affinity and so reads
+  back without schema drift.
+- **cli/generate:** the scaffolded `docs/guide/authentication.md` is now
+  **backend-aware** (#1927). `generate auth` made its two sibling guides
+  dialect-aware under #1908 (`session-management.md`, the OAuth guide) but left
+  this one emitting unconditional Postgres SQL: two `ALTER TABLE ... ADD COLUMN
+  IF NOT EXISTS ...` retrofit blocks (lockout columns, email-confirmation
+  columns), their `DROP COLUMN IF EXISTS` rollbacks, and an
+  `email_confirmed_at = NOW()` backfill. SQLite rejects all of those outright —
+  `IF NOT EXISTS` is a syntax error on `ADD COLUMN`, only one column may be
+  added per statement, and there is no `NOW()` — so an operator copy-pasting
+  from the guide got a migration that would not apply. A SQLite app now gets one
+  `ALTER TABLE` per column, `TEXT` timestamps, and `CURRENT_TIMESTAMP`. Postgres
+  output is unchanged.
+- **deploy: a live-safe `server.port` change on an existing deployment (issue
+  #2073, Option C).** #2071 refused a redeploy that changed `server.port`
+  because the reboot-durability restart (#2070) could not move the proxy's
+  public listener safely mid-cutover. `autumn deploy` now supports it directly,
+  in four phases: stand the candidate up on a loopback port derived from the
+  OLD public port (so it never collides with the still-live release), flip
+  traffic to it, drain the old release, then rebind the proxy's public listener
+  to the NEW port. That last step is its own failure boundary — a failed rebind
+  rolls the proxy back to the OLD port, and the release stays live and
+  reachable there; retry the port change alone in a separate deploy. The rare
+  case where the rollback itself fails reports that the proxy's public bind is
+  now unknown and needs a human, rather than silently guessing. [no-plugin]
+
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
@@ -189,6 +288,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 
 ### Fixed
+
+- **jobs:** the Redis `/admin/jobs` enqueued tab now lists jobs parked on a
+  full concurrency slot (issue #1186). A parked job lives in the
+  `{prefix}:blocked` zset and is promoted back to its queue every ~100 ms, so
+  a list built from `LRANGE` alone showed it blinking in and out of the table
+  even though it was never lost. The enqueued page now reads the queues and
+  the blocked zset as one logical list: the total is `LLEN` per queue plus
+  `ZCARD blocked`, and paging spans the concatenation, queue ids first. Merged
+  rows carry a new `JobAdminRecord::blocked_on_concurrency` flag and the
+  dashboard marks them "waiting on a concurrency slot", so an operator can
+  tell a job waiting for a slot from one ready to claim. Cancel still works on
+  a parked row. Enforcement, promotion cadence, the `/actuator/jobs` gauges,
+  and the local/Postgres/SQLite backends are unchanged; those backends report
+  `blocked_on_concurrency: false`. The count includes parked jobs, so the
+  dashboard's Enqueued counter can read higher than `/actuator/jobs`'s
+  `queued` gauge by the parked count — the two are separate there, `queued`
+  plus `blocked_on_concurrency`.
+  **Breaking:** `JobAdminRecord` is public and not `#[non_exhaustive]`, so a
+  struct-literal construction of it — only a custom `JobAdminBackend` builds
+  one — needs the new field. It now derives `Default`, so end the literal with
+  `..Default::default()` and the next field will not break it; see
+  [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
 
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path

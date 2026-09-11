@@ -31,7 +31,13 @@ CSRF tokens for every mutating action.
 
 The dashboard renders four paginated lists, newest-first:
 
-- Enqueued jobs waiting for a worker.
+- Enqueued jobs waiting for a worker. On the Redis backend this list also
+  covers jobs parked on a full concurrency slot; those rows are marked
+  "waiting on a concurrency slot". The marker is a sample: a parked job
+  returns to its queue every ~100 ms to retry, so a read can catch it
+  unmarked. The row stays listed either way. The Enqueued counter includes
+  parked jobs, so it can read higher than `/actuator/jobs`, which reports
+  `queued` and `blocked_on_concurrency` separately.
 - Running jobs currently executing in this runtime.
 - Completed jobs from the last 24 hours.
 - Terminally failed jobs from the last 7 days.
