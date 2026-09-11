@@ -41,9 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation set in `scripts/wire-contract-sweep.py`, all 12 wire-breaking changes
   turn `cargo build` red with a caller-named error and none of the 12 compatible
   changes is rejected. Worked two-service example in `examples/mesh-catalog` and
-  `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. First
+  `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. Entirely
+  new surface, so this is **non-breaking** — a glob-imported prelude name an app
+  already defines shadows the new one. First
   slice: one workspace, synchronous request/response, JSON over HTTP — the
   cross-version rolling-deploy proof is the next one.
+  <!-- migration-guide-gate: entirely new surface; "breaking" here describes the
+  wire-breaking changes the feature CATCHES, not a break in Autumn's own API -->
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
