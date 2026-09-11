@@ -1377,9 +1377,9 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 proc_macro2::Span::call_site(),
                 "retention(...) does not support position(...) yet: the sweep batches up to \
                  `batch_size` rows into one DELETE/UPDATE statement, and each swept row's \
-                 position-compaction trigger only sees its own row's pre-statement OLD \
-                 position — several swept rows from the same scope in one sweep statement can \
-                 leave a gap in the ordered sequence (#2240, same root cause already fixed for \
+                 compaction trigger only sees its own pre-statement OLD position — several \
+                 swept rows from the same scope in one sweep statement can leave a gap in the \
+                 ordered sequence (#2240, same root cause already fixed for \
                  delete_many/update_many by forcing chunk size 1). Remove `position(...)`, or \
                  age rows out of the ordered list yourself via delete_many(ids) (already \
                  single-row-chunked for position tables) from a hand-written #[scheduled] \
@@ -10925,11 +10925,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let upsert_many_body = {
             // A position-scoped table's compaction trigger fires per row and only
-            // sees that row's own pre-statement OLD position, so one multi-row
-            // upsert chunk that reassigns several rows' scope can under- or
-            // over-compact (#2240, same root cause already fixed for
-            // delete_many/update_many). Cap the chunk size at 1 so every upsert
-            // chunk is single-row when a position field exists.
+            // sees its own pre-statement OLD position, so one multi-row upsert
+            // chunk that reassigns several rows' scope can under- or over-compact
+            // (#2240, same root cause already fixed for delete_many/update_many).
+            // Cap the chunk size at 1 so every upsert chunk is single-row when a
+            // position field exists.
             let upsert_chunk_cap: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(
@@ -26459,10 +26459,10 @@ mod tests {
     fn retention_rejects_position() {
         // #2240: the sweep batches many rows into one DELETE/UPDATE statement.
         // A position-scoped table's per-row compaction trigger only sees its
-        // own row's pre-statement OLD position, so sweeping several live rows
-        // from the same scope in one statement can leave a gap (same root
-        // cause already fixed for delete_many/update_many). Reject rather
-        // than silently corrupt the ordered sequence.
+        // own pre-statement OLD position, so sweeping several live rows from
+        // the same scope in one statement can leave a gap (same root cause
+        // already fixed for delete_many/update_many). Reject rather than
+        // silently corrupt the ordered sequence.
         let tokens: proc_macro2::TokenStream =
             "Post, position, retention(after = \"30d\", basis = created_at)"
                 .parse()
@@ -27702,11 +27702,8 @@ mod tests {
         // Sibling of the test above: a repository without `position(...)`
         // must keep the original 1000-row chunk cap, i.e. this fix must not
         // regress bulk upsert throughput for ordinary repositories.
-        let generated = repository_macro(
-            quote! { Post },
-            quote! { pub trait PostRepository {} },
-        )
-        .to_string();
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         let anchor = generated
             .find("AutumnUpsertExecutionExt")
             .expect("upsert_many must be generated");

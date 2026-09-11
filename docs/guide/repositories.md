@@ -125,7 +125,7 @@ RETURNING *;
 > Because Postgres determines whether a row will insert vs update at runtime, it is impossible to correctly invoke `before_create` or `before_update` hooks before sending the query. To prevent silent hook bypass, this is caught during compilation.
 
 > [!NOTE]
-> **`position(...)` repositories chunk one row at a time.** A batched upsert that reassigns a scoped `position` field's scope column can rescope several same-scope rows in one statement; the compaction trigger for each row only sees its own pre-statement position, which can gap or duplicate ranks. `upsert_many` forces a chunk size of 1 whenever the repository declares `position(...)`, trading batch throughput for a correct sequence.
+> **`position(...)` repositories chunk one row at a time.** A batched upsert that reassigns a scoped `position` field's scope column can rescope several same-scope rows in one statement. Each row's compaction trigger only sees its own pre-statement position, so this can gap or duplicate ranks. `upsert_many` forces a chunk size of 1 whenever the repository declares `position(...)`, trading batch throughput for a correct sequence.
 
 ---
 

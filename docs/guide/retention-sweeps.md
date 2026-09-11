@@ -72,13 +72,12 @@ reach the shard it happens to be handed, silently skipping the rest), and
 neither is `dependent(...)` (a sweep mutates rows directly rather than
 through the cascade-aware delete path `dependent(...)` generates, so it
 could orphan children or ignore an `on_delete = restrict` rule). Nor is
-`position(...)`: a sweep batches many rows into one DELETE/UPDATE
-statement, and a position-scoped table's per-row compaction trigger only
-sees its own row's pre-statement position, so sweeping several live rows
-from the same scope in one statement can leave a gap in the ordered
-sequence. Age rows out of an ordered list yourself via `delete_many(ids)`
-(already single-row-chunked for `position(...)` tables) from a
-hand-written `#[scheduled]` sweep instead.
+`position(...)`. A sweep batches many rows into one DELETE/UPDATE
+statement. Each row's compaction trigger only sees its own pre-statement
+position. Sweeping several rows from the same scope in one statement can
+leave a gap in the ordered sequence. Age rows out of an ordered list
+yourself via `delete_many(ids)` (already single-row-chunked for
+`position(...)` tables) from a hand-written `#[scheduled]` sweep instead.
 
 ## `tenant_scoped` Repositories: Sweeps Are Cross-Tenant By Design
 
