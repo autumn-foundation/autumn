@@ -1223,10 +1223,12 @@ fn doc_getting_started_snippets_compile() {
     // (Codex review, round 5). Left in place afterward (unlike `scratch`
     // itself): it's cargo's own build output directory, already shared and
     // already excluded from version control by definition.
+    // `--profile test`, not the default `dev` (Codex review, round 12): the
+    // workspace root overrides `[profile.test]`'s debug/incremental
+    // settings, and cargo's fingerprint bakes in the resolved profile, so a
+    // `dev` check can't reuse the `test`-profile artifacts already here.
     let output = std::process::Command::new(env!("CARGO"))
-        .arg("check")
-        .arg("--offline")
-        .arg("--target-dir")
+        .args(["check", "--offline", "--profile", "test", "--target-dir"])
         .arg(resolve_cargo_target_dir())
         .current_dir(&scratch)
         .output()
