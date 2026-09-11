@@ -100,11 +100,19 @@
 # WHAT THIS GATE CANNOT SEE: agreement is not correctness. It compares the four
 # gates against each other, so a blindness they SHARE is invisible to it — if
 # every gate's corpus rule misses the same page, all four agree and this passes.
-# That is not hypothetical: the `readme = "…"` manifest parser they share was
-# double-quote-only, and would have skipped a single-quoted `readme = 'x.md'` in
-# step across all four (fixed in the same change as this note). So a rule copied
-# into all four gates still needs to be right on its own terms; this gate only
-# promises they do not diverge.
+# That is not hypothetical — the shared manifest parser produced three of these
+# in a row, each invisible here and each caught only by review:
+#
+#   - it read only double-quoted `readme = "…"`, so a single-quoted path
+#     resolved to nothing in all four;
+#   - it used the resolved set only to FILTER a markdown glob, so a published
+#     `README.rst` could not enter any of the four;
+#   - it ignored Cargo's implicit discovery, so a crate that simply omits the
+#     key — which two publishable crates here are not required to declare —
+#     published a landing page no gate owned.
+#
+# So a rule copied into all four gates still needs to be right on its own terms.
+# This gate only promises they do not diverge.
 #
 # A gate whose `--corpus` fails, or prints nothing, is a FAILURE and never a
 # skip: an empty corpus compares equal to another empty corpus, and a gate that
