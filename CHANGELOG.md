@@ -562,6 +562,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Removed dead `autumn/templates/build.rs.template` (#2694):** an
+  unreferenced leftover from before the Tailwind build script moved to
+  `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
+  actually scaffolds via `include_str!`). Zero code references anywhere in
+  the tree — only historical sprint docs and old CHANGELOG entries mention
+  it. This covers the dead-code sub-item of #2694; the clone-class merge
+  across the nine example `build.rs` copies still needs a human call per
+  that issue. Note: `autumn/templates/static/` also appears unreferenced and
+  was left in place — flagging for a separate decision.
 - **SQLite decimal `CHECK` now enforces canonical form (#2636):** the
   generated `CHECK` for `decimal{p,s}` `TEXT` columns on SQLite enforced the
   text *shape* (digit budgets, one decimal literal) but not its
