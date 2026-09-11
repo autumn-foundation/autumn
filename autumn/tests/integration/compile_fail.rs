@@ -1167,9 +1167,15 @@ fn doc_getting_started_snippets_compile() {
     // async `main` missing `#[autumn_web::main]`, etc.). Everything else is a
     // bare-item fragment nested in its own `mod` of one shared `src/lib.rs`,
     // where no `main` is required (Codex review, PR #2707, round 3).
+    // `declares_fn_main` tolerates whitespace between `main` and `(` (`fn
+    // main ()`, a line break) rather than requiring the literal `fn main(`
+    // spelling: a fence in that shape was falling through to the library
+    // path, where the exact defect this split exists to catch — a dropped
+    // `#[autumn_web::main]` on an async `main` — silently compiles instead
+    // of hitting the binary-only `E0752` (Codex review, round 6).
     let mut lib_rs = String::from("#![allow(dead_code, unused_variables, unused_imports)]\n\n");
     for (name, body) in &fixtures {
-        if body.contains("fn main(") {
+        if declares_fn_main(body) {
             std::fs::write(src_bin.join(format!("{name}.rs")), body)
                 .unwrap_or_else(|e| panic!("write scratch src/bin/{name}.rs: {e}"));
         } else {
@@ -1213,7 +1219,7 @@ fn doc_getting_started_snippets_compile() {
         .arg("check")
         .arg("--offline")
         .arg("--target-dir")
-        .arg(resolve_cargo_target_dir(root))
+        .arg(resolve_cargo_target_dir())
         .current_dir(&scratch)
         .output()
         .expect("failed to run cargo check on the extracted doc snippets");
@@ -1227,32 +1233,49 @@ fn doc_getting_started_snippets_compile() {
     );
 }
 
-/// Asks cargo for the workspace's actual build output directory —
-/// `cargo metadata`'s own `target_directory` field, which already accounts
-/// for a `CARGO_TARGET_DIR` env var or a `.cargo/config.toml`
-/// `build.target-dir` override, unlike hard-coding `root.join("target")`.
-fn resolve_cargo_target_dir(workspace_root: &std::path::Path) -> std::path::PathBuf {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args(["metadata", "--no-deps", "--format-version=1"])
-        .current_dir(workspace_root)
-        .output()
-        .expect("failed to run cargo metadata to resolve the workspace's target directory");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata_json = String::from_utf8_lossy(&output.stdout);
-    let key = "\"target_directory\":\"";
-    let value_start = metadata_json
-        .find(key)
-        .map(|i| i + key.len())
-        .expect("cargo metadata output has no target_directory field");
-    let value_end = metadata_json[value_start..]
-        .find('"')
-        .map(|i| value_start + i)
-        .expect("cargo metadata's target_directory string is unterminated");
-    std::path::PathBuf::from(metadata_json[value_start..value_end].replace("\\\\", "\\"))
+/// Whether a fence's body declares a `main` function, tolerating whitespace
+/// (including a line break) between `main` and `(` — `fn main ()`, not just
+/// `fn main()` — since a plain `body.contains("fn main(")` fell through to
+/// the library path on that spelling, the same silent-miss this whole split
+/// exists to prevent (Codex review, PR #2707, round 6).
+fn declares_fn_main(body: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(offset) = body[search_from..].find("fn main") {
+        let after = search_from + offset + "fn main".len();
+        if body[after..].trim_start().starts_with('(') {
+            return true;
+        }
+        search_from = after;
+    }
+    false
+}
+
+/// Finds the workspace's actual build output directory the same way cargo
+/// itself already answered it for *this* process, rather than re-deriving it
+/// from a fresh `cargo metadata` call: a `CARGO_TARGET_DIR` env var and a
+/// `.cargo/config.toml` `build.target-dir` both propagate to a spawned
+/// subprocess and so are visible to `cargo metadata` too, but the outer
+/// invocation's own one-shot `--target-dir` CLI flag is not — it applies
+/// only to that single command, so a child `cargo metadata` run resolves the
+/// *default* location instead and reuse silently stops working for exactly
+/// the supported case round 5 meant to cover (Codex review, round 6, with a
+/// reproduction: a probed child process saw `CARGO_TARGET_DIR=None` and
+/// still reported the default). The one thing that cannot lie about where
+/// cargo actually put this build's artifacts is where it put *this test
+/// binary*: `target-dir/<profile>/deps/<this binary>`, three path
+/// components down from `current_exe()`, however that target-dir was
+/// chosen.
+fn resolve_cargo_target_dir() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("resolve the running test binary's own path");
+    exe.ancestors()
+        .nth(3)
+        .unwrap_or_else(|| {
+            panic!(
+                "test binary path {} is not nested as target-dir/<profile>/deps/<binary>",
+                exe.display()
+            )
+        })
+        .to_path_buf()
 }
 
 /// Recursively removes the wrapped directory when dropped, pass or fail
