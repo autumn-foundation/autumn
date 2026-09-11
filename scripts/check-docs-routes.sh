@@ -371,6 +371,15 @@ def package_readmes(root):
     return out
 
 
+def tracked_files(root):
+    """Every tracked path, for the published READMEs the markdown glob misses."""
+    out = subprocess.run(
+        ['git', 'ls-files', '-z'],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    return {f for f in out.split('\0') if f}
+
+
 def corpus(root):
     """The reader-facing pages, including the one written into a new project.
 
@@ -390,8 +399,20 @@ def corpus(root):
                          cwd=root, capture_output=True, text=True,
                          check=True).stdout
     published = package_readmes(root)
-    return [f for f in out.split("\0")
-            if f and (in_scope(f) or f.endswith(".md.tmpl") or f in published)]
+    files = [f for f in out.split("\0")
+             if f and (in_scope(f) or f.endswith(".md.tmpl")
+                       or f in published)]
+    # A published landing page is corpus whatever it is NAMED. Using
+    # `published` only to filter the markdown glob meant a crate that names a
+    # `README.rst` or `README.txt` — valid, and unrestricted by
+    # `check-crate-metadata.sh` — resolved to a path the glob never produced, so
+    # the clause above could not add it and the page had no owner in any gate.
+    # All four filtered identically, so they agreed and the scope gate stayed
+    # green over it. Unioned in instead, and only when tracked.
+    seen = set(files)
+    tracked = tracked_files(root)
+    return files + sorted(p for p in published
+                          if p in tracked and p not in seen)
 
 
 # ── Extraction ───────────────────────────────────────────────────────────────
