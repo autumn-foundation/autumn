@@ -375,6 +375,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # check-docs-cli.sh and check-plugin-freshness.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
+import tomllib
 import os, re, subprocess, sys, pathlib, collections, bisect
 
 MODE = sys.argv[1]
@@ -5781,118 +5782,6 @@ def source_tokens(root):
 # rely on discovery here are the `examples/*`, all `publish = false` and so not
 # published at all, and their READMEs are already corpus by directory.
 README_CANDIDATES = ('README.md', 'README.txt', 'README')
-CARGO_README = re.compile(r"""^\s*readme\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.M)
-CARGO_README_FALSE = re.compile(r'^\s*readme\s*=\s*false\b', re.M)
-CARGO_README_INHERIT = re.compile(r'^\s*readme\.workspace\s*=\s*true\b', re.M)
-CARGO_PUBLISH_FALSE = re.compile(
-    r'^\s*publish\s*=\s*(?:false\b|\[\s*\])', re.M)
-CARGO_PUBLISH_INHERIT = re.compile(r'^\s*publish\.workspace\s*=\s*true\b',
-                                   re.M)
-PACKAGE_SECTION = re.compile(r'^\[package\]\s*$(.*?)(?=^\[|\Z)', re.M | re.S)
-
-
-def _named_readme(section):
-    """The explicit `readme = "..."` in a `[package]` body, in either quote."""
-    found = [dq or sq for dq, sq in CARGO_README.findall(section)]
-    return found[0] if found else None
-
-
-def not_published(body, root, tracked):
-    """Whether a `[package]` body opts out of publication.
-
-    `publish = false` and the equivalent empty registry list `publish = []`
-    both mean never published; a non-empty list means published somewhere.
-    `publish.workspace = true` defers to `[workspace.package]`, and an absent
-    key anywhere means published, which is Cargo's default.
-    """
-    if CARGO_PUBLISH_FALSE.search(body):
-        return True
-    if CARGO_PUBLISH_INHERIT.search(body) and 'Cargo.toml' in tracked:
-        text = (pathlib.Path(root) / 'Cargo.toml').read_text(
-            encoding='utf-8', errors='ignore')
-        m = re.search(r'^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)', text,
-                      re.M | re.S)
-        return bool(m and CARGO_PUBLISH_FALSE.search(m.group(1)))
-    return False
-
-
-def workspace_readme(root, tracked):
-    """The `[workspace.package] readme`, for manifests that inherit it.
-
-    An inherited path is relative to the WORKSPACE root, so it needs no
-    rebasing onto the inheriting manifest's directory.
-    """
-    if 'Cargo.toml' not in tracked:
-        return None
-    text = (pathlib.Path(root) / 'Cargo.toml').read_text(
-        encoding='utf-8', errors='ignore')
-    m = re.search(r'^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)', text,
-                  re.M | re.S)
-    return _named_readme(m.group(1)) if m else None
-
-
-def package_readmes(root):
-    """Every file a `Cargo.toml` publishes as its crate's README.
-
-    Cargo decides this four ways and so does this: an explicit path in either
-    TOML string form; `readme = false` for none; `readme.workspace = true`
-    inheriting the workspace's; and — when the key is ABSENT — discovery of
-    `README.md`, `README.txt` or `README` beside the manifest, in that order,
-    which Cargo publishes just the same.
-
-    Discovery is modelled rather than assumed away. It was left out on the
-    grounds that `scripts/check-crate-metadata.sh` requires an explicit `readme`
-    of every publishable crate, and that was WRONG: that gate walks a
-    hand-maintained `CRATES` list, and `autumn-media-plugin` and
-    `autumn-schema-core` are publishable, are absent from it, and so are not
-    held to it. Either could drop the key, go on publishing its README, and
-    leave that landing page with no owner in any gate — identically in all
-    four, which is the one shape `check-docs-scope.sh` cannot see.
-
-    The search is confined to the `[package]` body so a root manifest's
-    `[workspace.package]` cannot be read as a package of its own, and a
-    manifest with no `[package]` at all is skipped rather than discovered into.
-    """
-    tracked = tracked_files(root)
-    out = set()
-    for rel in sorted(f for f in tracked
-                      if f == 'Cargo.toml' or f.endswith('/Cargo.toml')):
-        manifest = pathlib.PurePosixPath(rel)
-        parent = str(manifest.parent)
-        parent = '' if parent == '.' else parent + '/'
-        text = (pathlib.Path(root) / rel).read_text(
-            encoding='utf-8', errors='ignore')
-        section = PACKAGE_SECTION.search(text)
-        if not section:
-            continue
-        body = section.group(1)
-        if not_published(body, root, tracked):
-            # `publish = false` means there is no crates.io landing page to
-            # keep true. Without this, adding an internal `README.md` to an
-            # unpublished package — a benchmark harness, a fixture crate —
-            # silently enrolled those working notes in all four drift gates,
-            # which then failed on the illustrative commands such a page is
-            # entitled to contain. Discovery made that automatic: before it,
-            # only an explicit `readme` key could do it.
-            continue
-        if CARGO_README_FALSE.search(body):
-            continue
-        named = _named_readme(body)
-        if named:
-            # `readme = "../README.md"` points at the workspace root's page.
-            resolved = os.path.normpath(str(manifest.parent / named))
-            out.add(resolved.replace(os.sep, '/'))
-            continue
-        if CARGO_README_INHERIT.search(body):
-            inherited = workspace_readme(root, tracked)
-            if inherited:
-                out.add(os.path.normpath(inherited).replace(os.sep, '/'))
-            continue
-        for candidate in README_CANDIDATES:
-            if parent + candidate in tracked:
-                out.add(parent + candidate)
-                break
-    return out
 
 
 def tracked_files(root):
@@ -5902,6 +5791,88 @@ def tracked_files(root):
         cwd=root, capture_output=True, text=True, check=True,
     ).stdout
     return {f for f in out.split('\0') if f}
+
+
+def _inherited(value):
+    """Whether a manifest value defers to `[workspace.package]`."""
+    return isinstance(value, dict) and value.get('workspace') is True
+
+
+def _published(pkg, workspace):
+    """Cargo's `publish`: absent means yes, `false` and `[]` mean no."""
+    value = pkg.get('publish')
+    if _inherited(value):
+        value = workspace.get('publish')
+    if value is None:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, list):
+        return bool(value)
+    return True
+
+
+def package_readmes(root):
+    """Every file a `Cargo.toml` publishes as its crate's README.
+
+    PARSED AS TOML, not matched with a regex, and that is the point. Review
+    found four ways a hand-rolled matcher misread a manifest: it took only
+    double-quoted values, then only explicit keys, then ignored `publish`, then
+    missed `readme = { workspace = true }` — the inline-table spelling of the
+    dotted key it did match. Each fix was correct and each left the next corner
+    of the same grammar uncovered, because the thing being approximated is a
+    TOML parser. `tomllib` is standard library and already used by
+    `check-docs-toml.sh` and by `check-example-bin-names.sh`, the latter on
+    `Cargo.toml` exactly like this. Both inheritance spellings are the same
+    TOML, so a parser cannot tell them apart and cannot miss one.
+
+    What Cargo does, and so does this: `readme = false` means none; a string is
+    a path relative to the manifest; `workspace = true` takes
+    `[workspace.package]`'s, relative to the workspace root; and an ABSENT key
+    discovers `README.md`, `README.txt` or `README` beside the manifest, in
+    that order. A package that does not publish is skipped — it has no landing
+    page to keep true, and enrolling its working notes made the drift gates
+    fail on the illustrative commands such a page may contain.
+    """
+    tracked = tracked_files(root)
+    root_path = pathlib.Path(root)
+    workspace = {}
+    if 'Cargo.toml' in tracked:
+        workspace = tomllib.loads(
+            (root_path / 'Cargo.toml').read_text(encoding='utf-8')
+        ).get('workspace', {}).get('package', {})
+
+    out = set()
+    for rel in sorted(f for f in tracked
+                      if f == 'Cargo.toml' or f.endswith('/Cargo.toml')):
+        manifest = pathlib.PurePosixPath(rel)
+        parent = str(manifest.parent)
+        parent = '' if parent == '.' else parent + '/'
+        pkg = tomllib.loads(
+            (root_path / rel).read_text(encoding='utf-8')).get('package')
+        if not isinstance(pkg, dict) or not _published(pkg, workspace):
+            continue
+
+        named = pkg.get('readme')
+        if _inherited(named):
+            # An inherited path is relative to the WORKSPACE root, so it needs
+            # no rebasing onto the inheriting manifest's directory.
+            named = workspace.get('readme')
+            if isinstance(named, str):
+                out.add(os.path.normpath(named).replace(os.sep, '/'))
+            continue
+        if named is False:
+            continue
+        if isinstance(named, str):
+            # `readme = "../README.md"` points at the workspace root's page.
+            resolved = os.path.normpath(str(manifest.parent / named))
+            out.add(resolved.replace(os.sep, '/'))
+            continue
+        for candidate in README_CANDIDATES:
+            if parent + candidate in tracked:
+                out.add(parent + candidate)
+                break
+    return out
 
 
 def corpus(root):

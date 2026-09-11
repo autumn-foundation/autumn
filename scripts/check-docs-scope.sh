@@ -182,14 +182,19 @@ SELF = 'scripts/check-docs-scope.sh'
 #     gone. Hence the claims, which are CHECKED against the tracked tree rather
 #     than trusted: a declaration has to keep being true, not merely keep
 #     matching something.
-# Cargo's README names, so a published `README.txt` under a declared prefix
-# counts as a README rather than as an unexplained extra.
-README_NAMES = ('README.md', 'README.txt', 'README')
-
+# A claim is a function of the pages under a prefix AND the pages every gate
+# agrees on, because "which of these is a README" is not answerable from the
+# filename alone. A crate may publish any file it names — `README.rst`, or a
+# `GUIDE.md` — so a fixed list of Cargo's conventional names rejected a
+# legitimately published page and failed the gate over a corpus that agreed.
+# Unanimity answers it instead: a published landing page is resolved by all
+# four gates, so it arrives in `agreed`, while a page only some gates report
+# does not and still has to be explained.
 CLAIMS = {
-    'every page': lambda under: under,
-    'the READMEs': lambda under: {f for f in under
-                                  if f.rsplit('/', 1)[-1] in README_NAMES},
+    'every page': lambda under, agreed: under,
+    'the READMEs': lambda under, agreed: (
+        {f for f in under if f.rsplit('/', 1)[-1] == 'README.md'}
+        | (under & agreed)),
 }
 
 DECLARED_DIFFERENCES = (
@@ -366,6 +371,7 @@ def main():
     # that prefix verified against the tracked tree. A declaration is only
     # allowed to waive a difference while the thing it says is still true.
     wide, narrow = corpora[SUPERSET], reference
+    agreed = set.intersection(*(set(c) for c in corpora.values()))
     # Bookkeeping is by INDEX, not by prefix. Two declarations can share a
     # prefix — the live one plus a stale entry for the opposite direction — and
     # keying on the prefix string let a match on either mark BOTH as used, so
@@ -389,7 +395,7 @@ def main():
                 ('the siblings',
                  {f for f in narrow if f.startswith(d['prefix'])},
                  d['siblings'])):
-            want = CLAIMS[claim](under)
+            want = CLAIMS[claim](under, agreed)
             if seen == want:
                 continue
             broken = True
