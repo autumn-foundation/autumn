@@ -109,6 +109,7 @@ after checking this table and `docs/guide/`.
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
 | Search plugin crate | `autumn-search` |
+| Billing plugin crate | `autumn-billing` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -1770,8 +1771,8 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the five first-party crates (`autumn-admin-plugin`,
-`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`list` covers the six first-party crates (`autumn-admin-plugin`,
+`autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
 `autumn-storage-s3`) plus community crates found on crates.io under the
 documented `autumn-plugin-<name>` convention.
 
@@ -2841,7 +2842,12 @@ user pins 0.5.x:
 
 ```bash
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
+                                 # native on Windows too (#1639): TCP transport,
+                                 # file-requested graceful drain, same serve.addr
 autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
+autumn serve install-service     # Windows only, elevated: register as a boot-start,
+                                 # crash-restarting service; uninstall-service removes it
+                                 # (flags go BEFORE the subcommand: serve --bundled-pg install-service)
 autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
 autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
 autumn generate scaffold Post title:String --live --live-validation
