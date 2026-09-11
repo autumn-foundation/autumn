@@ -646,6 +646,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
+  subscription (buffers -97.8%):** `close_dunning_for`
+  (`autumn-billing/src/reconcile.rs`), the step a `subscription.deleted`/
+  canceled webhook takes to settle any open dunning schedule for the
+  subscription that just ended, called `BillingStore::open_dunning()` —
+  every `Pending`/`Running` row in the **entire** `billing_dunning` table,
+  system-wide — and filtered the returned `Vec` in Rust for the one
+  `subscription_id` it wanted. The only index on that table
+  (`billing_dunning_state_idx (state, next_attempt_at)`) has no leading
+  column on `subscription_id`, so every cancellation paid for a scan of the
+  whole open-dunning backlog regardless of which subscription was canceling.
+  `BillingStore` gains a required `open_dunning_for_subscription` method
+  (both `MemoryBillingStore` and `DbBillingStore` implement it; a new
+  migration adds a partial `billing_dunning_subscription_idx (subscription_id)
+  WHERE subscription_id IS NOT NULL`), and `close_dunning_for` now calls it
+  instead of filtering client-side. Profiled against a 20,000-subscription
+  fixture (4,000 open dunning rows, ~2,857 closed historical ones) driving
+  296 real `reconcile::apply` cancellations: the open-dunning read's share of
+  the workload's `pg_stat_statements` buffers falls from 73.8% (36,118
+  buffers) to 5.8% (809 buffers); `EXPLAIN` confirms the plan moves from a
+  `Seq Scan` reading every open row on every call to an `Index Scan` on the
+  new index reading only the canceling subscription's own rows. No
+  behavior change: every existing `autumn-billing` test (162 unit/contract
+  tests plus the Postgres-backed contract suite) passes unchanged, and a
+  new contract test (`open_dunning_for_subscription_is_scoped_and_filtered`)
+  covers the NULL-subscription and cross-subscription edge cases. See
+  `docs/reports/2026-09-11-ledger-dunning-close-scan-scoped/`.
+
 - **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
   (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
   (`autumn-macros/src/repository.rs`) selected child ids in bulk but then

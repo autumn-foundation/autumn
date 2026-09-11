@@ -512,6 +512,18 @@ async fn dunning_close_scan_profile() {
         "close_dunning_for issues exactly one open-dunning read per cancellation, \
          whether or not that subscription has anything open"
     );
+    // Impact floor: a system-wide scan of every open row (pre-fix) costs
+    // 122 buffers per call regardless of the fixture's cardinality (a Seq
+    // Scan reads every pending/running row every time); a subscription-
+    // scoped index lookup costs O(1-2) per call. 10 buffers/call leaves
+    // generous headroom above the fixed post-fix cost while staying far
+    // below the pre-fix cost at ANY fixture size -- this is a scan-shape
+    // difference, not a threshold tuned to this fixture's row count.
+    assert!(
+        target_buffers < 10 * (EVENT_GROUPS * 2),
+        "open-dunning read must be a per-subscription lookup, not a table-wide scan: \
+         buffers={target_buffers} calls={target_calls}"
+    );
 
     let state_dump = dump_settled_state(&mut conn, &with_dunning);
     println!("\n=== settled state (invoice_id:state, sorted by invoice_id) ===");
@@ -536,10 +548,18 @@ async fn dunning_close_scan_profile() {
 
     explain(
         &mut conn,
-        "open-row scan for one subscription (the shape this harness measures)",
+        "before: system-wide open-row scan (open_dunning, pre-fix)",
         "SELECT invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at \
          FROM billing_dunning \
          WHERE state IN ('pending', 'running') \
+         ORDER BY next_attempt_at ASC, invoice_id ASC",
+    );
+    explain(
+        &mut conn,
+        "after: subscription-scoped lookup (open_dunning_for_subscription, this PR)",
+        "SELECT invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at \
+         FROM billing_dunning \
+         WHERE subscription_id = 'sub_10' AND state IN ('pending', 'running') \
          ORDER BY next_attempt_at ASC, invoice_id ASC",
     );
 }
