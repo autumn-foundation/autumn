@@ -110,8 +110,17 @@ tally altogether — not checked, not bucketed as anything — which is why
 the stated 14 only broke down to 13. It fails a `Test (windows-latest)`
 unit test, not `Clippy`; added as its own bucket above.
 
-No hits this pass on `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
-the three signatures the ongoing macOS/coverage investigation is tracking.
+No hits inside the sampled window on `live_upgrade`, `cache_stampede`, or
+`sim_fault_plan` — the three signatures the ongoing macOS/coverage
+investigation is tracking. **Late addition: one did land, live, on this
+PR's own CI after the sampled window closed.** Run 34591670807 (`Test
+(ubuntu-latest)`, this PR's branch, 2026-09-11T11:51:57Z) hit
+`live_upgrade`'s previously-unattributed `status: 0` signature a second
+time — same assertion, same shape as the 2026-09-09T13:59Z hit, now also
+on a plain (non-coverage) job. Docs-only PR, so this is organic noise
+unrelated to this diff; full writeup in the ledger's `live_upgrade` entry,
+including why this weakens the coverage-instrumentation hypothesis for
+that signature.
 
 ## 🔍 Diagnosis
 

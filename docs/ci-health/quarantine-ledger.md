@@ -307,7 +307,37 @@ without also filling in the intake form above.
   table this actively written to. Full reasoning and the reproduce
   command are in the 2026-09-11 report; a future pass sampling this repo
   should anchor to a stable run ID or commit rather than wall-clock time.
-  None of the 14 failures match
+  **Live organic hit during this same PR's own CI, 2026-09-11T11:51:57Z —
+  a second occurrence of the previously-unattributed `status: 0`
+  signature, now also on a plain `Test (ubuntu-latest)` job with no
+  coverage instrumentation.** PR #2711 (this ledger's own PR) is a
+  docs-only change with no code diff, so this is pure organic CI noise
+  from `trunk-dev`'s current `live_upgrade.rs`, not anything this PR
+  touched. Run 34591670807, job `Test (ubuntu-latest)`
+  (`check_run_id` 103245977784), branch `claude/sleepy-brown-uykw44`
+  at the same base commit as `trunk-dev`'s tip (which already carries the
+  #2645 fix — confirmed `8fae8af` is an ancestor). Panic at
+  `examples/hot-upgrade/tests/live_upgrade.rs:686:5`: `"every read must be
+  served across the cutover, saw [Observation { status: 0, body: "",
+  latency: 554.629µs }]"` — a single `status: 0`/empty-body observation,
+  same shape as the 2026-09-09T13:59Z hit this ledger already logged as
+  not matching any of PR #2645's three named predicates. `refused`/`hard`/
+  retry-bound assertions above this line did not panic, so those counters
+  were clean, consistent with the earlier hit. This is now two occurrences
+  of this exact signature, and — significantly — this one is on the plain
+  `Test (ubuntu-latest)` job, **not** `Coverage (workspace)`, which weakens
+  the working assumption (never more than a hypothesis) that this
+  signature needs `cargo llvm-cov` instrumentation to manifest: it doesn't.
+  Still undiagnosed and still not campaigned (n=2, not a formal rerun
+  protocol), but this raises its priority for the still-unbuilt
+  Linux-shaped rerun harness the 2026-09-09/10 reports already flagged as
+  needed — it is not coverage-specific after all, so a plain `cargo test`
+  rerun harness (Linux, no `llvm-cov`) could reproduce it, which is a
+  cheaper harness to build than previously assumed. (This hit is outside
+  the sampled 109-run window above — it landed live, after the window
+  closed — so it is not one of the 14 counted failures there.)
+
+  Of the 14 failures counted in the sampled window itself, none match
   `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
   see the new `job_tracking_stores_integration` entry below for the one
   finding this pass did turn up, on a different test entirely.
