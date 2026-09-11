@@ -1636,10 +1636,12 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// The attributes on an item, across every kind `main.rs` can hold at file
-/// or module scope. `syn::Item` has no shared accessor for this, so this
-/// matches each kind that carries attributes; a kind with none (or a future
-/// `syn` variant) reports an empty slice, which is also correct — there is
-/// no `#[cfg(test)]` to find on it.
+/// or module scope.
+///
+/// `syn::Item` has no shared accessor for attributes. This match covers
+/// every kind that carries them. A kind with none — or a future `syn`
+/// variant — returns an empty slice. That is still correct: there is no
+/// `#[cfg(test)]` to find on it.
 fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     use syn::Item;
     match item {
@@ -1682,18 +1684,21 @@ struct CallSite<'ast> {
     dot_span: proc_macro2::Span,
     is_cfg_test: bool,
     /// Every enclosing `fn`, innermost last. A nested `fn` inside `main`'s
-    /// body is not realistic generated code, but walking the whole stack
-    /// keeps "inside main's body" a containment question, same as before.
+    /// body is unlikely in generated code. Still, walking the whole stack
+    /// answers the same question as before: is this call inside `main`'s
+    /// body?
     enclosing_fns: Vec<*const syn::ItemFn>,
-    /// The block-nesting nearest this call, innermost last — used to
-    /// answer "already found in the SAME block", one branch at a time.
+    /// The block nesting nearest this call, innermost last. This answers
+    /// one question: is a call already in the SAME block, one branch at a
+    /// time?
     frames: Vec<Frame<'ast>>,
 }
 
-/// One pass over `main.rs`'s AST, collecting everything both
-/// [`ensure_i18n_auto`] and [`ensure_embedded_locales`] need to ask their
-/// questions: which `fn main`s are production, and where the interesting
-/// method calls and `static` items sit.
+/// One pass over `main.rs`'s AST.
+///
+/// It collects everything [`ensure_i18n_auto`] and [`ensure_embedded_locales`]
+/// need: which `fn main`s are production, and where the interesting method
+/// calls and `static` items sit.
 #[derive(Default)]
 struct Collector<'ast> {
     cfg_test_depth: u32,
@@ -1706,9 +1711,19 @@ struct Collector<'ast> {
     embedded_locales_calls: Vec<CallSite<'ast>>,
     statics: Vec<(&'ast syn::ItemStatic, bool)>,
     /// Whether each occurrence of the plain identifier `EMBEDDED_LOCALES`
-    /// — declaration or use — sits under `#[cfg(test)]`. A blanket "does
-    /// this name appear in production at all" check.
+    /// sits under `#[cfg(test)]` — a declaration, or a use site. This
+    /// answers one question: does the name appear anywhere in production
+    /// code?
     embedded_locales_idents: Vec<bool>,
+}
+
+impl<'ast> Collector<'ast> {
+    /// Walk `file` and collect everything both entry points need.
+    fn collect(file: &'ast syn::File) -> Self {
+        let mut collector = Self::default();
+        collector.visit_file(file);
+        collector
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for Collector<'ast> {
@@ -1755,11 +1770,16 @@ impl<'ast> syn::visit::Visit<'ast> for Collector<'ast> {
 
     fn visit_expr(&mut self, expr: &'ast syn::Expr) {
         if let syn::Expr::MethodCall(mc) = expr {
-            let bucket = match mc.method.to_string().as_str() {
-                "routes" => Some(&mut self.routes_calls),
-                "embedded_static" => Some(&mut self.embedded_static_calls),
-                "embedded_locales" => Some(&mut self.embedded_locales_calls),
-                _ => None,
+            // Compared as an `Ident`, not a `String` — every method call in
+            // `main.rs` reaches this, and only three names need a match.
+            let bucket = if mc.method == "routes" {
+                Some(&mut self.routes_calls)
+            } else if mc.method == "embedded_static" {
+                Some(&mut self.embedded_static_calls)
+            } else if mc.method == "embedded_locales" {
+                Some(&mut self.embedded_locales_calls)
+            } else {
+                None
             };
             if let Some(bucket) = bucket {
                 bucket.push(CallSite {
@@ -1780,11 +1800,12 @@ impl<'ast> syn::visit::Visit<'ast> for Collector<'ast> {
 ///
 /// A builder inside `fn main`'s body is unambiguous — EVERY non-test `fn
 /// main` counts, so `#[cfg(unix)] fn main()` beside `#[cfg(windows)] fn
-/// main()` both get wired. Otherwise `main` delegates
-/// (`fn main() { build_app().serve() }`), and the only safe read is when
-/// the file holds exactly one non-test builder; more than one is a coin
-/// flip that cannot be retried once wired, so it is refused rather than
-/// guessed.
+/// main()` both get wired.
+///
+/// Otherwise `main` delegates, for example `fn main() { build_app().serve() }`.
+/// The only safe case is when the file has exactly one non-test builder.
+/// More than one builder cannot be told apart, and the choice cannot be
+/// undone once wired. So the generator refuses instead of guessing.
 fn production_anchors<'a, 'ast>(collector: &'a Collector<'ast>) -> Vec<&'a CallSite<'ast>> {
     let main_fns: Vec<*const syn::ItemFn> = collector
         .main_fns
@@ -1847,10 +1868,11 @@ enum ChainOutcome<'ast> {
     Dead,
 }
 
-/// Walk `expr`'s receiver chain looking for a call to `method` — at this
-/// chain's OWN depth, never inside a nested call's arguments (a closure
-/// passed to `.layer(...)`, say), because a receiver link is the only
-/// thing this follows.
+/// Walk `expr`'s receiver chain, looking for a call to `method`.
+///
+/// Only look at this chain's own depth — never inside a nested call's
+/// arguments, such as a closure passed to `.layer(...)`. This function
+/// follows receiver links only.
 fn chain_walk<'ast>(mut expr: &'ast syn::Expr, method: &str) -> ChainOutcome<'ast> {
     loop {
         match expr {
@@ -1907,9 +1929,11 @@ fn branch_candidates(expr: &syn::Expr) -> Vec<&syn::Expr> {
 }
 
 /// The value a statement gives a name, in either form Rust spells it: a
-/// `let`, or a plain reassignment. Both carry a builder forward the same
-/// way — `let mut app = build(); app = app.i18n(b);` rebinds `app` just as
-/// a second `let app = …;` would.
+/// `let`, or a plain reassignment.
+///
+/// Both forms carry a builder forward the same way. `let mut app =
+/// build(); app = app.i18n(b);` rebinds `app`. A second `let app = …;`
+/// does the same thing.
 fn stmt_binds<'ast>(stmt: &'ast syn::Stmt, name: &str) -> Option<&'ast syn::Expr> {
     match stmt {
         syn::Stmt::Local(local) => {
@@ -1938,37 +1962,100 @@ fn stmt_binds<'ast>(stmt: &'ast syn::Stmt, name: &str) -> Option<&'ast syn::Expr
     }
 }
 
-/// The nearest binding of `name` visible from `frames`, searching this
-/// nesting level and then outward. Returns the initialiser and the frame
-/// stack from which THAT statement's own free names must be resolved —
-/// narrowed to "before this statement", at the level it was found.
-fn resolve_binding<'ast>(
+/// Every reassignment of `name` reachable from a bare `if`/`match`/block
+/// STATEMENT — one that is not itself a value, so a path through it that
+/// skips the reassignment leaves `name` holding whatever it held before.
+///
+/// `if flag { app = app.i18n(bundle()); }` with no `else` is the case this
+/// exists for: the assignment runs on ONE path only, so it is a candidate
+/// alongside — never instead of — whatever `name` held going in. Missing
+/// it would read a conditionally-installed bundle as never installed at
+/// all, and clear it.
+fn reachable_reassignments<'ast>(
+    expr: &'ast syn::Expr,
+    name: &str,
+    out: &mut Vec<&'ast syn::Expr>,
+) {
+    match expr {
+        syn::Expr::If(e) => {
+            reachable_reassignments_in_block(&e.then_branch, name, out);
+            if let Some((_, else_expr)) = &e.else_branch {
+                reachable_reassignments(else_expr, name, out);
+            }
+        }
+        syn::Expr::Block(e) => reachable_reassignments_in_block(&e.block, name, out),
+        syn::Expr::Match(e) => {
+            for arm in &e.arms {
+                reachable_reassignments(&arm.body, name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`reachable_reassignments`]'s scan over one block's own statements.
+fn reachable_reassignments_in_block<'ast>(
+    block: &'ast syn::Block,
+    name: &str,
+    out: &mut Vec<&'ast syn::Expr>,
+) {
+    for stmt in &block.stmts {
+        if let Some(rhs) = stmt_binds(stmt, name) {
+            out.push(rhs);
+        }
+        if let syn::Stmt::Expr(expr, _) = stmt {
+            reachable_reassignments(expr, name, out);
+        }
+    }
+}
+
+/// Every place `name` could be bound reaching `frames`, searching this
+/// nesting level and then outward.
+///
+/// Each comes with the frame stack a caller must use to resolve THAT
+/// binding's own free names — narrowed to the statements before it.
+///
+/// A plain `let`/reassignment fully replaces `name`, so it is the only
+/// candidate returned once found: nothing earlier can still be reached
+/// through this name. A bare conditional STATEMENT reassigning `name` does
+/// not — the path that skips it leaves `name` unchanged — so its
+/// reassignment is returned ALONGSIDE the search continuing past it,
+/// exactly like a plain binding would once it is found.
+fn resolve_bindings<'ast>(
     frames: &[Frame<'ast>],
     name: &str,
-) -> Option<(&'ast syn::Expr, Vec<Frame<'ast>>)> {
+) -> Vec<(&'ast syn::Expr, Vec<Frame<'ast>>)> {
+    let mut out = Vec::new();
     for depth in (0..frames.len()).rev() {
         let frame = frames[depth];
         for (i, stmt) in frame.block.stmts[..frame.before].iter().enumerate().rev() {
+            let mut narrowed = frames[..=depth].to_vec();
+            narrowed[depth] = Frame {
+                block: frame.block,
+                before: i,
+            };
             if let Some(rhs) = stmt_binds(stmt, name) {
-                let mut narrowed = frames[..=depth].to_vec();
-                narrowed[depth] = Frame {
-                    block: frame.block,
-                    before: i,
-                };
-                return Some((rhs, narrowed));
+                out.push((rhs, narrowed));
+                return out;
+            }
+            if let syn::Stmt::Expr(expr, _) = stmt {
+                let mut conditional = Vec::new();
+                reachable_reassignments(expr, name, &mut conditional);
+                out.extend(conditional.into_iter().map(|rhs| (rhs, narrowed.clone())));
             }
         }
     }
-    None
+    out
 }
 
-/// Whether the value reaching `expr` has already flowed through `method` —
-/// in its own call chain, or through however many rebindings and
-/// conditional branches it takes to reach where that chain started.
+/// Whether the value reaching `expr` has already flowed through `method`.
 ///
-/// A bundle on ANY reachable branch counts: which one runs is a runtime
-/// choice, and inserting `.i18n_auto()` on the strength of a branch that
-/// might not run would clear a bundle the flag could still select.
+/// It may flow through the call's own chain, or through earlier rebindings
+/// and conditional branches that lead back to where the chain started.
+///
+/// A bundle on ANY reachable branch counts. Which branch runs is a runtime
+/// choice. Inserting `.i18n_auto()` based on a branch that might not run
+/// could clear a bundle the flag would still select.
 ///
 /// `depth` bounds the walk against a pathological, deeply-rebound input;
 /// valid Rust cannot cycle through its own bindings.
@@ -1986,8 +2073,9 @@ fn value_already_called<'ast>(
         .any(|candidate| match chain_walk(candidate, method) {
             ChainOutcome::Found => true,
             ChainOutcome::Dead => false,
-            ChainOutcome::Root(name) => resolve_binding(frames, &name.to_string())
-                .is_some_and(|(rhs, next)| value_already_called(rhs, &next, method, depth + 1)),
+            ChainOutcome::Root(name) => resolve_bindings(frames, &name.to_string())
+                .into_iter()
+                .any(|(rhs, next)| value_already_called(rhs, &next, method, depth + 1)),
         })
 }
 
@@ -2003,18 +2091,22 @@ pub(super) enum I18nAutoWiring {
     /// The builder chain now calls `.i18n_auto()` (or already did).
     Wired(String),
     /// The app installs its own `Bundle` with `.i18n(...)` — from embedded
-    /// files, a translation-management service, memory. That bundle takes
-    /// precedence over any filesystem load, so the keys this generator wrote to
-    /// disk will never reach it, and every generated label renders as a
-    /// placeholder even though generation and `t!`'s compile-time check both
-    /// succeeded. `main.rs` is left alone (swapping someone's bundle for a
-    /// filesystem load would be worse) and the caller warns.
+    /// files, a translation-management service, memory.
+    ///
+    /// That bundle takes precedence over any filesystem load. So the keys
+    /// this generator wrote to disk never reach it. Every generated label
+    /// then renders as a placeholder, even though generation and `t!`'s
+    /// compile-time check both succeeded. `main.rs` is left alone —
+    /// swapping someone's bundle for a filesystem load would be worse —
+    /// and the caller warns.
     CustomBundle,
-    /// No real `.routes(` call was found, so there is nowhere safe to insert
-    /// — or `main.rs` failed to parse as Rust at all, which is stricter than
-    /// this generator needs to be right, so it is treated the same way: leave
-    /// the file alone and let the caller warn, rather than guess at code it
-    /// cannot fully read.
+    /// No real `.routes(` call was found, so there is nowhere safe to
+    /// insert.
+    ///
+    /// This also covers a `main.rs` that fails to parse as Rust — a
+    /// stricter check than this generator needs, but it is treated the
+    /// same way. Leave the file alone, and let the caller warn instead of
+    /// guessing at code it cannot fully read.
     NoAnchor,
 }
 
@@ -2029,25 +2121,27 @@ fn line_indent(src: &str, at: usize) -> &str {
 /// Insert `.i18n_auto()` into the `AppBuilder` chain in `main.rs` so the
 /// generated `t!` lookups actually resolve (AC4's "zero further config").
 ///
-/// Inserted immediately before the first REAL `.routes(` call — the same anchor
-/// `autumn new --with-i18n` uses. A `main.rs` that already installs a
-/// bundle — `.i18n_auto()` or an explicit `.i18n(...)` — is left untouched: an
-/// app that built its own `Bundle` from embedded files or a
-/// translation-management service must not have it swapped for a filesystem
+/// Inserted immediately before the first REAL `.routes(` call — the same
+/// anchor `autumn new --with-i18n` uses.
+///
+/// A `main.rs` that already installs a bundle — through `.i18n_auto()` or
+/// an explicit `.i18n(...)` — is left untouched. An app that builds its
+/// own `Bundle`, from embedded files or a translation-management service,
+/// keeps that bundle. The generator must not swap it for a filesystem
 /// load.
 pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     let Ok(file) = syn::parse_file(main_rs) else {
         return I18nAutoWiring::NoAnchor;
     };
-    let mut collector = Collector::default();
-    collector.visit_file(&file);
+    let collector = Collector::collect(&file);
 
-    // WHICH builders are production is decided first, and everything else is
-    // asked about those builders rather than about the file. A `main.rs` can
-    // hold several — a preview helper, a `#[cfg(test)]` fixture — and file-wide
-    // questions gave wrong answers on ordinary layouts: a `.i18n(test_bundle())`
-    // in a fixture reported the whole app as custom-bundled and left production
-    // unwired, and an `.i18n_auto()` on the fixture reported it as already done.
+    // WHICH builders are production is decided first, and everything else
+    // is asked about those builders rather than about the file. A
+    // `main.rs` can hold several `main` functions — a preview helper, a
+    // `#[cfg(test)]` fixture. File-wide questions gave wrong answers on
+    // ordinary layouts. A `.i18n(test_bundle())` in a fixture reported the
+    // whole app as custom-bundled and left production unwired. An
+    // `.i18n_auto()` on the fixture reported the app as already wired.
     let anchors = production_anchors(&collector);
     if anchors.is_empty() {
         return I18nAutoWiring::NoAnchor;
@@ -2059,10 +2153,11 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     // sibling.
     //
     // A chain with its own bundle is LEFT ALONE rather than blocking the rest.
-    // `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
-    // loading, so wiring it into that chain would replace the app's embedded or
-    // TMS-backed bundle and can panic when nothing is on disk — but that is a
-    // reason to skip THAT chain, not to abandon its siblings to raw keys.
+    // `.i18n_auto()` clears a preloaded bundle and switches to filesystem
+    // loading. Wiring it into that chain would replace the app's embedded or
+    // translation-management-service bundle, and it can panic when nothing is
+    // on disk. That is a reason to skip that one chain, not to leave its
+    // siblings with raw keys.
     let mut custom = false;
     let mut pending = Vec::new();
     for anchor in anchors {
@@ -2091,11 +2186,12 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     let mut out = main_rs.to_owned();
     for at in sites.into_iter().rev() {
         let line_start = out[..at].rfind('\n').map_or(0, |i| i + 1);
-        if out[line_start..at].trim_start().is_empty() {
+        let indent = line_indent(&out, at);
+        if line_start + indent.len() == at {
             // `.routes(` is the first token on its line: reuse the line's own
             // indentation so the inserted call sits in the builder chain
             // rather than at some arbitrary column.
-            let indent = out[line_start..at].to_owned();
+            let indent = indent.to_owned();
             out = format!(
                 "{}{indent}.i18n_auto()\n{}",
                 &out[..line_start],
@@ -2123,19 +2219,21 @@ fn is_embed_locales_macro(expr: &syn::Expr) -> bool {
 /// Embed the locale bundle into the binary for `autumn build --embed`,
 /// matching what `autumn new --with-i18n` wires into a fresh app.
 ///
-/// `.i18n_auto()` alone loads from DISK. An `--embed` build is supposed to be
-/// self-contained, so without this the binary still reaches for the locale
-/// directory at startup: run it from an empty deployment directory — or from
-/// the release image, whose embedded-build path deliberately ships no sidecar —
-/// and it panics on a missing default bundle, after a build that looked
-/// entirely clean.
+/// `.i18n_auto()` alone loads from DISK.
 ///
-/// Both edits sit behind the `embed-assets` feature the template already gates
-/// its static assets on, anchored beside the PRODUCTION `EMBEDDED_STATIC`
-/// declaration and its `.embedded_static(&EMBEDDED_STATIC)` install. Returns
-/// `None` when neither is present (an `--api` or hand-rolled `main.rs`, or a
-/// file that fails to parse), so the caller can warn instead of guessing;
-/// returns the input unchanged when the locales are already embedded.
+/// An `--embed` build is supposed to be self-contained. Without this call,
+/// the binary still reads the locale directory at startup. Run it from an
+/// empty deployment directory, or from the release image (whose
+/// embedded-build path ships no sidecar on purpose), and it panics on a
+/// missing default bundle — after a build that looked entirely clean.
+///
+/// Both edits sit behind the `embed-assets` feature that already gates the
+/// template's static assets. They are anchored beside the PRODUCTION
+/// `EMBEDDED_STATIC` declaration and its `.embedded_static(&EMBEDDED_STATIC)`
+/// install. This returns `None` when neither is present — an `--api` app, a
+/// hand-rolled `main.rs`, or a file that fails to parse — so the caller can
+/// warn instead of guessing. It returns the input unchanged when the locales
+/// are already embedded.
 pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
     // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
     // through as the macro's literal argument — escaped, because this is the one
@@ -2150,8 +2248,7 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     };
 
     let file = syn::parse_file(main_rs).ok()?;
-    let mut collector = Collector::default();
-    collector.visit_file(&file);
+    let collector = Collector::collect(&file);
     let index = SourceIndex::new(main_rs);
 
     // PRODUCTION occurrences only. A `#[cfg(test)]` fixture that happens to
@@ -2254,8 +2351,7 @@ fn statement_end(src: &str, end: usize) -> usize {
 /// in the binary.
 fn insert_locale_install(src: &str) -> Option<String> {
     let file = syn::parse_file(src).ok()?;
-    let mut collector = Collector::default();
-    collector.visit_file(&file);
+    let collector = Collector::collect(&file);
     let index = SourceIndex::new(src);
 
     let routes_anchors = production_anchors(&collector);
@@ -3808,6 +3904,27 @@ mod tests {
             "    let app = App::new();\n",
             "    let app = if use_tms { app.i18n(tms_bundle()) } else { app };\n",
             "    let app = app.routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// A bundle installed by a reassignment nested inside a bare `if`
+    /// STATEMENT (no `let`, no `else`) still reaches the value after it: the
+    /// `if` is not a value, so skipping it must not read the reassignment as
+    /// never having happened. The dangerous read is the false negative —
+    /// treating this app as unbundled clears a bundle installed on every run
+    /// where the flag is set.
+    #[test]
+    fn a_bundle_installed_by_a_bare_conditional_reassignment_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let mut app = App::new();\n",
+            "    if use_tms {\n",
+            "        app = app.i18n(tms_bundle());\n",
+            "    }\n",
+            "    app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
             "}\n",
         );
         assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
