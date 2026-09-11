@@ -10928,9 +10928,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // sees its own pre-statement OLD position, so one multi-row upsert
             // chunk that reassigns several rows' scope can under- or over-compact
             // (#2240, same root cause already fixed for delete_many/update_many).
-            // Cap the chunk size at 1 so every upsert chunk is single-row when a
-            // position field exists.
-            let upsert_chunk_cap: usize = if config.position.is_some() { 1 } else { 1000 };
+            // Force every upsert chunk to a single row when a position field
+            // exists, skipping the bind-param-based cap entirely: a plain
+            // `.min(1).max(1)` on that cap is always 1, so clippy's `min_max`
+            // lint (deny-by-default) correctly flags it as dead code.
+            let chunk_size_setup = if config.position.is_some() {
+                quote! {
+                    let chunk_size: usize = 1;
+                }
+            } else {
+                quote! {
+                    let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                }
+            };
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(
                     table_name,
@@ -11225,8 +11236,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
-                        let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { #upsert_chunk_cap } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(#upsert_chunk_cap).max(1) };
+                        #chunk_size_setup
                         #cc_serialize
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
@@ -27683,17 +27693,24 @@ mod tests {
             .find("AutumnUpsertExecutionExt")
             .expect("upsert_many must still be generated for a position(...) repository");
         let chunk_def_pos = generated[anchor..]
-            .find("let chunk_size = if cols")
-            .expect("upsert_many must compute chunk_size from cols")
+            .find("let chunk_size")
+            .expect("upsert_many must set chunk_size")
             + anchor;
-        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 160];
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 60];
         assert!(
-            chunk_def.contains("1usize"),
-            "position(...) must force upsert_many chunk size to 1 row: {chunk_def}"
+            chunk_def.contains(": usize = 1 ;"),
+            "position(...) must force upsert_many chunk size to a plain 1 row constant: {chunk_def}"
         );
         assert!(
             !chunk_def.contains("1000"),
             "position(...) must not leave a 1000-row upsert chunk cap in place: {chunk_def}"
+        );
+        let upsert_body_window = &generated[anchor..(anchor + 4000).min(generated.len())];
+        assert!(
+            !upsert_body_window.contains("__autumn_column_count"),
+            "position(...) must skip the bind-param-based chunk cap entirely, not just cap it \
+             at 1 -- clippy's min_max lint flags a `.min(1).max(1)` chain as dead code: \
+             {upsert_body_window}"
         );
     }
 
