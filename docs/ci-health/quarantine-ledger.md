@@ -464,34 +464,54 @@ without also filling in the intake form above.
   a sweep that runs once every five minutes with the DB clock leading the
   app clock by, say, 50ms can delete a row `PgJobTrackingStore` still
   considers live just as readily as one that runs every second; running
-  less often does not shrink the skew. What actually bounds the practical
-  risk is that `jobs.tracking.ttl_secs` is operator-configured and, unlike
-  this test's deliberately extreme 1-second value, a production TTL is
-  presumably chosen with enough margin over any realistic NTP-managed
-  clock drift (typically sub-tens-of-ms between hosts under normal
-  operation) that ordinary skew doesn't threaten it — not the sweep's
-  polling interval, which is an unrelated dimension. The early-deletion /
-  late-retention risk from a real clock disagreement is retained, not
-  dismissed; only the (wrong) reason previously given for discounting it
-  is withdrawn.
+  less often does not shrink the skew.
+  **Correction (post-review, via an eighth Codex review comment on PR
+  #2711): TTL length is not a bound on this risk either, and the previous
+  fix's replacement reasoning repeated the same class of error.** A
+  longer TTL moves the absolute expiry point further into the future; it
+  does not widen any margin around that point, and a fixed clock
+  disagreement (e.g. Postgres leading the stamping host by 50ms) shaves
+  the same 50ms off the effective TTL whether it is 1 second or 24 hours.
+  `JobTrackingConfig::ttl_secs` (`autumn/src/config.rs:3943-3966`) also has
+  no enforced minimum — it is operator-configurable with a 24-hour
+  default and nothing stopping a much smaller value — so "production TTLs
+  are presumably chosen with margin" was an assumption, not a bound.
+  Withdrawn along with the cadence reasoning it echoed: nothing in this
+  entry actually bounds the early-deletion/late-retention risk from a
+  real clock disagreement; it is retained as open, not quantified away.
 
-  The *read* path this test also exercises
-  (`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`)
-  is different in kind: it does `WHERE expires_at > $2` against
-  `self.clock.now()` — same-clock, unlike the cleanup sweep — so only a
-  genuine clock *step*, not cross-process skew, could make that
-  particular path misbehave. `autumn/src/time.rs:105-108` documents
-  exactly this gap: `MonotonicInstant` is guaranteed monotonic even across
-  a backward NTP jump, but "comparing wall-clock timestamps has no such
-  guarantee." A backward host clock step between a write and a later read
-  would extend a tracked job's effective TTL in production via this path
-  too, not just in this test — a real, if rare, product-relevant
-  characteristic of using wall-clock timestamps for TTL comparisons, not
-  dismissible as a test artifact. None of this means the observed failure
-  *was* a clock step or a cleanup-sweep-style race — the worker-refresh
+  **Correction (post-review, via a ninth Codex review comment on PR
+  #2711): the read path is not reliably same-clock either — that was true
+  only for this specific test's single-process shape, not for production
+  generally.** `docs/guide/jobs.md`'s "Web and worker process roles"
+  section documents `web` and `worker` as separate process roles
+  (typically separate replicas/hosts) that share one durable Postgres
+  backend: a `web` replica's `job::enqueue_tracked` can stamp `expires_at`
+  from its own `SystemClock`, while a different `worker` replica's
+  `mark_running`/`settle_success` later calls
+  `PgJobTrackingStore::update` (`autumn/src/job_tracking.rs:1896-1902`)
+  using *that host's* `self.clock.now()` — genuinely two independent
+  clocks in that supported topology, the same shape as the cleanup sweep,
+  not a same-clock comparison at all. Only this test's own `combined`
+  (single-process) shape makes it same-clock; a discrete clock step is
+  not the only way the read path can disagree with an `expires_at` stamped
+  elsewhere — ordinary inter-host skew across `web`/`worker` replicas can
+  too, with no step required. `autumn/src/time.rs:105-108`'s point about
+  wall-clock comparisons lacking a monotonic guarantee still applies and
+  still matters for the single-host clock-step case, but it is no longer
+  the only source of read-path risk. A backward host clock step between a
+  write and a later read would extend a tracked job's effective TTL in
+  production via this path too, not just in this test — a real,
+  product-relevant characteristic of using wall-clock timestamps for TTL
+  comparisons, not dismissible as a test artifact, and now understood to
+  be one of at least two ways (clock step, or ordinary web/worker skew)
+  this path's assumption can fail. None of this means the observed
+  failure *was* a clock-related race of any kind — the worker-refresh
   mechanism above remains the better-supported explanation for this
-  specific incident — only that the scenario's test-vs-product
-  classification was wrong as originally written, twice over: once for
+  specific incident, since it fires within a single test process and
+  needs no cross-host clock disagreement at all — only that the
+  scenario's test-vs-product classification was wrong as originally
+  written, repeatedly: once for
   treating the cross-process comparison itself as production-absent, and
   once for treating even a clock step as test-only. Refreshing
   `expires_at` on `mark_running`/`settle_success` (the
