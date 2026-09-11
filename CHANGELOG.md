@@ -31,6 +31,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit `message` on the validator attribute always wins and is never
   passed through the resolver. `into_changeset` is unchanged and keeps
   producing the same default messages as before.
+- **Translatable state-transition controls via `TransitionLabels` (#2227):**
+  `autumn::widgets::transition_controls` built its group aria-label
+  (`"{field} transitions"`) and every button's `"Mark as {state}"` inside
+  itself, from positional arguments that carried no label seam. A new
+  `TransitionLabels` builder carries a group label plus `(target_state, label)`
+  overrides, and `transition_controls_with_labels` takes one. Additive and
+  backward-compatible: `transition_controls` renders exactly as before, and a
+  state with no override keeps its English default.
+- **`autumn generate scaffold --i18n` now translates the last three English
+  surfaces (#2227):** the flag used to warn that a `richtext` column's editor
+  chrome, a `:states(…)` column's transition buttons, and every inline
+  `#[validate(...)]` message stayed English next to a translated label. All
+  three now go through the bundle. The rich-text editor gets
+  `common.richtext.toolbar` / `.hint` / `.preview` plus one key per toolbar
+  control (the Markdown syntax beside each name stays literal); the transition
+  controls get `<model>.field.<column>.transitions` and one
+  `<model>.field.<column>.transition.<state>` per distinct target state; and
+  the `create`/`update` handlers build their changeset with
+  `into_changeset_with`, resolving each validator code through
+  `<model>.field.<column>.error.<code>`. Every English default is the exact
+  text the plain scaffold renders today, so an `en` app is unchanged, and
+  output without `--i18n` is byte-identical. One honest gap remains and still
+  warns: the CSV import report runs its row handler per line with no request
+  locale, so `--import` plus `--validate` under `--i18n` keeps English
+  messages in that report.
 - **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
   README.md's `## Example` and the four `rust,no_run` snippets in
   `docs/guide/getting-started.md` (a CSRF form handler plus three

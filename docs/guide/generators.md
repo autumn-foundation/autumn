@@ -1695,26 +1695,24 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   ({ $media }, { $size } bytes)` — so the media type and byte count
   interpolate as arguments and a translator owns the parentheses, the comma
   and the unit noun.
-- **Two widgets are not covered yet**, both because they build their text
-  inside autumn-web from arguments that carry no label seam. A `richtext`
-  column's field label translates, but `rich_text_area`'s own chrome — the
-  toolbar's group label and per-control names, the "Markdown supported…"
-  hint, and the preview heading — stays English; and a `:states(…)` column's
-  `transition_controls` keeps its `Mark as …` buttons and `… transitions`
-  group label in English. Unlike the pager and bulk-delete widgets, these
-  two are free functions with no label setters to call, so covering them
-  needs new autumn-web API (a label per transition edge, and per toolbar
-  control). Scaffolding either column with `--i18n` warns and names it,
-  rather than leaving you to find it in the browser.
-- **Validation messages stay English.** A field label translates; the
-  inline error under it after a rejected submission does not.
-  `#[validate(...)]` accepts a `message`, but `validator` takes it as a
-  compile-time literal, so a runtime lookup cannot go there — and a rule
-  with no message renders as `validation failed: <code>`. Reaching these
-  means mapping error *codes* to lookups before the changeset is built,
-  and that conversion happens inside autumn-web, so it needs a seam there
-  rather than a generator change. Scaffolding with `--validate` under
-  `--i18n` warns.
+- **The two widgets with their own chrome are covered too** (issue #2227).
+  A `richtext` column passes `RichTextLabels` to the editor. The toolbar
+  group label, the seven control names, the hint and the preview heading
+  come from the bundle, under `common.richtext.*`. The Markdown syntax
+  beside each name — `**bold**`, `- item` — stays as it is, because the
+  user types it. A `:states(…)` column passes `TransitionLabels`. The group
+  label reads from `<model>.field.<column>.transitions`, and each button
+  from `<model>.field.<column>.transition.<state>`. Two edges that end at
+  the same state share one button and one key.
+- **Validation messages are translated on the create and update forms.**
+  The handler resolves each validator error code through the bundle, under
+  `<model>.field.<column>.error.<code>`. The English default is the text
+  autumn-web shows today: `validation failed: <code>`. So an `en` app reads
+  the same, and a translator writes better wording in their own locale file.
+  A rule that carries its own `message` keeps it, and gets no key.
+  The CSV import report is the one gap. `import_csv` calls its row handler
+  per line, away from the request, so there is no locale to look a message
+  up in. Scaffolding `--import` with `--validate` under `--i18n` warns.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).
@@ -1733,8 +1731,8 @@ Keys are split so a translator sees each string exactly once:
 
 | Kind | Examples | Written |
 | ---- | -------- | ------- |
-| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
-| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.flash.*` | Once per resource, under a marked comment block. |
+| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected`, and the Markdown editor chrome `common.richtext.*` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
+| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.field.<column>.error.<code>`, `post.field.<column>.transition.<state>`, `post.flash.*` | Once per resource, under a marked comment block. |
 
 **What interpolates and what does not.** A row key or a count travels as a
 Fluent argument, so a translation can *position* it: `post.show.title =
