@@ -9550,12 +9550,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    let normalize_impls = quote! {
-        impl ::autumn_web::normalize::Normalize for #new_name {
-            fn normalize(&mut self) {
-                #(#normalize_new_stmts)*
+    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
+    // having `#[normalize]` columns. With no columns the `Yes` arm of the
+    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
+    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
+    // Omitting the impl lets the probe's `No` arm win, so `save` /
+    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
+    // clone for unnormalized models. The read-model impl stays unconditional:
+    // it is `&mut self` in place (no clone involved) and user code may call
+    // `.normalize()` on it directly, so removing it would be a compile break.
+    // `NormalizedModel` stays unconditional too: derived finders call
+    // `normalize_lookup` for every model and rely on the `None` arm.
+    let normalize_new_impl = if normalize_new_stmts.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl ::autumn_web::normalize::Normalize for #new_name {
+                fn normalize(&mut self) {
+                    #(#normalize_new_stmts)*
+                }
             }
         }
+    };
+    let normalize_impls = quote! {
+        #normalize_new_impl
         impl ::autumn_web::normalize::Normalize for #name {
             fn normalize(&mut self) {
                 #(#normalize_model_stmts)*
@@ -15163,6 +15181,38 @@ mod tests {
         assert!(
             generated.contains("normalize :: trim") && generated.contains("normalize :: downcase"),
             "must chain the trim+downcase builtins: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
+        // #2634: a model with no `#[normalize]` columns must not get
+        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
+        // arm always wins and `save_many` clones a batch whose normalization
+        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
+        // stay unconditional (public API surface and the finder `None` arm).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("normalize :: Normalize for NewUser"),
+            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: Normalize for User"),
+            "must keep `impl Normalize for User` (read model): {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizedModel for User"),
+            "must keep `impl NormalizedModel for User`: {generated}"
         );
     }
 

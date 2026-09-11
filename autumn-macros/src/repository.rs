@@ -5580,7 +5580,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_create {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -5757,7 +5757,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_create {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -6080,7 +6080,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -6400,7 +6400,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -7242,7 +7242,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
                             ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                let __autumn_error_message = __autumn_error.message();
                                 ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                     &self.pool,
                                     hook_id,
@@ -7608,7 +7608,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                             }
                                         }
                                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                            let __autumn_error_message = __autumn_error.message();
                                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                                 &self.pool,
                                                 hook_id,
@@ -7733,7 +7733,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                     }
                                                 }
                                                 ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                                    let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                                    let __autumn_error_message = __autumn_error.message();
                                                     ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                                         &self.pool,
                                                         &hook_id,
@@ -8251,7 +8251,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 hook_id,
@@ -14383,7 +14383,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         match __autumn_after_create {
             ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
             ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                let __autumn_error_message = __autumn_error.message();
                 ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                     &self.pool,
                     &__autumn_commit_hook_id,
@@ -19875,13 +19875,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the body, so a skip-invalid import judges — and stores — the
                 // same canonical value `save_many` does.
                 //
-                // Costs one clone of the batch, as `save_many` already does:
-                // `#[model]` emits `impl Normalize` for every `New*` (empty-bodied
-                // when nothing is normalized), so the probe's `Yes` arm always
-                // wins here and the borrowed `No` arm is reachable only for a
-                // hand-written `New*`. Making that fallback real means gating the
-                // impl on the model actually having `#[normalize]` columns — see
-                // the follow-up issue; it is not specific to this path.
+                // #2634: no clone when there is nothing to normalize. `#[model]`
+                // emits `impl Normalize` for the `New*` only when the model
+                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
+                // exactly when normalization can change something; otherwise the
+                // borrowed `No` arm hands the caller's slice back untouched.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
                 #[allow(unused_imports)]
@@ -24892,6 +24890,32 @@ mod tests {
             generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
             "save_many must normalize each New input before persisting: {generated}"
         );
+    }
+
+    #[test]
+    fn repository_macro_after_hook_failure_records_message_not_display() {
+        // #2596: an immediate after-hook failure stores the hook's `AutumnError`
+        // via `message()` (the bare title, e.g. "Validation failed"), matching
+        // the deferred commit-hook worker path — not via `Display`, which
+        // appends the field list for validation errors and would store a
+        // different string for the same logical failure. The recording sites
+        // only exist with `commit_hooks = true`, so both configs enable it.
+        for attr in [
+            quote! { Post, hooks = PostHooks, commit_hooks = true },
+            quote! { Post, hooks = PostHooks, commit_hooks = true, tenant_scoped },
+        ] {
+            let label = attr.to_string();
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                generated.contains("__autumn_error . message ()"),
+                "`{label}` must record the hook failure with message(): {generated}"
+            );
+            assert!(
+                !generated.contains("format ! (\"{__autumn_error}\")"),
+                "`{label}` must not stringify the hook error with Display: {generated}"
+            );
+        }
     }
 
     #[test]

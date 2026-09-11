@@ -120,7 +120,10 @@ autumn seed --profile demo
 3. **Sets the profile** via the `AUTUMN_ENV` environment variable (default:
    `dev`). Your seed binary reads `ctx.profile()` to branch on environment.
 
-4. **Delegates to `cargo run --bin seed`**. All Cargo flags such as `--package`
+4. **Delegates to `cargo run --bin <seed-target>`**, where `<seed-target>` is the
+   bin target built from `src/bin/seed.rs` (resolved from `cargo metadata`, so
+   a renamed target such as `todo-app-seed` still works). All Cargo flags such
+   as `--package`
    work:
    ```sh
    autumn seed --profile demo --package my-workspace-member
