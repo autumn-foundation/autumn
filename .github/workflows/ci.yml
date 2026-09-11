@@ -2347,12 +2347,14 @@ jobs:
         # AC-2 of #1639, and the issue's success metric ("a graceful stop under
         # external probing records 0 failed in-flight requests").
         #
-        # Graded three ways, because each alone has a hole: the elapsed time must
+        # Graded four ways, because each alone has a hole: the elapsed time must
         # cover the configured prestop grace (a hard kill returns instantly),
-        # requests issued AFTER the stop began must still succeed (proving the
-        # server kept serving through the drain rather than dropping its
-        # listener), and the managed cluster's postmaster.pid must be gone
-        # (proving the app's on_shutdown hook ran rather than being skipped).
+        # APPLICATION requests issued AFTER the stop began must still succeed for
+        # that whole window (proving the server kept serving through the drain
+        # rather than dropping its listener), readiness must flip to 503 while it
+        # does (proving this is a drain and not just a slow death), and the
+        # managed cluster's postmaster.pid must be gone (proving the app's
+        # on_shutdown hook ran rather than being skipped).
         run: |
           $ErrorActionPreference = 'Stop'
           $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
@@ -2366,8 +2368,29 @@ jobs:
           if ($addrBefore -notmatch 'stop_budget_secs\s*=\s*(\d+)') { throw "the daemon recorded no stop budget: $addrBefore" }
           if ([int]$Matches[1] -lt 8) { throw "the daemon resolved a $($Matches[1])s drain budget; the 8s prestop grace did not reach it, so the timing below proves nothing" }
 
+          # Pre-flight: the route the drain is graded on must be serving 200
+          # BEFORE the stop. Without this, a scaffold whose sample route moved
+          # would fail below as though the drain were broken, which is the most
+          # expensive kind of wrong error message.
+          $pre = Invoke-WebRequest "http://$endpoint/hello" -UseBasicParsing -TimeoutSec 10 -SkipHttpErrorCheck
+          if ($pre.StatusCode -ne 200) {
+            throw "GET /hello returned $($pre.StatusCode) before any stop — the drain probe would grade the wrong thing"
+          }
+
           # Probe from a background job so the requests are genuinely concurrent
-          # with the stop, recording a timestamp and outcome per attempt.
+          # with the stop, recording a timestamp and both outcomes per attempt.
+          #
+          # `/hello` — a scaffolded APPLICATION route — is what grades the drain,
+          # not `/health`. `/health` is a documented alias for the readiness
+          # probe, and phase 2 of the shutdown sequence flips readiness to 503
+          # deliberately, "strictly before the listener closes", so a load
+          # balancer deregisters this replica while real traffic keeps being
+          # served. Probing `/health` therefore grades the readiness flip and
+          # calls a correct drain a failure.
+          #
+          # `-SkipHttpErrorCheck` for the same reason: a 503 is an ANSWER, and
+          # without it Invoke-WebRequest throws on any non-2xx, making a serving
+          # listener indistinguishable from a refused connection.
           $probeLog = "$env:JOURNEY_DIR\drain-probe.log"
           Remove-Item -Force -ErrorAction SilentlyContinue $probeLog
           $probe = Start-Job -ScriptBlock {
@@ -2376,11 +2399,18 @@ jobs:
             while ((Get-Date) -lt $deadline) {
               $stamp = (Get-Date).ToString('o')
               try {
-                $r = Invoke-WebRequest "http://$endpoint/health" -UseBasicParsing -TimeoutSec 5
-                Add-Content -Path $log -Value "$stamp,$($r.StatusCode)"
+                $r = Invoke-WebRequest "http://$endpoint/hello" -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                $helloCode = $r.StatusCode
               } catch {
-                Add-Content -Path $log -Value "$stamp,FAIL"
+                $helloCode = 'REFUSED'
               }
+              try {
+                $r = Invoke-WebRequest "http://$endpoint/health" -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                $healthCode = $r.StatusCode
+              } catch {
+                $healthCode = 'REFUSED'
+              }
+              Add-Content -Path $log -Value "$stamp,hello=$helloCode,health=$healthCode"
               Start-Sleep -Milliseconds 200
             }
           } -ArgumentList $endpoint, $probeLog
@@ -2414,24 +2444,22 @@ jobs:
             $parts = $_ -split ','
             ([datetime]::Parse($parts[0], $null, [System.Globalization.DateTimeStyles]::RoundtripKind)) -gt $stopBegan
           })
-          $servedDuring = @($during | Where-Object { $_ -match ',200$' })
+          $servedDuring = @($during | Where-Object { $_ -match 'hello=200,' })
           if ($servedDuring.Count -lt 1) {
-            throw "no request succeeded after the stop began — the server stopped accepting immediately instead of draining"
+            throw "no application request succeeded after the stop began — the server stopped accepting immediately instead of draining"
           }
 
           # The issue's success metric: 0 failed in-flight requests. Graded as a
           # CONTIGUOUS run of successes from the moment the stop began until the
           # drain closes the listener — after which failures are correct and
-          # expected. A naive "everything before the first FAIL succeeded" is
-          # vacuously true (the log's only other value IS `200`), so the real
-          # assertion is that the successful run covers the prestop grace: the
-          # server has to keep answering for the whole window it promised, not
-          # just for one probe.
+          # expected. One success somewhere in the window would be far too weak,
+          # so the real assertion is that the run COVERS the prestop grace: the
+          # server has to keep answering for the whole window it promised.
           $firstFailureIndex = -1
           for ($i = 0; $i -lt $during.Count; $i++) {
-            if ($during[$i] -match ',FAIL$') { $firstFailureIndex = $i; break }
+            if ($during[$i] -notmatch 'hello=200,') { $firstFailureIndex = $i; break }
           }
-          $servedRun = if ($firstFailureIndex -lt 0) { $during } else { $during[0..$firstFailureIndex] | Select-Object -SkipLast 1 }
+          $servedRun = if ($firstFailureIndex -lt 0) { $during } else { @($during[0..$firstFailureIndex]) | Select-Object -SkipLast 1 }
           $servedRun = @($servedRun)
           if ($servedRun.Count -lt 1) {
             throw "the very first request after the stop began failed — the listener was dropped, not drained"
@@ -2442,6 +2470,17 @@ jobs:
           if ($servedFor -lt 6) {
             throw "the server stopped accepting $servedFor s into an 8s prestop grace — in-flight requests were cut"
           }
+
+          # The other half of the phase ordering, and the reason `/health` is
+          # still probed: readiness must flip to 503 DURING the grace, while the
+          # listener is still accepting. Without this the timing above could be
+          # satisfied by a server that simply took 8s to die, and the drain that
+          # lets a load balancer deregister would go ungraded.
+          $flipped = @($during | Where-Object { $_ -match 'health=503' })
+          if ($flipped.Count -lt 1) {
+            throw "readiness never flipped to 503 during the drain — the prestop deregistration window did not happen"
+          }
+          Write-Host "readiness reported 503 on $($flipped.Count) probes during the drain"
 
           # The app's on_shutdown hook ran, so the cluster stopped itself and
           # removed its pidfile. A survivor is the orphan #1616/#1639 forbid.

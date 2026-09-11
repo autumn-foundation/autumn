@@ -325,6 +325,14 @@ fn the_daemon_journey_asserts_the_things_the_acceptance_criteria_name() {
         ("a tcp discovery file", r#"transport\s*=\s*"tcp""#),
         ("a second start is rejected", "already running"),
         ("the stop is observably a drain", "prestop grace"),
+        // The drain must be graded on an APPLICATION route. `/health` is an
+        // alias for the readiness probe, which phase 2 of the shutdown sequence
+        // flips to 503 on purpose while the listener is still accepting — so
+        // grading the drain on it calls a correct drain a failure.
+        ("the drain is graded on a real route", "hello=200"),
+        // And the flip itself is graded, so the timing assertion cannot be
+        // satisfied by a server that merely took the whole budget to die.
+        ("readiness drains before the listener closes", "health=503"),
         ("the managed cluster is not orphaned", "postmaster.pid"),
         ("boot start", "AUTO_START"),
         ("crash restart", "RESTART"),
