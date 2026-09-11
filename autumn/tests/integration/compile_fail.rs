@@ -1308,6 +1308,18 @@ fn resolve_cargo_target_dir() -> std::path::PathBuf {
     // under a marked `target/`), which must NOT be climbed past. Resolve it
     // by asking rustc for its own list of valid target triples: only an
     // actual `--target` subdirectory can be named one.
+    //
+    // Known, accepted limitation: an operator could name a *custom*
+    // `--target-dir` (without ever passing `--target`) after a real triple,
+    // e.g. `--target-dir /cache/x86_64-unknown-linux-gnu`. That directory is
+    // then byte-for-byte indistinguishable on disk from cargo's own
+    // `--target x86_64-unknown-linux-gnu` insertion — same name, same
+    // CACHEDIR.TAG placement — so no purely filesystem-based check (this one
+    // included) can tell the two apart; only a build-time capture of the
+    // real `TARGET` env var via a build script could, at the cost of adding
+    // one to this whole library crate for a case no CI job here exercises.
+    // We resolve the ambiguity in cargo's favor, since a triple-named
+    // `--target` insertion is the far more common real-world source of it.
     if let Some(name) = dir.file_name().and_then(std::ffi::OsStr::to_str)
         && is_rustc_target_triple(name)
         && let Some(parent) = dir.parent()
