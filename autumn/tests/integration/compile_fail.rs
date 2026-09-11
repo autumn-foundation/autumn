@@ -1202,15 +1202,18 @@ fn doc_getting_started_snippets_compile() {
     // cargo reuses those artifacts instead of rebuilding the entire
     // `autumn-web` dependency graph a second time — this repo's CI already
     // runs close to its disk ceiling, and a silent full second build would
-    // cost real minutes on every run. Left in place afterward (unlike
-    // `scratch` itself): it lives inside the workspace's own already-shared,
-    // already-gitignored `target/`, exactly where cargo's normal build
-    // output goes.
+    // cost real minutes on every run. `resolve_cargo_target_dir` asks cargo
+    // itself rather than assuming `root.join("target")`, since a
+    // `CARGO_TARGET_DIR` env var, a `.cargo/config.toml` `build.target-dir`,
+    // or the outer invocation's own `--target-dir` would each relocate it
+    // (Codex review, round 5). Left in place afterward (unlike `scratch`
+    // itself): it's cargo's own build output directory, already shared and
+    // already excluded from version control by definition.
     let output = std::process::Command::new(env!("CARGO"))
         .arg("check")
         .arg("--offline")
         .arg("--target-dir")
-        .arg(root.join("target"))
+        .arg(resolve_cargo_target_dir(root))
         .current_dir(&scratch)
         .output()
         .expect("failed to run cargo check on the extracted doc snippets");
@@ -1222,6 +1225,34 @@ fn doc_getting_started_snippets_compile() {
          autumn-web crate:\n\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Asks cargo for the workspace's actual build output directory —
+/// `cargo metadata`'s own `target_directory` field, which already accounts
+/// for a `CARGO_TARGET_DIR` env var or a `.cargo/config.toml`
+/// `build.target-dir` override, unlike hard-coding `root.join("target")`.
+fn resolve_cargo_target_dir(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--format-version=1"])
+        .current_dir(workspace_root)
+        .output()
+        .expect("failed to run cargo metadata to resolve the workspace's target directory");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata_json = String::from_utf8_lossy(&output.stdout);
+    let key = "\"target_directory\":\"";
+    let value_start = metadata_json
+        .find(key)
+        .map(|i| i + key.len())
+        .expect("cargo metadata output has no target_directory field");
+    let value_end = metadata_json[value_start..]
+        .find('"')
+        .map(|i| value_start + i)
+        .expect("cargo metadata's target_directory string is unterminated");
+    std::path::PathBuf::from(metadata_json[value_start..value_end].replace("\\\\", "\\"))
 }
 
 /// Recursively removes the wrapped directory when dropped, pass or fail
