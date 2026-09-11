@@ -281,7 +281,13 @@ without also filling in the intake form above.
   paragraph) — this note marks the verdict as rendered, not the entry as
   closed.
 - **2026-09-11 update — harness still undispatched (4th consecutive daily
-  pass), zero new organic hits on any of the three tracked signatures.**
+  pass); zero new organic hits inside the sampled window, but one landed
+  live afterward on this ledger's own tracking PR.** **Correction
+  (post-review, via a thirteenth Codex review comment on PR #2711): the
+  original headline here said "zero new organic hits" unscoped, which
+  went stale the moment the live hit below was logged in this same
+  entry.** Scoped now: zero hits in the sampled 109-run window; one hit
+  (run 34591670807, a `status: 0` repeat) outside it — see below.
   Sampled the ~23.3h since the 2026-09-10 follow-up's actual recorded
   cutoff (`2026-09-10T09:48:19Z`–`2026-09-11T09:09:24Z`; **correction,
   post-review, via a sixth Codex review comment on PR #2711**: an earlier

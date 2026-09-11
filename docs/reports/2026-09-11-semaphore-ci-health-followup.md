@@ -248,7 +248,9 @@ None shipped by this pass — no finding here clears the hard gate for a fix.
   not quarantined (the Docker sweep is unmodified — this test keeps running
   on every sweep, since one unconfirmed hit is not grounds to skip it). Also
   added a dated note to the `live_upgrade` entry recording this pass's
-  zero-new-hits result and the harness's 4th idle day.
+  zero-hits-in-window result, the harness's 4th idle day, and (added
+  after the fact) the one hit that landed live on this PR's own CI after
+  the window closed.
 - **Recommendation for a human, unchanged from the last three passes**:
   dispatch `manual-macos-contention-check.yml` against a `trunk-dev` commit
   at or after `8fae8af` (the #2645 fix), `samples: "20"`. It is the only
