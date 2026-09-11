@@ -63,6 +63,8 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "constela")]
+mod constela;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
 mod custom_domains;
@@ -185,6 +187,8 @@ mod mcp_plugin;
 mod mcp_repository;
 #[cfg(feature = "mcp")]
 mod mcp_schema_derive;
+#[cfg(feature = "mcp")]
+mod mcp_secured_guard;
 #[cfg(feature = "mcp")]
 mod mcp_streaming;
 #[cfg(feature = "mcp")]

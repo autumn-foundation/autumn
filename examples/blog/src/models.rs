@@ -63,7 +63,7 @@ impl Post {
 }
 
 /// Data needed to insert a new post.
-#[derive(Insertable, Deserialize)]
+#[derive(Insertable, Deserialize, Default)]
 #[diesel(table_name = posts)]
 pub struct NewPost {
     pub title: String,
@@ -77,6 +77,12 @@ pub struct NewPost {
 
 impl NewPost {
     /// Validate the post data. Returns 422 if title or body is empty.
+    ///
+    /// Used by the JSON API (`routes::api::create`) and the admin-plugin
+    /// backend (`admin.rs`), both of which already have their own
+    /// error-reporting conventions for a rejected submission (a JSON problem
+    /// response and the admin plugin's generic form-redisplay respectively) —
+    /// see [`Self::validate_fields`] for the HTML admin routes' own path.
     pub fn validated(self) -> AutumnResult<Self> {
         let title = self.title.trim().to_owned();
         let body = self.body.trim().to_owned();
@@ -102,6 +108,45 @@ impl NewPost {
             body,
             published: self.published,
         })
+    }
+
+    /// Same rule as [`Self::validated`] (title/body must have at least one
+    /// non-whitespace character), but returns every violation as a
+    /// `(field, message)` pair instead of stopping at the first one and
+    /// failing the whole request. Used by `routes::posts::create`/`update` so
+    /// a rejected submission can be redisplayed with each message next to its
+    /// field and the author's draft intact, instead of losing the page to a
+    /// generic error response.
+    pub fn validate_fields(&self) -> Vec<(&'static str, &'static str)> {
+        let mut errors = Vec::new();
+        if self.title.trim().is_empty() {
+            errors.push(("title", "Title must not be empty"));
+        }
+        if self.body.trim().is_empty() {
+            errors.push(("body", "Body must not be empty"));
+        }
+        errors
+    }
+
+    /// Trim title/body and auto-generate the slug from the title when the
+    /// author left it blank. Call only after [`Self::validate_fields`]
+    /// reports no errors.
+    pub fn normalized(self) -> Self {
+        let title = self.title.trim().to_owned();
+        let body = self.body.trim().to_owned();
+        let slug = self.slug.trim();
+        let slug = if slug.is_empty() {
+            slugify(&title)
+        } else {
+            slugify(slug)
+        };
+
+        Self {
+            title,
+            slug,
+            body,
+            published: self.published,
+        }
     }
 }
 
