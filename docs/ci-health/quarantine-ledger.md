@@ -441,21 +441,35 @@ without also filling in the intake form above.
   The store's actual lazy-expiry behavior (a request-path read filtering
   on `expires_at > now`, e.g. `autumn/src/job_tracking.rs:1899`) uses the
   *same* `self.clock.now()` on both the write and the read side inside the
-  application — it never compares against Postgres's own `NOW()` in
-  production code, so the clock-skew hypothesis, if confirmed, is a
-  test-only artifact of how this test independently verifies TTL
-  persistence rather than a real product concern. Refreshing `expires_at`
-  on `mark_running`/`settle_success` (the worker-refresh hypothesis) is
-  deliberate, sensible production behavior in its own right — a job still
-  being worked on should not expire out from under it — so if that
-  mechanism is the one actually firing, the defect is squarely in the
-  test's assumption that a fixed 1200ms sleep leaves no room for the
-  tracked job's own worker to touch the record, not in the store. Either
-  way this reads as a test defect, not a product defect — but both are
-  hypotheses from reading the source, not yet confirmed by a rerun
-  campaign or an isolating experiment (e.g. asserting on `updated_at`
-  to see which write, if either, actually fired), so treat the verdict as
-  provisional per this role's own bar.
+  application — it never compares against Postgres's own `NOW()` the way
+  this test independently does, so the specific *cross-process* framing
+  this entry originally proposed would have been a test-only artifact.
+  **Correction (post-review, via a third Codex review comment on PR
+  #2711): the demoted discrete-clock-step scenario is not test-only.**
+  `PgJobTrackingStore::update`'s own read (`autumn/src/job_tracking.rs:
+  1896-1902`) does `WHERE expires_at > $2` against `self.clock.now()` — a
+  plain wall-clock `DateTime<Utc>` comparison, and `autumn/src/time.rs:
+  105-108` documents exactly this gap: `MonotonicInstant` is guaranteed
+  monotonic even across a backward NTP jump, but "comparing wall-clock
+  timestamps has no such guarantee." A backward host clock step between a
+  write and a later read would extend a tracked job's effective TTL in
+  production, not just in this test — a real, if rare, product-relevant
+  characteristic of using wall-clock timestamps for TTL comparisons, not
+  dismissible as a test artifact. This does not mean the observed failure
+  *was* a clock step — the worker-refresh mechanism above remains the
+  better-supported explanation for this specific incident — only that the
+  scenario's test-vs-product classification was wrong as originally
+  written. Refreshing `expires_at` on `mark_running`/`settle_success` (the
+  worker-refresh hypothesis) is deliberate, sensible production behavior
+  in its own right — a job still being worked on should not expire out
+  from under it — so if that mechanism is the one actually firing here,
+  the defect is squarely in the test's assumption that a fixed 1200ms
+  sleep leaves no room for the tracked job's own worker to touch the
+  record, not in the store: a test defect there. Both remain hypotheses
+  from reading the source, not yet confirmed by a rerun campaign or an
+  isolating experiment (e.g. asserting on `updated_at` to see which write,
+  if either, actually fired), so treat the verdict as provisional per this
+  role's own bar.
 - **Status**: n=1, not campaigned. Logged here for recognition per this
   role's standard for a first hit; escalate to a rerun campaign only if a
   repeat signature appears. Not quarantined — the Docker sweep is

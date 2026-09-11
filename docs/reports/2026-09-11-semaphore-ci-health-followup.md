@@ -136,15 +136,30 @@ hit has been observed there — that clean history doesn't help isolate
 this hypothesis either way.
 
 The production code path this test is meant to verify never makes the
-cross-clock comparison — reads filter on the same `self.clock.now()` used
-to write, never against `NOW()` — so under the (now-demoted) clock-skew
-hypothesis this would be a test-only artifact. Refreshing `expires_at` on
-worker activity is deliberate, sensible production behavior in its own
-right, so under the worker-refresh hypothesis — the better-supported one —
-the defect is in the test's assumption that a fixed sleep leaves no room
-for the job's own worker to touch the record, not in the store. A test
-defect either way. **Neither is a rendered verdict**: n=1, no rerun
-evidence, and neither has been isolated (e.g. by
+*cross-process* comparison the original hypothesis described (the test
+queries Postgres's `NOW()` directly; production never does) — that specific
+framing would have been a test-only artifact. **Correction (post-review,
+via a third Codex review comment on PR #2711): the demoted clock-step
+scenario is not test-only.** Production's own read path
+(`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`) does
+`WHERE expires_at > $2` against `self.clock.now()` — a plain wall-clock
+`DateTime<Utc>` comparison with the same lack of monotonicity guarantee
+`autumn/src/time.rs:105-108` documents for wall-clock comparisons generally
+("a wall-clock/NTP jump ... can never make an elapsed duration negative or
+absurd [via `MonotonicInstant`]. Comparing wall-clock timestamps has no
+such guarantee."). A backward clock step between the write and a later
+read would make production's own TTL read stale-live too, not just this
+test's assertion — a real, if rare, product-relevant robustness question,
+not dismissible as a test artifact. This pass does not claim the observed
+failure *was* a clock step (the worker-refresh mechanism below remains the
+better-supported explanation for this specific incident), only that the
+scenario's product-vs-test classification was wrong as originally stated.
+Refreshing `expires_at` on worker activity is deliberate, sensible
+production behavior in its own right, so under the worker-refresh
+hypothesis the defect is in the test's assumption that a fixed sleep
+leaves no room for the job's own worker to touch the record, not in the
+store — a test defect there. **Neither is a rendered verdict**: n=1, no
+rerun evidence, and neither has been isolated (e.g. by
 asserting on `updated_at` to see which write, if either, actually fired).
 Recorded in the ledger rather than acted on, per this role's own bar — a
 fix here without a rerun-rate baseline would be exactly the "retry in
