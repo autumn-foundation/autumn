@@ -941,6 +941,10 @@ Ten lines, and an internal route is locked to a client CA.
 `optional` is not "unverified": a client that *offers* a certificate must still
 chain to a configured CA. The option is whether presenting one is mandatory.
 
+A `process.role = "worker"` replica serves only the probes and the actuator,
+but it serves them over the same listener, so `required_paths` applies there
+too — a prefix covering `/actuator/` holds on every role.
+
 Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
 segment (`//`) or a `.` / `..` segment — because it would protect less than it
 appears to. Write the resolved prefix.

@@ -495,7 +495,16 @@ pub fn try_build_probe_only_router(
         mount_probe_endpoints(axum::Router::<AppState>::new(), config, &no_user_routes);
     let router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
     let router = router.with_state(state);
-    Ok(apply_startup_barrier(router, config, &barrier_state))
+    let router = apply_startup_barrier(router, config, &barrier_state);
+    // A worker builds this router instead of the full one, and `run()` serves
+    // it over the same listener — the mTLS listener included. It never calls
+    // `apply_middleware`, so mirror the route-level certificate requirement
+    // (#1640) here, or a `required_paths` prefix covering `/actuator/` holds on
+    // a web replica and not on a worker.
+    if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+        return Ok(router.layer(require_client_cert));
+    }
+    Ok(router)
 }
 
 /// Prepared MCP exposure carried through `build_router_pre_state`: the mount
@@ -6913,6 +6922,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worker builds the probe-only router and serves it over the same
+    /// listener, so a `required_paths` prefix must hold there too. Without the
+    /// requirement layer, `/actuator/jobs` answered an uncertified client on a
+    /// worker while a web replica returned 403 for the same prefix.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_worker_actuator_under_a_required_path_still_demands_a_certificate() {
+        let mut config = AutumnConfig::default();
+        config.server.tls = Some(crate::config::TlsConfig {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            reload_interval_secs: 60,
+            handshake_timeout_secs: 10,
+            acme: None,
+            client_auth: Some(crate::config::ClientAuthConfig {
+                mode: crate::config::ClientAuthMode::Optional,
+                ca_bundle_path: Some("client-ca.pem".into()),
+                crl_path: None,
+                required_paths: vec!["/actuator/".to_owned()],
+                reload_interval_secs: 60,
+            }),
+        });
+
+        let app = try_build_probe_only_router(&config, test_state())
+            .expect("probe-only router should build");
+
+        // No `Arc<ClientIdentity>` extension: no verified certificate.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a worker actuator under a required_paths prefix must demand a certificate"
+        );
+
+        // A verified client still reaches it, so the guard has not simply
+        // broken the worker actuator.
+        let identity = std::sync::Arc::new(crate::tls::client_auth::ClientIdentity::new_for_test(
+            "svc-ops",
+            Vec::new(),
+        ));
+        let mut request = Request::builder()
+            .uri("/actuator/info")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(identity);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // A probe outside the prefix is untouched: an orchestrator that cannot
+        // present a certificate still supervises the process.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(config.health.live_path.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
     }
 
     /// Worker-role (#1613) probe-only router: exposes the framework probes and
