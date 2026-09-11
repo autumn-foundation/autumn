@@ -5973,6 +5973,23 @@ pub fn try_build_router_with_static_inner(
         "Pre-static gate (outside static middleware)",
     );
 
+    // mTLS route requirement (#1640), a SECOND time. The copy inside
+    // `inner_router` covers dynamic routes and the MCP dispatch clone, but the
+    // static-first middleware above answers a manifest hit from disk without
+    // ever calling that router — so a pre-rendered page under a
+    // `required_paths` prefix would be served to an uncertified client while
+    // the posture manifest reported `mtls_required: true`. Applied here, beside
+    // the pre-static gates and for the same reason they are: a cached page must
+    // not outrank the check that guards it.
+    //
+    // Applying it twice is harmless: on a rejection this outer copy
+    // short-circuits, so the inner one never runs and the counter moves once;
+    // on a pass both are no-ops. Inner to `SecurityHeadersLayer` below, like the
+    // gates, so the 403 carries the same headers every other response does.
+    if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+        router = router.layer(require_client_cert);
+    }
+
     // Security headers are applied OUTERMOST so they wrap both cached pages and
     // any gate short-circuit response. This is the SINGLE application for the
     // SSG/ISG path: the inner router skips it (build_router_pre_state is called
@@ -11219,6 +11236,77 @@ enabled = true
         let mut config = AutumnConfig::default();
         config.compression.enabled = true;
         config
+    }
+
+    /// A cached SSG page must not outrank the mTLS requirement that guards it
+    /// (#1640).
+    ///
+    /// The static-first middleware answers a manifest hit from disk without
+    /// ever calling the inner router, so the copy of `RequireClientCertLayer`
+    /// that lives in the inner router's stack never runs on that path. Without
+    /// a second copy outside the static cache, an uncertified client is served
+    /// the pre-rendered page while the posture manifest reports
+    /// `mtls_required: true`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_cached_ssg_page_under_a_required_path_still_demands_a_certificate() {
+        let tmp = create_ssg_dist(&[("/internal/report", "report.html", b"<h1>secret</h1>")]);
+        let dist = tmp.path().join("dist");
+
+        let mut config = AutumnConfig::default();
+        config.server.tls = Some(crate::config::TlsConfig {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            reload_interval_secs: 60,
+            handshake_timeout_secs: 10,
+            acme: None,
+            client_auth: Some(crate::config::ClientAuthConfig {
+                mode: crate::config::ClientAuthMode::Optional,
+                ca_bundle_path: Some("client-ca.pem".into()),
+                crl_path: None,
+                required_paths: vec!["/internal/".to_owned()],
+                reload_interval_secs: 60,
+            }),
+        });
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        // No `Arc<ClientIdentity>` extension: this request arrived over a
+        // connection with no verified certificate.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/report")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a cached page under a required_paths prefix must still demand a certificate"
+        );
+
+        // A verified client gets the cached page, so the guard has not simply
+        // broken static serving.
+        let identity = std::sync::Arc::new(crate::tls::client_auth::ClientIdentity::new_for_test(
+            "svc-reports",
+            Vec::new(),
+        ));
+        let mut request = Request::builder()
+            .uri("/internal/report")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(identity);
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<h1>secret</h1>");
     }
 
     /// A manifest-backed HTML page is gzip-compressed when the client accepts
