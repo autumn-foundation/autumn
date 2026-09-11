@@ -280,6 +280,21 @@ without also filling in the intake form above.
   closed-per-this-role's-bar (see the 2026-09-10 update's own closure
   paragraph) — this note marks the verdict as rendered, not the entry as
   closed.
+- **2026-09-11 update — harness still undispatched (4th consecutive daily
+  pass), zero new organic hits on any of the three tracked signatures.**
+  Sampled the ~23h since the 2026-09-10 follow-up's cutoff
+  (2026-09-10T10:30:30Z–2026-09-11T09:09:24Z, 100 `pull_request`-triggered
+  `ci.yml` runs: 61 cancelled/25 success/14 failure). None of the 14
+  failures match `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
+  see the new `job_tracking_stores_integration` entry below for the one
+  finding this pass did turn up, on a different test entirely.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-11T~09:5xZ — unchanged for a
+  4th straight day since it became dispatchable 2026-09-08T15:07:44Z.
+  Zero organic hits this pass is reassuring but a ~23h window is not a
+  substitute for the rerun campaign below; the recommendation to dispatch
+  it (macOS half only, `samples: "20"`) stands unchanged from the
+  2026-09-10 pass.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -354,3 +369,57 @@ without also filling in the intake form above.
   not an exhausted wall-clock wait.
 - **Status**: one occurrence — suggestive, not yet a repeat signature.
   Covered by the same rerun campaign as `live_upgrade` above.
+
+### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+
+- **New, 2026-09-11.** First occurrence found in the 2026-09-11 follow-up
+  pass. Run 34517281816 (branch `vesper/bugbash-2634-spez-normalize-fallback`,
+  not a change to the job-tracking code itself), job `Test (Docker)`
+  (the bare `--ignored` sweep over the `autumn` consolidated
+  `integration_tests` binary), 2026-09-10T19:24–20:01Z. `test result:
+  FAILED. 369 passed; 1 failed` — a single failure among the whole Docker
+  sweep. Panic at
+  `autumn/tests/integration/job_tracking_stores_integration.rs:264:5`:
+  `"record should be past its configured TTL"`.
+- **Mechanism (time dependence — dual clock source, thin margin)**: the
+  test (lines 216-264) configures `ttl_secs: 1`, calls
+  `job::enqueue_tracked` (which stamps `expires_at = self.clock.now() +
+  1s` using the *application's* `SystemClock`,
+  `PgJobTrackingStore::expires_at` in
+  `autumn/src/job_tracking.rs:1874-1878`), reads the row back once, then
+  `tokio::time::sleep(Duration::from_millis(1_200))` before asserting
+  `expires_at <= NOW()` — but `NOW()` there is evaluated **by Postgres's
+  own clock** (`autumn/tests/integration/job_tracking_stores_integration.rs:256-258`),
+  a different clock source than the one that stamped `expires_at` in the
+  first place. `tokio::time::sleep` is `Instant`-backed and cannot fire
+  early, so at least 1200ms of real host time elapses before the check —
+  comfortably over the 1000ms TTL if both clocks agree. The only way the
+  assertion sees `expired == false` is if Postgres's wall clock reads
+  behind the app host's by more than the ~200ms margin at check time —
+  plausible under a heavily contended runner (this sweep runs the full
+  Docker/testcontainer suite on one shared runner; the job itself took 37
+  minutes end to end) where a container's clock can lag real elapsed time
+  under host CPU/scheduling pressure. Compare to the sibling `sqlite`
+  block immediately above this test in the same file (lines 113-117):
+  that path checks Redis's own `EXISTS` after the same sleep/TTL shape,
+  same fixed-sleep-vs-TTL structure, but never crosses a second clock
+  source the way the Postgres path's `NOW()` comparison does — an
+  identically-shaped assertion 150 lines up is not itself evidence this
+  one is safe, but no organic hit has been observed on it, consistent
+  with the two-clock read being the differentiator.
+- **Test-vs-product**: not yet rendered. The store's actual lazy-expiry
+  behavior (a request-path read filtering on `expires_at > now`, e.g.
+  `autumn/src/job_tracking.rs:1899`) uses the *same* `self.clock.now()`
+  on both the write and the read side inside the application — it never
+  compares against Postgres's own `NOW()` in production code. That
+  comparison is a test-only artifact of how this test independently
+  verifies TTL persistence by querying Postgres directly rather than
+  through the store's own read path. If the mechanism above is confirmed,
+  this reads as a test defect (comparing two independently-advancing
+  clocks with an unbudgeted margin), not a product defect — but this is a
+  hypothesis from reading the source, not yet confirmed by a rerun
+  campaign, so treat the verdict as provisional per this role's own bar.
+- **Status**: n=1, not campaigned. Logged here for recognition per this
+  role's standard for a first hit; escalate to a rerun campaign only if a
+  repeat signature appears. Not quarantined — the Docker sweep is
+  unmodified and this test keeps running on every sweep.
