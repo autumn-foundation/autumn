@@ -1191,6 +1191,7 @@ http-client = ["dep:reqwest"]
 openapi = ["dep:serde_yaml"]
 mcp = ["openapi"]
 markdown = ["dep:pulldown-cmark"]
+constela = ["maud"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -1223,6 +1224,57 @@ system-tests = ["dep:chromiumoxide"]
 ```
 
 `storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
+
+## Generated UI (`autumn_web::constela`, feature `constela`)
+
+Parse, validate and server-render [Constela](https://github.com/yuuichieguchi/constela)
+documents — the constrained JSON UI language — so an app can serve an interface
+a language model generated. Implies `maud`; adds no new dependencies. The
+`markdown` node kind additionally needs the `markdown` feature (without it a
+document containing one fails validation with `constela.feature_required`).
+
+| Item | Signature / shape |
+|---|---|
+| `Document::parse` | `fn(&str, &Limits) -> Result<Document, ConstelaError>` — parses **and** validates |
+| `Document::from_program` | `fn(Program) -> Result<Document, ConstelaError>` — validates an already-parsed AST |
+| `Document::initial_state` | `fn(&self) -> serde_json::Map<String, Value>` — the declared initials |
+| `Document::action_names` | `fn(&self) -> Vec<&str>` |
+| `Document::render` | `fn(&self, &RenderContext) -> Result<RenderedUi, ConstelaError>` |
+| `Document::dispatch` | `fn(&self, &str, &mut Map<String, Value>, &Map<String, Value>) -> Result<Dispatched, ConstelaError>` |
+| `Document::dispatch_with` | as `dispatch`, plus a `&RouteValues` |
+| `parse` | free-function alias for `Document::parse` |
+| `parse_program` | `fn(&str, &Limits) -> Result<Program, ConstelaError>` — syntax only, no validation |
+| `validate` | `fn(&Program) -> Result<(), ConstelaError>` |
+| `RenderedUi` | `{ body: Markup, portals: Vec<RenderedPortal>, title: Option<String>, meta: BTreeMap<String, String> }`, plus `portals_for(target)` |
+| `Dispatched` | `{ effects: Vec<Effect>, suspended_at: Option<String> }`, plus `is_pure()` / `is_suspended()`; dispatch stops at the first effect |
+| `Effect` | `#[non_exhaustive]` — `Fetch`, `Storage`, `Navigate`, `Delay`, `Interval`, `Focus` |
+| `ConstelaError` | `Limit` / `Syntax` / `Invalid(Vec<Diagnostic>)` / `Render`, plus `diagnostics()` and `to_json()`; maps to **422** |
+| `Diagnostic` | `{ path: String, code: &'static str, message: String }` |
+| `codes` | `constela.limit`, `.syntax`, `.version`, `.state.type`, `.unknown_ref`, `.duplicate`, `.tag_not_allowed`, `.attr_not_allowed`, `.url_scheme`, `.misplaced`, `.cycle`, `.step_shape`, `.feature_required`, `.eval`, `.render_limit` |
+
+`RenderContext { state, route, id_prefix, limits }` — `id_prefix` defaults to
+`"c-"` and is applied to every element id the document writes and every
+attribute referencing one, so a fragment cannot collide with or clobber a
+host-page id. Give each fragment its own prefix when a page embeds several.
+
+Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
+max_nodes: 20_000 }` bounds the **document** and is applied before and around
+deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
+max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+`max_output_bytes` spans the body and every portal together and also caps what
+one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
+the evaluator before any of it is emitted); `max_depth` caps the shape of state
+on every mutation, not only `setPath`, because state persists between dispatches
+and `serde_json::Value` drops recursively. `Limits::unbounded()`
+exists for trusted, locally-authored documents only.
+
+Safety lives in `constela::policy` — `ALLOWED_TAGS`, `ALLOWED_ATTRS`,
+`URL_ATTRS`, `ALLOWED_URL_SCHEMES`, `ID_REF_ATTRS`, `VOID_TAGS`,
+`RESERVED_ATTR_PREFIX`, and the `is_allowed_tag` / `is_allowed_attr` /
+`is_allowed_url` / `canonical_attr` predicates. Fixed lists, no per-app
+configuration.
+
+Guide: `docs/guide/constela.md`.
 
 ## Workspace dependency versions
 
