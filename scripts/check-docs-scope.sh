@@ -340,8 +340,20 @@ def main():
     for i, d in enumerate(declarations):
         under = {f for f in tracked if f.startswith(d['prefix'])}
         broken = False
-        for label, seen, claim in (('routes', wide & under, d['routes']),
-                                   ('the siblings', narrow & under, d['siblings'])):
+        # `want` comes from the TREE, `seen` from what the gate REPORTED — two
+        # different universes, and mixing them hid a case. Intersecting the
+        # reported corpus with the tracked-markdown set first discarded any path
+        # that is not tracked markdown, so a gate that widened its glob to, say,
+        # `examples/notes.txt` had the extra path filtered out before the claim
+        # was checked and then waived by prefix as covered. `seen` is now every
+        # path the gate reports under the prefix, whatever it is, so a corpus
+        # that grew something the tree does not account for reads as `extra`.
+        for label, seen, claim in (
+                ('routes',
+                 {f for f in wide if f.startswith(d['prefix'])}, d['routes']),
+                ('the siblings',
+                 {f for f in narrow if f.startswith(d['prefix'])},
+                 d['siblings'])):
             want = CLAIMS[claim](under)
             if seen == want:
                 continue
@@ -519,6 +531,14 @@ examples/todo/NOTES.md"
     # A declaration with nothing left to describe is stale and reported.
     c8="$tmp/c8"; make_gates "$c8" "$RTS_OK" "$RTS_OK"
     check "a declaration describing no live difference fails" fail "$c8"
+
+    # A path the tree does not account for, reported under a DECLARED prefix,
+    # must not be waived by that declaration. Intersecting the reported corpus
+    # with the tracked-markdown set discarded it before the claim was checked,
+    # and the prefix match then treated it as covered.
+    c13="$tmp/c13"; make_gates "$c13" "$SIB_OK" "$RTS_OK
+examples/notes.txt"
+    check "an untracked path under a declared prefix is not waived" fail "$c13"
 
     # A SECOND declaration over the same prefix, for the opposite direction and
     # describing nothing, must still be reported stale. Bookkeeping keyed by the
