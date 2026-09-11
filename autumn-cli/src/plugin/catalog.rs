@@ -101,6 +101,36 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         ],
     },
     CatalogEntry {
+        crate_name: "autumn-billing",
+        summary: "Subscription billing plugin (Stripe checkout, portal, webhook mirror, dunning) for autumn-web applications",
+        mount: concat!(
+            "        // added by `autumn plugin add autumn-billing`\n",
+            "        .plugin(autumn_billing::BillingPlugin::new())\n",
+        ),
+        mount_call: ".plugin(",
+        mount_arg: "autumn_billing::BillingPlugin",
+        constructor: "BillingPlugin::new(",
+        // Registered through `plugin_migrations`, so the app's own migration
+        // run creates the mirror tables.
+        migrations: &["20260910203829_billing_mirror"],
+        // Drop order mirrors the migration's `down.sql`.
+        tables: &[
+            "billing_dunning",
+            "billing_events",
+            "billing_invoices",
+            "billing_subscriptions",
+            "billing_customers",
+        ],
+        config_keys: &[
+            "[[security.webhooks.endpoints]]\nname = \"billing\"\npath = \"/billing/webhook\"\nprovider = \"stripe\"\nsecret_env = \"STRIPE_WEBHOOK_SECRET\"",
+            "[billing]\nsuccess_url = \"/billing/success\"\ncancel_url = \"/billing/cancel\"",
+        ],
+        post_install: &[
+            "Set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` in the environment; declare the `/billing/webhook` endpoint under `[[security.webhooks.endpoints]]`.",
+            "Declare plans in code (`BillingPlugin::plans`) or under `[[billing.plans]]`, then gate routes with `Entitled<YourPlan>`.",
+        ],
+    },
+    CatalogEntry {
         crate_name: "autumn-cache-redis",
         summary: "Redis-backed shared cache plugin for autumn-web applications",
         mount: concat!(

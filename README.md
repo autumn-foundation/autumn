@@ -184,7 +184,7 @@ for the model and roadmap.
 
 This is the small-app shape Autumn is built around:
 
-```rust
+```rust,no_run
 use autumn_web::prelude::*;
 
 #[get("/")]
@@ -252,6 +252,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Generated UI (Constela)](docs/guide/constela.md) — serve an interface a language model wrote: the [Constela](https://github.com/yuuichieguchi/constela) constrained JSON UI language is parsed, validated against an allowlist of tags, attributes and URL schemes, and server-rendered to Maud, with element ids prefixed so a generated fragment cannot clobber the host page; `Document::dispatch` runs an action's pure state steps on the server so the interaction loop works over htmx with no client runtime, and browser-side steps such as `fetch` are reported as effects for the app to allow or decline rather than performed
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
 - [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
+- [Billing](docs/guide/billing.md) — `autumn-billing`: Stripe checkout and portal, a webhook-fed local mirror, the `Entitled<Plan>` gate, and durable dunning retries
 - [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)

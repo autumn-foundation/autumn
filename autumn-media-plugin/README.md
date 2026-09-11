@@ -61,7 +61,7 @@ endpoint_url      = "https://t3.storage.dev"
 region            = "auto"
 access_key_id     = "${MEDIA_S3_KEY}"
 secret_access_key = "${MEDIA_S3_SECRET}"
-public_base_url   = "https://cdn.example.com/media"
+public_base_url   = "https://cdn.example.com/media"  # required unless endpoint_url is Tigris
 key_prefix        = "media"
 force_path_style  = false
 
@@ -96,10 +96,32 @@ autumn_web::app()
 (and `AWS_*` / `BUCKET_NAME`) environment onto a `MediaConfig`, so an operator
 changes nothing when adopting the plugin.
 
+## Room routes
+
+`with_rooms()` nests five routes under the API prefix (default `/api/media`) and
+installs a `RoomService` on `AppState`:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/media/rooms` | Create a room. |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. |
+| `POST` | `/api/media/rooms/{room_id}/leave` | Leave. |
+| `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
+| `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |
+
+These routes ship **no authentication or rate limiting**. Mount them behind your
+application's own middleware.
+
+A background reaper reclaims seats and rooms that go quiet. A client holds its
+seat by sending a heartbeat, or by polling the roster, on any interval under the
+idle TTL (default 15 minutes). Room state lives in process memory by default;
+set `room_store_backend = "db"` for a shared store that survives restarts and is
+safe across processes.
+
 ## Status
 
-**Skeleton (slice 0).** This release ships the crate, the `MediaPlugin`
-builder, the `MediaConfig` surface + `[media]` parsing, and the
-`from_arroyo_env` compatibility shim. There is **no runtime behavior beyond
-configuration and registration** — storage, encode, transport, and rooms land
-in later slices.
+**Usable.** Broadcast (ingest, playback URLs, recording, retention), the encode
+workflows, the `MediaMTX` transport client, mesh rooms, and the
+`from_arroyo_env` shim all ship. See
+[docs/guide/media.md](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/media.md)
+for the full guide.

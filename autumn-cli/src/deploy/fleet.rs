@@ -502,6 +502,14 @@ pub(crate) fn classify_post_boundary(label: &str) -> PostBoundaryClass {
 pub(crate) const MANUAL_AMBIGUOUS_MARKERS: &str =
     "release markers left mid-transaction by `commit-markers`";
 
+/// Why an automatic rollback was declined when the Option C phase-4 public-port
+/// rebind failed AND its own rollback to the old port also failed (issue #2073):
+/// the proxy's public bind is now unknown, so an automated proxy-flip-based
+/// compensation could target a proxy that is not even listening — a human must
+/// check the host before anything else touches it.
+pub(crate) const MANUAL_PUBLIC_PORT_UNKNOWN: &str = "the public-port rebind failed and its own rollback also failed — the proxy's \
+     public bind on this host is unknown";
+
 /// Why an automatic rollback was declined by the target-dir precheck (§4.7).
 pub(crate) const MANUAL_ROLLBACK_TARGET_MISSING: &str = "rollback target release dir missing";
 
@@ -1944,6 +1952,7 @@ pub(crate) mod test_support {
         host: String,
         stdout: Vec<(&'static str, String)>,
         fail: Vec<&'static str>,
+        fail_on_occurrence: Vec<(&'static str, usize)>,
         transport_fail: Vec<&'static str>,
         upload_fail: Vec<String>,
     }
@@ -2006,6 +2015,23 @@ pub(crate) mod test_support {
             self
         }
 
+        /// Make one host's `label` fail (a scripted `CommandFailed`) on ONE specific
+        /// 1-indexed occurrence only — for a label that runs more than once in one
+        /// host's sequence (Option C's phase-4 rebind reuses the SAME labels for its
+        /// forward attempt and its rollback), which [`Self::fail`] (every
+        /// occurrence) cannot express.
+        pub(crate) fn fail_on_occurrence(
+            mut self,
+            host: &str,
+            label: &'static str,
+            occurrence: usize,
+        ) -> Self {
+            self.entry(host)
+                .fail_on_occurrence
+                .push((label, occurrence));
+            self
+        }
+
         /// Make one host's `label` fail as a dropped SSH TRANSPORT rather than a
         /// remote non-zero exit — the shape that carries no op label and so
         /// classifies as a FUNCTIONAL post-boundary failure (see
@@ -2037,6 +2063,9 @@ pub(crate) mod test_support {
                 }
                 for label in &script.fail {
                     exec = exec.failing(label);
+                }
+                for (label, occurrence) in &script.fail_on_occurrence {
+                    exec = exec.failing_on_occurrence(label, *occurrence);
                 }
                 for label in &script.transport_fail {
                     exec = exec.transport_failing(label);

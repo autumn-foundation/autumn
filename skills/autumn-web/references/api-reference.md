@@ -22,6 +22,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 | `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
+| `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
 together at `0.7.0`. This table lists the same crates, in the same order, as
