@@ -352,6 +352,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **sqlite target coverage guard only credits `run:` commands (#2574):**
+  `sqlite_test_targets_are_ci_named` (in
+  `autumn-cli/tests/integration/repo_hygiene.rs`) built its "commands" from
+  every non-comment YAML line, so step *metadata* — e.g. a step literally
+  named `cargo test -p autumn-web --features sqlite --test <target>` —
+  satisfied the guard while no job ran the target. Command collection now
+  tracks `run:`-block membership by indentation (inline `run:`, block
+  `run: |`/`>`, bare `run:`, and `- run:` forms), and only lines inside a
+  `run:` scalar become commands; `\`-continuation joining is unchanged. Two
+  new unit tests pin the behavior (`name:`/`env:` decoys credit nothing;
+  commented-out invocations stay ignored), and the guard still passes on the
+  unmodified workflow set.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
