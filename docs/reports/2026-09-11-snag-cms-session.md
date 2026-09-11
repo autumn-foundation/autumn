@@ -79,13 +79,23 @@ applied via the embedded-migration `AUTUMN_MIGRATE=1` one-shot instead of
   an internal doc comment, not a user-facing claim, and the actual
   behavior is safe either way — noted here only so a future session
   doesn't re-discover it as a lead.
-- **State-machine edges**: `draft → publish → password-protect → unlock`,
-  `draft → trash` all behaved as declared in `Post`'s `#[state_machine]`.
-  Did not attempt to find an undeclared-edge violation — the README
-  already cites this as directly covered by an existing test
-  (`compile_fail`-style refusal), and a fresh manual search over ~19
-  declared edges without a specific lead looked lower-value than the other
-  charters this session.
+- **State-machine edges**: the two `status` transitions actually exercised,
+  `draft → publish` and `draft → trash`, behaved as declared in `Post`'s
+  `#[state_machine]`. Did not attempt to find an undeclared-edge
+  violation — the README already cites this as directly covered by
+  `the_status_state_machine_refuses_an_undeclared_edge`
+  (`examples/cms/tests/integration_test.rs`), a runtime HTTP integration
+  test (not a compile-time check) that posts `to=future` against an
+  already-published post and asserts the edge is refused — and a fresh
+  manual search over ~19 declared edges without a specific lead looked
+  lower-value than the other charters this session. Password-protecting
+  and unlocking a post (covered separately, above) are not part of this
+  state machine at all: `password` is an ordinary `String` field, not a
+  transition target, and `/unlock/{id}` only ever writes session state,
+  never `status` — an earlier draft of this report listed
+  `draft → publish → password-protect → unlock` as if it were a sequence
+  of state-machine edges, which a Codex review on this PR correctly
+  flagged as conflating the two.
 - **Emoji/unicode in title** — a `🎉🎊` emoji-prefixed title round-tripped
   correctly end-to-end (admin edit form, REST API, and the public page's
   `<title>`/`<h1>` all preserved it); the slug generator correctly
