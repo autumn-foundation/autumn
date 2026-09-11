@@ -209,6 +209,42 @@ fn the_guide_documents_the_windows_prerequisites_doctor_reports() {
 }
 
 #[test]
+fn the_guide_documents_the_service_elevation_prerequisite() {
+    // #1639 added it to `WINDOWS_PREREQUISITES`, so `doctor` prints it. A
+    // prerequisite doctor names and the guide does not is one an operator meets
+    // as an access-denied error halfway through a registration.
+    let source = policy_source();
+    assert!(
+        source.contains("install-service") && source.contains("Administrator"),
+        "the policy must carry the service-registration prerequisite"
+    );
+    let doc = policy_doc();
+    assert!(
+        doc.contains("install-service") && doc.contains("Administrator"),
+        "the guide must document the elevation the service journey needs"
+    );
+}
+
+#[test]
+fn the_guide_records_that_the_daemon_lifecycle_left_tier_2() {
+    // The move is the point of #1639, and a guide that still routes a Windows
+    // operator to WSL2 for it would undo the slice while every table stayed
+    // consistent.
+    let doc = policy_doc();
+    let tier_two = guide_tier("## Tier 2");
+    assert!(
+        !tier_two
+            .iter()
+            .any(|command| command.contains("serve --daemon")),
+        "the daemon lifecycle must not be listed under Tier 2: {tier_two:?}"
+    );
+    assert!(
+        doc.contains("#1639"),
+        "the guide must say where the promotion came from"
+    );
+}
+
+#[test]
 fn the_guide_assigns_the_1456_browser_probe_a_tier_with_a_workaround() {
     // AC 5: #1456 is either resolved under this target or explicitly assigned
     // to a tier with a documented workaround. It IS resolved (the Windows
@@ -255,6 +291,62 @@ fn the_policy_doc_url_in_the_code_points_at_the_published_guide() {
         source.contains("docs/guide/platform-support.md"),
         "POLICY_DOC_URL must point at the published guide"
     );
+}
+
+#[test]
+fn the_windows_journey_job_still_gates_the_daemon_lifecycle() {
+    // #1639 promoted the daemon lifecycle to Tier 1, and a tier promise with no
+    // gate is a wish. The `windows-tier1` job's own meta-test below only checks
+    // that the job exists — these steps could be deleted without a single test
+    // going red, which is exactly how a Tier 1 claim rots back into a Tier 2
+    // reality. Pinned by step name, the way this repo already pins the
+    // cold-start tests it needs named in `generator-conformance.yml`.
+    let ci = read(".github/workflows/ci.yml");
+    for step in [
+        "Journey: the daemon starts, is discoverable, and serves",
+        "Journey: stop drains in-flight requests and stops Postgres cleanly",
+        "Journey: restart brings the daemon back as a new process",
+        "Journey: register a boot-start service that survives a crash",
+    ] {
+        assert!(
+            ci.contains(step),
+            "the Windows journey must still gate `{step}`"
+        );
+    }
+}
+
+#[test]
+fn the_daemon_journey_asserts_the_things_the_acceptance_criteria_name() {
+    // Guards against the steps surviving as names while their assertions are
+    // hollowed out. Each string below is the one that makes its step mean what
+    // its title says.
+    let ci = read(".github/workflows/ci.yml");
+    for (what, needle) in [
+        ("a tcp discovery file", r#"transport\s*=\s*"tcp""#),
+        ("a second start is rejected", "already running"),
+        ("the stop is observably a drain", "prestop grace"),
+        // The drain must be graded on an APPLICATION route. `/health` is an
+        // alias for the readiness probe, which phase 2 of the shutdown sequence
+        // flips to 503 on purpose while the listener is still accepting — so
+        // grading the drain on it calls a correct drain a failure.
+        ("the drain is graded on a real route", "hello=200"),
+        // And the flip itself is graded, so the timing assertion cannot be
+        // satisfied by a server that merely took the whole budget to die.
+        ("readiness drains before the listener closes", "health=503"),
+        ("the managed cluster is not orphaned", "postmaster.pid"),
+        ("boot start", "AUTO_START"),
+        ("crash restart", "RESTART"),
+        (
+            "a supervised restart is observed",
+            "supervised restart observed",
+        ),
+        ("the service entry is gone", "1060"),
+    ] {
+        assert!(
+            ci.contains(needle),
+            "the Windows journey must still assert {what}"
+        );
+    }
 }
 
 #[test]

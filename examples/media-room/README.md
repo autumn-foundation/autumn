@@ -72,6 +72,7 @@ curl -X POST http://localhost:3000/api/media/rooms/<id>/join \
 | POST | `/api/media/rooms` | (plugin) Create a room |
 | POST | `/api/media/rooms/{room_id}/join` | (plugin) Join a room |
 | POST | `/api/media/rooms/{room_id}/leave` | (plugin) Leave a room |
+| POST | `/api/media/rooms/{room_id}/heartbeat` | (plugin) Hold the seat: refresh liveness |
 | GET | `/api/media/rooms/{room_id}` | (plugin) Member-gated roster |
 
 ## System smoke test
