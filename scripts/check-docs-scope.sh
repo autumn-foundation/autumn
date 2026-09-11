@@ -102,6 +102,12 @@
 # silently stops being checked is the defect this gate exists to catch, one
 # level up.
 #
+# A declaration is kept alive only by a difference IT matched — the
+# bookkeeping is by index, not by prefix. Two entries can share a prefix, the
+# live one plus a dead entry for the opposite direction, and keying on the
+# prefix string let a match on either mark BOTH used, so the staleness check
+# passed the dead one.
+#
 # THE DECLARATIONS ARE CHECKED TOO, before any corpus is read: a prefix, a
 # direction, a claim per side drawn from a fixed vocabulary, and a NON-EMPTY
 # REASON. The reason is enforced rather than merely conventional because this
@@ -284,7 +290,13 @@ def main():
             print(f'  {d}')
         return 1 if problems else 0
 
-    shape = validate(DECLARED_DIFFERENCES)
+    # A second seam, for the rules that need a whole comparison rather than
+    # just a table: the stale-declaration bookkeeping. Absent in every real run.
+    override = os.environ.get('SCOPE_SELFTEST_TABLE')
+    declarations = (tuple(json.loads(override)) if override is not None
+                    else DECLARED_DIFFERENCES)
+
+    shape = validate(declarations)
     if shape:
         print(f'defects: {len(shape)}')
         print()
@@ -319,11 +331,14 @@ def main():
     # that prefix verified against the tracked tree. A declaration is only
     # allowed to waive a difference while the thing it says is still true.
     wide, narrow = corpora[SUPERSET], reference
-    under_prefix = {}
+    # Bookkeeping is by INDEX, not by prefix. Two declarations can share a
+    # prefix — the live one plus a stale entry for the opposite direction — and
+    # keying on the prefix string let a match on either mark BOTH as used, so
+    # the staleness check below passed the dead one. A declaration is only ever
+    # kept alive by a difference IT matched.
     verified = set()
-    for d in DECLARED_DIFFERENCES:
+    for i, d in enumerate(declarations):
         under = {f for f in tracked if f.startswith(d['prefix'])}
-        under_prefix[d['prefix']] = under
         broken = False
         for label, seen, claim in (('routes', wide & under, d['routes']),
                                    ('the siblings', narrow & under, d['siblings'])):
@@ -340,18 +355,18 @@ def main():
                 + '. Fix the gate, or rewrite the declaration to what is now '
                   'the case.')
         if not broken:
-            verified.add(d['prefix'])
+            verified.add(i)
 
     used = set()
     for f in sorted(wide ^ narrow):
         side = 'routes-only' if f in wide else 'siblings-only'
-        match = next((d for d in DECLARED_DIFFERENCES
+        match = next(((i, d) for i, d in enumerate(declarations)
                       if f.startswith(d['prefix']) and d['side'] == side), None)
         if match:
             # A declaration whose claim just failed has already been reported,
             # precisely. Stay quiet about the individual files under it rather
             # than burying that message in a list of consequences.
-            used.add(match['prefix'])
+            used.add(match[0])
             continue
         if side == 'routes-only':
             defects.append(
@@ -368,17 +383,17 @@ def main():
     # A declaration that no longer describes a real difference is stale: the
     # difference was resolved and the note outlived it. Report it, so the table
     # cannot quietly accumulate reasons for differences that are gone.
-    for d in DECLARED_DIFFERENCES:
-        if d['prefix'] not in used:
+    for i, d in enumerate(declarations):
+        if i not in used:
             defects.append(
-                f'DECLARED_DIFFERENCES in {SELF} records {d["prefix"]!r} as '
-                f'{d["side"]}, but the gates no longer differ that way over '
+                f'DECLARED_DIFFERENCES[{i}] in {SELF} records {d["prefix"]!r} '
+                f'as {d["side"]}, but the gates no longer differ that way over '
                 f'it. Remove the entry.')
 
     print(f'gates compared: {len(SIBLINGS)} siblings + {SUPERSET}')
     print(f'pages in the sibling corpus: {len(reference)}')
     print(f'declared differences: {len(verified)} verified, '
-          f'{len(used)} matched, of {len(DECLARED_DIFFERENCES)}')
+          f'{len(used)} matched, of {len(declarations)}')
     print(f'defects: {len(defects)}')
     if defects:
         print()
@@ -438,6 +453,8 @@ examples/todo/NOTES.md'
     check() {
       local label="$1" want="$2" dir="$3"
       local got=0
+      # `SCOPE_SELFTEST_TABLE` is exported by the caller for the cases that
+      # hand in a synthetic table; unset elsewhere, so the real one is used.
       (cd "$dir" && python3 -c "$PYSRC") >/dev/null 2>&1 || got=$?
       if { [ "$want" = pass ] && [ "$got" -eq 0 ]; } \
         || { [ "$want" = fail ] && [ "$got" -ne 0 ]; }; then
@@ -502,6 +519,21 @@ examples/todo/NOTES.md"
     # A declaration with nothing left to describe is stale and reported.
     c8="$tmp/c8"; make_gates "$c8" "$RTS_OK" "$RTS_OK"
     check "a declaration describing no live difference fails" fail "$c8"
+
+    # A SECOND declaration over the same prefix, for the opposite direction and
+    # describing nothing, must still be reported stale. Bookkeeping keyed by the
+    # prefix string let the live entry's match mark this dead one used too.
+    DUPE='[{"prefix":"examples/","side":"routes-only","routes":"every page","siblings":"the READMEs","why":"served pages, URLs only"},{"prefix":"examples/","side":"siblings-only","routes":"every page","siblings":"the READMEs","why":"describes nothing"}]'
+    c11="$tmp/c11"; make_gates "$c11" "$SIB_OK" "$RTS_OK"
+    SCOPE_SELFTEST_TABLE="$DUPE" check \
+      "a stale duplicate-prefix declaration is still reported" fail "$c11"
+
+    # …and the same table minus the dead entry still passes, so the case above
+    # fails for the duplicate rather than for anything else in the fixture.
+    LIVE='[{"prefix":"examples/","side":"routes-only","routes":"every page","siblings":"the READMEs","why":"served pages, URLs only"}]'
+    c12="$tmp/c12"; make_gates "$c12" "$SIB_OK" "$RTS_OK"
+    SCOPE_SELFTEST_TABLE="$LIVE" check \
+      "the same table without the dead entry passes" pass "$c12"
 
     # ── The declarations' own shape ──────────────────────────────────────────
     # Handed in as a synthetic table, since these rules are about the table
