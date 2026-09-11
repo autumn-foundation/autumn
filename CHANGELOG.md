@@ -543,6 +543,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **SSG/ISR:** the `Content-Type` equivalence check now decodes quoted-pairs
+  inside quoted MIME parameter values (RFC 9110 §5.6.4), so `boundary="a\b"`
+  and `boundary="ab"` compare equal. Previously a layer or proxy that merely
+  reserialized the header between `autumn build` and ISR regeneration —
+  changing `"a\b"` to `"ab"` or vice versa — made `regenerate_page` refuse
+  every refresh for that route (with an `error!` each cooldown) even though
+  the two spellings mean the same value (issue #2404).
+
 ### Security
 
 - **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
