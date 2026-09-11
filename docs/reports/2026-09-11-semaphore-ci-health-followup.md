@@ -254,9 +254,12 @@ None shipped by this pass — no finding here clears the hard gate for a fix.
 - **Recommendation for a human, unchanged from the last three passes**:
   dispatch `manual-macos-contention-check.yml` against a `trunk-dev` commit
   at or after `8fae8af` (the #2645 fix), `samples: "20"`. It is the only
-  rerun harness this investigation has, still macOS-only, and four days
-  idle is four days of not even the partial evidence it could already be
-  producing.
+  rerun harness this investigation has, still macOS-only, and — corrected
+  per a fourteenth Codex review comment on PR #2711, which caught this
+  line conflating the 4th daily pass with 4 days of duration — ~66.5
+  hours idle (dispatchable since 2026-09-08T15:07:44Z, checked against
+  this same report's own Verdict-path figure) is ~66.5 hours of not even
+  the partial evidence it could already be producing.
 - **No action on the `api_token_error_response` WIP failure** — it belongs
   to whoever is driving `vesper/bugbash-2635-api-token-error-response`, not
   to CI health.
