@@ -110,7 +110,7 @@ an `ApiDoc` at compile time from the path and the handler signature:
 | HTTP method | The `get`/`post`/`put`/`patch`/`delete` key of the path item |
 | Handler function name | The default `operationId` |
 | First non-parameter path segment | The default tag (`/api/articles` → `api`) |
-| `Query<T>` argument | One optional query parameter with `style: form, explode: true`, so `T`'s fields serialize as independent keys (`?q=foo&page=2`) |
+| `Query<T>` argument | One optional query parameter per field of `T`, each styled for how it decodes (`form`/`explode` for a scalar or scalar array, `deepObject` for a nested object) — or, when `T`'s fields cannot be read, one opaque parameter for the whole struct with `style: form, explode: true` |
 | `Json<T>` or `Valid<Json<T>>` argument | A required `application/json` request body referencing `T`'s schema |
 | `Json<T>` return, including `Result<Json<T>, _>` / `AutumnResult<Json<T>>` and tuples like `(StatusCode, Json<T>)` | The success response body |
 | `Vec<T>` in either position | `type: array` with `items` from `T` |
@@ -126,23 +126,24 @@ contributes an operation with no response body schema.
 Several places where the generated document can describe a request the handler
 will not accept. None of them fails the build:
 
-> **`style: form, explode: true` cannot describe a nested `Query<T>` field.**
-> The mapping is exact for scalar and scalar-sequence fields: a `Vec<String>`
-> field advertised as an array is sent by a conforming client as
-> `?tags=a&tags=b`, and `Query<T>` decodes that. A **nested** field (an object,
-> or an array of objects) is decoded from the bracketed form
-> (`?filter[status]=open`, `?items[0][sku]=A-1`) that
+> **An array-of-objects `Query<T>` field has no OpenAPI `style`.** A `Query<T>`
+> with `#[derive(OpenApiSchema)]` documents one parameter per field, each with
+> the `style` that matches how
 > [`query_string`](https://docs.rs/autumn-web/latest/autumn_web/query_string/)
-> defines and MCP `tools/call` dispatch emits — but OpenAPI's `form`/`explode`
-> style leaves composite values undefined, so the generated document does not
-> spell that encoding out for a third-party client. OAS 3.x's `deepObject` style
-> expresses one object level (`filter[status]=open`) but not an array of
-> objects, and it re-introduces the parameter name that `form`/`explode`
-> correctly drops for an exploded query struct — so Autumn emits `form`
-> unconditionally rather than a style that is right for some fields and wrong
-> for others. Document the bracketed form for external consumers, or take
-> deeply structured input as a JSON body. MCP `tools/call` dispatch is not
-> affected: it renders the bracketed form directly.
+> decodes it: `form`/`explode` for a scalar or scalar-array field
+> (`?tags=a&tags=b`), `deepObject` for a nested-object field
+> (`?filter[status]=open`). Neither RFC 6570 nor OAS 3.x define a `style` for
+> an **array of objects** (`?items[0][sku]=A-1`) — that parameter carries no
+> `style` at all, only a `description` naming the bracketed encoding a client
+> must use. Document that encoding for external consumers, or take deeply
+> structured input as a JSON body instead. MCP `tools/call` dispatch is not
+> affected either way: it renders the bracketed form directly, independent of
+> what the OpenAPI document says.
+>
+> A `Query<T>` that does **not** derive `OpenApiSchema` still documents one
+> opaque `style: form, explode: true` parameter for the whole struct — accurate
+> only for scalar and scalar-array fields, same as before this per-field
+> breakdown existed. Add the derive to get per-field accuracy.
 
 > **The query parameter is always `required: false`.** That flag is emitted
 > unconditionally, whatever `T` looks like. If `T` has a non-`Option` field, a
@@ -221,10 +222,18 @@ async fn create(Json(body): Json<NewArticle>) -> (StatusCode, Json<Article>) { /
         "tags": ["articles"],
         "parameters": [
           {
-            "name": "ArticleQuery",
+            "name": "page",
             "in": "query",
             "required": false,
-            "schema": { "$ref": "#/components/schemas/ArticleQuery" },
+            "schema": { "oneOf": [{ "type": "integer" }, { "type": "null" }] },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
             "style": "form",
             "explode": true
           }
@@ -799,7 +808,7 @@ contract the OpenAPI operation is. See
 | `/openapi.json` 404s in production | `[openapi] enabled = false` in that profile, or `.openapi(...)` was never called |
 | `autumn build` wrote no `dist/openapi.json` | It printed `No static routes registered` and exited first — the export rides along with static generation ([§11](#11-exporting-the-spec)) |
 | `autumn openapi export` says there is no spec to export | The app was built without the `openapi` feature, or never called `.openapi(...)` — the message names which ([§11](#11-exporting-the-spec)) |
-| A query struct documents one opaque `object` parameter | Expected shape — `style: form, explode: true` means clients send its fields as individual keys |
+| A query struct documents one opaque `object` parameter instead of one per field | `Query<T>` does not derive `OpenApiSchema`, so its fields cannot be read — add the derive ([§2](#2-what-autumn-infers-from-a-handler)) |
 
 ---
 

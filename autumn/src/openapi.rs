@@ -705,18 +705,26 @@ pub struct Parameter {
     pub required: bool,
     /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
-    /// Serialization style. `"form"` with `explode: true` makes each object
-    /// property a separate query key — the accurate mapping for a `Query<T>`
-    /// whose fields are scalars or scalar arrays. A **nested** field decodes
-    /// from the bracketed form (`?filter[status]=open`) that
-    /// [`crate::query_string`] defines, which `form`/`explode` leaves
-    /// undefined; see the "Known gaps" note in `docs/guide/openapi.md`.
+    /// Serialization style. A `Query<T>` field gets one of two styles, or
+    /// none:
+    /// * `"form"` with `explode: true` — a scalar or scalar-array field
+    ///   (`?q=foo`, `?tags=a&tags=b`).
+    /// * `"deepObject"` with `explode: true` — a nested-object field
+    ///   (`?filter[status]=open`).
+    /// * `None` — an array-of-objects field (`?items[0][sku]=A-1`). No
+    ///   OpenAPI style expresses this; see [`Self::description`] and the
+    ///   "Known gaps" note in `docs/guide/openapi.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
     /// When `true` with `style: "form"`, each schema property becomes an
-    /// independent query parameter (e.g. `?q=foo&page=2`).
+    /// independent query parameter (e.g. `?q=foo&page=2`). `true` with
+    /// `style: "deepObject"` expands one object level (`?filter[status]=open`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explode: Option<bool>,
+    /// Free-text note for a shape no OpenAPI `style` can express (an
+    /// array-of-objects query field). Absent whenever `style` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[cfg(feature = "openapi")]
@@ -1337,28 +1345,15 @@ fn operation_for(
             schema: serde_json::json!({ "type": "string" }),
             style: None,
             explode: None,
+            description: None,
         })
         .collect();
 
-    // Query parameters from `Query<T>` extractor.
-    // Use `style: form, explode: true` so each field of the query struct
-    // is serialized as an independent query key (e.g. `?q=foo&page=2`).
-    // That is exact for scalar and scalar-array fields. A nested field
-    // (an object, or an array of objects) is decoded from the bracketed form
-    // `crate::query_string` defines — `?filter[status]=open` — which no OpenAPI
-    // style expresses in full (`deepObject` covers one object level but not an
-    // array of objects, and would also re-introduce the parameter name that
-    // `form`/`explode` correctly drops). Documented in docs/guide/openapi.md
-    // rather than misdescribed here (issue #1972).
+    // Query parameters from `Query<T>` extractor — one per struct field when
+    // the field shapes are known (issue #2251), else the old single
+    // struct-level parameter. See `query_parameters_for`.
     if let Some(query_entry) = &api_doc.query_schema {
-        parameters.push(Parameter {
-            name: query_entry.name.to_owned(),
-            location: "query".to_owned(),
-            required: false,
-            schema: schema_value_for(query_entry, index),
-            style: Some("form".to_owned()),
-            explode: Some(true),
-        });
+        parameters.extend(query_parameters_for(query_entry, index));
     }
 
     let request_body = api_doc.request_body.as_ref().map(|entry| RequestBody {
@@ -1463,6 +1458,164 @@ fn operation_for(
             .map(ToString::to_string)
             .collect(),
     }
+}
+
+/// Build the `Query<T>` parameters for one operation (issue #2251).
+///
+/// One [`Parameter`] per field of `T` when `T`'s shape is known (an
+/// `OpenApiSchema` back-fill match) — each field then gets the `style` that
+/// actually round-trips it through [`crate::query_string`]. Falls back to the
+/// old single struct-level parameter when `T`'s fields cannot be read (no
+/// churn for a `Query<T>` that never opted into `#[derive(OpenApiSchema)]`).
+#[cfg(feature = "openapi")]
+fn query_parameters_for(query_entry: &SchemaEntry, index: &SchemaComponentIndex) -> Vec<Parameter> {
+    if matches!(query_entry.kind, SchemaKind::Ref)
+        && let Some(body) = registered_derived_schema(query_entry.identity_key())
+        && let Some(fields) = query_parameters_from_body(&body, index)
+    {
+        return fields;
+    }
+    vec![Parameter {
+        name: query_entry.name.to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        schema: schema_value_for(query_entry, index),
+        style: Some("form".to_owned()),
+        explode: Some(true),
+        description: None,
+    }]
+}
+
+/// Split a query struct's own JSON Schema body into one [`Parameter`] per
+/// property. `None` when `body` is not a plain object schema with
+/// `properties` — the caller then keeps the old whole-struct parameter.
+#[cfg(feature = "openapi")]
+fn query_parameters_from_body(
+    body: &serde_json::Value,
+    index: &SchemaComponentIndex,
+) -> Option<Vec<Parameter>> {
+    let object = body.as_object()?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return None;
+    }
+    let properties = object.get("properties")?.as_object()?;
+    let required = object.get("required").and_then(serde_json::Value::as_array);
+    let is_required =
+        |name: &str| required.is_some_and(|r| r.iter().any(|v| v.as_str() == Some(name)));
+
+    Some(
+        properties
+            .iter()
+            .map(|(name, field_schema)| {
+                let (style, explode, description) = query_field_style(field_schema);
+                // Nested `$ref`s in a derived schema body carry the raw
+                // `type_name` identity (not yet the display key) until the
+                // finalize pass rewrites `components_map` — this parameter's
+                // schema is never part of that map, so rewrite it here.
+                let mut schema = field_schema.clone();
+                rewrite_identity_refs(&mut schema, index);
+                Parameter {
+                    name: name.clone(),
+                    location: "query".to_owned(),
+                    required: is_required(name),
+                    schema,
+                    style,
+                    explode,
+                    description,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// How one query field's shape decodes through [`crate::query_string`], and
+/// the `(style, explode, description)` that documents it.
+#[cfg(feature = "openapi")]
+fn query_field_style(schema: &serde_json::Value) -> (Option<String>, Option<bool>, Option<String>) {
+    match query_field_shape(schema) {
+        QueryFieldShape::Flat => (Some("form".to_owned()), Some(true), None),
+        QueryFieldShape::Object => (Some("deepObject".to_owned()), Some(true), None),
+        QueryFieldShape::ObjectArray => (
+            None,
+            None,
+            Some(
+                "Bracketed array-of-objects query encoding, e.g. \
+                 ?field[0][prop]=value. No OpenAPI style expresses this; see \
+                 the query-string guide."
+                    .to_owned(),
+            ),
+        ),
+    }
+}
+
+/// A query field's shape, as far as it changes how it decodes off the wire.
+#[cfg(feature = "openapi")]
+enum QueryFieldShape {
+    /// A scalar, or an array of scalars — `form`/`explode` is exact.
+    Flat,
+    /// A nested object — needs `deepObject`.
+    Object,
+    /// An array of objects — no OpenAPI `style` expresses this.
+    ObjectArray,
+}
+
+#[cfg(feature = "openapi")]
+fn query_field_shape(schema: &serde_json::Value) -> QueryFieldShape {
+    let effective = unwrap_nullable_schema(schema);
+    if let Some(identity) = ref_target(effective) {
+        return if ref_is_object(identity) {
+            QueryFieldShape::Object
+        } else {
+            QueryFieldShape::Flat
+        };
+    }
+    if effective.get("type").and_then(serde_json::Value::as_str) == Some("array")
+        && let Some(items) = effective.get("items")
+    {
+        let items = unwrap_nullable_schema(items);
+        let items_are_objects = ref_target(items).map_or_else(
+            || items.get("type").and_then(serde_json::Value::as_str) == Some("array"),
+            ref_is_object,
+        );
+        if items_are_objects {
+            return QueryFieldShape::ObjectArray;
+        }
+    }
+    QueryFieldShape::Flat
+}
+
+/// Unwrap a nullable `{"oneOf": [<real>, {"type": "null"}]}` wrapper — the
+/// shape `emit_json_schema_tokens_for_field` emits for every `Option<T>`
+/// field — down to `<real>`. Returns `schema` unchanged for anything else.
+#[cfg(feature = "openapi")]
+fn unwrap_nullable_schema(schema: &serde_json::Value) -> &serde_json::Value {
+    schema
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|branches| branches.first())
+        .unwrap_or(schema)
+}
+
+/// The raw `$ref` target identity, when `schema` is a bare reference.
+#[cfg(feature = "openapi")]
+fn ref_target(schema: &serde_json::Value) -> Option<&str> {
+    schema
+        .get("$ref")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+}
+
+/// Does the schema `identity` names describe a JSON object?
+///
+/// An identity with no registered schema defaults to `true`: the back-fill
+/// placeholder for an unregistered type is itself `{"type": "object", ...}`
+/// (see the back-fill loop in `generate_spec_at`), so an opaque `$ref` is
+/// assumed nested rather than silently mis-described as flat.
+#[cfg(feature = "openapi")]
+fn ref_is_object(identity: &str) -> bool {
+    registered_derived_schema(identity).is_none_or(|schema| {
+        schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
+    })
 }
 
 /// Render a [`SchemaEntry`] into its JSON Schema value.

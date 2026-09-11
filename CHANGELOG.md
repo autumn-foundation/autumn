@@ -352,6 +352,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **openapi:** a `Query<T>` with a nested field now documents an OpenAPI
+  parameter per field of `T` instead of one opaque `style: form, explode: true`
+  parameter for the whole struct (issue #2251). Each field gets the `style`
+  that actually matches how the `query_string` decoder reads it: `form`/
+  `explode` for a scalar or scalar-array field, `deepObject` for a
+  nested-object field (`?filter[status]=open`). An array-of-objects field
+  (`?items[0][sku]=A-1`) has no OpenAPI `style` to carry — that parameter now
+  names the bracketed encoding in its `description` instead of silently
+  mis-describing it. Applies only to a `Query<T>` whose `T` derives
+  `OpenApiSchema` (directly or via `#[model]`); an undecorated `T` keeps the
+  previous whole-struct parameter, so there is no spec churn for the common
+  case. MCP `tools/call` dispatch is unaffected — it already renders the
+  bracketed form directly.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of

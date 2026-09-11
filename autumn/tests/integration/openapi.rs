@@ -1200,3 +1200,169 @@ fn non_colliding_nested_ref_stays_short_with_no_churn() {
         "nested-only component carries its real fields: {nested_schema}"
     );
 }
+
+// ── Per-field query parameters for a nested `Query<T>` (issue #2251) ──
+//
+// `Query<T>` used to document ONE struct-level parameter with
+// `style: form, explode: true` — exact for a scalar or scalar-array field, but
+// undefined for a nested one (neither RFC 6570 nor OAS 3.x say what `form`
+// means for a composite value). A `Query<T>` whose fields are introspectable
+// (an `OpenApiSchema` back-fill match) now documents one parameter PER FIELD,
+// so each field gets the `style` that actually round-trips it through
+// `crate::query_string`'s bracketed decoder.
+
+mod query_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Filter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Item {
+        pub sku: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct SearchQuery {
+        pub q: Option<String>,
+        pub tags: Option<Vec<String>>,
+        pub filter: Option<Filter>,
+        pub items: Option<Vec<Item>>,
+    }
+}
+
+#[get("/api/nested-search")]
+async fn nested_search_route(_q: Query<query_shapes::SearchQuery>) -> &'static str {
+    "ok"
+}
+
+fn nested_search_spec() -> autumn_web::openapi::OpenApiSpec {
+    let route = __autumn_route_info_nested_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    autumn_web::openapi::generate_spec(&config, &[&route.api_doc])
+}
+
+fn nested_search_param<'a>(
+    spec: &'a autumn_web::openapi::OpenApiSpec,
+    name: &str,
+) -> &'a autumn_web::openapi::Parameter {
+    spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .expect("GET /api/nested-search")
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == name)
+        .unwrap_or_else(|| panic!("expected a query parameter named {name}"))
+}
+
+/// Unwrap a nullable `{"oneOf": [<real>, {"type": "null"}]}` wrapper.
+fn unwrap_nullable(schema: &serde_json::Value) -> &serde_json::Value {
+    schema.get("oneOf").map_or(schema, |branches| &branches[0])
+}
+
+#[test]
+fn one_query_parameter_per_field() {
+    let spec = nested_search_spec();
+    let params: Vec<&str> = spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .unwrap()
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(
+        params,
+        ["filter", "items", "q", "tags"],
+        "one parameter per struct field, not one for the whole struct"
+    );
+}
+
+#[test]
+fn scalar_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let q = nested_search_param(&spec, "q");
+    assert_eq!(q.style.as_deref(), Some("form"));
+    assert_eq!(q.explode, Some(true));
+    assert!(!q.required, "an Option<T> field is not required");
+}
+
+#[test]
+fn scalar_array_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let tags = nested_search_param(&spec, "tags");
+    assert_eq!(
+        tags.style.as_deref(),
+        Some("form"),
+        "a scalar-array field still round-trips via ?tags=a&tags=b"
+    );
+    assert_eq!(tags.explode, Some(true));
+}
+
+#[test]
+fn nested_object_query_field_uses_deep_object() {
+    let spec = nested_search_spec();
+    let filter = nested_search_param(&spec, "filter");
+    assert_eq!(
+        filter.style.as_deref(),
+        Some("deepObject"),
+        "an object field decodes from ?filter[status]=open, which deepObject describes"
+    );
+    assert_eq!(filter.explode, Some(true));
+    let inner = unwrap_nullable(&filter.schema);
+    let reference = inner["$ref"]
+        .as_str()
+        .expect("a nested object field schema is a $ref");
+    assert!(
+        !reference.contains("::"),
+        "the $ref must be the collision-resolved display key, not a raw type_name: {reference}"
+    );
+}
+
+#[test]
+fn array_of_objects_query_field_documents_the_gap_instead_of_a_style() {
+    let spec = nested_search_spec();
+    let items = nested_search_param(&spec, "items");
+    assert!(
+        items.style.is_none(),
+        "no OpenAPI style expresses an array of objects (issue #2251)"
+    );
+    assert!(items.explode.is_none());
+    let description = items
+        .description
+        .as_deref()
+        .expect("the gap must be documented on the parameter, not left silent");
+    assert!(
+        description.contains("[0]"),
+        "must name the bracketed encoding a client needs: {description}"
+    );
+}
+
+#[test]
+fn undescribable_query_struct_keeps_the_old_single_parameter() {
+    // `SearchParams` (defined above) derives no `OpenApiSchema`, so its fields
+    // cannot be introspected — the old whole-struct fallback must still apply
+    // (no spec churn for the common undecorated case).
+    let route = __autumn_route_info_search();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/search"].get.as_ref().unwrap();
+    let query_params: Vec<_> = op
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .collect();
+    assert_eq!(
+        query_params.len(),
+        1,
+        "an undescribable query struct still documents one struct-level parameter"
+    );
+    assert_eq!(query_params[0].name, "SearchParams");
+}
