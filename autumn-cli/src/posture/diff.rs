@@ -2301,11 +2301,13 @@ mod tests {
 
         let fingerprint = |head_prefix: &str| {
             let head = manifest_mtls(&routes, "optional", &[head_prefix], &entry);
-            diff(&base, &head)
+            let found = diff(&base, &head)
                 .into_iter()
-                .find(|f| f.kind == "mtls_required_path_removed")
-                .map(|f| f.fingerprint)
-                .unwrap_or_else(|| panic!("expected a removal finding for {head_prefix}"))
+                .find(|f| f.kind == "mtls_required_path_removed");
+            let Some(finding) = found else {
+                panic!("expected a removal finding for {head_prefix}");
+            };
+            finding.fingerprint
         };
 
         assert_ne!(

@@ -6734,6 +6734,19 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         .and_then(toml::Value::as_str)
         .filter(|p| !p.is_empty());
 
+    grade_client_auth_trust_store(mode, bundle, crl, required_path_count)
+}
+
+/// Read the CA bundle and any CRL, and grade what they hold.
+///
+/// Split out of [`resolve_client_auth_doctor_data`], which parses the TOML.
+/// This half does the file I/O.
+fn grade_client_auth_trust_store(
+    mode: String,
+    bundle: &str,
+    crl: Option<&str>,
+    required_path_count: usize,
+) -> ClientAuthDoctorData {
     #[cfg(feature = "tls")]
     {
         let now = i64::try_from(
@@ -6789,7 +6802,7 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
     }
     #[cfg(not(feature = "tls"))]
     {
-        let _ = (crl, required_path_count);
+        let _ = (mode, bundle, crl, required_path_count);
         ClientAuthDoctorData::FeatureDisabled
     }
 }
