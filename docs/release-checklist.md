@@ -24,14 +24,16 @@ SemVer contract.
 | `autumn-storage-s3` | `autumn-storage-s3/` | 6 | Depends on `autumn-web`. |
 | `autumn-cache-redis` | `autumn-cache-redis/` | 6 | Depends on `autumn-web`. |
 | `autumn-search` | `autumn-search/` | 6 | Depends on `autumn-web`. |
+| `autumn-billing` | `autumn-billing/` | 6 | Depends on `autumn-web`. |
 
 This table is the same set, in the same order, as `CRATES` in
 [`scripts/check-publish-dry-run.sh`](../scripts/check-publish-dry-run.sh) —
 that script is the executable copy, so keep the two in step. Note that two
 other gate scripts currently carry **narrower** lists —
 `scripts/check-crate-metadata.sh` omits `autumn-schema-core` and
-`autumn-media-plugin`, and `scripts/check-semver.sh` omits all three of
-`autumn-schema-core`, `autumn-edge` and `autumn-media-plugin`. Those crates are
+`autumn-media-plugin`, and `scripts/check-semver.sh` omits all four of
+`autumn-schema-core`, `autumn-edge`, `autumn-media-plugin` and `autumn-billing`
+(the last has no published baseline yet). Those crates are
 therefore published without a metadata or SemVer check today; widening both
 lists is worth doing, but it does not change the publish order above.
 
@@ -501,6 +503,7 @@ Before pushing the release tag:
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
+   cargo publish -p autumn-billing
    ```
 10. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):

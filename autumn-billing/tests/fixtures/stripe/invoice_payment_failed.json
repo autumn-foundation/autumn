@@ -1,0 +1,43 @@
+{
+  "id": "evt_test_inv_failed_1",
+  "object": "event",
+  "api_version": "2025-08-27.basil",
+  "created": 1788998400,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "invoice.payment_failed",
+  "data": {
+    "object": {
+      "id": "in_test_1",
+      "object": "invoice",
+      "amount_due": 1999,
+      "amount_paid": 0,
+      "amount_remaining": 1999,
+      "attempt_count": 1,
+      "attempted": true,
+      "billing_reason": "subscription_cycle",
+      "collection_method": "charge_automatically",
+      "created": 1788994800,
+      "currency": "usd",
+      "customer": "cus_test_1",
+      "customer_email": "buyer@example.com",
+      "livemode": false,
+      "metadata": {},
+      "next_payment_attempt": 1789257600,
+      "paid": false,
+      "parent": {
+        "quote_details": null,
+        "subscription_details": {
+          "metadata": {},
+          "subscription": "sub_test_1"
+        },
+        "type": "subscription_details"
+      },
+      "period_end": 1788998400,
+      "period_start": 1786406400,
+      "status": "open",
+      "total": 1999
+    }
+  }
+}
