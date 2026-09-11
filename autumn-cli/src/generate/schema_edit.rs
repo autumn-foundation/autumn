@@ -983,18 +983,31 @@ fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String
 /// `SQLite` has no fixed-precision numeric type and no regular expressions, so
 /// the constraint is spelled with string builtins over the stored text, which
 /// `db::sqlite_types::SqliteDecimal` always writes as a plain, normalized
-/// decimal literal. Four conditions, in order:
+/// decimal literal. Six conditions, in order:
 ///
 /// 1. only digits remain once the sign and the point are removed;
 /// 2. at most one decimal point;
 /// 3. a `-`, if present, is leading;
 /// 4. the fractional part is at most `scale` digits, and the integer part at
-///    most `precision - scale` digits once leading zeros are stripped.
+///    most `precision - scale` digits once leading zeros are stripped;
+/// 5. the spelling is canonical — what `Decimal::normalize` would produce
+///    (issue #2636): the integer part is a lone `0` or starts `1`-`9` (no
+///    `007.5`, no `0019`, no missing integer part as in `.5`), a fractional
+///    part never ends in `0` (`19.90`, `0.10` rejected) and a bare trailing
+///    `.` is rejected (`19.00` normalizes to `19`, not `19.0`);
+/// 6. no negative zero (`-0`): `Decimal::normalize` converts -0 to 0, so the
+///    wrapper never writes it (`-0.0` is already caught by (5)).
 ///
 /// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
 /// unlike Postgres, which rounds a value to `scale` — a loud failure beats
-/// silently storing what the schema says is out of range. `NULL` passes; the
-/// column's own `NOT NULL` decides that.
+/// silently storing what the schema says is out of range. (5)-(6) exist
+/// because SQLite compares `TEXT` byte for byte: without them, text written
+/// outside the wrapper (raw SQL, an import, a hand-written migration) passes
+/// the constraint while being a spelling the wrapper would never produce —
+/// and is then invisible to the equality lookups the generated `find_by_*`
+/// queries issue (`'19.90'` vs `'19.9'`), or admitted twice by a `:unique`
+/// index while Rust equality says they are the same value.
+/// `NULL` passes; the column's own `NOT NULL` decides that.
 fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
     // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
     let abs = format!("replace({column},'-','')");
@@ -1002,6 +1015,9 @@ fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
         format!("CASE WHEN instr({abs},'.') = 0 THEN 0 ELSE length({abs}) - instr({abs},'.') END");
     let int_part = format!(
         "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
+    );
+    let frac = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN '' ELSE substr({abs}, instr({abs},'.') + 1) END"
     );
     // The digits alone — sign and point removed. Condition 1 proves it is all
     // digits, so its length is the digit count.
@@ -1031,6 +1047,23 @@ fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
             "length(ltrim({int_part}, '0')) <= {}",
             precision.saturating_sub(scale)
         ),
+        // 8: canonical integer part — the wrapper writes what
+        // `Decimal::normalize` produces: a lone `0`, or digits starting
+        // `1`-`9`. Rejects leading zeros (`007.5`, `0019`) and a missing
+        // integer part (`.5`); `Decimal` never prints either spelling.
+        format!(
+            "length({int_part}) >= 1 AND ({int_part} = '0' OR substr({int_part}, 1, 1) BETWEEN '1' AND '9')"
+        ),
+        // 9: canonical fractional part — `Decimal::normalize` strips trailing
+        // zeros and drops the point entirely when nothing remains (`19.00`
+        // becomes `19`, not `19.0`). Rejects `19.90`, `0.10` and a bare
+        // trailing `.`.
+        format!(
+            "(instr({abs},'.') = 0 OR (length({frac}) >= 1 AND substr({frac}, length({frac}), 1) != '0'))"
+        ),
+        // 10: no negative zero — `Decimal::normalize` converts -0 to 0, so
+        // the wrapper never writes `-0` (`-0.0` is already caught by 9).
+        format!("(instr({column},'-') = 0 OR ltrim({digits},'0') != '')"),
     ];
     format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
 }
@@ -8154,6 +8187,34 @@ fn main() {
             "abc",
         ] {
             assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
+        }
+
+        // Canonicality (issue #2636): SQLite compares TEXT byte for byte, so
+        // a non-canonical spelling passes every shape check above yet is
+        // invisible to the equality lookups the generated `find_by_*` queries
+        // issue — and a `:unique` index would admit both spellings as
+        // distinct rows while Rust equality says they are one value. Only
+        // what `Decimal::normalize` would write may pass.
+        for value in [
+            // Trailing zero in the fractional part, or a bare trailing point.
+            "19.90", "0.10", "19.0", "0.0", "19.", "-19.90",
+            // Leading zeros in the integer part, or none at all.
+            "007.5", "0019", "00.5", ".5", "-.5",
+            // Negative zero: `Decimal::normalize` converts -0 to 0, so the
+            // wrapper never writes it.
+            "-0", "-0.0",
+        ] {
+            assert!(
+                !accepts(&mut conn, value),
+                "`{value}` is not what `Decimal::normalize` writes and must be rejected"
+            );
+        }
+        // The canonical spellings of those same values stay accepted.
+        for value in ["19.9", "0.1", "19", "7.5", "0", "0.5", "-0.5", "10", "100"] {
+            assert!(
+                accepts(&mut conn, value),
+                "`{value}` is canonical and must be accepted"
+            );
         }
 
         // Storage class, not just text shape. A BLOB whose BYTES spell a valid

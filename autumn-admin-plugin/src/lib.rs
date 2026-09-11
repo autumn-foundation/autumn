@@ -49,6 +49,7 @@ pub use traits::{
     AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry,
     AdminHistoryPage, AdminImportError, AdminImportReport, AdminImportRowResult, AdminModel,
     CsvImportMode, ListParams, ListResult, SelectOption, SortDirection,
+    dispatch_restore_purge_or_unhandled,
 };
 
 /// Common downstream imports for implementing admin models.
@@ -56,7 +57,7 @@ pub mod prelude {
     pub use crate::{
         AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry, AdminHistoryPage,
         AdminImportRowResult, AdminModel, CsvImportMode, ListParams, ListResult, SelectOption,
-        SortDirection,
+        SortDirection, dispatch_restore_purge_or_unhandled,
     };
 }
 

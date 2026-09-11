@@ -184,7 +184,7 @@ for the model and roadmap.
 
 This is the small-app shape Autumn is built around:
 
-```rust
+```rust,no_run
 use autumn_web::prelude::*;
 
 #[get("/")]

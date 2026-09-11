@@ -994,3 +994,399 @@ fn agent_authority_guide_matches_the_real_diagnostics() {
         );
     }
 }
+
+/// The "first run" journey's flagship code — README.md's `## Example` and the
+/// runtime-tuning snippets in `docs/guide/getting-started.md` — was never
+/// actually compiled by anything. `scripts/check-docs-macro-args.sh` names the
+/// gap directly: "the markdown fences are not compiled by anything at all."
+/// The docs corpus's other gates check that a fence's *names* resolve (a
+/// link, a CLI flag, a config key, an import path); none of them catch a
+/// signature that has drifted out from under a fence that still typechecks
+/// against nothing, the way `inject_consent_banner`'s `csrf_cookie_name`
+/// drifted from `&str` to `Option<&str>` underneath the CLI scaffold template
+/// (#2459, #2620) — a widened-parameter class of break a string-equality
+/// check can never see.
+///
+/// Some authors already reached for rustdoc's own "compiles, don't execute"
+/// convention by hand on these fences (`rust,no_run`) even though nothing
+/// here has ever enforced it — a `#[autumn_web::main]` snippet binds a real
+/// port and blocks forever, exactly what `no_run` exists to avoid running.
+/// That rules out `trybuild::TestCases::pass`, which this module uses
+/// everywhere else: a `pass` fixture is a real compiled binary that trybuild
+/// then *executes* to check its exit status, so pointing it at one of these
+/// snippets would compile clean and then hang the test suite on the running
+/// server, forever, on purpose.
+///
+/// Also unlike every other fixture in this file, not every `no_run` fence is
+/// a complete program: one (the CSRF form handler) is a bare `async fn`, the
+/// same "elide the surrounding main for brevity" shape rustdoc itself accepts
+/// because it wraps a mainless doctest in one automatically. Nothing here
+/// does that wrapping, so a fence containing `fn main` becomes its own
+/// `src/bin/*.rs` — the same binary-crate shape a reader actually pastes a
+/// complete example into — and every other fence is nested in its own `mod`
+/// of one shared `src/lib.rs`, where a bare function is legal without one.
+/// The split matters, not just the bookkeeping: a binary's `fn main` obeys
+/// real entry-point rules a library `mod` does not enforce — an `async fn
+/// main` with no `#[autumn_web::main]` is `E0752` at the crate root of a
+/// binary, but merely an ordinary (unremarkable, silently-compiling) async
+/// function nested in a module (Codex review, PR #2707, round 3). Treating
+/// every fence as a library item would have let that exact class of typo
+/// through the gate uncaught.
+///
+/// Extracts every `rust,no_run` fence from the two files this way and
+/// `cargo check`s the result — real compilation against the in-tree crate,
+/// with no linked binary ever run. A new `no_run` fence in either file is
+/// picked up automatically; nothing here needs updating when one is added,
+/// renamed, or removed — only a fence that drops the tag silently opts back
+/// out, which is the same trust the tag already carries for rustdoc itself.
+#[test]
+fn doc_getting_started_snippets_compile() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+
+    let mut fixtures = Vec::new();
+    for (doc, slug) in [
+        ("README.md", "readme"),
+        ("docs/guide/getting-started.md", "getting_started"),
+    ] {
+        let path = root.join(doc);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        for (start_line, body) in extract_rust_no_run_fences(&text) {
+            fixtures.push((format!("{slug}_l{start_line}"), body));
+        }
+    }
+
+    // A parser regression that silently matched nothing would make this test
+    // trivially green without compiling a single snippet. 5 is today's known
+    // count (README's one `## Example`, the CSRF form handler, and three
+    // runtime-tuning snippets, all in the guide) — the assertion only guards
+    // against the extractor going quietly blind, not against that count
+    // changing.
+    assert!(
+        fixtures.len() >= 5,
+        "expected at least 5 `rust,no_run` fences across README.md and \
+         docs/guide/getting-started.md, found {}. Either a fence lost its \
+         `no_run` tag or extract_rust_no_run_fences is broken.",
+        fixtures.len()
+    );
+
+    // A throwaway crate, checked once, under this checkout's own (gitignored)
+    // `target/` rather than the system-wide temp dir — two checkouts (or two
+    // users) sharing `/tmp` would otherwise race to write the same
+    // `Cargo.toml`/`src/lib.rs` and could compile one checkout's snippets
+    // against another's `autumn-web` path (Codex review, PR #2707). Suffixed
+    // with this process's PID so two invocations of the same checkout (an
+    // IDE test run overlapping a pre-push check) get separate directories
+    // too, rather than one's `RemoveDirOnDrop` deleting files the other is
+    // still using (Codex review, round 2). Its own `[workspace]` keeps it
+    // from being folded into this checkout's real workspace despite living
+    // under `target/`. Removed on the way out, pass or fail, so a later run
+    // never inherits a stale lockfile or build artifact from this one.
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/doc-snippet-check")
+        .join(std::process::id().to_string());
+    let _cleanup = RemoveDirOnDrop(scratch.clone());
+    let src_bin = scratch.join("src/bin");
+    std::fs::create_dir_all(&src_bin).expect("scratch crate directories");
+
+    // Dependencies mirror what `autumn new` actually writes
+    // (`autumn-cli/src/templates/Cargo.toml.tmpl`), not a guess at what a
+    // fence might need: a generated app has no *direct* `axum` dependency
+    // (Codex review, PR #2707) — one snippet used bare `axum::Router` and
+    // only compiled here because an earlier version of this scratch crate
+    // added `axum` itself, masking that the snippet would fail an
+    // undeclared-crate error in a real `autumn new` project. Fixed at the
+    // doc layer (that snippet now goes through the same
+    // `autumn_web::reexports::axum` a real user would have to) rather than
+    // by widening this manifest to match. `maud`'s `html!` macro expands to
+    // code that names the `maud` crate directly, so a generated app depends
+    // on it too, and a fence exercising it needs the same direct dependency
+    // here.
+    //
+    // A name-only check couldn't have caught the template changing a
+    // dependency's *version or features* — e.g. `maud` dropping the `axum`
+    // feature would still pass a `contains("maud")` check while a fence
+    // exercising that feature kept compiling here against a stale spec
+    // hand-typed below (Codex review, PR #2707, round 4). Extracting each
+    // dependency's exact declaration line and using it verbatim removes the
+    // hand-typed copy entirely, so there is nothing left to drift.
+    let template_manifest =
+        std::fs::read_to_string(root.join("autumn-cli/src/templates/Cargo.toml.tmpl"))
+            .expect("read autumn-cli/src/templates/Cargo.toml.tmpl");
+    let template_dep_line = |name: &str| -> String {
+        template_manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{name} =")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "autumn-cli/src/templates/Cargo.toml.tmpl has no `{name} = ...` \
+                     dependency line for doc_getting_started_snippets_compile to mirror \
+                     — update it to match what `autumn new` actually writes."
+                )
+            })
+            .trim()
+            .to_string()
+    };
+    let maud_dep = template_dep_line("maud");
+    let diesel_migrations_dep = template_dep_line("diesel_migrations");
+    // `autumn-web` itself is special-cased below to a local path dependency
+    // instead of the templated `{{autumn_version}}` placeholder (this test
+    // checks against the in-tree crate, not a published version) — the
+    // template's own line carries no features/extra detail beyond that
+    // placeholder, so a presence check is enough for it alone. Must still go
+    // through the same active-line test `template_dep_line` uses rather than
+    // a plain substring search: the template also carries a *commented*
+    // example (`# autumn-web = { ..., features = [...] }`) right above the
+    // real line, which a bare `.contains("autumn-web")` would match even if
+    // the real line were removed or commented out too (Codex review, PR
+    // #2707).
+    assert!(
+        template_manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with("autumn-web =")),
+        "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares an active `autumn-web` dependency"
+    );
+
+    let autumn_web_path = root.join("autumn");
+    std::fs::write(
+        scratch.join("Cargo.toml"),
+        format!(
+            "[package]\n\
+             name = \"autumn-doc-snippet-check\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\
+             publish = false\n\
+             \n\
+             [dependencies]\n\
+             autumn-web = {{ path = {autumn_web_path:?} }}\n\
+             {maud_dep}\n\
+             {diesel_migrations_dep}\n\
+             \n\
+             [workspace]\n"
+        ),
+    )
+    .expect("write scratch Cargo.toml");
+
+    // Fences containing `fn main` are complete programs — the same shape a
+    // reader pastes into `src/main.rs` — so each becomes its own binary
+    // target, where rustc enforces the real entry-point rules (`E0752` on an
+    // async `main` missing `#[autumn_web::main]`, etc.). Everything else is a
+    // bare-item fragment nested in its own `mod` of one shared `src/lib.rs`,
+    // where no `main` is required (Codex review, PR #2707, round 3).
+    // `declares_fn_main` tolerates whitespace between `main` and `(` (`fn
+    // main ()`, a line break) rather than requiring the literal `fn main(`
+    // spelling: a fence in that shape was falling through to the library
+    // path, where the exact defect this split exists to catch — a dropped
+    // `#[autumn_web::main]` on an async `main` — silently compiles instead
+    // of hitting the binary-only `E0752` (Codex review, round 6).
+    let mut lib_rs = String::from("#![allow(dead_code, unused_variables, unused_imports)]\n\n");
+    for (name, body) in &fixtures {
+        if declares_fn_main(body) {
+            std::fs::write(src_bin.join(format!("{name}.rs")), body)
+                .unwrap_or_else(|e| panic!("write scratch src/bin/{name}.rs: {e}"));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(lib_rs, "mod {name} {{\n{body}\n}}\n\n");
+        }
+    }
+    std::fs::write(scratch.join("src/lib.rs"), lib_rs).expect("write scratch src/lib.rs");
+
+    // Seed the scratch crate's lockfile from the real workspace's (Codex
+    // review, round 2): with no `Cargo.lock` of its own, `cargo check` has to
+    // resolve autumn-web's entire dependency graph from scratch, and without
+    // `--offline` that means an index/registry round trip for every
+    // transitive crate — reproduced hanging on an `aes-gcm` fetch — even
+    // though every one of those versions was already downloaded and built
+    // moments earlier compiling `autumn-web` itself for the outer test
+    // binary. Copying the workspace's lock in (not asserted immutable via
+    // `--locked`, since this crate's own root package has no entry in it)
+    // gives the resolver every version it needs already pinned; the only
+    // node left to add is this crate itself, which introduces no new
+    // external requirement, so `--offline` never has to leave the local
+    // cache.
+    std::fs::copy(root.join("Cargo.lock"), scratch.join("Cargo.lock"))
+        .expect("seed the scratch crate's Cargo.lock from the workspace's");
+
+    // Point at the real workspace's own target dir rather than a fresh one
+    // under `scratch` (Codex review, PR #2707, round 4): every dependency
+    // this crate needs was just compiled there for the outer test binary, at
+    // the same locked versions this crate's seeded lockfile now shares, so
+    // cargo reuses those artifacts instead of rebuilding the entire
+    // `autumn-web` dependency graph a second time — this repo's CI already
+    // runs close to its disk ceiling, and a silent full second build would
+    // cost real minutes on every run. `resolve_cargo_target_dir` asks cargo
+    // itself rather than assuming `root.join("target")`, since a
+    // `CARGO_TARGET_DIR` env var, a `.cargo/config.toml` `build.target-dir`,
+    // or the outer invocation's own `--target-dir` would each relocate it
+    // (Codex review, round 5). Left in place afterward (unlike `scratch`
+    // itself): it's cargo's own build output directory, already shared and
+    // already excluded from version control by definition.
+    // `--profile test`, not the default `dev` (Codex review, round 12): the
+    // workspace root overrides `[profile.test]`'s debug/incremental
+    // settings, and cargo's fingerprint bakes in the resolved profile, so a
+    // `dev` check can't reuse the `test`-profile artifacts already here.
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["check", "--offline", "--profile", "test", "--target-dir"])
+        .arg(resolve_cargo_target_dir())
+        .current_dir(&scratch)
+        .output()
+        .expect("failed to run cargo check on the extracted doc snippets");
+
+    assert!(
+        output.status.success(),
+        "one or more `rust,no_run` snippets in README.md / \
+         docs/guide/getting-started.md no longer compile against the in-tree \
+         autumn-web crate:\n\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Whether a fence's body declares a `main` function, tolerating whitespace
+/// (including a line break) between `main` and `(` — `fn main ()`, not just
+/// `fn main()` — since a plain `body.contains("fn main(")` fell through to
+/// the library path on that spelling, the same silent-miss this whole split
+/// exists to prevent (Codex review, PR #2707, round 6).
+fn declares_fn_main(body: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(offset) = body[search_from..].find("fn main") {
+        let after = search_from + offset + "fn main".len();
+        if body[after..].trim_start().starts_with('(') {
+            return true;
+        }
+        search_from = after;
+    }
+    false
+}
+
+/// Finds the workspace's actual build output directory the same way cargo
+/// itself already answered it for *this* process, rather than re-deriving it
+/// from a fresh `cargo metadata` call: a `CARGO_TARGET_DIR` env var and a
+/// `.cargo/config.toml` `build.target-dir` both propagate to a spawned
+/// subprocess and so are visible to `cargo metadata` too, but the outer
+/// invocation's own one-shot `--target-dir` CLI flag is not — it applies
+/// only to that single command, so a child `cargo metadata` run resolves the
+/// *default* location instead and reuse silently stops working for exactly
+/// the supported case round 5 meant to cover (Codex review, round 6, with a
+/// reproduction: a probed child process saw `CARGO_TARGET_DIR=None` and
+/// still reported the default). The one thing that cannot lie about where
+/// cargo actually put this build's artifacts is where it put *this test
+/// binary*: `target-dir/<profile>/deps/<this binary>`, three path
+/// components down from `current_exe()`, however that target-dir was
+/// chosen.
+///
+/// A `cargo test --target <triple>` build inserts one more directory —
+/// `target-dir/<triple>/<profile>/deps/<binary>` — so the same three-level
+/// walk lands one level short, at `target-dir/<triple>` instead of
+/// `target-dir` itself (Codex review, round 7; this repo's own CI never
+/// passes `--target` today, so it doesn't hit this, but the function's own
+/// doc comment claimed to handle "however that target-dir was chosen" and
+/// didn't). Rather than sniff a target triple out of a path component —
+/// nothing distinguishes one from a custom profile name by shape alone —
+/// this checks for `CACHEDIR.TAG`, which cargo unconditionally writes in the
+/// real target-dir root (a stable, documented marker other tools already
+/// rely on to know a directory is cache-like); its absence means the walk
+/// landed one level short, so go up once more. Deliberately doesn't try to
+/// detect or propagate the triple into the nested `cargo check` itself: this
+/// gate exists to prove a doc snippet compiles the way a reader's own
+/// machine would build it, which is a host-target question regardless of
+/// what target the outer test suite happens to be exercising elsewhere.
+fn resolve_cargo_target_dir() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("resolve the running test binary's own path");
+    let mut dir = exe
+        .ancestors()
+        .nth(3)
+        .unwrap_or_else(|| {
+            panic!(
+                "test binary path {} is not nested as target-dir/<profile>/deps/<binary>",
+                exe.display()
+            )
+        })
+        .to_path_buf();
+    if !dir.join("CACHEDIR.TAG").exists()
+        && let Some(parent) = dir.parent()
+    {
+        dir = parent.to_path_buf();
+    }
+    // A `--target <triple>` build inserts an extra `<target-dir>/<triple>/`
+    // level that also carries CACHEDIR.TAG (confirmed by probing `cargo
+    // build --target <host-triple>`, which stamped the marker in both
+    // `target/` and `target/<triple>/`) — so "parent also has CACHEDIR.TAG"
+    // can't tell that inserted level apart from a deliberately nested
+    // `--target-dir` (e.g. `--target-dir target/doc-tests`, itself sitting
+    // under a marked `target/`), which must NOT be climbed past. Resolve it
+    // by asking rustc for its own list of valid target triples: only an
+    // actual `--target` subdirectory can be named one.
+    //
+    // Known, accepted limitation: an operator could name a *custom*
+    // `--target-dir` (without ever passing `--target`) after a real triple,
+    // e.g. `--target-dir /cache/x86_64-unknown-linux-gnu`. That directory is
+    // then byte-for-byte indistinguishable on disk from cargo's own
+    // `--target x86_64-unknown-linux-gnu` insertion — same name, same
+    // CACHEDIR.TAG placement — so no purely filesystem-based check (this one
+    // included) can tell the two apart; only a build-time capture of the
+    // real `TARGET` env var via a build script could, at the cost of adding
+    // one to this whole library crate for a case no CI job here exercises.
+    // We resolve the ambiguity in cargo's favor, since a triple-named
+    // `--target` insertion is the far more common real-world source of it.
+    if let Some(name) = dir.file_name().and_then(std::ffi::OsStr::to_str)
+        && is_rustc_target_triple(name)
+        && let Some(parent) = dir.parent()
+    {
+        dir = parent.to_path_buf();
+    }
+    dir
+}
+
+/// Whether `name` is one of rustc's own recognized `--target` triples,
+/// distinguishing a `--target <triple>`-inserted artifact directory from an
+/// arbitrary user-chosen `--target-dir` path component of the same shape.
+fn is_rustc_target_triple(name: &str) -> bool {
+    let Ok(output) = std::process::Command::new("rustc")
+        .args(["--print", "target-list"])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == name)
+}
+
+/// Recursively removes the wrapped directory when dropped, pass or fail
+/// (including on an `assert!` panic) — used to keep `doc_getting_started_
+/// snippets_compile`'s scratch crate from surviving its own test run.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pulls the body of every ` ```rust,no_run ` fence out of a markdown
+/// document, paired with the 1-indexed source line its body starts on (used
+/// only to name the extracted fixture — a compile failure is reported against
+/// that copy, not the original file, so tracking it down still means
+/// `grep -n 'rust,no_run'` in the doc).
+fn extract_rust_no_run_fences(markdown: &str) -> Vec<(usize, String)> {
+    let mut fences = Vec::new();
+    let mut lines = markdown.lines().enumerate();
+    while let Some((i, line)) = lines.next() {
+        if line.trim() != "```rust,no_run" {
+            continue;
+        }
+        let start_line = i + 2;
+        let mut body = String::new();
+        for (_, body_line) in lines.by_ref() {
+            if body_line.trim() == "```" {
+                break;
+            }
+            body.push_str(body_line);
+            body.push('\n');
+        }
+        fences.push((start_line, body));
+    }
+    fences
+}
