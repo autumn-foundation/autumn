@@ -4494,6 +4494,11 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                // #2597: `#[decimal_shape(precision = .., scale = ..)]` is a
+                // marker the model macro reads to shape factory `.fake()`
+                // values; the field type carries no such information, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("decimal_shape")
         })
         .collect()
 }
@@ -5701,6 +5706,52 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
+/// Parse the declared `decimal{p,s}` shape from a field's
+/// `#[decimal_shape(precision = p, scale = s)]` attribute (issue #2597).
+///
+/// The attribute is emitted by the `autumn generate` model renderer for
+/// `decimal{p,s}` fields; the Rust type (`Decimal`/`SqliteDecimal`) carries
+/// no precision/scale, so the factory `.fake()` cannot do better without it.
+///
+/// Malformed spellings (unknown keys, missing or non-integer values) return
+/// `None`: the field then falls back to the untyped `fake::decimal()`,
+/// exactly as before this attribute existed. The macro's fake inference must
+/// never fail expansion on a best-effort hint, so silent fallback — not a
+/// compile error — is the correct failure mode here.
+fn field_decimal_shape(field: &Field) -> Option<(u32, u32)> {
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("decimal_shape"))
+    {
+        let mut precision = None;
+        let mut scale = None;
+        let parsed = attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("precision") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    precision = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else if meta.path.is_ident("scale") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    scale = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else {
+                    Err(meta
+                        .error("unsupported decimal_shape key (expected `precision` or `scale`)"))
+                }
+            })
+            .is_ok();
+        if !parsed {
+            continue;
+        }
+        if let (Some(p), Some(s)) = (precision, scale) {
+            return Some((p, s));
+        }
+    }
+    None
+}
+
 /// Infer the fake-data expression for a factory field when `.fake()` is active.
 ///
 /// Selection order (per issue #1343):
@@ -5715,24 +5766,38 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
 ///    `Uuid` → `uuid()`, …).
 /// 3. `Option<T>` wraps the inner expression in `Some(..)`.
 ///
+/// The `decimal_shape` parameter carries the declared `decimal{p,s}` from a
+/// `#[decimal_shape(precision = p, scale = s)]` field attribute (issue #2597),
+/// parsed by [`field_decimal_shape`]; a shaped `Decimal`/`SqliteDecimal`
+/// field draws from `fake::decimal_with(p, s)` so every value fits the column
+/// by construction. `None` keeps the untyped `fake::decimal()`.
+///
 /// Returns `None` when no sensible fake value can be produced — the caller then
 /// leaves the field at its `Default::default()` value. This function must NEVER
 /// emit an expression that fails to compile: when unsure, return `None`.
-fn fake_expr_for_field(ident: &syn::Ident, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_for_field(
+    ident: &syn::Ident,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let raw = ident.to_string();
     let name = raw.strip_prefix("r#").unwrap_or(&raw).to_ascii_lowercase();
 
     // Option<T>: fake the inner value, wrap in Some.
     if let Some(inner) = option_inner_type(ty) {
-        let inner_expr = fake_expr_core(&name, inner)?;
+        let inner_expr = fake_expr_core(&name, inner, decimal_shape)?;
         return Some(quote! { ::core::option::Option::Some(#inner_expr) });
     }
 
-    fake_expr_core(&name, ty)
+    fake_expr_core(&name, ty, decimal_shape)
 }
 
 /// Core inference over a non-`Option` target type. See [`fake_expr_for_field`].
-fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_core(
+    name: &str,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let last = ty_last_ident(ty)?;
     match last.as_str() {
         "String" => Some(fake_string_expr(name)),
@@ -5757,12 +5822,20 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
             Some(quote! { (::autumn_web::fake::decimal_f64() as #cast) })
         }
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
-        "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
+        // Issue #2597: a shaped decimal draws from `fake::decimal_with(p, s)`
+        // so factory values fit the declared `decimal{p,s}` by construction.
+        "Decimal" => Some(match decimal_shape {
+            Some((p, s)) => quote! { ::autumn_web::fake::decimal_with(#p, #s) },
+            None => quote! { ::autumn_web::fake::decimal() },
+        }),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
         // The SQLite newtypes (issue #1924) wrap exactly those values. Without
         // these arms every faked row falls back to `Default` — one shared nil
         // UUID, which collides on a `:unique` column the first time twice.
-        "SqliteDecimal" => Some(quote! { ::autumn_web::fake::decimal().into() }),
+        "SqliteDecimal" => Some(match decimal_shape {
+            Some((p, s)) => quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
+            None => quote! { ::autumn_web::fake::decimal().into() },
+        }),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
@@ -8800,7 +8873,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     expr
                 }
             };
-            fake_expr_for_field(ident, &f.ty).map_or_else(
+            fake_expr_for_field(ident, &f.ty, field_decimal_shape(f)).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
                 || {
@@ -10431,7 +10504,7 @@ mod tests {
         // Narrow types must clamp the range to their own maximum so the `as`
         // cast can't wrap (`1000 as u8 == 232`, `1000 as i8 == -24`).
         let expr = |ty: syn::Type| {
-            fake_expr_core("count", &ty)
+            fake_expr_core("count", &ty, None)
                 .expect("integer type should infer a fake expr")
                 .to_string()
         };
@@ -10468,6 +10541,123 @@ mod tests {
         assert!(
             u128_expr.contains("as u128"),
             "u128 must be matched: {u128_expr}"
+        );
+    }
+
+    // ── Fake decimal shape (#2597) ─────────────────────────────────────────
+    // A `#[decimal_shape(precision = p, scale = s)]` field attribute carries
+    // the generator's declared `decimal{p,s}` into `#[model]`, so the
+    // factory `.fake()` draws from `fake::decimal_with(p, s)` — values that
+    // fit the column by construction — instead of the untyped
+    // `fake::decimal()`.
+
+    #[test]
+    fn decimal_shape_attr_parses_precision_and_scale() {
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), Some((5, 2)));
+    }
+
+    #[test]
+    fn decimal_shape_attr_absent_yields_no_shape() {
+        let field: syn::Field = syn::parse_quote! {
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), None);
+    }
+
+    #[test]
+    fn decimal_shape_attr_malformed_falls_back_to_untyped() {
+        // The macro must never fail expansion on a best-effort hint: unknown
+        // keys, missing values, and non-integer values all fall back to the
+        // untyped `fake::decimal()`, exactly as before the attribute existed.
+        for tokens in [
+            quote! { #[decimal_shape(frobnicate = 1)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = 5)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = "five", scale = 2)] pub price: rust_decimal::Decimal },
+        ] {
+            let field: syn::Field = syn::parse_quote!(#tokens);
+            assert_eq!(
+                field_decimal_shape(&field),
+                None,
+                "malformed attribute must fall back: {tokens}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_shape_attr_stripped_from_user_attrs() {
+        // The marker must not leak onto the generated Diesel query struct —
+        // Diesel doesn't understand it.
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("decimal_shape")),
+            "`#[decimal_shape]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn shaped_decimal_fake_expr_uses_decimal_with() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(rust_decimal::Decimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 2)))
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("5u32"), "{shaped}");
+        assert!(shaped.contains("2u32"), "{shaped}");
+
+        let untyped = fake_expr_for_field(&ident, &ty, None)
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(!untyped.contains("decimal_with"), "{untyped}");
+        assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn shaped_sqlite_decimal_fake_expr_converts() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(autumn_web::db::sqlite_types::SqliteDecimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 0)))
+            .expect("SqliteDecimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("into ()"), "{shaped}");
+    }
+
+    #[test]
+    fn model_macro_emits_decimal_with_for_shaped_field() {
+        // End-to-end at the macro level: the generator's attribute flows
+        // through `#[model]` into the factory's `.fake()` binding.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Invoice {
+                    #[id]
+                    pub id: i64,
+                    #[decimal_shape(precision = 5, scale = 2)]
+                    pub amount: rust_decimal::Decimal,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("decimal_with"),
+            "shaped decimal field must draw from fake::decimal_with: {generated}"
+        );
+        // ...and the marker attribute itself must not leak onto the Diesel
+        // structs (`cannot find attribute decimal_shape in this scope`).
+        assert!(
+            !generated.contains("decimal_shape ("),
+            "the marker must be consumed, not re-emitted: {generated}"
         );
     }
 

@@ -233,4 +233,61 @@ mod fake_factory_tests {
             assert_eq!(r.email.matches('@').count(), 1);
         }
     }
+
+    // ── Decimal shape (issue #2597) ──────────────────────────────────
+
+    diesel::table! {
+        fake_invoices (id) {
+            id -> Int8,
+            amount -> Numeric,
+            quantity -> Numeric,
+        }
+    }
+
+    #[autumn_web::model(table = "fake_invoices")]
+    pub struct FakeInvoice {
+        #[id]
+        pub id: i64,
+        #[decimal_shape(precision = 5, scale = 2)]
+        pub amount: rust_decimal::Decimal,
+        #[decimal_shape(precision = 5, scale = 0)]
+        pub quantity: rust_decimal::Decimal,
+    }
+
+    #[test]
+    fn fake_decimal_respects_declared_shape() {
+        // The `#[decimal_shape]` attribute the generator emits must flow
+        // through `#[model]` into `fake::decimal_with(p, s)`: every faked
+        // value fits the declared `decimal{p,s}` by construction, instead of
+        // the untyped `fake::decimal()` that overflows narrow columns ~90%
+        // of the time. Seeded, so this cannot pass by luck.
+        let _guard = fake::test_serial_guard();
+        fake::reseed(2597);
+        for _ in 0..200 {
+            let inv = FakeInvoice::factory().fake().build();
+            // decimal{5,2}: at most 3 integer digits, at most 2 fractional.
+            assert!(
+                inv.amount < rust_decimal::Decimal::new(1000, 0),
+                "amount overflows decimal{{5,2}}: {}",
+                inv.amount
+            );
+            assert!(
+                inv.amount.scale() <= 2,
+                "amount exceeds scale 2: {}",
+                inv.amount
+            );
+            // decimal{5,0}: whole numbers only, at most 5 integer digits.
+            assert_eq!(
+                inv.quantity.scale(),
+                0,
+                "quantity must be whole: {}",
+                inv.quantity
+            );
+            assert!(
+                inv.quantity < rust_decimal::Decimal::new(100_000, 0),
+                "quantity overflows decimal{{5,0}}: {}",
+                inv.quantity
+            );
+        }
+    }
 }

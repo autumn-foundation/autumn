@@ -454,6 +454,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Factory `.fake()` respects declared `decimal{p,s}` (#2597):** `autumn
+  generate` now emits a `#[decimal_shape(precision = p, scale = s)]` field
+  attribute on `decimal{p,s}` model fields, and `#[model]` parses it to draw
+  factory values from the new `fake::decimal_with(p, s)` — at most `p - s`
+  integer digits and at most `s` fractional digits — instead of the untyped
+  `fake::decimal()`, which always draws scale 2 over `0.00..=9999.99` and
+  overflows any column with `p - s < 4` (about 90% of draws for
+  `decimal{5,2}`) and is rejected by the SQLite decimal `CHECK` for any
+  column with `s < 2`. The untyped `fake::decimal()` is unchanged for ad-hoc
+  use; the attribute is consumed by the macro and never reaches the Diesel
+  derives; malformed spellings fall back to the untyped draw rather than
+  failing expansion.
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
