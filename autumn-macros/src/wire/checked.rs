@@ -370,17 +370,17 @@ impl<'a> Analyzer<'a> {
     /// A `let`: the initializer is evaluated first, then the name it binds
     /// takes effect — so a rebinding cannot reach backwards.
     fn local(&mut self, local: &syn::Local) {
-        let mut bound = Bound::Other;
         if let Some(init) = &local.init {
             self.visit_expr(&init.expr);
             if let Some((_, diverge)) = &init.diverge {
                 self.visit_expr(diverge);
             }
-            bound = self
-                .bound_of(&init.expr)
-                .or_else(|| self.constructor_client(&init.expr).map(Bound::Client))
-                .unwrap_or(Bound::Other);
         }
+        let bound = local.init.as_ref().map_or(Bound::Other, |init| {
+            self.bound_of(&init.expr)
+                .or_else(|| self.constructor_client(&init.expr).map(Bound::Client))
+                .unwrap_or(Bound::Other)
+        });
         // `let Item { id, name, .. } = …` names the fields it reads.
         if let (Bound::Response(index), syn::Pat::Struct(pat)) = (bound, strip_pat_type(&local.pat))
         {
