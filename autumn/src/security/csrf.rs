@@ -579,71 +579,6 @@ fn validate_cookie_token_hmac(cookie_token: &str, settings: &CsrfSettings) -> bo
     keys.verify(uuid_part.as_bytes(), sig)
 }
 
-/// Return the byte position of the first occurrence of `needle` in `haystack`.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Scan a buffered `multipart/form-data` body for a named text field.
-///
-/// Returns the field value as a `&str` slice into `bytes`, or `None` when the
-/// field is absent or the body is malformed / truncated.  Callers pre-limit the
-/// buffer via `max_scan_bytes` so we never allocate more than that.
-fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -> Option<&'a str> {
-    let delimiter = format!("--{boundary}");
-    let delim = delimiter.as_bytes();
-    let end_marker = format!("\r\n{delimiter}");
-    let end_bytes = end_marker.as_bytes();
-    let mut pos = 0;
-
-    loop {
-        let rel = find_bytes(&bytes[pos..], delim)?;
-        pos += rel + delim.len();
-
-        // After the boundary: \r\n begins a part; anything else ends the multipart.
-        match bytes.get(pos..pos + 2) {
-            Some(b"\r\n") => pos += 2,
-            _ => break, // final boundary (--), truncated, or malformed
-        }
-
-        let header_end = find_bytes(&bytes[pos..], b"\r\n\r\n")?;
-        let headers = std::str::from_utf8(&bytes[pos..pos + header_end]).ok()?;
-        let value_start = pos + header_end + 4;
-
-        let is_match = headers.lines().any(|line| {
-            if !line
-                .to_ascii_lowercase()
-                .starts_with("content-disposition:")
-            {
-                return false;
-            }
-            line.split(';').skip(1).any(|attr| {
-                attr.trim()
-                    .strip_prefix("name=")
-                    .map(|v| v.trim_matches('"'))
-                    == Some(field_name)
-            })
-        });
-
-        if is_match {
-            let end = find_bytes(&bytes[value_start..], end_bytes)
-                .map_or(bytes.len(), |i| value_start + i);
-            return std::str::from_utf8(&bytes[value_start..end]).ok();
-        }
-
-        let next = find_bytes(&bytes[value_start..], end_bytes)?;
-        // Advance to the start of the boundary delimiter (skip only the leading
-        // \r\n of end_bytes so the next loop iteration finds --boundary at
-        // rel=0 and processes it normally).
-        pos = value_start + next + 2;
-    }
-
-    None
-}
-
 /// Verify the submitted token against `cookie_token`.
 ///
 /// `cookie_token` is already known HMAC-valid by the time it gets here:
@@ -766,7 +701,9 @@ async fn verify_csrf_token(
         }
     } else if let Some(ref boundary) = multipart_boundary {
         #[allow(clippy::collapsible_if)]
-        if let Some(value) = scan_multipart_field(&prefix, boundary, &settings.form_field) {
+        if let Some(value) =
+            super::multipart_scan::scan_multipart_field(&prefix, boundary, &settings.form_field)
+        {
             if let Some(c) = cookie_token
                 && !c.is_empty()
                 && !value.is_empty()
