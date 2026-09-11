@@ -393,32 +393,57 @@ without also filling in the intake form above.
   a different clock source than the one that stamped `expires_at` in the
   first place. `tokio::time::sleep` is `Instant`-backed and cannot fire
   early, so at least 1200ms of real host time elapses before the check —
-  comfortably over the 1000ms TTL if both clocks agree. The only way the
-  assertion sees `expired == false` is if Postgres's wall clock reads
-  behind the app host's by more than the ~200ms margin at check time —
-  plausible under a heavily contended runner (this sweep runs the full
-  Docker/testcontainer suite on one shared runner; the job itself took 37
-  minutes end to end) where a container's clock can lag real elapsed time
-  under host CPU/scheduling pressure. Compare to the sibling `sqlite`
-  block immediately above this test in the same file (lines 113-117):
-  that path checks Redis's own `EXISTS` after the same sleep/TTL shape,
-  same fixed-sleep-vs-TTL structure, but never crosses a second clock
-  source the way the Postgres path's `NOW()` comparison does — an
-  identically-shaped assertion 150 lines up is not itself evidence this
-  one is safe, but no organic hit has been observed on it, consistent
-  with the two-clock read being the differentiator.
-- **Test-vs-product**: not yet rendered. The store's actual lazy-expiry
-  behavior (a request-path read filtering on `expires_at > now`, e.g.
-  `autumn/src/job_tracking.rs:1899`) uses the *same* `self.clock.now()`
-  on both the write and the read side inside the application — it never
-  compares against Postgres's own `NOW()` in production code. That
-  comparison is a test-only artifact of how this test independently
-  verifies TTL persistence by querying Postgres directly rather than
-  through the store's own read path. If the mechanism above is confirmed,
-  this reads as a test defect (comparing two independently-advancing
-  clocks with an unbudgeted margin), not a product defect — but this is a
-  hypothesis from reading the source, not yet confirmed by a rerun
-  campaign, so treat the verdict as provisional per this role's own bar.
+  comfortably over the 1000ms TTL if both clocks agree and `expires_at`
+  is never rewritten after the initial enqueue. Originally read (see
+  correction immediately below) as requiring Postgres's wall clock to lag
+  the app host's by more than the ~200ms margin — plausible under a
+  heavily contended runner (this sweep runs the full Docker/testcontainer
+  suite on one shared runner; the job itself took 37 minutes end to end)
+  where a container's clock can lag real elapsed time under host
+  CPU/scheduling pressure.
+  **Correction (post-review, via a Codex review comment on PR #2711):**
+  "the only way" was wrong — a second, likely more probable mechanism
+  requires no clock skew at all. `run_job_handler_inner`
+  (`autumn/src/job.rs:2266-2286`) calls `store.mark_running(key)`
+  immediately once the enqueued no-op job is picked up by the running job
+  runtime this test starts, and on completion calls `ctx.settle_success()`
+  (`autumn/src/job.rs:2346`); both route through
+  `PgJobTrackingStore::update` (`autumn/src/job_tracking.rs:1927-1936`),
+  which unconditionally rewrites `expires_at` to *that write's own*
+  `now + ttl`. If either write lands roughly 200-1000ms after the test's
+  initial read — well within reach of ordinary worker dispatch latency,
+  no contention or clock disagreement required — `expires_at` is pushed
+  past the 1.2s check point on a single, consistent clock, and the row
+  legitimately has not expired yet. This is the same worker/update race
+  the reviewer notes the Redis sibling test (lines 113-117 immediately
+  above) also permits in principle, though no organic hit has been
+  observed there. Both mechanisms remain live candidates; neither is
+  confirmed, and they are not mutually exclusive. Compare to the sibling
+  `sqlite` block immediately above this test in the same file (lines
+  113-117): that path checks Redis's own `EXISTS` after the same
+  sleep/TTL shape and is exposed to the same worker/update race, but never
+  crosses a second clock source the way the Postgres path's `NOW()`
+  comparison does — so it isolates the clock-skew hypothesis (if that one
+  is real) but not the worker-refresh one.
+- **Test-vs-product**: not yet rendered, under either candidate mechanism.
+  The store's actual lazy-expiry behavior (a request-path read filtering
+  on `expires_at > now`, e.g. `autumn/src/job_tracking.rs:1899`) uses the
+  *same* `self.clock.now()` on both the write and the read side inside the
+  application — it never compares against Postgres's own `NOW()` in
+  production code, so the clock-skew hypothesis, if confirmed, is a
+  test-only artifact of how this test independently verifies TTL
+  persistence rather than a real product concern. Refreshing `expires_at`
+  on `mark_running`/`settle_success` (the worker-refresh hypothesis) is
+  deliberate, sensible production behavior in its own right — a job still
+  being worked on should not expire out from under it — so if that
+  mechanism is the one actually firing, the defect is squarely in the
+  test's assumption that a fixed 1200ms sleep leaves no room for the
+  tracked job's own worker to touch the record, not in the store. Either
+  way this reads as a test defect, not a product defect — but both are
+  hypotheses from reading the source, not yet confirmed by a rerun
+  campaign or an isolating experiment (e.g. asserting on `updated_at`
+  to see which write, if either, actually fired), so treat the verdict as
+  provisional per this role's own bar.
 - **Status**: n=1, not campaigned. Logged here for recognition per this
   role's standard for a first hit; escalate to a rerun campaign only if a
   repeat signature appears. Not quarantined — the Docker sweep is

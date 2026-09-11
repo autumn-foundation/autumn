@@ -55,6 +55,16 @@ success, **14 failure**. Triaged each by job/log inspection:
   the branch name and the failing test name both name the same feature
   (`api_token_error_response`), consistent with in-progress work whose new
   test doesn't pass yet. Not campaigned, not logged as a flake.
+- **1 is a second, distinct genuine WIP product bug, also not a CI health
+  issue**: run 34512432068 (`codex/plan-and-fix-model-registration-issue`)
+  fails `Test (windows-latest)` — not `Clippy` — at two `autumn-macros`
+  unit tests, `crate_path::tests::resolve_autumn_web_name_honors_cargo_rename`
+  and `crate_path::tests::resolve_autumn_web_name_default_when_unrenamed`,
+  each asserting `"autumn_web" == "web"` (or the reverse) and failing with
+  the two sides swapped — a crate-rename-resolution regression in the
+  branch's own in-progress change, not an environment-dependent flake.
+  (An earlier version of this report missed this run entirely, which is
+  why the tally below didn't reconcile — see the correction note.)
 - **1 new signature, logged in the ledger, not yet campaigned**: run
   34517281816 (`vesper/bugbash-2634-spez-normalize-fallback`, itself
   unrelated to job tracking) failed `Test (Docker)` — the bare `--ignored`
@@ -65,9 +75,18 @@ success, **14 failure**. Triaged each by job/log inspection:
   passed; 1 failed` — a single failure in an otherwise-clean 37-minute sweep.
   Full writeup and mechanism hypothesis in the ledger (new entry, this
   pass).
-- **1 is `Test suite`'s own aggregator reporting the `Test (Docker)` failure
-  above** — not a distinct failure, not double-counted (same run
-  34517281816).
+`Test suite`'s own aggregator on run 34517281816 reports failure too, for
+the same underlying `Test (Docker)` failure above — a second failed *job*
+in an already-counted run, not a 14th failed *run*, so it is not added to
+the tally separately.
+
+**Correction (post-review, via a Codex review comment on PR #2711): the
+first version of this bullet list only accounted for 13 of the 14 failed
+runs.** Reconciled: 10 Clippy + 1 `cargo-deny` + 1 `api_token_error_response`
++ 1 `crate_path` rename regression (added above) + 1 `job_tracking` = 14.
+The missing run was 34512432068, mischaracterized in the original pass as
+one of the "2 more" Clippy failures without actually checking its job log —
+it fails a `Test (windows-latest)` unit test, not `Clippy`. Fixed above.
 
 No hits this pass on `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
 the three signatures the ongoing macOS/coverage investigation is tracking.
@@ -88,17 +107,36 @@ compared instead of one, this reads as a textbook thin-margin timing
 dependency — the same anti-pattern class as the three `live_upgrade`
 mechanisms PR #2645 fixed (a fixed wait with no stated budget against
 contention), except here the missing budget is clock-skew tolerance rather
-than a retry-on-barrier. The production code path this test is meant to
-verify never makes this comparison — reads filter on the same
-`self.clock.now()` used to write, never against `NOW()` — so if confirmed
-this is a test defect, not a product defect. **This is a hypothesis, not a
-verdict**: n=1, no rerun evidence, and the "Postgres clock lagging under
-runner contention" half is asserted from plausibility (the sweep job ran
-37 minutes end to end, on a runner shared with every other Docker/
-testcontainer test in the crate) rather than measured directly. Recorded in
-the ledger rather than acted on, per this role's own bar — a fix here
-without a rerun-rate baseline would be exactly the "retry in disguise" the
-hard gate exists to block, even though no retry is actually being proposed.
+than a retry-on-barrier.
+
+**Correction (post-review, via a Codex review comment on PR #2711): a
+second, likely more probable mechanism requires no clock skew at all.**
+The test's own job runtime processes the enqueued no-op job during that
+1200ms window; `run_job_handler_inner` calls `store.mark_running(key)` on
+pickup and `ctx.settle_success()` on completion, and both route through
+`PgJobTrackingStore::update`, which unconditionally rewrites `expires_at`
+to *that write's own* `now + ttl`. If either write lands roughly
+200-1000ms after the test's initial read — ordinary worker dispatch
+latency, no contention required — `expires_at` is pushed past the 1.2s
+check point on one single, consistent clock. This mechanism and the
+clock-skew one are not mutually exclusive, and neither is confirmed; see
+the ledger entry for the full comparison, including why the sibling Redis
+test isolates one hypothesis but not the other.
+
+The production code path this test is meant to verify never makes the
+cross-clock comparison — reads filter on the same `self.clock.now()` used
+to write, never against `NOW()` — so under the clock-skew hypothesis this
+is a test defect, not a product defect. Refreshing `expires_at` on worker
+activity is deliberate production behavior in its own right, so under the
+worker-refresh hypothesis the defect is in the test's assumption that a
+fixed sleep leaves no room for the job's own worker to touch the record,
+not in the store — a test defect either way. **Both are hypotheses, not a
+verdict**: n=1, no rerun evidence, and neither has been isolated (e.g. by
+asserting on `updated_at` to see which write, if either, actually fired).
+Recorded in the ledger rather than acted on, per this role's own bar — a
+fix here without a rerun-rate baseline would be exactly the "retry in
+disguise" the hard gate exists to block, even though no retry is actually
+being proposed.
 
 **`live_upgrade`/`cache_stampede`/`sim_fault_plan`: unchanged.** Zero new
 organic hits this pass; the harness that would let any of these three close
@@ -132,7 +170,7 @@ diagnosis, not a rerun campaign of its own.
 
 | Test | Hits (this pass) | Cumulative organic hits | Status |
 |---|---|---|---|
-| `live_upgrade` (all three tracked signatures) | 0 | unchanged from 2026-09-10 | Verdict rendered for 2 of 3 signatures (PR #2645); CI-native verification still blocked on the undispatched harness |
+| `live_upgrade` (all three tracked signatures) | 0 | unchanged from 2026-09-10 | Verdict rendered for 1 of 3 signatures (the Linux "new build never served" hit, PR #2645's mechanism 2); the macOS connect-error cluster is attributed to the earlier #2510, and the third (`status: 0`) signature remains unattributed to any fix, per the ledger's own corrected attribution. CI-native verification still blocked on the undispatched harness |
 | `cache_stampede` (line 501) | 0 | 2 (2026-09-03, 2026-09-09) | Undiagnosed |
 | `sim_fault_plan` | 0 | 1 (2026-09-03) | Undiagnosed |
 | `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it` | 1 | 1 (new, 2026-09-10T19:54Z) | New; mechanism hypothesis recorded, not campaigned |
