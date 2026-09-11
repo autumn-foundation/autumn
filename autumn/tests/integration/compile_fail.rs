@@ -1084,10 +1084,34 @@ fn doc_getting_started_snippets_compile() {
     std::fs::create_dir_all(&src).expect("scratch crate directories");
 
     // Dependencies mirror what `autumn new` actually writes
-    // (`autumn-cli/src/templates/Cargo.toml.tmpl`) rather than only what
-    // `autumn-web` re-exports: `maud`'s `html!` macro expands to code that
-    // names the `maud` crate directly, so a generated app depends on it too,
-    // and a fence exercising it needs the same direct dependency here.
+    // (`autumn-cli/src/templates/Cargo.toml.tmpl`), not a guess at what a
+    // fence might need: a generated app has no *direct* `axum` dependency
+    // (Codex review, PR #2707) — one snippet used bare `axum::Router` and
+    // only compiled here because an earlier version of this scratch crate
+    // added `axum` itself, masking that the snippet would fail an
+    // undeclared-crate error in a real `autumn new` project. Fixed at the
+    // doc layer (that snippet now goes through the same
+    // `autumn_web::reexports::axum` a real user would have to) rather than
+    // by widening this manifest to match. `maud`'s `html!` macro expands to
+    // code that names the `maud` crate directly, so a generated app depends
+    // on it too, and a fence exercising it needs the same direct dependency
+    // here.
+    //
+    // A silent addition to the template's own dependency list wouldn't fail
+    // loud — it would just leave a fence free to use something the real
+    // scaffold doesn't have — so this asserts the mirror is still complete
+    // rather than only copying it once.
+    let template_manifest =
+        std::fs::read_to_string(root.join("autumn-cli/src/templates/Cargo.toml.tmpl"))
+            .expect("read autumn-cli/src/templates/Cargo.toml.tmpl");
+    for dep in ["autumn-web", "maud", "diesel_migrations"] {
+        assert!(
+            template_manifest.contains(dep),
+            "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares `{dep}` — \
+             update the mirrored dependency list in doc_getting_started_snippets_compile \
+             to match what `autumn new` actually writes."
+        );
+    }
 
     let autumn_web_path = root.join("autumn");
     std::fs::write(
@@ -1101,8 +1125,8 @@ fn doc_getting_started_snippets_compile() {
              \n\
              [dependencies]\n\
              autumn-web = {{ path = {autumn_web_path:?} }}\n\
-             axum = \"0.8\"\n\
              maud = {{ version = \"0.27\", features = [\"axum\"] }}\n\
+             diesel_migrations = \"2\"\n\
              \n\
              [workspace]\n"
         ),
