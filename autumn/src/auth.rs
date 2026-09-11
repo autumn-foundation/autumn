@@ -2559,6 +2559,11 @@ fn api_token_error_response<ResBody: From<String> + Default>(
     // which stays the wrapped error even when the error carries a field map.
     let message = err.message();
     let details = err.details().cloned();
+    // Redact server-error detail in the body itself: this is the response the
+    // client sees unless a downstream exception filter rebuilds it, and the
+    // raw message stays available to filters/logging via
+    // `AutumnErrorInfo.message`. A reclassified query timeout must read
+    // "Service unavailable", not leak the store's db message.
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
@@ -2566,7 +2571,7 @@ fn api_token_error_response<ResBody: From<String> + Default>(
         problem_type,
         request_id,
         instance,
-        true,
+        false,
     );
     let mut response = Response::builder()
         .status(status)
@@ -4861,7 +4866,10 @@ mod api_token_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], 503);
         assert_eq!(json["code"], "autumn.service_unavailable");
-        assert_eq!(json["detail"], "api token store unavailable");
+        // Server-error detail is redacted in the body (issue #2635): the
+        // store's message stays available to exception filters and logging
+        // via `AutumnErrorInfo.message`, never to the client.
+        assert_eq!(json["detail"], "Service unavailable");
     }
 
     #[tokio::test]

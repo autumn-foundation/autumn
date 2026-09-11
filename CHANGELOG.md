@@ -74,7 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation failure as `autumn.unprocessable_entity` with an empty `errors`
   array; both now agree with `AutumnError::code()` and the standard response,
   and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
-  exception filters (issue #2635).
+  exception filters. Server-error `detail` is redacted in the body (the
+  store's message remains in `AutumnErrorInfo.message` for logging and
+  filters), matching the production exception-filter render (issue #2635).
 
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
