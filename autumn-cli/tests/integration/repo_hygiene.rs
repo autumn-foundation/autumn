@@ -1029,6 +1029,163 @@ fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
     values
 }
 
+/// Feed one shell line through `\`-continuation joining: a line ending in `\`
+/// extends `pending`, anything else flushes the joined command.
+fn feed_command_line(line: &str, pending: &mut String, commands: &mut Vec<String>) {
+    let trimmed = line.trim_end();
+    if let Some(head) = trimmed.strip_suffix('\\') {
+        pending.push_str(head);
+        pending.push(' ');
+    } else {
+        pending.push_str(trimmed);
+        commands.push(std::mem::take(pending));
+    }
+}
+
+/// Every shell command a workflow actually runs, in order.
+///
+/// Only lines inside a `run:` scalar are commands. A line-at-a-time scan
+/// credits *any* YAML line, so step metadata like
+/// `- name: cargo test … --test <target>` satisfied the coverage guard while
+/// no job ran the target (issue #2574).
+///
+/// `run:`-block membership is tracked by indentation: a `run:` key — inline
+/// `run: <cmd>`, block `run: |` / `run: >` (chomping indicators included), a
+/// bare `run:` whose scalar follows on later lines, or the sequence-item
+/// form `- run: <cmd>` — opens a region covering the more-indented lines
+/// after it. The first non-blank line at or left of the key's indent closes
+/// it; blank lines never close a block. A dangling `\`-continuation is
+/// flushed when its block closes, mirroring the end-of-file behavior.
+fn workflow_commands(body: &str) -> Vec<String> {
+    /// If `line` (already trimmed) is a `run:` key, return the scalar tail:
+    /// `""` for a bare `run:`, `"|"`/`">"`/`"|-"`/… for a block header, or the
+    /// inline command. `None` for anything else (`name:`, `running:`, …).
+    fn run_key_tail(line: &str) -> Option<&str> {
+        // A step can also spell the key as a sequence item (`- run: …`).
+        let key = line.strip_prefix("- ").unwrap_or(line);
+        let tail = key.strip_prefix("run:")?;
+        // `run:` must be the whole key, followed by end-of-line or
+        // whitespace — not `running:` or `run-foo:`.
+        if tail.is_empty() || tail.starts_with([' ', '\t']) {
+            Some(tail.trim_start())
+        } else {
+            None
+        }
+    }
+
+    let mut commands = Vec::new();
+    let mut pending = String::new();
+    let mut run_indent: Option<usize> = None;
+    for line in strip_yaml_comments(body).lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if let Some(ri) = run_indent {
+            if !trimmed.is_empty() && indent <= ri {
+                if !pending.is_empty() {
+                    commands.push(std::mem::take(&mut pending));
+                }
+                run_indent = None;
+            }
+        }
+        if let Some(tail) = run_key_tail(trimmed) {
+            run_indent = Some(indent);
+            // An inline `run: <cmd>` tail is itself a command; a block
+            // indicator or a bare `run:` leaves the command to the lines
+            // that follow.
+            if !tail.is_empty() && !tail.starts_with('|') && !tail.starts_with('>') {
+                feed_command_line(tail, &mut pending, &mut commands);
+            }
+            continue;
+        }
+        if run_indent.is_none() {
+            continue;
+        }
+        feed_command_line(line, &mut pending, &mut commands);
+    }
+    if !pending.is_empty() {
+        commands.push(pending);
+    }
+    commands
+}
+
+#[test]
+fn workflow_commands_ignores_non_run_lines() {
+    // Issue #2574: a step whose `name:` (or any non-`run:` field) contains a
+    // full `cargo test --features sqlite --test <target>` string must NOT
+    // count as coverage for `<target>`.
+    let yaml = r#"
+jobs:
+  sqlite:
+    steps:
+      - name: cargo test -p autumn-web --features sqlite --test sqlite_decoy
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features sqlite \
+            --test sqlite_real
+      - name: next step
+        env:
+          CMD: cargo test --features sqlite --test sqlite_env_decoy
+      - run: cargo test -p autumn-web --features sqlite --test sqlite_inline
+"#;
+    let commands = workflow_commands(yaml);
+    let is_credited = |target: &str| {
+        commands.iter().any(|command| {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && flag_values(&tokens, "--features")
+                    .iter()
+                    .any(|v| v.split(',').any(|f| f.trim() == "sqlite"))
+                && flag_values(&tokens, "--test").contains(&target)
+        })
+    };
+
+    assert!(
+        !is_credited("sqlite_decoy"),
+        "a `name:` line naming a target must not credit it; got {commands:?}",
+    );
+    assert!(
+        !is_credited("sqlite_env_decoy"),
+        "an `env:` value naming a target must not credit it; got {commands:?}",
+    );
+    assert!(
+        is_credited("sqlite_real"),
+        "a `run: |` block invocation (with `\\`-continuation) must credit its target; got {commands:?}",
+    );
+    assert!(
+        is_credited("sqlite_inline"),
+        "an inline `run:` / `- run:` invocation must credit its target; got {commands:?}",
+    );
+    // The `\`-continued invocation is one joined command, not two fragments.
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains("--features sqlite") && c.contains("--test sqlite_real")),
+        "expected one joined command for the continued invocation; got {commands:?}",
+    );
+}
+
+#[test]
+fn workflow_commands_ignores_commented_invocations() {
+    let yaml = r#"
+    steps:
+      - name: sqlite suite
+        # run: cargo test -p autumn-web --features sqlite --test sqlite_commented
+        run: |
+          cargo test -p autumn-web --features sqlite --test sqlite_live
+"#;
+    let commands = workflow_commands(yaml);
+    let text = commands.join("\n");
+    assert!(
+        !text.contains("sqlite_commented"),
+        "a commented-out invocation must not become a command; got {commands:?}",
+    );
+    assert!(
+        text.contains("--test sqlite_live"),
+        "the live invocation must survive; got {commands:?}",
+    );
+}
+
 /// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
 /// in a CI workflow (issue #1908).
 ///
@@ -1053,10 +1210,11 @@ fn sqlite_test_targets_are_ci_named() {
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
-    // Collect the cargo commands every workflow actually runs. `strip_yaml_comments`
-    // drops commented-out invocations and prose mentions; joining `\`-continued
-    // lines keeps one wrapped command as one command, so a target is credited only
-    // to the invocation that names it.
+    // Collect the cargo commands every workflow actually runs. `workflow_commands`
+    // keeps only lines inside a `run:` scalar (issue #2574) — `strip_yaml_comments`
+    // drops commented-out invocations and prose mentions, and joining
+    // `\`-continued lines keeps one wrapped command as one command, so a target
+    // is credited only to the invocation that names it.
     let workflows_dir = root.join(".github/workflows");
     let mut commands: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&workflows_dir)
@@ -1066,20 +1224,7 @@ fn sqlite_test_targets_are_ci_named() {
         let Ok(body) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let mut pending = String::new();
-        for line in strip_yaml_comments(&body).lines() {
-            let trimmed = line.trim_end();
-            if let Some(head) = trimmed.strip_suffix('\\') {
-                pending.push_str(head);
-                pending.push(' ');
-            } else {
-                pending.push_str(trimmed);
-                commands.push(std::mem::take(&mut pending));
-            }
-        }
-        if !pending.is_empty() {
-            commands.push(pending);
-        }
+        commands.extend(workflow_commands(&body));
     }
 
     // A command covers a target only when it BOTH enables the `sqlite` feature and
