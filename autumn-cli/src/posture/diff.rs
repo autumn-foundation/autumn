@@ -1709,6 +1709,7 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
 /// one deletion.
 fn diff_mtls(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
     diff_mtls_mode(base, head, out);
+    diff_mtls_required_paths(base, head, out);
 
     let before = mtls_index(base);
     let after = mtls_index(head);
@@ -1760,6 +1761,100 @@ fn diff_mtls(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             detail: "this route now requires a verified client certificate".to_owned(),
         });
     }
+}
+
+/// Compare the configured `required_paths` themselves, not just the per-route
+/// rows they produce.
+///
+/// The rows answer whether a route TEMPLATE matches a prefix; the runtime
+/// answers it of the concrete request path. A prefix that protects only part of
+/// a parameterized route — `/users/admin` against a route mounted at
+/// `/users/{id}` — therefore flags no row in either manifest, so dropping it
+/// moves nothing the per-route pass can see while the live listener stops
+/// protecting `/users/admin`. The `csrf` dimension carries `exempt_paths` for
+/// exactly this reason; this is the same rule in the opposite direction.
+///
+/// Coverage, not spelling: replacing `/internal` with `/internal/keys` still
+/// requires a certificate for everything the narrower prefix names, so only the
+/// coverage the narrower set LOSES is reported.
+fn diff_mtls_required_paths(
+    base: &PostureManifest,
+    head: &PostureManifest,
+    out: &mut Vec<Finding>,
+) {
+    // A listener that stopped requesting certificates has already been reported
+    // by `diff_mtls_mode` in the strongest terms available; enumerating the
+    // prefixes it also stopped honouring would add a row without adding
+    // information.
+    if !base.dimensions.mtls.requests_certificate() {
+        return;
+    }
+    let head_requests = head.dimensions.mtls.requests_certificate();
+    let before: BTreeSet<&String> = base.dimensions.mtls.required_paths.iter().collect();
+    let after: BTreeSet<&String> = head.dimensions.mtls.required_paths.iter().collect();
+
+    // Dropped when the head no longer requests certificates at all (every
+    // prefix is then uncovered), or when no remaining prefix covers it.
+    let dropped: Vec<String> = before
+        .iter()
+        .filter(|p| !head_requests || !after.iter().any(|new| covers_prefix(new, p)))
+        .map(|p| (*p).clone())
+        .collect();
+    let added: Vec<String> = after
+        .iter()
+        .filter(|p| !before.iter().any(|old| covers_prefix(old, p)))
+        .map(|p| (*p).clone())
+        .collect();
+
+    if !dropped.is_empty() {
+        out.push(Finding {
+            kind: "mtls_required_path_removed",
+            severity: Severity::Widening,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: dropped.join(", "),
+            after: "not required".to_owned(),
+            fingerprint: format!(
+                "mtls-required-path-removed:{}",
+                escape_list(&[escape_list(&dropped), escape_list(&added)])
+            ),
+            detail: format!(
+                "a verified client certificate is no longer required for {}, which the \
+                 per-route rows cannot show: the audit matches a prefix against a route \
+                 template, the runtime against the request path",
+                dropped.join(", ")
+            ),
+        });
+    }
+    if !added.is_empty() {
+        out.push(Finding {
+            kind: "mtls_required_path_added",
+            severity: Severity::Narrowing,
+            method: "*".to_owned(),
+            path: "*".to_owned(),
+            before: "not required".to_owned(),
+            after: added.join(", "),
+            fingerprint: format!("mtls-required-path-added:{}", escape_list(&added)),
+            detail: format!(
+                "a verified client certificate is now required for {}",
+                added.join(", ")
+            ),
+        });
+    }
+}
+
+/// Whether requirement prefix `outer` covers everything `inner` does.
+///
+/// The runtime's rule (`client_auth::path_matches_any`): a trailing slash is
+/// stripped before matching, and the boundary must be a segment break — so
+/// `/internal` covers `/internal/keys` but not `/internal-tools`.
+fn covers_prefix(outer: &str, inner: &str) -> bool {
+    let outer = outer.strip_suffix('/').unwrap_or(outer);
+    let inner = inner.strip_suffix('/').unwrap_or(inner);
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|r| r.starts_with('/'))
 }
 
 /// Compare the listener-wide mTLS mode.
@@ -2057,11 +2152,18 @@ mod tests {
             &mtls_entry("/internal/keys", "GET", false),
         );
 
-        let finding = only(diff(&base, &head));
-        assert_eq!(finding.kind, "mtls_requirement_removed");
+        // Two findings, deliberately: the route row that lost its requirement,
+        // and the configured prefix that stopped being honoured. They catch
+        // different regressions — see `diff_mtls_required_paths`.
+        let findings = diff(&base, &head);
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "mtls_requirement_removed")
+            .unwrap_or_else(|| panic!("expected a per-route finding: {findings:#?}"));
         assert_eq!(finding.severity, Severity::Widening);
         assert_eq!(finding.path, "/internal/keys");
         assert_eq!(finding.method, "GET");
+        assert!(kinds(&findings).contains(&"mtls_required_path_removed"));
     }
 
     #[test]
@@ -2080,9 +2182,13 @@ mod tests {
             &mtls_entry("/internal/keys", "GET", true),
         );
 
-        let finding = only(diff(&base, &head));
-        assert_eq!(finding.kind, "mtls_requirement_added");
+        let findings = diff(&base, &head);
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "mtls_requirement_added")
+            .unwrap_or_else(|| panic!("expected a per-route finding: {findings:#?}"));
         assert_eq!(finding.severity, Severity::Narrowing);
+        assert!(kinds(&findings).contains(&"mtls_required_path_added"));
     }
 
     #[test]
@@ -2124,6 +2230,77 @@ mod tests {
         assert!(
             !kinds(&diff(&base, &head)).contains(&"mtls_requirement_removed"),
             "a removed route must not raise a second, mTLS-shaped finding"
+        );
+    }
+
+    /// The per-route rows answer whether a route TEMPLATE matches a prefix; the
+    /// runtime answers it of the request path. A prefix protecting part of a
+    /// parameterized route flags no row in either manifest, so only comparing
+    /// the configured prefixes catches it being dropped.
+    #[test]
+    fn dropping_a_required_prefix_that_matches_no_route_template_is_a_widening() {
+        let routes = route("/users/{id}", "GET", "gated", &[], &[], false);
+        let entry = mtls_entry("/users/{id}", "GET", false);
+        let base = manifest_mtls(&routes, "optional", &["/users/admin"], &entry);
+        let head = manifest_mtls(&routes, "optional", &[], &entry);
+
+        let finding = only(diff(&base, &head));
+        assert_eq!(finding.kind, "mtls_required_path_removed");
+        assert_eq!(finding.severity, Severity::Widening);
+        assert!(finding.before.contains("/users/admin"), "{finding:?}");
+    }
+
+    #[test]
+    fn narrowing_a_required_prefix_reports_only_the_coverage_lost() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        // `/internal/keys` still requires a certificate, so replacing
+        // `/internal/keys` with the WIDER `/internal` loses nothing.
+        let widened = diff(
+            &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+        );
+        assert!(
+            !kinds(&widened).contains(&"mtls_required_path_removed"),
+            "widening a prefix loses no coverage: {widened:#?}"
+        );
+
+        // The reverse DOES lose coverage: everything under `/internal` that is
+        // not under `/internal/keys` stops requiring one.
+        let narrowed = diff(
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
+        );
+        assert!(kinds(&narrowed).contains(&"mtls_required_path_removed"));
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_a_prefix_change() {
+        // The runtime strips it before matching, so the two spellings cover the
+        // same URLs and must not raise a finding either way.
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "optional", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &["/internal/"], &entry),
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn turning_the_listener_off_does_not_double_report_every_prefix() {
+        // `mtls_mode_weakened` already says it in the strongest terms.
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "required", &["/internal"], &entry),
+            &manifest_mtls(&routes, "off", &[], &entry),
+        );
+        let kinds = kinds(&findings);
+        assert!(kinds.contains(&"mtls_mode_weakened"), "{findings:#?}");
+        assert!(
+            kinds.contains(&"mtls_required_path_removed"),
+            "the prefixes it stopped honouring are still named: {findings:#?}"
         );
     }
 

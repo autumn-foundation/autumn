@@ -6666,11 +6666,25 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         return ClientAuthDoctorData::NotConfigured;
     };
 
-    let mode = section
-        .get("mode")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("off")
-        .to_owned();
+    // An absent `mode` defaults to `off`, exactly as serde does. A PRESENT one
+    // that is not a supported string is a config the runtime refuses to
+    // deserialize, so doctor must Fail rather than fall back to `off` and bless
+    // an app that cannot start — `mode = 1` and `mode = "requred"` both land
+    // here.
+    let mode = match section.get("mode") {
+        None => "off".to_owned(),
+        Some(value) => match value.as_str() {
+            Some(m @ ("off" | "optional" | "required")) => m.to_owned(),
+            _ => {
+                return ClientAuthDoctorData::Invalid {
+                    detail: format!(
+                        "[server.tls.client_auth] mode must be one of \"off\", \"optional\" or \
+                         \"required\"; found {value}"
+                    ),
+                };
+            }
+        },
+    };
     if mode == "off" {
         return ClientAuthDoctorData::ModeOff;
     }
@@ -12161,6 +12175,49 @@ pub struct Vault {
         let r = check_client_auth_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn client_auth_fails_on_an_unsupported_mode() {
+        // `ClientAuthMode` deserialization refuses these, so the app cannot
+        // start; falling back to `off` would let `--strict` bless it.
+        for bad in [
+            toml::Value::Integer(1),
+            toml::Value::String("requred".to_owned()),
+            toml::Value::Boolean(true),
+        ] {
+            let mut section = toml::Table::new();
+            section.insert("mode".to_owned(), bad.clone());
+            section.insert(
+                "ca_bundle_path".to_owned(),
+                toml::Value::String("ca.pem".to_owned()),
+            );
+            let mut tls = toml::Table::new();
+            tls.insert("client_auth".to_owned(), toml::Value::Table(section));
+
+            let data = resolve_client_auth_doctor_data(Some(&tls));
+            assert!(
+                matches!(data, ClientAuthDoctorData::Invalid { .. }),
+                "mode = {bad} should be graded invalid, got {data:?}"
+            );
+            assert!(matches!(
+                check_client_auth_impl(&data).status,
+                CheckStatus::Fail
+            ));
+        }
+    }
+
+    #[test]
+    fn client_auth_reads_an_absent_mode_as_off() {
+        let mut tls = toml::Table::new();
+        tls.insert(
+            "client_auth".to_owned(),
+            toml::Value::Table(toml::Table::new()),
+        );
+        assert!(matches!(
+            resolve_client_auth_doctor_data(Some(&tls)),
+            ClientAuthDoctorData::ModeOff
+        ));
     }
 
     // ── check_tls_impl (issue #1603) ─────────────────────────────────────────

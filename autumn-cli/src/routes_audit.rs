@@ -595,6 +595,29 @@ fn empty_mtls_dimension() -> MtlsDimension {
 /// Where the `mtls` dimension is read from.
 const MTLS_DIMENSION_SOURCE: &str = "config:server.tls.client_auth";
 
+/// Whether `path` falls under one of the configured mTLS `required_paths`.
+///
+/// Mirrors the RUNTIME matcher
+/// (`autumn_web::tls::client_auth::path_matches_any`), which deliberately
+/// differs from the CSRF exemption rule this file's `path_is_exempt`
+/// implements: a requirement prefix written with a trailing slash ALSO covers
+/// the bare path, so `/internal/` covers a route mounted at exactly
+/// `/internal`. Reusing `path_is_exempt` here made the manifest report
+/// `mtls_required: false` for a route the live listener protects — an audit
+/// that disagrees with the listener is worse than no audit.
+fn path_requires_mtls(path: &str, required_paths: &[String]) -> bool {
+    required_paths.iter().any(|prefix| {
+        let bare = prefix.strip_suffix('/').unwrap_or(prefix);
+        if path == bare {
+            true
+        } else if let Some(rest) = path.strip_prefix(bare) {
+            rest.starts_with('/')
+        } else {
+            false
+        }
+    })
+}
+
 /// Build the `mtls` dimension (declared): one entry per route, flagged when the
 /// listener requests certificates AND the route matches a `required_paths`
 /// prefix.
@@ -615,7 +638,7 @@ fn build_mtls_dimension(routes: &[AuditRoute], client_auth: &ClientAuthDump) -> 
         .map(|r| MtlsEntry {
             path: r.path.clone(),
             method: r.method.clone(),
-            mtls_required: listener_requests && path_is_exempt(&r.path, &required_paths),
+            mtls_required: listener_requests && path_requires_mtls(&r.path, &required_paths),
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
@@ -1271,6 +1294,30 @@ mod tests {
             json["dimensions"]["mtls"]["entries"][0]["mtls_required"],
             false
         );
+    }
+
+    #[test]
+    fn a_trailing_slash_prefix_covers_the_bare_route_like_the_runtime() {
+        // The runtime's `path_matches_any` strips the trailing slash before
+        // matching; reusing the CSRF exemption rule here reported
+        // `mtls_required: false` for a route the live listener protects.
+        let routes = vec![
+            route("GET", "/internal", "index", "gated"),
+            route("GET", "/internal/keys", "keys", "gated"),
+            route("GET", "/internal-tools", "tools", "public"),
+        ];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("optional", &["/internal/"])),
+        ));
+        let required: Vec<&str> = json["dimensions"]["mtls"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|e| e["mtls_required"] == true)
+            .map(|e| e["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(required, vec!["/internal", "/internal/keys"]);
     }
 
     #[test]
