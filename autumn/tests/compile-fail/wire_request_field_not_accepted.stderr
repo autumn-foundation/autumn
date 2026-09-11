@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: wire contract broken in `create` at `create_item(…)`: sets request field `price_cents` on endpoint `create_item`, which does not accept it
+  --> tests/compile-fail/wire_request_field_not_accepted.rs:34:10
+   |
+34 |         .create_item(NewItem {
+   |          ^^^^^^^^^^^ evaluation of `create::{closure#0}::_` failed here

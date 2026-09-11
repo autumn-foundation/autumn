@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: wire contract broken in `create` at `create_item(…)`: builds the request for endpoint `create_item` with a `..rest` initializer that supplies only [name], and the endpoint requires a field outside that set
+  --> tests/compile-fail/wire_missing_required_request_field.rs:33:10
+   |
+33 |         .create_item(NewItem {
+   |          ^^^^^^^^^^^ evaluation of `create::{closure#0}::_` failed here

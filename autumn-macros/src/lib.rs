@@ -80,6 +80,7 @@ mod step_up;
 mod story_macro;
 mod tasks_macro;
 mod throttle;
+mod wire;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -1599,6 +1600,119 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let _guard = crate_path::set_target(crate_override.as_deref());
     crate_path::finalize(service::service_macro(attr, item.into())).into()
+}
+
+/// Mark a typed handler as a service endpoint (issue #1755).
+///
+/// Emits a marker type — `<name>_endpoint` — implementing
+/// `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire
+/// descriptor as a build artifact. The handler itself is untouched.
+///
+/// Everything comes from the handler's own signature and the route attribute
+/// below it: the `Json<T>` parameter is the request shape, the `Json<T>` in the
+/// return type is the response shape, and the route attribute supplies the
+/// method and path.
+///
+/// # Placement
+///
+/// `#[endpoint]` must sit **above** the route attribute. A route attribute
+/// placed outermost expands first and rewrites the signature, leaving nothing
+/// to read.
+///
+/// ```rust,ignore
+/// #[endpoint(service = "catalog")]
+/// #[get("/items/{id}")]
+/// async fn get_item(id: Path<String>) -> AutumnResult<Json<Item>> { … }
+/// ```
+///
+/// # Arguments
+///
+/// | Argument | Required | Description |
+/// |---|---|---|
+/// | `service` | yes | The service this endpoint belongs to |
+/// | `name` | no | Endpoint name; defaults to the handler's function name |
+#[proc_macro_attribute]
+pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(wire::endpoint::endpoint_macro(attr, &item.into())).into()
+}
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// ```rust,ignore
+/// wire_client! {
+///     name = CatalogClient,
+///     endpoints = [
+///         catalog::get_item_endpoint(id),
+///         catalog::create_item_endpoint,
+///     ],
+/// }
+/// ```
+///
+/// Each entry names an endpoint marker and, in parentheses, the path
+/// parameters its route takes. Request and response types come from the
+/// marker's associated types, so they are the callee's own types. A const
+/// assertion holds the declared path parameters to the endpoint's real path.
+#[proc_macro]
+pub fn wire_client(input: TokenStream) -> TokenStream {
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(wire::client::wire_client_macro(input.into())).into()
+}
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+///
+/// ```rust,ignore
+/// #[contract_checked(client = CatalogClient)]
+/// async fn page(catalog: CatalogClient, id: Path<String>) -> AutumnResult<Markup> {
+///     let item = catalog.get_item(&*id, NoBody).await?;
+///     Ok(html! { h1 { (item.name) } })
+/// }
+/// ```
+///
+/// Every response field the function names, and every request field an inline
+/// literal sets, becomes a const assertion against the callee's own field
+/// table. A field the endpoint no longer produces — or a required field a
+/// `..rest` initializer omits — fails the build at the call site.
+///
+/// Repeat `client = …` for a function that calls more than one service. A
+/// declared client with no value in the function is an error, so the attribute
+/// can never pass by checking nothing.
+#[proc_macro_attribute]
+pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(wire::checked::contract_checked_macro(attr, &item.into())).into()
+}
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// Emits two const field tables — what the type puts on the wire and what it
+/// takes off it — and writes the type's JSON descriptor as a build artifact.
+/// `#[contract_checked]` asserts against those tables.
+///
+/// The two tables differ under directional serde attributes, and that is the
+/// point: a field carrying `#[serde(skip_serializing)]` is accepted but never
+/// produced, so a caller reading it is broken even though the code compiles.
+///
+/// Refused rather than guessed at: generics, enums, tuple structs,
+/// `#[serde(flatten)]`, and split `rename(serialize = …, deserialize = …)`.
+#[proc_macro_derive(WireShape)]
+pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
+    let _guard = crate_path::set_target(None);
+    let parsed = syn::parse_macro_input!(input as syn::DeriveInput);
+    let out = match wire::shape::derive_wire_shape(&parsed) {
+        Ok(ts) => ts,
+        Err(err) => err.to_compile_error(),
+    };
+    crate_path::finalize(out).into()
 }
 
 /// Cache the return value of a function based on its arguments.

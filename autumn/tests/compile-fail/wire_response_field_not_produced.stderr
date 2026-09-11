@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: wire contract broken in `show` at `get_item(…)`: reads response field `name` from endpoint `get_item`, which it no longer produces
+  --> tests/compile-fail/wire_response_field_not_produced.rs:29:24
+   |
+29 |     let item = catalog.get_item("1", NoBody).await?;
+   |                        ^^^^^^^^ evaluation of `show::{closure#0}::_` failed here

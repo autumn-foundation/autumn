@@ -520,6 +520,7 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
@@ -559,6 +560,11 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Build-checked typed contracts between two Autumn services (issue #1755).
+///
+/// See the [`wire`] module for the mechanism and `docs/guide/wire-contracts.md`
+/// for the guide.
+pub mod wire;
 // Declared bare, like `notifications`: the module carries its own `//!` docs,
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
@@ -1173,6 +1179,26 @@ pub use autumn_macros::repository;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::service;
+
+/// Mark a typed handler as a service endpoint (issue #1755).
+///
+/// See the [`wire`] module for the mechanism and
+/// `docs/guide/wire-contracts.md` for the guide.
+pub use autumn_macros::endpoint;
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+pub use autumn_macros::contract_checked;
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+pub use autumn_macros::WireShape;
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// The generated methods call through [`http_client::Client`], so this needs
+/// the `http-client` feature.
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
 
 /// Annotate an async function as a `PATCH` route handler.
 ///

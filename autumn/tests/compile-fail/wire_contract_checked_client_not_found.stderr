@@ -1,0 +1,5 @@
+error: #[contract_checked] found no `CatalogClient` value in `show` to check. Name it in the signature (`catalog: CatalogClient`), in a typed `let`, or build it with `CatalogClient::new(…)`.
+ --> tests/compile-fail/wire_contract_checked_client_not_found.rs:7:29
+  |
+7 | #[contract_checked(client = CatalogClient)]
+  |                             ^^^^^^^^^^^^^

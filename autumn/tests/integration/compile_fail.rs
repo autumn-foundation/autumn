@@ -502,6 +502,27 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+/// Wire contracts (#1755), in their own `#[test]` so the shard that owns them
+/// is the `rest` filter in ci.yml's `trybuild` job rather than the big
+/// `compile_fail_tests` one.
+///
+/// The first three are the falsification the issue asks for: each is a change
+/// that keeps the callee compiling and the caller type-checking, and each must
+/// still turn the build red at the caller's call site. The last four are the
+/// refusals that keep the check from ever passing vacuously.
+#[test]
+fn compile_fail_wire_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/wire_response_field_not_produced.rs");
+    t.compile_fail("tests/compile-fail/wire_request_field_not_accepted.rs");
+    t.compile_fail("tests/compile-fail/wire_missing_required_request_field.rs");
+    t.compile_fail("tests/compile-fail/wire_endpoint_below_route_attribute.rs");
+    t.compile_fail("tests/compile-fail/wire_contract_checked_client_not_found.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_flatten.rs");
+    t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
+}
+
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
 // shards (see the `trybuild` job in .github/workflows/ci.yml). Each half owns a
 // disjoint slice of the SAME fixture list — nothing is gated on the split, so a
@@ -630,6 +651,11 @@ fn compile_pass_tests_a() {
     // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
+
+    // Wire contracts (#1755): the compatible half of the falsification — a
+    // caller that reads only produced fields and supplies every required one
+    // compiles, including across a serde rename and a `skip_serializing_if`.
+    t.pass("tests/compile-pass/wire_contract_holds.rs");
 }
 
 // The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.
