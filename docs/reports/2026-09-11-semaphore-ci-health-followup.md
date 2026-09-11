@@ -213,8 +213,17 @@ fix here without a rerun-rate baseline would be exactly the "retry in
 disguise" the hard gate exists to block, even though no retry is actually
 being proposed.
 
-**`live_upgrade`/`cache_stampede`/`sim_fault_plan`: unchanged.** Zero new
-organic hits this pass. `manual-macos-contention-check.yml` — macOS-only,
+**`cache_stampede`/`sim_fault_plan`: unchanged. `live_upgrade`: one new
+organic hit, live, after the sampled window closed.** **Correction
+(post-review, via a twelfth Codex review comment on PR #2711): this
+section and the measurement table below still said "zero new hits" and
+"unchanged" after the late 34591670807 hit was already logged elsewhere
+in this report — inconsistent with itself.** Run 34591670807 (`Test
+(ubuntu-latest)`, this PR's own CI, 2026-09-11T11:51:57Z) is a second
+occurrence of the `status: 0` signature; see the Symptom section and the
+ledger's `live_upgrade` entry for the full writeup, including why a
+non-coverage-job hit weakens the coverage-instrumentation hypothesis for
+that signature. `manual-macos-contention-check.yml` — macOS-only,
 plain `cargo test --workspace` — is still undispatched. **Correction
 (post-review, via a third Codex review comment on PR #2711): a clean
 dispatch would not "close" `cache_stampede` or `sim_fault_plan` either,
@@ -257,7 +266,7 @@ diagnosis, not a rerun campaign of its own.
 
 | Test | Hits (this pass) | Cumulative organic hits | Status |
 |---|---|---|---|
-| `live_upgrade` (all three tracked signatures) | 0 | unchanged from 2026-09-10 | Verdict rendered for 1 of 3 signatures (the Linux "new build never served" hit, PR #2645's mechanism 2); the macOS connect-error cluster is attributed to the earlier #2510, and the third (`status: 0`) signature remains unattributed to any fix, per the ledger's own corrected attribution. CI-native verification still blocked on the undispatched harness |
+| `live_upgrade` (all three tracked signatures) | 1 (late, post-window: the `status: 0` signature, run 34591670807) | 2 for the `status: 0` signature specifically (2026-09-09, 2026-09-11); unchanged for the other two | Verdict rendered for 1 of 3 signatures (the Linux "new build never served" hit, PR #2645's mechanism 2); the macOS connect-error cluster is attributed to the earlier #2510, and the third (`status: 0`) signature remains unattributed to any fix — now a confirmed repeat, and observed on a non-coverage job for the first time. CI-native verification still blocked on the undispatched harness |
 | `cache_stampede` (line 501) | 0 | 2 (2026-09-03, 2026-09-09) | Undiagnosed |
 | `sim_fault_plan` | 0 | 1 (2026-09-03) | Undiagnosed |
 | `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it` | 1 | 1 (new, 2026-09-10T19:54Z) | New; mechanism hypothesis recorded, not campaigned |
