@@ -6659,11 +6659,22 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
 /// sibling `[server.tls.acme]` sub-table has none either — so the merged TOML
 /// is the whole story.
 fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDoctorData {
-    let Some(section) = tls
-        .and_then(|t| t.get("client_auth"))
-        .and_then(toml::Value::as_table)
-    else {
-        return ClientAuthDoctorData::NotConfigured;
+    let section = match tls.and_then(|t| t.get("client_auth")) {
+        None => return ClientAuthDoctorData::NotConfigured,
+        Some(toml::Value::Table(section)) => section,
+        // Present but not a table — `client_auth = "required"`, say. The
+        // generic schema check validates key NAMES, not value types, so
+        // nothing else catches this; the runtime's `Option<ClientAuthConfig>`
+        // refuses to deserialize it and the app does not start. Grading it
+        // NotConfigured would let `--strict` pass an unbootable config.
+        Some(other) => {
+            return ClientAuthDoctorData::Invalid {
+                detail: format!(
+                    "[server.tls] client_auth must be a table (a `[server.tls.client_auth]` \
+                     section); found {other}"
+                ),
+            };
+        }
     };
 
     // An absent `mode` defaults to `off`, exactly as serde does. A PRESENT one
@@ -12240,6 +12251,28 @@ pub struct Vault {
         let result = check_client_auth_impl(&data);
         assert!(matches!(result.status, CheckStatus::Fail));
         assert!(result.detail.unwrap().contains("required_paths"));
+    }
+
+    #[test]
+    fn client_auth_fails_when_the_section_is_not_a_table() {
+        // `client_auth = "required"` under `[server.tls]`. The schema check
+        // validates key names, not value types, so nothing else catches it —
+        // and the runtime refuses to deserialize it.
+        let mut tls = toml::Table::new();
+        tls.insert(
+            "client_auth".to_owned(),
+            toml::Value::String("required".to_owned()),
+        );
+
+        let data = resolve_client_auth_doctor_data(Some(&tls));
+        assert!(
+            matches!(data, ClientAuthDoctorData::Invalid { .. }),
+            "got {data:?}"
+        );
+        assert!(matches!(
+            check_client_auth_impl(&data).status,
+            CheckStatus::Fail
+        ));
     }
 
     #[test]

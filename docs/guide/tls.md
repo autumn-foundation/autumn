@@ -941,6 +941,10 @@ Ten lines, and an internal route is locked to a client CA.
 `optional` is not "unverified": a client that *offers* a certificate must still
 chain to a configured CA. The option is whether presenting one is mandatory.
 
+Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
+segment (`//`) or a `.` / `..` segment — because it would protect less than it
+appears to. Write the resolved prefix.
+
 **Per-route requirements** come from `required_paths`, matched against the
 normalized request path exactly as CSRF exemptions are — so `/internal/` covers
 `/internal/keys` but not `/internal-tools`, and `/open/../internal/keys` cannot

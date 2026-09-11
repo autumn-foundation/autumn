@@ -1807,16 +1807,31 @@ fn diff_mtls_required_paths(
         .collect();
 
     if !dropped.is_empty() {
+        // The fingerprint carries the surviving prefixes too. Narrowing
+        // `/internal` to `/internal/admin` leaves `added` empty, so `dropped`
+        // and `added` alone hash the same as a later swap to
+        // `/internal/public` — and one acknowledgment would then cover two
+        // different sets of URLs.
+        let mut surviving: Vec<String> = after.iter().map(|p| (*p).clone()).collect();
+        surviving.sort();
         out.push(Finding {
             kind: "mtls_required_path_removed",
             severity: Severity::Widening,
             method: "*".to_owned(),
             path: "*".to_owned(),
             before: dropped.join(", "),
-            after: "not required".to_owned(),
+            after: if surviving.is_empty() {
+                "not required".to_owned()
+            } else {
+                format!("still required: {}", surviving.join(", "))
+            },
             fingerprint: format!(
                 "mtls-required-path-removed:{}",
-                escape_list(&[escape_list(&dropped), escape_list(&added)])
+                escape_list(&[
+                    escape_list(&dropped),
+                    escape_list(&added),
+                    escape_list(&surviving),
+                ])
             ),
             detail: format!(
                 "a verified client certificate is no longer required for {}, which the \
@@ -2272,6 +2287,32 @@ mod tests {
             &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
         );
         assert!(kinds(&narrowed).contains(&"mtls_required_path_removed"));
+    }
+
+    /// Replacing a broad prefix with a narrower one leaves `added` empty (the
+    /// old prefix already covered the replacement), so the fingerprint has to
+    /// carry what SURVIVES or two different narrowings hash alike and the first
+    /// acknowledgment silently covers the second.
+    #[test]
+    fn two_different_narrowings_of_one_prefix_do_not_share_a_fingerprint() {
+        let routes = route("/internal/{id}", "GET", "gated", &[], &[], false);
+        let entry = mtls_entry("/internal/{id}", "GET", false);
+        let base = manifest_mtls(&routes, "optional", &["/internal"], &entry);
+
+        let fingerprint = |head_prefix: &str| {
+            let head = manifest_mtls(&routes, "optional", &[head_prefix], &entry);
+            diff(&base, &head)
+                .into_iter()
+                .find(|f| f.kind == "mtls_required_path_removed")
+                .map(|f| f.fingerprint)
+                .unwrap_or_else(|| panic!("expected a removal finding for {head_prefix}"))
+        };
+
+        assert_ne!(
+            fingerprint("/internal/admin"),
+            fingerprint("/internal/public"),
+            "two narrowings protecting different URLs must not share an acknowledgment"
+        );
     }
 
     #[test]

@@ -777,11 +777,15 @@ fn build_router_pre_state(
         let inspector_path = config.dev.inspector_path.clone();
         let threshold = config.dev.inspector_n_plus_one_threshold;
 
-        // Mount the inspector UI routes.
-        router = router.merge(crate::inspector::inspector_router(
-            buf.clone(),
-            &inspector_path,
-        ));
+        // Mount the inspector UI routes. They merge after `apply_middleware`,
+        // so they do not inherit its layers. Mirror the mTLS route requirement
+        // (#1640) onto them, or a `required_paths` prefix that covers the
+        // inspector path promises a 403 it does not deliver.
+        let mut inspector = crate::inspector::inspector_router(buf.clone(), &inspector_path);
+        if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+            inspector = inspector.layer(require_client_cert);
+        }
+        router = router.merge(inspector);
         tracing::debug!(
             path = %inspector_path,
             "Mounted dev request inspector"

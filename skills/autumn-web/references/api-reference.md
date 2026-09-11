@@ -1563,8 +1563,8 @@ Absent, the handshake is byte-for-byte the server-only TLS above.
   `unknown_revocation`, `invalid`) and `tls_client_auth_route_rejected_total`,
   plus a rate-limited operator log. The client sees only the TLS alert.
 - Fail-fast at startup on a missing / unparseable / empty bundle or CRL, on a
-  non-`off` mode with no `ca_bundle_path`, and on `required_paths` under
-  `mode = "off"`. Revocation is CRL-only — no OCSP. See `docs/guide/tls.md`.
+  non-`off` mode with no `ca_bundle_path`, on `required_paths` under
+  `mode = "off"`, and on a noncanonical prefix (`//`, `.` or `..` segment). Revocation is CRL-only — no OCSP. See `docs/guide/tls.md`.
 
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 

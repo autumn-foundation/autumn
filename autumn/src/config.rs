@@ -7518,6 +7518,28 @@ impl ClientAuthConfig {
                      path prefix starting with `/`"
                 ));
             }
+            // Requests are normalized before matching (`security::path::clean_path`)
+            // but the configured prefix is not, so a noncanonical prefix silently
+            // matches less than it appears to: `/internal//` reduces to
+            // `/internal/` after the matcher strips ONE trailing slash, and
+            // `/internal/keys` then fails to match it. A prefix that protects
+            // less than the operator wrote is the failure this whole section
+            // exists to prevent, so refuse it rather than normalize it silently.
+            if path.contains("//") {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains an empty \
+                     path segment; write it as a canonical prefix like `/internal/`"
+                ));
+            }
+            if path
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
+            {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains a dot \
+                     segment; write the resolved prefix instead"
+                ));
+            }
         }
 
         Ok(())
@@ -16472,6 +16494,42 @@ path = "/healthz"
         };
         let err = ca.validate().expect_err("a required_path must be rooted");
         assert!(err.contains("required_paths"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_noncanonical_required_paths() {
+        // Requests are normalized before matching but the configured prefix is
+        // not, so `/internal//` would protect strictly less than it looks like
+        // it does. A prefix that protects less than the operator wrote is the
+        // failure this section exists to prevent.
+        for bad in [
+            "/internal//",
+            "//internal",
+            "/internal/./keys",
+            "/internal/../admin",
+        ] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![bad.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            let Err(err) = ca.validate() else {
+                panic!("`{bad}` should be rejected");
+            };
+            assert!(err.contains("required_paths"), "unhelpful message: {err}");
+        }
+
+        // The canonical spellings stay accepted.
+        for good in ["/internal", "/internal/", "/internal/keys", "/"] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![good.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            assert!(ca.validate().is_ok(), "`{good}` should be accepted");
+        }
     }
 
     #[test]
