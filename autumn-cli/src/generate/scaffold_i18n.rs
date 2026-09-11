@@ -32,7 +32,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::scaffold::{is_raw_string_start, skip_raw_string};
+use syn::spanned::Spanned as _;
+use syn::visit::Visit as _;
 
 /// The comment introducing the shared-chrome block in a generated `en.ftl`.
 const COMMON_HEADER: &str = "# Shared chrome — reused by every scaffolded resource.";
@@ -1236,213 +1237,6 @@ pub(super) fn locale_bundles(project_root: &Path, dir: &str) -> Vec<PathBuf> {
     out
 }
 
-/// The `static` item `autumn new` emits for embedded assets — where the locale
-/// static is written next to.
-const STATIC_ANCHOR: &str =
-    "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();";
-/// The builder line that installs those assets — where the locale install goes.
-const INSTALL_ANCHOR: &str = "    let app = app.embedded_static(&EMBEDDED_STATIC);\n";
-
-/// Embed the locale bundle into the binary for `autumn build --embed`,
-/// matching what `autumn new --with-i18n` wires into a fresh app.
-///
-/// `.i18n_auto()` alone loads from DISK. An `--embed` build is supposed to be
-/// self-contained, so without this the binary still reaches for the locale
-/// directory at startup: run it from an empty deployment directory — or from
-/// the release image, whose embedded-build path deliberately ships no sidecar —
-/// and it panics on a missing default bundle, after a build that looked
-/// entirely clean.
-///
-/// Both edits sit behind the `embed-assets` feature the template already gates
-/// its static assets on, and both anchor on the `EMBEDDED_STATIC` lines that
-/// `autumn new` emits. Returns `None` when those are absent (an `--api` or
-/// hand-rolled `main.rs`), so the caller can leave it alone; returns the input
-/// unchanged when the locales are already embedded.
-pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
-    // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
-    // through as the macro's literal argument — escaped, because this is the one
-    // place a `dir` read out of `autumn.toml` becomes Rust source.
-    let macro_call = if dir == "i18n" {
-        "autumn_web::embed_locales!()".to_owned()
-    } else {
-        format!(
-            "autumn_web::embed_locales!(\"{}\")",
-            rust_string_escape(dir)
-        )
-    };
-    // PRODUCTION occurrences only. A `#[cfg(test)]` fixture that happens to
-    // mention `EMBEDDED_LOCALES` is not the binary's embedding, and treating it
-    // as one returns "already wired" while `autumn build --embed` ships a
-    // release binary with no bundle in it — which panics on a machine that has
-    // no sidecar locale directory. Same scoping `ensure_i18n_auto` applies to
-    // its own detections; it belongs here for the same reason.
-    // As a WHOLE identifier. A substring match reads an unrelated
-    // `ADMIN_EMBEDDED_LOCALES` as this static, reports the file as already
-    // embedded, and then hands the install below a symbol the file never
-    // declares — an `--embed` build that stops compiling on an undefined name.
-    let embedded_in_production = identifier_offsets(main_rs, "EMBEDDED_LOCALES")
-        .into_iter()
-        .any(|at| !in_cfg_test(main_rs, at));
-    // The static alone is not the setup. `embed_locales!` bakes the files into the binary;
-    // `.embedded_locales(&EMBEDDED_LOCALES)` is what makes the app read them. With the
-    // first present and the second missing, an `autumn build --embed` carries the bundle
-    // and never loads it, so a deployment without the sidecar directory falls through to
-    // `.i18n_auto()` and panics, having been told embedding was configured. Both halves are
-    // required before this is treated as done, and a missing half is added.
-    //
-    // Scoped to the function the production builder lives in, not merely to "outside
-    // `cfg(test)`". A preview or helper builder is ordinary non-test code, and one of those
-    // installing the locales says nothing about the chain the binary runs: treating it as
-    // done leaves production falling through to `.i18n_auto()`.
-    if embedded_in_production {
-        // Already embedded — but not necessarily from the right place. A
-        // project that changed `[i18n] dir` after its first `--i18n` scaffold
-        // keeps embedding the OLD directory while the keys, the Docker `COPY`,
-        // and the runtime load all move to the new one, so an `--embed` build
-        // ships a bundle the app never reads. Repoint it.
-        //
-        // Within THIS static's own item, not anywhere in the file. A `main.rs`
-        // can carry more than one embedded directory — an `ADMIN_EMBEDDED_LOCALES`
-        // beside this one is ordinary — and rewriting whichever `embed_locales!`
-        // came first repoints somebody else's bundle at this resource's
-        // directory: the admin app then ships the wrong translations, and the
-        // static this call is actually about keeps its stale directory.
-        //
-        // No declaration found (a hand-rolled or macro-generated static), or no
-        // `embed_locales!` in it: the macro is left alone, and only the install
-        // below is checked.
-        let stale_macro = locales_static_item(main_rs).and_then(|(start, end)| {
-            let item = &main_rs[start..end];
-            if !real_offsets(item, &macro_call).is_empty() {
-                return None;
-            }
-            let rel = real_offsets(item, "autumn_web::embed_locales!")
-                .first()
-                .copied()?;
-            Some((start + rel, end))
-        });
-        let out = match stale_macro {
-            Some((call_at, end)) => {
-                format!("{}{macro_call}{}", &main_rs[..call_at], &main_rs[end..])
-            }
-            None => main_rs.to_owned(),
-        };
-        // Unconditionally: the insertion is per-anchor and skips the ones
-        // already served, so "some branch has it" can no longer stand in for
-        // "every branch has it".
-        return insert_locale_install(&out);
-    }
-    // Beside the PRODUCTION static, on the same production test the install
-    // below uses. A `#[cfg(test)]` module can declare its own fixture with the
-    // very same line, and a file-wide first-occurrence replacement then
-    // declared `EMBEDDED_LOCALES` inside that module while the install went —
-    // correctly — into the production builder: an `--embed` release that stops
-    // compiling on a symbol out of scope.
-    let static_at = real_offsets(main_rs, STATIC_ANCHOR)
-        .into_iter()
-        .find(|&at| !in_cfg_test(main_rs, at))?;
-    let end = static_at + STATIC_ANCHOR.len();
-    let with_static = format!(
-        "{}{STATIC_ANCHOR}\n#[cfg(feature = \"embed-assets\")]\n\
-         static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = {macro_call};{}",
-        &main_rs[..static_at],
-        &main_rs[end..]
-    );
-    insert_locale_install(&with_static)
-}
-
-/// Splice `.embedded_locales(&EMBEDDED_LOCALES)` in after the PRODUCTION
-/// `embedded_static` install, or `None` when there is no such line.
-///
-/// The anchor is picked with the same production test that decided the install
-/// was missing in the first place, because the two questions have to be asked
-/// about the same code. A file-wide "first occurrence" replacement answered
-/// them at different granularities: with a preview or helper builder above
-/// `main` carrying the ordinary `let app = app.embedded_static(&EMBEDDED_STATIC);`
-/// line, the detection correctly reported production as missing the call and
-/// the insertion then wrote it into the HELPER — leaving the production
-/// `--embed` binary still falling through to a disk load, which panics when the
-/// deployment has no sidecar locale directory. Recomputed against the text
-/// passed in, since an earlier edit may have shifted every offset.
-/// EVERY production anchor, each judged on its own — the same per-branch shape
-/// `ensure_i18n_auto` uses, and for the same reason. A `main` that builds the
-/// app conditionally has one `embedded_static` install per branch, every one of
-/// them production; serving only the first leaves the others loading locales
-/// from disk, so an `--embed` deployment panics whenever it takes one of those
-/// branches, with the bundle sitting unused in the binary.
-fn insert_locale_install(src: &str) -> Option<String> {
-    let scopes = production_scopes(src);
-    let anchors: Vec<usize> = real_offsets(src, INSTALL_ANCHOR)
-        .into_iter()
-        .filter(|&at| in_production(src, &scopes, at))
-        .collect();
-    let pending: Vec<usize> = anchors
-        .iter()
-        .copied()
-        .filter(|&at| !locales_installed_beside(src, at))
-        .collect();
-    if pending.is_empty() {
-        // Nothing to add — but say whether that is because everything is
-        // served or because there was nowhere to write. A file with no
-        // production anchor at all is only "done" when the call is already
-        // there; otherwise the caller has to warn.
-        let served = !anchors.is_empty()
-            || method_call_offsets(src, ".embedded_locales")
-                .any(|at| in_production(src, &scopes, at));
-        return served.then(|| src.to_owned());
-    }
-    // Back-to-front, so each insertion leaves the earlier offsets valid.
-    let mut out = src.to_owned();
-    for at in pending.into_iter().rev() {
-        let end = at + INSTALL_ANCHOR.len();
-        out = format!(
-            "{}{INSTALL_ANCHOR}    #[cfg(feature = \"embed-assets\")]\n\
-             \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n{}",
-            &out[..at],
-            &out[end..]
-        );
-    }
-    Some(out)
-}
-
-/// Whether the block holding the `embedded_static` install at `at` already
-/// installs the locales.
-///
-/// Per BLOCK, because that is what a conditional branch is: one branch already
-/// carrying the call says nothing about its sibling, and reading it file-wide
-/// would leave that sibling on a disk load.
-fn locales_installed_beside(src: &str, at: usize) -> bool {
-    let start = enclosing_block_start(src, at);
-    let end = start
-        .checked_sub(1)
-        .and_then(|brace| brace_block(src, brace))
-        .map_or(src.len(), |(_, close)| close);
-    method_call_offsets(&src[start..end], ".embedded_locales")
-        .next()
-        .is_some()
-}
-
-/// The function bodies holding the builders the binary runs.
-fn production_scopes(src: &str) -> Vec<(usize, usize)> {
-    production_routes_anchors(src)
-        .into_iter()
-        .filter_map(|at| enclosing_body(src, at))
-        .collect()
-}
-
-/// Whether `at` sits in one of `scopes` — or, when no production builder could
-/// be identified at all, merely outside `#[cfg(test)]`.
-///
-/// The fallback is the coarser question, taken deliberately: with nothing to
-/// scope to, "anything non-test" is a better read than "nothing counts".
-fn in_production(src: &str, scopes: &[(usize, usize)], at: usize) -> bool {
-    if scopes.is_empty() {
-        !in_cfg_test(src, at)
-    } else {
-        scopes.iter().any(|&(open, close)| open < at && at < close)
-    }
-}
-
 /// Ship the `i18n/` sidecar into a generated `Dockerfile`, in both stages.
 ///
 /// `.i18n_auto()` reads `i18n/<default>.ftl` from the working directory at
@@ -1786,269 +1580,509 @@ pub(super) fn ensure_i18n_config_block(existing: &str) -> String {
     out
 }
 
-/// Byte offsets of every `needle` in `src` that is REAL CODE — not inside a
-/// line comment, a (nestable) block comment, a string or raw-string literal, or
-/// a char literal.
-///
-/// `autumn new`'s own template carries the line
-/// `// Register new endpoints by adding them to the .routes(routes![...]) list`
-/// right above `fn main`, and a naive `find(".routes(")` lands there: the
-/// `.i18n_auto()` call gets written into a COMMENT, the builder chain is never
-/// touched, and the idempotency guard then makes every later run a no-op. The
-/// app compiles, starts, and renders raw keys forever with no error anywhere.
-/// Same class of decoy — and the same lexical defence — as
-/// [`has_shared_layout`](super::scaffold::has_shared_layout).
-pub(super) fn real_offsets(src: &str, needle: &str) -> Vec<usize> {
-    let bytes = src.as_bytes();
-    let n = needle.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut block_depth = 0usize;
-    while i < bytes.len() {
-        if block_depth > 0 {
-            if bytes[i..].starts_with(b"/*") {
-                block_depth += 1;
-                i += 2;
-            } else if bytes[i..].starts_with(b"*/") {
-                block_depth -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i..].starts_with(b"//") {
-            i += src[i..].find('\n').map_or(src.len() - i, |nl| nl + 1);
-            continue;
-        }
-        if bytes[i..].starts_with(b"/*") {
-            block_depth = 1;
-            i += 2;
-            continue;
-        }
-        if is_raw_string_start(bytes, i) {
-            i = skip_raw_string(bytes, i);
-            continue;
-        }
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'"' {
-                i += usize::from(bytes[i] == b'\\') + 1;
-            }
-            i += 1;
-            continue;
-        }
-        // A CHAR literal, which the doc above has always claimed and the code
-        // did not do. `let open = '{';` is the case that bites: its brace is
-        // counted as syntax, so `brace_block` never finds where `main` ends and
-        // the anchor search falls back to whatever builder comes first. `'"'`
-        // is worse — it opens a phantom string that swallows the rest of the
-        // file. Distinguished from a LIFETIME (`&'a str`) by looking for the
-        // closing quote: `'a` has none, `'{'` does.
-        if bytes[i] == b'\'' {
-            if let Some(end) = char_literal_end(bytes, i) {
-                i = end + 1;
-                continue;
-            }
-            // A lifetime. Step past the tick only, so `'a` does not eat ahead.
-            i += 1;
-            continue;
-        }
-        if bytes[i..].starts_with(n) {
-            out.push(i);
-            i += n.len();
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
 /// `value` as a JSON string literal, for Dockerfile's exec/JSON `COPY` form.
 fn json_str(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Offsets of `name` in real code where it is a WHOLE identifier, not a slice
-/// of a longer one.
+/// Byte offset of a `proc_macro2` source position.
 ///
-/// The same token-boundary rule [`method_call_offsets`] applies to method
-/// names, for the identifiers this module looks up by name.
-fn identifier_offsets(src: &str, name: &str) -> Vec<usize> {
-    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
-    real_offsets(src, name)
-        .into_iter()
-        .filter(|&at| {
-            !src[..at].chars().next_back().is_some_and(ident_char)
-                && !src[at + name.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(ident_char)
-        })
-        .collect()
+/// `proc_macro2` counts a `LineColumn`'s `column` in UTF-8 CHARACTERS, not
+/// bytes, so this walks each line's own chars to find the byte offset —
+/// the same conversion `proc_macro2` does internally, done here because
+/// `main.rs` needs a BYTE range to slice and splice.
+struct SourceIndex<'a> {
+    src: &'a str,
+    /// Byte offset where each 1-indexed source line starts.
+    line_starts: Vec<usize>,
 }
 
-/// The production `static EMBEDDED_LOCALES … ;` declaration, as the span from
-/// its name to its terminating `;`.
-///
-/// A DECLARATION, told from a use site (`.embedded_locales(&EMBEDDED_LOCALES)`)
-/// by the `static` keyword in front of it, so the repointing above rewrites the
-/// initialiser rather than something that merely mentions the name.
-fn locales_static_item(src: &str) -> Option<(usize, usize)> {
-    identifier_offsets(src, "EMBEDDED_LOCALES")
-        .into_iter()
-        .filter(|&at| !in_cfg_test(src, at))
-        .find_map(|at| {
-            let before = src[..at].trim_end();
-            let keyword = before.strip_suffix("static")?;
-            // On an identifier boundary of its own: `mystatic EMBEDDED_LOCALES`
-            // is not a static declaration.
-            if keyword
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
-            {
-                return None;
-            }
-            let semi = real_offsets(&src[at..], ";").first().copied()?;
-            Some((at, at + semi))
-        })
-}
+impl<'a> SourceIndex<'a> {
+    fn new(src: &'a str) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
+        Self { src, line_starts }
+    }
 
-/// Offsets of real-code `method` calls, tolerating whitespace and comments
-/// between the method name and its opening paren, and requiring the name to end
-/// on a token boundary so `.i18n` does not match `.i18n_auto`.
-fn method_call_offsets<'a>(src: &'a str, method: &'a str) -> impl Iterator<Item = usize> + 'a {
-    real_offsets(src, method).into_iter().filter(move |&at| {
-        let rest = &src[at + method.len()..];
-        // `.i18n_auto(` is a different method that starts with this name.
-        if rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
-            return false;
+    fn byte_offset(&self, at: proc_macro2::LineColumn) -> usize {
+        let line_start = self.line_starts[at.line - 1];
+        let line_end = self
+            .line_starts
+            .get(at.line)
+            .copied()
+            .unwrap_or(self.src.len());
+        let mut offset = line_start;
+        for ch in self.src[line_start..line_end].chars().take(at.column) {
+            offset += ch.len_utf8();
         }
-        // Only whitespace and comments may sit before the paren. `real_offsets`
-        // over the remainder is the cheapest way to say "the next real token".
-        real_offsets(rest, "(").first() == Some(&ignorable_prefix_len(rest))
+        offset
+    }
+
+    /// The byte range a span covers.
+    fn range(&self, span: proc_macro2::Span) -> std::ops::Range<usize> {
+        self.byte_offset(span.start())..self.byte_offset(span.end())
+    }
+}
+
+/// Whether `attrs` carries `#[cfg(test)]` exactly — the one attribute this
+/// generator excludes production code on.
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|ident| ident == "test")
     })
 }
 
-/// Length of the run of whitespace and comments at the start of `src`.
+/// The attributes on an item, across every kind `main.rs` can hold at file
+/// or module scope.
 ///
-/// Block comments NEST in Rust, and this has to agree with [`real_offsets`]
-/// about where one ends, because [`method_call_offsets`] compares the two: the
-/// first `*/` in `.i18n /* outer /* nested */ tail */ (bundle())` closes only
-/// the inner comment, and stopping there put this length short of the paren
-/// `real_offsets` reports. The two disagreed, the call was not recognised as a
-/// call, and `.i18n_auto()` went in and CLEARED the bundle that comment was
-/// sitting next to.
-pub(super) fn ignorable_prefix_len(src: &str) -> usize {
-    let bytes = src.as_bytes();
-    let mut i = 0;
-    loop {
-        let rest = &src[i..];
-        let trimmed = rest.trim_start();
-        i += rest.len() - trimmed.len();
-        if let Some(after) = src[i..].strip_prefix("//") {
-            i += 2 + after.find('\n').map_or(after.len(), |nl| nl + 1);
-            continue;
-        }
-        if src[i..].starts_with("/*") {
-            let mut depth = 1usize;
-            i += 2;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        return i;
+/// `syn::Item` has no shared accessor for attributes. This match covers
+/// every kind that carries them. A kind with none — or a future `syn`
+/// variant — returns an empty slice. That is still correct: there is no
+/// `#[cfg(test)]` to find on it.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    use syn::Item;
+    match item {
+        Item::Const(i) => &i.attrs,
+        Item::Enum(i) => &i.attrs,
+        Item::ExternCrate(i) => &i.attrs,
+        Item::Fn(i) => &i.attrs,
+        Item::ForeignMod(i) => &i.attrs,
+        Item::Impl(i) => &i.attrs,
+        Item::Macro(i) => &i.attrs,
+        Item::Mod(i) => &i.attrs,
+        Item::Static(i) => &i.attrs,
+        Item::Struct(i) => &i.attrs,
+        Item::Trait(i) => &i.attrs,
+        Item::TraitAlias(i) => &i.attrs,
+        Item::Type(i) => &i.attrs,
+        Item::Union(i) => &i.attrs,
+        Item::Use(i) => &i.attrs,
+        _ => &[],
     }
 }
 
-/// Byte offset of a char literal's closing `'`, when `at` opens one.
-///
-/// `None` for a lifetime (`&'a str`, `'static`), which shares the opening
-/// character and must not be treated as a literal — skipping to a later `'`
-/// would swallow real code between them.
-fn char_literal_end(bytes: &[u8], at: usize) -> Option<usize> {
-    let mut i = at + 1;
-    if bytes.get(i)? == &b'\\' {
-        // An escape. Skip the ESCAPED character before looking for the closing
-        // tick — `'\''` carries a tick of its own, and stopping at it would cut
-        // the literal one byte short and leave the real closing tick to open a
-        // phantom one.
-        i += 1;
-        let selector = *bytes.get(i)?;
-        i += 1;
-        match selector {
-            // `\u{1F600}` — variable length, delimited by its own brace.
-            b'u' => {
-                while bytes.get(i).is_some_and(|b| *b != b'}') {
-                    i += 1;
-                }
-                i += 1;
-            }
-            // `\x41` — exactly two hex digits.
-            b'x' => i += 2,
-            // `\n`, `\t`, `\\`, `\'`, `\"`, `\0` — the selector was the whole
-            // escape.
-            _ => {}
-        }
-        return (bytes.get(i) == Some(&b'\'')).then_some(i);
-    }
-    // One character, which may be multi-byte UTF-8; the closing tick is the
-    // next ASCII `'` within four bytes.
-    let limit = (i + 4).min(bytes.len());
-    while i < limit {
-        if bytes[i] == b'\'' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+/// One nesting level: the statements of `block` BEFORE index `before` are
+/// what a value at this point can still see. An enclosing statement is
+/// visible; a sibling branch is not.
+#[derive(Clone, Copy)]
+struct Frame<'ast> {
+    block: &'ast syn::Block,
+    before: usize,
 }
 
-/// The `(open, close)` byte offsets of the first brace-delimited block at or
-/// after `from` — the body of the item declared there.
+/// A tracked method call (`.routes`, `.embedded_static`, or
+/// `.embedded_locales`), with enough context to answer "is this
+/// production" and "what did its value already flow through".
+struct CallSite<'ast> {
+    /// The whole method-call expression, so its receiver chain can be
+    /// walked from here.
+    call: &'ast syn::Expr,
+    /// Where `.method(` starts — the anchor for a text splice.
+    dot_span: proc_macro2::Span,
+    is_cfg_test: bool,
+    /// Every enclosing `fn`, innermost last. A nested `fn` inside `main`'s
+    /// body is unlikely in generated code. Still, walking the whole stack
+    /// answers the same question as before: is this call inside `main`'s
+    /// body?
+    enclosing_fns: Vec<*const syn::ItemFn>,
+    /// The block nesting nearest this call, innermost last. This answers
+    /// one question: is a call already in the SAME block, one branch at a
+    /// time?
+    frames: Vec<Frame<'ast>>,
+}
+
+/// One pass over `main.rs`'s AST.
 ///
-/// Brace-matched, and blind to braces inside comments and string literals for
-/// the same reason [`real_offsets`] is: a `//` line mentioning `}` would
-/// otherwise close the body early and shrink the window this bounds a search
-/// to. `None` when there is no `{`, or when it is never closed.
-fn brace_block(src: &str, from: usize) -> Option<(usize, usize)> {
-    // `real_offsets` gives brace positions that are real code; the first one at
-    // or after `from` opens the body.
-    let open = real_offsets(&src[from..], "{").first().copied()? + from;
-    let tail = &src[open..];
-    let mut braces: Vec<(usize, bool)> = real_offsets(tail, "{")
-        .into_iter()
-        .map(|o| (o, true))
-        .chain(real_offsets(tail, "}").into_iter().map(|o| (o, false)))
+/// It collects everything [`ensure_i18n_auto`] and [`ensure_embedded_locales`]
+/// need: which `fn main`s are production, and where the interesting method
+/// calls and `static` items sit.
+#[derive(Default)]
+struct Collector<'ast> {
+    cfg_test_depth: u32,
+    fn_stack: Vec<*const syn::ItemFn>,
+    frames: Vec<Frame<'ast>>,
+
+    main_fns: Vec<(&'ast syn::ItemFn, bool)>,
+    routes_calls: Vec<CallSite<'ast>>,
+    embedded_static_calls: Vec<CallSite<'ast>>,
+    embedded_locales_calls: Vec<CallSite<'ast>>,
+    statics: Vec<(&'ast syn::ItemStatic, bool)>,
+    /// Whether each occurrence of the plain identifier `EMBEDDED_LOCALES`
+    /// sits under `#[cfg(test)]` — a declaration, or a use site. This
+    /// answers one question: does the name appear anywhere in production
+    /// code?
+    embedded_locales_idents: Vec<bool>,
+}
+
+impl<'ast> Collector<'ast> {
+    /// Walk `file` and collect everything both entry points need.
+    fn collect(file: &'ast syn::File) -> Self {
+        let mut collector = Self::default();
+        collector.visit_file(file);
+        collector
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Collector<'ast> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let is_test = has_cfg_test(item_attrs(item));
+        if is_test {
+            self.cfg_test_depth += 1;
+        }
+        syn::visit::visit_item(self, item);
+        if is_test {
+            self.cfg_test_depth -= 1;
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if item.sig.ident == "main" {
+            self.main_fns.push((item, self.cfg_test_depth > 0));
+        }
+        self.fn_stack.push(std::ptr::from_ref(item));
+        syn::visit::visit_item_fn(self, item);
+        self.fn_stack.pop();
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.statics.push((item, self.cfg_test_depth > 0));
+        syn::visit::visit_item_static(self, item);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident == "EMBEDDED_LOCALES" {
+            self.embedded_locales_idents.push(self.cfg_test_depth > 0);
+        }
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let base = self.frames.len();
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            self.frames.push(Frame { block, before: i });
+            self.visit_stmt(stmt);
+            self.frames.pop();
+        }
+        self.frames.truncate(base);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if let syn::Expr::MethodCall(mc) = expr {
+            // Compared as an `Ident`, not a `String` — every method call in
+            // `main.rs` reaches this, and only three names need a match.
+            let bucket = if mc.method == "routes" {
+                Some(&mut self.routes_calls)
+            } else if mc.method == "embedded_static" {
+                Some(&mut self.embedded_static_calls)
+            } else if mc.method == "embedded_locales" {
+                Some(&mut self.embedded_locales_calls)
+            } else {
+                None
+            };
+            if let Some(bucket) = bucket {
+                bucket.push(CallSite {
+                    call: expr,
+                    dot_span: mc.dot_token.span(),
+                    is_cfg_test: self.cfg_test_depth > 0,
+                    enclosing_fns: self.fn_stack.clone(),
+                    frames: self.frames.clone(),
+                });
+            }
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// The `.routes(` calls belonging to builders the BINARY runs, or empty
+/// when that cannot be told apart from a helper's.
+///
+/// A builder inside `fn main`'s body is unambiguous — EVERY non-test `fn
+/// main` counts, so `#[cfg(unix)] fn main()` beside `#[cfg(windows)] fn
+/// main()` both get wired.
+///
+/// Otherwise `main` delegates, for example `fn main() { build_app().serve() }`.
+/// The only safe case is when the file has exactly one non-test builder.
+/// More than one builder cannot be told apart, and the choice cannot be
+/// undone once wired. So the generator refuses instead of guessing.
+fn production_anchors<'a, 'ast>(collector: &'a Collector<'ast>) -> Vec<&'a CallSite<'ast>> {
+    let main_fns: Vec<*const syn::ItemFn> = collector
+        .main_fns
+        .iter()
+        .filter(|(_, is_test)| !is_test)
+        .map(|(item, _)| std::ptr::from_ref(*item))
         .collect();
-    braces.sort_unstable();
+    if !main_fns.is_empty() {
+        let inside: Vec<&CallSite<'ast>> = collector
+            .routes_calls
+            .iter()
+            .filter(|call| call.enclosing_fns.iter().any(|f| main_fns.contains(f)))
+            .collect();
+        if !inside.is_empty() {
+            return inside;
+        }
+    }
+    let candidates: Vec<&CallSite<'ast>> = collector
+        .routes_calls
+        .iter()
+        .filter(|c| !c.is_cfg_test)
+        .collect();
+    match candidates.as_slice() {
+        [only] => vec![*only],
+        _ => Vec::new(),
+    }
+}
 
-    let mut depth = 0usize;
-    for (at, is_open) in braces {
-        if is_open {
-            depth += 1;
-        } else {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some((open, open + at));
+/// The innermost `fn` each of `anchors` sits in — the function bodies the
+/// binary runs, used to scope "is this call production" for a call site
+/// that has nothing to do with `.routes(` itself.
+fn production_fn_ptrs(anchors: &[&CallSite<'_>]) -> Vec<*const syn::ItemFn> {
+    let mut out: Vec<*const syn::ItemFn> = anchors
+        .iter()
+        .filter_map(|c| c.enclosing_fns.last().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether `call` sits in one of `scopes` — or, when no production builder
+/// could be identified at all, merely outside `#[cfg(test)]`. The fallback
+/// is deliberate: with nothing to scope to, "anything non-test" is a
+/// better read than "nothing counts".
+fn in_production(call: &CallSite<'_>, scopes: &[*const syn::ItemFn]) -> bool {
+    if scopes.is_empty() {
+        !call.is_cfg_test
+    } else {
+        call.enclosing_fns.iter().any(|f| scopes.contains(f))
+    }
+}
+
+/// The value a receiver expression starts from: a call in the SAME chain
+/// (`.receiver`), a plain name to resolve through a binding, or a fresh
+/// value (`App::new()`, a literal, …) with no binding behind it.
+enum ChainOutcome<'ast> {
+    Found,
+    Root(&'ast syn::Ident),
+    Dead,
+}
+
+/// Walk `expr`'s receiver chain, looking for a call to `method`.
+///
+/// Only look at this chain's own depth — never inside a nested call's
+/// arguments, such as a closure passed to `.layer(...)`. This function
+/// follows receiver links only.
+fn chain_walk<'ast>(mut expr: &'ast syn::Expr, method: &str) -> ChainOutcome<'ast> {
+    loop {
+        match expr {
+            syn::Expr::MethodCall(mc) => {
+                if mc.method == method {
+                    return ChainOutcome::Found;
+                }
+                expr = &mc.receiver;
+            }
+            syn::Expr::Path(p) => {
+                return p
+                    .path
+                    .get_ident()
+                    .map_or(ChainOutcome::Dead, ChainOutcome::Root);
+            }
+            _ => return ChainOutcome::Dead,
+        }
+    }
+}
+
+/// The trailing expression of `block` — what it evaluates to — or `None`
+/// when the last statement ends in `;` and the block yields `()`.
+fn block_tail(block: &syn::Block) -> Option<&syn::Expr> {
+    match block.stmts.last()? {
+        syn::Stmt::Expr(expr, None) => Some(expr),
+        _ => None,
+    }
+}
+
+/// The leaf expressions a value can actually come from: the branches of a
+/// conditional or a bare block, expanded recursively. Which branch runs is
+/// a choice made at runtime, so every one of them has to be checked.
+fn branch_candidates(expr: &syn::Expr) -> Vec<&syn::Expr> {
+    match expr {
+        syn::Expr::If(e) => {
+            let mut out = block_tail(&e.then_branch)
+                .map(branch_candidates)
+                .unwrap_or_default();
+            if let Some((_, else_expr)) = &e.else_branch {
+                out.extend(branch_candidates(else_expr));
+            }
+            out
+        }
+        syn::Expr::Match(e) => e
+            .arms
+            .iter()
+            .flat_map(|arm| branch_candidates(&arm.body))
+            .collect(),
+        syn::Expr::Block(e) => block_tail(&e.block)
+            .map(branch_candidates)
+            .unwrap_or_default(),
+        _ => vec![expr],
+    }
+}
+
+/// The value a statement gives a name, in either form Rust spells it: a
+/// `let`, or a plain reassignment.
+///
+/// Both forms carry a builder forward the same way. `let mut app =
+/// build(); app = app.i18n(b);` rebinds `app`. A second `let app = …;`
+/// does the same thing.
+fn stmt_binds<'ast>(stmt: &'ast syn::Stmt, name: &str) -> Option<&'ast syn::Expr> {
+    match stmt {
+        syn::Stmt::Local(local) => {
+            let pat = match &local.pat {
+                syn::Pat::Ident(pat) => pat,
+                // A type annotation may sit between the name and `=`
+                // (`let app: App = …;`); the pattern is nested one level.
+                syn::Pat::Type(pat_type) => match &*pat_type.pat {
+                    syn::Pat::Ident(pat) => pat,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if pat.ident != name {
+                return None;
+            }
+            local.init.as_ref().map(|init| &*init.expr)
+        }
+        syn::Stmt::Expr(syn::Expr::Assign(assign), _) => match &*assign.left {
+            syn::Expr::Path(path) if path.path.get_ident().is_some_and(|id| id == name) => {
+                Some(&*assign.right)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Every reassignment of `name` reachable from a bare `if`/`match`/block
+/// STATEMENT — one that is not itself a value, so a path through it that
+/// skips the reassignment leaves `name` holding whatever it held before.
+///
+/// `if flag { app = app.i18n(bundle()); }` with no `else` is the case this
+/// exists for: the assignment runs on ONE path only, so it is a candidate
+/// alongside — never instead of — whatever `name` held going in. Missing
+/// it would read a conditionally-installed bundle as never installed at
+/// all, and clear it.
+fn reachable_reassignments<'ast>(
+    expr: &'ast syn::Expr,
+    name: &str,
+    out: &mut Vec<&'ast syn::Expr>,
+) {
+    match expr {
+        syn::Expr::If(e) => {
+            reachable_reassignments_in_block(&e.then_branch, name, out);
+            if let Some((_, else_expr)) = &e.else_branch {
+                reachable_reassignments(else_expr, name, out);
+            }
+        }
+        syn::Expr::Block(e) => reachable_reassignments_in_block(&e.block, name, out),
+        syn::Expr::Match(e) => {
+            for arm in &e.arms {
+                reachable_reassignments(&arm.body, name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`reachable_reassignments`]'s scan over one block's own statements.
+fn reachable_reassignments_in_block<'ast>(
+    block: &'ast syn::Block,
+    name: &str,
+    out: &mut Vec<&'ast syn::Expr>,
+) {
+    for stmt in &block.stmts {
+        if let Some(rhs) = stmt_binds(stmt, name) {
+            out.push(rhs);
+        }
+        if let syn::Stmt::Expr(expr, _) = stmt {
+            reachable_reassignments(expr, name, out);
+        }
+    }
+}
+
+/// Every place `name` could be bound reaching `frames`, searching this
+/// nesting level and then outward.
+///
+/// Each comes with the frame stack a caller must use to resolve THAT
+/// binding's own free names — narrowed to the statements before it.
+///
+/// A plain `let`/reassignment fully replaces `name`, so it is the only
+/// candidate returned once found: nothing earlier can still be reached
+/// through this name. A bare conditional STATEMENT reassigning `name` does
+/// not — the path that skips it leaves `name` unchanged — so its
+/// reassignment is returned ALONGSIDE the search continuing past it,
+/// exactly like a plain binding would once it is found.
+fn resolve_bindings<'ast>(
+    frames: &[Frame<'ast>],
+    name: &str,
+) -> Vec<(&'ast syn::Expr, Vec<Frame<'ast>>)> {
+    let mut out = Vec::new();
+    for depth in (0..frames.len()).rev() {
+        let frame = frames[depth];
+        for (i, stmt) in frame.block.stmts[..frame.before].iter().enumerate().rev() {
+            let mut narrowed = frames[..=depth].to_vec();
+            narrowed[depth] = Frame {
+                block: frame.block,
+                before: i,
+            };
+            if let Some(rhs) = stmt_binds(stmt, name) {
+                out.push((rhs, narrowed));
+                return out;
+            }
+            if let syn::Stmt::Expr(expr, _) = stmt {
+                let mut conditional = Vec::new();
+                reachable_reassignments(expr, name, &mut conditional);
+                out.extend(conditional.into_iter().map(|rhs| (rhs, narrowed.clone())));
             }
         }
     }
-    None
+    out
+}
+
+/// Whether the value reaching `expr` has already flowed through `method`.
+///
+/// It may flow through the call's own chain, or through earlier rebindings
+/// and conditional branches that lead back to where the chain started.
+///
+/// A bundle on ANY reachable branch counts. Which branch runs is a runtime
+/// choice. Inserting `.i18n_auto()` based on a branch that might not run
+/// could clear a bundle the flag would still select.
+///
+/// `depth` bounds the walk against a pathological, deeply-rebound input;
+/// valid Rust cannot cycle through its own bindings.
+fn value_already_called<'ast>(
+    expr: &'ast syn::Expr,
+    frames: &[Frame<'ast>],
+    method: &str,
+    depth: u32,
+) -> bool {
+    if depth > 256 {
+        return false;
+    }
+    branch_candidates(expr)
+        .into_iter()
+        .any(|candidate| match chain_walk(candidate, method) {
+            ChainOutcome::Found => true,
+            ChainOutcome::Dead => false,
+            ChainOutcome::Root(name) => resolve_bindings(frames, &name.to_string())
+                .into_iter()
+                .any(|(rhs, next)| value_already_called(rhs, &next, method, depth + 1)),
+        })
+}
+
+/// Whether the app value reaching `call` has already been passed through
+/// `method` (`"i18n"` or `"i18n_auto"`).
+fn method_called_before(call: &CallSite<'_>, method: &str) -> bool {
+    value_already_called(call.call, &call.frames, method, 0)
 }
 
 /// The outcome of trying to wire `.i18n_auto()` into `main.rs`.
@@ -2057,179 +2091,83 @@ pub(super) enum I18nAutoWiring {
     /// The builder chain now calls `.i18n_auto()` (or already did).
     Wired(String),
     /// The app installs its own `Bundle` with `.i18n(...)` — from embedded
-    /// files, a translation-management service, memory. That bundle takes
-    /// precedence over any filesystem load, so the keys this generator wrote to
-    /// disk will never reach it, and every generated label renders as a
-    /// placeholder even though generation and `t!`'s compile-time check both
-    /// succeeded. `main.rs` is left alone (swapping someone's bundle for a
-    /// filesystem load would be worse) and the caller warns.
+    /// files, a translation-management service, memory.
+    ///
+    /// That bundle takes precedence over any filesystem load. So the keys
+    /// this generator wrote to disk never reach it. Every generated label
+    /// then renders as a placeholder, even though generation and `t!`'s
+    /// compile-time check both succeeded. `main.rs` is left alone —
+    /// swapping someone's bundle for a filesystem load would be worse —
+    /// and the caller warns.
     CustomBundle,
-    /// No real `.routes(` call was found, so there is nowhere safe to insert.
-    /// The caller surfaces this as a plan warning rather than writing the call
-    /// into a comment, where it would silently never run.
+    /// No real `.routes(` call was found, so there is nowhere safe to
+    /// insert.
+    ///
+    /// This also covers a `main.rs` that fails to parse as Rust — a
+    /// stricter check than this generator needs, but it is treated the
+    /// same way. Leave the file alone, and let the caller warn instead of
+    /// guessing at code it cannot fully read.
     NoAnchor,
 }
 
-/// The body braces of the innermost `fn` containing `at`.
-///
-/// Used where the question really is per-FUNCTION rather than per-chain: the
-/// locale install is a statement of its own (`let app =
-/// app.embedded_locales(&…);`), not a link in the builder chain, so "is this
-/// production?" is answered by which function it sits in.
-fn enclosing_body(src: &str, at: usize) -> Option<(usize, usize)> {
-    real_offsets(src, "fn ")
-        .into_iter()
-        .filter(|&fn_at| fn_at < at)
-        .filter_map(|fn_at| brace_block(src, fn_at))
-        .filter(|&(open, close)| open < at && at < close)
-        .max_by_key(|&(open, _)| open)
-}
-
-/// The `.routes(` calls belonging to builders the BINARY runs, or empty when
-/// that cannot be told apart from a helper's.
-///
-/// A builder inside `fn main`'s body is unambiguous. Otherwise `main` delegates
-/// (`fn main() { build_app().serve() }`), and the only safe read is when the
-/// file holds exactly one builder. Picking the first of several was a guess
-/// dressed as a default: with a preview helper above `build_app()` it wires the
-/// preview, production renders raw keys, and the idempotency guard stops any
-/// later run from correcting it. A refusal the caller can warn about is worth
-/// more than a coin flip that cannot be retried.
-fn production_routes_anchors(main_rs: &str) -> Vec<usize> {
-    // Token-wise, like every other method detection here: `.routes
-    // (routes![…])` and a comment before the paren are valid Rust, and missing
-    // the anchor makes the whole wiring a no-op — the scaffold emits translated
-    // views and never installs the bundle to resolve them.
-    let offsets: Vec<usize> = method_call_offsets(main_rs, ".routes").collect();
-    // EVERY `fn main`, not just the first. `#[cfg(unix)] fn main()` beside
-    // `#[cfg(windows)] fn main()` is one entry point per target, and both are
-    // production: wiring only the first leaves the other rendering raw keys,
-    // and the idempotency guard means no later run repairs it. On an
-    // IDENTIFIER boundary, so `fn main_preview()` is not one of them.
-    let main_bodies: Vec<(usize, usize)> = real_offsets(main_rs, "fn main")
-        .into_iter()
-        .filter(|&at| {
-            main_rs[at + "fn main".len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-        })
-        .filter(|&at| !in_cfg_test(main_rs, at))
-        .filter_map(|at| brace_block(main_rs, at))
-        .collect();
-    // EVERY builder inside those, not just the first: a conditionally-built
-    // app has one per branch, and each is production.
-    if !main_bodies.is_empty() {
-        let inside: Vec<usize> = offsets
-            .iter()
-            .copied()
-            .filter(|&o| {
-                main_bodies
-                    .iter()
-                    .any(|&(open, close)| o > open && o < close)
-            })
-            .collect();
-        if !inside.is_empty() {
-            return inside;
-        }
-    }
-    // `main` delegates. A `#[cfg(test)]` builder is not a candidate at all —
-    // it cannot be the one the binary runs — and excluding it keeps the very
-    // common `build_app()` + `#[cfg(test)] test_app()` shape working. What is
-    // left must be unambiguous: two ordinary builders (a preview helper beside
-    // the real one) is a coin flip, and a wrong flip cannot be retried, since
-    // the inserted call makes every later run a no-op.
-    let candidates: Vec<usize> = offsets
-        .iter()
-        .copied()
-        .filter(|&o| !in_cfg_test(main_rs, o))
-        .collect();
-    match candidates.as_slice() {
-        [only] => vec![*only],
-        _ => Vec::new(),
-    }
-}
-
-/// Whether `at` sits inside a `#[cfg(test)]` item — the fixture module or
-/// function, whose builder is never the one the binary runs.
-fn in_cfg_test(src: &str, at: usize) -> bool {
-    real_offsets(src, "#[cfg(test)]")
-        .into_iter()
-        .filter_map(|attr| cfg_item_span(src, attr))
-        .any(|(start, end)| start < at && at < end)
-}
-
-/// The span of the item an attribute at `attr` applies to.
-///
-/// An item is EITHER brace-delimited (`mod`, `fn`, `impl`) or
-/// semicolon-terminated (`static`, `const`, `use`, `type`). Taking the next
-/// brace unconditionally walks straight past a `static … ;` and lands on some
-/// unrelated later block — which both fails to recognise the test-only static
-/// AND drags whatever that later block is into the `cfg(test)` region. A
-/// `#[cfg(test)] static EMBEDDED_LOCALES` read as production is the concrete
-/// harm: the install gets added to production code referring to a symbol that
-/// does not exist there, and the `--embed` release stops compiling.
-fn cfg_item_span(src: &str, attr: usize) -> Option<(usize, usize)> {
-    const ATTR: &str = "#[cfg(test)]";
-    let after = attr + ATTR.len();
-    let rest = &src[after..];
-    let brace = real_offsets(rest, "{").first().copied();
-    let semi = real_offsets(rest, ";").first().copied();
-    match (brace, semi) {
-        // Whichever terminator comes first decides which kind of item this is.
-        (Some(b), Some(s)) if s < b => Some((attr, after + s)),
-        (None, Some(s)) => Some((attr, after + s)),
-        (Some(_), _) => brace_block(src, after).map(|(_, close)| (attr, close)),
-        (None, None) => None,
-    }
+/// The leading whitespace of the line containing byte offset `at`.
+fn line_indent(src: &str, at: usize) -> &str {
+    let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line = &src[line_start..];
+    let indent_len = line.len() - line.trim_start().len();
+    &line[..indent_len]
 }
 
 /// Insert `.i18n_auto()` into the `AppBuilder` chain in `main.rs` so the
 /// generated `t!` lookups actually resolve (AC4's "zero further config").
 ///
-/// Inserted immediately before the first REAL `.routes(` call — the same anchor
-/// `autumn new --with-i18n` uses, but found with a comment/string-aware scan
-/// (see [`real_offsets`]). A `main.rs` that already installs a
-/// bundle — `.i18n_auto()` or an explicit `.i18n(...)` — is left untouched: an
-/// app that built its own `Bundle` from embedded files or a
-/// translation-management service must not have it swapped for a filesystem
+/// Inserted immediately before the first REAL `.routes(` call — the same
+/// anchor `autumn new --with-i18n` uses.
+///
+/// A `main.rs` that already installs a bundle — through `.i18n_auto()` or
+/// an explicit `.i18n(...)` — is left untouched. An app that builds its
+/// own `Bundle`, from embedded files or a translation-management service,
+/// keeps that bundle. The generator must not swap it for a filesystem
 /// load.
 pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
-    // WHICH builders are production is decided first, and everything else is
-    // asked about those builders rather than about the file. A `main.rs` can
-    // hold several — a preview helper, a `#[cfg(test)]` fixture — and file-wide
-    // questions gave wrong answers on ordinary layouts: a `.i18n(test_bundle())`
-    // in a fixture reported the whole app as custom-bundled and left production
-    // unwired, and an `.i18n_auto()` on the fixture reported it as already done.
-    let anchors = production_routes_anchors(main_rs);
+    let Ok(file) = syn::parse_file(main_rs) else {
+        return I18nAutoWiring::NoAnchor;
+    };
+    let collector = Collector::collect(&file);
+
+    // WHICH builders are production is decided first, and everything else
+    // is asked about those builders rather than about the file. A
+    // `main.rs` can hold several `main` functions — a preview helper, a
+    // `#[cfg(test)]` fixture. File-wide questions gave wrong answers on
+    // ordinary layouts. A `.i18n(test_bundle())` in a fixture reported the
+    // whole app as custom-bundled and left production unwired. An
+    // `.i18n_auto()` on the fixture reported the app as already wired.
+    let anchors = production_anchors(&collector);
     if anchors.is_empty() {
         return I18nAutoWiring::NoAnchor;
     }
+
     // EVERY production branch, not just the first, and each judged ON ITS OWN.
     // `main` may build the app conditionally — one `.routes(` per configuration
     // branch — and one branch carrying `.i18n_auto()` says nothing about its
-    // sibling. A hand-installed `.i18n(...)` is asked about the enclosing
-    // function instead of the chain; [`custom_bundle_before`] carries the
-    // reasoning for the difference.
+    // sibling.
     //
     // A chain with its own bundle is LEFT ALONE rather than blocking the rest.
-    // `.i18n_auto()` CLEARS a preloaded bundle and switches to filesystem
-    // loading, so wiring it into that chain would replace the app's embedded or
-    // TMS-backed bundle and can panic when nothing is on disk — but that is a
-    // reason to skip THAT chain, not to abandon its siblings to raw keys.
+    // `.i18n_auto()` clears a preloaded bundle and switches to filesystem
+    // loading. Wiring it into that chain would replace the app's embedded or
+    // translation-management-service bundle, and it can panic when nothing is
+    // on disk. That is a reason to skip that one chain, not to leave its
+    // siblings with raw keys.
     let mut custom = false;
     let mut pending = Vec::new();
-    for at in anchors {
-        if custom_bundle_before(main_rs, at) {
+    for anchor in anchors {
+        if method_called_before(anchor, "i18n") {
             custom = true;
-        } else if !chain_already_wired(main_rs, at) {
-            pending.push(at);
+        } else if !method_called_before(anchor, "i18n_auto") {
+            pending.push(anchor);
         }
     }
     if pending.is_empty() {
-        // Nothing to add. Say WHY: a file whose only production chain installs
-        // its own bundle is reported, so the caller warns rather than claiming
-        // success.
         return if custom {
             I18nAutoWiring::CustomBundle
         } else {
@@ -2237,434 +2175,230 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
         };
     }
 
+    let index = SourceIndex::new(main_rs);
+    let mut sites: Vec<usize> = pending
+        .iter()
+        .map(|anchor| index.byte_offset(anchor.dot_span.start()))
+        .collect();
+    sites.sort_unstable();
+
     // Applied back-to-front so each insertion leaves the earlier offsets valid.
     let mut out = main_rs.to_owned();
-    for at in pending.into_iter().rev() {
-        // Reuse the anchor line's own indentation so the inserted call sits in
-        // the builder chain rather than at some arbitrary column.
+    for at in sites.into_iter().rev() {
         let line_start = out[..at].rfind('\n').map_or(0, |i| i + 1);
-        if out[line_start..at].trim_start().is_empty() {
-            let indent: String = out[line_start..at]
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .collect();
+        let indent = line_indent(&out, at);
+        if line_start + indent.len() == at {
+            // `.routes(` is the first token on its line: reuse the line's own
+            // indentation so the inserted call sits in the builder chain
+            // rather than at some arbitrary column.
+            let indent = indent.to_owned();
             out = format!(
                 "{}{indent}.i18n_auto()\n{}",
                 &out[..line_start],
                 &out[line_start..]
             );
         } else {
-            // `.routes(` is not the first token on its line (e.g. a single-line
-            // builder chain). Insert inline, which is still valid Rust.
+            // A single-line builder chain — inserted inline, still valid Rust.
             out = format!("{}.i18n_auto(){}", &out[..at], &out[at..]);
         }
     }
     I18nAutoWiring::Wired(out)
 }
 
-/// Whether the builder chain ending at `.routes(` offset `at` already calls
-/// `.i18n_auto()`.
-///
-/// The chain is delimited by the previous `;` or `{` — the start of the
-/// statement this call belongs to — so one branch being wired says nothing
-/// about its sibling.
-fn chain_already_wired(src: &str, at: usize) -> bool {
-    method_called_before(src, at, ".i18n_auto")
+/// Whether `expr` is `autumn_web::embed_locales!(...)`, the macro this
+/// generator wires up — as opposed to a hand-rolled or otherwise-built
+/// `EMBEDDED_LOCALES`, which is left alone.
+fn is_embed_locales_macro(expr: &syn::Expr) -> bool {
+    let syn::Expr::Macro(mac) = expr else {
+        return false;
+    };
+    let segments: Vec<&syn::Ident> = mac.mac.path.segments.iter().map(|s| &s.ident).collect();
+    matches!(segments.as_slice(), [a, b] if *a == "autumn_web" && *b == "embed_locales")
 }
 
-/// Whether a bundle is already installed on the app the chain at `at` builds.
-fn custom_bundle_before(src: &str, at: usize) -> bool {
-    method_called_before(src, at, ".i18n")
-}
+/// Embed the locale bundle into the binary for `autumn build --embed`,
+/// matching what `autumn new --with-i18n` wires into a fresh app.
+///
+/// `.i18n_auto()` alone loads from DISK.
+///
+/// An `--embed` build is supposed to be self-contained. Without this call,
+/// the binary still reads the locale directory at startup. Run it from an
+/// empty deployment directory, or from the release image (whose
+/// embedded-build path ships no sidecar on purpose), and it panics on a
+/// missing default bundle — after a build that looked entirely clean.
+///
+/// Both edits sit behind the `embed-assets` feature that already gates the
+/// template's static assets. They are anchored beside the PRODUCTION
+/// `EMBEDDED_STATIC` declaration and its `.embedded_static(&EMBEDDED_STATIC)`
+/// install. This returns `None` when neither is present — an `--api` app, a
+/// hand-rolled `main.rs`, or a file that fails to parse — so the caller can
+/// warn instead of guessing. It returns the input unchanged when the locales
+/// are already embedded.
+pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
+    // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
+    // through as the macro's literal argument — escaped, because this is the one
+    // place a `dir` read out of `autumn.toml` becomes Rust source.
+    let macro_call = if dir == "i18n" {
+        "autumn_web::embed_locales!()".to_owned()
+    } else {
+        format!(
+            "autumn_web::embed_locales!(\"{}\")",
+            rust_string_escape(dir)
+        )
+    };
 
-/// Whether the app value reaching `at` has already flowed through `method`.
-///
-/// The value's LEXICAL FLOW, which is neither of the fixed windows tried
-/// before: the enclosing block up to `at`, then each ancestor level up to where
-/// the inner construct opened, and at every level only that level's own nesting
-/// depth. So an enclosing statement is visible and a sibling branch is not.
-///
-/// Each fixed window got a real layout wrong, and each got it wrong in the
-/// severe direction — inserting `.i18n_auto()`, which CLEARS a preloaded
-/// bundle and switches the app to a filesystem load, or skipping a chain that
-/// then renders raw keys:
-///
-///   * The CHAIN missed the ordinary rebinding `let app = app.i18n(bundle);`
-///     followed by `let app = app.routes(…);` — one app, two statements.
-///   * The enclosing FUNCTION read a sibling `if` branch's bundle as this
-///     branch's, and left the branch that had none unwired.
-///   * The enclosing BLOCK missed a bundle installed BEFORE an `if` and
-///     inherited by every branch, wiring `.i18n_auto()` into each of them.
-///
-/// Ascending the levels while skipping nested groups is exactly what separates
-/// "inherited from an enclosing statement" from "installed only in a sibling
-/// branch", so both questions this module asks about a chain can share it
-/// rather than trading one failure for another.
-///
-/// Stopping at `at` keeps a call made AFTER the routes chain out of it: that
-/// one runs later and overrides `.i18n_auto()` rather than being clobbered by
-/// it, so there is nothing to protect.
-fn method_called_before(src: &str, at: usize, method: &str) -> bool {
-    // The chain itself, first: `App::new().i18n(b).routes(…)` needs no
-    // bindings followed.
-    let start = statement_start(src, at);
-    if calls_at_own_depth(&src[start..at], method) {
-        return true;
+    let file = syn::parse_file(main_rs).ok()?;
+    let collector = Collector::collect(&file);
+    let index = SourceIndex::new(main_rs);
+
+    // PRODUCTION occurrences only. A `#[cfg(test)]` fixture that happens to
+    // mention `EMBEDDED_LOCALES` is not the binary's embedding, and treating it
+    // as one returns "already wired" while `autumn build --embed` ships a
+    // release binary with no bundle in it.
+    let embedded_in_production = collector
+        .embedded_locales_idents
+        .iter()
+        .any(|is_test| !is_test);
+
+    if embedded_in_production {
+        // Already embedded — but not necessarily from the right place. A
+        // project that changed `[i18n] dir` after its first `--i18n` scaffold
+        // keeps embedding the OLD directory, so this repoints the PRODUCTION
+        // static's own macro call — never a differently-named neighbour, such
+        // as an `ADMIN_EMBEDDED_LOCALES` beside it — and only when that
+        // initialiser is this macro at all; a hand-rolled or macro-generated
+        // static is left alone, and only the install below is checked.
+        let production_decl = collector
+            .statics
+            .iter()
+            .find(|(item, is_test)| !is_test && item.ident == "EMBEDDED_LOCALES");
+        let out = match production_decl {
+            Some((item, _)) if is_embed_locales_macro(&item.expr) => {
+                let range = index.range(item.expr.span());
+                format!(
+                    "{}{macro_call}{}",
+                    &main_rs[..range.start],
+                    &main_rs[range.end..]
+                )
+            }
+            _ => main_rs.to_owned(),
+        };
+        // Unconditionally: the insertion is per-anchor and skips the ones
+        // already served, so "some branch has it" can no longer stand in for
+        // "every branch has it".
+        return insert_locale_install(&out);
     }
-    // Otherwise the chain starts from a NAME, and only that name's value is
-    // this app. A lexical-depth scan counted every earlier call at the same
-    // level, so `let preview = preview.i18n(bundle);` above `let app =
-    // app.routes(…)` reported the production chain as already bundled — and
-    // for `.i18n_auto` that is silent: the caller reports success and
-    // production renders raw keys.
-    let statement = &src[start..at];
-    // Following them transitively matters: giving up after one hop would miss
-    // a bundle installed two rebindings back, and MISSING one is the failure
-    // that clears it. A conditional initialiser contributes EVERY branch's
-    // root, since which one runs is a runtime choice — so this is a frontier,
-    // not a single name. Bounded only against a pathological input; valid Rust
-    // cannot cycle.
-    let mut frontier: Vec<(&str, usize)> =
-        value_roots(binds(statement).map_or(statement, |(_, init)| init))
-            .into_iter()
-            .map(|name| (name, start))
-            .collect();
-    for _ in 0..64 {
-        let Some((name, before)) = frontier.pop() else {
-            return false;
-        };
-        let Some((bind_start, bind_end)) = binding_of(src, before, name) else {
-            continue;
-        };
-        let statement = &src[bind_start..bind_end];
-        let initialiser = binds(statement).map_or(statement, |(_, init)| init);
-        if calls_at_own_depth(initialiser, method) {
-            return true;
-        }
-        frontier.extend(
-            value_roots(initialiser)
-                .into_iter()
-                .map(|next| (next, bind_start)),
+
+    // Beside the PRODUCTION static, on the same production test the install
+    // below uses. A `#[cfg(test)]` module can declare its own fixture with the
+    // very same declaration, and treating the FIRST occurrence in the file as
+    // "the" static would declare `EMBEDDED_LOCALES` inside that module while
+    // the install went — correctly — into the production builder.
+    let (production_static, _) = collector
+        .statics
+        .iter()
+        .find(|(item, is_test)| !is_test && item.ident == "EMBEDDED_STATIC")?;
+    let at = index.range(production_static.span()).end;
+    let with_static = format!(
+        "{}\n#[cfg(feature = \"embed-assets\")]\nstatic EMBEDDED_LOCALES: autumn_web::include_dir::Dir = {macro_call};{}",
+        &main_rs[..at],
+        &main_rs[at..]
+    );
+    insert_locale_install(&with_static)
+}
+
+/// Whether `anchor`'s block already carries an `.embedded_locales(` call —
+/// per BLOCK, because that is what a conditional branch is: one branch
+/// already carrying the call says nothing about its sibling.
+fn locales_installed_beside(
+    anchor: &CallSite<'_>,
+    embedded_locales_calls: &[CallSite<'_>],
+) -> bool {
+    let Some(&block) = anchor.frames.last().map(|f| &f.block) else {
+        return false;
+    };
+    embedded_locales_calls.iter().any(|c| {
+        c.frames
+            .last()
+            .is_some_and(|f| std::ptr::eq(f.block, block))
+    })
+}
+
+/// Byte offset right after the statement whose method call ends at `end` —
+/// its terminating `;`, plus the following newline when there is one. The
+/// calls this anchors on (`app.embedded_static(&EMBEDDED_STATIC)`) are
+/// always a bare statement of their own, so the next `;` is that
+/// statement's.
+fn statement_end(src: &str, end: usize) -> usize {
+    let mut at = src[end..].find(';').map_or(src.len(), |i| end + i + 1);
+    if src[at..].starts_with('\n') {
+        at += 1;
+    }
+    at
+}
+
+/// Splice `.embedded_locales(&EMBEDDED_LOCALES)` in after every PRODUCTION
+/// `embedded_static` install that does not already have one beside it, or
+/// `None` when there is no such install at all (and none of the locales
+/// calls the file already carries are production either).
+///
+/// EVERY production anchor, each judged on its own — the same per-branch
+/// shape [`ensure_i18n_auto`] uses, and for the same reason. A `main` that
+/// builds the app conditionally has one `embedded_static` install per
+/// branch, every one of them production; serving only the first leaves the
+/// others loading locales from disk, so an `--embed` deployment panics
+/// whenever it takes one of those branches, with the bundle sitting unused
+/// in the binary.
+fn insert_locale_install(src: &str) -> Option<String> {
+    let file = syn::parse_file(src).ok()?;
+    let collector = Collector::collect(&file);
+    let index = SourceIndex::new(src);
+
+    let routes_anchors = production_anchors(&collector);
+    let scopes = production_fn_ptrs(&routes_anchors);
+
+    let anchors: Vec<&CallSite<'_>> = collector
+        .embedded_static_calls
+        .iter()
+        .filter(|c| in_production(c, &scopes))
+        .collect();
+    let pending: Vec<&CallSite<'_>> = anchors
+        .iter()
+        .filter(|c| !locales_installed_beside(c, &collector.embedded_locales_calls))
+        .copied()
+        .collect();
+
+    if pending.is_empty() {
+        // Nothing to add — but say whether that is because everything is
+        // served or because there was nowhere to write. A file with no
+        // production anchor at all is only "done" when the call is already
+        // there; otherwise the caller has to warn.
+        let served = !anchors.is_empty()
+            || collector
+                .embedded_locales_calls
+                .iter()
+                .any(|c| in_production(c, &scopes));
+        return served.then(|| src.to_owned());
+    }
+
+    let mut sites: Vec<usize> = pending
+        .iter()
+        .map(|c| index.range(c.call.span()).end)
+        .collect();
+    sites.sort_unstable();
+
+    // Back-to-front, so each insertion leaves the earlier offsets valid.
+    let mut out = src.to_owned();
+    for call_end in sites.into_iter().rev() {
+        let indent = line_indent(&out, call_end).to_owned();
+        let at = statement_end(&out, call_end);
+        out = format!(
+            "{}{indent}#[cfg(feature = \"embed-assets\")]\n{indent}let app = app.embedded_locales(&EMBEDDED_LOCALES);\n{}",
+            &out[..at],
+            &out[at..]
         );
     }
-    false
-}
-
-/// The identifiers an expression's value can come from.
-///
-/// One for a plain chain, and one per branch for a conditional: `let app = if
-/// use_tms { tms } else { plain };` produces whichever the flag picks, so both
-/// have to be followed. Empty when the expression starts from something with no
-/// binding behind it.
-fn value_roots(expr: &str) -> Vec<&str> {
-    if let Some(root) = value_root(expr) {
-        return vec![root];
-    }
-    // A conditional or block expression: each brace group at the expression's
-    // own PAREN depth is a branch, and its tail is what that branch yields.
-    // Groups nested inside a call — a closure body — are not branches.
-    brace_groups(expr)
-        .into_iter()
-        .filter_map(|(open, close)| value_root(&expr[open..close]))
-        .collect()
-}
-
-/// Spans just inside each `{ … }` group at `expr`'s own paren depth.
-fn brace_groups(expr: &str) -> Vec<(usize, usize)> {
-    let marks = delimiter_marks(expr, expr.len());
-    let mut out = Vec::new();
-    let mut paren = 0i32;
-    let mut brace = 0i32;
-    let mut open = 0usize;
-    for &(offset, byte) in &marks {
-        match byte {
-            b'(' | b'[' => paren += 1,
-            b')' | b']' => paren -= 1,
-            b'{' if paren <= 0 => {
-                if brace == 0 {
-                    open = offset + 1;
-                }
-                brace += 1;
-            }
-            b'}' if paren <= 0 => {
-                brace -= 1;
-                if brace == 0 {
-                    out.push((open, offset));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The nearest statement before `before` that gives `name` a value, searching
-/// this block level and then outward.
-///
-/// Outward matters and nested does not: a binding made in an enclosing block is
-/// what a conditional branch continues from, while one made inside a sibling
-/// branch belongs to that branch alone.
-fn binding_of(src: &str, before: usize, name: &str) -> Option<(usize, usize)> {
-    let mut end = before;
-    loop {
-        let level = enclosing_block_start(src, end);
-        if let Some(found) = statements_in(src, level, end)
-            .into_iter()
-            .rev()
-            .find(|&(s, e)| binds(&src[s..e]).is_some_and(|(bound, _)| bound == name))
-        {
-            return Some(found);
-        }
-        if level == 0 {
-            return None;
-        }
-        end = level - 1;
-    }
-}
-
-/// Spans of the COMPLETE statements of `src[start..end]` at its own nesting
-/// level — those a `;` closes.
-///
-/// The trailing unterminated run is deliberately not one of them. Ascending out
-/// of a block lands mid-statement, and that statement is the construct being
-/// searched from: `let app = if flag {` is where this app is going, not a prior
-/// binding of it, and returning it makes the search resolve `app` to itself.
-fn statements_in(src: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
-    let region = &src[start..end];
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut statement = 0usize;
-    for &(offset, byte) in &delimiter_marks(region, region.len()) {
-        match byte {
-            b'{' | b'(' | b'[' => depth += 1,
-            b'}' | b')' | b']' => depth -= 1,
-            b';' if depth <= 0 => {
-                out.push((start + statement, start + offset));
-                statement = offset + 1;
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// `(name, expression)` for a statement that gives a name a value, in either
-/// form Rust spells it.
-///
-/// A `let` and a plain reassignment are the same step to a builder: `let mut
-/// app = build(); app = app.i18n(bundle); app = app.routes(…);` is the
-/// mutable spelling of the same chain, and reading only `let` skipped straight
-/// past the bundle and cleared it.
-fn binds(statement: &str) -> Option<(&str, &str)> {
-    let_parts(statement).or_else(|| assignment_parts(statement))
-}
-
-/// `(assigned name, expression)` for a bare `<ident> = <expr>` statement.
-///
-/// Whole-value assignment only. `app.field = x` and `app += x` change
-/// something about the value rather than replacing it, and neither carries the
-/// builder forward; nothing between the name and the `=` but whitespace and
-/// comments is what tells them apart.
-fn assignment_parts(statement: &str) -> Option<(&str, &str)> {
-    let rest = &statement[ignorable_prefix_len(statement)..];
-    let len = rest
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let (name, after) = rest.split_at(len);
-    if name.is_empty()
-        || name.starts_with(|c: char| c.is_ascii_digit())
-        || matches!(
-            name,
-            "let" | "if" | "match" | "while" | "for" | "loop" | "return" | "unsafe" | "async"
-        )
-    {
-        return None;
-    }
-    let after = &after[ignorable_prefix_len(after)..];
-    let value = after.strip_prefix('=')?;
-    // `==` is a comparison and `=>` a match arm; neither assigns.
-    (!value.starts_with(['=', '>'])).then_some((name, value))
-}
-
-/// `(bound name, initialiser)` for a `let <ident> = <expr>` statement.
-///
-/// Only a plain identifier binds a name this can follow. A destructuring
-/// pattern binds no single value, and reporting one would attribute an app to
-/// whatever the tuple happened to hold.
-fn let_parts(statement: &str) -> Option<(&str, &str)> {
-    let rest = statement.trim_start();
-    let rest = rest.strip_prefix("let")?;
-    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-        // `letters` is not `let`.
-        return None;
-    }
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix("mut").map_or(rest, |after| {
-        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-            rest
-        } else {
-            after
-        }
-    });
-    let rest = rest.trim_start();
-    let name_len = rest
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let (name, after) = rest.split_at(name_len);
-    if name.is_empty() {
-        return None;
-    }
-    // A type annotation may sit between the name and the `=`; nothing else this
-    // needs to read can. `==` and `=>` cannot appear here.
-    let eq = real_offsets(after, "=")
-        .into_iter()
-        .find(|&at| !after[at + 1..].starts_with(['=', '>']))?;
-    Some((name, &after[eq + 1..]))
-}
-
-/// The identifier an expression's value starts from — `app` in
-/// `app.routes(…)` — or `None` when it starts from something this cannot
-/// follow: a path or call (`App::new()`), a block, or a keyword.
-fn value_root(expr: &str) -> Option<&str> {
-    let rest = &expr[ignorable_prefix_len(expr)..];
-    let len = rest
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let ident = &rest[..len];
-    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    // `App::new()` is a fresh value, and a keyword opens a construct rather
-    // than naming one. Either way there is no binding to follow.
-    let after = &rest[len..];
-    let after = &after[ignorable_prefix_len(after)..];
-    if after.starts_with("::")
-        || after.starts_with('!')
-        || after.starts_with('(')
-        || matches!(
-            ident,
-            "if" | "match"
-                | "loop"
-                | "while"
-                | "for"
-                | "let"
-                | "unsafe"
-                | "async"
-                | "move"
-                | "return"
-        )
-    {
-        return None;
-    }
-    Some(ident)
-}
-
-/// Start of the statement the call at `at` belongs to — the previous `;` or
-/// opening delimiter at this level.
-///
-/// Balanced-delimiter aware and reading only REAL code, so a `;` inside a
-/// nested `.layer(from_fn(|req, next| async move { … }))` is not mistaken for
-/// the boundary.
-fn statement_start(src: &str, at: usize) -> usize {
-    let mut depth = 0usize;
-    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
-        match byte {
-            b')' | b']' | b'}' => depth += 1,
-            b'(' | b'[' | b'{' => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return offset + 1;
-                };
-                depth = next;
-            }
-            b';' if depth == 0 => return offset + 1,
-            _ => {}
-        }
-    }
-    0
-}
-
-/// Whether `region` calls `method` on the value it is building, rather than
-/// inside something nested in it.
-///
-/// PAREN depth decides, not brace depth, and the difference is what a brace
-/// means here. `let app = if use_tms { app.i18n(bundle) } else { app };` puts
-/// the call in a branch of the very expression this value comes from — that IS
-/// the app on one path, and skipping it inserts `.i18n_auto()` after the join,
-/// clearing the bundle whenever the flag selects that branch. A `.i18n(…)`
-/// inside `.layer(from_fn(|| { … }))` is applied to whatever that closure
-/// builds and sits inside the call's parentheses, so it stays out.
-fn calls_at_own_depth(region: &str, method: &str) -> bool {
-    let marks = delimiter_marks(region, region.len());
-    let mut marks = marks.iter().peekable();
-    let mut depth = 0i32;
-    for at in method_call_offsets(region, method) {
-        while let Some(&&(offset, byte)) = marks.peek() {
-            if offset >= at {
-                break;
-            }
-            match byte {
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                _ => {}
-            }
-            marks.next();
-        }
-        if depth <= 0 {
-            return true;
-        }
-    }
-    false
-}
-
-/// Just inside the innermost block or delimiter pair containing `at`, or 0 at
-/// file scope.
-///
-/// A balanced backward scan over REAL code, so a `{` inside a string or comment
-/// is not mistaken for structure, and a nested
-/// `.layer(from_fn(|req, next| async move { … }))` — ordinary middleware — does
-/// not have its closing brace read as this level's opening one. A `;` is
-/// crossed rather than stopped at: statements are what an app value flows
-/// between.
-fn enclosing_block_start(src: &str, at: usize) -> usize {
-    let mut depth = 0usize;
-    for &(offset, byte) in delimiter_marks(src, at).iter().rev() {
-        match byte {
-            b')' | b']' | b'}' => depth += 1,
-            b'(' | b'[' | b'{' => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return offset + 1;
-                };
-                depth = next;
-            }
-            // A `;` is a statement boundary, which is exactly what this scan
-            // is meant to cross.
-            _ => {}
-        }
-    }
-    0
-}
-
-/// Real-code delimiter positions before `at`, in source order, so a `;` or
-/// brace inside a string or comment is never mistaken for structure.
-fn delimiter_marks(src: &str, at: usize) -> Vec<(usize, u8)> {
-    let mut marks: Vec<(usize, u8)> = Vec::new();
-    for (needle, byte) in [
-        (";", b';'),
-        ("{", b'{'),
-        ("}", b'}'),
-        ("(", b'('),
-        (")", b')'),
-        ("[", b'['),
-        ("]", b']'),
-    ] {
-        marks.extend(
-            real_offsets(&src[..at], needle)
-                .into_iter()
-                .map(|o| (o, byte)),
-        );
-    }
-    marks.sort_unstable();
-    marks
+    Some(out)
 }
 
 #[cfg(test)]
@@ -3019,6 +2753,18 @@ mod tests {
         assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::NoAnchor);
     }
 
+    /// A `main.rs` this crate cannot parse as Rust at all — a hand edit left
+    /// broken, a syntax this `syn` version does not cover — must not be
+    /// guessed at. Leaving it alone and reporting no anchor is what a caller
+    /// already does for an ambiguous file; it is strictly better than a
+    /// hand-rolled scanner that reads broken code as something it is not.
+    #[test]
+    fn a_file_that_fails_to_parse_is_left_alone() {
+        let broken = "fn main( {\n    app.routes(routes![index]);\n";
+        assert_eq!(ensure_i18n_auto(broken), I18nAutoWiring::NoAnchor);
+        assert_eq!(ensure_embedded_locales(broken, "i18n"), None);
+    }
+
     #[test]
     fn config_block_detects_a_spaced_section_header() {
         // `[ i18n ]` is legal TOML; appending a second `[i18n]` beside it makes
@@ -3274,38 +3020,6 @@ mod tests {
         );
     }
 
-    /// A lifetime shares the char literal's opening tick and must not be read
-    /// as one — skipping to a later `'` would swallow real code.
-    /// A lifetime shares the opening tick and must not be read as a literal:
-    /// scanning on to a later `'` swallows the code between them, which is how
-    /// a `fn main` or a brace goes missing.
-    ///
-    /// Tested on the helper directly. Routed through `ensure_i18n_auto` the
-    /// assertion is unreliable — ticks usually pair up harmlessly, so the
-    /// wiring comes out right whether or not lifetimes are handled, and the
-    /// test would report a guarantee it is not making.
-    #[test]
-    fn a_lifetime_is_not_read_as_a_char_literal() {
-        let cases: &[(&str, Option<usize>)] = &[
-            // Char literals: Some(offset of the closing tick).
-            ("'{'", Some(2)),
-            ("'\"'", Some(2)),
-            ("'\\''", Some(3)),
-            ("'\\n'", Some(3)),
-            ("'\\u{1F600}'", Some(10)),
-            // Lifetimes: no literal here at all.
-            ("'a>(s: &str)", None),
-            ("'static", None),
-        ];
-        for (src, expected) in cases {
-            assert_eq!(
-                char_literal_end(src.as_bytes(), 0),
-                *expected,
-                "char_literal_end({src:?})"
-            );
-        }
-    }
-
     /// The runtime merges `[profile.<env>]`'s `i18n` however it is spelled, so
     /// a warning keyed on a header ending in `.i18n` misses most of them —
     /// and a missed profile override is a production startup panic.
@@ -3465,7 +3179,9 @@ mod tests {
     fn a_cfg_test_mention_does_not_count_as_embedded_locales() {
         let main_rs = concat!(
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "fn main() {\n",
             "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
             "\n",
             "#[cfg(test)]\n",
             "mod tests {\n",
@@ -3590,32 +3306,17 @@ mod tests {
     /// cfg(test) region.
     #[test]
     fn a_cfg_test_static_is_scoped_to_its_own_semicolon() {
-        let src = concat!(
-            "#[cfg(test)]\n",
-            "static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
-            "\n",
-            "fn production() {\n",
-            "    let app = App::new().routes(routes![index]);\n",
-            "}\n",
-        );
-        let static_at = src.find("EMBEDDED_LOCALES").unwrap();
-        assert!(
-            in_cfg_test(src, static_at),
-            "the semicolon-terminated static is test-only"
-        );
-        let prod_at = src.find("routes![index]").unwrap();
-        assert!(
-            !in_cfg_test(src, prod_at),
-            "the following item must NOT be dragged into cfg(test)"
-        );
-
-        // End to end: a test-only static must not suppress production wiring,
-        // and must not have its install spliced into production either.
+        // The semicolon-terminated static is test-only, and the following
+        // item must not be dragged into `cfg(test)` with it: a test-only
+        // static must not suppress production wiring, and must not have its
+        // install spliced into production either.
         let main_rs = concat!(
             "#[cfg(test)]\n",
             "static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "fn main() {\n",
             "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
         );
         let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
         assert!(
@@ -3659,8 +3360,10 @@ mod tests {
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
             "#[cfg(feature = \"embed-assets\")]\n",
             "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+            "fn main() {\n",
             "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
             "    let app = app.embedded_locales (&EMBEDDED_LOCALES);\n",
+            "}\n",
         );
         let out = ensure_embedded_locales(embedded, "i18n").expect("anchors present");
         assert_eq!(
@@ -3948,19 +3651,8 @@ mod tests {
         );
     }
 
-    /// Block comments NEST. Stopping at the first `*/` left this scan short of
-    /// the paren `real_offsets` reports; the two disagreed, the call was not
-    /// recognised as a call, and `.i18n_auto()` went in and CLEARED the bundle.
-    #[test]
-    fn ignorable_prefix_len_counts_nested_block_comments() {
-        let src = "/* outer /* nested */ tail */ (";
-        assert_eq!(&src[ignorable_prefix_len(src)..], "(");
-        // An unterminated comment swallows the rest, as `real_offsets` does.
-        let open = "/* outer /* nested */ never closed";
-        assert_eq!(ignorable_prefix_len(open), open.len());
-    }
-
-    /// The same disagreement, end to end.
+    /// Block comments NEST, and a comment sitting between a method name and
+    /// its call must not hide a bundle it wraps.
     #[test]
     fn a_nested_block_comment_does_not_hide_a_bundle() {
         let main_rs = concat!(
@@ -4026,7 +3718,9 @@ mod tests {
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
             "#[cfg(feature = \"embed-assets\")]\n",
             "static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+            "fn main() {\n",
             "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
         );
         let out = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
         assert!(
@@ -4210,6 +3904,27 @@ mod tests {
             "    let app = App::new();\n",
             "    let app = if use_tms { app.i18n(tms_bundle()) } else { app };\n",
             "    let app = app.routes(routes![index]);\n",
+            "}\n",
+        );
+        assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
+    }
+
+    /// A bundle installed by a reassignment nested inside a bare `if`
+    /// STATEMENT (no `let`, no `else`) still reaches the value after it: the
+    /// `if` is not a value, so skipping it must not read the reassignment as
+    /// never having happened. The dangerous read is the false negative —
+    /// treating this app as unbundled clears a bundle installed on every run
+    /// where the flag is set.
+    #[test]
+    fn a_bundle_installed_by_a_bare_conditional_reassignment_is_still_found() {
+        let main_rs = concat!(
+            "fn main() {\n",
+            "    let mut app = App::new();\n",
+            "    if use_tms {\n",
+            "        app = app.i18n(tms_bundle());\n",
+            "    }\n",
+            "    app = app.routes(routes![index]);\n",
+            "    app.serve();\n",
             "}\n",
         );
         assert_eq!(ensure_i18n_auto(main_rs), I18nAutoWiring::CustomBundle);
@@ -5012,7 +4727,9 @@ default_locale = "fr"
     fn the_embedded_locale_dir_is_escaped_as_a_rust_literal() {
         let main_rs = concat!(
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
+            "fn main() {\n",
             "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "}\n",
         );
         let out = ensure_embedded_locales(main_rs, r"translations\bundles").expect("anchors");
         assert!(
