@@ -168,9 +168,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is allowed but must be recorded in the script's `DECLARED_DIFFERENCES` table
   with its reason — the rule that catches what a superset check cannot, namely
   one gate widening alone while its siblings still agree with each other, which
-  is exactly how this drift passed unnoticed, and the direction a difference
-  runs in is part of its key, so a note cannot outlive what it describes and
-  waive its own opposite. One difference is declared today:
+  is exactly how this drift passed unnoticed. A declaration is keyed by the
+  direction the difference runs in as well as its path, and states what each
+  side reads under that path as a claim checked against the tracked tree rather
+  than trusted — two ways a looser key let a note waive something it was never
+  written about. Keyed by path alone it waived its own opposite: dropping a
+  prefix from the routes gate is a loss of coverage, not the difference
+  described, and the lookup still matched. Keyed by path and direction it
+  survived on a replacement: the routes gate could stop reading the served
+  pages the note exists for and pick up some unrelated file under the same
+  prefix instead. One difference is declared today:
   the routes gate reads all of `examples/` rather than only the `README.md`
   under it, because `examples/wiki/content/` is embedded and served, an argument
   about URLs that does not carry to commands or config keys. A declaration that
