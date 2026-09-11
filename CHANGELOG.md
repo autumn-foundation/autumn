@@ -359,9 +359,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no link back to the issue — `unused_async_trait_impl` carries a scoped,
   commented `[workspace.lints.clippy]` allow in the root `Cargo.toml`; the
   other three carry local `#[allow(...)]` annotations with the same
-  rationale pattern. Recorded the one open acceptance criterion: the lint
-  lanes track `stable` on purpose, so a new lint is caught close to when it
-  lands, not pinned like the separate `msrv` job's 1.88.0 floor.
+  rationale pattern. This closes the one open acceptance criterion: a
+  decision recorded on toolchain pinning. The lint lanes track `stable` on
+  purpose, to catch a new lint close to when it lands. The separate `msrv`
+  job keeps its own 1.88.0 pin for the compile floor.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
