@@ -352,6 +352,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **auth:** `api_token_error_response` now renders through the canonical
+  problem classification — the rendered status/problem type (including the
+  query-timeout reclassification) and the validation field map — instead of
+  rebuilding the body from `status()` alone. A `query_timeout` from an
+  `ApiTokenStore` previously rendered as `autumn.service_unavailable` and a
+  validation failure as `autumn.unprocessable_entity` with an empty `errors`
+  array; both now agree with `AutumnError::code()` and the standard response,
+  and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
+  exception filters. Server-error `detail` is redacted in the body (the
+  store's message remains in `AutumnErrorInfo.message` for logging and
+  filters), matching the production exception-filter render (issue #2635).
 - **docs:** `strict_config` and a plugin-owned `[media]` table are no longer
   documented as mutually exclusive (#1974). The deployment guide still carried
   the pre-#2061/#2063 workaround telling operators to turn `strict_config` off.
@@ -381,7 +392,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one — needs the new field. It now derives `Default`, so end the literal with
   `..Default::default()` and the next field will not break it; see
   [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
-
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind
