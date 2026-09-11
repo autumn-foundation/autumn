@@ -12,8 +12,9 @@ WHAT THE INVARIANT IS
 
 WHAT IT CHECKS
   For every member of the workspace rooted at the repo root — the listed
-  `[workspace].members` plus in-tree path dependencies, which cargo
-  automatically treats as members even when `members` does not name them —
+  `[workspace].members` (globs expanded) plus in-tree path dependencies, which
+  cargo automatically treats as members even when `members` does not name them
+  (including `[workspace.dependencies]`-inherited paths) —
   it enumerates the binary target names cargo would build:
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
@@ -26,7 +27,9 @@ WHAT IT CHECKS
   explicit entry — via its `path`, or the default `src/bin/<name>.rs` when no
   `path` is given — are excluded so one target is not counted twice.
 
-  It fails if the same name is claimed by more than one member.
+  It fails if the same name is claimed by more than one member. Names are
+  compared case-insensitively: on Windows `Seed.exe` and `seed.exe` are the
+  same output file, and this gate exists for the Windows linker.
 
 WHY A SCRIPT
   The collision is timing-dependent, so CI only catches it when two links
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import glob
 import sys
 import tempfile
 import tomllib
@@ -54,9 +58,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _in_tree_dep_paths(manifest: dict) -> list[str]:
-    """`path = ...` dependencies declared in one member's manifest."""
-    paths: list[str] = []
+def _in_tree_dep_paths(manifest: dict, workspace_deps: dict) -> list[tuple[str, bool]]:
+    """`path = ...` dependencies declared in one member's manifest.
+
+    Returns `(path, relative_to_workspace_root)` pairs: `workspace_deps` is
+    the root's `[workspace.dependencies]` table, used to resolve
+    `dep.workspace = true` inheritances back to their path — and those paths
+    are relative to the workspace root, unlike direct `path` specs which are
+    relative to the dependent package.
+    """
+    paths: list[tuple[str, bool]] = []
     tables: list[dict] = [manifest]
     targets = manifest.get("target", {})
     if isinstance(targets, dict):
@@ -66,10 +77,35 @@ def _in_tree_dep_paths(manifest: dict) -> list[str]:
             deps = table.get(section, {})
             if not isinstance(deps, dict):
                 continue
-            for spec in deps.values():
-                if isinstance(spec, dict) and isinstance(spec.get("path"), str):
-                    paths.append(spec["path"])
+            for dep_name, spec in deps.items():
+                if not isinstance(spec, dict):
+                    continue
+                if isinstance(spec.get("path"), str):
+                    paths.append((spec["path"], False))
+                elif spec.get("workspace") is True:
+                    # Inherited from [workspace.dependencies]; the lookup key
+                    # is `package = "..."` when the dependency is renamed.
+                    inherited = workspace_deps.get(spec.get("package", dep_name), {})
+                    if isinstance(inherited, dict) and isinstance(
+                        inherited.get("path"), str
+                    ):
+                        paths.append((inherited["path"], True))
     return paths
+
+
+def _expand_member_pattern(root: Path, pattern: str) -> list[Path]:
+    """Expand one `[workspace].members` entry, supporting cargo's globs.
+
+    A non-glob entry is a literal directory; a glob like `crates/*` expands to
+    the matching directories that actually contain a manifest.
+    """
+    if glob.has_magic(pattern):
+        return sorted(
+            p.resolve()
+            for p in root.glob(pattern)
+            if p.is_dir() and (p / "Cargo.toml").is_file()
+        )
+    return [(root / pattern).resolve()]
 
 
 def workspace_members(root: Path) -> list[Path]:
@@ -86,6 +122,9 @@ def workspace_members(root: Path) -> list[Path]:
     manifest = tomllib.loads((root / "Cargo.toml").read_text())
     ws = manifest.get("workspace", {})
     exclude = ws.get("exclude", [])
+    workspace_deps = ws.get("dependencies", {})
+    if not isinstance(workspace_deps, dict):
+        workspace_deps = {}
 
     ordered: list[Path] = []
     seen: set[Path] = set()
@@ -101,10 +140,10 @@ def workspace_members(root: Path) -> list[Path]:
 
     queue: list[Path] = []
     for m in ws.get("members", []):
-        member_dir = (root / m).resolve()
-        if (member_dir / "Cargo.toml").is_file() and not is_excluded(member_dir):
-            note(member_dir)
-            queue.append(member_dir)
+        for member_dir in _expand_member_pattern(root, m):
+            if (member_dir / "Cargo.toml").is_file() and not is_excluded(member_dir):
+                note(member_dir)
+                queue.append(member_dir)
 
     while queue:
         member_dir = queue.pop(0)
@@ -112,8 +151,12 @@ def workspace_members(root: Path) -> list[Path]:
             member_manifest = tomllib.loads((member_dir / "Cargo.toml").read_text())
         except OSError:
             continue
-        for dep_path in _in_tree_dep_paths(member_manifest):
-            dep_dir = (member_dir / dep_path).resolve()
+        for dep_path, from_root in _in_tree_dep_paths(member_manifest, workspace_deps):
+            # Direct `path` specs are relative to the dependent package;
+            # `[workspace.dependencies]` paths are relative to the root.
+            dep_dir = (
+                (root / dep_path) if from_root else (member_dir / dep_path)
+            ).resolve()
             try:
                 dep_dir.relative_to(root)
             except ValueError:
@@ -196,12 +239,18 @@ def bin_target_names(member_dir: Path) -> list[str]:
 
 
 def check(root: Path) -> tuple[int, dict[str, list[str]]]:
+    # Grouped case-insensitively: the gate exists for the Windows linker, and
+    # on Windows `Seed.exe` vs `seed.exe` alias the same output file even
+    # though cargo accepts both target names.
     owners: dict[str, list[str]] = defaultdict(list)
+    display: dict[str, str] = {}
     for member in workspace_members(root):
         for name in bin_target_names(member):
-            owners[name].append(member.relative_to(root).as_posix())
+            key = name.casefold()
+            owners[key].append(member.relative_to(root).as_posix())
+            display.setdefault(key, name)
 
-    collisions = {name: pkgs for name, pkgs in owners.items() if len(pkgs) > 1}
+    collisions = {display[k]: pkgs for k, pkgs in owners.items() if len(pkgs) > 1}
     return len(owners), collisions
 
 
@@ -235,12 +284,18 @@ def _make_member(tmp: Path, name: str, manifest: str, bins: dict[str, str] | Non
         path.write_text(body)
 
 
-def _make_workspace(tmp: Path, members: list[str], exclude: list[str] | None = None) -> Path:
+def _make_workspace(
+    tmp: Path,
+    members: list[str],
+    exclude: list[str] | None = None,
+    extra: str = "",
+) -> Path:
     root = tmp / "root"
     root.mkdir()
     manifest = "[workspace]\nmembers = [\n" + "".join(f'  "{m}",\n' for m in members) + "]\n"
     if exclude:
         manifest += "exclude = [\n" + "".join(f'  "{e}",\n' for e in exclude) + "]\n"
+    manifest += extra
     (root / "Cargo.toml").write_text(manifest)
     return root
 
@@ -487,12 +542,81 @@ def self_test() -> int:
             not collisions and total == 1,
         )
 
+    # Case 14 (Codex review): `[workspace].members` globs are expanded before
+    # scanning — a glob entry is not treated as a literal directory.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["crates/*"])
+        _make_member(
+            tmp / "root", "crates/a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "crates/b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "members glob expanded; collision among globbed crates caught",
+            "clash" in collisions,
+        )
+
+    # Case 15 (Codex review): a path dependency inherited via
+    # `[workspace.dependencies]` (`dep.workspace = true`) is followed to its
+    # in-tree path and scanned as a member.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(
+            tmp, ["app", "other"],
+            extra='[workspace.dependencies]\ndep = { path = "dep" }\n',
+        )
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ndep.workspace = true\n',
+            {},
+        )
+        _make_member(
+            tmp / "root", "other",
+            '[package]\nname = "other"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "dep",
+            '[package]\nname = "dep"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "workspace-inherited path dependency scanned; collision caught",
+            "clash" in collisions,
+        )
+
+    # Case 16 (Codex review): names differing only by case collide — on Windows
+    # `Seed.exe` and `seed.exe` are the same output file.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n',
+            {"src/bin/Seed.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/seed.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect("case-only name collision caught", "seed" in collisions or "Seed" in collisions)
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 13 cases passed")
+    print("self-test: all 16 cases passed")
     return 0
 
 
