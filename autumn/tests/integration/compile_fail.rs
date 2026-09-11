@@ -1069,16 +1069,25 @@ fn doc_getting_started_snippets_compile() {
         fixtures.len()
     );
 
-    // A throwaway crate, checked once. Its own `[workspace]` keeps it from
-    // being folded into this checkout's workspace no matter where the temp
-    // dir lands. Dependencies mirror what `autumn new` actually writes
+    // A throwaway crate, checked once, under this checkout's own (gitignored)
+    // `target/` rather than the system-wide temp dir — two checkouts (or two
+    // users) sharing `/tmp` would otherwise race to write the same
+    // `Cargo.toml`/`src/lib.rs` and could compile one checkout's snippets
+    // against another's `autumn-web` path (Codex review, PR #2707). Its own
+    // `[workspace]` keeps it from being folded into this checkout's real
+    // workspace despite living under `target/`. Removed on the way out, pass
+    // or fail, so a later run never inherits a stale lockfile or build
+    // artifact from this one.
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/doc-snippet-check");
+    let _cleanup = RemoveDirOnDrop(scratch.clone());
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("scratch crate directories");
+
+    // Dependencies mirror what `autumn new` actually writes
     // (`autumn-cli/src/templates/Cargo.toml.tmpl`) rather than only what
     // `autumn-web` re-exports: `maud`'s `html!` macro expands to code that
     // names the `maud` crate directly, so a generated app depends on it too,
     // and a fence exercising it needs the same direct dependency here.
-    let scratch = std::env::temp_dir().join("autumn-doc-snippet-check");
-    let src = scratch.join("src");
-    std::fs::create_dir_all(&src).expect("scratch crate directories");
 
     let autumn_web_path = root.join("autumn");
     std::fs::write(
@@ -1120,6 +1129,17 @@ fn doc_getting_started_snippets_compile() {
          autumn-web crate:\n\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Recursively removes the wrapped directory when dropped, pass or fail
+/// (including on an `assert!` panic) — used to keep `doc_getting_started_
+/// snippets_compile`'s scratch crate from surviving its own test run.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Pulls the body of every ` ```rust,no_run ` fence out of a markdown
