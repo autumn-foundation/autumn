@@ -97,6 +97,15 @@
 # mirrored — a second implementation with its own drift, gating the first. So a
 # gate answers for itself.
 #
+# WHAT THIS GATE CANNOT SEE: agreement is not correctness. It compares the four
+# gates against each other, so a blindness they SHARE is invisible to it — if
+# every gate's corpus rule misses the same page, all four agree and this passes.
+# That is not hypothetical: the `readme = "…"` manifest parser they share was
+# double-quote-only, and would have skipped a single-quoted `readme = 'x.md'` in
+# step across all four (fixed in the same change as this note). So a rule copied
+# into all four gates still needs to be right on its own terms; this gate only
+# promises they do not diverge.
+#
 # A gate whose `--corpus` fails, or prints nothing, is a FAILURE and never a
 # skip: an empty corpus compares equal to another empty corpus, and a gate that
 # silently stops being checked is the defect this gate exists to catch, one

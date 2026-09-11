@@ -5769,7 +5769,18 @@ def source_tokens(root):
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.
-CARGO_README = re.compile(r'^\s*readme\s*=\s*"([^"]+)"', re.M)
+# TOML has two string forms and a manifest may use either, so both are read. The
+# double-quote-only spelling missed `readme = 'README.md'` — valid TOML that
+# every gate sharing this parser would have skipped in step, which an agreement
+# check between them cannot see.
+#
+# Cargo's IMPLICIT discovery (no `readme` key, a `README.md` beside the
+# manifest) is deliberately not modelled: `scripts/check-crate-metadata.sh`
+# lists `readme` among REQUIRED_FIELDS for every publishable crate, so a
+# published landing page always has an explicit key to find. The crates that
+# rely on discovery here are the `examples/*`, all `publish = false` and so not
+# published at all, and their READMEs are already corpus by directory.
+CARGO_README = re.compile(r'''^\s*readme\s*=\s*(?:"([^"]+)"|'([^']+)')''', re.M)
 
 
 def package_readmes(root):
@@ -5783,7 +5794,8 @@ def package_readmes(root):
         manifest = pathlib.PurePosixPath(rel)
         text = (pathlib.Path(root) / rel).read_text(
             encoding='utf-8', errors='ignore')
-        for named in CARGO_README.findall(text):
+        for dq, sq in CARGO_README.findall(text):
+            named = dq or sq
             # `readme = "../README.md"` points at the workspace root's page.
             resolved = os.path.normpath(str(manifest.parent / named))
             out.add(resolved.replace(os.sep, '/'))
