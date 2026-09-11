@@ -1265,9 +1265,27 @@ fn declares_fn_main(body: &str) -> bool {
 /// binary*: `target-dir/<profile>/deps/<this binary>`, three path
 /// components down from `current_exe()`, however that target-dir was
 /// chosen.
+///
+/// A `cargo test --target <triple>` build inserts one more directory —
+/// `target-dir/<triple>/<profile>/deps/<binary>` — so the same three-level
+/// walk lands one level short, at `target-dir/<triple>` instead of
+/// `target-dir` itself (Codex review, round 7; this repo's own CI never
+/// passes `--target` today, so it doesn't hit this, but the function's own
+/// doc comment claimed to handle "however that target-dir was chosen" and
+/// didn't). Rather than sniff a target triple out of a path component —
+/// nothing distinguishes one from a custom profile name by shape alone —
+/// this checks for `CACHEDIR.TAG`, which cargo unconditionally writes in the
+/// real target-dir root (a stable, documented marker other tools already
+/// rely on to know a directory is cache-like); its absence means the walk
+/// landed one level short, so go up once more. Deliberately doesn't try to
+/// detect or propagate the triple into the nested `cargo check` itself: this
+/// gate exists to prove a doc snippet compiles the way a reader's own
+/// machine would build it, which is a host-target question regardless of
+/// what target the outer test suite happens to be exercising elsewhere.
 fn resolve_cargo_target_dir() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("resolve the running test binary's own path");
-    exe.ancestors()
+    let dir = exe
+        .ancestors()
         .nth(3)
         .unwrap_or_else(|| {
             panic!(
@@ -1275,7 +1293,13 @@ fn resolve_cargo_target_dir() -> std::path::PathBuf {
                 exe.display()
             )
         })
-        .to_path_buf()
+        .to_path_buf();
+    if dir.join("CACHEDIR.TAG").exists() {
+        dir
+    } else {
+        let up_one = dir.parent().map(std::path::Path::to_path_buf);
+        up_one.unwrap_or(dir)
+    }
 }
 
 /// Recursively removes the wrapped directory when dropped, pass or fail
