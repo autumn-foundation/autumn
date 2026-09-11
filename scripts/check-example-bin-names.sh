@@ -17,7 +17,11 @@ WHAT IT CHECKS
   cargo automatically treats as members even when `members` does not name them
   (including `[workspace.dependencies]`-inherited paths) —
   it enumerates the binary target names cargo would build, honoring cargo's
-  auto-discovery rules (including the edition-2015 manual-target opt-out):
+  auto-discovery rules (including the edition-2015 manual-target opt-out and
+  `edition.workspace = true` inheritance). `[workspace].exclude` follows
+  cargo's `WorkspaceRootConfig::is_excluded` exactly: entries are literal path
+  prefixes (never globs), and an explicitly listed `members` entry always wins
+  over `exclude`.
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
   - auto-discovered targets whenever `[package] autobins` is not `false`:
@@ -50,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import re
 import sys
 import tempfile
 import tomllib
@@ -95,42 +98,6 @@ def _in_tree_dep_paths(manifest: dict, workspace_deps: dict) -> list[tuple[str, 
     return paths
 
 
-def _cargo_glob_match(rel: str, pattern: str) -> bool:
-    """Match a workspace-relative path against an `exclude` glob, cargo-style.
-
-    Cargo treats `exclude` entries as glob patterns where `*` and `?` do not
-    match `/` (only `**` crosses directories); `fnmatch.fnmatchcase` instead
-    lets `*` swallow `/`, so `examples/*` would wrongly exclude
-    `examples/x/nested`. Translate to a regex with separator-aware wildcards.
-    """
-    out: list[str] = []
-    i, n = 0, len(pattern)
-    while i < n:
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < n and pattern[i + 1] == "*":
-                out.append(".*")
-                i += 2
-            else:
-                out.append("[^/]*")
-                i += 1
-        elif c == "?":
-            out.append("[^/]")
-            i += 1
-        elif c == "[":
-            j = pattern.find("]", i + 1)
-            if j == -1:
-                out.append(re.escape(c))
-                i += 1
-            else:
-                out.append(pattern[i : j + 1])
-                i = j + 1
-        else:
-            out.append(re.escape(c))
-            i += 1
-    return re.fullmatch("".join(out), rel) is not None
-
-
 def _expand_member_pattern(root: Path, pattern: str) -> list[Path]:
     """Expand one `[workspace].members` entry, supporting cargo's globs.
 
@@ -172,9 +139,22 @@ def workspace_members(root: Path) -> list[Path]:
             seen.add(member_dir)
             ordered.append(member_dir)
 
+    def _under(rel: str, pat: str) -> bool:
+        # Component-wise prefix match, mirroring cargo's
+        # `Path::starts_with` in `WorkspaceRootConfig::is_excluded`.
+        pat = pat.strip("/")
+        return bool(pat) and (rel == pat or rel.startswith(pat + "/"))
+
     def is_excluded(member_dir: Path) -> bool:
-        rel = member_dir.relative_to(root).as_posix()
-        return any(_cargo_glob_match(rel, pat) for pat in exclude)
+        # True cargo semantics (`WorkspaceRootConfig::is_excluded`): `exclude`
+        # entries are literal path PREFIXES (not globs — `exclude =
+        # ["crates/*"]` matches nothing), and an explicitly listed `members`
+        # entry always wins over `exclude`.
+        manifest_rel = (member_dir / "Cargo.toml").relative_to(root).as_posix()
+        raw_members = ws.get("members", [])
+        excluded = any(_under(manifest_rel, pat) for pat in exclude)
+        explicit = any(_under(manifest_rel, pat) for pat in raw_members)
+        return excluded and not explicit
 
     queue: list[Path] = []
     for m in ws.get("members", []):
@@ -231,7 +211,7 @@ def explicit_bins(member_dir: Path) -> tuple[list[str], set[Path]]:
     return names, claimed
 
 
-def bin_target_names(member_dir: Path) -> list[str]:
+def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> list[str]:
     manifest = tomllib.loads((member_dir / "Cargo.toml").read_text())
     package = manifest.get("package", {})
     explicit_names, claimed_paths = explicit_bins(member_dir)
@@ -241,8 +221,17 @@ def bin_target_names(member_dir: Path) -> list[str]:
     # edition 2015 (also the default when `edition` is omitted), where any
     # manually specified target ([[bin]] or [lib]) disables auto-discovery
     # entirely. (In edition 2018+ explicit [[bin]] entries do NOT disable it.)
+    # The edition itself may be inherited: `edition.workspace = true` resolves
+    # against the root's `[workspace.package] edition`.
+    edition_spec: object = package.get("edition", "2015")
+    if (
+        isinstance(edition_spec, dict)
+        and edition_spec.get("workspace") is True
+        and workspace_edition is not None
+    ):
+        edition_spec = workspace_edition
     auto = package.get("autobins", True) is not False
-    if auto and str(package.get("edition", "2015")) == "2015":
+    if auto and str(edition_spec) == "2015":
         auto = not ("bin" in manifest or "lib" in manifest)
     if auto:
         src = member_dir / "src"
@@ -290,10 +279,15 @@ def check(root: Path) -> tuple[int, dict[str, list[str]]]:
     # Grouped case-insensitively: the gate exists for the Windows linker, and
     # on Windows `Seed.exe` vs `seed.exe` alias the same output file even
     # though cargo accepts both target names.
+    root_manifest = tomllib.loads((root / "Cargo.toml").read_text())
+    ws_package = root_manifest.get("workspace", {}).get("package", {})
+    workspace_edition = (
+        ws_package.get("edition") if isinstance(ws_package, dict) else None
+    )
     owners: dict[str, list[str]] = defaultdict(list)
     display: dict[str, str] = {}
     for member in workspace_members(root):
-        for name in bin_target_names(member):
+        for name in bin_target_names(member, workspace_edition):
             key = name.casefold()
             owners[key].append(member.relative_to(root).as_posix())
             display.setdefault(key, name)
@@ -661,12 +655,15 @@ def self_test() -> int:
         total, collisions = check(root)
         expect("case-only name collision caught", "seed" in collisions or "Seed" in collisions)
 
-    # Case 17 (Codex review): `exclude` globs are cargo-style — `*` does not
-    # match `/`, so `examples/*` excludes `examples/x` but NOT the deeper
-    # in-tree path dependency `examples/x/nested`, which must still be scanned.
+    # Case 17 (Codex review, verified against cargo's
+    # `WorkspaceRootConfig::is_excluded` source): `exclude` entries are literal
+    # path PREFIXES and an explicitly listed `members` entry always wins —
+    # `exclude = ["examples/x"]` neither drops the listed member `examples/x`
+    # nor the path dependency `examples/x/nested` living under its prefix, so
+    # the collision between the nested dep and `other` is caught.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        root = _make_workspace(tmp, ["app", "other", "examples/x"], exclude=["examples/*"])
+        root = _make_workspace(tmp, ["app", "other", "examples/x"], exclude=["examples/x"])
         _make_member(
             tmp / "root", "app",
             '[package]\nname = "app"\nversion = "0.1.0"\n\n'
@@ -676,7 +673,7 @@ def self_test() -> int:
         _make_member(
             tmp / "root", "examples/x",
             '[package]\nname = "x"\nversion = "0.1.0"\n',
-            {"src/bin/shadowed.rs": "fn main() {}\n"},
+            {"src/bin/unique.rs": "fn main() {}\n"},
         )
         _make_member(
             tmp / "root", "examples/x/nested",
@@ -691,12 +688,33 @@ def self_test() -> int:
         total, collisions = check(root)
         members = [m.relative_to(root).as_posix() for m in workspace_members(root)]
         expect(
-            "exclude glob matches first level",
-            "examples/x" not in members,
+            "explicit member wins over exclude",
+            "examples/x" in members,
         )
         expect(
-            "exclude glob does not cross '/'; nested dep scanned, collision caught",
+            "dep under explicit prefix still scanned; collision caught",
             "examples/x/nested" in members and "clash" in collisions,
+        )
+
+    # Case 17b: the documented `exclude` use — a literal entry removes a
+    # glob-matched member (`members = ["crates/*"]`, `exclude = ["crates/old"]`).
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["crates/*"], exclude=["crates/old"])
+        _make_member(
+            tmp / "root", "crates/old",
+            '[package]\nname = "old"\nversion = "0.1.0"\n',
+            {"src/bin/gone.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "crates/new",
+            '[package]\nname = "new"\nversion = "0.1.0"\n',
+            {"src/bin/here.rs": "fn main() {}\n"},
+        )
+        members = [m.relative_to(root).as_posix() for m in workspace_members(root)]
+        expect(
+            "literal exclude drops the glob-matched member",
+            "crates/old" not in members and "crates/new" in members,
         )
 
     # Case 18 (Codex review): a root Cargo.toml with both [package] and
@@ -746,12 +764,61 @@ def self_test() -> int:
             not collisions and sorted(bin_target_names(root / "a")) == ["real"],
         )
 
+    # Case 20 (Codex review): an explicitly listed member is kept even when
+    # `exclude` names it — cargo reports both.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"], exclude=["b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/clash.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        members = [m.relative_to(root).as_posix() for m in workspace_members(root)]
+        expect(
+            "explicit member survives exclude; collision caught",
+            "b" in members and "clash" in collisions,
+        )
+
+    # Case 21 (Codex review): the edition-2015 opt-out also applies when the
+    # edition is inherited — root `[workspace.package] edition = "2015"` plus
+    # member `edition.workspace = true` with an explicit [[bin]]: no
+    # auto-discovery, so `src/bin/extra.rs` is not invented.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(
+            tmp, ["a", "b"],
+            extra='[workspace.package]\nedition = "2015"\n',
+        )
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nedition.workspace = true\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "inherited edition 2015 disables auto-discovery; no false collision",
+            not collisions,
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 19 cases passed")
+    print("self-test: all 21 cases passed")
     return 0
 
 
