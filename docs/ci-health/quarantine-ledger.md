@@ -282,10 +282,16 @@ without also filling in the intake form above.
   closed.
 - **2026-09-11 update — harness still undispatched (4th consecutive daily
   pass), zero new organic hits on any of the three tracked signatures.**
-  Sampled the ~23h since the 2026-09-10 follow-up's cutoff
-  (2026-09-10T10:30:30Z–2026-09-11T09:09:24Z, 100 `pull_request`-triggered
-  `ci.yml` runs: 61 cancelled/25 success/14 failure). None of the 14
-  failures match `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
+  Sampled the ~23.3h since the 2026-09-10 follow-up's actual recorded
+  cutoff (`2026-09-10T09:48:19Z`–`2026-09-11T09:09:24Z`; **correction,
+  post-review, via a sixth Codex review comment on PR #2711**: an earlier
+  version of this line understated the window as starting at
+  `10:30:30Z`, silently skipping the 42-minute gap between the two
+  reports — that gap was separately queried and holds 9 more
+  `pull_request`-triggered `ci.yml` runs, all cancelled, no failures, so
+  the combined population is 109 runs: 70 cancelled/25 success/14
+  failure, not 100/61/25/14). None of the 14 failures match
+  `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
   see the new `job_tracking_stores_integration` entry below for the one
   finding this pass did turn up, on a different test entirely.
   `manual-macos-contention-check.yml`: still `total_count: 0` against
@@ -449,11 +455,25 @@ without also filling in the intake form above.
   this test's assertion uses, and the codebase's own test comments
   (`autumn/src/job.rs:16704-16707`) already document the choice
   explicitly. So this test doesn't invent a comparison production never
-  makes; it re-derives one production already makes elsewhere. What
-  distinguishes the two: the cleanup sweep's interval is presumably
-  minutes-scale in a real deployment, so ordinary clock disagreement is
-  immaterial to it, whereas this test's ~200ms margin makes it far more
-  exposed to the same comparison shape.
+  makes; it re-derives one production already makes elsewhere.
+  **Correction (post-review, via a seventh Codex review comment on PR
+  #2711): the sweep's cadence does not make ordinary clock disagreement
+  immaterial to it, and the reasoning above was wrong to imply that.**
+  Cadence controls how often the sweep gets a chance to observe a
+  disagreement, not the disagreement's *size* at any one observation —
+  a sweep that runs once every five minutes with the DB clock leading the
+  app clock by, say, 50ms can delete a row `PgJobTrackingStore` still
+  considers live just as readily as one that runs every second; running
+  less often does not shrink the skew. What actually bounds the practical
+  risk is that `jobs.tracking.ttl_secs` is operator-configured and, unlike
+  this test's deliberately extreme 1-second value, a production TTL is
+  presumably chosen with enough margin over any realistic NTP-managed
+  clock drift (typically sub-tens-of-ms between hosts under normal
+  operation) that ordinary skew doesn't threaten it — not the sweep's
+  polling interval, which is an unrelated dimension. The early-deletion /
+  late-retention risk from a real clock disagreement is retained, not
+  dismissed; only the (wrong) reason previously given for discounting it
+  is withdrawn.
 
   The *read* path this test also exercises
   (`PgJobTrackingStore::update`, `autumn/src/job_tracking.rs:1896-1902`)
