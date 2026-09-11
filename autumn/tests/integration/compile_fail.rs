@@ -1105,21 +1105,41 @@ fn doc_getting_started_snippets_compile() {
     // on it too, and a fence exercising it needs the same direct dependency
     // here.
     //
-    // A silent addition to the template's own dependency list wouldn't fail
-    // loud — it would just leave a fence free to use something the real
-    // scaffold doesn't have — so this asserts the mirror is still complete
-    // rather than only copying it once.
+    // A name-only check couldn't have caught the template changing a
+    // dependency's *version or features* — e.g. `maud` dropping the `axum`
+    // feature would still pass a `contains("maud")` check while a fence
+    // exercising that feature kept compiling here against a stale spec
+    // hand-typed below (Codex review, PR #2707, round 4). Extracting each
+    // dependency's exact declaration line and using it verbatim removes the
+    // hand-typed copy entirely, so there is nothing left to drift.
     let template_manifest =
         std::fs::read_to_string(root.join("autumn-cli/src/templates/Cargo.toml.tmpl"))
             .expect("read autumn-cli/src/templates/Cargo.toml.tmpl");
-    for dep in ["autumn-web", "maud", "diesel_migrations"] {
-        assert!(
-            template_manifest.contains(dep),
-            "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares `{dep}` — \
-             update the mirrored dependency list in doc_getting_started_snippets_compile \
-             to match what `autumn new` actually writes."
-        );
-    }
+    let template_dep_line = |name: &str| -> String {
+        template_manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{name} =")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "autumn-cli/src/templates/Cargo.toml.tmpl has no `{name} = ...` \
+                     dependency line for doc_getting_started_snippets_compile to mirror \
+                     — update it to match what `autumn new` actually writes."
+                )
+            })
+            .trim()
+            .to_string()
+    };
+    let maud_dep = template_dep_line("maud");
+    let diesel_migrations_dep = template_dep_line("diesel_migrations");
+    // `autumn-web` itself is special-cased below to a local path dependency
+    // instead of the templated `{{autumn_version}}` placeholder (this test
+    // checks against the in-tree crate, not a published version) — the
+    // template's own line carries no features/extra detail beyond that
+    // placeholder, so a presence check is enough for it alone.
+    assert!(
+        template_manifest.contains("autumn-web"),
+        "autumn-cli/src/templates/Cargo.toml.tmpl no longer declares `autumn-web`"
+    );
 
     let autumn_web_path = root.join("autumn");
     std::fs::write(
@@ -1133,8 +1153,8 @@ fn doc_getting_started_snippets_compile() {
              \n\
              [dependencies]\n\
              autumn-web = {{ path = {autumn_web_path:?} }}\n\
-             maud = {{ version = \"0.27\", features = [\"axum\"] }}\n\
-             diesel_migrations = \"2\"\n\
+             {maud_dep}\n\
+             {diesel_migrations_dep}\n\
              \n\
              [workspace]\n"
         ),
@@ -1175,9 +1195,22 @@ fn doc_getting_started_snippets_compile() {
     std::fs::copy(root.join("Cargo.lock"), scratch.join("Cargo.lock"))
         .expect("seed the scratch crate's Cargo.lock from the workspace's");
 
+    // Point at the real workspace's own target dir rather than a fresh one
+    // under `scratch` (Codex review, PR #2707, round 4): every dependency
+    // this crate needs was just compiled there for the outer test binary, at
+    // the same locked versions this crate's seeded lockfile now shares, so
+    // cargo reuses those artifacts instead of rebuilding the entire
+    // `autumn-web` dependency graph a second time — this repo's CI already
+    // runs close to its disk ceiling, and a silent full second build would
+    // cost real minutes on every run. Left in place afterward (unlike
+    // `scratch` itself): it lives inside the workspace's own already-shared,
+    // already-gitignored `target/`, exactly where cargo's normal build
+    // output goes.
     let output = std::process::Command::new(env!("CARGO"))
         .arg("check")
         .arg("--offline")
+        .arg("--target-dir")
+        .arg(root.join("target"))
         .current_dir(&scratch)
         .output()
         .expect("failed to run cargo check on the extracted doc snippets");
