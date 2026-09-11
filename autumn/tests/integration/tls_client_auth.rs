@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use super::mtls_support::{
     CA_PEM, CLIENT_CERT_PEM, CLIENT_KEY_PEM, CRL_EMPTY_PEM, CRL_PEM, MtlsServer, REVOKED_CERT_PEM,
     REVOKED_KEY_PEM, ROTATED_CA_PEM, ROTATED_CLIENT_CERT_PEM, ROTATED_CLIENT_KEY_PEM, TrustFixture,
-    UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM, eventually, keep_alive_request, mtls_get,
-    mtls_get_with_headers, serve_mtls,
+    UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM, client_config, eventually, keep_alive_request, mtls_get,
+    mtls_get_with_config, mtls_get_with_headers, serve_mtls,
 };
 use super::tls_support::{CertFixture, RecordingVerifier, now_unix};
 
@@ -346,6 +346,33 @@ async fn the_identity_carries_the_sans_a_policy_would_key_on() {
 
 // ── composition with session auth ───────────────────────────────────────────
 
+/// A route behind `RequireAuth`, with a session stamped only when the request
+/// asks for one — standing in for the session layer without booting an
+/// `AppState`.
+fn session_guarded_router() -> Router {
+    use std::collections::HashMap;
+
+    use autumn_web::auth::RequireAuth;
+    use autumn_web::session::Session;
+
+    Router::new()
+        .route("/internal/both", get(|| async { "both" }))
+        .layer(RequireAuth::new("user_id"))
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.headers().contains_key("x-test-login") {
+                    let mut data = HashMap::new();
+                    data.insert("user_id".to_owned(), "42".to_owned());
+                    let mut req = req;
+                    req.extensions_mut()
+                        .insert(Session::new_for_test(String::new(), data));
+                    return next.run(req).await;
+                }
+                next.run(req).await
+            },
+        ))
+}
+
 #[tokio::test]
 async fn machine_identity_and_session_auth_guard_the_same_route_independently() {
     // AC: mTLS composes with `Auth<T>`/`RequireAuth` on one router without
@@ -353,11 +380,6 @@ async fn machine_identity_and_session_auth_guard_the_same_route_independently() 
     // request's session, `RequireClientCert` reads the connection — so a route
     // carrying both must demand BOTH, and neither may swallow the other's
     // rejection.
-    use std::collections::HashMap;
-
-    use autumn_web::auth::RequireAuth;
-    use autumn_web::session::Session;
-
     let trust = TrustFixture::write(CA_PEM, None);
     let server_cert = CertFixture::write();
     let provider = autumn_web::tls::crypto_provider();
@@ -397,29 +419,11 @@ async fn machine_identity_and_session_auth_guard_the_same_route_independently() 
         shutdown.child_token(),
     );
 
-    // A session is stamped only when the request asks for one, standing in for
-    // the session layer without booting an `AppState`.
-    let router = Router::new()
-        .route("/internal/both", get(|| async { "both" }))
-        .layer(RequireAuth::new("user_id"))
-        .layer(axum::middleware::from_fn(
-            |req: axum::extract::Request, next: axum::middleware::Next| async move {
-                if req.headers().contains_key("x-test-login") {
-                    let mut data = HashMap::new();
-                    data.insert("user_id".to_owned(), "42".to_owned());
-                    let mut req = req;
-                    req.extensions_mut()
-                        .insert(Session::new_for_test(String::new(), data));
-                    return next.run(req).await;
-                }
-                next.run(req).await
-            },
-        ));
     let service = tower::Layer::layer(
         &autumn_web::tls::client_auth::RequireClientCertLayer::for_paths(vec![
             "/internal/".to_owned(),
         ]),
-        router,
+        session_guarded_router(),
     );
     let service = tower::Layer::layer(&ClientIdentityLayer, service);
     let make_service =
@@ -652,6 +656,55 @@ async fn publishing_a_revocation_takes_effect_without_a_restart() {
         .await
         .is_ok(),
         "revoking one certificate must not revoke its siblings"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_revoked_client_cannot_resume_its_way_back_in() {
+    // rustls restores a RESUMED connection's peer certificates from the stored
+    // session and never calls the verifier again, so a swap-the-verifier design
+    // cannot close this by swapping: the check it swaps is not run. The
+    // listener therefore turns resumption off whenever client auth is active.
+    //
+    // The rotation tests miss this because each `mtls_get` builds a fresh
+    // client config with no session cache. This one reuses ONE client config
+    // across both connections, which is what a real client does.
+    let trust = TrustFixture::write(CA_PEM, Some(CRL_EMPTY_PEM));
+    let server = serve_mtls(&trust, ClientAuthMode::Required, Vec::new()).await;
+
+    // One config, so its session cache is shared by every connection below —
+    // exactly how a long-lived client would offer a resumption ticket.
+    let shared = client_config(Some((REVOKED_CERT_PEM, REVOKED_KEY_PEM)));
+
+    // Nothing is revoked yet, and this first exchange is what would populate a
+    // resumable session on a listener that allowed one.
+    let first = mtls_get_with_config(Arc::clone(&shared), server.addr, "/open", "")
+        .await
+        .expect("the certificate is not revoked yet");
+    assert_eq!(first.status, 200);
+
+    trust.publish_crl(CRL_PEM);
+    eventually("the revocation takes effect", async || {
+        mtls_get(
+            server.addr,
+            "/open",
+            Some((REVOKED_CERT_PEM, REVOKED_KEY_PEM)),
+        )
+        .await
+        .is_err()
+    })
+    .await;
+
+    // The SAME client, with the session it just established, must not get back
+    // in. Were resumption left on, this would succeed without the verifier — and
+    // the handler would even see a verified-looking identity.
+    assert!(
+        mtls_get_with_config(shared, server.addr, "/open", "")
+            .await
+            .is_err(),
+        "a revoked client must not resume its way past the trust store"
     );
 
     server.shutdown().await;

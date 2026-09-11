@@ -242,13 +242,20 @@ pub async fn mtls_get_with_headers(
     client: Option<(&str, &str)>,
     extra_headers: &str,
 ) -> std::io::Result<HttpResponse> {
+    mtls_get_with_config(client_config(client), addr, path, extra_headers).await
+}
+
+/// Build a client config once, so several connections can SHARE its session
+/// cache — which is what a long-lived client does, and the only way to observe
+/// whether the listener allows resumption.
+pub fn client_config(client: Option<(&str, &str)>) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("protocol versions")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(RecordingVerifier::default()));
-    let config = match client {
+    Arc::new(match client {
         Some((cert_pem, key_pem)) => {
             let chain: Vec<CertificateDer<'static>> =
                 CertificateDer::pem_slice_iter(cert_pem.as_bytes())
@@ -260,9 +267,18 @@ pub async fn mtls_get_with_headers(
                 .expect("client auth cert")
         }
         None => builder.with_no_client_auth(),
-    };
+    })
+}
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+/// GET `path` using an already-built client config, so repeated calls reuse one
+/// session cache.
+pub async fn mtls_get_with_config(
+    config: Arc<rustls::ClientConfig>,
+    addr: SocketAddr,
+    path: &str,
+    extra_headers: &str,
+) -> std::io::Result<HttpResponse> {
+    let connector = tokio_rustls::TlsConnector::from(config);
     let server_name = ServerName::try_from("localhost").expect("server name");
 
     let work = async move {

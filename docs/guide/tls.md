@@ -1090,6 +1090,21 @@ Two deliberate choices:
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
 
+### TLS session resumption is off under client auth
+
+A listener with `mode` other than `off` disables TLS session resumption — both
+the session cache and TLS 1.3 tickets. rustls restores a resumed connection's
+peer certificate from the stored session and does **not** re-run the verifier,
+so a client whose CA you rotated out (or whose certificate you just revoked)
+would otherwise keep reconnecting on a resumed session until it expired — and
+would keep presenting a verified-looking identity to your handlers. That is the
+one hole a swappable trust store cannot close by swapping, because the check it
+swaps is never run.
+
+The cost is a full handshake per connection. For a listener whose purpose is
+deciding who may connect, that is the right trade. Server-only TLS
+(`[server.tls]` without this section) keeps resumption exactly as it was.
+
 ### Failure diagnostics
 
 A rejected handshake is invisible to the client beyond the standard TLS alert —

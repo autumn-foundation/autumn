@@ -920,6 +920,16 @@ fn build_router_pre_state(
             // allow-list read the proxy-resolved identity instead of a spoofable raw
             // `X-Forwarded-For`.
             mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
+            // mTLS route requirement (#1640), mirroring the layer
+            // `apply_middleware` installs for direct routes. The `/mcp` router
+            // merges after that layer, so an operator who puts the MCP mount
+            // itself under `required_paths` would otherwise find `initialize`,
+            // `tools/list` and `tools/call` answering an uncertified client
+            // while the prefix promised a 403. The `tools/call` replay is
+            // guarded separately, through the dispatch clone.
+            if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+                mcp_router = mcp_router.layer(require_client_cert);
+            }
             // Admission control / load shedding (#1006), mirroring the layer
             // `apply_middleware` installs for direct routes (see the comment
             // there). The `/mcp` router is merged after that layer, so without

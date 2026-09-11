@@ -6685,14 +6685,26 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
             }
         },
     };
-    if mode == "off" {
-        return ClientAuthDoctorData::ModeOff;
-    }
-
     let required_path_count = section
         .get("required_paths")
         .and_then(toml::Value::as_array)
         .map_or(0, Vec::len);
+
+    if mode == "off" {
+        // `ClientAuthConfig::validate` refuses this combination — no
+        // certificate is ever requested, so those routes would reject every
+        // request — and the server exits at boot on it. Grading it Pass would
+        // let `--strict` bless a config that cannot start.
+        if required_path_count > 0 {
+            return ClientAuthDoctorData::Invalid {
+                detail: "[server.tls.client_auth] lists required_paths but mode = \"off\", so no \
+                         certificate is ever requested and those routes would reject every \
+                         request"
+                    .to_owned(),
+            };
+        }
+        return ClientAuthDoctorData::ModeOff;
+    }
 
     let bundle = section
         .get("ca_bundle_path")
@@ -12205,6 +12217,29 @@ pub struct Vault {
                 CheckStatus::Fail
             ));
         }
+    }
+
+    #[test]
+    fn client_auth_fails_on_required_paths_under_mode_off() {
+        // `ClientAuthConfig::validate` refuses this, so the server exits at
+        // boot; doctor must not Pass it.
+        let mut section = toml::Table::new();
+        section.insert("mode".to_owned(), toml::Value::String("off".to_owned()));
+        section.insert(
+            "required_paths".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("/internal/".to_owned())]),
+        );
+        let mut tls = toml::Table::new();
+        tls.insert("client_auth".to_owned(), toml::Value::Table(section));
+
+        let data = resolve_client_auth_doctor_data(Some(&tls));
+        assert!(
+            matches!(data, ClientAuthDoctorData::Invalid { .. }),
+            "got {data:?}"
+        );
+        let result = check_client_auth_impl(&data);
+        assert!(matches!(result.status, CheckStatus::Fail));
+        assert!(result.detail.unwrap().contains("required_paths"));
     }
 
     #[test]

@@ -583,12 +583,34 @@ pub fn build_server_config_with_client_auth(
     let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|source| TlsError::BuildConfig { source })?;
-    let config = match client_verifier {
-        Some(verifier) => builder
-            .with_client_cert_verifier(verifier)
-            .with_cert_resolver(resolver),
+    let mut config = match client_verifier {
+        Some(verifier) => {
+            let mut config = builder
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(resolver);
+            // Turn OFF session resumption for a client-authenticating listener.
+            //
+            // rustls restores a resumed connection's `peer_certificates` from
+            // the stored session and never calls the verifier again
+            // (`server/tls13.rs`, `server/tls12.rs`). So a client whose CA was
+            // rotated out — or whose certificate was just added to the CRL —
+            // would keep reconnecting on a resumed session until it expired,
+            // and would keep presenting a verified-looking identity to
+            // handlers. That is the one hole a swap-the-verifier design cannot
+            // close by swapping, because the check it swaps is not run.
+            //
+            // The cost is a full handshake per connection, which is the right
+            // trade for a listener whose whole purpose is deciding who may
+            // connect. Server-only TLS keeps resumption untouched.
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config
+        }
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
     };
+    // `config` is only reassigned in the client-auth arm above; silence the
+    // unused-mut in the server-only build without splitting the match.
+    let _ = &mut config;
     Ok(Arc::new(config))
 }
 

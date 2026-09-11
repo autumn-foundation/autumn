@@ -45,7 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface offline as `tls_client_auth`, and a route's mTLS requirement is a new
   `mtls` dimension of the security-posture manifest (schema v4), so
   `autumn routes posture diff` blocks on a route that silently drops it. Revocation is a
-  static CRL plus short-lived certificates; OCSP is not in this slice. See the
+  static CRL plus short-lived certificates; OCSP is not in this slice. A listener
+  with client auth active also disables TLS session resumption: rustls restores a
+  resumed connection's peer certificate from the stored session without re-running
+  the verifier, so a revoked client could otherwise reconnect until its session
+  expired. Server-only TLS keeps resumption untouched. See the
   [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
 
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
