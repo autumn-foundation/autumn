@@ -127,7 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Docs gate: the drift gates must now agree on which pages are reader-facing.**
+- **Docs gate: the drift gates must now agree on which pages are reader-facing
+  [no-plugin].**
   `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
   each read "the reader-facing corpus", and four of them spell that set out
   themselves as tuples of path prefixes; three carry a comment promising the
