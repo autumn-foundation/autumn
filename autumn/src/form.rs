@@ -435,8 +435,8 @@ pub trait IntoChangeset: Sized {
     /// message.
     ///
     /// The default implementation ignores `resolve` and defers to
-    /// [`into_changeset`](Self::into_changeset), so a hand-rolled `IntoChangeset`
-    /// impl that predates this method keeps compiling unchanged.
+    /// [`into_changeset`](Self::into_changeset). This keeps a hand-rolled
+    /// `IntoChangeset` impl written before this method compiling unchanged.
     fn into_changeset_with(
         self,
         _resolve: impl Fn(&str, &str) -> Option<String>,

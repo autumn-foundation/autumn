@@ -1484,10 +1484,10 @@ fn plan_scaffold_with_options_impl(
             // made at this point would be silently dropped.)
 
             // (#2227 closed the three gaps this block used to warn about. The
-            // Markdown editor's chrome now goes through `RichTextLabels`, the
-            // state-transition buttons through `TransitionLabels`, and the
-            // inline validation messages through `into_changeset_with`. The one
-            // remaining gap — the CSV import report — is named where
+            // Markdown editor's chrome now goes through `RichTextLabels`. The
+            // state-transition buttons go through `TransitionLabels`. The
+            // inline validation messages go through `into_changeset_with`. The
+            // one remaining gap — the CSV import report — is named where
             // `import_enabled` is known, further down.)
 
             // A profile overlay can repoint i18n somewhere else entirely, and
@@ -1817,11 +1817,12 @@ fn plan_scaffold_with_options_impl(
         ));
     }
     // #2227: `create` and `update` now resolve each validator error code through
-    // the bundle, so a rejected form shows a translated message under a
-    // translated label. The CSV import reports the same messages, and it cannot:
-    // `import_csv` calls its row handler once per line, far from the request, so
-    // there is no locale to look the message up in. The report an operator reads
-    // after an upload therefore keeps `validation failed: <code>` in English.
+    // the bundle. A rejected form shows a translated message under a translated
+    // label. The CSV import report shows the same messages but cannot translate
+    // them: `import_csv` calls its row handler once per line, far from the
+    // request, so there is no locale to look the message up in. The report an
+    // operator reads after an upload keeps `validation failed: <code>` in
+    // English.
     if options_with_key.i18n && import_enabled && metadata.has_validator_rules() {
         plan.warn(
             "`--i18n` translates the inline `#[validate(...)]` messages on the create and \
@@ -4049,10 +4050,10 @@ fn render_routes_file(
     } else {
         (String::new(), String::new())
     };
-    // #2227: how `create`/`update` build their changeset. Plain
-    // `form.into_changeset()` without `--i18n`; with it, a resolver that turns
-    // each validator error code into a bundle lookup, so the inline error under
-    // a rejected field is translated like the label above it.
+    // #2227: how `create`/`update` build their changeset. Without `--i18n` this
+    // is plain `form.into_changeset()`. With it, a resolver turns each
+    // validator error code into a bundle lookup, so the inline error matches
+    // the translated label above it.
     let changeset_build = render_changeset_build(snake_name, fields, validations, labels);
     let export_csv_text = if export_enabled {
         labels.lit("common.export.csv", "Export CSV")
@@ -8867,7 +8868,7 @@ fn rich_text_fields(fields: &[Field]) -> Vec<&Field> {
 /// `RICH_TEXT_TOOLBAR` in `autumn-web`, entry for entry.
 ///
 /// Only the NAME goes through the bundle. A Markdown marker such as `**bold**`
-/// is the syntax the user must type, so it reads the same in every locale and
+/// is the syntax the user must type. It reads the same in every locale, so it
 /// stays a literal. The keys are `common.*` because the toolbar reads the same
 /// above every rich-text column in a project.
 const RICH_TEXT_CHROME_CONTROLS: &[(&str, &str, &str)] = &[
@@ -8886,12 +8887,13 @@ const RICH_TEXT_CHROME_HINT: &str =
     "Markdown supported. HTML is not allowed and is shown as plain text.";
 
 /// Emit the `let l_rt_… = …;` bindings the `--i18n` form helper hands to
-/// `RichTextLabels` (issue #2227). Empty without the flag, and empty for a
-/// scaffold with no rich-text column, so the plain output is unchanged.
+/// `RichTextLabels` (issue #2227). This returns an empty string without the
+/// flag, and for a scaffold with no rich-text column. Either way, the plain
+/// output is unchanged.
 ///
-/// One binding per label, rather than one builder chain: `RichTextLabels`
-/// BORROWS every string, and a `t!(locale, …)` temporary built inside the chain
-/// is dropped before the form uses it.
+/// This uses one binding per label, not one builder chain. `RichTextLabels`
+/// borrows every string. A `t!(locale, …)` temporary built inside a chain
+/// would drop before the form uses it.
 fn render_rich_text_label_binds(fields: &[Field], labels: &scaffold_i18n::ViewLabels) -> String {
     use std::fmt::Write as _;
     if !labels.enabled() || !has_rich_text_fields(fields) {
@@ -9090,10 +9092,10 @@ fn render_form_for_helper(
                 } else {
                     "required_rich_text_area_htmx_with_token_field"
                 };
-                // #2227: the editor's own chrome — the toolbar, the hint, and
-                // the preview heading — is built inside autumn-web. Under
-                // `--i18n` the `_with_labels` variant takes it from the bundle
-                // instead. `l_rt_labels` is bound once above the form (see
+                // #2227: autumn-web builds the editor's own chrome — the
+                // toolbar, the hint, and the preview heading. Under `--i18n`
+                // the `_with_labels` variant takes it from the bundle instead.
+                // `l_rt_labels` is bound once above the form (see
                 // `render_rich_text_label_binds`), because the chrome reads the
                 // same for every rich-text column.
                 let (variant, labels_arg) = if labels.enabled() {
@@ -9324,8 +9326,8 @@ fn render_form_for_helper(
         }
     }
     // #2227: one set of chrome bindings for every rich-text column in the form.
-    // Appended after the per-field loop so it always sits last in `preludes`,
-    // which keeps the emitted order stable.
+    // This is appended after the per-field loop, so it always sits last in
+    // `preludes`. That keeps the emitted order stable.
     preludes.push_str(&render_rich_text_label_binds(fields, labels));
     // Issue #1326: a `:states(…)` state-machine column is transition-only. The
     // create form keeps it (initial state), but the EDIT form must not offer it
@@ -11807,17 +11809,18 @@ fn render_show_property_label_binds(
 /// `TransitionLabels`, one group label per state-machine column plus one button
 /// label per DISTINCT target state (issue #2227). Empty without `--i18n`.
 ///
-/// Per distinct target state, not per edge: two edges that end at the same
-/// state share one button, so a key per edge would define a translation the
-/// view never reads.
+/// Per distinct target state, not per edge. Two edges that end at the same
+/// state share one button. A key per edge would define a translation the view
+/// never reads.
 ///
 /// The keys are per model, per field, and per state, unlike the rich-text
 /// chrome. A state token such as `published` reads differently beside each
 /// column it belongs to, so one shared key could not serve them all.
 ///
-/// The button texts are bound as an array and borrowed from a second one:
-/// `TransitionLabels` borrows, so a `t!(locale, …)` temporary built inside the
-/// array would be dropped before the view uses it.
+/// The button labels are built in `l_tr_{field}_texts`, and
+/// `l_tr_{field}_buttons` borrows from it. `TransitionLabels` borrows too, so
+/// a `t!(locale, …)` temporary built directly in the array would drop before
+/// the view uses it.
 fn render_show_transition_label_binds(
     sm_fields: &[&Field],
     snake_name: &str,
@@ -12021,12 +12024,12 @@ fn validator_code_for_rule(rule: &str) -> Option<&str> {
 ///
 /// Without `--i18n` this is the plain `form.into_changeset()`, so the output is
 /// unchanged. With it, the handler passes a resolver with one arm per
-/// `(field, code)` pair the model's rules can produce, and each arm looks the
+/// `(field, code)` pair the model's rules can produce. Each arm looks the
 /// message up in the bundle.
 ///
 /// The English default is the EXACT text autumn-web renders today
-/// (`validation failed: <code>`), so an `en` app reads the same either way and
-/// a translator improves the wording in their own locale file.
+/// (`validation failed: <code>`), so an `en` app reads the same either way. A
+/// translator can still improve the wording in their own locale file.
 fn render_changeset_build(
     snake_name: &str,
     fields: &[Field],
@@ -25742,8 +25745,9 @@ exempt_paths = [
     }
 
     /// #2227: the Markdown editor's chrome now reaches the bundle through
-    /// `RichTextLabels`, so the toolbar, the hint and the preview heading are
-    /// looked up like every other label. The flag used to warn here instead.
+    /// `RichTextLabels`. The view looks up the toolbar, the hint, and the
+    /// preview heading like every other label. The flag used to warn here
+    /// instead.
     #[test]
     fn i18n_translates_the_rich_text_editor_chrome() {
         let tmp = project_with_main(default_main());
@@ -25980,9 +25984,9 @@ exempt_paths = [
     }
 
     /// The one surface #2227 could not reach. `import_csv` calls its row
-    /// handler per line, away from the request, so the report an operator reads
-    /// keeps English messages — and the flag says so rather than leaving it to
-    /// be found in production.
+    /// handler per line, away from the request, so the report an operator
+    /// reads keeps English messages. The flag warns about this instead of
+    /// leaving it to be found in production.
     #[test]
     fn i18n_says_so_when_the_csv_import_report_keeps_english_messages() {
         let tmp = project_with_main(default_main());
