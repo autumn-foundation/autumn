@@ -14,9 +14,14 @@ waiting on since 2026-09-08 — is still undispatched.
 ## 🎯 Verdict path
 
 `trunk-dev` is green (`ci.yml`'s own push-triggered runs on the branch
-succeed). The check developers actually wait on is `Test suite`, the
-shard-result aggregator across `test`/`trybuild`/`test-features`/
-`test-docker`/`coverage`. `manual-macos-contention-check.yml` remains
+succeed). The check developers actually wait on is `Test suite`
+(`test-gate`), the required aggregator whose own `needs:` in `ci.yml` is
+exactly `[test, trybuild, test-features, test-docker]` — `coverage` is a
+separate lane (`needs: [test, meta]`) that reports its own check and does
+not feed `test-gate`, so a coverage failure does not fail the required
+gate. (An earlier version of this line included `coverage` in the
+aggregation; corrected per a Codex review comment, checked against
+`ci.yml` directly.) `manual-macos-contention-check.yml` remains
 dispatch-only, gated on a human (new macOS CI spend needs sign-off per this
 role's own "Ask before" list) — **still zero `workflow_dispatch` runs**
 (`total_count: 0`, checked 2026-09-11T~09:5xZ), the same number reported on
@@ -94,44 +99,52 @@ the three signatures the ongoing macOS/coverage investigation is tracking.
 ## 🔍 Diagnosis
 
 **`job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`:
-a plausible mechanism, not yet a rendered verdict.** Read against
+a plausible mechanism, not yet a rendered verdict — and the leading
+candidate changed twice under review.** Read against
 `autumn/tests/integration/job_tracking_stores_integration.rs` and
 `autumn/src/job_tracking.rs` rather than guessed from the panic text alone.
 The test configures a 1-second TTL, sleeps a fixed 1200ms (`Instant`-backed,
 so it cannot fire early — at least 1200ms of real host time genuinely
-elapses), then asserts `expires_at <= NOW()` where `expires_at` was stamped
-by the *application's* `SystemClock` at write time and `NOW()` is evaluated
-by *Postgres's own clock* at read time. With only a ~200ms margin between
-the TTL and the sleep, and two independently-advancing clock sources being
-compared instead of one, this reads as a textbook thin-margin timing
-dependency — the same anti-pattern class as the three `live_upgrade`
-mechanisms PR #2645 fixed (a fixed wait with no stated budget against
-contention), except here the missing budget is clock-skew tolerance rather
-than a retry-on-barrier.
+elapses), then asserts `expires_at <= NOW()`, evaluated by Postgres.
 
-**Correction (post-review, via a Codex review comment on PR #2711): a
-second, likely more probable mechanism requires no clock skew at all.**
-The test's own job runtime processes the enqueued no-op job during that
-1200ms window; `run_job_handler_inner` calls `store.mark_running(key)` on
-pickup and `ctx.settle_success()` on completion, and both route through
+The original hypothesis in this pass framed this as a dual-clock-source
+race: `expires_at` stamped by the app's `SystemClock`, `NOW()` evaluated
+by Postgres's own clock, with only a ~200ms margin between the TTL and the
+sleep — read as needing Postgres's clock to lag the app host's under
+runner contention. **Correction (post-review, via a second Codex review
+comment on PR #2711): drop contention-induced clock skew as a candidate.**
+The test process and its `testcontainers`-managed Postgres share the same
+runner's `CLOCK_REALTIME` (no time namespace is configured), so scheduling
+contention can only delay *when* a value is read, never make the value
+read back lag true elapsed time — both sides are the same clock. A real
+skew here would need a discrete clock step (e.g. an NTP correction), a
+different and far less likely mechanism than originally proposed; see the
+ledger for the full reasoning.
+
+**Correction (post-review, via a first Codex review comment on PR #2711,
+and now the primary candidate): the test's own job runtime can rewrite
+`expires_at` with no clock disagreement of any kind.** `run_job_handler_inner`
+calls `store.mark_running(key)` on pickup and `ctx.settle_success()` on
+completion of the enqueued no-op job, and both route through
 `PgJobTrackingStore::update`, which unconditionally rewrites `expires_at`
 to *that write's own* `now + ttl`. If either write lands roughly
 200-1000ms after the test's initial read — ordinary worker dispatch
-latency, no contention required — `expires_at` is pushed past the 1.2s
-check point on one single, consistent clock. This mechanism and the
-clock-skew one are not mutually exclusive, and neither is confirmed; see
-the ledger entry for the full comparison, including why the sibling Redis
-test isolates one hypothesis but not the other.
+latency — `expires_at` is pushed past the 1.2s check point legitimately,
+on one single clock. This is the same worker/update race the reviewer
+notes the Redis sibling test also permits in principle, though no organic
+hit has been observed there — that clean history doesn't help isolate
+this hypothesis either way.
 
 The production code path this test is meant to verify never makes the
 cross-clock comparison — reads filter on the same `self.clock.now()` used
-to write, never against `NOW()` — so under the clock-skew hypothesis this
-is a test defect, not a product defect. Refreshing `expires_at` on worker
-activity is deliberate production behavior in its own right, so under the
-worker-refresh hypothesis the defect is in the test's assumption that a
-fixed sleep leaves no room for the job's own worker to touch the record,
-not in the store — a test defect either way. **Both are hypotheses, not a
-verdict**: n=1, no rerun evidence, and neither has been isolated (e.g. by
+to write, never against `NOW()` — so under the (now-demoted) clock-skew
+hypothesis this would be a test-only artifact. Refreshing `expires_at` on
+worker activity is deliberate, sensible production behavior in its own
+right, so under the worker-refresh hypothesis — the better-supported one —
+the defect is in the test's assumption that a fixed sleep leaves no room
+for the job's own worker to touch the record, not in the store. A test
+defect either way. **Neither is a rendered verdict**: n=1, no rerun
+evidence, and neither has been isolated (e.g. by
 asserting on `updated_at` to see which write, if either, actually fired).
 Recorded in the ledger rather than acted on, per this role's own bar — a
 fix here without a rerun-rate baseline would be exactly the "retry in
@@ -139,8 +152,15 @@ disguise" the hard gate exists to block, even though no retry is actually
 being proposed.
 
 **`live_upgrade`/`cache_stampede`/`sim_fault_plan`: unchanged.** Zero new
-organic hits this pass; the harness that would let any of these three close
-is still undispatched.
+organic hits this pass. `manual-macos-contention-check.yml` — macOS-only,
+plain `cargo test --workspace` — is still undispatched; dispatching it
+could plausibly close `cache_stampede` and `sim_fault_plan` outright (both
+observed macOS-only so far), but per the ledger's own corrected accounting
+it cannot close `live_upgrade` on its own even with a clean run — that
+entry has two Linux/`Coverage (workspace)` signatures this harness cannot
+reproduce (no Linux leg, no `cargo llvm-cov`), needing a still-unbuilt
+second harness. (An earlier version of this line implied the one harness
+could close all three; corrected per a Codex review comment.)
 
 ## 🔧 Treatment
 

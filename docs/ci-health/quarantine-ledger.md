@@ -381,50 +381,62 @@ without also filling in the intake form above.
   sweep. Panic at
   `autumn/tests/integration/job_tracking_stores_integration.rs:264:5`:
   `"record should be past its configured TTL"`.
-- **Mechanism (time dependence — dual clock source, thin margin)**: the
-  test (lines 216-264) configures `ttl_secs: 1`, calls
+- **Mechanism**: the test (lines 216-264) configures `ttl_secs: 1`, calls
   `job::enqueue_tracked` (which stamps `expires_at = self.clock.now() +
   1s` using the *application's* `SystemClock`,
   `PgJobTrackingStore::expires_at` in
   `autumn/src/job_tracking.rs:1874-1878`), reads the row back once, then
   `tokio::time::sleep(Duration::from_millis(1_200))` before asserting
-  `expires_at <= NOW()` — but `NOW()` there is evaluated **by Postgres's
-  own clock** (`autumn/tests/integration/job_tracking_stores_integration.rs:256-258`),
-  a different clock source than the one that stamped `expires_at` in the
-  first place. `tokio::time::sleep` is `Instant`-backed and cannot fire
-  early, so at least 1200ms of real host time elapses before the check —
-  comfortably over the 1000ms TTL if both clocks agree and `expires_at`
-  is never rewritten after the initial enqueue. Originally read (see
-  correction immediately below) as requiring Postgres's wall clock to lag
-  the app host's by more than the ~200ms margin — plausible under a
-  heavily contended runner (this sweep runs the full Docker/testcontainer
-  suite on one shared runner; the job itself took 37 minutes end to end)
-  where a container's clock can lag real elapsed time under host
-  CPU/scheduling pressure.
-  **Correction (post-review, via a Codex review comment on PR #2711):**
-  "the only way" was wrong — a second, likely more probable mechanism
-  requires no clock skew at all. `run_job_handler_inner`
-  (`autumn/src/job.rs:2266-2286`) calls `store.mark_running(key)`
-  immediately once the enqueued no-op job is picked up by the running job
-  runtime this test starts, and on completion calls `ctx.settle_success()`
-  (`autumn/src/job.rs:2346`); both route through
-  `PgJobTrackingStore::update` (`autumn/src/job_tracking.rs:1927-1936`),
-  which unconditionally rewrites `expires_at` to *that write's own*
-  `now + ttl`. If either write lands roughly 200-1000ms after the test's
+  `expires_at <= NOW()`, evaluated by Postgres
+  (`autumn/tests/integration/job_tracking_stores_integration.rs:256-258`).
+  `tokio::time::sleep` is `Instant`-backed and cannot fire early, so at
+  least 1200ms of real host time elapses before the check — comfortably
+  over the 1000ms TTL if `expires_at` is never rewritten after the initial
+  enqueue.
+
+  **Originally read (time dependence — dual clock source) as requiring
+  Postgres's wall clock to lag the app host's by more than the ~200ms
+  margin, attributed to contention on a heavily loaded runner.**
+  **Correction (post-review, via a second Codex review comment on PR
+  #2711): drop contention-induced clock skew as a candidate.** The Rust
+  test process and its `testcontainers`-managed Postgres container run on
+  the same GH Actions runner and, absent an explicit Linux time
+  namespace (not configured here), read the same underlying
+  `CLOCK_REALTIME` — they are not two independently-advancing clocks in
+  the sense that framing implied. CPU scheduling contention can delay
+  *when* a descheduled process gets to observe or write the clock, but
+  that only ever adds real elapsed time before the observation happens; it
+  cannot make the value read back *lag behind* true elapsed time, since
+  both sides are reading the same clock. A genuine clock skew here would
+  need a discrete step (e.g. an NTP correction moving the clock backward
+  between the write and the check) rather than ordinary contention — a
+  categorically different and far less likely mechanism, not the
+  contention-driven one originally proposed. Demoted accordingly; not
+  ruled out as a class (a clock step is possible in principle), but no
+  longer treated as comparably likely to the mechanism below.
+
+  **Correction (post-review, via a first Codex review comment on PR
+  #2711): the "only way" framing was wrong regardless — a second,
+  actually well-supported mechanism requires no clock disagreement at
+  all.** `run_job_handler_inner` (`autumn/src/job.rs:2266-2286`) calls
+  `store.mark_running(key)` immediately once the enqueued no-op job is
+  picked up by the running job runtime this test starts, and on
+  completion calls `ctx.settle_success()` (`autumn/src/job.rs:2346`); both
+  route through `PgJobTrackingStore::update`
+  (`autumn/src/job_tracking.rs:1927-1936`), which unconditionally
+  rewrites `expires_at` to *that write's own* `now + ttl`, all on the same
+  clock. If either write lands roughly 200-1000ms after the test's
   initial read — well within reach of ordinary worker dispatch latency,
-  no contention or clock disagreement required — `expires_at` is pushed
-  past the 1.2s check point on a single, consistent clock, and the row
-  legitimately has not expired yet. This is the same worker/update race
-  the reviewer notes the Redis sibling test (lines 113-117 immediately
-  above) also permits in principle, though no organic hit has been
-  observed there. Both mechanisms remain live candidates; neither is
-  confirmed, and they are not mutually exclusive. Compare to the sibling
-  `sqlite` block immediately above this test in the same file (lines
-  113-117): that path checks Redis's own `EXISTS` after the same
-  sleep/TTL shape and is exposed to the same worker/update race, but never
-  crosses a second clock source the way the Postgres path's `NOW()`
-  comparison does — so it isolates the clock-skew hypothesis (if that one
-  is real) but not the worker-refresh one.
+  no contention or clock disagreement of any kind required —
+  `expires_at` is pushed past the 1.2s check point legitimately. This is
+  the same worker/update race the reviewer notes the Redis sibling test
+  (lines 113-117 immediately above) also permits in principle, though no
+  organic hit has been observed there — that sibling test is exposed to
+  the same worker/update race but never crosses a second clock source, so
+  it cannot help isolate the (now-demoted) clock-skew hypothesis, and its
+  clean history so far says nothing about the worker-refresh one either
+  way. **This worker-refresh mechanism is now the primary candidate**;
+  neither it nor a discrete clock step is confirmed.
 - **Test-vs-product**: not yet rendered, under either candidate mechanism.
   The store's actual lazy-expiry behavior (a request-path read filtering
   on `expires_at > now`, e.g. `autumn/src/job_tracking.rs:1899`) uses the
