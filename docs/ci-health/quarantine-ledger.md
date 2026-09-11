@@ -290,7 +290,24 @@ without also filling in the intake form above.
   reports — that gap was separately queried and holds 9 more
   `pull_request`-triggered `ci.yml` runs, all cancelled, no failures, so
   the combined population is 109 runs: 70 cancelled/25 success/14
-  failure, not 100/61/25/14). None of the 14 failures match
+  failure, not 100/61/25/14). **Second correction (post-review, via an
+  eleventh Codex review comment on PR #2711): the 100-run figure itself
+  was only ever a page-1 result at the `perPage=100` ceiling, not verified
+  complete.** This repo's `total_count` for the underlying query grew
+  visibly during the pass (~7369 → ~8191), evidence of continuous
+  concurrent writes that can shift page boundaries between fetches.
+  Checked page 2 of the identical query: it overlaps this window's near
+  edge (`2026-09-09T10:07:59Z`–`2026-09-10T10:46:39Z`, i.e. past the
+  page-1 minimum), and every run in the overlap back to the actual cutoff
+  is accounted for — 16 runs, all cancelled/success except one failure
+  (34467823999) already identified above. No additional failures surfaced
+  there, but the window's far edge (near `2026-09-11T09:09:24Z`) was never
+  independently re-checked against a later page, and sampling by
+  wall-clock time plus a fixed page count is not reproducible against a
+  table this actively written to. Full reasoning and the reproduce
+  command are in the 2026-09-11 report; a future pass sampling this repo
+  should anchor to a stable run ID or commit rather than wall-clock time.
+  None of the 14 failures match
   `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
   see the new `job_tracking_stores_integration` entry below for the one
   finding this pass did turn up, on a different test entirely.

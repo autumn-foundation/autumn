@@ -257,6 +257,34 @@ diagnosis, not a rerun campaign of its own.
 consecutive pass with no change (idle since it became dispatchable
 2026-09-08T15:07:44Z — now ~66.5 hours).
 
+**Correction (post-review, via an eleventh Codex review comment on PR
+#2711): the page-1-only query cannot itself prove the window held only
+100 runs.** `perPage=100, page=1` returned exactly 100 rows — the page-size
+ceiling — so without checking page 2, a window that actually holds more
+than 100 runs would silently drop its oldest entries off page 1, and nothing
+in the original query would reveal that. This repo's own `total_count` grew
+visibly during this pass (~7369 → ~8191 across successive calls), confirming
+continuous concurrent writes that can also shift page boundaries between
+one fetch and the next. Checked directly: page 2 of the identical query
+(`event=pull_request, status=completed, perPage=100`) returned rows spanning
+`2026-09-09T10:07:59Z`–`2026-09-10T10:46:39Z` — overlapping past page 1's
+recorded minimum (`10:30:30Z`) up to `10:46:39Z`, exactly the pagination
+drift the comment warned about. Every run in that overlap
+(`>= 2026-09-10T09:48:19Z`) was inspected: 16 total, all either `cancelled`
+or `success` except one `failure` — run 34467823999
+(`vesper/bugbash-2635-api-token-error-response`), which is the same run
+already identified above as the genuine WIP `api_token_error_response`
+regression, not a new, previously-missed failure. So this specific
+overlap check found no additional failures and no new tracked-signature
+hits, but it does not prove page 1 was complete at its *far* edge (near
+the window's stated end, `2026-09-11T09:09:24Z`) — that edge was never
+independently checked against a later page, and wall-clock-bounded
+pagination against a rapidly, concurrently written table is not a
+reproducible sampling method in general. A future pass sampling this
+repo should anchor the window to a stable reference (a specific run ID or
+commit) rather than wall-clock time plus page count, or explicitly
+paginate until reaching a run older than the intended cutoff.
+
 ## 🔬 Reproduce
 
 ```
@@ -266,6 +294,10 @@ actions_list(list_workflow_runs, ci.yml, event=pull_request, status=completed,
 #   100 runs, 61 cancelled / 25 success / 14 failure
 # each failure's jobs via list_workflow_jobs(run_id, filter=latest),
 # each failing job's log via get_job_logs(job_id, return_content=true)
+# NOTE: page=1 alone cannot prove completeness under concurrent writes --
+# see the correction above. Cross-checked against page=2 of the same
+# query, which overlaps this window's near edge; no additional failures
+# found there, but the window's far edge was not independently verified.
 ```
 
 The new finding:
