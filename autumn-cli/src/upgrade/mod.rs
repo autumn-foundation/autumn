@@ -711,10 +711,10 @@ fn collect_manifests(
 /// `CARGO_TARGET_DIR` overrides every config file's `target-dir`, but has no
 /// equivalent for vendoring, so the config walk runs either way.
 ///
-/// The root's own target directory is asked of `cargo metadata` first (issue
+/// `cargo metadata` supplies the root's own target directory first (issue
 /// #2234): it resolves the env vars and config hierarchy the way Cargo
-/// actually does. The hand-rolled walk still runs, both as the fallback when
-/// the subprocess fails and as the only source for vendoring and for any
+/// actually does. The hand-rolled walk still runs: it is the fallback when
+/// the subprocess fails, and it is the only source for vendoring and for any
 /// nested crate's own `target-dir` redirect.
 fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     // `CARGO_TARGET_DIR` is the dedicated variable; `CARGO_BUILD_TARGET_DIR` is
@@ -762,7 +762,7 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     // Cargo's own answer for the root, in preference to the hand-rolled walk
     // above (issue #2234): `cargo metadata` resolves the same env vars and
     // config hierarchy the way Cargo actually does, without the divergences
-    // hand-rolling it kept reintroducing. Fall back to the walk when the
+    // the hand-rolled walk kept reintroducing. Fall back to the walk when the
     // subprocess is unavailable or fails.
     let root_target_dir = cargo_metadata_target_dir(&absolute_root)
         .or(forced_target_dir)

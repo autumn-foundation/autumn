@@ -845,8 +845,8 @@ mod tests {
             .find(|m| m.id == "0.6.0-repository-with-pool-untracked")
             .expect("the with_pool rename is the first shipped codemod (issue #1629)");
         // `review`, not `auto` (issue #2234): receiver identification is
-        // textual, not name resolution, so a flagged rewrite a human reads is
-        // the safer default until that gap closes.
+        // textual, not name resolution, so flagging every rewrite for a human
+        // to read is the safer default until that gap closes.
         assert_eq!(migration.confidence, Confidence::Review);
         assert_eq!(
             migration.rewrite,
