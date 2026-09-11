@@ -165,7 +165,7 @@ fn join_url(base: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::join_url;
+    use super::{join_url, truncate_on_boundary};
 
     #[test]
     fn join_url_never_doubles_or_drops_the_slash() {
