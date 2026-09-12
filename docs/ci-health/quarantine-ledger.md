@@ -74,6 +74,71 @@ _None as of 2026-09-05._
   revert check passed. Un-quarantined and restored to the Docker sweep.
 - **Closed**: 2026-09-04, #2479 (🚦 Semaphore).
 
+### `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
+
+- **Not a flake — a total, deterministic external-dependency outage.**
+  Sampling the ~23.3h window since the 2026-09-11 follow-up's cutoff
+  (2026-09-11T09:09:24Z–2026-09-12T07:46:03Z) found `Test (Docker)` failing
+  on 20 of 24 failed `ci.yml` runs, across completely unrelated branches
+  (`claude/*` and `vesper/bugbash-*`, no shared code change). Every one of
+  the `autumn-cli` `cli_tests` occurrences checked (run IDs 34668965068,
+  34681578354, 34650506433, 34641243320, 34647320725, and others) panics
+  identically at `autumn-cli/tests/integration/offsite_backup.rs:213:10`:
+  `"start MinIO — is Docker running?: Client(PullImage { descriptor:
+  \"minio/minio:RELEASE.2025-02-28T09-55-16Z\", err:
+  DockerResponseServerError { status_code: 404, message: \"pull access
+  denied for minio/minio, repository does not exist or may require 'docker
+  login': denied: requested access to the resource is denied\" } })"`.
+  Since `Test (Docker)` feeds the required `test-gate` aggregator
+  (`Test suite`), this was failing the required check on essentially every
+  open PR in the repo.
+- **Mechanism**: unpinned/vanished external service, not a race or shared
+  state. Confirmed directly against Docker Hub's own API
+  (`https://hub.docker.com/v2/repositories/minio/minio/` →
+  `{"message":"object not found"}`) that the `minio/minio` repository no
+  longer exists on Docker Hub at all — not just this tag. MinIO Inc.
+  stopped publishing free images to Docker Hub in October 2025. The
+  `testcontainers-modules` crate (pinned at 0.15.0 in `Cargo.lock`) hard-codes
+  `minio/minio` as the image name in its `Image` impl, so every
+  `MinIO::default()` call in this repo pulled from the now-dead repository,
+  100% of the time — this is not stochastic, so no rerun-rate campaign is
+  needed to characterize it beyond the cross-commit evidence already in
+  hand (dozens of independent commits, zero passes, identical signature).
+  The same tagged image is still mirrored byte-for-byte on Quay
+  (`quay.io/minio/minio:RELEASE.2025-02-28T09-55-16Z`, confirmed via
+  `quay.io`'s API: identical manifest digest
+  `sha256:379b06de0d24339646b6139860b170c39b004818dcec95259ee680997839f7dc`
+  to the Docker Hub layer that used to serve this tag).
+- **Test-vs-product**: neither — this is test/CI infrastructure depending
+  on a third-party image registry outside this repo's control. No product
+  code path is implicated.
+- **Fix**: redirect every `MinIO::default()` call site to Quay via
+  `testcontainers`'s own `ImageExt::with_name("quay.io/minio/minio")`,
+  keeping the crate's existing default tag unchanged (same verified
+  manifest digest, so container behavior is identical — only the registry
+  changes). Applied to all three affected call sites:
+  `autumn-cli/tests/integration/offsite_backup.rs` (both tests),
+  `autumn/tests/integration/sqlite_replication_s3.rs`, and
+  `examples/reddit-clone/tests/avatar_s3_integration.rs` (not part of
+  either CI Docker sweep, but the same defect, so fixed for consistency
+  rather than left to fail identically whenever someone runs it).
+- **Verification**: `cargo check`/`cargo clippy -D warnings` clean on all
+  three affected test targets (`autumn-cli --test cli_tests`, `autumn-web
+  --test integration_tests --features test-support,offline-sync`,
+  `reddit-clone --test avatar_s3_integration`). No Docker daemon is
+  available in this sandbox, so the actual container pull could not be
+  exercised locally; **CI-native verification is pending on this PR's own
+  `Test (Docker)` job**, which exercises the real pull against
+  `quay.io/minio/minio` for the first time. Revert check: not applicable in
+  the usual sense (nothing in this repo's own logic changed — the defect
+  was entirely in an external registry going away), but the `PullImage`
+  failure this fix removes is fully reproducible pre-fix (see the run IDs
+  above) and specific to the registry, not the tag or image content, so
+  restoring `MinIO::default()` without `.with_name(...)` would reproduce
+  the identical 404 immediately.
+- **Closed**: 2026-09-12, pending this PR's own CI run for the CI-native
+  confirmation noted above (🚦 Semaphore).
+
 ## Under active investigation, not yet quarantined
 
 These are tracked here because they are the subject of an open rerun

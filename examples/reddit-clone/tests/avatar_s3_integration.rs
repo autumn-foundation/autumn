@@ -11,9 +11,15 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
 };
 use bytes::Bytes;
-use testcontainers::ImageExt as _;
+use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
+
+// Docker Hub no longer serves anonymous pulls of `minio/minio` (any tag,
+// including `latest`, 401s `insufficient_scope`) — MinIO restricted the
+// repository some time in 2025. Quay.io still mirrors the same tags
+// anonymously, so pull from there instead (issue #2727 CI investigation).
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
@@ -37,9 +43,8 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    // Docker Hub refuses anonymous pulls of `minio/minio` (401, surfaced as "repository
-    // does not exist"). quay.io serves the identical tag publicly, so only the registry
-    // moves — `with_name` leaves the tag to `testcontainers-modules`.
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
     let container = MinIO::default()
         .with_name("quay.io/minio/minio")
         .start()
