@@ -720,6 +720,13 @@ impl BillingStore for FailingStore {
         delegate!(self, open_dunning)
     }
 
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        subscription_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<autumn_billing::DunningAttempt>> {
+        delegate!(self, open_dunning_for_subscription, subscription_id)
+    }
+
     fn settle_dunning<'a>(
         &'a self,
         invoice_id: &'a str,
