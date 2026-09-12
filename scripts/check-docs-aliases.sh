@@ -196,6 +196,17 @@ AUTOLINK = re.compile(
 _ATTR_SOUP = r'(?:[^>"\']|"[^"]*"|\'[^\']*\')*'
 HTML_TAG = re.compile(r'</?[A-Za-z][A-Za-z0-9:-]*' + _ATTR_SOUP + r'>')
 
+# In a FULL REFERENCE link, `[visible text][label]`, only the first bracket
+# renders; the label is an identifier pointing at a definition elsewhere. So
+# the second bracket goes and the first stays — the same visible/invisible cut
+# as `[text](dest)`, in different punctuation. The corpus carries 41, e.g.
+# `[#1611][issue-1611]` and `[`CompressionLayer`][cl]`.
+#
+# The lookbehind requires the label to sit IMMEDIATELY after a `]`: `[a] [b]`
+# with a space is two shortcut references, and a shortcut reference renders its
+# own label, so both of those are visible and must be kept.
+REF_LABEL = re.compile(r'(?<=\])\[[^\[\]]*\]')
+
 
 # A destination can contain balanced parentheses, so it is scanned rather than
 # matched. The corpus has one: `](javascript:alert(1))` in rich-text.md.
@@ -249,6 +260,7 @@ def _strip_markup(chunk):
     chunk = REF_DEFINITION.sub(' ', chunk)
     chunk = AUTOLINK.sub(r' \1 ', chunk)    # keep the URL: it is the label
     chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
+    chunk = REF_LABEL.sub(' ', chunk)        # after: `][label]` needs its `]`
     return HTML_TAG.sub(' ', chunk)
 
 
@@ -614,12 +626,29 @@ def self_test():
     if len(d) != 1 or d[0][3] != 'reader word absent':
         failures.append('an HTML tag must not be treated as an autolink')
 
+    # 31. A FULL REFERENCE LABEL is an identifier, not text: `[setup][two-factor]`
+    # renders "setup" only. The corpus carries 41 full references.
+    d, _ = one('See [setup][two-factor].\n\n[two-factor]: ./totp\n')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a full-reference label must not satisfy a row')
+
+    # 32. ... but the VISIBLE half of a full reference still counts.
+    d, _ = one('See [two-factor setup][x].\n\n[x]: ./totp\n')
+    if d:
+        failures.append('a full reference keeps its visible text')
+
+    # 33. ... and a SHORTCUT reference renders its own label, so `[a] [b]` is
+    # two visible references, not a reference plus a hidden identifier.
+    d, _ = one('See [totp] [two-factor] both.\n\n[totp]: ./a\n[two-factor]: ./b\n')
+    if d:
+        failures.append('a shortcut reference renders its label and counts')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (34 properties).')
+    print('Self-test OK (37 properties).')
     return 0
 
 
