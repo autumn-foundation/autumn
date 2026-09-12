@@ -636,13 +636,27 @@ impl syn::parse::Parse for TargetCfgPredicate {
         let ident: syn::Ident = input.parse()?;
         let key_is_known = WASM32_WASIP1_CFG_VALUES.iter().any(|(key, _)| ident == key);
         if key_is_known {
-            input.parse::<syn::Token![=]>()?;
-            let lit: syn::LitStr = input.parse()?;
-            let value = lit.value();
-            let matches = WASM32_WASIP1_CFG_VALUES
-                .iter()
-                .any(|(key, known_value)| ident == key && value == *known_value);
-            return Ok(Self::Leaf(matches));
+            if input.peek(syn::Token![=]) {
+                input.parse::<syn::Token![=]>()?;
+                let lit: syn::LitStr = input.parse()?;
+                let value = lit.value();
+                let matches = WASM32_WASIP1_CFG_VALUES
+                    .iter()
+                    .any(|(key, known_value)| ident == key && value == *known_value);
+                return Ok(Self::Leaf(matches));
+            }
+            // The BARE form of a known key (`target_has_atomic`, no
+            // `= "value"`) is a different predicate from any of its valued
+            // forms, and always false: verified directly (a native,
+            // non-wasm target has real `target_has_atomic = "..."` values,
+            // yet `#[cfg(target_has_atomic)]` bare still does not compile
+            // in) — rustc never emits these keys as a bare flag, only as
+            // one or more `key = "value"` pairs. Previously this fell
+            // through to a parse error, which failed the WHOLE enclosing
+            // predicate (not just this leaf) — `not(target_has_atomic)`,
+            // always true, evaluated as unresolvable-so-false instead
+            // (Codex review on #2739, round 19, P1).
+            return Ok(Self::Leaf(false));
         }
         if ident == "not" {
             let content;
@@ -2637,6 +2651,41 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("dep"));
+    }
+
+    /// Verified directly: a bare `#[cfg(target_has_atomic)]` (no value) does
+    /// NOT compile in even on a native target with real
+    /// `target_has_atomic = "..."` values — rustc never emits these keys as
+    /// a bare flag, only as `key = "value"` pairs — so it is always false,
+    /// and `not(target_has_atomic)` is always TRUE. Previously the bare form
+    /// failed to parse, which failed the WHOLE `not(...)` predicate rather
+    /// than resolving to `Leaf(false)` for just that one leaf (Codex review
+    /// on #2739, round 19, P1).
+    #[test]
+    fn a_bare_known_key_inside_not_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(not(target_has_atomic))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// The un-negated bare form must evaluate false.
+    #[test]
+    fn a_bare_known_key_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(target_has_atomic)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
     }
 
     /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
