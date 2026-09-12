@@ -540,7 +540,7 @@ pub(crate) fn rearm_pending(state: AppState, service: Arc<BillingService>) {
     });
 }
 
-/// The re-arm body [`rearm_pending`] spawns.
+/// The re-arm body `rearm_pending` spawns.
 ///
 /// Waits for the job runtime, loads every open row, re-enqueues each one,
 /// then prunes the event ledger. Exposed (rather than kept file-private) so
