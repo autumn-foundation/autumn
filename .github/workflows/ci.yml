@@ -493,6 +493,31 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: Reader-vocabulary gate
+        # Every docs gate above asks whether a page is TRUE. None asks whether
+        # a reader FINDS it. The orphan gate is the near miss: it proves a page
+        # is reachable by CLICKING from an entry surface, which is not the same
+        # question — nobody clicks through a 159-page guide with no index, they
+        # type the word they already have.
+        #
+        # A findability defect is quieter than a wrong sentence, because a wrong
+        # sentence is at least read. The reader who never lands on the page
+        # produces no 404, no exit code and no ticket; they conclude the feature
+        # does not exist and go and build it, or pick a framework whose docs
+        # answered them.
+        #
+        # Baseline: `autumn generate auth --totp` ships two-factor auth, and
+        # `docs/guide/authentication.md` documented it accurately as "TOTP" and
+        # "Multi-factor" while never once saying "2FA" or "two-factor" — the
+        # words essentially everyone types. A corpus-wide grep for the reader's
+        # words returned four hits, none of them an answer: two were `%2F` URL
+        # escapes, one an example URL on the rate-limiting page, one an agent
+        # skill file. That is why this gate unescapes `%XX` before matching and
+        # why a row is satisfied only by the page that answers the question.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-aliases.sh --self-test && ./scripts/check-docs-aliases.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
