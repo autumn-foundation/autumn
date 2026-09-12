@@ -93,34 +93,55 @@ import sys
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else ''
 
-# (capability, page that documents it, regex of the words a reader searches by)
+# (capability, page that documents it, TERMS — every one of which must appear)
 #
-# The regex is the READER's vocabulary, not the codebase's. A row earns its
+# The terms are the READER's vocabulary, not the codebase's. A row earns its
 # place when the two differ: `--totp` / "2FA" differ, and `rate-limiting.md` /
 # "rate limit" do not. The rows where they agree are kept anyway as live
 # tripwires — they cost one regex each and they fail loudly if a page is ever
 # retitled into internal vocabulary.
+#
+# EVERY TERM IN A ROW IS REQUIRED, and that is the whole point rather than a
+# detail. These started as one alternation per row, which meant any single
+# alternative satisfied the entire row and the other terms were decorative: a
+# row reading "2FA or two-factor" passed on "2FA" alone, so a reader typing
+# "two-factor" was unprotected by a row that named their word. Readers do not
+# search an alternation; they search one word, and the row has to hold for
+# each word it claims.
+#
+# Consequently a LABEL MUST NAME EXACTLY WHAT THE TERMS ENFORCE. The earlier
+# table failed this too, and more quietly: rows labelled "sign-up /
+# registration" and "OAuth / social login" enforced only `\bsign[- ]?up\b` and
+# `\boauth\b`. The label advertised a guarantee the pattern never made, which
+# is the same defect as a docs page promising a feature it does not have. A
+# term belongs in a row only once the page actually carries it.
+#
+# A single term MAY still spell one word several ways — `\bpassword reset\b|
+# \breset password\b` is one reader term in two word orders, not two terms.
+# The test is whether a reader would type one OR the other for the same idea;
+# "2FA" and "two-factor" are the same idea and both get typed, so they are two
+# required terms, not one alternation.
 READER_VOCABULARY = (
     ('two-factor authentication (2FA)', 'docs/guide/authentication.md',
-     r'\b2fa\b|\btwo[- ]factor\b'),
-    ('sign-up / registration', 'docs/guide/authentication.md',
-     r'\bsign[- ]?up\b|\bregistration\b'),
-    ('forgot-password / password reset', 'docs/guide/authentication.md',
-     r'\bforgot[- ]password\b|\bpassword reset\b|\breset password\b'),
-    ('OAuth / social login', 'docs/guide/oauth.md', r'\boauth\b'),
-    ('CSRF protection', 'docs/guide/middleware.md', r'\bcsrf\b'),
-    ('CORS', 'docs/guide/middleware.md', r'\bcors\b'),
-    ('rate limiting', 'docs/guide/rate-limiting.md', r'\brate[- ]limit'),
-    ('background jobs', 'docs/guide/jobs.md', r'\bbackground job'),
-    ('cron / scheduled work', 'docs/guide/jobs.md', r'\bcron\b'),
-    ('websockets', 'docs/guide/websockets.md', r'\bwebsocket'),
+     (r'\b2fa\b', r'\btwo[- ]factor\b')),
+    ('sign-up', 'docs/guide/authentication.md',
+     (r'\bsign[- ]?up\b',)),
+    ('password reset', 'docs/guide/authentication.md',
+     (r'\bforgot[- ]password\b', r'\bpassword reset\b|\breset password\b')),
+    ('OAuth sign-in', 'docs/guide/oauth.md', (r'\boauth\b',)),
+    ('CSRF protection', 'docs/guide/middleware.md', (r'\bcsrf\b',)),
+    ('CORS', 'docs/guide/middleware.md', (r'\bcors\b',)),
+    ('rate limiting', 'docs/guide/rate-limiting.md', (r'\brate[- ]limit',)),
+    ('background jobs', 'docs/guide/jobs.md', (r'\bbackground job',)),
+    ('cron', 'docs/guide/jobs.md', (r'\bcron\b',)),
+    ('websockets', 'docs/guide/websockets.md', (r'\bwebsocket',)),
     ('full-text search', 'docs/guide/full-text-search.md',
-     r'\bfull[- ]text search\b'),
-    ('file upload', 'docs/guide/forms.md', r'\bfile upload\b|\bupload'),
-    ('file storage / S3', 'docs/guide/storage.md', r'\bs3\b'),
-    ('database migrations', 'docs/guide/migrations.md', r'\bmigration'),
-    ('testing', 'docs/guide/testing.md', r'\btest'),
-    ('deployment', 'docs/guide/deployment.md', r'\bdeploy'),
+     (r'\bfull[- ]text search\b',)),
+    ('file upload', 'docs/guide/forms.md', (r'\bfile upload\b',)),
+    ('S3 storage', 'docs/guide/storage.md', (r'\bs3\b',)),
+    ('database migrations', 'docs/guide/migrations.md', (r'\bmigration',)),
+    ('testing', 'docs/guide/testing.md', (r'\btest',)),
+    ('deployment', 'docs/guide/deployment.md', (r'\bdeploy',)),
 )
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')
@@ -256,14 +277,17 @@ def check(rows, read=None, exists=None):
 
     defects = []
     checked = 0
-    for label, page, pattern in rows:
+    for label, page, terms in rows:
         if not exists(page):
-            defects.append((label, page, pattern, 'page does not exist'))
+            defects.append((label, page, terms[0], 'page does not exist'))
             continue
         checked += 1
-        hits = re.findall(pattern, prose(read(page)), re.I)
-        if not hits:
-            defects.append((label, page, pattern, 'reader word absent'))
+        visible = prose(read(page))
+        # EVERY term is required. A row is only as strong as its weakest term,
+        # because a reader searches one word rather than an alternation.
+        for term in terms:
+            if not re.findall(term, visible, re.I):
+                defects.append((label, page, term, 'reader word absent'))
     return defects, checked
 
 
@@ -289,7 +313,7 @@ def self_test():
     """
     failures = []
 
-    row = (('2FA', 'p.md', r'\b2fa\b|\btwo[- ]factor\b'),)
+    row = (('2FA', 'p.md', (r'\b2fa\b|\btwo[- ]factor\b',)),)
     here = lambda p: True
 
     def one(text):
@@ -317,9 +341,24 @@ def self_test():
         failures.append('a page carrying the reader word should pass')
 
     # 4. a missing page is a defect, not a crash
-    d, _ = check((('x', 'does/not/exist.md', r'x'),))
+    d, _ = check((('x', 'does/not/exist.md', (r'x',)),))
     if len(d) != 1 or d[0][3] != 'page does not exist':
         failures.append('a missing page should be reported as a defect')
+
+    # 4b. EVERY term in a row is required. This is the bug the table shape
+    # replaced: as one alternation, "2FA or two-factor" passed on "2FA" alone,
+    # leaving a reader who types "two-factor" unprotected by a row that named
+    # their word. Two required terms, only one present -> a defect naming the
+    # missing one.
+    two = (('2FA', 'p.md', (r'\b2fa\b', r'\btwo[- ]factor\b')),)
+    d, _ = check(two, read=lambda p: 'Enable 2FA with TOTP.', exists=here)
+    if len(d) != 1 or d[0][2] != r'\btwo[- ]factor\b':
+        failures.append('every declared term must be required, not just one')
+    # both present -> clean
+    d, _ = check(two, read=lambda p: 'Two-factor auth (2FA) via TOTP.',
+                 exists=here)
+    if d:
+        failures.append('a row whose terms are all present should pass')
 
     # 5-8. a term that never renders does not satisfy a row. Each of these
     # passes a plain grep over the source and shows the reader nothing.
@@ -390,7 +429,7 @@ def self_test():
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (16 properties).')
+    print('Self-test OK (18 properties).')
     return 0
 
 
@@ -399,7 +438,9 @@ if MODE == '--self-test':
 
 print('Checking that capability pages carry the words readers search by...')
 defects, checked = check(READER_VOCABULARY)
-print(f'vocabulary rows: {len(READER_VOCABULARY)} ({checked} pages read)')
+terms = sum(len(r[2]) for r in READER_VOCABULARY)
+print(f'vocabulary rows: {len(READER_VOCABULARY)} ({terms} required terms, '
+      f'{checked} pages read)')
 print(f'defects: {len(defects)}')
 
 if defects:
