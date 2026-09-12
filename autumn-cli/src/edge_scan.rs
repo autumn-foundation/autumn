@@ -579,14 +579,19 @@ enum TargetCfgPredicate {
     Any(Vec<Self>),
 }
 
-/// wasm32-wasip1's own value(s) for every `cfg(...)` key this scan resolves,
-/// verified directly against the complete
-/// `rustc --print cfg --target wasm32-wasip1` output (Codex review on
-/// #2739, rounds 14, 15 and 16, each extending the previous round's grammar
-/// after a real predicate it did not recognize was found to evaluate as
-/// "does not match" when it actually does — the exact dangerous-direction
-/// mistake this evaluator exists to avoid: a route Cargo really compiles for
-/// the capsule was scanned out). A `cfg(...)` key can list MULTIPLE
+/// wasm32-wasip1's own value(s) for every `cfg(...)` key this scan resolves
+/// — every key/value pair `rustc --print cfg --target wasm32-wasip1` prints,
+/// `debug_assertions` (a bare flag, not a `key = "value"` pair, and not a
+/// realistic target-table predicate) aside — verified directly against that
+/// complete output (Codex review on #2739, rounds 14 through 17, each
+/// extending the previous round's grammar after a real predicate it did not
+/// recognize was found to evaluate as "does not match" when it actually
+/// does — the exact dangerous-direction mistake this evaluator exists to
+/// avoid: a route Cargo really compiles for the capsule was scanned out).
+/// `panic = "abort"` (round 17) is not a target-architecture property like
+/// the rest, but it is still a real, always-true cfg for this target —
+/// wasm32-wasip1 always builds with `panic = "abort"` — so it belongs here
+/// on the same footing. A `cfg(...)` key can list MULTIPLE
 /// simultaneous values for one target — `target_feature` and
 /// `target_has_atomic` both do here — and a real predicate checks
 /// *membership* in that set: `cfg(target_has_atomic = "32")` is satisfied
@@ -616,6 +621,7 @@ const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_has_atomic", "32"),
     ("target_has_atomic", "64"),
     ("target_has_atomic", "ptr"),
+    ("panic", "abort"),
 ];
 
 impl syn::parse::Parse for TargetCfgPredicate {
@@ -2615,6 +2621,24 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(!enabled.contains("dep"));
+    }
+
+    /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
+    /// that target always reports `panic = "abort"` — not a target-arch
+    /// property like the rest of the table, but still a real, always-true
+    /// predicate for the capsule's own build (Codex review on #2739, round
+    /// 17, P1).
+    #[test]
+    fn a_panic_abort_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(panic = "abort")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
     }
 
     /// `dep?/extra` (the weak-dependency form) makes no promise that `dep`
