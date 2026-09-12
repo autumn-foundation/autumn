@@ -577,18 +577,24 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
         .cloned();
     let package_name = table.as_ref().and_then(package_name_from_manifest);
 
-    let mut queue: Vec<String> = features_table
-        .as_ref()
-        .and_then(|features| features.get("default"))
-        .and_then(toml::Value::as_array)
-        .map(|default| {
-            default
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    // `default` is itself a real, always-on feature name (Cargo treats it as
+    // such even with no explicit `[features] default = [...]` entry, an
+    // empty implicit one) — every `autumn build` run has it active, since
+    // (per the module doc) there is no `--no-default-features` flag to turn
+    // it off. Missing this left a bare `#[cfg(feature = "default")]` route
+    // looking excluded even though Cargo always compiles it (Codex review on
+    // #2739, round 9, P1).
+    let mut queue: Vec<String> = vec!["default".to_owned()];
+    queue.extend(
+        features_table
+            .as_ref()
+            .and_then(|features| features.get("default"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned),
+    );
     queue.extend(requested.iter().map(|name| {
         name.split_once('/').map_or_else(
             || (*name).to_owned(),
@@ -1033,6 +1039,14 @@ fn collect_registrations(
 /// reference like this reports as an extra false-positive "unregistered"
 /// warning instead.
 fn registration_candidates(entry: &str, module_path: &[String]) -> Vec<String> {
+    // A leading `::` (Rust's "anchor to a crate root" form, `::my_crate::show`)
+    // means the same thing as the unanchored `my_crate::show` — it only rules
+    // out a same-named local item shadowing the crate name. Left in place, it
+    // splits off as a phantom empty leading segment that matches neither the
+    // `crate` nor the crate-name branch below in `is_registered`, so every
+    // absolute-path registration missed its handler even though Cargo
+    // resolves it fine (Codex review on #2739, round 9, P2).
+    let entry = entry.strip_prefix("::").unwrap_or(entry);
     let segments: Vec<&str> = entry.split("::").collect();
     let (mut base, rest): (Vec<String>, &[&str]) = match segments.first().copied() {
         Some("self") => (module_path.to_vec(), &segments[1..]),
@@ -1469,6 +1483,35 @@ mod tests {
         assert!(!enabled.contains("extra"));
     }
 
+    /// `default` is itself a real, always-on feature name — Cargo compiles a
+    /// `#[cfg(feature = "default")]` route in every ordinary build, `autumn
+    /// build` has no `--no-default-features` flag to turn it off — so it
+    /// must be in the enabled set even though it never appears inside its
+    /// own `default = [...]` list (Codex review on #2739, round 9, P1).
+    #[test]
+    fn the_default_feature_itself_is_enabled() {
+        let manifest = r#"
+            [features]
+            default = ["a"]
+            a = []
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("default"));
+        assert!(enabled.contains("a"));
+    }
+
+    /// Even with no `[features]` table at all, `default` is still Cargo's
+    /// always-on implicit feature.
+    #[test]
+    fn the_default_feature_is_enabled_with_no_features_table() {
+        let manifest = r#"
+            [package]
+            name = "blog"
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("default"));
+    }
+
     /// `default = ["dep/extra"]` (no `?`) also activates the optional
     /// dependency `dep` itself — Cargo auto-generates a same-named local
     /// feature for every optional dependency — so a `#[cfg(feature =
@@ -1830,6 +1873,27 @@ mod tests {
             pub fn show() {}
 
             fn wire() { edge_routes![edgeapp::show]; }
+            ",
+        );
+        scan.crate_name = Some("edgeapp".to_owned());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// `edge_routes![::my_crate::show]` — the leading `::` anchors the path
+    /// to a crate root the same way an explicit `my_crate::show` already
+    /// does, ruling out a same-named local item shadowing the crate name.
+    /// It must match the same as the unanchored form, not fail to match at
+    /// all because of the leading separator (Codex review on #2739, round 9,
+    /// P2).
+    #[test]
+    fn a_leading_double_colon_qualified_registration_matches_its_module_path() {
+        let mut scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() { edge_routes![::edgeapp::show]; }
             ",
         );
         scan.crate_name = Some("edgeapp".to_owned());
