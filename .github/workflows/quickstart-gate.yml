@@ -187,16 +187,26 @@ jobs:
     # generator-emitted call site is a separate, uncovered instance of the
     # same gap, not something a red/green here proves either way.
     #
-    # A red run here means precisely that has happened. Until the next
-    # release ships, the workaround is the one `autumn doctor`'s own docs
-    # already describe: point the generated `Cargo.toml` at the checkout
-    # with a `[patch.crates-io]` override (see
-    # `generated_project_compiles_against_published_autumn_web`'s doc
-    # comment in autumn-cli/tests/e2e.rs for the mechanism and the exact
-    # commit — 76c56b1 — that first triggered it, undetected, for three
-    # days). This job does not gate anything else in this repo; it exists
-    # to make that failure visible the moment it happens instead of
-    # leaving it for whoever tries `cargo install --path autumn-cli` next.
+    # A red run here means precisely that has happened, and it is not, on its
+    # own, actionable: this repo never bumps the workspace version outside a
+    # deliberate release (CLAUDE.md), and trunk-dev is *expected* to keep
+    # moving ahead of the last release indefinitely — there is no cadence at
+    # which this job settles green on its own. Treating that as a build
+    # failure was mistaking a permanent, by-design gap for a regression: it
+    # produced 26+ straight red runs (issue #2620) with no code fix and no
+    # release to cut, which trains reviewers to stop looking at this job at
+    # all — the opposite of what an advisory signal is for.
+    #
+    # `continue-on-error: true` below keeps the signal (a neutral ⊘, not a
+    # red ✗, with the exact drifted call site in the job log) without it
+    # counting toward the workflow's pass/fail or blocking anything. The
+    # workaround remains the one `autumn doctor`'s own docs already describe:
+    # point the generated `Cargo.toml` at the checkout with a
+    # `[patch.crates-io]` override (see
+    # `generated_project_compiles_against_published_autumn_web`'s doc comment
+    # in autumn-cli/tests/e2e.rs for the mechanism). A maintainer only needs
+    # to act on this job at release-cut time (docs/release-checklist.md), not
+    # on every red run in between.
     #
     # Skipped on workflow_dispatch: a dispatched run gates a specific
     # release *candidate* pinned via `cli-version` (docs/release-checklist.md
@@ -209,6 +219,7 @@ jobs:
     # from turning an otherwise-green candidate gate into a false release
     # blocker.
     if: github.event_name != 'workflow_dispatch'
+    continue-on-error: true
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

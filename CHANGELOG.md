@@ -454,6 +454,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
+  CI failure [no-plugin]:** nothing here is agent-facing — it's a
+  CI-workflow-only change, not new framework surface
+  (`.github/workflows/quickstart-gate.yml`). The `local-dev-quickstart` job
+  checks a source-built CLI's `autumn new` against the *published*
+  `autumn-web` — and has been red on every run since it was added by #2459,
+  because this repo's own policy (CLAUDE.md: never bump the workspace
+  version outside a deliberate release) guarantees trunk-dev stays ahead of
+  the last release indefinitely. Issue #2620 treated that as an incident
+  ("broken for 26 straight CI runs, needs a release") and recommended
+  cutting one; the maintainer's call was that trunk-dev being ahead of the
+  crate release is permanent, not a release-cadence gap to close. A
+  permanent, by-design condition reported as a build failure is exactly the
+  kind of CI red that trains reviewers to stop looking — so the job now
+  runs with `continue-on-error: true`: it still surfaces the exact drifted
+  call site in its log (and still goes green the moment a release does
+  catch up), but a run where it fires no longer fails the workflow or looks
+  indistinguishable from a real regression. No code or doc change — the
+  `[patch.crates-io]` workaround `docs/guide/getting-started.md`'s "Local
+  development" section already describes is unchanged and still correct.
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
