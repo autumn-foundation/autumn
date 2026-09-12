@@ -465,6 +465,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision recorded on toolchain pinning. The lint lanes track `stable` on
   purpose, to catch a new lint close to when it lands. The separate `msrv`
   job keeps its own 1.88.0 pin for the compile floor.
+- **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
+  `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
+  one opaque `style: form, explode: true` parameter for the whole struct
+  (issue #2251). Each field gets the `style` that actually matches how the
+  `query_string` decoder reads it: `form`/`explode` for a scalar or
+  scalar-array field (unchanged from before), `deepObject` for a nested-object
+  field (`?filter[status]=open`). An array-of-objects field
+  (`?items[0][sku]=A-1`) has no OpenAPI `style` to carry — that parameter now
+  names the bracketed encoding in its `description` instead of silently
+  mis-describing it. Each parameter's `required` also now reflects the real
+  field — a non-`Option` field can be `required: true` — where the old
+  whole-struct parameter was always `required: false`. A `Query<T>` whose `T`
+  does not derive `OpenApiSchema` is unaffected: its fields cannot be read, so
+  it keeps the previous whole-struct parameter with no spec churn. MCP
+  `tools/call` dispatch is unaffected either way — it already renders the
+  bracketed form directly.
+  **Breaking:** `openapi::Parameter` (public, not `#[non_exhaustive]`) carries
+  a new `description` field. It now derives `Default`, so end a struct-literal
+  built outside this crate with `..Default::default()` rather than listing
+  every field. See the [migration guide](docs/migrations/next.md#openapi-parameter-gains-a-description-field).
+- **`cms` starter: the WordPress-style `[[tag]]` escape no longer leaves a
+  stray trailing `]` in rendered content.** `shortcodes::expand` collapsed the
+  opening `[[` to `[` but never consumed the matching second `]` at the close,
+  so `[[gallery]]` rendered as `[gallery]]` on the live page and in the Atom
+  feed — silently, with no error anywhere in the authoring flow. A paired
+  escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
+  the module's own "same syntax WordPress does" claim, and still suppresses
+  expansion of the inner shortcode (#2678).
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
@@ -694,6 +722,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Duplicate-name checker now enumerates auto-discovered bins and runs in an
+  enforced gate (#2690, #2691):** `scripts/check-example-bin-names.sh` — the
+  LNK1104 manifest gate from #2639 — returned early whenever a member declared
+  any explicit `[[bin]]`, on the false premise that an explicit `[[bin]]`
+  disables auto-discovery. It does not: unless `[package] autobins = false`,
+  cargo still builds `src/bin/*.rs` and `src/bin/*/main.rs` alongside the
+  explicit entries, so a member with one explicit bin could add a colliding
+  auto-discovered helper and the checker would report success (#2690). The
+  checker now enumerates both classes — honoring `autobins = false`, covering
+  the `src/bin/<name>/main.rs` form, and excluding only paths an explicit
+  `[[bin]]` actually claims (its `path`, or the default
+  `src/bin/<name>.rs`) — plus the package-named `src/main.rs` binary cargo
+  auto-discovers (a review finding: an explicit `[[bin]]` named like another
+  member's package would otherwise collide on the linker output undetected) —
+  and carries a synthetic `--self-test` (13 cases) that
+  the default invocation runs first, matching the other manifest gates. The
+  member enumeration also covers in-tree path dependencies cargo
+  auto-includes as workspace members even when `[workspace].members` does not
+  name them (honoring `[workspace].exclude`; a second review finding). The
+  checker was previously invoked by nothing — no workflow, no pre-push script,
+  no test — so a reintroduced duplicate would have passed every enforced check
+  (#2691): it now runs in the CI `lint` job and is mirrored in
+  `scripts/pre-push-check.sh` alongside the other manifest gates. No toolchain,
+  ~1 second.
 - **Removed dead `autumn/templates/build.rs.template` (#2694):** an
   unreferenced leftover from before the Tailwind build script moved to
   `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
