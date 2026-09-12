@@ -236,6 +236,24 @@ struct StatementRow {
     buffers: i64,
 }
 
+/// Every `pg_stat_statements` query below excludes this fragment too, unique
+/// to `pg_update_queue_depth_gauges`'s `SELECT ... FROM autumn_jobs ...
+/// GROUP BY queue, name` (`autumn/src/job.rs`). `job::start_runtime` spawns
+/// that survey on a fixed 5-second interval on **every** role, including the
+/// enqueue-only (`run_workers = false`) one this harness starts, specifically
+/// so a web replica's `/actuator/jobs` gauges reflect the shared backlog —
+/// it has nothing to do with dunning, runs whether or not a restart ever
+/// re-arms anything, and its own interval fires immediately on spawn and
+/// every 5s after, landing at an arbitrary point relative to this harness's
+/// `reset_stats`/measure windows (confirmed: an earlier version of this
+/// harness saw its `oldest_wait_ms` statement show up with 0, 4, then 1,624
+/// buffers across the three tiers, pure scheduling noise). Cancelling the
+/// runtime's `shutdown` token after `start_runtime` returns does not close
+/// this race either -- the survey's first tick can already be in flight on
+/// another worker thread by the time cancellation is observed -- so this
+/// filters the statement out of the measurement instead of racing it.
+const EXCLUDE_QUEUE_DEPTH_SURVEY: &str = "query NOT ILIKE '%oldest_wait_ms%'";
+
 /// Prints every statement this run issued, ranked by buffers then by calls.
 /// Returns `(job_insert_calls, job_insert_buffers, workload_total_buffers)` --
 /// the `INSERT INTO autumn_jobs` statement this harness targets, isolated
@@ -246,12 +264,12 @@ struct StatementRow {
 fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64) {
     use diesel::RunQueryDsl;
     println!("\n=== pg_stat_statements: {label} (by buffers) ===");
-    let by_buffers = diesel::sql_query(
+    let by_buffers = diesel::sql_query(format!(
         "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers \
          FROM pg_stat_statements \
-         WHERE query NOT ILIKE '%pg_stat_statements%' \
-         ORDER BY buffers DESC LIMIT 10",
-    )
+         WHERE query NOT ILIKE '%pg_stat_statements%' AND {EXCLUDE_QUEUE_DEPTH_SURVEY} \
+         ORDER BY buffers DESC LIMIT 10"
+    ))
     .load::<StatementRow>(conn)
     .expect("query pg_stat_statements by buffers");
     for row in &by_buffers {
@@ -263,12 +281,12 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64) {
     }
 
     println!("\n=== pg_stat_statements: {label} (by calls) ===");
-    let by_calls = diesel::sql_query(
+    let by_calls = diesel::sql_query(format!(
         "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers \
          FROM pg_stat_statements \
-         WHERE query NOT ILIKE '%pg_stat_statements%' \
-         ORDER BY calls DESC LIMIT 10",
-    )
+         WHERE query NOT ILIKE '%pg_stat_statements%' AND {EXCLUDE_QUEUE_DEPTH_SURVEY} \
+         ORDER BY calls DESC LIMIT 10"
+    ))
     .load::<StatementRow>(conn)
     .expect("query pg_stat_statements by calls");
     for row in &by_calls {
@@ -279,10 +297,11 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64) {
         );
     }
 
-    let grand_total_all: i64 = diesel::sql_query(
+    let grand_total_all: i64 = diesel::sql_query(format!(
         "SELECT COALESCE(SUM(shared_blks_hit + shared_blks_read), 0)::bigint AS n \
-         FROM pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%'",
-    )
+         FROM pg_stat_statements \
+         WHERE query NOT ILIKE '%pg_stat_statements%' AND {EXCLUDE_QUEUE_DEPTH_SURVEY}"
+    ))
     .get_result::<CountRow>(conn)
     .expect("grand total buffers")
     .n;
