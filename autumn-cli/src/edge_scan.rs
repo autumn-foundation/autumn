@@ -428,47 +428,86 @@ pub fn resolve_edge_scan_with_features(
     scan
 }
 
-/// [`resolve_edge_scan_with_features`], plus `extra_file` — a path outside
-/// `project_root/src` to scan as well.
+/// [`resolve_edge_scan_with_features`], plus `extra_file` — the edge-capsule
+/// bin's own resolved root file, scanned as its own `[[bin]]` crate tree
+/// (root file plus every out-of-line submodule it transitively declares)
+/// rather than as part of the library.
 ///
 /// A project may declare its edge-capsule bin at a custom `[[bin]] path`
-/// outside `src/` (`path = "cmd/edge.rs"`). The `src/` walk above can never
-/// reach such a file, so a `edge_routes![...]` call written only there was
-/// invisible to the scan — every handler it wires looked unregistered to
-/// `autumn doctor`, even though the real build serves them fine. `extra_file`
-/// is a no-op when `None`, unreadable, or already under `src/` (the `src/`
-/// walk scanned it there already; scanning it again would double-count its
-/// functions).
+/// (`path = "cmd/edge.rs"`, or even `path = "src/edge.rs"` — inside `src/`
+/// but outside the conventional `src/bin/`). The library's `src/` walk
+/// cannot give such a file the right identity on its own: it would either
+/// never reach it at all (outside `src/`) or credit it to a fictitious
+/// library module named after the file (inside `src/`, since only the
+/// `src/bin/` prefix specifically is recognized as a `[[bin]]` crate root).
+/// Either way, a `edge_routes![...]` call or a bare `crate::`-qualified
+/// registration written there could look invisible or wrongly scoped to
+/// `autumn doctor`, even though the real build serves the routes fine
+/// (Codex review on #2739, round 7 and round 13, P2). `extra_file` is a
+/// no-op when `None` or already under the conventional `src/bin/` (the
+/// `src/` walk already gives that the right identity).
 #[must_use]
 pub fn resolve_edge_scan_with_extra_file(
     project_root: &Path,
     requested_features: &[&str],
     extra_file: Option<&Path>,
 ) -> EdgeScan {
-    let mut scan = resolve_edge_scan_with_features(project_root, requested_features);
     let Some(file) = extra_file else {
-        return scan;
+        return resolve_edge_scan_with_features(project_root, requested_features);
     };
-    if file.starts_with(project_root.join("src")) {
-        return scan;
+    if file.starts_with(project_root.join("src").join("bin")) {
+        return resolve_edge_scan_with_features(project_root, requested_features);
     }
-    let Ok(rel) = file.strip_prefix(project_root) else {
-        return scan;
-    };
-    let Ok(src) = std::fs::read_to_string(file) else {
-        return scan;
-    };
-    let default_features = std::fs::read_to_string(project_root.join("Cargo.toml"))
-        .ok()
-        .map(|manifest| enabled_features_from_manifest(&manifest, requested_features))
+
+    let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
+    let default_features = manifest
+        .as_deref()
+        .map(|manifest| enabled_features_from_manifest(manifest, requested_features))
         .unwrap_or_default();
-    scan_source(
-        &rel.to_string_lossy().replace('\\', "/"),
-        &src,
+    let crate_name = manifest
+        .as_deref()
+        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok())
+        .and_then(|table| rust_crate_name_from_manifest(&table));
+
+    let mut scan = EdgeScan {
+        crate_name,
+        ..EdgeScan::default()
+    };
+
+    // Scan the capsule's own tree FIRST, so its file set is known before the
+    // library walk below — excluding those files there is what stops a root
+    // file living inside `src/` from being double-scanned under two
+    // different (and for the library one, wrong) crate identities.
+    let capsule_files = scan_bin_crate_tree(
+        file,
+        project_root,
+        "bin:edge-capsule",
         &default_features,
         &mut scan,
     );
-    scan.files_scanned += 1;
+
+    let mut files = Vec::new();
+    collect_rs_files(&project_root.join("src"), &mut files);
+    files.sort();
+
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .filter(|path| !capsule_files.contains(path.as_path()))
+        .filter_map(|path| {
+            let src = std::fs::read_to_string(path).ok()?;
+            let rel = path
+                .strip_prefix(project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            Some((rel, src))
+        })
+        .collect();
+    for (rel, src) in &sources {
+        scan_source(rel, src, &default_features, &mut scan);
+    }
+    scan.files_scanned += sources.len();
+
     scan
 }
 
@@ -487,22 +526,111 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `<name>` is declared `optional = true` in `[dependencies]` or in
-/// any `[target.'cfg(...)'.dependencies]` table (dev/build dependency tables
-/// are still not consulted, matching this scanner's other best-effort
-/// limits). A version-string dependency (`name = "1"`) is never optional;
-/// only the expanded table form can set the flag.
+/// Whether `target_key` — the string inside `[target.<target_key>.dependencies]`
+/// — can apply to the edge capsule's own build target,
+/// [`crate::build::EDGE_TARGET`] (`wasm32-wasip1`): the one target this
+/// scanner's target-specific dependency check can reliably reason about.
 ///
-/// Cargo enables a target-specific optional dependency's implicit local
-/// feature the same as a top-level one whenever a `dep/feat` reference is
-/// active, regardless of whether that target `cfg` matches the build — the
-/// feature graph is resolved before target selection. Checking only
-/// `[dependencies]` missed that, so a `pkg/feat` naming a target-only
-/// optional dependency looked non-optional, its implicit feature never got
-/// queued, and a sole `#[cfg(feature = "pkg")]` route was excluded from the
-/// scan even though Cargo compiles it — this scanner's dangerous direction,
-/// a genuinely-served route silently missing (Codex review on #2739, round
-/// 8, P1).
+/// Verified directly against `cargo rustc -- --print cfg`: Cargo enables a
+/// target-specific optional dependency's implicit feature only for a target
+/// whose predicate actually holds — treating every target table as
+/// unconditionally active (this scanner's prior behavior, round 8) let a
+/// target that can never build the edge capsule (`cfg(windows)`, say) still
+/// count as declaring an "optional dependency," crediting a
+/// `#[cfg(feature = "...")]` route that Cargo never really compiles for
+/// wasm32-wasip1 — a phantom route that can spuriously demand a capsule/WASI
+/// target or reject `--embed` (Codex review on #2739, round 13, P2).
+///
+/// Only a literal `wasm32-wasip1` triple, or a `cfg(...)` predicate built
+/// from `target_arch = "wasm32"` leaves combined with `not`/`all`/`any`, is
+/// resolved; anything else (an OS-family shorthand like `windows`/`unix`, a
+/// `target_os`/`target_family`/… key, or a predicate this scan cannot parse)
+/// is treated as NOT applying. That is the opposite default from function-
+/// level `#[cfg(...)]` evaluation ([`eval_cfg_attr`], which stays
+/// conservative by assuming *true*): crediting an inapplicable target here
+/// produces a phantom route, not a merely missed one, so "cannot resolve"
+/// must mean "does not match."
+#[must_use]
+fn target_key_matches_edge_capsule(target_key: &str) -> bool {
+    if target_key == crate::build::EDGE_TARGET {
+        return true;
+    }
+    let Some(inner) = target_key
+        .strip_prefix("cfg(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    syn::parse_str::<TargetCfgPredicate>(inner).is_ok_and(|pred| pred.eval())
+}
+
+/// A `cfg(...)` predicate this scan can resolve against the fixed
+/// wasm32-wasip1 edge-capsule target: built only from `target_arch = "wasm32"`
+/// leaves, combined with `not`, `all`, and `any` — see
+/// [`target_key_matches_edge_capsule`].
+enum TargetCfgPredicate {
+    Wasm32,
+    NotWasm32,
+    Not(Box<Self>),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+}
+
+impl syn::parse::Parse for TargetCfgPredicate {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let ident: syn::Ident = input.parse()?;
+        if ident == "target_arch" {
+            input.parse::<syn::Token![=]>()?;
+            let lit: syn::LitStr = input.parse()?;
+            return Ok(if lit.value() == "wasm32" {
+                Self::Wasm32
+            } else {
+                Self::NotWasm32
+            });
+        }
+        if ident == "not" {
+            let content;
+            syn::parenthesized!(content in input);
+            let inner: Self = content.parse()?;
+            return Ok(Self::Not(Box::new(inner)));
+        }
+        if ident == "all" || ident == "any" {
+            let content;
+            syn::parenthesized!(content in input);
+            let list =
+                syn::punctuated::Punctuated::<Self, syn::Token![,]>::parse_terminated(&content)?;
+            let parts: Vec<Self> = list.into_iter().collect();
+            return Ok(if ident == "all" {
+                Self::All(parts)
+            } else {
+                Self::Any(parts)
+            });
+        }
+        // `windows`, `unix`, `target_os`, `target_family`, ... — not part of
+        // the resolvable grammar; the caller treats this as "does not match."
+        Err(input.error("target cfg predicate not resolvable by this scan"))
+    }
+}
+
+impl TargetCfgPredicate {
+    fn eval(&self) -> bool {
+        match self {
+            Self::Wasm32 => true,
+            Self::NotWasm32 => false,
+            Self::Not(inner) => !inner.eval(),
+            Self::All(parts) => parts.iter().all(Self::eval),
+            Self::Any(parts) => parts.iter().any(Self::eval),
+        }
+    }
+}
+
+/// Whether `<name>` is declared `optional = true` in `[dependencies]` or in
+/// a `[target.'cfg(...)'.dependencies]` table whose target actually applies
+/// to the edge capsule's own build (see
+/// [`target_key_matches_edge_capsule`]) — dev/build dependency tables are
+/// still not consulted, matching this scanner's other best-effort limits. A
+/// version-string dependency (`name = "1"`) is never optional; only the
+/// expanded table form can set the flag.
 #[must_use]
 fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
     let declares_optional = |deps: &toml::Table| {
@@ -525,7 +653,9 @@ fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
         .and_then(toml::Value::as_table)
         .is_some_and(|targets| {
             targets
-                .values()
+                .iter()
+                .filter(|(target_key, _)| target_key_matches_edge_capsule(target_key))
+                .map(|(_, target)| target)
                 .filter_map(toml::Value::as_table)
                 .any(|target| in_table("dependencies", target))
         })
@@ -738,12 +868,29 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// parse can still contribute registrations, and vice versa.
 fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan: &mut EdgeScan) {
     let (crate_root, module_path) = crate_context_from_file(file);
+    scan_source_with_context(file, src, &crate_root, module_path, default_features, scan);
+}
+
+/// [`scan_source`], but with the crate/module context supplied directly
+/// instead of derived from `file`'s own path via [`crate_context_from_file`].
+/// [`scan_bin_crate_tree`] uses this: a custom `[[bin]] path]`'s own
+/// out-of-line submodule lives wherever `mod x;` resolution says it does,
+/// which need not follow `src/`'s directory-mirrors-modules convention at
+/// all (Codex review on #2739, round 13, P2).
+fn scan_source_with_context(
+    file: &str,
+    src: &str,
+    crate_root: &str,
+    module_path: Vec<String>,
+    default_features: &BTreeSet<String>,
+    scan: &mut EdgeScan,
+) {
     if let Ok(ast) = syn::parse_file(src) {
         let mut module_path = module_path.clone();
         scan_items(
             &ast.items,
             file,
-            &crate_root,
+            crate_root,
             &mut module_path,
             default_features,
             scan,
@@ -751,7 +898,7 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
     }
     if let Ok(stream) = TokenStream::from_str(src) {
         let mut module_path = module_path;
-        collect_registrations(&stream, &crate_root, &mut module_path, scan);
+        collect_registrations(&stream, crate_root, &mut module_path, scan);
     }
 }
 
@@ -906,6 +1053,152 @@ fn scan_items(
             _ => {}
         }
     }
+}
+
+/// Find every out-of-line `mod name;` declaration reachable from `items`
+/// (descending into inline `mod a { ... }` blocks the same way [`scan_items`]
+/// does, cfg-excluded ones included), returning each as `(enclosing_path,
+/// name)` — `enclosing_path` is the chain of *inline* module names between
+/// `items`' own file and the declaration, empty for a top-level one.
+///
+/// [`scan_bin_crate_tree`] uses this to follow a custom `[[bin]] path]`'s own
+/// module graph: unlike the library's `src/` walk (which reaches every file
+/// under `src/` regardless of whether any `mod` declaration actually
+/// references it), a bin target outside the conventional layout has no such
+/// directory convention to lean on, so its submodules are invisible unless
+/// this scan actually follows its `mod` declarations (Codex review on #2739,
+/// round 13, P2).
+fn out_of_line_mod_declarations(
+    items: &[syn::Item],
+    default_features: &BTreeSet<String>,
+) -> Vec<(Vec<String>, String)> {
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    collect_out_of_line_mods(items, default_features, &mut path, &mut out);
+    out
+}
+
+fn collect_out_of_line_mods(
+    items: &[syn::Item],
+    default_features: &BTreeSet<String>,
+    path: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, String)>,
+) {
+    for item in items {
+        let syn::Item::Mod(item_mod) = item else {
+            continue;
+        };
+        let cfg_excludes = item_mod
+            .attrs
+            .iter()
+            .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+        if cfg_excludes {
+            continue;
+        }
+        match &item_mod.content {
+            Some((_, inner)) => {
+                path.push(item_mod.ident.to_string());
+                collect_out_of_line_mods(inner, default_features, path, out);
+                path.pop();
+            }
+            None => out.push((path.clone(), item_mod.ident.to_string())),
+        }
+    }
+}
+
+/// Resolve an out-of-line `mod name;` to its file, following Rust's own rule:
+/// relative to `root_dir` (the crate root's own directory) plus
+/// `dir_segments` (the accumulated module path so far), the file is either
+/// `<dir>/name.rs` or, failing that, `<dir>/name/mod.rs`. `None` when neither
+/// exists — a non-standard `#[path = "..."]` override, like every other
+/// heuristic in this best-effort scanner, is not resolved (see the module
+/// doc's "Recognition limits").
+fn resolve_out_of_line_module_file(
+    root_dir: &Path,
+    dir_segments: &[String],
+    name: &str,
+) -> Option<PathBuf> {
+    let dir = dir_segments
+        .iter()
+        .fold(root_dir.to_path_buf(), |dir, segment| dir.join(segment));
+    let flat = dir.join(format!("{name}.rs"));
+    if flat.is_file() {
+        return Some(flat);
+    }
+    let nested = dir.join(name).join("mod.rs");
+    if nested.is_file() {
+        return Some(nested);
+    }
+    None
+}
+
+/// Scan a `[[bin]]` target's own crate tree, starting at its root file:
+/// `root_file` itself, plus every out-of-line submodule it (transitively)
+/// declares via `mod name;`, each tagged with `crate_root` and its own
+/// module path. Returns the absolute paths of every file scanned, so the
+/// caller can exclude them from the library's own `src/` walk — without
+/// that, a root file living inside `src/` (a custom `[[bin]] path =
+/// "src/edge.rs"`, say) would be scanned twice: once here with the correct
+/// bin identity, once by the library walk with an incorrect library-module
+/// one (Codex review on #2739, round 13, P2).
+///
+/// A conventional `src/bin/<name>.rs` / `src/bin/<name>/main.rs` capsule
+/// never reaches this function — [`resolve_edge_scan_with_extra_file`] only
+/// calls it for `extra_file`, which is `None` for the conventional layout
+/// (the library walk already reaches it there, with the right identity via
+/// [`crate_context_from_file`]'s own `src/bin/` handling).
+fn scan_bin_crate_tree(
+    root_file: &Path,
+    project_root: &Path,
+    crate_root: &str,
+    default_features: &BTreeSet<String>,
+    scan: &mut EdgeScan,
+) -> BTreeSet<PathBuf> {
+    let root_dir = root_file.parent().unwrap_or_else(|| Path::new(""));
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root_file.to_path_buf(), Vec::new()));
+
+    while let Some((file, module_path)) = queue.pop_front() {
+        if !visited.insert(file.clone()) {
+            continue; // Already scanned — a module cycle can't loop forever.
+        }
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(project_root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        scan_source_with_context(
+            &rel,
+            &src,
+            crate_root,
+            module_path.clone(),
+            default_features,
+            scan,
+        );
+        scan.files_scanned += 1;
+
+        let Ok(ast) = syn::parse_file(&src) else {
+            continue;
+        };
+        for (nested, name) in out_of_line_mod_declarations(&ast.items, default_features) {
+            let mut dir_segments = module_path.clone();
+            dir_segments.extend(nested);
+            let Some(resolved) = resolve_out_of_line_module_file(root_dir, &dir_segments, &name)
+            else {
+                continue;
+            };
+            let mut child_module_path = dir_segments;
+            child_module_path.push(name);
+            queue.push_back((resolved, child_module_path));
+        }
+    }
+
+    visited
 }
 
 /// The last `::` segment of an attribute path, e.g. `edge` for
@@ -1738,15 +2031,14 @@ mod tests {
         assert!(enabled.contains("foo"));
     }
 
-    /// Cargo resolves the feature graph before target selection, so a
-    /// `[target.'cfg(...)'.dependencies]` optional dependency's implicit
-    /// local feature turns on from a `dep/feat` reference exactly like a
-    /// top-level one — regardless of whether that target's `cfg` matches the
-    /// host doing the scan. Missing this made a target-only optional
-    /// dependency look non-optional, so its implicit feature never got
-    /// queued and a `#[cfg(feature = "dep")]` route was scanned out even
-    /// though Cargo genuinely compiles it (Codex review on #2739, round 8,
-    /// P1).
+    /// A `[target.'cfg(...)'.dependencies]` optional dependency's implicit
+    /// local feature turns on from a `dep/feat` reference the same as a
+    /// top-level one, when that target's predicate applies to the edge
+    /// capsule's own `wasm32-wasip1` build target. Missing this made a
+    /// target-only optional dependency look non-optional, so its implicit
+    /// feature never got queued and a `#[cfg(feature = "dep")]` route was
+    /// scanned out even though Cargo genuinely compiles it for the capsule
+    /// (Codex review on #2739, round 8, P1).
     #[test]
     fn a_target_specific_optional_dependency_feature_reference_also_enables_the_dependency() {
         let manifest = r#"
@@ -1758,6 +2050,59 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("dep"));
+    }
+
+    /// The literal-triple form of a target table (no `cfg(...)` wrapper) is
+    /// recognized the same way when it names the capsule's own target
+    /// exactly.
+    #[test]
+    fn a_literal_wasm32_wasip1_target_table_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.wasm32-wasip1.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// Verified directly against `cargo rustc -- --print cfg`: a
+    /// `[target.'cfg(...)'.dependencies]` table whose predicate can never
+    /// hold for the edge capsule's `wasm32-wasip1` build (here,
+    /// `cfg(windows)`) must NOT credit its optional dependency — Cargo never
+    /// sets that dependency's implicit feature for a build that isn't
+    /// Windows, so crediting it here would include a
+    /// `#[cfg(feature = "dep")]` route in the scan that the capsule build
+    /// never really compiles: a phantom route (Codex review on #2739, round
+    /// 13, P2, correcting round 8's unconditional target-table scan).
+    #[test]
+    fn a_target_specific_dependency_whose_target_cannot_be_the_edge_capsule_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(windows)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
+    /// A `not(target_arch = "wasm32")` predicate is the direct opposite of
+    /// the capsule's own target and must not be credited either.
+    #[test]
+    fn a_not_wasm32_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
     }
 
     /// `dep?/extra` (the weak-dependency form) makes no promise that `dep`
@@ -2285,11 +2630,11 @@ mod tests {
 
     /// A custom `[[bin]] path` for the edge-capsule target pointing outside
     /// `src/` (e.g. `path = "cmd/edge.rs"`) reaches the scan only through
-    /// `resolve_edge_scan_with_extra_file`'s `extra_file`, scanned as a
-    /// single file. It must get its own crate root, not the library crate's
-    /// — a `crate::`-qualified registration written in it should resolve to
-    /// its own handler, never to a same-named library-crate function (Codex
-    /// review on #2739, round 8, P2).
+    /// `resolve_edge_scan_with_extra_file`'s `extra_file`. It must get its
+    /// own crate root, not the library crate's — a `crate::`-qualified
+    /// registration written in it should resolve to its own handler, never
+    /// to a same-named library-crate function (Codex review on #2739, round
+    /// 8, P2).
     #[test]
     fn a_custom_out_of_tree_bin_path_is_its_own_crate_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -2330,5 +2675,100 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "cmd/edge.rs");
+    }
+
+    /// A custom `[[bin]] path` INSIDE `src/` but outside the conventional
+    /// `src/bin/` (e.g. `path = "src/edge.rs"`) must also get its own crate
+    /// root — the ordinary library `src/` walk would otherwise credit it to
+    /// a fictitious library module named `edge`, and a bare
+    /// `crate::`-qualified registration written there would then look like
+    /// it lives in the wrong module entirely (Codex review on #2739, round
+    /// 13, P2).
+    #[test]
+    fn a_custom_in_src_bin_path_is_its_own_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "src/edge.rs"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "#[edge]\npub fn show() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/edge.rs"),
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("src/edge.rs")),
+        );
+
+        let unregistered = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/lib.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/edge.rs");
+        assert_eq!(registered[0].module_path, Vec::<String>::new());
+    }
+
+    /// An out-of-tree custom bin's own `mod routes;` must be followed and
+    /// scanned with the same bin crate identity — a valid registration
+    /// written only in that submodule was previously invisible, since the
+    /// capsule was scanned as a single file with no submodule traversal at
+    /// all (Codex review on #2739, round 13, P2).
+    #[test]
+    fn a_custom_out_of_tree_bins_out_of_line_submodule_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "cmd/edge.rs"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "mod routes;\nfn main() { edge_routes![routes::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/routes.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "cmd/routes.rs");
+        assert_eq!(registered[0].module_path, vec!["routes".to_owned()]);
+        assert_eq!(registered[0].crate_root, "bin:edge-capsule");
     }
 }
