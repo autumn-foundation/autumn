@@ -174,10 +174,21 @@ REF_DEFINITION = re.compile(
 )
 # An AUTOLINK is the one bracketed construct whose "destination" IS its label:
 # `<https://example.com/x>` renders as the URL itself, which a reader sees and
-# ctrl-F finds. So the brackets go and the URL STAYS. Stripping it outright —
-# as this did, by filing autolinks with link destinations — could reject a page
-# whose term was genuinely visible. The corpus carries 29 of them.
-AUTOLINK = re.compile(r'<([a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*)>')
+# ctrl-F finds. So the brackets go and the CONTENT STAYS. Stripping it outright
+# — as this did, by filing autolinks with link destinations — could reject a
+# page whose term was genuinely visible.
+#
+# BOTH CommonMark forms count, not just the hierarchical one: an absolute URI
+# with any scheme (`<mailto:unsubscribe@example.com?subject=…>`) and a bare
+# email (`<noreply@example.com>`). Requiring `://` missed both, and `HTML_TAG`
+# then ate them. The corpus carries 29 URL autolinks plus 5 email/mailto ones
+# across cloud-native.md, mail.md, mail-compliance.md and operator-alerts.md.
+AUTOLINK = re.compile(
+    r'<('
+    r'[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*'          # absolute URI, any scheme
+    r'|[^\s<>@]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'        # bare email
+    r')>'
+)
 
 # A tag ends at the first `>` that is NOT inside a quoted attribute value, so
 # `<span id=">x">` is one tag rather than a tag plus the stray text `x">`.
@@ -589,12 +600,26 @@ def self_test():
     if len(d) != 1 or d[0][3] != 'reader word absent':
         failures.append('an explicit link destination must not satisfy a row')
 
+    # 28-29. BOTH autolink forms render, not just the hierarchical URI one.
+    # Requiring `://` missed the email and `mailto:` spellings and let HTML_TAG
+    # eat them, which is again the false-failure direction. The corpus has five.
+    for form in ('<two-factor@example.com>',
+                 '<mailto:help@example.com?subject=two-factor>'):
+        d, _ = one(f'Mail {form} to enrol.')
+        if d:
+            failures.append(f'autolink {form} is visible and should count')
+
+    # ... and a real HTML tag is still not an autolink.
+    d, _ = one('<span data-x="two-factor">TOTP</span>')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('an HTML tag must not be treated as an autolink')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (31 properties).')
+    print('Self-test OK (34 properties).')
     return 0
 
 
