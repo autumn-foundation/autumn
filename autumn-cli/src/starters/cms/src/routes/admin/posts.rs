@@ -886,7 +886,7 @@ async fn ensure_submitted_choices_visible(
         }
         let present: std::collections::HashSet<i64> =
             field.terms.iter().map(|term| term.id).collect();
-        let missing: Vec<i64> = form
+        let mut missing: Vec<i64> = form
             .taxonomies
             .get(field.slug)
             .into_iter()
@@ -894,6 +894,14 @@ async fn ensure_submitted_choices_visible(
             .copied()
             .filter(|id| !present.contains(id))
             .collect();
+        // Deduplicated and bounded the same way `resolve_term_ids` bounds a
+        // save, before any of it reaches the database: this is a display
+        // convenience for an already-rejected submission, not a save, so a
+        // crafted request repeating thousands of ids must not make it
+        // allocate, query and render an unbounded list.
+        missing.sort_unstable();
+        missing.dedup();
+        missing.truncate(MAX_TERMS_PER_SAVE);
         if missing.is_empty() {
             continue;
         }
