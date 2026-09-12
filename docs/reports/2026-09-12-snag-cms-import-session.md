@@ -122,16 +122,21 @@ The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
 always created before its children) is a no-op whenever a post's `path` is
 absent: `identity()` falls back to the bare slug, which never contains
-`/`. That is guaranteed for every version-2 and version-3 file (`path`
-was added in version 4), but — a Codex catch on this PR, confirmed by a
-fourth reproduction below — it is **not** limited to those versions:
-`ExportPost::path` is `#[serde(default)]`, so a version-4 or version-5
-file that simply omits `path` on the affected posts (while every other
-post carries one, and the file's declared `version` stays current) hits
-the identical fallback and the identical bug. The condition is "this
-post's `path` is missing," not "this file's version is old" — version
-2/3 is simply the case where the *format itself* never supplies `path` at
-all.
+`/`. The condition is purely "this post's `path` is missing" — **not**
+"this file's version is old or new." `ExportPost::path` is
+`#[serde(default)]` and the importer's version check
+(`READABLE_EXPORT_VERSIONS`) only validates the declared `version` number
+against an allowlist; it never inspects, requires, or strips `path` based
+on that number. So the two are independent: a *period-authentic*
+version-2 or -3 export (one an old exporter of this software actually
+produced) never carries `path` at all, since that format predates the
+field — but an arbitrary file merely *labeled* version 2 or 3 is not
+guaranteed to lack it (nothing stops a hand-crafted file from including
+`path` values despite an old version label, in which case it sorts
+correctly and does not trigger the bug), and conversely a version-4 or
+-5 file that simply omits `path` on some posts, while declaring a current
+version, hits the identical fallback and the identical bug — confirmed by
+a fourth reproduction below, a Codex catch on this PR.
 
 When two same-slug pages under different parents are listed in the file
 before their respective parents, and neither carries a `path`, the
