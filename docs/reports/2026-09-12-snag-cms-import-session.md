@@ -202,10 +202,13 @@ regression test the sweep will then pick up automatically.
    is only an extension, concurrent uploads racing the
    `OrphanedBlobGuard` cleanup — has not been driven at all yet.
 2. **The scheduled-publishing sweep, end-to-end** — still open from the
-   prior session's list; a good pairing with this one, since
-   `import_status`'s "an elapsed `future` schedule becomes a publish"
-   logic is the import-time analogue of the same sweep and was exercised
-   only through the import path this session, never through the real timer.
+   prior session's list. `import_status`'s "an elapsed `future` schedule
+   becomes a publish" logic is the import-time analogue of the same sweep
+   and reads correctly, but — a Codex catch on this PR — this session
+   never actually constructed a `status: "future"` post with an elapsed
+   date to drive that branch over HTTP; none of this session's fixtures
+   used `future` at all. Both the import-time analogue and the real timer
+   sweep remain unverified end-to-end and belong together in a follow-up.
 3. **A fix for #2737** would benefit from a design decision on how to order
    posts by ancestry depth when the file carries no `path` (recursively
    resolving each post's `parent` chain rather than counting `/`) — flagged
