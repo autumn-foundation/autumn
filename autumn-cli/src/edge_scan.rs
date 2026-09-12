@@ -292,6 +292,22 @@ impl EdgeScan {
 /// `module_path` — would be indistinguishable, silently crediting whichever
 /// one this function happened to see first (Codex review on #2739, round 7,
 /// P2).
+///
+/// The crate-name reading is applied unconditionally whenever the leading
+/// segment matches, without checking whether the invocation's own crate
+/// ALSO happens to declare a local module of that same name — real Rust
+/// would resolve an unqualified `my_app::show` to such a local module
+/// first (ordinary name shadowing takes priority over the extern-crate
+/// reading), only reaching the library crate via the explicitly-anchored
+/// `::my_app::show`. A project that names a local module identically to
+/// its own package is the same "not a name resolver" limit as an
+/// unresolved `use`-alias (see the module doc's "Recognition limits"): this
+/// scanner doesn't track what else is in scope at the invocation site, so
+/// it cannot tell the two readings apart, and deliberately does not guess
+/// — guessing risks exactly the false-positive-credit direction this
+/// function's own crate-root/crate-name checks exist to avoid, for a
+/// pattern rare enough (and confusing enough as real code) that resolving
+/// it isn't worth that risk (Codex review on #2739, round 20, P2).
 fn is_registered(
     f: &EdgeFn,
     registered: &BTreeSet<(String, String)>,
@@ -331,9 +347,15 @@ fn is_registered(
 
 /// Scan a set of in-memory `(file, source)` pairs, given the set of feature
 /// names enabled for this build — see [`enabled_features_from_manifest`] —
-/// used to evaluate `#[cfg(...)]` on `#[edge]`-marked functions. The pure
-/// core of the scan: [`resolve_edge_scan_with_features`] is the thin
-/// filesystem wrapper around it.
+/// used to evaluate `#[cfg(...)]` on `#[edge]`-marked functions.
+///
+/// `#[cfg(test)]`: nothing outside a test build calls this. Production code
+/// (`resolve_edge_scan_with_features`) scans files straight from disk via
+/// [`scan_source`]/[`scan_source_with_context`] instead of collecting them
+/// into an in-memory list first, so it can special-case one file (a custom
+/// `[lib] path`) without this helper's uniform per-file treatment getting in
+/// the way (Codex review on #2739, round 20, P2).
+#[cfg(test)]
 fn scan_sources_with_features(
     sources: &[(&str, &str)],
     default_features: &BTreeSet<String>,
@@ -399,10 +421,11 @@ pub fn resolve_edge_scan_with_features(
         .as_deref()
         .map(|manifest| enabled_features_from_manifest(manifest, requested_features))
         .unwrap_or_default();
-    let crate_name = manifest
+    let table = manifest
         .as_deref()
-        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok())
-        .and_then(|table| rust_crate_name_from_manifest(&table));
+        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
+    let crate_name = table.as_ref().and_then(rust_crate_name_from_manifest);
+    let custom_lib_path = table.as_ref().and_then(custom_lib_path_from_manifest);
 
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
@@ -426,13 +449,37 @@ pub fn resolve_edge_scan_with_features(
             Some((rel, src))
         })
         .collect();
-    let borrowed: Vec<(&str, &str)> = sources
-        .iter()
-        .map(|(file, src)| (file.as_str(), src.as_str()))
-        .collect();
-    let mut scan = scan_sources_with_features(&borrowed, &default_features);
+
+    let mut scan = EdgeScan::default();
+    for (rel, src) in &sources {
+        // A custom `[lib] path` (e.g. `src/app.rs`) IS this crate's library
+        // root, the same way a custom `[[bin]] path` is its own bin's root
+        // (see `resolve_edge_scan_with_extra_file`'s doc) — without this, it
+        // was scanned as an ordinary library submodule instead (module path
+        // `app`, say), so a registration meaning the crate root
+        // (`edge_routes![my_app::show]`, `crate_name` stripped to nothing)
+        // could never match it (Codex review on #2739, round 20, P2).
+        if Some(rel.as_str()) == custom_lib_path.as_deref() {
+            scan_source_with_context(rel, src, "", Vec::new(), &default_features, &mut scan);
+        } else {
+            scan_source(rel, src, &default_features, &mut scan);
+        }
+    }
+    scan.files_scanned = sources.len();
     scan.crate_name = crate_name;
     scan
+}
+
+/// The library target's own `[lib] path` override, when the manifest sets
+/// one — the file Cargo actually compiles as this crate's library root
+/// instead of the conventional `src/lib.rs`.
+#[must_use]
+fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
+    table
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// [`resolve_edge_scan_with_features`], plus `extra_file` — the edge-capsule
@@ -689,9 +736,23 @@ impl syn::parse::Parse for TargetCfgPredicate {
         if ident == "windows" || ident == "unix" {
             return Ok(Self::Leaf(false));
         }
+        // `debug_assertions` deliberately falls through to "unresolvable"
+        // here too, and that is the CORRECT answer, not merely a
+        // conservative one: `rustc --print cfg --target wasm32-wasip1`
+        // reports it bare, but only because that command defaults to a
+        // dev-profile-shaped query. Verified directly with
+        // `-C debug-assertions=off` (what a `--release` build actually
+        // uses): the flag disappears entirely. The edge capsule is always
+        // compiled `--release` (see the module doc), so `debug_assertions`
+        // is genuinely false for it — treating it as true here would
+        // manufacture the exact phantom-route problem this evaluator
+        // exists to avoid, in the opposite direction (Codex review on
+        // #2739, round 20, P1 — investigated and not applied; see the
+        // adjacent test asserting today's exclusion is correct).
+        //
         // `target_env`, `target_pointer_width`, ... as a bare identifier
-        // (not `key = "value"`) — not part of the resolvable grammar; the
-        // caller treats this as "does not match."
+        // (not `key = "value"`) — not part of the resolvable grammar
+        // either; the caller treats all of these as "does not match."
         Err(input.error("target cfg predicate not resolvable by this scan"))
     }
 }
@@ -2639,6 +2700,28 @@ mod tests {
         assert!(!enabled.contains("dep"));
     }
 
+    /// `cfg(debug_assertions)` must NOT enable a target-specific optional
+    /// dependency — verified directly with
+    /// `rustc --print cfg --target wasm32-wasip1 -C debug-assertions=off`
+    /// (what the capsule's always-`--release` build actually uses): the
+    /// flag is genuinely absent there, unlike the dev-profile-shaped
+    /// default `--print cfg` output. Treating it as true would manufacture
+    /// a phantom route in the opposite direction from every other fix in
+    /// this file (Codex review on #2739, round 20, P1 — investigated, not
+    /// applied).
+    #[test]
+    fn a_debug_assertions_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(debug_assertions)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
     /// Same reasoning for `unix`.
     #[test]
     fn a_not_unix_target_specific_dependency_also_enables_the_dependency() {
@@ -3396,6 +3479,31 @@ mod tests {
         let unregistered: Vec<&EdgeFn> = scan.unregistered();
         assert_eq!(unregistered.len(), 1, "{unregistered:?}");
         assert_eq!(unregistered[0].file, "src/lib.rs");
+    }
+
+    /// A custom `[lib] path` (the library target compiled from a file other
+    /// than the conventional `src/lib.rs`) must be treated as the crate
+    /// root too — an empty module path, not one derived from its own file
+    /// name — the same way a custom `[[bin]] path` already is (Codex review
+    /// on #2739, round 20, P2).
+    #[test]
+    fn resolve_edge_scan_honors_a_custom_lib_path_as_the_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
     /// A *bare* registration, unlike the `crate::`-qualified one above, DOES
