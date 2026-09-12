@@ -427,22 +427,6 @@ fn resolve_edge_scan_impl(
         .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
     let crate_name = table.as_ref().and_then(rust_crate_name_from_manifest);
     let custom_lib_path = table.as_ref().and_then(custom_lib_path_from_manifest);
-    // Normalized the same way `rel` below is (joined onto `project_root`,
-    // then stripped back off) so a manifest spelling like `./src/app.rs` —
-    // Cargo's own target is `src/app.rs`, dot-component and all — still
-    // compares equal to the walk's own `rel`, which never has a `./` to
-    // begin with. Comparing the raw manifest string directly missed this:
-    // the crate root would be scanned as an ordinary submodule instead, and
-    // a registration meaning the crate root could never match it (Codex
-    // review on #2739, round 21, P2).
-    let custom_lib_path_rel = custom_lib_path.as_deref().map(|lib_path| {
-        project_root
-            .join(lib_path)
-            .strip_prefix(project_root)
-            .unwrap_or_else(|_| Path::new(lib_path))
-            .to_string_lossy()
-            .replace('\\', "/")
-    });
 
     let mut scan = EdgeScan {
         crate_name,
@@ -450,19 +434,22 @@ fn resolve_edge_scan_impl(
     };
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // A custom `[lib] path` (e.g. `src/app.rs`, or even `lib/app.rs` outside
-    // `src/` entirely) IS this crate's library root, the same way a custom
-    // `[[bin]] path` is its own bin's root (see
-    // `resolve_edge_scan_with_extra_file`'s doc). One outside `src/` is
-    // otherwise invisible to the `src/` walk below the same way an
-    // out-of-tree capsule bin is, so it needs the same `scan_bin_crate_tree`
-    // treatment (Codex review on #2739, round 21, P1) — one still inside
-    // `src/` is already reached by that walk, so it only needs its identity
-    // corrected, which the walk's own per-file check (below) does without
-    // the overhead of a separate mod-graph traversal.
+    // A custom `[lib] path` (e.g. `src/app.rs`, `src/custom/app.rs`, or even
+    // `lib/app.rs` outside `src/` entirely) IS this crate's library root, the
+    // same way a custom `[[bin]] path` is its own bin's root (see
+    // `resolve_edge_scan_with_extra_file`'s doc). Always scanned via
+    // `scan_bin_crate_tree`, regardless of whether it lives inside `src/`:
+    // an in-`src/` root's own out-of-line submodules (`mod routes;` next to
+    // it) still need real Rust module-path resolution relative to the
+    // root's own directory, not `crate_context_from_file`'s
+    // directory-mirrors-module heuristic, which would invent an extra
+    // leading segment from the root's enclosing directory name (`custom`)
+    // that is not a real module at all (Codex review on #2739, round 22,
+    // P2 — round 21's own fix only corrected the root file's own identity,
+    // never its submodules').
     if let Some(lib_path) = &custom_lib_path {
         let lib_file = project_root.join(lib_path);
-        if !lib_file.starts_with(project_root.join("src")) && lib_file.is_file() {
+        if lib_file.is_file() {
             claimed.extend(scan_bin_crate_tree(
                 &lib_file,
                 project_root,
@@ -477,7 +464,7 @@ fn resolve_edge_scan_impl(
     // cannot give it the right identity on its own (see
     // `resolve_edge_scan_with_extra_file`'s doc for the exact cases).
     if let Some(file) = capsule_bin_file
-        && !file.starts_with(project_root.join("src").join("bin"))
+        && !bin_path_is_a_conventional_root(file, project_root)
     {
         claimed.extend(scan_bin_crate_tree(
             file,
@@ -513,20 +500,7 @@ fn resolve_edge_scan_impl(
         .collect();
 
     for (rel, src) in &sources {
-        // A custom `[lib] path` still under `src/` was found by the walk
-        // above like any other file; it only needs its crate identity
-        // corrected here — without this it was scanned as an ordinary
-        // library submodule instead (module path `app`, say), so a
-        // registration meaning the crate root (`edge_routes![my_app::show]`,
-        // `crate_name` stripped to nothing) could never match it (Codex
-        // review on #2739, round 20, P2). Compared against the normalized
-        // `custom_lib_path_rel`, not the raw manifest string — see its own
-        // doc above (round 21, P2).
-        if Some(rel.as_str()) == custom_lib_path_rel.as_deref() {
-            scan_source_with_context(rel, src, "", Vec::new(), &default_features, &mut scan);
-        } else {
-            scan_source(rel, src, &default_features, &mut scan);
-        }
+        scan_source(rel, src, &default_features, &mut scan);
     }
     scan.files_scanned += sources.len();
     scan
@@ -542,6 +516,32 @@ fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
         .and_then(|lib| lib.get("path"))
         .and_then(toml::Value::as_str)
         .map(str::to_owned)
+}
+
+/// Whether `file` matches one of Cargo's own two auto-discovery shapes for a
+/// `[[bin]]` target root — `src/bin/<name>.rs` or `src/bin/<name>/main.rs` —
+/// the only shapes [`crate_context_from_file`]'s own `src/bin/` handling
+/// resolves correctly (it treats the first path segment under `src/bin/` as
+/// the bin's own name and everything after it as a submodule path relative
+/// to that bin's root). An explicit `[[bin]] path` override can point
+/// anywhere else under `src/bin/` too (`src/bin/tools/capsule.rs`, several
+/// segments deep, not named `main.rs`) — there, that heuristic invents a
+/// phantom bin name from an intermediate directory and misplaces the root
+/// under it as a submodule, so it needs the same explicit
+/// `scan_bin_crate_tree` treatment as a root entirely outside `src/bin/`
+/// (Codex review on #2739, round 22, P2).
+fn bin_path_is_a_conventional_root(file: &Path, project_root: &Path) -> bool {
+    let Ok(rel) = file.strip_prefix(project_root.join("src").join("bin")) else {
+        return false;
+    };
+    matches!(
+        rel.to_string_lossy()
+            .replace('\\', "/")
+            .split('/')
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [_name] | [_name, "main.rs"]
+    )
 }
 
 /// Walk `project_root/src` and scan every `.rs` file below it, plus
@@ -572,8 +572,11 @@ fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
 /// registration written there could look invisible or wrongly scoped to
 /// `autumn doctor`, even though the real build serves the routes fine
 /// (Codex review on #2739, round 7 and round 13, P2). `extra_file` is a
-/// no-op when `None` or already under the conventional `src/bin/` (the
-/// `src/` walk already gives that the right identity). A custom `[lib]
+/// no-op when `None` or when it already matches one of Cargo's own two
+/// `src/bin/` auto-discovery shapes (`src/bin/<name>.rs` or
+/// `src/bin/<name>/main.rs` — see [`bin_path_is_a_conventional_root`]): the
+/// `src/` walk already gives those the right identity, but nothing else
+/// under `src/bin/` (Codex review on #2739, round 22, P2). A custom `[lib]
 /// path` is handled the same way regardless of `extra_file` — see
 /// [`resolve_edge_scan_impl`]'s own doc.
 #[must_use]
@@ -1355,9 +1358,10 @@ fn resolve_out_of_line_module_file(
 ///
 /// A conventional `src/bin/<name>.rs` / `src/bin/<name>/main.rs` capsule
 /// never reaches this function — [`resolve_edge_scan_with_extra_file`] only
-/// calls it for `extra_file`, which is `None` for the conventional layout
-/// (the library walk already reaches it there, with the right identity via
-/// [`crate_context_from_file`]'s own `src/bin/` handling).
+/// calls it for `extra_file` when [`bin_path_is_a_conventional_root`] says
+/// no (`extra_file` itself is `None` for the conventional layout, same as
+/// any other case the library walk already reaches with the right identity
+/// via [`crate_context_from_file`]'s own `src/bin/` handling).
 fn scan_bin_crate_tree(
     root_file: &Path,
     project_root: &Path,
@@ -3582,6 +3586,36 @@ mod tests {
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
+    /// A custom `[lib] path` nested under its own subdirectory
+    /// (`src/custom/app.rs`) whose root declares an out-of-line submodule
+    /// (`mod routes;`, resolving to `src/custom/routes.rs`) must resolve
+    /// that submodule's module path the same way real Rust does — relative
+    /// to the crate root (`routes`), not `crate_context_from_file`'s
+    /// directory-mirrors-module heuristic, which would invent a spurious
+    /// leading `custom` segment from the enclosing directory name (Codex
+    /// review on #2739, round 22, P2).
+    #[test]
+    fn resolve_edge_scan_resolves_a_nested_custom_lib_paths_own_submodule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/custom")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/custom/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/custom/app.rs"), "mod routes;\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/custom/routes.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::routes::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].module_path, vec!["routes".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
     /// Same as above, but the manifest spells the custom `[lib] path` with a
     /// leading `./` (`./src/app.rs`) — a dot-component Cargo normalizes away
     /// to the same `src/app.rs` target, so the scan's own crate-root
@@ -3771,6 +3805,49 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "cmd/edge.rs");
+    }
+
+    /// A custom `[[bin]] path` nested several segments under `src/bin/`
+    /// itself (`src/bin/tools/capsule.rs`) is NEITHER of Cargo's own two
+    /// auto-discovery shapes (`src/bin/<name>.rs`, `src/bin/<name>/main.rs`)
+    /// — `crate_context_from_file`'s heuristic would otherwise treat `tools`
+    /// as a phantom bin name and `capsule` as its submodule, so a bare
+    /// `crate::`-qualified registration in the real capsule root would never
+    /// match its own root-level handler (Codex review on #2739, round 22,
+    /// P2).
+    #[test]
+    fn a_custom_bin_path_nested_under_src_bin_is_its_own_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin/tools")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "src/bin/tools/capsule.rs"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/tools/capsule.rs"),
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("src/bin/tools/capsule.rs")),
+        );
+
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/bin/tools/capsule.rs");
     }
 
     /// A custom `[[bin]] path` INSIDE `src/` but outside the conventional
