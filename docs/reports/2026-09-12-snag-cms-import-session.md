@@ -91,14 +91,24 @@ whose *database* was restored but whose blob store bytes were not. Looked
 like a bug at first glance — an HTTP-semantics oracle says a missing
 resource should be a client-facing `404`, not a server error — but the
 code's own comment at that exact line names this distinction deliberately:
-`attachment.file` being `None` (a version-2 import, or a hand-written row)
-is a 404 by explicit check; `attachment.file` being `Some` but the
-underlying blob store lookup failing (bytes never restored) is treated as
-"a caller with no better answer" and left as a 500. That is a real,
-already-considered design line, not an oversight — restoring the blob
-store's actual contents alongside the database (what a full backup restore
-does) made the same request return `200` with byte-identical content, which
-is what closed this out as a self-inflicted setup gap rather than a finding.
+`attachment.file` being `None` is a 404 by explicit check; `attachment.file`
+being `Some` but the underlying blob store lookup failing (bytes never
+restored) is treated as "a caller with no better answer" and left as a 500.
+That is a real, already-considered design line, not an oversight —
+restoring the blob store's actual contents alongside the database (what a
+full backup restore does) made the same request return `200` with
+byte-identical content, which is what closed this out as a self-inflicted
+setup gap rather than a finding. (The source comment attributes a
+`file: None` row to "a version-2 import," but that doesn't hold up on a
+second look — `Export::attachments` defaults to empty for a version-2 file,
+since attachments were only introduced at version 3, so a genuine v2 import
+creates no attachment row at all, `file: None` or otherwise; a
+`/media/{slug}` request against one 404s from the slug lookup finding
+nothing, never reaching the null-handle check. A hand-written row, or an
+attachment entry whose `file` field is simply absent from the JSON, is the
+scenario that actually reaches it — not specifically "a version-2 import."
+Another Codex catch on this PR, not something either cms session verified
+independently.)
 
 ## 🐛 Bug filed
 
