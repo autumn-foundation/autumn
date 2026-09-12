@@ -427,6 +427,22 @@ fn resolve_edge_scan_impl(
         .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
     let crate_name = table.as_ref().and_then(rust_crate_name_from_manifest);
     let custom_lib_path = table.as_ref().and_then(custom_lib_path_from_manifest);
+    // Normalized the same way `rel` below is (joined onto `project_root`,
+    // then stripped back off) so a manifest spelling like `./src/app.rs` —
+    // Cargo's own target is `src/app.rs`, dot-component and all — still
+    // compares equal to the walk's own `rel`, which never has a `./` to
+    // begin with. Comparing the raw manifest string directly missed this:
+    // the crate root would be scanned as an ordinary submodule instead, and
+    // a registration meaning the crate root could never match it (Codex
+    // review on #2739, round 21, P2).
+    let custom_lib_path_rel = custom_lib_path.as_deref().map(|lib_path| {
+        project_root
+            .join(lib_path)
+            .strip_prefix(project_root)
+            .unwrap_or_else(|_| Path::new(lib_path))
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
 
     let mut scan = EdgeScan {
         crate_name,
@@ -503,8 +519,10 @@ fn resolve_edge_scan_impl(
         // library submodule instead (module path `app`, say), so a
         // registration meaning the crate root (`edge_routes![my_app::show]`,
         // `crate_name` stripped to nothing) could never match it (Codex
-        // review on #2739, round 20, P2).
-        if Some(rel.as_str()) == custom_lib_path.as_deref() {
+        // review on #2739, round 20, P2). Compared against the normalized
+        // `custom_lib_path_rel`, not the raw manifest string — see its own
+        // doc above (round 21, P2).
+        if Some(rel.as_str()) == custom_lib_path_rel.as_deref() {
             scan_source_with_context(rel, src, "", Vec::new(), &default_features, &mut scan);
         } else {
             scan_source(rel, src, &default_features, &mut scan);
@@ -3563,6 +3581,33 @@ mod tests {
         .unwrap();
 
         let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same as above, but the manifest spells the custom `[lib] path` with a
+    /// leading `./` (`./src/app.rs`) — a dot-component Cargo normalizes away
+    /// to the same `src/app.rs` target, so the scan's own crate-root
+    /// identity check must resolve the same way rather than comparing the
+    /// raw manifest string against the walk's already-normalized `rel`
+    /// (Codex review on #2739, round 21, P2).
+    #[test]
+    fn resolve_edge_scan_honors_a_dot_component_custom_lib_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"./src/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
         assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
