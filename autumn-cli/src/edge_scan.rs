@@ -35,7 +35,14 @@
 //!   function body, nested in another macro's group). A re-exported alias of the
 //!   macro under a different name is not recognized. Each comma-separated entry
 //!   keeps its full path text, so `edge_routes![handlers::greet]` registers
-//!   `handlers::greet`. A leading `self` or `super` in an entry is resolved
+//!   `handlers::greet`. A qualifier that is a `use`-introduced alias
+//!   (`use crate::handlers as h;` then `edge_routes![h::show]`) is matched
+//!   literally as written (`h::show`), the same "not a name resolver"
+//!   limit as the `#[edge]`-rename case above — this scan does not track
+//!   `use` at all, so an alias reports as an extra false-positive
+//!   "unregistered" warning rather than resolving to the real path (Codex
+//!   review on #2739, round 18, P2).
+//!   A leading `self` or `super` in an entry is resolved
 //!   against the *inline* module the invocation itself is written in
 //!   (`self::show` inside `mod users { ... }` resolves to `users::show`)
 //!   before matching; an out-of-line invocation site (inside a separate
@@ -655,9 +662,22 @@ impl syn::parse::Parse for TargetCfgPredicate {
                 Self::Any(parts)
             });
         }
-        // `windows`, `unix`, `target_env`, `target_pointer_width`, ... — not
-        // part of the resolvable grammar; the caller treats this as "does
-        // not match."
+        // `windows` and `unix` are rustc's own built-in aliases for
+        // `target_family = "windows"` / `target_family = "unix"` — bare
+        // flags, no `= "value"` to parse. wasm32-wasip1's only
+        // `target_family` value is "wasm" (a target has exactly one), so
+        // both are always false for it; leaving them unresolvable (as
+        // opposed to explicitly false) made `not(windows)` — true for this
+        // target, and a real pattern for an optional dependency meant for
+        // every non-Windows target including the capsule — evaluate as
+        // "does not match" instead, filtering out a route Cargo genuinely
+        // compiles (Codex review on #2739, round 18, P1).
+        if ident == "windows" || ident == "unix" {
+            return Ok(Self::Leaf(false));
+        }
+        // `target_env`, `target_pointer_width`, ... as a bare identifier
+        // (not `key = "value"`) — not part of the resolvable grammar; the
+        // caller treats this as "does not match."
         Err(input.error("target cfg predicate not resolvable by this scan"))
     }
 }
@@ -1482,8 +1502,9 @@ fn collect_registrations(
             // ordinary walk below rather than risk mis-scanning a LATER,
             // unrelated item's body as this function's own (Codex review on
             // #2739, round 16, P2).
+            let attr_index = skip_back_over_fn_modifiers(&trees, index);
             if let TokenTree::Group(body) = &trees[body_index]
-                && !preceding_cfg_excludes(&trees, index, default_features)
+                && !preceding_cfg_excludes(&trees, attr_index, default_features)
             {
                 collect_registrations(
                     &body.stream(),
@@ -1535,6 +1556,54 @@ fn collect_registrations(
         }
         index += 1;
     }
+}
+
+/// Walk backward from `fn_index` (the `fn` keyword) over any of `pub`,
+/// `pub(...)`, `async`, `const`, `unsafe`, and `extern`/`extern "ABI"` —
+/// ordinary function modifiers — and return the index of whatever comes
+/// before all of them. [`preceding_cfg_excludes`] is meant to be called at
+/// that index, not at `fn_index` itself: `#[cfg(feature = "premium")] pub
+/// async fn wire() { ... }` has `async`/`pub` between the attribute and
+/// `fn`, and checking immediately before `fn` alone would see those
+/// modifiers instead of the attribute and wrongly conclude nothing excludes
+/// it (Codex review on #2739, round 18, P2).
+fn skip_back_over_fn_modifiers(trees: &[TokenTree], fn_index: usize) -> usize {
+    let mut i = fn_index;
+    loop {
+        let Some(prev) = i.checked_sub(1) else {
+            break;
+        };
+        match &trees[prev] {
+            TokenTree::Ident(ident)
+                if matches!(
+                    ident.to_string().as_str(),
+                    "pub" | "async" | "const" | "unsafe" | "extern"
+                ) =>
+            {
+                i = prev;
+            }
+            // `pub(crate)` / `pub(super)` / `pub(in path)`: the parenthesized
+            // group only belongs to a modifier if `pub` precedes it.
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis => {
+                if prev >= 1 && matches!(&trees[prev - 1], TokenTree::Ident(id) if id == "pub") {
+                    i = prev - 1;
+                } else {
+                    break;
+                }
+            }
+            // `extern "C"`: the ABI string only belongs to a modifier if
+            // `extern` precedes it.
+            TokenTree::Literal(_) => {
+                if prev >= 1 && matches!(&trees[prev - 1], TokenTree::Ident(id) if id == "extern") {
+                    i = prev - 1;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    i
 }
 
 /// For `fn <name>(<params>) [-> <plain return type>] { <body> }` starting at
@@ -2070,6 +2139,30 @@ mod tests {
         );
     }
 
+    /// `pub`/`async`/`const`/`unsafe` (and `pub(crate)`, `extern "C"`)
+    /// between the `#[cfg(...)]` and `fn` must not hide the attribute —
+    /// `preceding_cfg_excludes` has to look past every modifier, not just
+    /// immediately before `fn` itself (Codex review on #2739, round 18, P2).
+    #[test]
+    fn cfg_feature_gated_pub_async_fn_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            pub async fn wire() { edge_routes![crate::show]; }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
     #[test]
     fn cfg_feature_gated_fn_registration_is_included_when_feature_is_default() {
         let scan = scan_one_with_features(
@@ -2495,6 +2588,55 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(!enabled.contains("dep"));
+    }
+
+    /// `windows` and `unix` are rustc's own bare-flag aliases for
+    /// `target_family = "windows"`/`"unix"` — always false for
+    /// wasm32-wasip1, whose only `target_family` is "wasm" — so
+    /// `not(windows)` is always TRUE for it: a common real pattern for a
+    /// dependency meant for every non-Windows target, capsule included
+    /// (Codex review on #2739, round 18, P1).
+    #[test]
+    fn a_not_windows_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(not(windows))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// The un-negated form must evaluate false, confirming `windows` really
+    /// resolves as an explicit `Leaf(false)`, not merely "unresolvable" by
+    /// coincidence of the same top-level answer.
+    #[test]
+    fn a_windows_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(windows)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
+    /// Same reasoning for `unix`.
+    #[test]
+    fn a_not_unix_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(not(unix))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
     }
 
     /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
