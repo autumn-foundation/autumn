@@ -22,6 +22,9 @@ use std::process::Command;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use testcontainers::ImageExt as _;
+use testcontainers::{ContainerRequest, Image as _};
+use testcontainers_modules::minio::MinIO;
 
 const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
@@ -49,6 +52,39 @@ fn run_autumn_ok(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, S
         "autumn {args:?} failed (exit={code:?})\nstdout: {stdout}\nstderr: {stderr}",
     );
     (stdout, stderr)
+}
+
+// ─── MinIO image source ──────────────────────────────────────────────────────
+//
+// `testcontainers-modules` pins `minio/minio` on Docker Hub, which no longer
+// serves anonymous pulls: the registry answers 401, which Docker reports as
+// "pull access denied for minio/minio, repository does not exist". MinIO
+// publishes the identical tag to quay.io, and that copy is still public, so only
+// the registry moves here — image and tag are unchanged, and the tag still comes
+// from the module, so a dependency bump keeps carrying it.
+fn minio_image() -> ContainerRequest<MinIO> {
+    MinIO::default().with_name("quay.io/minio/minio")
+}
+
+/// Guards the registry override without needing Docker.
+///
+/// The Docker sweep is the only place the two tests below run, so a silent
+/// regression here — a dependency bump reinstating the Hub name, or the
+/// `with_name` call being dropped — would surface as a red Docker job rather
+/// than a named failure. This runs in the ordinary lane instead.
+#[test]
+fn minio_image_takes_the_module_tag_from_the_public_registry() {
+    let descriptor = minio_image().descriptor();
+    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
+    assert_eq!(
+        name, "quay.io/minio/minio",
+        "Docker Hub refuses anonymous pulls of minio/minio",
+    );
+    assert_eq!(
+        tag,
+        MinIO::default().tag(),
+        "the tag must stay the module's, so a bump carries it",
+    );
 }
 
 // ─── Minimal SigV4 bucket-creation helper (test-only) ────────────────────────
@@ -194,7 +230,6 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -207,7 +242,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = MinIO::default()
+    let minio = minio_image()
         .start()
         .await
         .expect("start MinIO — is Docker running?");
@@ -317,7 +352,6 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -330,7 +364,7 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = MinIO::default()
+    let minio = minio_image()
         .start()
         .await
         .expect("start MinIO — is Docker running?");

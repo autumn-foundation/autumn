@@ -308,6 +308,42 @@ Two binaries rather than one — the whole point is the *old* build becoming the
 
 ---
 
+### `examples/mesh-catalog` — Service Contract (callee half)
+
+<!-- catalog:example name=mesh-catalog tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, callee side: mark a typed handler `#[endpoint]` and let the framework emit the contract its callers are compiled against |
+| **Key capabilities** | `#[endpoint]`, `#[derive(WireShape)]`, the JSON wire descriptor build artifact |
+| **Prerequisites** | Rust 1.88.0+. No database, no config file |
+| **Run command** | `AUTUMN_SERVER__PORT=3001 cargo run -p mesh-catalog` |
+| **Success proof** | `curl http://127.0.0.1:3001/items/42` returns the item as JSON; `target/autumn-contracts/` carries its wire descriptors |
+| **Rationale for the tier** | Half of a two-crate pair whose proof is a *compile-time* contract failure in its sibling, not a browser smoke. See `examples/mesh-storefront`. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
+
+---
+
+### `examples/mesh-storefront` — Service Contract (caller half)
+
+<!-- catalog:example name=mesh-storefront tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, caller side: call another Autumn service through a generated typed client, and have a breaking change on the callee fail *this* build at the call site |
+| **Key capabilities** | `wire_client!`, `#[contract_checked]`, `autumn_web::wire::Endpoint`, `NoBody` |
+| **Prerequisites** | Rust 1.88.0+ and `examples/mesh-catalog` in the same workspace |
+| **Run command** | `CATALOG_URL=http://127.0.0.1:3001 cargo run -p mesh-storefront` |
+| **Success proof** | `python3 scripts/wire-contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
+| **Rationale for the tier** | Its proof is a build that must *fail*, which no Chromium smoke can express. The sweep script is the dedicated proof. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal

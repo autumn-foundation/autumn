@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Build-checked typed contracts between two Autumn services (#1755):** the day
+  a team carves the first service out of an Autumn monolith, the framework used
+  to go silent — `openapi.rs` and `mcp.rs` project a typed surface *outward*,
+  `http_client.rs` gives a raw outbound client, and nothing generated a
+  caller-side client from a callee's real handler signatures or checked that the
+  two still agreed. Four new pieces close that, with no IDL and no codegen step.
+  On the callee, `#[endpoint(service = "…")]` marks a typed handler: it reads
+  the request and response types straight off the signature (and the method and
+  path off the route attribute below it), emits a marker type implementing
+  `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire descriptor
+  under `target/autumn-contracts/`. `#[derive(WireShape)]` records a DTO's
+  serde-visible field shape in *both* directions. On the caller, `wire_client!`
+  generates the typed client from those markers — so every method's types are
+  the callee's own types — and `#[contract_checked]` reads each call site's
+  read-set (every response field the caller names, including inside a `html!` or
+  `format!` body) and write-set (every request field an inline literal sets) and
+  emits one `const _: () = assert!(…)` per field against the callee's own const
+  field table. A mismatch is a compile error at the call site naming the caller,
+  the endpoint and the field. Because the assertion is a cross-crate const fact,
+  rustc rebuilds the caller whenever the callee's table changes — nothing can go
+  stale. The check earns its keep on the breaks the type checker cannot see: a
+  `#[serde(skip_serializing)]` on a response field a caller reads, a
+  `#[serde(skip_deserializing)]` on a request field a caller sets, a required
+  request field the request type may keep off the wire
+  (`#[serde(skip_serializing_if)]`) that a call site does not set, and a route
+  path that stops taking the parameters a client declares — each of which
+  compiles today and fails in production. What it deliberately does NOT flag is
+  a plain `..Default::default()` request: both ends share the type, so
+  serialization emits every field and the body is complete. Against the seeded
+  mutation set in `scripts/wire-contract-sweep.py`, all 12 wire-breaking changes
+  turn `cargo build` red with a caller-named error and none of the 12 compatible
+  changes is rejected. Worked two-service example in `examples/mesh-catalog` and
+  `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. Entirely
+  new surface, so this is **non-breaking** — a glob-imported prelude name an app
+  already defines shadows the new one. First
+  slice: one workspace, synchronous request/response, JSON over HTTP — the
+  cross-version rolling-deploy proof is the next one.
+  <!-- migration-guide-gate: entirely new surface; "breaking" here describes the
+  wire-breaking changes the feature CATCHES, not a break in Autumn's own API -->
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs

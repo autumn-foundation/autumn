@@ -397,7 +397,7 @@ pub fn infer_request_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 /// inner `T`. Any deeper nesting returns `None` — we intentionally
 /// don't guess at unknown wrappers because mis-identifying them would
 /// produce wrong schemas.
-fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
+pub fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
     if let Some(inner) = unwrap_single_generic(ty, "Json") {
         return Some(inner);
     }
@@ -447,7 +447,7 @@ pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 
 /// The handler's declared return type, straight off `sig.output` — `None` for
 /// a unit-returning (`ReturnType::Default`) handler.
-fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
+pub fn sig_output_type(input_fn: &syn::ItemFn) -> Option<syn::Type> {
     let syn::ReturnType::Type(_, ty) = &input_fn.sig.output else {
         return None;
     };
@@ -513,7 +513,7 @@ fn recover_guarded_return_type(
 /// `([(HeaderName, _); N], Json<T>)` to attach status codes or
 /// headers. We scan each tuple element so the generated schema still
 /// reflects the JSON body.
-fn find_json_in_type(ty: &syn::Type) -> Option<syn::Type> {
+pub fn find_json_in_type(ty: &syn::Type) -> Option<syn::Type> {
     if let Some(inner) = unwrap_single_generic(ty, "Json") {
         return Some(inner);
     }
@@ -529,7 +529,7 @@ fn find_json_in_type(ty: &syn::Type) -> Option<syn::Type> {
 
 /// Peel a single layer of `Result<T, _>` / `AutumnResult<T>` so we can
 /// inspect the `Ok` variant for a `Json<...>` wrapper.
-fn unwrap_result_ok(ty: &syn::Type) -> Option<syn::Type> {
+pub fn unwrap_result_ok(ty: &syn::Type) -> Option<syn::Type> {
     let path = match ty {
         syn::Type::Path(p) => &p.path,
         _ => return None,

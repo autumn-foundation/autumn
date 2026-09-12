@@ -1,0 +1,7 @@
+error: #[endpoint] name must be a Rust identifier — it becomes the `get-item_endpoint` marker type — and is `get-item`
+  --> tests/compile-fail/wire_endpoint_name_is_not_an_identifier.rs:10:1
+   |
+10 | #[endpoint(service = "catalog", name = "get-item")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `endpoint` (in Nightly builds, run with -Z macro-backtrace for more info)
