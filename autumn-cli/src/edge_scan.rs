@@ -2004,6 +2004,17 @@ fn collect_registrations(
                 if bang
                     && let Some(TokenTree::Group(group)) = trees.get(index + 2)
                     && group.delimiter() != Delimiter::None
+                    // `#[cfg(feature = "premium")] edge_routes![show];` — a
+                    // cfg attribute directly on the macro invocation
+                    // STATEMENT itself (legal Rust: statement attributes
+                    // apply to a macro-invocation statement same as any
+                    // other), not just on an enclosing `mod {}`/`fn {}` —
+                    // neither of which this specific token position sits
+                    // inside. Without this check, a disabled route's
+                    // registration was still credited, letting a build
+                    // with zero real handlers pass preflight (Codex review
+                    // on #2739, round 22, P2).
+                    && !preceding_cfg_excludes(&trees, index, default_features)
                 {
                     scan.registrations += 1;
                     for name in registered_idents(&group.stream()) {
@@ -2637,6 +2648,35 @@ mod tests {
 
             #[cfg(feature = "premium")]
             fn wire() { edge_routes![crate::show]; }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// `#[cfg(...)]` directly on the `edge_routes![...]` STATEMENT itself
+    /// (legal Rust: statement attributes apply to a macro-invocation
+    /// statement same as any other), inside an otherwise-ENABLED wiring
+    /// function — a different shape from a whole cfg'd-out `fn`/`mod`,
+    /// which this scan already handled. Without checking this position too,
+    /// a disabled route's registration was still credited (Codex review on
+    /// #2739, round 22, P2).
+    #[test]
+    fn cfg_feature_gated_registration_statement_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                edge_routes![crate::show];
+            }
             "#,
             &[],
         );
