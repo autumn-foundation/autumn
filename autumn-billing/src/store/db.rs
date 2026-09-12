@@ -975,6 +975,30 @@ impl BillingStore for DbBillingStore {
         })
     }
 
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        subscription_id: &'a str,
+    ) -> StoreFuture<'a, Vec<DunningAttempt>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let rows: Vec<DunningRow> = billing_dunning::table
+                .filter(billing_dunning::subscription_id.eq(subscription_id))
+                .filter(billing_dunning::state.eq_any([
+                    DunningState::Pending.as_str(),
+                    DunningState::Running.as_str(),
+                ]))
+                .order((
+                    billing_dunning::next_attempt_at.asc(),
+                    billing_dunning::invoice_id.asc(),
+                ))
+                .select(DunningRow::as_select())
+                .load(&mut conn)
+                .await
+                .map_err(|err| db_err("open_dunning_for_subscription", &err))?;
+            rows.into_iter().map(DunningRow::into_model).collect()
+        })
+    }
+
     fn settle_dunning<'a>(
         &'a self,
         invoice_id: &'a str,
