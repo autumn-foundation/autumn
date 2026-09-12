@@ -1703,7 +1703,10 @@ pub fn run_with_options(
 /// Handles the three common forms a fresh Autumn project may use:
 /// - `autumn-web = "x.y"` (simple string)
 /// - `autumn-web = { version = "x.y", ... }` (inline table)
-/// - `[dependencies.autumn-web]` subtable
+/// - `[dependencies.autumn-web]` subtable (hyphenated or Cargo's underscore-normalized
+///   `[dependencies.autumn_web]` spelling — both are valid TOML keys for the same
+///   dependency, as `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` already
+///   check)
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
     const FEATURE: &str = "\"mail\"";
@@ -1714,6 +1717,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     let simple_prefix = format!("{CRATE} = \"");
     let table_prefix = format!("{CRATE} = {{");
     let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
 
     let mut i = 0;
     while i < lines.len() {
@@ -1769,7 +1773,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header {
+        if trimmed == subtable_header || trimmed == subtable_header_underscore {
             // Scan ahead within the subtable.
             let mut j = i + 1;
             let mut found_features = false;
@@ -14296,6 +14300,49 @@ mod tests {
             out.matches("\"mail\"").count(),
             1,
             "must not duplicate feature"
+        );
+    }
+
+    /// Characterization test (Echo clone-class survey, `ensure_autumn_web_*_feature`
+    /// family): `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` both check
+    /// `[dependencies.autumn_web]` (Cargo's underscore-normalized table header,
+    /// valid alongside the hyphenated `autumn-web` spelling) via a
+    /// `subtable_header_underscore` variable. `ensure_autumn_web_mail_feature` was
+    /// written first (#706) and never gained that check, so it silently leaves the
+    /// `mail` feature unset when a project's Cargo.toml uses the underscore form —
+    /// see `cargo_toml_gets_mail_feature_subtable_underscore_form` below for the
+    /// missed-fix half of this pair.
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize
+    /// `[dependencies.autumn_web]` the same way its `oauth2`/`webauthn` siblings do
+    /// (see `cargo_toml_gets_oauth2_feature_subtable_underscore_form` above). Before
+    /// this fix the function silently returned the TOML unmodified for this form.
+    #[test]
+    fn cargo_toml_gets_mail_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(
+            out.contains("features = [\"mail\"]"),
+            "mail feature missing for underscore subtable form: {out}"
         );
     }
 
