@@ -159,3 +159,117 @@ async fn tampered_signature_is_rejected() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+// ── sign_upload_legacy signature malleability ──────────────────────
+//
+// `sign_upload` was fixed (docs/plans/2026-06-05-feedback-bugfixes.md,
+// "Length-Delimit Upload Signature Fields") to length-prefix `blob_key` and
+// `content_type` specifically because concatenating them with a bare `:`
+// delimiter lets two different (key, content_type) pairs hash identically
+// when one field contains a `:`. `sign_upload_legacy` is the pre-fix
+// algorithm, kept — and still checked by `verify_upload_rotation_with_now`
+// against the *current* signing key, not just keys already known to be
+// retired — purely so upload tokens minted before that fix don't break
+// mid-flight. It reintroduces the exact ambiguity the fix eliminated.
+//
+// See docs/security/2026-09-12-legacy-upload-signature-malleability/ for the
+// full writeup of why this is a negative result rather than a fix PR:
+// `storage::validate_key` happens to reject every key this ambiguity can
+// produce (it forbids `:` for unrelated, Windows-portability reasons), so no
+// working exploit exists against either shipped `BlobStore` backend today.
+// Both tests below are load-bearing tripwires, not just documentation.
+
+#[test]
+fn legacy_upload_signature_collides_across_the_key_content_type_boundary() {
+    use autumn_web::storage::local::{sign_upload, sign_upload_legacy};
+
+    let key = b"shared-signing-key";
+    let exp_at: u64 = 4_102_444_800; // 2100-01-01 — far enough out to never expire in CI
+
+    // Two different (blob_key, content_type) pairs that concatenate to the
+    // identical byte string under the legacy "key:content_type:exp" scheme.
+    let legacy_a = sign_upload_legacy(key, "reports/mine.txt", "text/plain:evil", exp_at);
+    let legacy_b = sign_upload_legacy(key, "reports/mine.txt:text/plain", "evil", exp_at);
+    assert_eq!(
+        legacy_a, legacy_b,
+        "sign_upload_legacy must not collide across a re-sliced key/content-type \
+         boundary — if this starts failing, the legacy algorithm has been fixed \
+         and the compensating-control test below can be revisited"
+    );
+
+    // The current, length-prefixed scheme does not have this ambiguity.
+    let fixed_a = sign_upload(key, "reports/mine.txt", "text/plain:evil", exp_at);
+    let fixed_b = sign_upload(key, "reports/mine.txt:text/plain", "evil", exp_at);
+    assert_ne!(
+        fixed_a, fixed_b,
+        "sign_upload (length-prefixed) must not reproduce the legacy collision"
+    );
+}
+
+#[tokio::test]
+async fn legacy_signature_replay_cannot_retarget_an_upload() {
+    use autumn_web::reexports::axum::body::Body;
+    use autumn_web::storage::local::sign_upload_legacy;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let signing_key = SigningKey::new(b"the-key".to_vec());
+    let store = LocalBlobStore::new(
+        "default",
+        dir.path().to_path_buf(),
+        "/_blobs",
+        Duration::from_secs(300),
+        signing_key.clone(),
+        vec![],
+    )
+    .unwrap();
+
+    let exp_at = (std::time::SystemTime::now() + Duration::from_secs(300))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Stand-in for a legacy-format token minted for the attacker's own
+    // object ("reports/mine.txt", content_type "text/plain:evil" — an
+    // unusual but unvalidated content-type string, since `presign_put`
+    // never restricts its format) that is still unexpired.
+    let sig = sign_upload_legacy(
+        signing_key.as_bytes(),
+        "reports/mine.txt",
+        "text/plain:evil",
+        exp_at,
+    );
+
+    let arc: SharedBlobStore = Arc::new(store.clone());
+    let state = autumn_web::AppState::for_test().with_extension(BlobStoreState::new(arc));
+    let router = autumn_web::storage::local::serve_router(&store).with_state(state);
+
+    // Re-sliced replay: same signature, but the request now claims key
+    // "reports/mine.txt:text/plain" with content_type "evil" — a different
+    // pair that hashes identically under the legacy scheme (proven above).
+    let uri =
+        format!("/_blobs/reports/mine.txt:text/plain?upload=1&ct=evil&exp={exp_at}&sig={sig}");
+    let request = Request::builder()
+        .method("PUT")
+        .uri(&uri)
+        .body(Body::from("attacker-controlled-bytes"))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+
+    // The signature check alone accepts this re-sliced pair — that's the
+    // malleability bug. `validate_key` rejecting the embedded `:` is the
+    // only thing stopping the write; pin that it still does.
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "expected validate_key to reject the re-sliced key even though the \
+         legacy signature check accepted it — if this starts returning 200, \
+         the colon-rejection compensating control has been relaxed and the \
+         legacy fallback is now a live cross-object-write bypass"
+    );
+
+    // No blob exists under either interpretation of the ambiguous pair.
+    assert!(store.get("reports/mine.txt:text/plain").await.is_err());
+    assert!(store.get("reports/mine.txt").await.is_err());
+}
