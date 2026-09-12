@@ -394,8 +394,39 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
 /// needs it too, or a route gated on a feature this invocation explicitly
 /// requests — but that is not in the manifest's own `default = [...]` —
 /// would look cfg'd-out here even though the build about to run turns it on.
+///
+/// `embed` mirrors `build_cargo_command`'s own unconditional `embed-assets`
+/// feature injection for an `--embed` build: without it here too, a sole
+/// `#[cfg(feature = "embed-assets")] #[edge]` handler looked scanned-out
+/// (`edge_scan.is_empty()`), so `plan_edge_step` below saw no edge routes and
+/// silently let the embed build proceed instead of reporting the documented
+/// edge/embed conflict — the handler was then really compiled straight into
+/// the native binary by `build_embedded`, never into a capsule (Codex review
+/// on #2739, round 10, P1).
+/// The feature names to pass to the edge scan for one build invocation: the
+/// user's own `--features` list, split on `,`/whitespace like Cargo's own
+/// flag, plus `embed-assets` when `embed` is set — the same feature
+/// `build_cargo_command` unconditionally injects for an `--embed` build.
+/// Factored out of [`resolve_project_edge_scan`] so this part is
+/// unit-testable without a real project directory.
+fn edge_scan_requested_features(features: Option<&str>, embed: bool) -> Vec<&str> {
+    let mut requested: Vec<&str> = features
+        .map(|value| {
+            value
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if embed {
+        requested.push("embed-assets");
+    }
+    requested
+}
+
 fn resolve_project_edge_scan(
     debug: bool,
+    embed: bool,
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
@@ -408,14 +439,7 @@ fn resolve_project_edge_scan(
             .1
             .unwrap_or_else(|| cwd.clone())
     };
-    let requested: Vec<&str> = features
-        .map(|value| {
-            value
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter(|name| !name.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let requested = edge_scan_requested_features(features, embed);
     // A custom `[[bin]] path` for the capsule can live outside `src/`, which
     // the scan's own `src/` walk never reaches — see
     // `resolve_edge_scan_with_extra_file`'s doc for why (Codex review on
@@ -560,7 +584,7 @@ pub fn run(
     // edge routes) is reported in milliseconds instead of after a full native
     // build. The capsule itself is compiled much later — after the native build
     // and fingerprinting — by `run_edge_capsule_build`.
-    let edge_scan = resolve_project_edge_scan(debug, package, bin, features);
+    let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
     let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
@@ -1277,6 +1301,31 @@ mod tests {
         );
         assert!(EDGE_EMBED_ERROR.contains("--embed"));
         assert!(EDGE_EMBED_ERROR.contains("#1790"));
+    }
+
+    /// `--embed` must add `embed-assets` to the edge scan's requested
+    /// features, the same feature `build_cargo_command` unconditionally adds
+    /// to the real `cargo build` invocation — otherwise a sole
+    /// `#[cfg(feature = "embed-assets")] #[edge]` handler looks scanned-out,
+    /// `plan_edge_step` sees no edge routes, and the embed build silently
+    /// proceeds instead of hitting the documented edge/embed conflict (Codex
+    /// review on #2739, round 10, P1).
+    #[test]
+    fn embed_adds_the_embed_assets_feature_to_the_edge_scan() {
+        let requested = edge_scan_requested_features(None, true);
+        assert_eq!(requested, vec!["embed-assets"]);
+    }
+
+    #[test]
+    fn non_embed_does_not_add_the_embed_assets_feature_to_the_edge_scan() {
+        let requested = edge_scan_requested_features(None, false);
+        assert!(requested.is_empty());
+    }
+
+    #[test]
+    fn embed_combines_with_explicitly_requested_features_for_the_edge_scan() {
+        let requested = edge_scan_requested_features(Some("a,b"), true);
+        assert_eq!(requested, vec!["a", "b", "embed-assets"]);
     }
 
     fn capsule_metadata(with_capsule_bin: bool) -> serde_json::Value {

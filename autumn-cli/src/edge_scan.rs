@@ -221,11 +221,21 @@ impl EdgeScan {
 /// `true` when some `edge_routes![...]` entry in `registered` names `f`.
 ///
 /// An entry's last `::` segment must equal `f.name`. A bare entry (no `::`)
-/// matches `f` regardless of module — the scanner's long-standing lenient
-/// rule for unqualified names — but never across a crate boundary: a plain
-/// name in real Rust only ever resolves within the crate it is written in,
-/// so a bare (or otherwise same-crate-relative) entry matches only an `f`
-/// whose [`EdgeFn::crate_root`] equals the entry's own recorded crate.
+/// matches `f` regardless of module OR crate — the scanner's long-standing
+/// lenient rule for unqualified names. A same-crate-only reading might look
+/// more precise (a plain name in real Rust only ever resolves within the
+/// crate it is written in, with no qualifier), but this scanner never tracks
+/// `use` imports (see the module doc's "Recognition limits"), so a bare name
+/// can equally well be an item a `use other_crate::x::*;` pulled in from
+/// elsewhere — restricting the match to the entry's own recorded crate turned
+/// that ordinary, valid pattern into a false "unregistered" scan, which
+/// `run_edge_capsule_build` then treats as a hard, build-blocking error, not
+/// a soft warning, when it is the invocation's only route (Codex review on
+/// #2739, round 10, P2, partially reverting round 7's tightening). A
+/// *qualified* entry is different: `crate::`/crate-name-qualified and plain
+/// module-qualified entries below still require the same-crate match, since
+/// their qualifier's own crate membership is unambiguous from how it is
+/// written — crossing it really would be wrong, not merely unresolved.
 /// A qualified entry matches only when its qualifier equals `f.module_path`
 /// exactly, crate-root prefix stripped (see below). `f.module_path` is
 /// always the scan's real answer, never a placeholder for "unknown":
@@ -249,10 +259,10 @@ impl EdgeScan {
 /// [`registration_candidates`] for the same reason — see its own doc for
 /// why trying it as a second candidate was reverted.
 ///
-/// A leading `crate` segment in the qualifier is stripped first, and — only
-/// when the target is that same crate too, since `crate` never reaches
-/// outside it — requires `f.crate_root` to equal the entry's own recorded
-/// crate, the same same-crate rule a bare entry follows. A leading segment
+/// A leading `crate` segment in the qualifier is stripped first, and — since
+/// `crate` never reaches outside the crate it is written in, unlike a bare
+/// name — requires `f.crate_root` to equal the entry's own recorded crate.
+/// A leading segment
 /// equal to `crate_name` (the scanned crate's own Rust library-crate
 /// identifier, when known — see [`rust_crate_name_from_manifest`]) is
 /// stripped the same way, but targets the library crate specifically
@@ -277,7 +287,7 @@ fn is_registered(
             return false;
         }
         if qualifier.is_empty() {
-            return *written_in == f.crate_root;
+            return true;
         }
         let mut qualifier_segments = qualifier.split("::");
         match qualifier_segments.clone().next() {
@@ -2052,6 +2062,27 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "src/bin/edge-capsule.rs");
+    }
+
+    /// A *bare* registration, unlike the `crate::`-qualified one above, DOES
+    /// cross a `[[bin]]` target's crate boundary: `use my_app::handlers::*;`
+    /// followed by a bare `edge_routes![show]` is ordinary, valid Rust this
+    /// scanner cannot see (it does not track `use` imports), so restricting
+    /// the match to the entry's own recorded crate turned that pattern into a
+    /// false "unregistered" scan — a hard, build-blocking error from
+    /// `run_edge_capsule_build` when it is the only route, not merely a
+    /// missed warning (Codex review on #2739, round 10, P2).
+    #[test]
+    fn a_bare_registration_crosses_a_bin_targets_crate_boundary() {
+        let scan = scan_sources(&[
+            ("src/lib.rs", "#[edge]\npub fn show() {}\n"),
+            (
+                "src/bin/edge-capsule.rs",
+                "fn main() { edge_routes![show]; }\n",
+            ),
+        ]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
     }
 
     /// Same as above for the directory-style bin layout
