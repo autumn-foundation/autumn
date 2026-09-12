@@ -172,7 +172,12 @@ REF_DEFINITION = re.compile(
     r'(?:\n[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^)\n]*\))[ \t]*)?',  # its title
     re.M,
 )
-AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
+# An AUTOLINK is the one bracketed construct whose "destination" IS its label:
+# `<https://example.com/x>` renders as the URL itself, which a reader sees and
+# ctrl-F finds. So the brackets go and the URL STAYS. Stripping it outright —
+# as this did, by filing autolinks with link destinations — could reject a page
+# whose term was genuinely visible. The corpus carries 29 of them.
+AUTOLINK = re.compile(r'<([a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*)>')
 
 # A tag ends at the first `>` that is NOT inside a quoted attribute value, so
 # `<span id=">x">` is one tag rather than a tag plus the stray text `x">`.
@@ -231,7 +236,7 @@ def _strip_link_destinations(text):
 
 def _strip_markup(chunk):
     chunk = REF_DEFINITION.sub(' ', chunk)
-    chunk = AUTOLINK.sub(' ', chunk)
+    chunk = AUTOLINK.sub(r' \1 ', chunk)    # keep the URL: it is the label
     chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
     return HTML_TAG.sub(' ', chunk)
 
@@ -570,12 +575,26 @@ def self_test():
     if d:
         failures.append('a <style> inside a fence is visible code and counts')
 
+    # 26. AN AUTOLINK'S URL IS ITS LABEL. `<https://…/two-factor>` renders as
+    # the URL, which a reader sees and ctrl-F finds, so it must still count —
+    # unlike a `[text](dest)` destination, which never reaches the page. Filing
+    # the two together made this the false-FAILURE direction: rejecting a page
+    # whose term was genuinely visible.
+    d, _ = one('See <https://example.com/two-factor> for setup.')
+    if d:
+        failures.append("an autolink's URL is visible and should satisfy a row")
+
+    # ... while an explicit destination is still not visible.
+    d, _ = one('See [the guide](https://example.com/two-factor) for setup.')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('an explicit link destination must not satisfy a row')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (29 properties).')
+    print('Self-test OK (31 properties).')
     return 0
 
 
