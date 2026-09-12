@@ -819,6 +819,79 @@ pub async fn open_dunning_ordered_and_filtered(store: &dyn BillingStore) {
     assert_eq!(open, ["dun-c-inv-early", "dun-c-inv-mid", "dun-c-inv-late"]);
 }
 
+/// `open_dunning_for_subscription` returns only `sub-e-1`'s own open rows,
+/// ordered the same way `open_dunning` is, and excludes: a different
+/// subscription's open row, this subscription's own closed rows, and a row
+/// with no subscription link at all (`subscription_id IS NULL` must never
+/// match any `subscription_id = ...` lookup).
+pub async fn open_dunning_for_subscription_is_scoped_and_filtered(store: &dyn BillingStore) {
+    store
+        .upsert_dunning(
+            dunning("dun-e", "late", 1, 300, DunningState::Pending).with_subscription("sub-e-1"),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_dunning(
+            dunning("dun-e", "early", 1, 100, DunningState::Running).with_subscription("sub-e-1"),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_dunning(
+            dunning("dun-e", "mid", 1, 200, DunningState::Pending).with_subscription("sub-e-1"),
+        )
+        .await
+        .unwrap();
+    // Closed rows on the SAME subscription must not appear.
+    store
+        .upsert_dunning(
+            dunning("dun-e", "recovered", 1, 50, DunningState::Recovered)
+                .with_subscription("sub-e-1"),
+        )
+        .await
+        .unwrap();
+    // An open row on a DIFFERENT subscription must not appear.
+    store
+        .upsert_dunning(
+            dunning("dun-e", "other-sub", 1, 150, DunningState::Pending)
+                .with_subscription("sub-e-2"),
+        )
+        .await
+        .unwrap();
+    // An open row with no subscription link at all must not appear.
+    store
+        .upsert_dunning(dunning("dun-e", "unlinked", 1, 175, DunningState::Pending))
+        .await
+        .unwrap();
+
+    let open: Vec<String> = store
+        .open_dunning_for_subscription("sub-e-1")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.invoice_id)
+        .collect();
+    assert_eq!(open, ["dun-e-inv-early", "dun-e-inv-mid", "dun-e-inv-late"]);
+
+    let other: Vec<String> = store
+        .open_dunning_for_subscription("sub-e-2")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.invoice_id)
+        .collect();
+    assert_eq!(other, ["dun-e-inv-other-sub"]);
+
+    assert!(
+        store
+            .open_dunning_for_subscription("sub-e-does-not-exist")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ── Fix round 2 properties ──────────────────────────────────────────────
 
 /// One customer row per user: a second provider customer for a linked user
@@ -1138,6 +1211,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     dunning_upsert_replaces(store).await;
     dunning_claim_is_compare_and_set(store).await;
     open_dunning_ordered_and_filtered(store).await;
+    open_dunning_for_subscription_is_scoped_and_filtered(store).await;
     customer_one_row_per_user(store).await;
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
@@ -1177,6 +1251,7 @@ mod memory {
         dunning_upsert_replaces,
         dunning_claim_is_compare_and_set,
         open_dunning_ordered_and_filtered,
+        open_dunning_for_subscription_is_scoped_and_filtered,
         customer_one_row_per_user,
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
