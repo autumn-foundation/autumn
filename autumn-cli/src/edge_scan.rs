@@ -308,6 +308,17 @@ impl EdgeScan {
 /// function's own crate-root/crate-name checks exist to avoid, for a
 /// pattern rare enough (and confusing enough as real code) that resolving
 /// it isn't worth that risk (Codex review on #2739, round 20, P2).
+///
+/// The crate-name comparison strips a leading `r#` from the leading segment
+/// before comparing it to `crate_name`. A package name that collides with a
+/// Rust keyword (`name = "type"`) compiles to a crate identifier that is
+/// only legal in path position spelled as a raw identifier
+/// (`edge_routes![r#type::show]`); `proc_macro2::Ident::to_string()` keeps
+/// that `r#` prefix verbatim (verified directly — it is not a hypothetical),
+/// but `crate_name` itself comes from the manifest's own package-name text
+/// via `rust_crate_name_from_manifest`, which never carries one. Comparing
+/// the two spellings unnormalized always missed the library crate through
+/// this branch (Codex review on #2739, round 22, P2).
 fn is_registered(
     f: &EdgeFn,
     registered: &BTreeSet<(String, String)>,
@@ -329,7 +340,9 @@ fn is_registered(
                 }
                 qualifier_segments.next();
             }
-            Some(seg) if crate_name.is_some_and(|name| name == seg) => {
+            Some(seg)
+                if crate_name.is_some_and(|name| name == seg.strip_prefix("r#").unwrap_or(seg)) =>
+            {
                 if !f.crate_root.is_empty() {
                     return false;
                 }
@@ -3306,6 +3319,27 @@ mod tests {
             ",
         );
         scan.crate_name = Some("edgeapp".to_owned());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// A package name that collides with a Rust keyword (`name = "type"`)
+    /// compiles to a crate identifier only legal in path position spelled as
+    /// a raw identifier (`edge_routes![r#type::show]`) — the tokenizer keeps
+    /// that `r#` prefix verbatim, but `crate_name` itself never carries one,
+    /// so the comparison must normalize it away (Codex review on #2739,
+    /// round 22, P2).
+    #[test]
+    fn a_raw_identifier_crate_name_qualified_registration_matches_its_module_path() {
+        let mut scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() { edge_routes![r#type::show]; }
+            ",
+        );
+        scan.crate_name = Some("type".to_owned());
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
         assert_eq!(scan.registered_fns().len(), 1);
     }
