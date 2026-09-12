@@ -926,11 +926,10 @@ fn workspace_implies_resolver_v1(table: &toml::Table) -> bool {
     {
         return resolver == "1";
     }
-    table
-        .get("package")
-        .and_then(toml::Value::as_table)
-        // virtual workspace, no explicit resolver: always "1"
-        .is_none_or(edition_implies_resolver_v1)
+    let Some(root_package) = table.get("package").and_then(toml::Value::as_table) else {
+        return true; // virtual workspace, no explicit resolver: always "1"
+    };
+    root_package_edition_implies_resolver_v1(root_package, workspace)
 }
 
 /// Cargo's own default: edition 2015/2018 (or no `edition` key at all, which
@@ -940,6 +939,44 @@ fn edition_implies_resolver_v1(package_table: &toml::Table) -> bool {
         package_table.get("edition").and_then(toml::Value::as_str),
         Some("2021" | "2024")
     )
+}
+
+/// Same rule as [`edition_implies_resolver_v1`], but for a workspace ROOT
+/// package specifically: its own `edition` can be `edition.workspace =
+/// true` (a TOML table, not a string) instead of a literal edition string,
+/// inheriting from `[workspace.package] edition` in that SAME manifest — a
+/// real, sanctioned Cargo pattern (define the edition once under
+/// `[workspace.package]`, every member including the root inherits it via
+/// `edition.workspace = true`), verified directly against a real build: a
+/// root package that inherits edition `"2021"` this way resolves as v2, not
+/// v1. `package_table.get("edition").and_then(toml::Value::as_str)` alone
+/// returns `None` for a table value, which this function's simpler sibling
+/// would then treat as "no edition at all" (2015, implying v1) — silently
+/// wrong for a 2021/2024-edition workspace (Codex review on #2739, round
+/// 22, P2). A workspace MEMBER's own `edition.workspace = true` is not
+/// resolved here: only the root's is ever read from at all (see
+/// [`workspace_implies_resolver_v1`]'s doc), and a member can only use that
+/// syntax when it's already part of a workspace to inherit from, which
+/// means it is never reached from the "standalone package" call site that
+/// uses the plain [`edition_implies_resolver_v1`] instead.
+fn root_package_edition_implies_resolver_v1(
+    root_package: &toml::Table,
+    workspace: Option<&toml::Table>,
+) -> bool {
+    match root_package.get("edition") {
+        Some(toml::Value::String(edition)) => !matches!(edition.as_str(), "2021" | "2024"),
+        Some(toml::Value::Table(inherit))
+            if inherit.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+        {
+            let inherited_edition = workspace
+                .and_then(|w| w.get("package"))
+                .and_then(toml::Value::as_table)
+                .and_then(|p| p.get("edition"))
+                .and_then(toml::Value::as_str);
+            !matches!(inherited_edition, Some("2021" | "2024"))
+        }
+        _ => true, // no edition key at all defaults to 2015, implying v1
+    }
 }
 
 /// Best-effort discovery of the nearest ancestor directory whose
@@ -2161,7 +2198,23 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         loop {
             match trees.get(i) {
                 Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => return Some(i),
-                Some(TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_)) => i += 1,
+                // A non-brace group is legitimate return-type/where-clause
+                // syntax — `-> ()`, `-> Result<(), E>`, `-> [T; N]`, a
+                // parenthesized trait-bound group — real Rust grammar never
+                // puts a `{ ... }` brace group in either shape, so accepting
+                // any OTHER delimiter here still cannot mistake it for the
+                // function's own body; only a Brace group ever ends this
+                // loop. Previously only bare `Ident`/`Punct`/`Literal`
+                // tokens were tolerated, so a grouped return type fell
+                // through to `None` and the unprotected old fallback then
+                // scanned the body of what could be a `#[cfg(...)]`-excluded
+                // function (Codex review on #2739, round 22, P2).
+                Some(
+                    TokenTree::Ident(_)
+                    | TokenTree::Punct(_)
+                    | TokenTree::Literal(_)
+                    | TokenTree::Group(_),
+                ) => i += 1,
                 _ => return None,
             }
         }
@@ -2677,6 +2730,35 @@ mod tests {
                 #[cfg(feature = "premium")]
                 edge_routes![crate::show];
             }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// A grouped return type (`-> ()`, `-> Result<(), E>`, `-> [T; N]`) has
+    /// a non-brace `Group` token (a parenthesized or bracketed group) inside
+    /// it — previously unrecognized by the return-type/`where`-clause
+    /// tolerant loop, which only accepted bare `Ident`/`Punct`/`Literal`
+    /// tokens, so it fell through to `None` and the unprotected old
+    /// fallback scanned the body of what could be (and, here, is) a
+    /// `#[cfg(...)]`-excluded function (Codex review on #2739, round 22,
+    /// P2).
+    #[test]
+    fn cfg_feature_gated_fn_with_a_grouped_return_type_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire() -> Result<(), ()> { edge_routes![crate::show]; Ok(()) }
             "#,
             &[],
         );
@@ -3600,6 +3682,36 @@ mod tests {
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"mainpkg\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        assert!(!resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A non-virtual workspace's root package can spell its own edition as
+    /// `edition.workspace = true` (a TOML table, not a string) instead of a
+    /// literal edition string, inheriting from `[workspace.package]
+    /// edition` in that SAME manifest — a real, sanctioned Cargo pattern,
+    /// verified directly against a real build (a root package inheriting
+    /// edition `"2021"` this way resolves as v2). Reading the root
+    /// package's `edition` as a plain string alone would see `None` for a
+    /// table value and default to "no edition at all" (2015, v1) — silently
+    /// wrong here (Codex review on #2739, round 22, P2).
+    #[test]
+    fn resolver_v1_is_in_effect_resolves_the_root_packages_inherited_workspace_edition() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition.workspace = true\n\n\
+             [workspace]\nmembers = [\"mainpkg\"]\n\n\
+             [workspace.package]\nedition = \"2021\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
