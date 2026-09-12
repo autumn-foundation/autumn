@@ -1664,10 +1664,7 @@ fn collect_registrations(
 /// it (Codex review on #2739, round 18, P2).
 fn skip_back_over_fn_modifiers(trees: &[TokenTree], fn_index: usize) -> usize {
     let mut i = fn_index;
-    loop {
-        let Some(prev) = i.checked_sub(1) else {
-            break;
-        };
+    while let Some(prev) = i.checked_sub(1) {
         match &trees[prev] {
             TokenTree::Ident(ident)
                 if matches!(
