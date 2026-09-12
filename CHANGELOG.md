@@ -454,6 +454,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
+  `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
+  one opaque `style: form, explode: true` parameter for the whole struct
+  (issue #2251). Each field gets the `style` that actually matches how the
+  `query_string` decoder reads it: `form`/`explode` for a scalar or
+  scalar-array field (unchanged from before), `deepObject` for a nested-object
+  field (`?filter[status]=open`). An array-of-objects field
+  (`?items[0][sku]=A-1`) has no OpenAPI `style` to carry — that parameter now
+  names the bracketed encoding in its `description` instead of silently
+  mis-describing it. Each parameter's `required` also now reflects the real
+  field — a non-`Option` field can be `required: true` — where the old
+  whole-struct parameter was always `required: false`. A `Query<T>` whose `T`
+  does not derive `OpenApiSchema` is unaffected: its fields cannot be read, so
+  it keeps the previous whole-struct parameter with no spec churn. MCP
+  `tools/call` dispatch is unaffected either way — it already renders the
+  bracketed form directly.
+  **Breaking:** `openapi::Parameter` (public, not `#[non_exhaustive]`) carries
+  a new `description` field. It now derives `Default`, so end a struct-literal
+  built outside this crate with `..Default::default()` rather than listing
+  every field. See the [migration guide](docs/migrations/next.md#openapi-parameter-gains-a-description-field).
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when

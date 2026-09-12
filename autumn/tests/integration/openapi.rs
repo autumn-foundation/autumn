@@ -1200,3 +1200,280 @@ fn non_colliding_nested_ref_stays_short_with_no_churn() {
         "nested-only component carries its real fields: {nested_schema}"
     );
 }
+
+// ── Per-field query parameters for a nested `Query<T>` (issue #2251) ──
+//
+// `Query<T>` used to document ONE struct-level parameter with
+// `style: form, explode: true` — exact for a scalar or scalar-array field, but
+// undefined for a nested one (neither RFC 6570 nor OAS 3.x say what `form`
+// means for a composite value). A `Query<T>` whose fields are introspectable
+// (an `OpenApiSchema` back-fill match) now documents one parameter PER FIELD,
+// so each field gets the `style` that actually round-trips it through
+// `crate::query_string`'s bracketed decoder.
+
+mod query_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Filter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Item {
+        pub sku: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct SearchQuery {
+        pub q: Option<String>,
+        pub tags: Option<Vec<String>>,
+        pub filter: Option<Filter>,
+        pub items: Option<Vec<Item>>,
+    }
+}
+
+#[get("/api/nested-search")]
+async fn nested_search_route(_q: Query<query_shapes::SearchQuery>) -> &'static str {
+    "ok"
+}
+
+mod query_required_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredFilter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredSearchQuery {
+        pub filter: RequiredFilter,
+    }
+}
+
+#[get("/api/required-search")]
+async fn required_search_route(
+    _q: Query<query_required_shapes::RequiredSearchQuery>,
+) -> &'static str {
+    "ok"
+}
+
+mod unregistered_ref_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    // Deliberately does NOT derive `OpenApiSchema` — a plain enum that
+    // serializes as a string (`?dir=asc`), same as any type a caller never
+    // opted into field-accurate schemas for.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    pub enum Sort {
+        Asc,
+        Desc,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct UnregisteredRefQuery {
+        pub dir: Sort,
+    }
+}
+
+#[get("/api/unregistered-ref-search")]
+async fn unregistered_ref_search_route(
+    _q: Query<unregistered_ref_shapes::UnregisteredRefQuery>,
+) -> &'static str {
+    "ok"
+}
+
+fn nested_search_spec() -> autumn_web::openapi::OpenApiSpec {
+    let route = __autumn_route_info_nested_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    autumn_web::openapi::generate_spec(&config, &[&route.api_doc])
+}
+
+fn nested_search_param<'a>(
+    spec: &'a autumn_web::openapi::OpenApiSpec,
+    name: &str,
+) -> &'a autumn_web::openapi::Parameter {
+    spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .expect("GET /api/nested-search")
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == name)
+        .unwrap_or_else(|| panic!("expected a query parameter named {name}"))
+}
+
+/// Unwrap a nullable `{"oneOf": [<real>, {"type": "null"}]}` wrapper.
+fn unwrap_nullable(schema: &serde_json::Value) -> &serde_json::Value {
+    schema.get("oneOf").map_or(schema, |branches| &branches[0])
+}
+
+#[test]
+fn one_query_parameter_per_field() {
+    let spec = nested_search_spec();
+    let params: Vec<&str> = spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .unwrap()
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(
+        params,
+        ["filter", "items", "q", "tags"],
+        "one parameter per struct field, not one for the whole struct"
+    );
+}
+
+#[test]
+fn scalar_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let q = nested_search_param(&spec, "q");
+    assert_eq!(q.style.as_deref(), Some("form"));
+    assert_eq!(q.explode, Some(true));
+    assert!(!q.required, "an Option<T> field is not required");
+}
+
+#[test]
+fn scalar_array_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let tags = nested_search_param(&spec, "tags");
+    assert_eq!(
+        tags.style.as_deref(),
+        Some("form"),
+        "a scalar-array field still round-trips via ?tags=a&tags=b"
+    );
+    assert_eq!(tags.explode, Some(true));
+}
+
+#[test]
+fn nested_object_query_field_uses_deep_object() {
+    let spec = nested_search_spec();
+    let filter = nested_search_param(&spec, "filter");
+    assert_eq!(
+        filter.style.as_deref(),
+        Some("deepObject"),
+        "an object field decodes from ?filter[status]=open, which deepObject describes"
+    );
+    assert_eq!(filter.explode, Some(true));
+    let inner = unwrap_nullable(&filter.schema);
+    let reference = inner["$ref"]
+        .as_str()
+        .expect("a nested object field schema is a $ref");
+    assert!(
+        !reference.contains("::"),
+        "the $ref must be the collision-resolved display key, not a raw type_name: {reference}"
+    );
+    let key = reference.trim_start_matches("#/components/schemas/");
+    let components = spec
+        .components
+        .as_ref()
+        .expect("components must be present");
+    let resolved = components
+        .schemas
+        .get(key)
+        .unwrap_or_else(|| panic!("$ref {reference} must resolve to a real component"));
+    assert!(
+        resolved["properties"].get("status").is_some(),
+        "the resolved component must carry Filter's real fields: {resolved}"
+    );
+}
+
+#[test]
+fn required_nested_object_query_field_is_required() {
+    // `filter` on `RequiredSearchQuery` is NOT `Option`-wrapped, so it must be
+    // `required: true` on its own parameter — the old whole-struct fallback
+    // could never say this (issue #2251).
+    let route = __autumn_route_info_required_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/required-search"].get.as_ref().unwrap();
+    let filter = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "filter")
+        .expect("a query parameter named filter");
+    assert!(
+        filter.required,
+        "a non-Option nested field must be required: true"
+    );
+    assert_eq!(filter.style.as_deref(), Some("deepObject"));
+}
+
+#[test]
+fn unregistered_ref_field_keeps_form_explode_not_deep_object() {
+    // `Sort` derives no `OpenApiSchema`, so its own shape can't be read. A
+    // plain enum serializes as a string (?dir=asc), so defaulting an
+    // unresolvable $ref to "flat" must win over guessing "object" — the old
+    // whole-struct fallback got this right by luck (everything was form), and
+    // the per-field split must not regress it (issue #2251).
+    let route = __autumn_route_info_unregistered_ref_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/unregistered-ref-search"]
+        .get
+        .as_ref()
+        .unwrap();
+    let dir = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "dir")
+        .expect("a query parameter named dir");
+    assert_eq!(
+        dir.style.as_deref(),
+        Some("form"),
+        "an unregistered $ref must default to flat, not deepObject: {dir:?}"
+    );
+    assert_eq!(dir.explode, Some(true));
+}
+
+#[test]
+fn array_of_objects_query_field_documents_the_gap_instead_of_a_style() {
+    let spec = nested_search_spec();
+    let items = nested_search_param(&spec, "items");
+    assert!(
+        items.style.is_none(),
+        "no OpenAPI style expresses an array of objects (issue #2251)"
+    );
+    assert!(items.explode.is_none());
+    let description = items
+        .description
+        .as_deref()
+        .expect("the gap must be documented on the parameter, not left silent");
+    assert!(
+        description.contains("[0]"),
+        "must name the bracketed encoding a client needs: {description}"
+    );
+}
+
+#[test]
+fn undescribable_query_struct_keeps_the_old_single_parameter() {
+    // `SearchParams` (defined above) derives no `OpenApiSchema`, so its fields
+    // cannot be introspected — the old whole-struct fallback must still apply
+    // (no spec churn for the common undecorated case).
+    let route = __autumn_route_info_search();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/search"].get.as_ref().unwrap();
+    let query_params: Vec<_> = op
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .collect();
+    assert_eq!(
+        query_params.len(),
+        1,
+        "an undescribable query struct still documents one struct-level parameter"
+    );
+    assert_eq!(query_params[0].name, "SearchParams");
+}
