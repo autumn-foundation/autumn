@@ -5238,28 +5238,49 @@ impl AppBuilder {
         // A duplicate of the listening socket is kept aside so a `SIGUSR2`
         // in-place upgrade (#1674) can hand it to a successor while this process
         // keeps serving through the original. Only a plain TCP listener can be
-        // handed over in this release.
+        // handed over in this release. This runs up front, before the match
+        // consumes `bound_listener` to build the (not yet spawned) accept-loop
+        // future below.
         #[cfg(unix)]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
+        #[cfg(unix)]
+        if let BoundListener::Tcp(listener) = &bound_listener {
+            match crate::upgrade::HandoffSocket::from_listener(listener) {
+                Ok(socket) => handoff_socket = Some(socket),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not duplicate the listening socket; in-place upgrade \
+                     (SIGUSR2) will be refused for this process"
+                ),
+            }
+        }
 
-        let server_task = match bound_listener {
+        // Build the accept-loop future per transport, but do NOT spawn it yet.
+        // The arms differ only in the connect-info type baked into the
+        // make-service (`SocketAddr` for TCP, `UdsConnectInfo` for Unix
+        // sockets); the shutdown wiring and the resulting `io::Result<()>` are
+        // identical. Handlers extracting `ConnectInfo<SocketAddr>` are
+        // unsupported under a Unix socket — daemon mode is local and
+        // loopback-equivalent.
+        //
+        // The future is spawned only after the startup hooks have succeeded
+        // (#2368). Adopting the inherited fd still happens up front (so a
+        // failure to adopt aborts early, as today), but during an in-place
+        // upgrade the successor must not compete for connections before it can
+        // actually serve them: every connection it wins in that window is
+        // answered by the startup barrier with a 503 while the predecessor is
+        // right there, healthy. The predecessor keeps serving for the whole
+        // window; the successor's accept loop goes live once
+        // `run_startup_hooks` has returned `Ok`.
+        let server_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+        > = match bound_listener {
             BoundListener::Tcp(listener) => {
-                #[cfg(unix)]
-                {
-                    match crate::upgrade::HandoffSocket::from_listener(&listener) {
-                        Ok(socket) => handoff_socket = Some(socket),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not duplicate the listening socket; in-place upgrade \
-                             (SIGUSR2) will be refused for this process"
-                        ),
-                    }
-                }
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         std::net::SocketAddr,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5281,7 +5302,7 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5317,7 +5338,7 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         crate::tls::TlsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5508,13 +5529,21 @@ impl AppBuilder {
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
+            // The accept loop is not spawned until the hooks succeed (#2368),
+            // so there is nothing to abort here: in an in-place upgrade the
+            // predecessor simply keeps serving through the adopted socket while
+            // this process exits, and no user ever sees a 503.
             server_shutdown.cancel();
-            server_task.abort();
             // `process::exit` skips `on_shutdown`; stop any managed Postgres.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
+
+        // Go live on the accept loop only now, with the startup hooks complete
+        // (#2368). The cold-start path is unaffected: with no predecessor the
+        // startup barrier still answers until `mark_startup_complete` below.
+        let server_task = tokio::spawn(server_future);
 
         if !state.probes().is_shutting_down() {
             // Web role runs no cron scheduler (workers/combined only). Skipping
@@ -15302,6 +15331,57 @@ mod tests {
                  and hooks ({hooks:?}) would spend more"
             );
         }
+    }
+
+    /// The accept loop must go live only after the startup hooks succeed.
+    ///
+    /// During an in-place upgrade (#1674) the successor adopts the
+    /// predecessor's listening socket up front, so both processes are
+    /// accepting on the same socket and the kernel hands new connections to
+    /// either — and every connection the successor wins before it can serve is
+    /// answered by the startup barrier with a 503 while the predecessor is
+    /// right there, healthy. Spawning the accept loop only once
+    /// `run_startup_hooks` has returned `Ok` keeps the predecessor serving for
+    /// the whole window, so a slow or failing successor can no longer 503 real
+    /// users (#2368). Source-order test in the house style: the ordering is a
+    /// property of this function, and a two-process upgrade test with fd
+    /// handoff cannot run in CI.
+    #[test]
+    fn accept_loop_spawns_only_after_startup_hooks_succeed() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let bound = server_source
+            .find("let server_future:")
+            .expect("the accept-loop future must be built from the bound listener");
+        let hooks = server_source
+            .find("run_startup_hooks(&startup_hooks, state.clone())")
+            .expect("startup hooks must run on the normal server path");
+        let spawn = server_source
+            .find("let server_task = tokio::spawn(server_future);")
+            .expect("the accept loop must be spawned exactly once, after the hooks");
+
+        assert!(
+            bound < hooks && hooks < spawn,
+            "the listener must be bound and the accept-loop future built BEFORE \
+             the startup hooks (so a failure to adopt aborts early), but the \
+             accept loop must be spawned only AFTER the hooks succeed \
+             (bound={bound}, hooks={hooks}, spawn={spawn})"
+        );
+        // The old shape spawned the accept loop inline from the
+        // bound-listener match; it must not come back.
+        assert!(
+            !server_source.contains("let server_task = match bound_listener"),
+            "the accept loop must not be spawned from the bound-listener match"
+        );
     }
 
     #[test]

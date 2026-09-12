@@ -454,6 +454,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **hot-upgrade:** the successor no longer starts its accept loop before its
+  startup hooks have run (#2368). The inherited listening socket is still
+  adopted up front (so a failure to adopt aborts early, as before), but the
+  accept-loop future is only spawned once `run_startup_hooks` returns `Ok` —
+  previously both processes accepted on the same socket while the successor's
+  hooks were still running, and every connection the successor won in that
+  window was answered by the startup barrier with a 503 while the healthy
+  predecessor sat right there. The predecessor now keeps serving for the whole
+  window, and a successor whose hooks fail exits having never competed for a
+  connection. The cold-start path is unchanged: with no predecessor, the
+  startup barrier still answers until `mark_startup_complete`.
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
