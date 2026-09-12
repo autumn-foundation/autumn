@@ -340,7 +340,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *finds* it. `check-docs-orphans.sh` is the near miss: it proves a page is
   reachable by clicking from an entry surface, which is a different question,
   since nobody clicks through a 159-page guide with no index — they type the
-  word they already have. Baseline: `autumn generate auth --totp` ships
+  word they already have. Baseline: `autumn generate auth User --totp` ships
   two-factor authentication, and `docs/guide/authentication.md` documented it
   accurately as "TOTP" and "Multi-factor" while never once saying "2FA" or
   "two-factor". Searching the reader-facing corpus for those words returned

@@ -506,8 +506,8 @@ jobs:
         # does not exist and go and build it, or pick a framework whose docs
         # answered them.
         #
-        # Baseline: `autumn generate auth --totp` ships two-factor auth, and
-        # `docs/guide/authentication.md` documented it accurately as "TOTP" and
+        # Baseline: `autumn generate auth User --totp` ships two-factor auth,
+        # and `docs/guide/authentication.md` documented it accurately as "TOTP" and
         # "Multi-factor" while never once saying "2FA" or "two-factor" — the
         # words essentially everyone types. A corpus-wide grep for the reader's
         # words returned four hits, none of them an answer: two were `%2F` URL

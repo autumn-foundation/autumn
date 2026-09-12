@@ -33,8 +33,8 @@
 # protocol name.
 #
 # THE BASELINE DEFECT, and why it is the shape of the whole class:
-# `autumn generate auth --totp` ships two-factor authentication — enrollment,
-# login-verify, encrypted-at-rest secrets, single-use recovery codes. It is
+# `autumn generate auth User --totp` ships two-factor authentication —
+# enrollment, login-verify, encrypted-at-rest secrets, recovery codes. It is
 # documented in `docs/guide/authentication.md`, accurately and in detail. That
 # page called it "TOTP" and "Multi-factor" and never once called it "2FA" or
 # "two-factor authentication", which is what essentially everyone types.
