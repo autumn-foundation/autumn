@@ -1331,9 +1331,9 @@ impl AppBuilder {
     ///
     /// This includes only user-installed layers from
     /// [`AppBuilder::layer`], not framework-managed middleware — even one
-    /// installed through this same `custom_layers` vector internally (see
-    /// [`is_framework_owned_layer`]), such as the `edge` feature's
-    /// [`StripEdgeFallthroughSentinelLayer`].
+    /// installed through this same `custom_layers` vector internally, such
+    /// as the `edge` feature's own sentinel-strip layer, which this filters
+    /// back out.
     #[must_use]
     pub fn get_layer_types(&self) -> Vec<TypeId> {
         self.custom_layers

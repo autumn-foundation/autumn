@@ -132,10 +132,10 @@ pub struct EdgeFn {
     /// `src/bin/`), or `"bin:<name>"` for a `[[bin]]` target's own separate
     /// crate. Two functions can share an identical `module_path` (both
     /// crate roots, say) while genuinely belonging to different crates —
-    /// [`is_registered`] treats this as part of the match key precisely so
-    /// a registration written in one crate can never silently credit a
-    /// same-named function root in another (Codex review on #2739, round 7,
-    /// P2).
+    /// the scan's own matching logic treats this as part of the match key
+    /// precisely so a registration written in one crate can never silently
+    /// credit a same-named function root in another (Codex review on #2739,
+    /// round 7, P2).
     pub crate_root: String,
 }
 
@@ -155,22 +155,22 @@ pub struct EdgeScan {
     /// `(crate_root, path text)` for each `edge_routes![...]` entry: `crate_root`
     /// is the crate the invocation itself was written in (see
     /// [`EdgeFn::crate_root`]) and the text is the entry as written, with a
-    /// leading `self`/`super` resolved against the invocation's own module
-    /// (see [`registration_candidates`]). Nothing outside this module reads
-    /// it directly, only through [`EdgeScan::unregistered`] and
-    /// [`EdgeScan::registered_fns`].
+    /// leading `self`/`super` resolved against the invocation's own module.
+    /// Nothing outside this module reads it directly, only through
+    /// [`EdgeScan::unregistered`] and [`EdgeScan::registered_fns`].
     pub registered: BTreeSet<(String, String)>,
     /// Number of `edge_routes![...]` invocations seen (0 means the app never
     /// registers its marked handlers, so the capsule would serve nothing).
     pub registrations: usize,
     /// Number of `.rs` files read.
     pub files_scanned: usize,
-    /// The scanned crate's own Rust library-crate identifier (see
-    /// [`rust_crate_name_from_manifest`]), when its manifest could be read
-    /// and parsed. Lets a registration written as `my_crate::show` (Rust's
-    /// own rule: a crate's name is also a valid path root to its own items,
-    /// same as `crate::show`) match a function `is_registered` would
-    /// otherwise treat as a reference to an unrelated `my_crate` module.
+    /// The scanned crate's own Rust library-crate identifier (hyphens
+    /// converted to underscores, and a `[lib] name` override honored),
+    /// when its manifest could be read and parsed. Lets a registration
+    /// written as `my_crate::show` (Rust's own rule: a crate's name is also
+    /// a valid path root to its own items, same as `crate::show`) match a
+    /// function that would otherwise look like a reference to an unrelated
+    /// `my_crate` module.
     pub crate_name: Option<String>,
 }
 
