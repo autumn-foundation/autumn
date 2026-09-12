@@ -62,10 +62,12 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
 
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
+    // `testcontainers-modules`' `MinIO` pins `minio/minio` on Docker Hub, which
+    // no longer serves that repository at all (MinIO Inc. dropped it). Point at
+    // MinIO's other public registry, `quay.io/minio/minio`, instead.
     let minio = MinIO::default()
         .with_name("quay.io/minio/minio")
+        .with_tag("RELEASE.2025-09-07T16-13-09Z")
         .start()
         .await
         .expect("start MinIO — is Docker running?");

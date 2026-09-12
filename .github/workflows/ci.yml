@@ -40,6 +40,14 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
+      # Decision (issue #2252): track `stable` here on purpose, not a pinned
+      # version. A pin would hide new lints instead of catching them close to
+      # when they land. The `msrv` job below pins 1.88.0 — that is the
+      # compile floor, a separate concern from lint currency. A stable bump
+      # can arm a new lint across many call sites. Add a scoped
+      # `[workspace.lints.clippy]` allow with a comment for it (see
+      # `unused_async_trait_impl` in the root Cargo.toml). Do not add a
+      # toolchain pin instead.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -135,6 +143,15 @@ jobs:
         # the `sqlite`-excluding feature lists below, and nothing read the
         # manifests. No toolchain, ~1 second, self-testing.
         run: ./scripts/check-sqlite-unification.sh
+      - name: Example binary-name collision gate
+        # Two workspace members producing the same binary file name break the
+        # Windows linker intermittently (LNK1104, issue #2639) while staying
+        # invisible on Unix, so CI only catches the reintroduction when two
+        # links happen to overlap. This script enumerates every member's
+        # explicit [[bin]] AND auto-discovered src/bin targets (issues
+        # #2690/#2691) and fails on a duplicate name. No toolchain, ~1
+        # second, self-testing.
+        run: ./scripts/check-example-bin-names.sh
 
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
