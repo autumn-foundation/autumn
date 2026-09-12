@@ -187,8 +187,10 @@ regression test the sweep will then pick up automatically.
 
 ## Findings summary
 
-- **Bugs filed:** 1 — #2737 (data loss on import of any accepted-version
-  file whose posts lack `path`; see above).
+- **Bugs filed:** 1 — #2737 (data loss on import, when a same-slug sibling
+  page is listed before its parent and neither carries `path`; see above —
+  not a risk to ordinary pathless *posts*, which never collide on slug in
+  the first place, only to same-slug *pages* under different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
