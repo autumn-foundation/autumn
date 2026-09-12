@@ -146,18 +146,31 @@ READER_VOCABULARY = (
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')
 
-# Code renders verbatim, so these regions are carried through untouched and
-# every markup rule below is applied only OUTSIDE them. Fenced blocks first, so
-# a stray backtick inside a fence cannot start an inline span.
-CODE_REGION = re.compile(
-    r'^[ \t]*(?P<f>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=f)[ \t]*$'  # fenced block
-    r'|`+[^`\n]*`+',                                             # inline span
-    re.M | re.S,
+# ONE SCANNER decides what each region is, in document order, because running
+# these rules in sequence over the whole file makes the ANSWER DEPEND ON THE
+# ORDER — and neither order is right:
+#
+#   strip comments first  -> deletes a comment a fence was DISPLAYING as code
+#   segment code first    -> a backtick inside a comment splits that comment,
+#                            and its text is carried through as "code"
+#
+# The second is not hypothetical; it was a live regression here. The real
+# question is never "comments or code first", it is WHICH CONSTRUCT STARTS
+# FIRST at this position, which is what a scanner answers and a pipeline of
+# substitutions cannot.
+NEXT_CONSTRUCT = re.compile(
+    r'(?P<comment><!--)'
+    r'|(?P<fence>^[ \t]{0,3}(?P<frun>`{3,}|~{3,})[^\n]*$)'
+    r'|(?P<crun>`+)',
+    re.M,
 )
 
 # Markup that carries text a reader never sees.
-HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
-REF_DEFINITION = re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M)
+REF_DEFINITION = re.compile(
+    r'^[ \t]*\[[^\]]+\]:[ \t]*\S+[^\n]*'                 # the definition
+    r'(?:\n[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^)\n]*\))[ \t]*)?',  # its title
+    re.M,
+)
 AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
 HTML_TAG = re.compile(r'</?[A-Za-z][^>]*>')
 
@@ -210,11 +223,62 @@ def _strip_link_destinations(text):
 
 
 def _strip_markup(chunk):
-    chunk = HTML_COMMENT.sub(' ', chunk)
     chunk = REF_DEFINITION.sub(' ', chunk)
     chunk = AUTOLINK.sub(' ', chunk)
     chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
     return HTML_TAG.sub(' ', chunk)
+
+
+def _segments(text):
+    """Walk the document once, yielding ('code'|'prose'|'drop', chunk).
+
+    At each position the construct that STARTS FIRST wins, which is the only
+    ordering that is not arbitrary. A comment opening before a fence swallows
+    the fence's backticks; a fence opening before a comment displays the
+    comment as code. Both are what a renderer does.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        m = NEXT_CONSTRUCT.search(text, i)
+        if not m:
+            out.append(('prose', text[i:]))
+            break
+        if m.start() > i:
+            out.append(('prose', text[i:m.start()]))
+
+        if m.group('comment'):
+            end = text.find('-->', m.end())
+            end = n if end < 0 else end + 3
+            out.append(('drop', text[m.start():end]))
+            i = end
+            continue
+
+        if m.group('fence'):
+            run = m.group('frun')
+            # A fence closes on a run of the SAME character at least as long as
+            # the opener — so a ``` inside a ```` block is content, not a close.
+            # `scripts/check-docs-cli.sh` applies the same rule for the same
+            # reason: closing early makes the rest of the block read as prose.
+            close = re.compile(
+                r'^[ \t]{0,3}%s{%d,}[ \t]*$' % (re.escape(run[0]), len(run)),
+                re.M,
+            )
+            cm = close.search(text, m.end())
+            end = cm.end() if cm else n
+            out.append(('code', text[m.start():end]))
+            i = end
+            continue
+
+        run = m.group('crun')                       # inline code span
+        cm = re.compile(r'(?<!`)%s(?!`)' % re.escape(run)).search(text, m.end())
+        if cm is None or '\n\n' in text[m.end():cm.start()]:
+            out.append(('prose', text[m.start():m.end()]))  # never closed
+            i = m.end()
+        else:
+            out.append(('code', text[m.start():cm.end()]))
+            i = cm.end()
+    return out
 
 
 def prose(text):
@@ -248,14 +312,19 @@ def prose(text):
     a fence or a `span` is on the page and ctrl-F finds it. That is why the
     markup rules run per-segment rather than over the whole file — stripping
     tags inside a fence would delete text the reader can see.
+
+    `_segments` decides which regions those are in a single ordered pass, so
+    that "comments first" versus "code first" never has to be answered: the
+    construct that opens first wins, as it does in a renderer.
     """
     out = []
-    pos = 0
-    for m in CODE_REGION.finditer(text):
-        out.append(_strip_markup(text[pos:m.start()]))
-        out.append(m.group(0))
-        pos = m.end()
-    out.append(_strip_markup(text[pos:]))
+    for kind, chunk in _segments(text):
+        if kind == 'code':
+            out.append(chunk)
+        elif kind == 'prose':
+            out.append(_strip_markup(chunk))
+        else:                                  # 'drop' — never rendered
+            out.append(' ')
     return PERCENT_ESCAPE.sub('/', ''.join(out))
 
 
@@ -424,12 +493,39 @@ def self_test():
     if d:
         failures.append('unbalanced `](` renders literally and should count')
 
+    # 17. A COMMENT CONTAINING BACKTICKS is still a comment. Segmenting code
+    # before removing comments let the inline span split the comment and carry
+    # its text through as "code" — a regression introduced by that ordering,
+    # and the reason segmentation is now one ordered pass.
+    d, _ = one('<!-- `2FA` and `two-factor` wording -->\nTOTP enrollment.')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a comment containing backticks must not satisfy a row')
+
+    # 18. A FENCE CLOSES ON A LONGER RUN. Opening with ``` and closing with
+    # ```` is valid markdown; failing to see the close made the block read as
+    # prose, which stripped a destination the reader can see and could REJECT
+    # a valid page. Same rule as scripts/check-docs-cli.sh.
+    d, _ = one('Text.\n\n```\n[flow](./two-factor)\n````\n')
+    if d:
+        failures.append('a fence must close on a run at least as long')
+
+    # ... and a shorter run inside a longer fence is content, not a close.
+    d, _ = one('````\n```\ntwo-factor\n````\n')
+    if d:
+        failures.append('a shorter run inside a longer fence is content')
+
+    # 19. A REFERENCE DEFINITION'S TITLE may sit on the next line, and is just
+    # as unrendered as the destination.
+    d, _ = one('See [f].\n\n[f]: /totp\n    "two-factor setup"\n')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a ref-definition continuation title must not count')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (18 properties).')
+    print('Self-test OK (23 properties).')
     return 0
 
 
