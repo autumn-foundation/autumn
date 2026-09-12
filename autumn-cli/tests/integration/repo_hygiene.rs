@@ -8949,7 +8949,13 @@ fn every_minio_container_is_pulled_from_the_public_registry() {
             let window = builder_window(&content, index);
             // Only a container actually being started needs the override; the
             // builder is also read for its tag, which pulls nothing.
-            if !window.contains(".start()") || window.contains(MINIO_REGISTRY) {
+            if !window.contains(".start()") {
+                continue;
+            }
+            // The registry may be named inline or through a constant, so the
+            // literal is looked for anywhere in the file rather than in the
+            // builder itself.
+            if window.contains(".with_name(") && content.contains(MINIO_REGISTRY) {
                 continue;
             }
             let relative = path.strip_prefix(&root).unwrap_or(&path);
@@ -8981,15 +8987,23 @@ fn the_minio_registry_scan_sees_an_unqualified_call_site() {
             .filter(|(_, line)| line.contains("MinIO::default()"))
             .any(|(index, _)| {
                 let window = builder_window(src, index);
-                window.contains(".start()") && !window.contains(MINIO_REGISTRY)
+                window.contains(".start()")
+                    && !(window.contains(".with_name(") && src.contains(MINIO_REGISTRY))
             })
     };
     let unqualified = "let c = MinIO::default()\n    .start()\n    .await;";
-    let qualified = format!(
+    let inline = format!(
         "let c = MinIO::default()\n    .with_name(\"{MINIO_REGISTRY}\")\n    .start()\n    .await;",
     );
+    let via_const = format!(
+        "const IMAGE: &str = \"{MINIO_REGISTRY}\";\n\
+         let c = MinIO::default()\n    .with_name(IMAGE)\n    .start()\n    .await;",
+    );
+    let wrong_registry = "let c = MinIO::default()\n    .with_name(\"docker.io/minio/minio\")\n    .start()\n    .await;";
     let tag_only = "let t = MinIO::default().tag();";
     assert!(flags(unqualified), "an unqualified start must be caught");
-    assert!(!flags(&qualified), "a qualified start must pass");
+    assert!(!flags(&inline), "an inline registry must pass");
+    assert!(!flags(&via_const), "a registry named by constant must pass");
+    assert!(flags(wrong_registry), "a different registry must be caught");
     assert!(!flags(tag_only), "reading the tag pulls nothing");
 }
