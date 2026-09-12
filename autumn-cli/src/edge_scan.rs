@@ -41,7 +41,20 @@
 //!   limit as the `#[edge]`-rename case above — this scan does not track
 //!   `use` at all, so an alias reports as an extra false-positive
 //!   "unregistered" warning rather than resolving to the real path (Codex
-//!   review on #2739, round 18, P2).
+//!   review on #2739, round 18, P2). A `pub use crate::handlers::*;`
+//!   glob re-export — `pub mod api { pub use crate::handlers::*; }`, say,
+//!   making `handlers::show` also reachable as `api::show` — is the same
+//!   limit in a different shape: `edge_routes![my_app::api::show]` compares
+//!   `api` against `show`'s own recorded module path (`handlers`), not
+//!   against every path a re-export might also make it reachable through,
+//!   so it reports the same false-positive "unregistered" warning rather
+//!   than resolving the re-export (Codex review on #2739, round 22, P2 —
+//!   investigated, not applied: tracking arbitrary `pub use` re-exports
+//!   (glob, selective, renamed, chained through several modules) is a
+//!   name-resolution feature, not a textual scan, and any partial version
+//!   risks the false-positive-credit direction this whole module exists to
+//!   avoid for a pattern the "not a name resolver" limit already covers in
+//!   spirit).
 //!   A leading `self` or `super` in an entry is resolved
 //!   against the *inline* module the invocation itself is written in
 //!   (`self::show` inside `mod users { ... }` resolves to `users::show`)
@@ -319,6 +332,21 @@ impl EdgeScan {
 /// via `rust_crate_name_from_manifest`, which never carries one. Comparing
 /// the two spellings unnormalized always missed the library crate through
 /// this branch (Codex review on #2739, round 22, P2).
+///
+/// The final module-path equality strips a leading `r#` from EVERY
+/// remaining segment on both sides, for the same reason: a conventional
+/// `mod r#type;` loads `src/type.rs` (verified directly — Rust's own
+/// file-system convention strips the escape), so [`crate_context_from_file`]
+/// derives module path `["type"]` for that file, while a registration
+/// written as `edge_routes![my_app::r#type::show]` tokenizes its qualifier
+/// with the `r#` intact. An INLINE `mod r#type { ... }`, by contrast, is
+/// tracked via [`scan_items`]'s own `item_mod.ident.to_string()`, which
+/// keeps the `r#` in `f.module_path` too — so which side (or both, or
+/// neither) actually carries the prefix depends on how that module was
+/// discovered, and stripping it from both makes the comparison correct
+/// either way, since `r#foo` and `foo` never name different identifiers —
+/// the escape is a purely syntactic affordance for using a keyword as a
+/// name, not part of the name itself (Codex review on #2739, round 22, P2).
 fn is_registered(
     f: &EdgeFn,
     registered: &BTreeSet<(String, String)>,
@@ -340,9 +368,7 @@ fn is_registered(
                 }
                 qualifier_segments.next();
             }
-            Some(seg)
-                if crate_name.is_some_and(|name| name == seg.strip_prefix("r#").unwrap_or(seg)) =>
-            {
+            Some(seg) if crate_name.is_some_and(|name| name == strip_raw_prefix(seg)) => {
                 if !f.crate_root.is_empty() {
                     return false;
                 }
@@ -354,8 +380,24 @@ fn is_registered(
                 }
             }
         }
-        qualifier_segments.eq(f.module_path.iter().map(String::as_str))
+        qualifier_segments.map(strip_raw_prefix).eq(f
+            .module_path
+            .iter()
+            .map(|segment| strip_raw_prefix(segment)))
     })
+}
+
+/// Strip a leading `r#` from a Rust path segment. `r#foo` and `foo` never
+/// name different identifiers — the escape is a purely syntactic affordance
+/// for using a keyword as a name, not part of the name itself — but
+/// `syn`/`proc_macro2::Ident::to_string()` keeps it verbatim (verified
+/// directly), while a file-system-derived module path
+/// ([`crate_context_from_file`], [`module_path_from_segments`]) never
+/// carries one (the file itself is never actually named with a literal
+/// `r#` prefix). [`is_registered`] uses this to compare the two spellings
+/// as equal (Codex review on #2739, round 22, P2).
+fn strip_raw_prefix(segment: &str) -> &str {
+    segment.strip_prefix("r#").unwrap_or(segment)
 }
 
 /// Scan a set of in-memory `(file, source)` pairs, given the set of feature
@@ -3718,6 +3760,39 @@ mod tests {
         assert_eq!(scan.registered_fns().len(), 1);
     }
 
+    /// A CONVENTIONAL library module declared `mod r#type;` at the crate
+    /// root: Rust loads `src/type.rs` (verified directly), so the ordinary
+    /// `src/` walk's `crate_context_from_file` derives module path `["type"]`
+    /// for that file — no `r#` at all, since it comes from the literal file
+    /// name — while a registration written as
+    /// `edge_routes![my_app::r#type::show]` tokenizes its qualifier with the
+    /// `r#` intact. The two spellings must still compare equal (Codex review
+    /// on #2739, round 22, P2).
+    #[test]
+    fn a_raw_identifier_modules_conventional_file_still_matches_its_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "mod r#type;\nfn wire() { edge_routes![my_app::r#type::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/type.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
     /// `edge_routes![::my_crate::show]` — the leading `::` anchors the path
     /// to a crate root the same way an explicit `my_crate::show` already
     /// does, ruling out a same-named local item shadowing the crate name.
@@ -3788,6 +3863,33 @@ mod tests {
             unregistered[0].module_path,
             vec!["api".to_owned(), "v1".to_owned()]
         );
+        assert!(scan.registered_fns().is_empty());
+    }
+
+    /// A `pub use crate::handlers::*;` glob re-export makes `handlers::show`
+    /// also reachable as `api::show` in real Rust, but this scan does not
+    /// track `use` at all (see the module doc's "Recognition limits"), so a
+    /// registration written against the re-exported path reports the same
+    /// safe-direction false-positive "unregistered" warning as an unresolved
+    /// `use`-alias, rather than crediting `handlers::show` (Codex review on
+    /// #2739, round 22, P2 — investigated, not applied).
+    #[test]
+    fn a_glob_reexported_registration_is_left_unresolved() {
+        let scan = scan_one(
+            r"
+            mod handlers {
+                #[edge]
+                pub fn show() {}
+            }
+            mod api {
+                pub use crate::handlers::*;
+            }
+            fn wire() { edge_routes![api::show]; }
+            ",
+        );
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].module_path, vec!["handlers".to_owned()]);
         assert!(scan.registered_fns().is_empty());
     }
 
