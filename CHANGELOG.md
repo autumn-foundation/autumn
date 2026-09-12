@@ -463,6 +463,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "app" task definition when registering the real image, so a narrower
   migrate secret list silently stripped the signing secret from every real
   app deploy, and the app failed fast on startup.
+- **ci:** the `minio` testcontainer used by the offsite-backup, S3-replication,
+  and avatar-blob-store Docker-dependent tests now pulls from
+  `quay.io/minio/minio` instead of the default `minio/minio`. Docker Hub
+  started refusing anonymous pulls of `minio/minio` in 2025, so every
+  unauthenticated CI runner failed these tests with "pull access denied"
+  regardless of the change under test; `quay.io/minio/minio` mirrors the same
+  release tags and stays public.
 - **cli:** `autumn upgrade` bounds the two approximations behind its codemod
   safety posture (issue #2234, follow-up to #2231). `0.6.0-repository-with-pool-untracked`
   now ships as `review` rather than `auto`: it still rewrites every call site,

@@ -11,6 +11,7 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
 };
 use bytes::Bytes;
+use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
 
@@ -36,7 +37,15 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    let container = MinIO::default().start().await.expect("start MinIO");
+    // Docker Hub's `minio/minio` now requires auth for anonymous pulls
+    // (MinIO restricted it in 2025); `quay.io/minio/minio` mirrors the same
+    // tags and stays public, so CI runners without registry credentials
+    // still work.
+    let container = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .start()
+        .await
+        .expect("start MinIO");
     let port = container
         .get_host_port_ipv4(9000)
         .await
