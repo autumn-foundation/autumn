@@ -1783,10 +1783,11 @@ mod tests {
     /// page actually refreshes, so such a divergence fails CI instead of
     /// freezing ISR in production.
     ///
-    /// (Note the known asymmetry it does *not* cover: `autumn build` renders
-    /// through the app's custom Tower layers while ISR regeneration
-    /// deliberately does not. An app whose own layer rewrites `Content-Type`
-    /// will see refusals; the error names the route and both types.)
+    /// (The asymmetry this note used to document — `autumn build` rendering
+    /// through the app's custom Tower layers while ISR regeneration did not —
+    /// is closed by #2405: the build renders through the pre-layer router too.
+    /// `isr_accepts_regeneration_when_a_user_layer_rewrites_content_type`
+    /// covers the rewriting-layer shape directly.)
     #[tokio::test]
     async fn isr_regenerates_page_built_by_render_static_routes() {
         let router = axum::Router::new().route(
@@ -1835,6 +1836,127 @@ mod tests {
             "<h1>fresh</h1>",
             "a page built by render_static_routes must still be regenerable by ISR — \
              a build/ISR disagreement on the recorded Content-Type would freeze it"
+        );
+    }
+
+    /// #2405: `autumn build` used to render through the app's custom Tower
+    /// layers while ISR regeneration deliberately did not. For an app with a
+    /// `Content-Type`-rewriting layer the build recorded the post-layer type,
+    /// ISR saw the pre-layer one, and the #2400 guard refused every refresh —
+    /// freezing the route until the next build.
+    ///
+    /// The build now renders through the pre-layer router (user layers drained
+    /// in `run_build_mode` via
+    /// [`crate::router::partition_custom_layers_for_static_render`], the same
+    /// partition the SSG serve path applies), so the manifest records the
+    /// handler's type and the body on disk is the handler's body. This drives
+    /// the real `render_static_routes` into the real `regenerate_page` with a
+    /// rewriting layer in the picture and asserts the refresh is accepted —
+    /// the exact shape that used to freeze.
+    #[tokio::test]
+    async fn isr_accepts_regeneration_when_a_user_layer_rewrites_content_type() {
+        use axum::http::header::{CONTENT_TYPE, HeaderValue};
+
+        // The offending shape: a user layer that rewrites Content-Type on the
+        // way out.
+        let rewrite = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let mut response = next.run(req).await;
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-rewritten"),
+                );
+                response
+            },
+        );
+        let registration = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<()>(),
+            type_name: "content_type_rewrite",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(rewrite.clone()),
+        };
+
+        // What `run_build_mode` does before rendering: drain the user layers.
+        let (pre_layer, drained) =
+            crate::router::partition_custom_layers_for_static_render(vec![registration]);
+        assert!(
+            pre_layer.is_empty(),
+            "a plain user layer must not survive the build-time drain"
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "the drained set carries the rewriting layer"
+        );
+
+        let base = axum::Router::new().route(
+            "/page",
+            axum::routing::get(|| async { axum::response::Html("<h1>v1</h1>") }),
+        );
+        // The old build composition, for contrast: the layer applied at
+        // render time.
+        let layered = base.clone().layer(rewrite);
+
+        let meta = || crate::static_gen::StaticRouteMeta {
+            path: "/page",
+            name: "page",
+            revalidate: Some(1),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        };
+
+        // Old behavior: the build records the post-layer type ...
+        let tmp_old = tempfile::tempdir().expect("tempdir");
+        let dist_old = tmp_old.path().join("dist");
+        crate::static_gen::render_static_routes(layered, &[meta()], &dist_old)
+            .await
+            .expect("static build");
+        let manifest_old = StaticManifest::load(&dist_old.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest_old.routes["/page"].content_type.as_deref(),
+            Some("application/x-rewritten"),
+            "rendering through the layer records the rewritten type"
+        );
+        // ... which ISR (pre-layer view) then refuses: the freeze.
+        let refused = regenerate_page(
+            &base,
+            "/page",
+            &dist_old.join("page/index.html"),
+            manifest_old.routes["/page"].content_type.as_deref(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "the old build/ISR asymmetry must refuse the refresh — this is the freeze #2405 fixes"
+        );
+
+        // New behavior: the build renders through the pre-layer router, so
+        // the manifest records the handler's type ...
+        let tmp_new = tempfile::tempdir().expect("tempdir");
+        let dist_new = tmp_new.path().join("dist");
+        crate::static_gen::render_static_routes(base.clone(), &[meta()], &dist_new)
+            .await
+            .expect("static build");
+        let manifest_new = StaticManifest::load(&dist_new.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest_new.routes["/page"].content_type.as_deref(),
+            Some("text/html; charset=utf-8"),
+            "the build must record the handler's pre-layer type, not the layer's rewrite"
+        );
+        // ... and ISR accepts the refresh, writing the handler's body.
+        let dest_new = dist_new.join("page/index.html");
+        std::fs::write(&dest_new, "<h1>stale</h1>").expect("write stale");
+        regenerate_page(
+            &base,
+            "/page",
+            &dest_new,
+            manifest_new.routes["/page"].content_type.as_deref(),
+        )
+        .await
+        .expect("ISR regeneration must accept the pre-layer recording");
+        assert_eq!(
+            std::fs::read_to_string(&dest_new).unwrap(),
+            "<h1>v1</h1>",
+            "the regenerated body is the handler's output"
         );
     }
 }

@@ -5691,6 +5691,56 @@ pub fn try_build_router_with_static(
     )
 }
 
+/// Partition `custom_layers` for the static render path (#2405).
+///
+/// Returns `(session_scoped, drained)`:
+/// - `session_scoped`: layers that must stay on the inner (pre-layer) router —
+///   the i18n ambient-locale layer, which reads the session and therefore
+///   cannot run outside the static-first middleware (see #1384).
+/// - `drained`: everything else — the user layers the SSG serve path applies
+///   outside the static-first middleware, to the cached response, at request
+///   time.
+///
+/// Both the static build (`App::run_build_mode`) and ISR regeneration render
+/// through the pre-layer router, so the recorded `Content-Type` and the body
+/// on disk are the handler's own. Recording the post-layer output instead
+/// double-applies the layers — once at generation, once per request — and,
+/// because ISR's type guard sees the pre-layer response, refuses every
+/// regeneration for an app with a `Content-Type`-rewriting layer, freezing
+/// the route until the next build.
+#[cfg(feature = "i18n")]
+pub(crate) fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    // #1384: the ambient-locale layer must not drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session,
+    // and everything drained here is applied outside the static-first middleware
+    // — that is, outside `SessionLayer`. Out there the session extension does not
+    // exist yet, so a locale persisted by the documented `set_locale_in_session`
+    // switcher would be invisible and content would resolve from
+    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
+    // A handler that deliberately takes no `Locale` argument — the point of the
+    // feature — never runs an extractor later to correct it.
+    custom_layers
+        .into_iter()
+        .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>())
+}
+
+/// The same partition with the `i18n` feature off: nothing is session-scoped,
+/// so every custom layer drains.
+#[cfg(not(feature = "i18n"))]
+pub(crate) fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    (Vec::new(), custom_layers)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
@@ -5767,34 +5817,15 @@ pub fn try_build_router_with_static_inner(
     );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
-    // #1384: the ambient-locale layer must not drain out with the rest. It runs
-    // `Locale::from_request_parts`, whose session step reads the signed session,
-    // and everything drained here is applied outside the static-first middleware
-    // — that is, outside `SessionLayer`. Out there the session extension does not
-    // exist yet, so a locale persisted by the documented `set_locale_in_session`
-    // switcher would be invisible and content would resolve from
-    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
-    // A handler that deliberately takes no `Locale` argument — the point of the
-    // feature — never runs an extractor later to correct it.
-    //
-    // Putting it back on the inner router's context lands it in
-    // `apply_middleware`'s merged tuple, which is inside `session_layer` on both
-    // this path and the fully-dynamic one. The bundle `Extension` still drains
-    // out and stays outer, so the layer can read it.
-    //
-    // Shadowed rather than mutated in place: with the `i18n` feature off this
-    // block vanishes, and a `let mut` the remaining code never reassigns fails
-    // `-D warnings` in every non-unified build (`-p autumn-web`, the sqlite
-    // lane). A `--workspace` build hides that, because another member turns
-    // `i18n` on and Cargo unifies it.
-    #[cfg(feature = "i18n")]
-    let custom_layers = {
-        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
-            .into_iter()
-            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
-        ctx.custom_layers = session_scoped;
-        outside
-    };
+    // The ambient-locale layer stays on the inner router's context, which
+    // lands it in `apply_middleware`'s merged tuple — inside `session_layer`
+    // on both this path and the fully-dynamic one. The bundle `Extension`
+    // still drains out and stays outer, so the layer can read it. Shared with
+    // the static build (`App::run_build_mode`), which renders through the
+    // same pre-layer composition — see
+    // [`partition_custom_layers_for_static_render`].
+    let (session_scoped, custom_layers) = partition_custom_layers_for_static_render(custom_layers);
+    ctx.custom_layers = session_scoped;
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of
@@ -14045,6 +14076,49 @@ mod trusted_host_tests {
             type_name: "redirect_gate",
             layer: tower::util::BoxCloneSyncServiceLayer::new(gate),
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // #2405: the static render path drains user layers (#2405)
+    // ----------------------------------------------------------------------
+
+    /// A plain user layer must drain out of the static render entirely: the
+    /// build and ISR regeneration both render through the pre-layer router,
+    /// so the recorded Content-Type and the body on disk are the handler's
+    /// own.
+    #[test]
+    fn static_render_partition_drains_user_layers() {
+        let (kept, drained) =
+            partition_custom_layers_for_static_render(vec![redirect_gate_registration()]);
+        assert!(
+            kept.is_empty(),
+            "user layers must not survive the static-render drain"
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].type_name, "redirect_gate");
+    }
+
+    /// The ambient-locale layer reads the session, so it must stay on the
+    /// inner (pre-layer) router even though every other custom layer drains
+    /// (#1384). Only its `TypeId` matters to the partition.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_render_partition_keeps_the_ambient_locale_layer() {
+        let ambient = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+            type_name: "ambient_locale",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let (kept, drained) =
+            partition_custom_layers_for_static_render(vec![redirect_gate_registration(), ambient]);
+        assert_eq!(kept.len(), 1, "the ambient-locale layer must stay");
+        assert_eq!(kept[0].type_name, "ambient_locale");
+        assert_eq!(drained.len(), 1, "the user layer must drain");
+        assert_eq!(drained[0].type_name, "redirect_gate");
     }
 
     /// Create a minimal dist dir with `manifest.json` mapping `/` → an

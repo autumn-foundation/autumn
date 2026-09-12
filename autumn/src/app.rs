@@ -6060,6 +6060,22 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
+        // #2405: render through the pre-layer router — the same layer
+        // composition the ISR regeneration path uses
+        // (`partition_custom_layers_for_static_render`, shared with the SSG
+        // serve path) — so the recorded Content-Type and the body on disk are
+        // the handler's own, not the app layer stack's post-layer output. The
+        // serve path applies the drained layers to the cached response at
+        // request time, outside the static-first middleware, so recording the
+        // post-layer output both double-applies the layers (once at
+        // generation, once per request) and — because ISR's type guard sees
+        // the pre-layer response — refuses every regeneration for an app with
+        // a Content-Type-rewriting layer, freezing the route until the next
+        // build. The drained set is dropped: this process exits after the
+        // render; serving is a separate invocation.
+        let (custom_layers, _drained) =
+            crate::router::partition_custom_layers_for_static_render(custom_layers);
+
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
         // routes the server path serves.
@@ -6077,13 +6093,18 @@ impl AppBuilder {
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
-        // Build the full router (same as production). Use the inner builder
+        // Build the router for static rendering. Use the inner builder
         // so the custom session store installed via with_session_store(...)
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
-        // Custom Tower layers registered via .layer(...) are likewise
-        // applied so static output matches the production response pipeline.
+        // Custom Tower layers registered via .layer(...) are deliberately
+        // NOT applied here (#2405): they were drained above, so the render
+        // sees the handler's own response — the same pre-layer composition
+        // ISR regeneration uses. The serve path applies those layers to the
+        // cached response at request time, which is what makes the recorded
+        // Content-Type and the body on disk mean "what the handler declared"
+        // rather than "what the layer stack happened to produce".
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
         #[cfg(feature = "storage")]
