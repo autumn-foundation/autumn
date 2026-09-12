@@ -114,9 +114,8 @@ independently.)
 ## 🐛 Bug filed
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
-silently drops a same-slug sibling page whenever neither it nor its parent
-carries a `path` and the parent is created later in the same run (data
-loss, repro 4/4).**
+silently drops a same-slug sibling page whenever it lacks a `path` and is
+processed before its parent (data loss, repro 5/5).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -139,16 +138,24 @@ version, hits the identical fallback and the identical bug — confirmed by
 a fourth reproduction below, a Codex catch on this PR.
 
 When two same-slug pages under different parents are listed in the file
-before their respective parents, and neither carries a `path`, the
-import loop misidentifies the *second* one as "somebody else's row that
-merely shares the slug" against the *first* one it just created — and
-drops it permanently, with the summary screen reporting an unremarkable
-"N imported, M already present" and no orphan count. Reproduced 4/4
-across independent fresh databases: two on version 2 (one a
-hand-reordered full export, one a minimized 4-post file), one on version
-3, and one — added after the Codex catch above — a version-5-labeled file
-with the same 4 posts, `path` simply omitted on all of them. All four are
-deterministic given the file's post ordering, not a race.
+before their respective parents, and neither of the two colliding pages
+itself carries a `path`, the import loop misidentifies the *second* one as
+"somebody else's row that merely shares the slug" against the *first* one
+it just created — and drops it permanently, with the summary screen
+reporting an unremarkable "N imported, M already present" and no orphan
+count. The *parents'* own `path` is not part of the condition: a top-level
+parent's path (`"about"`, `"company"`) never contains `/` either way, so it
+sorts at the same depth-0 tier as a pathless child whether the parent
+carries `path` or not — a Codex catch on this PR, confirmed with a fifth
+live reproduction rather than by reasoning about the sort key alone: the
+identical 4-post file, `version: 5`, with the two parent posts given real
+`path` values (`"a"`, `"b"`) and only the two colliding children left
+pathless, still produced `"3 imported, 1 already present"` and a 404 on
+`/b/team`. Reproduced 5/5 across independent fresh databases: two on
+version 2 (one a hand-reordered full export, one a minimized 4-post file),
+one on version 3, one a version-5-labeled file with `path` omitted on all
+four posts, and this fifth with `path` present on the parents only. All
+five are deterministic given the file's post ordering, not a race.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
