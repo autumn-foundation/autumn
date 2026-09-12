@@ -11142,7 +11142,13 @@ fn edge_manifest_is_virtual_workspace_root(root: &std::path::Path) -> bool {
     let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
         return false;
     };
-    content.contains("[workspace]") && !content.contains("[package]")
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return false;
+    };
+    // Parsed keys, not a text search: a comment or string mentioning
+    // "[package]" (e.g. "# each member has a [package] table") must not
+    // read as a real one (Codex review on #2739).
+    table.contains_key("workspace") && !table.contains_key("package")
 }
 
 /// The shared `Warn` result for both edge checks when doctor runs from a
@@ -11503,6 +11509,19 @@ mod tests {
     fn virtual_workspace_root_false_when_manifest_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!edge_manifest_is_virtual_workspace_root(dir.path()));
+    }
+
+    /// A comment mentioning `[package]` must not read as a real one — parsed
+    /// keys, not a text search (Codex review on #2739, P2).
+    #[test]
+    fn virtual_workspace_root_true_despite_a_comment_mentioning_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "# each member has a [package] table\n[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        assert!(edge_manifest_is_virtual_workspace_root(dir.path()));
     }
 
     // ── Edge-capsule bin resolution (issue #2244) ────────────────────────────

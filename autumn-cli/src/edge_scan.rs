@@ -52,18 +52,21 @@
 //!   scan does not stitch file boundaries into one module chain.
 //! - `#[cfg(...)]` is evaluated, but only a safe, narrow slice of it. The scan
 //!   reads the crate's own `Cargo.toml`, follows `[features] default = [...]`
-//!   through the feature graph in `[features]`, and builds the set of feature
-//!   names a default build turns on. It then checks each `#[cfg(...)]` on the
-//!   same function as `#[edge]` (real Rust requires every one of them to hold,
-//!   so several such attributes combine the same way). A predicate built only
-//!   from `feature = "x"` leaves combined with
-//!   `not(...)`, `all(...)`, and `any(...)` is evaluated against that set, and
-//!   the function is excluded only when such a predicate is definitely false.
-//!   Any other predicate — `target_os`, `debug_assertions`, a feature implied
-//!   by an optional dependency, or one this scan cannot parse — is treated as
-//!   true, so the function stays in the scan. The scan does not know about
-//!   `--features` / `--no-default-features` build flags or workspace feature
-//!   unification.
+//!   plus any features the caller explicitly requested (`autumn build
+//!   --features x` — see [`resolve_edge_scan_with_features`]) through the
+//!   feature graph in `[features]`, and builds the set of feature names this
+//!   build turns on. It then checks each `#[cfg(...)]` on the same function
+//!   as `#[edge]` (real Rust requires every one of them to hold, so several
+//!   such attributes combine the same way). A predicate built only from
+//!   `feature = "x"` leaves combined with `not(...)`, `all(...)`, and
+//!   `any(...)` is evaluated against that set, and the function is excluded
+//!   only when such a predicate is definitely false. Any other predicate —
+//!   `target_os`, `debug_assertions`, a feature implied by an optional
+//!   dependency, or one this scan cannot parse — is treated as true, so the
+//!   function stays in the scan. `autumn build` has no `--no-default-features`
+//!   flag, so that case does not arise; workspace feature unification (a
+//!   sibling crate elsewhere in the build turning on a feature this scan does
+//!   not know about) is not considered.
 //! - A file that does not parse is skipped silently (it will fail the build with
 //!   a far better message than this scanner could produce).
 //!
@@ -199,10 +202,10 @@ fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
 }
 
 /// Scan a set of in-memory `(file, source)` pairs, given the set of feature
-/// names a default build of the project turns on — see
-/// [`default_features_from_manifest`] — used to evaluate `#[cfg(...)]` on
-/// `#[edge]`-marked functions. The pure core of the scan: [`resolve_edge_scan`]
-/// is the thin filesystem wrapper around it.
+/// names enabled for this build — see [`enabled_features_from_manifest`] —
+/// used to evaluate `#[cfg(...)]` on `#[edge]`-marked functions. The pure
+/// core of the scan: [`resolve_edge_scan_with_features`] is the thin
+/// filesystem wrapper around it.
 fn scan_sources_with_features(
     sources: &[(&str, &str)],
     default_features: &BTreeSet<String>,
@@ -231,17 +234,37 @@ pub fn scan_sources(sources: &[(&str, &str)]) -> EdgeScan {
     scan_sources_with_features(sources, &BTreeSet::new())
 }
 
+/// [`resolve_edge_scan`] with no explicitly-requested features — the shape
+/// every caller used before `autumn build --features x` needed to widen the
+/// considered set beyond the manifest's own defaults.
+#[must_use]
+pub fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
+    resolve_edge_scan_with_features(project_root, &[])
+}
+
 /// Walk `project_root/src` and scan every `.rs` file below it. Paths are
 /// recorded relative to `project_root` (`src/routes/home.rs`). A missing `src/`
 /// yields an empty scan — a project without sources simply has no edge routes.
+///
+/// `requested_features` are feature names asked for on the command line
+/// (`autumn build --features x`, forwarded here from `build.rs`), on top of
+/// the manifest's own `[features] default = [...]`. Without them, a route
+/// gated on a non-default feature the caller explicitly requested would look
+/// cfg'd-out to this scan even though the real build the caller is about to
+/// run turns it on — exactly the dangerous direction (a route that will
+/// really be served, silently missing from the scan) this module's `#[cfg]`
+/// evaluation is designed to never risk.
 #[must_use]
-pub fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
+pub fn resolve_edge_scan_with_features(
+    project_root: &Path,
+    requested_features: &[&str],
+) -> EdgeScan {
     // A missing or unparseable Cargo.toml yields no default features, which is
     // the safe direction: every `#[cfg(feature = "...")]` then stays
     // unresolved, and the function it gates stays in the scan.
     let default_features = std::fs::read_to_string(project_root.join("Cargo.toml"))
         .ok()
-        .map(|manifest| default_features_from_manifest(&manifest))
+        .map(|manifest| enabled_features_from_manifest(&manifest, requested_features))
         .unwrap_or_default();
 
     let mut files = Vec::new();
@@ -273,35 +296,47 @@ pub fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
     scan_sources_with_features(&borrowed, &default_features)
 }
 
-/// Read a crate's `Cargo.toml` and follow `[features] default = [...]`
-/// through the feature graph in `[features]`, to build the full set of
-/// feature names a default build turns on.
+/// Read a crate's `Cargo.toml`, seed the feature queue with `[features]
+/// default = [...]` plus `requested` (features asked for on the command
+/// line), and follow both through the feature graph in `[features]` to build
+/// the full set of feature names actually enabled.
 ///
 /// Only follows features the crate declares in its own `[features]` table. A
 /// dependency-feature reference (`pkg/feat`, `pkg?/feat`, `dep:pkg`) is not a
 /// feature name of this crate, so it stops there rather than being treated as
 /// one — `cfg(feature = "...")` never names a dependency's feature anyway.
-/// Returns an empty set on any parse failure or a missing `[features]` /
-/// `default` table — the safe direction, since an empty set resolves no
-/// `feature = "..."` predicate to true.
+/// A requested name is still recorded as enabled even without a `[features]`
+/// table to expand it through — an app can request a feature that exists
+/// only to gate `#[cfg(feature = "...")]` code, with no `[features]` entry of
+/// its own. Returns just `requested` (or nothing) on a parse failure — the
+/// safe direction, since an unresolvable `feature = "..."` predicate stays
+/// conservative regardless.
 #[must_use]
-fn default_features_from_manifest(manifest: &str) -> BTreeSet<String> {
+fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
-    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
-        return enabled;
-    };
-    let Some(features) = table.get("features").and_then(toml::Value::as_table) else {
-        return enabled;
-    };
-    let Some(default) = features.get("default").and_then(toml::Value::as_array) else {
-        return enabled;
-    };
+    let features_table = toml::from_str::<toml::Table>(manifest)
+        .ok()
+        .and_then(|table| {
+            table
+                .get("features")
+                .and_then(toml::Value::as_table)
+                .cloned()
+        });
 
-    let mut queue: Vec<String> = default
-        .iter()
-        .filter_map(toml::Value::as_str)
-        .map(str::to_owned)
-        .collect();
+    let mut queue: Vec<String> = features_table
+        .as_ref()
+        .and_then(|features| features.get("default"))
+        .and_then(toml::Value::as_array)
+        .map(|default| {
+            default
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    queue.extend(requested.iter().map(|name| (*name).to_owned()));
+
     while let Some(name) = queue.pop() {
         if name.contains('/') || name.starts_with("dep:") {
             continue;
@@ -309,7 +344,11 @@ fn default_features_from_manifest(manifest: &str) -> BTreeSet<String> {
         if !enabled.insert(name.clone()) {
             continue; // Already expanded — skip, so a feature cycle can't loop forever.
         }
-        if let Some(sub) = features.get(&name).and_then(toml::Value::as_array) {
+        if let Some(sub) = features_table
+            .as_ref()
+            .and_then(|features| features.get(&name))
+            .and_then(toml::Value::as_array)
+        {
             queue.extend(
                 sub.iter()
                     .filter_map(toml::Value::as_str)
@@ -893,16 +932,28 @@ mod tests {
             a = ["b"]
             b = []
         "#;
-        let enabled = default_features_from_manifest(manifest);
+        let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("a"));
         assert!(enabled.contains("b"));
+    }
+
+    #[test]
+    fn enabled_features_from_manifest_includes_a_requested_feature() {
+        let manifest = r"
+            [features]
+            default = []
+            other = []
+        ";
+        let enabled = enabled_features_from_manifest(manifest, &["premium"]);
+        assert!(enabled.contains("premium"));
+        assert!(!enabled.contains("other"));
     }
 
     #[test]
     fn cfg_transitive_default_feature_is_included() {
         let mut features = BTreeSet::new();
         // Mirrors `default = ["a"]`, `a = ["b"]` already expanded by
-        // `default_features_from_manifest`.
+        // `enabled_features_from_manifest`.
         features.insert("a".to_owned());
         features.insert("b".to_owned());
         let scan = scan_sources_with_features(
@@ -953,6 +1004,45 @@ mod tests {
 
         let scan = resolve_edge_scan(dir.path());
         assert_eq!(scan.names(), vec!["shown"]);
+    }
+
+    /// `autumn build --features premium` must not lose a route gated on
+    /// `premium` just because `premium` is not in the manifest's own
+    /// `default = [...]` — the real build turns it on, so the scan must too
+    /// (Codex review on #2739, P1).
+    #[test]
+    fn resolve_edge_scan_with_features_honors_explicitly_requested_features() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [features]
+            default = []
+            premium = []
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            r#"
+            #[cfg(feature = "premium")]
+            #[edge]
+            fn premium_only() {}
+            "#,
+        )
+        .unwrap();
+
+        // Without the requested feature, the route looks cfg'd-out.
+        assert!(resolve_edge_scan(dir.path()).is_empty());
+        // With it requested, exactly as `--features premium` would forward,
+        // the route must be found.
+        let scan = resolve_edge_scan_with_features(dir.path(), &["premium"]);
+        assert_eq!(scan.names(), vec!["premium_only"]);
     }
 
     // --- Item 2: qualified registration matching ---

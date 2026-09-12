@@ -388,7 +388,18 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
 /// whose sources live elsewhere, and a selector-free CWD *without* `src/` is
 /// a virtual workspace root, where only `find_binary`'s resolution matches
 /// the package every later build step operates on.
-fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&str>) -> EdgeScan {
+///
+/// `features` is the same `--features` value the native and capsule builds
+/// receive (see `build_cargo_command`/`build_edge_cargo_command`); the scan
+/// needs it too, or a route gated on a feature this invocation explicitly
+/// requests — but that is not in the manifest's own `default = [...]` —
+/// would look cfg'd-out here even though the build about to run turns it on.
+fn resolve_project_edge_scan(
+    debug: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: Option<&str>,
+) -> EdgeScan {
     let cwd = std::env::current_dir().expect("current dir");
     let root = if package.is_none() && bin.is_none() && cwd.join("src").is_dir() {
         cwd
@@ -397,7 +408,15 @@ fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&st
             .1
             .unwrap_or_else(|| cwd.clone())
     };
-    crate::edge_scan::resolve_edge_scan(&root)
+    let requested: Vec<&str> = features
+        .map(|value| {
+            value
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::edge_scan::resolve_edge_scan_with_features(&root, &requested)
 }
 
 /// Run a cargo command, exiting the process on failure.
@@ -536,7 +555,7 @@ pub fn run(
     // edge routes) is reported in milliseconds instead of after a full native
     // build. The capsule itself is compiled much later — after the native build
     // and fingerprinting — by `run_edge_capsule_build`.
-    let edge_scan = resolve_project_edge_scan(debug, package, bin);
+    let edge_scan = resolve_project_edge_scan(debug, package, bin, features);
     let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);

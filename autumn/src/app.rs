@@ -171,13 +171,13 @@ pub fn app() -> AppBuilder {
     // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
     // bug — hits that same 500 at the origin. Without this layer the internal
     // header would leak straight to a real HTTP client. See
-    // `strip_edge_fallthrough_sentinel` below.
+    // `StripEdgeFallthroughSentinelLayer` below.
     #[cfg(feature = "edge")]
-    let builder = builder.layer(axum::middleware::from_fn(strip_edge_fallthrough_sentinel));
+    let builder = builder.layer(StripEdgeFallthroughSentinelLayer);
     builder
 }
 
-/// Remove [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
+/// Removes [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
 ///
 /// `autumn-edge` is substrate-agnostic on purpose: `extract.rs` cannot tell
 /// whether it is running at the edge or at the origin, so it always sets the
@@ -185,16 +185,67 @@ pub fn app() -> AppBuilder {
 /// the origin, so only the origin strips the header before a real client ever
 /// sees it. The response body's actionable message is left untouched — only
 /// the internal signaling header is removed.
+///
+/// A bespoke `tower::Layer`, not `axum::middleware::from_fn`: this type's
+/// `TypeId` is what `router::is_idempotency_transparent_app_layer` matches
+/// on to recognize this one framework-owned registration without forcing
+/// fail-closed idempotency on every app built with the `edge` feature. A
+/// name (even a function's) is not unique enough for that — a user's own
+/// `from_fn` middleware could share it by coincidence; a crate-private type
+/// cannot.
 #[cfg(feature = "edge")]
-async fn strip_edge_fallthrough_sentinel(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .remove(autumn_edge::FALLTHROUGH_SENTINEL);
-    response
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StripEdgeFallthroughSentinelLayer;
+
+#[cfg(feature = "edge")]
+impl<S> tower::Layer<S> for StripEdgeFallthroughSentinelLayer {
+    type Service = StripEdgeFallthroughSentinelService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StripEdgeFallthroughSentinelService { inner }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by
+/// [`StripEdgeFallthroughSentinelLayer`].
+#[cfg(feature = "edge")]
+#[derive(Clone, Debug)]
+pub(crate) struct StripEdgeFallthroughSentinelService<S> {
+    inner: S,
+}
+
+#[cfg(feature = "edge")]
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>>
+    for StripEdgeFallthroughSentinelService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let response = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = response.await?;
+            response
+                .headers_mut()
+                .remove(autumn_edge::FALLTHROUGH_SENTINEL);
+            Ok(response)
+        })
+    }
 }
 
 /// Count the raw routers omitted from `autumn routes` output because their
@@ -16848,14 +16899,53 @@ mod tests {
     #[test]
     fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
         let registration = &app().custom_layers[0];
-        assert!(
-            registration
-                .type_name
-                .contains("::strip_edge_fallthrough_sentinel,"),
-            "the real registration's type_name no longer matches what \
-             router::is_idempotency_transparent_app_layer looks for: {}",
-            registration.type_name
+        assert_eq!(
+            registration.type_id,
+            std::any::TypeId::of::<StripEdgeFallthroughSentinelLayer>(),
+            "the real registration's type_id no longer matches what \
+             router::is_idempotency_transparent_app_layer looks for"
         );
+    }
+
+    /// The header-stripping behavior itself, independent of the router-level
+    /// idempotency classification test above.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn the_sentinel_strip_service_removes_the_header_and_keeps_the_body() {
+        use axum::response::IntoResponse as _;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let inner = tower::service_fn(|_req: axum::extract::Request| async move {
+            Ok::<_, std::convert::Infallible>(
+                (
+                    [(autumn_edge::FALLTHROUGH_SENTINEL, "missing_capability")],
+                    "actionable message",
+                )
+                    .into_response(),
+            )
+        });
+        let mut service = StripEdgeFallthroughSentinelLayer.layer(inner);
+        let request = axum::extract::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response: axum::response::Response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("infallible");
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, "actionable message".as_bytes());
     }
 
     #[cfg(feature = "i18n")]
