@@ -78,7 +78,7 @@ machine can apply, so a reader knows before starting whether the upgrade is a
 command or an afternoon (issue #1629):
 
 ```markdown
-**Automation:** `auto` — `autumn upgrade` rewrites every call site; codemod
+**Automation:** `review` — `autumn upgrade` rewrites every call site; codemod
 `0.6.0-repository-with-pool-untracked`.
 ```
 
