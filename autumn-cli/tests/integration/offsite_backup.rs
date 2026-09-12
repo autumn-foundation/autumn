@@ -191,9 +191,9 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 }
 
 /// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub.
-/// Docker Hub no longer serves that repository at all (MinIO Inc. dropped it),
-/// so every pull now fails with "pull access denied ... repository does not
-/// exist". Point at MinIO's other public registry, `quay.io/minio/minio`,
+/// Docker Hub no longer serves that repository at all (`MinIO` Inc. dropped
+/// it), so every pull now fails with "pull access denied ... repository does
+/// not exist". Point at `MinIO`'s other public registry, `quay.io/minio/minio`,
 /// instead. This tag choice is independent of `testcontainers-modules`, so it
 /// stays pullable even if a future crate bump changes the crate's own default.
 fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
