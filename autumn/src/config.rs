@@ -428,6 +428,28 @@ pub fn normalize_profile_name(profile: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+/// The single source of truth for "is this profile dev-like?", used by every
+/// dev-only surface (the request inspector, the HTML dev error overlay, …).
+///
+/// Fails closed: an unset profile (`None`) is NOT dev. A [`ConfigLoader`]
+/// other than the default [`TomlEnvConfigLoader`] is free to build an
+/// [`AutumnConfig`] however it wants (see `docs/guide/custom-subsystems.md`),
+/// and nothing requires it to populate `profile` — `resolve_profile` (which
+/// always resolves to a concrete profile, defaulting to `"dev"`) only runs
+/// inside `TomlEnvConfigLoader`. A dev-only surface must never treat that
+/// absence as an invitation to guess `cfg!(debug_assertions)` instead: a
+/// production deployment running a debug build (forgetting `--release`, or a
+/// misconfigured Docker multi-stage build, is an easy operational mistake)
+/// would otherwise get the dev error overlay — internal error messages,
+/// headers, cookies, and SQL query text — on every 5xx, even though the app
+/// author never opted into `profile = "dev"`.
+///
+/// [`ConfigLoader`]: crate::config::ConfigLoader
+#[must_use]
+pub(crate) fn profile_is_dev(profile: Option<&str>) -> bool {
+    matches!(profile, Some("dev" | "development"))
+}
+
 /// Profile names to check for inline/file overrides.
 ///
 /// For canonical profiles, include legacy aliases for compatibility so
@@ -7273,9 +7295,30 @@ pub struct TlsConfig {
     /// code is gated behind the off-by-default `acme` feature.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+
+    /// Mutual-TLS client-certificate verification (issue #1640). When present
+    /// with a mode other than [`ClientAuthMode::Off`], the listener requests —
+    /// and verifies — a client certificate against the configured CA bundle.
+    /// Absent (the default), the handshake is byte-for-byte #1603's
+    /// server-only TLS. The serving code is gated behind the same
+    /// off-by-default `tls` feature as the listener.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuthConfig>,
 }
 
 impl TlsConfig {
+    /// Whether the listener should request a client certificate — i.e. a
+    /// `[server.tls.client_auth]` section is present with a mode other than
+    /// `off`.
+    ///
+    /// The bind path keys the whole mTLS wiring on this, so an absent (or
+    /// `off`) section takes the identical #1603 code path.
+    #[must_use]
+    pub fn client_auth_active(&self) -> bool {
+        self.client_auth
+            .as_ref()
+            .is_some_and(|c| c.mode.requests_certificate())
+    }
     /// An empty `TlsConfig` used only as the seed for env-var overrides of a
     /// section that was absent from TOML. Both paths are unset (which fails
     /// fast at startup if neither a static cert nor ACME is configured), and the
@@ -7287,6 +7330,7 @@ impl TlsConfig {
             reload_interval_secs: default_tls_reload_interval_secs(),
             handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             acme: None,
+            client_auth: None,
         }
     }
 
@@ -7338,6 +7382,186 @@ impl TlsConfig {
 
         if let Some(acme) = &self.acme {
             acme.validate()?;
+        }
+
+        if let Some(client_auth) = &self.client_auth {
+            client_auth.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// How hard the listener asks for a client certificate (issue #1640).
+///
+/// Per listener; a route can additionally demand one via
+/// [`ClientAuthConfig::required_paths`] or the `RequireClientCert` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ClientAuthMode {
+    /// No certificate is requested. The handshake is #1603's server-only TLS.
+    #[default]
+    Off,
+    /// A certificate is requested but not demanded. A client that presents one
+    /// must pass verification; a client that presents none still connects, and
+    /// routes that require mTLS reject it.
+    Optional,
+    /// A valid certificate is demanded. The handshake fails without one.
+    Required,
+}
+
+impl ClientAuthMode {
+    /// Whether the listener asks the client for a certificate at all.
+    #[must_use]
+    pub const fn requests_certificate(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether a missing certificate fails the handshake.
+    #[must_use]
+    pub const fn mandates_certificate(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// The lowercase tag used in config, logs, and the posture manifest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// Mutual-TLS client-certificate verification (issue #1640). Present under
+/// `[server.tls.client_auth]`.
+///
+/// The trust store is a PEM bundle of one or more client CAs. It hot-reloads on
+/// the same poll the server certificate uses, so a CA rotation — ship old+new in
+/// one bundle, later drop old — needs no restart and drops no connection.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.client_auth]
+/// mode = "required"                                  # off (default) | optional | required
+/// ca_bundle_path = "/etc/autumn/tls/client-ca.pem"   # one or more PEM CAs
+/// crl_path = "/etc/autumn/tls/client-ca.crl.pem"     # optional; hot-reloads too
+/// required_paths = ["/internal/"]                    # routes that demand a certificate
+/// reload_interval_secs = 60
+/// ```
+///
+/// Unlike `cert_path`/`key_path`, these keys have no `AUTUMN_SERVER__TLS__*`
+/// env-var override — matching the sibling `[server.tls.acme]` sub-table.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientAuthConfig {
+    /// Listener-wide requirement level. Default: `off`.
+    #[serde(default)]
+    pub mode: ClientAuthMode,
+
+    /// Path to the PEM bundle of trusted client CAs. Required whenever
+    /// [`mode`](Self::mode) is not `off`. A bundle that is missing, unparseable,
+    /// or contains no CERTIFICATE block fails startup.
+    #[serde(default)]
+    pub ca_bundle_path: Option<PathBuf>,
+
+    /// Optional path to a PEM certificate revocation list issued by a CA in the
+    /// bundle. Revocation is checked for the presented client certificate only;
+    /// see the deployment guide for the recommended short-lived-certificate
+    /// posture. OCSP is not supported.
+    #[serde(default)]
+    pub crl_path: Option<PathBuf>,
+
+    /// Rooted path prefixes whose routes demand a verified client certificate,
+    /// matched against the normalized request path exactly as CSRF exemptions
+    /// are. A request reaching one of these over a connection with no verified
+    /// certificate is rejected with `403` and the standard JSON error envelope.
+    #[serde(default)]
+    pub required_paths: Vec<String>,
+
+    /// How often, in seconds, to poll the CA bundle and CRL modification times
+    /// for a rotation. Default: `60`. A value of `0` is clamped to `1` second.
+    #[serde(default = "default_tls_reload_interval_secs")]
+    pub reload_interval_secs: u64,
+}
+
+impl ClientAuthConfig {
+    /// Validate the `[server.tls.client_auth]` wiring before the listener binds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode.requests_certificate() {
+            match &self.ca_bundle_path {
+                None => {
+                    return Err(format!(
+                        "[server.tls.client_auth] mode = \"{}\" needs ca_bundle_path — the PEM \
+                         bundle of client CAs to verify against",
+                        self.mode.as_str()
+                    ));
+                }
+                Some(path) if path.to_str().is_none_or(|p| p.trim().is_empty()) => {
+                    return Err(
+                        "[server.tls.client_auth] ca_bundle_path is empty; set it to the PEM \
+                         bundle of client CAs, or remove the section"
+                            .to_owned(),
+                    );
+                }
+                Some(_) => {}
+            }
+        } else if !self.required_paths.is_empty() {
+            return Err(
+                "[server.tls.client_auth] lists required_paths but mode = \"off\", so no \
+                 certificate is ever requested and those routes would reject every request; \
+                 set mode = \"optional\" or \"required\""
+                    .to_owned(),
+            );
+        }
+
+        if self
+            .crl_path
+            .as_ref()
+            .is_some_and(|p| p.to_str().is_none_or(|s| s.trim().is_empty()))
+        {
+            return Err(
+                "[server.tls.client_auth] crl_path is empty; set it to a PEM revocation list, \
+                 or remove the key"
+                    .to_owned(),
+            );
+        }
+
+        for path in &self.required_paths {
+            if !path.starts_with('/') {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` must be a rooted \
+                     path prefix starting with `/`"
+                ));
+            }
+            // Requests are normalized before matching (`security::path::clean_path`)
+            // but the configured prefix is not, so a noncanonical prefix silently
+            // matches less than it appears to: `/internal//` reduces to
+            // `/internal/` after the matcher strips ONE trailing slash, and
+            // `/internal/keys` then fails to match it. A prefix that protects
+            // less than the operator wrote is the failure this whole section
+            // exists to prevent, so refuse it rather than normalize it silently.
+            if path.contains("//") {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains an empty \
+                     path segment; write it as a canonical prefix like `/internal/`"
+                ));
+            }
+            if path
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
+            {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains a dot \
+                     segment; write the resolved prefix instead"
+                ));
+            }
         }
 
         Ok(())
@@ -16151,6 +16375,194 @@ path = "/healthz"
         assert_eq!(config.deploy.expect("deploy configured").host, None);
     }
 
+    // ── server.tls.client_auth (#1640) ────────────────────────────
+
+    #[test]
+    fn client_auth_absent_is_none_and_off() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            "#,
+        )
+        .expect("server-only TLS should parse");
+        let tls = config.server.tls.expect("tls configured");
+        // Absent section => no client auth at all, so #1603's path is unchanged.
+        assert!(tls.client_auth.is_none());
+        assert!(!tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_parses_modes_and_paths() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            mode = "required"
+            ca_bundle_path = "/etc/autumn/tls/client-ca.pem"
+            crl_path = "/etc/autumn/tls/client-ca.crl.pem"
+            required_paths = ["/internal/"]
+            "#,
+        )
+        .expect("[server.tls.client_auth] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let ca = tls.client_auth.as_ref().expect("client_auth configured");
+        assert_eq!(ca.mode, ClientAuthMode::Required);
+        assert_eq!(
+            ca.ca_bundle_path,
+            Some(PathBuf::from("/etc/autumn/tls/client-ca.pem"))
+        );
+        assert_eq!(
+            ca.crl_path,
+            Some(PathBuf::from("/etc/autumn/tls/client-ca.crl.pem"))
+        );
+        assert_eq!(ca.required_paths, vec!["/internal/".to_owned()]);
+        assert_eq!(ca.reload_interval_secs, 60);
+        assert!(tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_mode_defaults_to_off() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            "#,
+        )
+        .expect("an empty [server.tls.client_auth] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let ca = tls.client_auth.as_ref().expect("client_auth present");
+        assert_eq!(ca.mode, ClientAuthMode::Off);
+        // Present but off is still no handshake change.
+        assert!(!tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_requires_a_ca_bundle_when_enabled() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            mode = "optional"
+            "#,
+        )
+        .expect("parse");
+        let err = config
+            .server
+            .tls
+            .expect("tls configured")
+            .validate()
+            .expect_err("client auth without a trust store is invalid");
+        assert!(err.contains("ca_bundle_path"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_blank_paths() {
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
+        let err = ca
+            .validate()
+            .expect_err("a blank ca_bundle_path is invalid");
+        assert!(err.contains("ca_bundle_path"), "unhelpful message: {err}");
+
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            crl_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
+        let err = ca.validate().expect_err("a blank crl_path is invalid");
+        assert!(err.contains("crl_path"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_required_paths_when_mode_is_off() {
+        // Routes declaring an mTLS requirement on a listener that never
+        // requests a certificate would reject every request forever — that is a
+        // misconfiguration, not a posture.
+        let ca = ClientAuthConfig {
+            required_paths: vec!["/internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
+        let err = ca
+            .validate()
+            .expect_err("required_paths with mode = off is invalid");
+        assert!(err.contains("required_paths"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_relative_required_paths() {
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Optional,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            required_paths: vec!["internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
+        let err = ca.validate().expect_err("a required_path must be rooted");
+        assert!(err.contains("required_paths"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_noncanonical_required_paths() {
+        // Requests are normalized before matching but the configured prefix is
+        // not, so `/internal//` would protect strictly less than it looks like
+        // it does. A prefix that protects less than the operator wrote is the
+        // failure this section exists to prevent.
+        for bad in [
+            "/internal//",
+            "//internal",
+            "/internal/./keys",
+            "/internal/../admin",
+        ] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![bad.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            let Err(err) = ca.validate() else {
+                panic!("`{bad}` should be rejected");
+            };
+            assert!(err.contains("required_paths"), "unhelpful message: {err}");
+        }
+
+        // The canonical spellings stay accepted.
+        for good in ["/internal", "/internal/", "/internal/keys", "/"] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![good.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            assert!(ca.validate().is_ok(), "`{good}` should be accepted");
+        }
+    }
+
+    #[test]
+    fn client_auth_mode_requires_a_certificate_only_when_required() {
+        assert!(!ClientAuthMode::Off.requests_certificate());
+        assert!(ClientAuthMode::Optional.requests_certificate());
+        assert!(ClientAuthMode::Required.requests_certificate());
+        assert!(!ClientAuthMode::Optional.mandates_certificate());
+        assert!(ClientAuthMode::Required.mandates_certificate());
+    }
+
     // ── server.tls.acme (#1608) ───────────────────────────────────
 
     fn tls_static(cert: Option<&str>, key: Option<&str>) -> TlsConfig {
@@ -16160,6 +16572,7 @@ path = "/healthz"
             reload_interval_secs: default_tls_reload_interval_secs(),
             handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             acme: None,
+            client_auth: None,
         }
     }
 

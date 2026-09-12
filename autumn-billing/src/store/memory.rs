@@ -439,6 +439,25 @@ impl BillingStore for MemoryBillingStore {
         }))
     }
 
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        subscription_id: &'a str,
+    ) -> StoreFuture<'a, Vec<DunningAttempt>> {
+        ready(self.lock().map(|inner| {
+            let mut rows: Vec<DunningAttempt> = inner
+                .dunning
+                .values()
+                .filter(|d| {
+                    d.subscription_id.as_deref() == Some(subscription_id)
+                        && matches!(d.state, DunningState::Pending | DunningState::Running)
+                })
+                .cloned()
+                .collect();
+            rows.sort_by_key(|d| d.next_attempt_at);
+            rows
+        }))
+    }
+
     fn settle_dunning<'a>(
         &'a self,
         invoice_id: &'a str,

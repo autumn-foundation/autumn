@@ -1,0 +1,72 @@
+running 1 test
+test dunning_close_scan_profile ... 
+-- fixture: 20000 subscriptions, 4000 open dunning rows system-wide; canceling 148 subscriptions with an open row + 148 with none --
+
+=== pg_stat_statements: 296 subscription cancellations (by buffers) ===
+calls=296    buffers=3559       UPDATE "billing_subscriptions" SET "customer_id" = $1, "provider_subscription_id" = $2, "provider_price_id" = $3, "plan_id" = $4, "status" = $5, "quantity" = $6, "current_period_end" = $7, "cancel_at_period_end" = $8, "last_event_at" = $9, "created_at" = $10, "updated_at" = $11 WHERE ("billing_subscriptions"."id" = $12)
+calls=296    buffers=2928       UPDATE "billing_customers" SET "user_id" = $1, "provider" = $2, "provider_customer_id" = $3, "email" = $4, "created_at" = $5, "updated_at" = $6 WHERE ("billing_customers"."id" = $7)
+calls=148    buffers=1824       UPDATE "billing_dunning" SET "invoice_id" = $1, "customer_id" = $2, "subscription_id" = $3, "attempt" = $4, "next_attempt_at" = $5, "state" = $6, "updated_at" = $7 WHERE ((("billing_dunning"."invoice_id" = $8) AND ("billing_dunning"."state" = ANY($9))) AND ("billing_dunning"."attempt" = $10))
+calls=592    buffers=1776       SELECT "billing_subscriptions"."id", "billing_subscriptions"."customer_id", "billing_subscriptions"."provider_subscription_id", "billing_subscriptions"."provider_price_id", "billing_subscriptions"."plan_id", "billing_subscriptions"."status", "billing_subscriptions"."quantity", "billing_subscriptions"."current_period_end", "billing_subscriptions"."cancel_at_period_end", "billing_subscriptions"."last_event_at", "billing_subscriptions"."created_at", "billing_subscriptions"."updated_at" FROM "billing_subscriptions" WHERE ("billing_subscriptions"."provider_subscription_id" = $1) LIMIT $2
+calls=296    buffers=1212       UPDATE "billing_events" SET "applied_at" = $1 WHERE ("billing_events"."provider_event_id" = $2)
+calls=296    buffers=888        SELECT "billing_customers"."id", "billing_customers"."user_id", "billing_customers"."provider", "billing_customers"."provider_customer_id", "billing_customers"."email", "billing_customers"."created_at", "billing_customers"."updated_at" FROM "billing_customers" WHERE ("billing_customers"."provider_customer_id" = $1) LIMIT $2
+calls=296    buffers=809        SELECT "billing_dunning"."invoice_id", "billing_dunning"."customer_id", "billing_dunning"."subscription_id", "billing_dunning"."attempt", "billing_dunning"."next_attempt_at", "billing_dunning"."state", "billing_dunning"."updated_at" FROM "billing_dunning" WHERE (("billing_dunning"."subscription_id" = $1) AND ("billing_dunning"."state" = ANY($2))) ORDER BY "billing_dunning"."next_attempt_at" ASC, "billing_dunning"."invoice_id" ASC
+calls=296    buffers=623        INSERT INTO "billing_events" ("provider_event_id", "kind", "claimed_at", "applied_at") VALUES ($1, $2, $3, DEFAULT)
+calls=296    buffers=322        SELECT "billing_events"."applied_at" FROM "billing_events" WHERE ("billing_events"."provider_event_id" = $1) LIMIT $2
+calls=592    buffers=0          BEGIN
+
+=== pg_stat_statements: 296 subscription cancellations (by calls) ===
+calls=1923   buffers=0          SELECT $1
+calls=592    buffers=0          COMMIT
+calls=592    buffers=0          BEGIN
+calls=592    buffers=1776       SELECT "billing_subscriptions"."id", "billing_subscriptions"."customer_id", "billing_subscriptions"."provider_subscription_id", "billing_subscriptions"."provider_price_id", "billing_subscriptions"."plan_id", "billing_subscriptions"."status", "billing_subscriptions"."quantity", "billing_subscriptions"."current_period_end", "billing_subscriptions"."cancel_at_period_end", "billing_subscriptions"."last_event_at", "billing_subscriptions"."created_at", "billing_subscriptions"."updated_at" FROM "billing_subscriptions" WHERE ("billing_subscriptions"."provider_subscription_id" = $1) LIMIT $2
+calls=296    buffers=3559       UPDATE "billing_subscriptions" SET "customer_id" = $1, "provider_subscription_id" = $2, "provider_price_id" = $3, "plan_id" = $4, "status" = $5, "quantity" = $6, "current_period_end" = $7, "cancel_at_period_end" = $8, "last_event_at" = $9, "created_at" = $10, "updated_at" = $11 WHERE ("billing_subscriptions"."id" = $12)
+calls=296    buffers=2928       UPDATE "billing_customers" SET "user_id" = $1, "provider" = $2, "provider_customer_id" = $3, "email" = $4, "created_at" = $5, "updated_at" = $6 WHERE ("billing_customers"."id" = $7)
+calls=296    buffers=1212       UPDATE "billing_events" SET "applied_at" = $1 WHERE ("billing_events"."provider_event_id" = $2)
+calls=296    buffers=888        SELECT "billing_customers"."id", "billing_customers"."user_id", "billing_customers"."provider", "billing_customers"."provider_customer_id", "billing_customers"."email", "billing_customers"."created_at", "billing_customers"."updated_at" FROM "billing_customers" WHERE ("billing_customers"."provider_customer_id" = $1) LIMIT $2
+calls=296    buffers=623        INSERT INTO "billing_events" ("provider_event_id", "kind", "claimed_at", "applied_at") VALUES ($1, $2, $3, DEFAULT)
+calls=296    buffers=809        SELECT "billing_dunning"."invoice_id", "billing_dunning"."customer_id", "billing_dunning"."subscription_id", "billing_dunning"."attempt", "billing_dunning"."next_attempt_at", "billing_dunning"."state", "billing_dunning"."updated_at" FROM "billing_dunning" WHERE (("billing_dunning"."subscription_id" = $1) AND ("billing_dunning"."state" = ANY($2))) ORDER BY "billing_dunning"."next_attempt_at" ASC, "billing_dunning"."invoice_id" ASC
+
+-- target SELECT: calls=296 buffers=809 (workload total buffers=13941) --
+
+-- close_dunning_for's open-row scan: calls=296 buffers=809 (5.8% of 13941 total workload buffers) --
+
+=== settled state (invoice_id:state, sorted by invoice_id) ===
+inv_10125:canceled,inv_10260:canceled,inv_10395:canceled,inv_10530:canceled,inv_10665:canceled,inv_1080:canceled,inv_10800:canceled,inv_10935:canceled,inv_11070:canceled,inv_11205:canceled,inv_11340:canceled,inv_11475:canceled,inv_11610:canceled,inv_11745:canceled,inv_11880:canceled,inv_12015:canceled,inv_1215:canceled,inv_12150:canceled,inv_12285:canceled,inv_12420:canceled,inv_12555:canceled,inv_12690:canceled,inv_12825:canceled,inv_12960:canceled,inv_13095:canceled,inv_13230:canceled,inv_13365:canceled,inv_135:canceled,inv_1350:canceled,inv_13500:canceled,inv_13635:canceled,inv_13770:canceled,inv_13905:canceled,inv_14040:canceled,inv_14175:canceled,inv_14310:canceled,inv_14445:canceled,inv_14580:canceled,inv_14715:canceled,inv_1485:canceled,inv_14850:canceled,inv_14985:canceled,inv_15120:canceled,inv_15255:canceled,inv_15390:canceled,inv_15525:canceled,inv_15660:canceled,inv_15795:canceled,inv_15930:canceled,inv_16065:canceled,inv_1620:canceled,inv_16200:canceled,inv_16335:canceled,inv_16470:canceled,inv_16605:canceled,inv_16740:canceled,inv_16875:canceled,inv_17010:canceled,inv_17145:canceled,inv_17280:canceled,inv_17415:canceled,inv_1755:canceled,inv_17550:canceled,inv_17685:canceled,inv_17820:canceled,inv_17955:canceled,inv_18090:canceled,inv_18225:canceled,inv_18360:canceled,inv_18495:canceled,inv_18630:canceled,inv_18765:canceled,inv_1890:canceled,inv_18900:canceled,inv_19035:canceled,inv_19170:canceled,inv_19305:canceled,inv_19440:canceled,inv_19575:canceled,inv_19710:canceled,inv_19845:canceled,inv_19980:canceled,inv_2025:canceled,inv_2160:canceled,inv_2295:canceled,inv_2430:canceled,inv_2565:canceled,inv_270:canceled,inv_2700:canceled,inv_2835:canceled,inv_2970:canceled,inv_3105:canceled,inv_3240:canceled,inv_3375:canceled,inv_3510:canceled,inv_3645:canceled,inv_3780:canceled,inv_3915:canceled,inv_405:canceled,inv_4050:canceled,inv_4185:canceled,inv_4320:canceled,inv_4455:canceled,inv_4590:canceled,inv_4725:canceled,inv_4860:canceled,inv_4995:canceled,inv_5130:canceled,inv_5265:canceled,inv_540:canceled,inv_5400:canceled,inv_5535:canceled,inv_5670:canceled,inv_5805:canceled,inv_5940:canceled,inv_6075:canceled,inv_6210:canceled,inv_6345:canceled,inv_6480:canceled,inv_6615:canceled,inv_675:canceled,inv_6750:canceled,inv_6885:canceled,inv_7020:canceled,inv_7155:canceled,inv_7290:canceled,inv_7425:canceled,inv_7560:canceled,inv_7695:canceled,inv_7830:canceled,inv_7965:canceled,inv_810:canceled,inv_8100:canceled,inv_8235:canceled,inv_8370:canceled,inv_8505:canceled,inv_8640:canceled,inv_8775:canceled,inv_8910:canceled,inv_9045:canceled,inv_9180:canceled,inv_9315:canceled,inv_945:canceled,inv_9450:canceled,inv_9585:canceled,inv_9720:canceled,inv_9855:canceled,inv_9990:canceled
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): before: system-wide open-row scan (open_dunning, pre-fix) ===
+SELECT invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at FROM billing_dunning WHERE state IN ('pending', 'running') ORDER BY next_attempt_at ASC, invoice_id ASC
+Sort  (cost=447.03..457.03 rows=4000 width=63) (actual time=1.907..2.055 rows=3852 loops=1)
+  Output: invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at
+  Sort Key: billing_dunning.next_attempt_at, billing_dunning.invoice_id
+  Sort Method: quicksort  Memory: 427kB
+  Buffers: shared hit=122
+  ->  Seq Scan on public.billing_dunning  (cost=0.00..207.71 rows=4000 width=63) (actual time=0.018..1.245 rows=3852 loops=1)
+        Output: invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at
+        Filter: (billing_dunning.state = ANY ('{pending,running}'::text[]))
+        Rows Removed by Filter: 3005
+        Buffers: shared hit=122
+Query Identifier: 2830333950309037891
+Planning:
+  Buffers: shared hit=19
+Planning Time: 0.221 ms
+Execution Time: 2.259 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): after: subscription-scoped lookup (open_dunning_for_subscription, this PR) ===
+SELECT invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at FROM billing_dunning WHERE subscription_id = 'sub_10' AND state IN ('pending', 'running') ORDER BY next_attempt_at ASC, invoice_id ASC
+Sort  (cost=8.31..8.32 rows=1 width=63) (actual time=0.032..0.032 rows=1 loops=1)
+  Output: invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at
+  Sort Key: billing_dunning.next_attempt_at, billing_dunning.invoice_id
+  Sort Method: quicksort  Memory: 25kB
+  Buffers: shared hit=3
+  ->  Index Scan using billing_dunning_subscription_idx on public.billing_dunning  (cost=0.28..8.30 rows=1 width=63) (actual time=0.021..0.022 rows=1 loops=1)
+        Output: invoice_id, customer_id, subscription_id, attempt, next_attempt_at, state, updated_at
+        Index Cond: (billing_dunning.subscription_id = 'sub_10'::text)
+        Filter: (billing_dunning.state = ANY ('{pending,running}'::text[]))
+        Buffers: shared hit=3
+Query Identifier: -7925786853115714735
+Planning Time: 0.081 ms
+Execution Time: 0.058 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.42s
+

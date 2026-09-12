@@ -30,7 +30,13 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// next bumped, re-read [`PostureManifest::projection`] below: if the bump changes the
 /// meaning of an existing field rather than adding new ones, the diff rules move with
 /// it.
-pub const MAX_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 (#1640) *adds* the `mtls` dimension and changes no existing field, so v3
+/// still reads correctly: a v3 manifest has no `mtls` key, defaults to an empty
+/// dimension, and contributes no `mtls` projection lines. A route that gains an
+/// mTLS requirement therefore shows up as an added line, never as a silent
+/// re-interpretation of an old one.
+pub const MAX_SCHEMA_VERSION: u32 = 4;
 
 // Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
 // would auto-widen what this differ accepts on the very bump whose doc comment
@@ -86,7 +92,7 @@ pub struct PostureManifest {
     pub dimensions: Dimensions,
 }
 
-/// The four manifest dimensions. Every one defaults to empty so a manifest that
+/// The manifest dimensions. Every one defaults to empty so a manifest that
 /// predates a dimension — or omits one — reads as "nothing declared here"
 /// instead of failing the gate.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -99,6 +105,10 @@ pub struct Dimensions {
     pub security_headers: HeadersDimension,
     #[serde(default)]
     pub authorization_policies: AuthorizationPoliciesDimension,
+    /// mTLS client-certificate requirements (schema v4, #1640). Absent on a v3
+    /// manifest, which reads as "no route requires mTLS".
+    #[serde(default)]
+    pub mtls: MtlsDimension,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -184,6 +194,35 @@ pub struct AuthorizationPolicyEntry {
     pub resource: String,
 }
 
+/// The `mtls` dimension: which routes demand a verified client certificate.
+///
+/// The CA bundle and CRL *paths* are deliberately not in the manifest: moving a
+/// file is not a posture change.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MtlsDimension {
+    /// Listener requirement level: `off`, `optional`, or `required`.
+    #[serde(default)]
+    pub mode: String,
+    /// `[server.tls.client_auth] required_paths`, verbatim.
+    ///
+    /// Carried for the same reason `csrf.exempt_paths` is: the per-route rows
+    /// answer whether a *route template* matches a prefix, so a prefix change
+    /// that stops covering a concrete request path is invisible in them alone.
+    #[serde(default)]
+    pub required_paths: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<MtlsEntry>,
+}
+
+/// One route's declared mTLS requirement.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MtlsEntry {
+    pub path: String,
+    pub method: String,
+    #[serde(default)]
+    pub mtls_required: bool,
+}
+
 /// The stable key a route, CSRF entry or authorization binding is compared on.
 pub type RouteKey = (String, String);
 
@@ -254,6 +293,25 @@ pub const CAPTURE: char = '\u{1}';
 
 /// A catch-all capture (`{*rest}`), which matches every remaining segment.
 pub const CATCH_ALL: char = '\u{2}';
+
+impl MtlsDimension {
+    /// Whether the listener requests a client certificate at all.
+    ///
+    /// An empty `mode` is what a manifest that predates this dimension reads
+    /// as, and it means the same thing as `off`.
+    #[must_use]
+    pub fn requests_certificate(&self) -> bool {
+        !(self.mode.is_empty() || self.mode == "off")
+    }
+}
+
+impl MtlsEntry {
+    /// `(path, method)` — the same route identity the other dimensions key on.
+    #[must_use]
+    pub fn key(&self) -> RouteKey {
+        (normalize_captures(&self.path), self.method.clone())
+    }
+}
 
 impl RouteEntry {
     /// `(path, method)` — the identity of a mounted route. Handler name and
@@ -407,6 +465,32 @@ impl PostureManifest {
                 escape_field(&a.action),
                 escape_field(&a.resource)
             ));
+        }
+        // mTLS (#1640). Only the *required* rows are projected, so a v3
+        // manifest (no `mtls` dimension) and a v4 manifest of the same app with
+        // client auth off hash identically — the schema bump alone is not a
+        // posture change. The mode and prefixes are projected only when the
+        // listener actually requests certificates, for the same reason.
+        if self.dimensions.mtls.requests_certificate() {
+            lines.push(format!(
+                "mtls-mode\t{}",
+                escape_field(&self.dimensions.mtls.mode)
+            ));
+            if !self.dimensions.mtls.required_paths.is_empty() {
+                let mut prefixes = self.dimensions.mtls.required_paths.clone();
+                prefixes.sort();
+                prefixes.dedup();
+                lines.push(format!("mtls-required-paths\t{}", escape_list(&prefixes)));
+            }
+        }
+        for m in &self.dimensions.mtls.entries {
+            if m.mtls_required {
+                lines.push(format!(
+                    "mtls\t{}\t{}",
+                    escape_field(&normalize_captures(&m.path)),
+                    escape_field(&m.method)
+                ));
+            }
         }
         lines.sort();
         lines.dedup();

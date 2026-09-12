@@ -815,9 +815,11 @@ resource "aws_ecs_task_definition" "migrate" {
       essential = true
       command   = ["sh", "-lc", "autumn migrate"]
 
-      secrets = [
-        { name = "AUTUMN_DATABASE__PRIMARY_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
-      ]
+      # Use the full app secret list here. Do not use only the DB URL.
+      # CI and the manual walkthrough copy this list to the "app" task.
+      # See the "app" container's `secrets = []` comment above.
+      # A shorter list here removes secrets from the real app.
+      secrets = local.container_secrets
 
       logConfiguration = {
         logDriver = "awslogs"
