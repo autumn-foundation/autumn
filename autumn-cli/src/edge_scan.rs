@@ -1606,6 +1606,25 @@ fn resolve_out_of_line_module_file(
     None
 }
 
+/// Collapse `.` and `..` components lexically (no filesystem access, so it
+/// works on a path that may not exist yet — unlike `std::fs::canonicalize`,
+/// and without resolving symlinks, which lexical `..` handling never claims
+/// to do correctly in their presence; that mismatch is accepted here the
+/// same way every other heuristic in this best-effort scanner accepts a
+/// narrower-than-Cargo's-own-semantics trade-off). A leading `..` with
+/// nothing to pop against is kept as-is rather than discarded.
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if out.pop() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Scan a `[[bin]]` target's own crate tree, starting at its root file:
 /// `root_file` itself, plus every out-of-line submodule it (transitively)
 /// declares via `mod name;`, each tagged with `crate_root` and its own
@@ -1631,6 +1650,22 @@ fn scan_bin_crate_tree(
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) -> BTreeSet<PathBuf> {
+    // A manifest-specified path (a custom `[lib] path` or `[[bin]] path`)
+    // can spell its root with a `..` component (`"src/sub/../app.rs"`).
+    // Unlike a `.` component, Rust's own `Path`/`PathBuf` equality does NOT
+    // lexically collapse `..` (verified directly: `Path::new("a/../b") !=
+    // Path::new("b")`, and a `BTreeSet<PathBuf>` built from the former does
+    // not recognize the latter as already present) — the caller's `claimed`
+    // filter, built from this function's returned paths, would then fail to
+    // recognize the ordinary `src/` walk's own (naturally `..`-free, since
+    // it comes from a real directory listing) path to the very same file,
+    // scanning it a second time under a different, wrong crate identity
+    // (Codex review on #2739, round 22, P2). Normalizing here, once, up
+    // front is enough: every other path this function builds is joined
+    // from `root_dir` using plain segment names, which can never
+    // (re-)introduce a `..` of their own.
+    let root_file = lexically_normalize_path(root_file);
+    let root_file = root_file.as_path();
     let root_dir = root_file.parent().unwrap_or_else(|| Path::new(""));
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>)> =
@@ -3098,6 +3133,40 @@ mod tests {
         assert!(enabled.contains("dep"));
     }
 
+    // --- lexically_normalize_path ---
+
+    #[test]
+    fn lexically_normalize_path_collapses_a_parent_dir_component() {
+        assert_eq!(
+            lexically_normalize_path(Path::new("/project/src/sub/../app.rs")),
+            Path::new("/project/src/app.rs")
+        );
+    }
+
+    #[test]
+    fn lexically_normalize_path_collapses_multiple_parent_dir_components() {
+        assert_eq!(
+            lexically_normalize_path(Path::new("/project/a/b/../../c")),
+            Path::new("/project/c")
+        );
+    }
+
+    #[test]
+    fn lexically_normalize_path_keeps_a_leading_parent_dir_with_nothing_to_pop() {
+        assert_eq!(
+            lexically_normalize_path(Path::new("../a/b")),
+            Path::new("../a/b")
+        );
+    }
+
+    #[test]
+    fn lexically_normalize_path_drops_current_dir_components() {
+        assert_eq!(
+            lexically_normalize_path(Path::new("/project/./src/./app.rs")),
+            Path::new("/project/src/app.rs")
+        );
+    }
+
     // --- resolver_v1_is_in_effect ---
 
     #[test]
@@ -4271,6 +4340,37 @@ mod tests {
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"./src/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same as above, but the manifest spells the custom `[lib] path` with a
+    /// `..` component (`src/sub/../app.rs`) that lexically resolves to the
+    /// same `src/app.rs` the ordinary walk finds directly. Unlike a `.`
+    /// component, Rust's own `Path`/`PathBuf` equality does NOT collapse
+    /// `..` (verified directly), so without normalizing it first, the file
+    /// was scanned twice — once via `scan_bin_crate_tree` with the correct
+    /// crate-root identity, once via the ordinary walk with a wrong
+    /// library-submodule one — reporting the same handler as both
+    /// registered and (under its wrong identity) unregistered (Codex review
+    /// on #2739, round 22, P2).
+    #[test]
+    fn resolve_edge_scan_honors_a_dot_dot_component_custom_lib_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/sub/../app.rs\"\n",
         )
         .unwrap();
         std::fs::write(
