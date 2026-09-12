@@ -332,6 +332,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
+  CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
+  `csrf.rs` and `submit_token.rs` each carried a byte-identical private
+  `find_bytes`/`scan_multipart_field` pair — a hand-rolled scan for a named
+  field's value in a buffered `multipart/form-data` body, needed because
+  reading ahead for the CSRF/submit token must not disturb the handler's own
+  `Multipart` extraction downstream. History showed this pair needs to stay
+  in lockstep: a Content-Type case-sensitivity bug was fixed in
+  `submit_token.rs` and, a day later, the identical bug had to be
+  independently rediscovered and fixed in `csrf.rs` ("Mirrors the
+  submit-token replay-guard fix"). Both functions now live once in the new
+  `pub(crate) mod multipart_scan`, called identically from both guards with
+  no adaptation at either call site. Characterization tests (committed
+  first, passing unchanged against the pre-merge duplicated code) now live
+  with the merged function; behavior is unchanged — internal-only, no public
+  API surface.
+
 - **Docs gate: the drift gates must now agree on which pages are reader-facing
   [no-plugin].**
   `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
