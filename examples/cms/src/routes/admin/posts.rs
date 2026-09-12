@@ -847,6 +847,68 @@ fn apply_submitted_taxonomies(context: &mut EditorContext, form: &PostForm) {
     }
 }
 
+/// Make sure a submission's chosen parent, featured image and hierarchical
+/// terms still appear as selectable options on the redisplayed editor, even
+/// when the bounded picker's window (the 100 most-recently-edited pages,
+/// most-recent uploads, or terms by name) has moved between the GET this
+/// submission's page came from and this rejected POST.
+///
+/// `EditorContext::load` already re-adds a post's *persisted* choices for
+/// exactly this reason — a stored parent/image/term that has since scrolled
+/// out of the window must still render as selected, or saving the form
+/// unchanged would silently clear it. This is the same argument applied to a
+/// submission's *chosen-but-not-yet-saved* ones: without it, a choice that
+/// was in the window at the original GET but has since fallen out of it
+/// renders with no matching `<option>`/checkbox, and the corrected
+/// resubmission silently drops it.
+async fn ensure_submitted_choices_visible(
+    repos: &Repos,
+    context: &mut EditorContext,
+    form: &PostForm,
+) -> AutumnResult<()> {
+    if let Some(parent_id) = optional_id(form.parent_id.as_ref())
+        && !context.parents.iter().any(|p| p.id == parent_id)
+        && let Some(parent) = repos.posts.find_by_id(parent_id).await?
+    {
+        context.parents.insert(0, parent);
+    }
+
+    if let Some(media_id) = optional_id(form.featured_media_id.as_ref())
+        && !context.media.iter().any(|m| m.id == media_id)
+        && let Some(attachment) = repos.attachments.find_by_id(media_id).await?
+    {
+        context.media.insert(0, attachment);
+    }
+
+    for field in &mut context.taxonomies {
+        if !field.hierarchical {
+            continue;
+        }
+        let present: std::collections::HashSet<i64> =
+            field.terms.iter().map(|term| term.id).collect();
+        let missing: Vec<i64> = form
+            .taxonomies
+            .get(field.slug)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut extra: Vec<Term> = repos
+            .with_conn(async |conn| content::terms_by_ids(conn, &missing).await)
+            .await?
+            .into_values()
+            .collect();
+        extra.sort_by(|a, b| a.name.cmp(&b.name));
+        field.terms.splice(0..0, extra);
+    }
+
+    Ok(())
+}
+
 /// The field values `editor()` renders.
 ///
 /// Either the persisted post's ([`Self::from_post`], every GET route), or the
@@ -867,6 +929,13 @@ struct EditorValues<'a> {
     parent_id: Option<i64>,
     menu_order: i32,
     featured_media_id: Option<i64>,
+    /// The `lock_version` the hidden stale-edit field should carry.
+    ///
+    /// `from_form` echoes back exactly what was submitted rather than the
+    /// row's current value: a rejected submission that was *already* stale
+    /// must stay stale through the redisplay, or the corrected resubmission
+    /// would pass optimistic locking against an edit it never actually saw.
+    lock_version: Option<String>,
 }
 
 impl<'a> EditorValues<'a> {
@@ -887,6 +956,7 @@ impl<'a> EditorValues<'a> {
             parent_id: post.and_then(|p| p.parent_id),
             menu_order: post.map_or(0, |p| p.menu_order),
             featured_media_id: post.and_then(|p| p.featured_media_id),
+            lock_version: post.map(|p| p.lock_version.to_string()),
         }
     }
 
@@ -904,6 +974,7 @@ impl<'a> EditorValues<'a> {
             parent_id: optional_id(form.parent_id.as_ref()),
             menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
             featured_media_id: optional_id(form.featured_media_id.as_ref()),
+            lock_version: form.lock_version.clone(),
         }
     }
 }
@@ -928,11 +999,14 @@ fn editor(
     html! {
         form action=(action) method="post" class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
             (csrf.input())
-            @if let Some(post) = post {
+            @if let Some(lock_version) = &values.lock_version {
                 // Stale-edit detection: the server compares this against the
                 // row it locks, so a save built on content someone else has
                 // since changed is refused rather than silently overwriting.
-                input type="hidden" name="lock_version" value=(post.lock_version);
+                // Comes from `values`, not `post`, so a rejected submission
+                // that was already stale redisplays still-stale — see
+                // `EditorValues::lock_version`.
+                input type="hidden" name="lock_version" value=(lock_version);
             }
             div class="lg:col-span-2 space-y-4" {
                 div class="bg-white rounded-lg shadow p-5 space-y-4" {
@@ -1243,6 +1317,7 @@ pub async fn create(
     if !errors.is_empty() {
         let mut context = EditorContext::load(&repos, &registered, None).await?;
         apply_submitted_taxonomies(&mut context, &form);
+        ensure_submitted_choices_visible(&repos, &mut context, &form).await?;
         let values = EditorValues::from_form(&form, &status);
         let editor_body = editor(&registered, None, &values, &context, &user, &csrf, &errors);
         return Ok((
@@ -1425,6 +1500,7 @@ pub async fn update(
     if !errors.is_empty() {
         let mut context = EditorContext::load(&repos, &registered, Some(&existing)).await?;
         apply_submitted_taxonomies(&mut context, &form);
+        ensure_submitted_choices_visible(&repos, &mut context, &form).await?;
         let values = EditorValues::from_form(&form, &status);
         let editor_body = editor(
             &registered,
@@ -2251,6 +2327,7 @@ mod editor_validation_tests {
         submitted.menu_order = Some("3".to_owned());
         submitted.featured_media_id = Some("9".to_owned());
         submitted.publish_at = Some("2999-06-01T12:00".to_owned());
+        submitted.lock_version = Some("4".to_owned());
 
         let values = EditorValues::from_form(&submitted, "draft");
         assert_eq!(values.title, "My Draft");
@@ -2265,6 +2342,19 @@ mod editor_validation_tests {
         assert_eq!(values.parent_id, Some(7));
         assert_eq!(values.menu_order, 3);
         assert_eq!(values.featured_media_id, Some(9));
+        assert_eq!(values.lock_version.as_deref(), Some("4"));
+    }
+
+    /// The exact bug a rejected-then-corrected submission must not
+    /// reintroduce: `from_form` echoes back whatever `lock_version` was
+    /// submitted, even a stale one, rather than substituting anything fresher
+    /// — see `EditorValues::lock_version`'s doc comment for why.
+    #[test]
+    fn editor_values_from_form_does_not_refresh_a_stale_lock_version() {
+        let mut submitted = form("Titled", "draft");
+        submitted.lock_version = Some("1".to_owned());
+        let values = EditorValues::from_form(&submitted, "draft");
+        assert_eq!(values.lock_version.as_deref(), Some("1"));
     }
 
     /// A label for [`title_required_error`]'s wording, so the test above does

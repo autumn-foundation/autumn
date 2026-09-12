@@ -261,6 +261,68 @@ fn resolve_type(slug: &str) -> AutumnResult<PostType> {
         .ok_or_else(|| AutumnError::not_found_msg(format!("Unknown post type `{slug}`")))
 }
 
+/// The message [`crate::models::Post::can_publish`]'s guard — and
+/// `normalize_post`'s direct-create check — would refuse this submission
+/// with, if it has no title. `None` when `status` does not require one.
+fn title_required_error(status: &str) -> Option<(&'static str, String)> {
+    let label = match status {
+        "publish" => "published",
+        "private" => "private",
+        "future" => "scheduled",
+        _ => return None,
+    };
+    Some(("title", format!("A {label} post must have a title")))
+}
+
+/// Look up the message [`validate_submission`] recorded against `field`, if
+/// any.
+fn field_error<'a>(errors: &'a [(&'static str, String)], field: &str) -> Option<&'a str> {
+    errors
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, msg)| msg.as_str())
+}
+
+/// Every failure `create`/`update` can detect from the submission alone,
+/// before any write — a blank title on a status that requires one, and an
+/// unusable or non-future scheduled date.
+///
+/// This is what lets a rejected submission redisplay the editor with the
+/// draft intact and a message next to the field that failed, instead of the
+/// generic error page `scheduled_at`, `require_future_publish_date`,
+/// `guard_deferred_transition` and the state machine's `can_publish` guard
+/// each produced via `?` on their own. Those still run afterwards, unchanged,
+/// as the authority for callers that reach `create`/`update`'s inner
+/// transaction some other way — this is a redisplay, not a replacement.
+fn validate_submission(
+    form: &PostForm,
+    status: &str,
+    settings: &crate::settings::Settings,
+) -> (Option<chrono::NaiveDateTime>, Vec<(&'static str, String)>) {
+    let mut errors = Vec::new();
+
+    let scheduled_for = match scheduled_at(form, settings) {
+        Ok(value) => value,
+        Err(err) => {
+            errors.push(("publish_at", err.to_string()));
+            None
+        }
+    };
+    if errors.is_empty()
+        && let Err(err) = require_future_publish_date(status, scheduled_for)
+    {
+        errors.push(("publish_at", err.to_string()));
+    }
+
+    if form.title.trim().is_empty()
+        && let Some(error) = title_required_error(status)
+    {
+        errors.push(error);
+    }
+
+    (scheduled_for, errors)
+}
+
 // ── List ────────────────────────────────────────────────────────────────────
 
 #[get("/admin/content/{post_type}")]
@@ -480,7 +542,8 @@ pub async fn new_form(
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
     let registered = resolve_type(&post_type)?;
     let context = EditorContext::load(&repos, &registered, None).await?;
-    let body = editor(&registered, None, &context, &user, &csrf);
+    let values = EditorValues::from_post(None, &context.settings);
+    let body = editor(&registered, None, &values, &context, &user, &csrf, &[]);
     Ok(layout(
         &user,
         &csrf,
@@ -514,7 +577,16 @@ pub async fn edit_form(
     }
 
     let context = EditorContext::load(&repos, &registered, Some(&post)).await?;
-    let body = editor(&registered, Some(&post), &context, &user, &csrf);
+    let values = EditorValues::from_post(Some(&post), &context.settings);
+    let body = editor(
+        &registered,
+        Some(&post),
+        &values,
+        &context,
+        &user,
+        &csrf,
+        &[],
+    );
     Ok(layout(
         &user,
         &csrf,
@@ -754,36 +826,202 @@ impl EditorContext {
     }
 }
 
+/// Overwrite `context`'s taxonomy selections with what the author just
+/// submitted.
+///
+/// `EditorContext::load` always reflects what is persisted — right for the
+/// GET routes, wrong for redisplaying a rejected POST, where the checkboxes
+/// and free-text boxes need to show what was just checked and typed rather
+/// than what is still filed in the database.
+fn apply_submitted_taxonomies(context: &mut EditorContext, form: &PostForm) {
+    for field in &mut context.taxonomies {
+        if field.hierarchical {
+            field.selected = form.taxonomies.get(field.slug).cloned().unwrap_or_default();
+        } else {
+            field.names = form
+                .taxonomy_names
+                .get(field.slug)
+                .cloned()
+                .unwrap_or_default();
+        }
+    }
+}
+
+/// Make sure a submission's chosen parent, featured image and hierarchical
+/// terms still appear as selectable options on the redisplayed editor, even
+/// when the bounded picker's window (the 100 most-recently-edited pages,
+/// most-recent uploads, or terms by name) has moved between the GET this
+/// submission's page came from and this rejected POST.
+///
+/// `EditorContext::load` already re-adds a post's *persisted* choices for
+/// exactly this reason — a stored parent/image/term that has since scrolled
+/// out of the window must still render as selected, or saving the form
+/// unchanged would silently clear it. This is the same argument applied to a
+/// submission's *chosen-but-not-yet-saved* ones: without it, a choice that
+/// was in the window at the original GET but has since fallen out of it
+/// renders with no matching `<option>`/checkbox, and the corrected
+/// resubmission silently drops it.
+async fn ensure_submitted_choices_visible(
+    repos: &Repos,
+    context: &mut EditorContext,
+    form: &PostForm,
+) -> AutumnResult<()> {
+    if let Some(parent_id) = optional_id(form.parent_id.as_ref())
+        && !context.parents.iter().any(|p| p.id == parent_id)
+        && let Some(parent) = repos.posts.find_by_id(parent_id).await?
+    {
+        context.parents.insert(0, parent);
+    }
+
+    if let Some(media_id) = optional_id(form.featured_media_id.as_ref())
+        && !context.media.iter().any(|m| m.id == media_id)
+        && let Some(attachment) = repos.attachments.find_by_id(media_id).await?
+    {
+        context.media.insert(0, attachment);
+    }
+
+    for field in &mut context.taxonomies {
+        if !field.hierarchical {
+            continue;
+        }
+        let present: std::collections::HashSet<i64> =
+            field.terms.iter().map(|term| term.id).collect();
+        let missing: Vec<i64> = form
+            .taxonomies
+            .get(field.slug)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut extra: Vec<Term> = repos
+            .with_conn(async |conn| content::terms_by_ids(conn, &missing).await)
+            .await?
+            .into_values()
+            .collect();
+        extra.sort_by(|a, b| a.name.cmp(&b.name));
+        field.terms.splice(0..0, extra);
+    }
+
+    Ok(())
+}
+
+/// The field values `editor()` renders.
+///
+/// Either the persisted post's ([`Self::from_post`], every GET route), or the
+/// author's just-rejected submission ([`Self::from_form`], `create`/`update`'s
+/// 422 branch) — sharing one render is what lets a rejected submission
+/// redisplay with every field the author had already set intact, instead of
+/// falling back to whatever the database still holds.
+struct EditorValues<'a> {
+    title: &'a str,
+    slug: &'a str,
+    body: &'a str,
+    excerpt: &'a str,
+    password: &'a str,
+    status: &'a str,
+    publish_at: String,
+    comment_open: bool,
+    sticky: bool,
+    parent_id: Option<i64>,
+    menu_order: i32,
+    featured_media_id: Option<i64>,
+    /// The `lock_version` the hidden stale-edit field should carry.
+    ///
+    /// `from_form` echoes back exactly what was submitted rather than the
+    /// row's current value: a rejected submission that was *already* stale
+    /// must stay stale through the redisplay, or the corrected resubmission
+    /// would pass optimistic locking against an edit it never actually saw.
+    lock_version: Option<String>,
+}
+
+impl<'a> EditorValues<'a> {
+    fn from_post(post: Option<&'a Post>, settings: &crate::settings::Settings) -> Self {
+        Self {
+            title: post.map_or("", |p| p.title.as_str()),
+            slug: post.map_or("", |p| p.slug.as_str()),
+            body: post.map_or("", |p| p.body.as_str()),
+            excerpt: post.map_or("", |p| p.excerpt.as_str()),
+            password: post.map_or("", |p| p.password.as_str()),
+            status: post.map_or("draft", |p| p.status.as_str()),
+            publish_at: post
+                .and_then(|p| p.published_at)
+                .map(|d| settings.format_datetime_local(d))
+                .unwrap_or_default(),
+            comment_open: post.is_none_or(|p| p.comment_status == "open"),
+            sticky: post.is_some_and(|p| p.sticky),
+            parent_id: post.and_then(|p| p.parent_id),
+            menu_order: post.map_or(0, |p| p.menu_order),
+            featured_media_id: post.and_then(|p| p.featured_media_id),
+            lock_version: post.map(|p| p.lock_version.to_string()),
+        }
+    }
+
+    fn from_form(form: &'a PostForm, status: &'a str) -> Self {
+        Self {
+            title: &form.title,
+            slug: &form.slug,
+            body: &form.body,
+            excerpt: &form.excerpt,
+            password: &form.password,
+            status,
+            publish_at: form.publish_at.clone().unwrap_or_default(),
+            comment_open: form.comment_status.is_some(),
+            sticky: form.sticky.is_some(),
+            parent_id: optional_id(form.parent_id.as_ref()),
+            menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
+            featured_media_id: optional_id(form.featured_media_id.as_ref()),
+            lock_version: form.lock_version.clone(),
+        }
+    }
+}
+
 fn editor(
     registered: &PostType,
     post: Option<&Post>,
+    values: &EditorValues,
     context: &EditorContext,
     user: &User,
     csrf: &Csrf,
+    errors: &[(&'static str, String)],
 ) -> Markup {
     let action = post.map_or_else(
         || format!("/admin/content/{}", registered.slug),
         |p| format!("/admin/content/{}/{}", registered.slug, p.id),
     );
-    let value = |get: fn(&Post) -> &str| post.map_or("", get);
     let can_publish = user.role().can(Capability::PublishPosts);
+    let title_error = field_error(errors, "title");
+    let publish_at_error = field_error(errors, "publish_at");
 
     html! {
         form action=(action) method="post" class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
             (csrf.input())
-            @if let Some(post) = post {
+            @if let Some(lock_version) = &values.lock_version {
                 // Stale-edit detection: the server compares this against the
                 // row it locks, so a save built on content someone else has
                 // since changed is refused rather than silently overwriting.
-                input type="hidden" name="lock_version" value=(post.lock_version);
+                // Comes from `values`, not `post`, so a rejected submission
+                // that was already stale redisplays still-stale — see
+                // `EditorValues::lock_version`.
+                input type="hidden" name="lock_version" value=(lock_version);
             }
             div class="lg:col-span-2 space-y-4" {
                 div class="bg-white rounded-lg shadow p-5 space-y-4" {
                     div {
                         label for="title" class="block text-sm font-medium mb-1" { "Title" }
                         input #title type="text" name="title" required maxlength="300"
-                              value=(value(|p| &p.title))
+                              value=(values.title)
+                              aria-invalid=(if title_error.is_some() { "true" } else { "false" })
+                              aria-describedby="title-error"
                               class="w-full border rounded px-3 py-2 text-lg";
+                        div id="title-error" {
+                            @if let Some(msg) = title_error {
+                                p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                            }
+                        }
                     }
                     div {
                         label for="slug" class="block text-sm font-medium mb-1" {
@@ -792,7 +1030,7 @@ fn editor(
                                 "(leave blank to derive from the title)"
                             }
                         }
-                        input #slug type="text" name="slug" value=(value(|p| &p.slug))
+                        input #slug type="text" name="slug" value=(values.slug)
                               class="w-full border rounded px-3 py-2 font-mono text-sm";
                     }
                     div {
@@ -802,7 +1040,7 @@ fn editor(
                         }
                         textarea #body name="body" rows="18"
                                  class="w-full border rounded px-3 py-2 font-mono text-sm" {
-                            (value(|p| &p.body))
+                            (values.body)
                         }
                     }
                     @if registered.supports_excerpt {
@@ -815,7 +1053,7 @@ fn editor(
                             }
                             textarea #excerpt name="excerpt" rows="3"
                                      class="w-full border rounded px-3 py-2 text-sm" {
-                                (value(|p| &p.excerpt))
+                                (values.excerpt)
                             }
                         }
                     }
@@ -838,8 +1076,7 @@ fn editor(
                                 @if (can_publish || matches!(*value, "draft" | "pending"))
                                     && status_is_offerable(post.map(|p| p.status.as_str()), value) {
                                     option value=(value)
-                                           selected[post.is_some_and(|p| p.status == *value)
-                                                    || (post.is_none() && *value == "draft")] {
+                                           selected[values.status == *value] {
                                         (label)
                                     }
                                 }
@@ -859,10 +1096,15 @@ fn editor(
                         // whichever zone the browser is in, this field means the
                         // site's.
                         input #publish_at type="datetime-local" name="publish_at"
-                              value=(post.and_then(|p| p.published_at)
-                                  .map(|d| context.settings.format_datetime_local(d))
-                                  .unwrap_or_default())
+                              value=(values.publish_at)
+                              aria-invalid=(if publish_at_error.is_some() { "true" } else { "false" })
+                              aria-describedby="publish_at-error"
                               class="w-full border rounded px-3 py-2 text-sm";
+                        div id="publish_at-error" {
+                            @if let Some(msg) = publish_at_error {
+                                p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                            }
+                        }
                     }
                     button type="submit"
                            class="w-full px-4 py-2 bg-indigo-600 text-white rounded \
@@ -961,8 +1203,7 @@ fn editor(
                             option value="" { "None" }
                             @for media in &context.media {
                                 option value=(media.id)
-                                       selected[post.and_then(|p| p.featured_media_id)
-                                           == Some(media.id)] {
+                                       selected[values.featured_media_id == Some(media.id)] {
                                     (media.title)
                                 }
                             }
@@ -984,7 +1225,7 @@ fn editor(
                     @if registered.supports_comments {
                         label class="flex items-center gap-2 text-sm" {
                             input type="checkbox" name="comment_status" value="open"
-                                  checked[post.is_none_or(|p| p.comment_status == "open")]
+                                  checked[values.comment_open]
                                   class="rounded border-gray-300";
                             "Allow comments"
                         }
@@ -992,7 +1233,7 @@ fn editor(
                     @if registered.slug == "post" {
                         label class="flex items-center gap-2 text-sm" {
                             input type="checkbox" name="sticky" value="on"
-                                  checked[post.is_some_and(|p| p.sticky)]
+                                  checked[values.sticky]
                                   class="rounded border-gray-300";
                             "Pin to the top of the blog"
                         }
@@ -1002,7 +1243,7 @@ fn editor(
                             "Password"
                         }
                         input #password type="text" name="password"
-                              value=(value(|p| &p.password))
+                              value=(values.password)
                               placeholder="Leave blank for public"
                               class="w-full border rounded px-3 py-2 text-sm";
                     }
@@ -1016,8 +1257,7 @@ fn editor(
                                 option value="" { "(top level)" }
                                 @for parent in &context.parents {
                                     option value=(parent.id)
-                                           selected[post.and_then(|p| p.parent_id)
-                                               == Some(parent.id)] {
+                                           selected[values.parent_id == Some(parent.id)] {
                                         (parent.title)
                                     }
                                 }
@@ -1034,7 +1274,7 @@ fn editor(
                                 "Order"
                             }
                             input #menu_order type="number" name="menu_order"
-                                  value=(post.map_or(0, |p| p.menu_order))
+                                  value=(values.menu_order)
                                   class="w-full border rounded px-3 py-2 text-sm";
                         }
                     }
@@ -1066,8 +1306,32 @@ pub async fn create(
     // would carry `published_at = NULL`, and the publish sweep — which selects
     // `status = 'future' AND published_at <= now()` — would never see it
     // again: the post would sit in `future` forever.
-    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
-    require_future_publish_date(&status, scheduled_for)?;
+    //
+    // Checked here, pre-flight, rather than via `?` on `scheduled_at` and
+    // `require_future_publish_date` directly: a rejection redisplays the
+    // editor with the author's title, body, taxonomy picks and every other
+    // field intact and a message next to the field that failed, instead of
+    // the generic error page those calls used to produce on their own.
+    let settings = repos.settings().await?;
+    let (scheduled_for, errors) = validate_submission(&form, &status, &settings);
+    if !errors.is_empty() {
+        let mut context = EditorContext::load(&repos, &registered, None).await?;
+        apply_submitted_taxonomies(&mut context, &form);
+        ensure_submitted_choices_visible(&repos, &mut context, &form).await?;
+        let values = EditorValues::from_form(&form, &status);
+        let editor_body = editor(&registered, None, &values, &context, &user, &csrf, &errors);
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                &user,
+                &csrf,
+                &format!("/admin/content/{post_type}"),
+                &format!("Add {}", registered.singular),
+                editor_body,
+            ),
+        )
+            .into_response());
+    }
 
     // Asked before anything is written. `private` and `future` are reached by
     // transitioning the draft this creates, and that edge carries the
@@ -1224,10 +1488,41 @@ pub async fn update(
     }
 
     let status = requested_status(&form, &user);
-    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
     // The submitted date, not the stored one. Falling back to
     // `existing.published_at` is what let a past timestamp through.
-    require_future_publish_date(&status, scheduled_for)?;
+    //
+    // Checked pre-flight, same as `create`: a rejection here redisplays the
+    // editor with the author's edits intact and a message next to the field
+    // that failed, instead of the generic error page `scheduled_at` and
+    // `require_future_publish_date`'s `?` used to produce on their own.
+    let settings = repos.settings().await?;
+    let (scheduled_for, errors) = validate_submission(&form, &status, &settings);
+    if !errors.is_empty() {
+        let mut context = EditorContext::load(&repos, &registered, Some(&existing)).await?;
+        apply_submitted_taxonomies(&mut context, &form);
+        ensure_submitted_choices_visible(&repos, &mut context, &form).await?;
+        let values = EditorValues::from_form(&form, &status);
+        let editor_body = editor(
+            &registered,
+            Some(&existing),
+            &values,
+            &context,
+            &user,
+            &csrf,
+            &errors,
+        );
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                &user,
+                &csrf,
+                &format!("/admin/content/{post_type}"),
+                &format!("Edit {}", registered.singular),
+                editor_body,
+            ),
+        )
+            .into_response());
+    }
 
     // Validate the status change BEFORE anything is written. The content edit
     // and the term assignment each commit in their own transaction, so a
@@ -1892,4 +2187,183 @@ pub async fn restore(
         .await?;
     do_action(Action::PostSaved, id);
     Ok(Redirect::to(&format!("/admin/content/{post_type}/{id}")).into_response())
+}
+
+#[cfg(test)]
+mod editor_validation_tests {
+    use super::*;
+
+    /// A submission with every field blank except `title` and `status` — the
+    /// two `validate_submission` actually looks at.
+    fn form(title: &str, status: &str) -> PostForm {
+        PostForm {
+            title: title.to_owned(),
+            slug: String::new(),
+            excerpt: String::new(),
+            body: String::new(),
+            status: status.to_owned(),
+            comment_status: None,
+            password: String::new(),
+            sticky: None,
+            parent_id: None,
+            menu_order: None,
+            featured_media_id: None,
+            taxonomies: std::collections::HashMap::new(),
+            taxonomy_names: std::collections::HashMap::new(),
+            publish_at: None,
+            lock_version: None,
+        }
+    }
+
+    #[test]
+    fn title_is_required_for_every_status_that_makes_content_reachable() {
+        for status in ["publish", "private", "future"] {
+            let (field, msg) =
+                title_required_error(status).unwrap_or_else(|| panic!("{status} needs a title"));
+            assert_eq!(field, "title");
+            assert!(msg.contains("must have a title"), "{msg}");
+        }
+        for status in ["draft", "pending"] {
+            assert_eq!(
+                title_required_error(status),
+                None,
+                "{status} must not require a title"
+            );
+        }
+    }
+
+    #[test]
+    fn field_error_looks_up_by_key() {
+        let errors = vec![
+            ("title", "blank".to_owned()),
+            ("publish_at", "past".to_owned()),
+        ];
+        assert_eq!(field_error(&errors, "title"), Some("blank"));
+        assert_eq!(field_error(&errors, "publish_at"), Some("past"));
+        assert_eq!(field_error(&errors, "slug"), None);
+    }
+
+    /// The exact failure this fix targets: a scheduled/private/published post
+    /// with a blank (or whitespace-only) title is rejected *before* any
+    /// write, adjacent to the field that caused it — not via a `?` on a
+    /// guard three layers into a transaction.
+    #[test]
+    fn validate_submission_rejects_a_blank_title_that_would_publish() {
+        let settings = crate::settings::Settings::default();
+        for status in ["publish", "private", "future"] {
+            let mut submitted = form("   ", status);
+            if status == "future" {
+                submitted.publish_at = Some("2999-01-01T00:00".to_owned());
+            }
+            let (_, errors) = validate_submission(&submitted, status, &settings);
+            assert_eq!(
+                field_error(&errors, "title"),
+                Some(format!("A {} post must have a title", title_label(status)).as_str()),
+                "status {status} did not flag the blank title"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_submission_allows_a_blank_title_for_draft_and_pending() {
+        let settings = crate::settings::Settings::default();
+        for status in ["draft", "pending"] {
+            let (_, errors) = validate_submission(&form("", status), status, &settings);
+            assert!(errors.is_empty(), "{status} should not require a title");
+        }
+    }
+
+    #[test]
+    fn validate_submission_rejects_a_past_scheduled_date() {
+        let settings = crate::settings::Settings::default();
+        let mut submitted = form("Titled", "future");
+        submitted.publish_at = Some("2000-01-01T00:00".to_owned());
+        let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
+        assert!(
+            scheduled_for.is_some(),
+            "a parseable date still round-trips"
+        );
+        assert_eq!(
+            field_error(&errors, "publish_at"),
+            Some("A scheduled post needs a publish date in the future")
+        );
+    }
+
+    #[test]
+    fn validate_submission_rejects_a_missing_scheduled_date() {
+        let settings = crate::settings::Settings::default();
+        let submitted = form("Titled", "future");
+        let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
+        assert_eq!(scheduled_for, None);
+        assert_eq!(
+            field_error(&errors, "publish_at"),
+            Some("Pick a publish date for a scheduled post")
+        );
+    }
+
+    #[test]
+    fn validate_submission_accepts_a_titled_future_post_with_a_future_date() {
+        let settings = crate::settings::Settings::default();
+        let mut submitted = form("Titled", "future");
+        submitted.publish_at = Some("2999-01-01T00:00".to_owned());
+        let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
+        assert!(
+            errors.is_empty(),
+            "a valid submission must not be rejected: {errors:?}"
+        );
+        assert!(scheduled_for.is_some());
+    }
+
+    #[test]
+    fn editor_values_from_form_preserves_every_field_the_author_set() {
+        let mut submitted = form("My Draft", "draft");
+        submitted.slug = "my-draft".to_owned();
+        submitted.body = "body text".to_owned();
+        submitted.excerpt = "excerpt text".to_owned();
+        submitted.password = "secret".to_owned();
+        submitted.comment_status = Some("open".to_owned());
+        submitted.sticky = Some("on".to_owned());
+        submitted.parent_id = Some("7".to_owned());
+        submitted.menu_order = Some("3".to_owned());
+        submitted.featured_media_id = Some("9".to_owned());
+        submitted.publish_at = Some("2999-06-01T12:00".to_owned());
+        submitted.lock_version = Some("4".to_owned());
+
+        let values = EditorValues::from_form(&submitted, "draft");
+        assert_eq!(values.title, "My Draft");
+        assert_eq!(values.slug, "my-draft");
+        assert_eq!(values.body, "body text");
+        assert_eq!(values.excerpt, "excerpt text");
+        assert_eq!(values.password, "secret");
+        assert_eq!(values.status, "draft");
+        assert_eq!(values.publish_at, "2999-06-01T12:00");
+        assert!(values.comment_open);
+        assert!(values.sticky);
+        assert_eq!(values.parent_id, Some(7));
+        assert_eq!(values.menu_order, 3);
+        assert_eq!(values.featured_media_id, Some(9));
+        assert_eq!(values.lock_version.as_deref(), Some("4"));
+    }
+
+    /// The exact bug a rejected-then-corrected submission must not
+    /// reintroduce: `from_form` echoes back whatever `lock_version` was
+    /// submitted, even a stale one, rather than substituting anything fresher
+    /// — see `EditorValues::lock_version`'s doc comment for why.
+    #[test]
+    fn editor_values_from_form_does_not_refresh_a_stale_lock_version() {
+        let mut submitted = form("Titled", "draft");
+        submitted.lock_version = Some("1".to_owned());
+        let values = EditorValues::from_form(&submitted, "draft");
+        assert_eq!(values.lock_version.as_deref(), Some("1"));
+    }
+
+    /// A label for [`title_required_error`]'s wording, so the test above does
+    /// not hard-code the same match twice.
+    fn title_label(status: &str) -> &'static str {
+        match status {
+            "publish" => "published",
+            "private" => "private",
+            _ => "scheduled",
+        }
+    }
 }

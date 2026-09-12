@@ -642,6 +642,24 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
         .await
 }
 
+/// The post's current `lock_version`, read directly from the database.
+///
+/// Split out from [`edit_form`] so a staleness test can capture a version
+/// stamp *before* a later request changes it — `edit_form` always reads the
+/// current value, which is right for every ordinary test but cannot express
+/// "the form this stale request carries."
+async fn lock_version_of(id: i64) -> i32 {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::schema::posts::table
+        .find(id)
+        .select(cms::schema::posts::lock_version)
+        .first::<i32>(&mut conn)
+        .await
+        .expect("the post")
+}
+
 /// Encode an editor form, stamping the post's current `lock_version`.
 ///
 /// The editor renders that hidden field on every edit and the update handler
@@ -649,19 +667,8 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
 /// make — and, before the check existed, one that silently skipped the
 /// stale-edit guard.
 async fn edit_form(id: &impl std::fmt::Display, fields: &[(&str, &str)]) -> String {
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
     let id: i64 = id.to_string().parse().expect("a post id");
-    let version = {
-        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        cms::schema::posts::table
-            .find(id)
-            .select(cms::schema::posts::lock_version)
-            .first::<i32>(&mut conn)
-            .await
-            .expect("the post")
-            .to_string()
-    };
+    let version = lock_version_of(id).await.to_string();
     let mut all: Vec<(&str, &str)> = fields.to_vec();
     all.push(("lock_version", version.as_str()));
     form(&all)
@@ -798,6 +805,87 @@ async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_d
         front.status, 404,
         "the post must still be an unreachable draft"
     );
+}
+
+/// The redisplay must not silently repair a stale edit.
+///
+/// `EditorContext`/`editor` are shared between the GET routes (which always
+/// want the row's *current* `lock_version`) and the validation-error 422
+/// branch (which must echo back exactly what was submitted, stale or not) —
+/// see `EditorValues::lock_version`. Getting this backwards would make a
+/// rejected-then-corrected submission pass optimistic locking against an
+/// edit it never actually saw, silently overwriting it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_rejected_submission_does_not_launder_a_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Concurrent Post", "v1", "draft").await;
+    let stale_version = lock_version_of(id).await;
+
+    // A concurrent edit lands and succeeds, bumping `lock_version`.
+    let bump = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Concurrent Post"),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "v2, from someone else"),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    assert_eq!(bump.status, 303, "the concurrent edit should succeed");
+    assert_ne!(
+        lock_version_of(id).await,
+        stale_version,
+        "the concurrent edit must have advanced the lock version"
+    );
+
+    // The original editor, unaware of the concurrent edit, submits the stale
+    // `lock_version` it loaded with — but also a blank title while trying to
+    // publish, which the pre-flight check rejects. The redisplay must carry
+    // the *stale* version back, not the row's now-current one.
+    let stale_form = form(&[
+        ("title", "   "),
+        ("slug", ""),
+        ("excerpt", ""),
+        ("body", "v1, edited but never saved"),
+        ("status", "publish"),
+        ("password", ""),
+        ("taxonomy_names[post_tag]", ""),
+        ("comment_status", "open"),
+        ("lock_version", &stale_version.to_string()),
+    ]);
+    let rejected = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form)
+        .send()
+        .await;
+    rejected
+        .assert_status(422)
+        .assert_body_contains(&format!(r#"value="{stale_version}""#));
+
+    // Correcting just the title and resubmitting the same (still-stale) form
+    // must now be caught by optimistic locking — not silently accepted.
+    let resubmitted = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form.replacen("title=+++", "title=Fixed", 1))
+        .send()
+        .await;
+    resubmitted.assert_status(409);
 }
 
 /// A scheduled post's date needs to be both present and in the future — see
