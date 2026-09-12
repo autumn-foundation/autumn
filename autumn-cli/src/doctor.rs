@@ -11188,7 +11188,15 @@ fn edge_virtual_workspace_warn(name: &'static str) -> CheckResult {
 /// `src/bin/edge-capsule/main.rs`. A project that turns off `autobins` and
 /// never declares the target explicitly cannot build the capsule, even if
 /// one of these files exists on disk.
-fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::PathBuf> {
+///
+/// `pub` (not `pub(crate)`: `doctor` is a private module, so `pub` here
+/// still stops at the crate boundary): `build.rs`'s own preflight scan uses
+/// this too, to also scan the capsule bin's own source when it lives outside
+/// `src/` (a custom `[[bin]] path`) — without it, a registration written
+/// only there is invisible to `autumn build --edge` the same way it was to
+/// `autumn doctor` before this function was shared (Codex review on #2739,
+/// round 7).
+pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let conventional = || conventional_edge_capsule_bin(root);
     let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let table = toml::from_str::<toml::Table>(&content).ok()?;

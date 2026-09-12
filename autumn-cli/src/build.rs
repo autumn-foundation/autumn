@@ -416,7 +416,12 @@ fn resolve_project_edge_scan(
                 .collect()
         })
         .unwrap_or_default();
-    crate::edge_scan::resolve_edge_scan_with_features(&root, &requested)
+    // A custom `[[bin]] path` for the capsule can live outside `src/`, which
+    // the scan's own `src/` walk never reaches — see
+    // `resolve_edge_scan_with_extra_file`'s doc for why (Codex review on
+    // #2739, round 7).
+    let capsule_bin = crate::doctor::resolve_edge_capsule_bin(&root);
+    crate::edge_scan::resolve_edge_scan_with_extra_file(&root, &requested, capsule_bin.as_deref())
 }
 
 /// Run a cargo command, exiting the process on failure.

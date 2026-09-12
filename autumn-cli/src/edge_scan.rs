@@ -58,7 +58,13 @@
 //!   *relative* qualified entry (`v1::show` written inside `mod api { mod
 //!   v1 { ... } } }`, meaning `api::v1::show` in real Rust) is not resolved
 //!   — genuinely ambiguous without full symbol resolution — so it reports
-//!   as unregistered, the documented safe direction.
+//!   as unregistered, the documented safe direction. A bare or `crate`- (not
+//!   crate-name-) qualified entry additionally never crosses a `src/bin/`
+//!   crate boundary: it must be written in the same crate as the function it
+//!   names, since real Rust never resolves a bare name or `crate::` into a
+//!   different crate either — a `use` import that brings a library item into
+//!   a capsule bin's scope by a bare name is invisible to this scan, so that
+//!   pattern also reports as unregistered.
 //! - Only free functions are scanned, including those declared in inline
 //!   modules (`mod routes { ... }`) or out-of-line ones (`mod routes;`
 //!   backed by `src/routes.rs` or `src/routes/mod.rs`). A function generated
@@ -118,8 +124,19 @@ pub struct EdgeFn {
     /// Names of the modules the function is declared under, outermost first
     /// (`mod a { mod b { ... } }` gives `["a", "b"]`; an out-of-line `mod a;`
     /// backed by `src/a.rs` gives the same, derived from the file's own
-    /// location). Empty for a genuinely top-level function.
+    /// location). Empty for a genuinely top-level function. Relative to
+    /// [`Self::crate_root`], not necessarily to `src/` — see there.
     pub module_path: Vec<String>,
+    /// Which Cargo crate this function's own module path is relative to:
+    /// `""` for the app's library crate (anything under `src/` outside
+    /// `src/bin/`), or `"bin:<name>"` for a `[[bin]]` target's own separate
+    /// crate. Two functions can share an identical `module_path` (both
+    /// crate roots, say) while genuinely belonging to different crates —
+    /// [`is_registered`] treats this as part of the match key precisely so
+    /// a registration written in one crate can never silently credit a
+    /// same-named function root in another (Codex review on #2739, round 7,
+    /// P2).
+    pub crate_root: String,
 }
 
 impl EdgeFn {
@@ -135,14 +152,14 @@ impl EdgeFn {
 pub struct EdgeScan {
     /// Every `#[edge]`-marked function, in scan order (files sorted by path).
     pub functions: Vec<EdgeFn>,
-    /// Full path text of each `edge_routes![...]` entry, resolved against its
-    /// own module (`"users::show"` as written, or `"api::v1::show"` for a
-    /// `v1::show` entry written inside `mod api`). May hold more than one
-    /// resolved reading of the same entry (see [`registration_candidates`]),
-    /// so this is not exactly "as written" for every member — nothing outside
-    /// this module reads it directly, only through [`EdgeScan::unregistered`]
-    /// and [`EdgeScan::registered_fns`].
-    pub registered: BTreeSet<String>,
+    /// `(crate_root, path text)` for each `edge_routes![...]` entry: `crate_root`
+    /// is the crate the invocation itself was written in (see
+    /// [`EdgeFn::crate_root`]) and the text is the entry as written, with a
+    /// leading `self`/`super` resolved against the invocation's own module
+    /// (see [`registration_candidates`]). Nothing outside this module reads
+    /// it directly, only through [`EdgeScan::unregistered`] and
+    /// [`EdgeScan::registered_fns`].
+    pub registered: BTreeSet<(String, String)>,
     /// Number of `edge_routes![...]` invocations seen (0 means the app never
     /// registers its marked handlers, so the capsule would serve nothing).
     pub registrations: usize,
@@ -205,17 +222,22 @@ impl EdgeScan {
 ///
 /// An entry's last `::` segment must equal `f.name`. A bare entry (no `::`)
 /// matches `f` regardless of module — the scanner's long-standing lenient
-/// rule for unqualified names. A qualified entry matches only when its
-/// qualifier equals `f.module_path` exactly, crate-root prefix stripped (see
-/// below). `f.module_path` is always the scan's real answer, never a
-/// placeholder for "unknown": [`module_path_from_file`] derives it from the
-/// declaring file's own location, so an empty path means the function is
-/// genuinely declared at crate root (`src/lib.rs`, `src/main.rs`), not that
-/// the scan lost track of it. A qualified entry therefore does not match a
-/// crate-root function unless the qualifier is empty too (after the `crate`
-/// prefix is stripped) — the old rule of treating an empty path as "match any
-/// qualifier" would let an unrelated same-named function elsewhere silently
-/// satisfy a registration meant for the crate-root one.
+/// rule for unqualified names — but never across a crate boundary: a plain
+/// name in real Rust only ever resolves within the crate it is written in,
+/// so a bare (or otherwise same-crate-relative) entry matches only an `f`
+/// whose [`EdgeFn::crate_root`] equals the entry's own recorded crate.
+/// A qualified entry matches only when its qualifier equals `f.module_path`
+/// exactly, crate-root prefix stripped (see below). `f.module_path` is
+/// always the scan's real answer, never a placeholder for "unknown":
+/// [`crate_context_from_file`] derives it from the declaring file's own
+/// location, so an empty path means the function is genuinely declared at
+/// its crate's root (`src/lib.rs`, or `src/bin/<name>.rs`'s own separate
+/// crate), not that the scan lost track of it. A qualified entry therefore
+/// does not match a crate-root function unless the qualifier is empty too
+/// (after the `crate` prefix is stripped) — the old rule of treating an
+/// empty path as "match any qualifier" would let an unrelated same-named
+/// function elsewhere silently satisfy a registration meant for the
+/// crate-root one.
 ///
 /// Exact equality, not a suffix match, is deliberate: with sibling modules
 /// `mod a { mod x { #[edge] fn f() {} } }` and `mod b { mod x { #[edge] fn
@@ -227,32 +249,55 @@ impl EdgeScan {
 /// [`registration_candidates`] for the same reason — see its own doc for
 /// why trying it as a second candidate was reverted.
 ///
-/// A leading `crate` segment in the qualifier is stripped first, and so is a
-/// leading segment equal to `crate_name` (the scanned crate's own Rust
-/// library-crate identifier, when known — see
-/// [`rust_crate_name_from_manifest`]) — Rust treats a crate's own name as
-/// another valid path root to its items, same as `crate`. Either way
-/// `edge_routes![crate::users::show]` or `edge_routes![my_crate::users::show]`
-/// is the same route as `users::show`, and `f.module_path` never carries
-/// either prefix, so leaving it in would make such a registration miss its
-/// own function.
-fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>, crate_name: Option<&str>) -> bool {
-    registered.iter().any(|entry| {
+/// A leading `crate` segment in the qualifier is stripped first, and — only
+/// when the target is that same crate too, since `crate` never reaches
+/// outside it — requires `f.crate_root` to equal the entry's own recorded
+/// crate, the same same-crate rule a bare entry follows. A leading segment
+/// equal to `crate_name` (the scanned crate's own Rust library-crate
+/// identifier, when known — see [`rust_crate_name_from_manifest`]) is
+/// stripped the same way, but targets the library crate specifically
+/// (`f.crate_root` must be empty) regardless of which crate the entry
+/// itself was written in — Rust's own rule that a crate's name is a valid
+/// path root to its items from anywhere, including a `[[bin]]` target
+/// referencing the library crate it links against. Without requiring
+/// `f.crate_root` equality (or emptiness) at all, `edge_routes![crate::show]`
+/// written inside `src/bin/edge-capsule.rs` and a same-named `show` at
+/// `src/lib.rs`'s own root — two different crates, but the same empty
+/// `module_path` — would be indistinguishable, silently crediting whichever
+/// one this function happened to see first (Codex review on #2739, round 7,
+/// P2).
+fn is_registered(
+    f: &EdgeFn,
+    registered: &BTreeSet<(String, String)>,
+    crate_name: Option<&str>,
+) -> bool {
+    registered.iter().any(|(written_in, entry)| {
         let (qualifier, name) = entry.rsplit_once("::").unwrap_or(("", entry.as_str()));
         if name != f.name {
             return false;
         }
         if qualifier.is_empty() {
-            return true;
+            return *written_in == f.crate_root;
         }
         let mut qualifier_segments = qualifier.split("::");
-        let root_matches = match qualifier_segments.clone().next() {
-            Some("crate") => true,
-            Some(seg) => crate_name.is_some_and(|name| name == seg),
-            None => false,
-        };
-        if root_matches {
-            qualifier_segments.next();
+        match qualifier_segments.clone().next() {
+            Some("crate") => {
+                if *written_in != f.crate_root {
+                    return false;
+                }
+                qualifier_segments.next();
+            }
+            Some(seg) if crate_name.is_some_and(|name| name == seg) => {
+                if !f.crate_root.is_empty() {
+                    return false;
+                }
+                qualifier_segments.next();
+            }
+            _ => {
+                if *written_in != f.crate_root {
+                    return false;
+                }
+            }
         }
         qualifier_segments.eq(f.module_path.iter().map(String::as_str))
     })
@@ -423,6 +468,23 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether `[dependencies].<name>` (a plain dependency table only — target-
+/// specific and dev/build dependency tables are not consulted, matching this
+/// scanner's other best-effort limits) is declared `optional = true`. A
+/// version-string dependency (`name = "1"`) is never optional; only the
+/// expanded table form can set the flag.
+#[must_use]
+fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
+    table
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|deps| deps.get(name))
+        .and_then(toml::Value::as_table)
+        .and_then(|dep| dep.get("optional"))
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+}
+
 /// The scanned crate's own Rust library-crate identifier — what
 /// `edge_routes![this_name::item]` would actually have to spell to reach one
 /// of its items, same as `crate::item`. This is not always the bare
@@ -518,12 +580,19 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
             continue;
         }
         if let Some((pkg, _feat)) = name.split_once('/') {
-            // The strong form (`pkg/feat`, no `?`) also activates the
-            // optional dependency `pkg` itself, and Cargo auto-generates a
-            // same-named local feature for every optional dependency — so
-            // queue `pkg` for normal expansion. The weak form (`pkg?/feat`)
-            // makes no such promise.
-            if !pkg.ends_with('?') {
+            // The strong form (`pkg/feat`, no `?`) also activates `pkg`
+            // itself — but only when `pkg` is declared `optional = true`:
+            // Cargo auto-generates a same-named local feature for an
+            // optional dependency, never for a normal one, so a normal
+            // dependency sharing its name with an unrelated local feature
+            // must not have that feature turned on here (Codex review on
+            // #2739, round 7, P2). The weak form (`pkg?/feat`) makes no
+            // such promise either way.
+            if !pkg.ends_with('?')
+                && table
+                    .as_ref()
+                    .is_some_and(|t| is_optional_dependency(t, pkg))
+            {
                 queue.push(pkg.to_owned());
             }
             continue;
@@ -579,35 +648,43 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The two halves are independent on purpose — a file whose *items* fail to
 /// parse can still contribute registrations, and vice versa.
 fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan: &mut EdgeScan) {
+    let (crate_root, module_path) = crate_context_from_file(file);
     if let Ok(ast) = syn::parse_file(src) {
-        let mut module_path = module_path_from_file(file);
-        scan_items(&ast.items, file, &mut module_path, default_features, scan);
+        let mut module_path = module_path.clone();
+        scan_items(
+            &ast.items,
+            file,
+            &crate_root,
+            &mut module_path,
+            default_features,
+            scan,
+        );
     }
     if let Ok(stream) = TokenStream::from_str(src) {
-        let mut module_path = module_path_from_file(file);
-        collect_registrations(&stream, &mut module_path, scan);
+        let mut module_path = module_path;
+        collect_registrations(&stream, &crate_root, &mut module_path, scan);
     }
 }
 
-/// Derive a function's module-path *prefix* from the file it is declared
-/// in, following Rust's directory-mirrors-modules convention: `src/routes/
-/// home.rs` is module `routes::home`; `src/routes/mod.rs`, `src/main.rs`,
-/// and `src/lib.rs` contribute no segment of their own (each is the "index"
-/// file for its directory, or the crate root). Inline `mod x { ... }`
-/// nesting (tracked separately in [`scan_items`]) appends after this
-/// prefix, giving the full accumulated path.
+/// Derive a function's crate identity and module-path *prefix* from the file
+/// it is declared in, following Rust's directory-mirrors-modules convention:
+/// `src/routes/home.rs` is module `routes::home`; `src/routes/mod.rs`,
+/// `src/main.rs`, and `src/lib.rs` contribute no segment of their own (each
+/// is the "index" file for its directory, or the crate root). Inline `mod x
+/// { ... }` nesting (tracked separately in [`scan_items`]) appends after
+/// this prefix, giving the full accumulated path.
 ///
-/// Without this, every function reached via `mod x;` (a separate file) —
-/// the common case, not the inline-module one — got an empty module path.
-/// [`is_registered`] used to treat any empty path as "any qualifier
-/// matches" (a fallback for a path it genuinely could not resolve), which
-/// let `edge_routes![users::show]` mark an unrelated `admin::show` as
-/// registered too, for the exact `mod users;` / `mod admin;` layout this
-/// function exists to handle (Codex review on #2739, P2). That fallback is
-/// gone now that this function makes the path resolvable in the first
-/// place — an empty path means a genuine crate-root function, not an
-/// unresolved one, so `is_registered` no longer treats it as a wildcard
-/// either (Codex review on #2739, round 3, P2).
+/// Without the module-path half, every function reached via `mod x;` (a
+/// separate file) — the common case, not the inline-module one — got an
+/// empty module path. [`is_registered`] used to treat any empty path as
+/// "any qualifier matches" (a fallback for a path it genuinely could not
+/// resolve), which let `edge_routes![users::show]` mark an unrelated
+/// `admin::show` as registered too, for the exact `mod users;` / `mod
+/// admin;` layout this function exists to handle (Codex review on #2739,
+/// P2). That fallback is gone now that this function makes the path
+/// resolvable in the first place — an empty path means a genuine crate-root
+/// function, not an unresolved one, so `is_registered` no longer treats it
+/// as a wildcard either (Codex review on #2739, round 3, P2).
 ///
 /// A non-standard layout (`#[path = "..."]`, e.g.) can make this wrong, like
 /// every other heuristic in this best-effort scanner — see the module doc's
@@ -619,27 +696,36 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
 /// none of the above: Cargo treats it as its OWN crate root, one `[[bin]]`
 /// target entirely separate from the app's library crate, however deep its
 /// own path under `src/` looks. `crate::show` inside it means that bin
-/// target's own crate root, so the path derived here is relative to the bin
-/// target's root, not to `src/` itself (Codex review on #2739, round 6, P2).
+/// target's own crate root, so the module path returned here is relative to
+/// the bin target's root, not to `src/` itself, and the returned crate
+/// identity is `"bin:<name>"` rather than the library crate's `""` (Codex
+/// review on #2739, round 6, P2). The crate identity matters beyond
+/// resolving `crate::` correctly: two different crates can each declare a
+/// same-named function at their own root, both with an empty module path,
+/// and [`is_registered`] needs the identity to tell them apart (round 7,
+/// P2) — see [`EdgeFn::crate_root`].
 #[must_use]
-fn module_path_from_file(file: &str) -> Vec<String> {
+fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
     let without_ext = file.strip_suffix(".rs").unwrap_or(file);
     let without_src = without_ext.strip_prefix("src/").unwrap_or(without_ext);
     if without_src.is_empty() {
-        return Vec::new();
+        return (String::new(), Vec::new());
     }
     if let Some(rest) = without_src.strip_prefix("bin/") {
         // `<name>` alone (the flat `src/bin/<name>.rs` form) has nothing left
         // once the bin target's own name is dropped — it IS that crate's root.
-        let bin_relative = rest.split_once('/').map_or("", |(_name, tail)| tail);
-        return module_path_from_segments(bin_relative);
+        let (name, bin_relative) = rest.split_once('/').unwrap_or((rest, ""));
+        return (
+            format!("bin:{name}"),
+            module_path_from_segments(bin_relative),
+        );
     }
-    module_path_from_segments(without_src)
+    (String::new(), module_path_from_segments(without_src))
 }
 
 /// Split `path` on `/`, dropping a trailing `mod`/`main`/`lib` segment (the
 /// "index" file for its directory, or a crate root) — the rule
-/// [`module_path_from_file`] applies both from `src/` and, relative to a
+/// [`crate_context_from_file`] applies both from `src/` and, relative to a
 /// `[[bin]]` target's own root, from `src/bin/<name>/`.
 fn module_path_from_segments(path: &str) -> Vec<String> {
     if path.is_empty() {
@@ -662,6 +748,7 @@ fn module_path_from_segments(path: &str) -> Vec<String> {
 fn scan_items(
     items: &[syn::Item],
     file: &str,
+    crate_root: &str,
     module_path: &mut Vec<String>,
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
@@ -673,6 +760,7 @@ fn scan_items(
                     &item_fn.attrs,
                     &item_fn.sig,
                     file,
+                    crate_root,
                     module_path,
                     default_features,
                 ) {
@@ -682,7 +770,7 @@ fn scan_items(
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
                     module_path.push(item_mod.ident.to_string());
-                    scan_items(inner, file, module_path, default_features, scan);
+                    scan_items(inner, file, crate_root, module_path, default_features, scan);
                     module_path.pop();
                 }
             }
@@ -704,6 +792,7 @@ fn edge_fn(
     attrs: &[syn::Attribute],
     sig: &syn::Signature,
     file: &str,
+    crate_root: &str,
     module_path: &[String],
     default_features: &BTreeSet<String>,
 ) -> Option<EdgeFn> {
@@ -729,6 +818,7 @@ fn edge_fn(
         line: sig.ident.span().start().line,
         guards,
         module_path: module_path.to_vec(),
+        crate_root: crate_root.to_owned(),
     })
 }
 
@@ -806,7 +896,10 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 
 /// Find every `edge_routes![...]` invocation in a token stream and record the
 /// handler identifiers it registers, resolved against the module the
-/// invocation itself is written in.
+/// invocation itself is written in. `crate_root` is that same invocation's
+/// own crate identity (see [`EdgeFn::crate_root`]), recorded alongside each
+/// entry so [`is_registered`] can require it to match a function's own
+/// crate before crediting a same-crate-relative reference.
 ///
 /// Token-level rather than AST-level because the invocation is equally valid in
 /// item position, inside a function body, or nested in another macro's group —
@@ -819,8 +912,13 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 /// round 4, P2). An out-of-line `mod <name>;` has no group to recurse into
 /// here; its own registrations are covered when that file is scanned on its
 /// own, seeded from its file-derived module path instead (see
-/// [`module_path_from_file`]).
-fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, scan: &mut EdgeScan) {
+/// [`crate_context_from_file`]).
+fn collect_registrations(
+    stream: &TokenStream,
+    crate_root: &str,
+    module_path: &mut Vec<String>,
+    scan: &mut EdgeScan,
+) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut index = 0;
     while index < trees.len() {
@@ -831,13 +929,15 @@ fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, sc
             && group.delimiter() == Delimiter::Brace
         {
             module_path.push(name.to_string());
-            collect_registrations(&group.stream(), module_path, scan);
+            collect_registrations(&group.stream(), crate_root, module_path, scan);
             module_path.pop();
             index += 3;
             continue;
         }
         match &trees[index] {
-            TokenTree::Group(group) => collect_registrations(&group.stream(), module_path, scan),
+            TokenTree::Group(group) => {
+                collect_registrations(&group.stream(), crate_root, module_path, scan);
+            }
             TokenTree::Ident(ident) if ident == "edge_routes" => {
                 let bang = matches!(
                     trees.get(index + 1),
@@ -850,7 +950,7 @@ fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, sc
                     scan.registrations += 1;
                     for name in registered_idents(&group.stream()) {
                         for candidate in registration_candidates(&name, module_path) {
-                            scan.registered.insert(candidate);
+                            scan.registered.insert((crate_root.to_owned(), candidate));
                         }
                     }
                 }
@@ -1032,9 +1132,16 @@ mod tests {
             ",
         );
         assert_eq!(scan.registrations, 1);
-        // Full path text, not just the last segment.
-        assert!(scan.registered.contains("handlers::greet"));
-        assert!(scan.registered.contains("note"));
+        // Full path text, not just the last segment, tagged with the
+        // invocation's own crate (the library crate, `""`, for `src/main.rs`).
+        assert!(
+            scan.registered
+                .contains(&(String::new(), "handlers::greet".to_owned()))
+        );
+        assert!(
+            scan.registered
+                .contains(&(String::new(), "note".to_owned()))
+        );
         // `greet` is genuinely declared at crate root here (`src/main.rs`),
         // not inside a `handlers` module, so the qualified entry does not
         // match it — only the bare `note` entry does.
@@ -1122,7 +1229,7 @@ mod tests {
         let scan = scan_sources(&[
             ("src/handlers.rs", "#[edge]\nfn greet() {}"),
             (
-                "src/bin/edge-capsule.rs",
+                "src/lib.rs",
                 "fn main() { autumn_edge::serve(edge_routes![greet]); }",
             ),
         ]);
@@ -1327,6 +1434,9 @@ mod tests {
     #[test]
     fn a_strong_dependency_feature_reference_also_enables_the_dependency_itself() {
         let manifest = r#"
+            [dependencies]
+            dep = { version = "1", optional = true }
+
             [features]
             default = ["dep/extra"]
         "#;
@@ -1334,6 +1444,24 @@ mod tests {
         assert!(enabled.contains("dep"));
         assert!(!enabled.contains("extra"));
         assert!(!enabled.iter().any(|f| f.contains('/')));
+    }
+
+    /// Cargo only auto-generates a same-named local feature for an
+    /// *optional* dependency — a normal dependency shares no such link, so
+    /// `foo/extra` must not turn on an unrelated local feature that happens
+    /// to also be named `foo` (Codex review on #2739, round 7, P2).
+    #[test]
+    fn a_strong_reference_to_a_normal_dependency_does_not_enable_a_same_named_feature() {
+        let manifest = r#"
+            [dependencies]
+            foo = { version = "1" }
+
+            [features]
+            default = ["foo/extra"]
+            foo = []
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("foo"));
     }
 
     /// `dep?/extra` (the weak-dependency form) makes no promise that `dep`
@@ -1768,7 +1896,33 @@ mod tests {
             "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
         )]);
         assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert_eq!(scan.functions[0].crate_root, "bin:edge-capsule");
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// `src/lib.rs` and `src/bin/edge-capsule.rs` can each declare a
+    /// crate-root `show` — both with an *empty* `module_path`, since each is
+    /// its own crate's root — so `edge_routes![crate::show]` written in the
+    /// capsule must credit only the capsule's own `show`, never the
+    /// library's unrelated same-named one (Codex review on #2739, round 7,
+    /// P2).
+    #[test]
+    fn crate_qualified_registrations_do_not_cross_a_bin_targets_crate_boundary() {
+        let scan = scan_sources(&[
+            ("src/lib.rs", "#[edge]\npub fn show() {}\n"),
+            (
+                "src/bin/edge-capsule.rs",
+                "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+            ),
+        ]);
+
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/lib.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/bin/edge-capsule.rs");
     }
 
     /// Same as above for the directory-style bin layout
