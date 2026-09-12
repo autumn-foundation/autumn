@@ -45,9 +45,8 @@
 //!   with that name in any module — the old, lenient rule. A qualified entry
 //!   (`users::show`, or `crate::users::show` with the `crate::` prefix
 //!   stripped first) matches only a function whose own module path is
-//!   exactly `users`, unless the scan never learned the function's module
-//!   path — the scan cannot know such a function's true, resolved module
-//!   path from its declaring file alone, so any qualifier still matches it.
+//!   exactly `users` — including a crate-root function (an empty module
+//!   path), which only a qualifier of `crate` (or none) can match.
 //! - Only free functions are scanned, including those declared in inline
 //!   modules (`mod routes { ... }`) or out-of-line ones (`mod routes;`
 //!   backed by `src/routes.rs` or `src/routes/mod.rs`). A function generated
@@ -183,9 +182,16 @@ impl EdgeScan {
 /// An entry's last `::` segment must equal `f.name`. A bare entry (no `::`)
 /// matches `f` regardless of module — the scanner's long-standing lenient
 /// rule for unqualified names. A qualified entry matches only when its
-/// qualifier equals `f.module_path` exactly, unless `f.module_path` is empty
-/// (a top-level function, whose real, resolved module path the scan cannot
-/// know from its declaring file alone) — then any qualifier still matches.
+/// qualifier equals `f.module_path` exactly, crate-root prefix stripped (see
+/// below). `f.module_path` is always the scan's real answer, never a
+/// placeholder for "unknown": [`module_path_from_file`] derives it from the
+/// declaring file's own location, so an empty path means the function is
+/// genuinely declared at crate root (`src/lib.rs`, `src/main.rs`), not that
+/// the scan lost track of it. A qualified entry therefore does not match a
+/// crate-root function unless the qualifier is empty too (after the `crate`
+/// prefix is stripped) — the old rule of treating an empty path as "match any
+/// qualifier" would let an unrelated same-named function elsewhere silently
+/// satisfy a registration meant for the crate-root one.
 ///
 /// Exact equality, not a suffix match, is deliberate: a relative reference
 /// written from inside an ancestor of `f`'s module (`edge_routes![v1::greet]`
@@ -207,7 +213,7 @@ fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
         if name != f.name {
             return false;
         }
-        if qualifier.is_empty() || f.module_path.is_empty() {
+        if qualifier.is_empty() {
             return true;
         }
         let mut qualifier_segments = qualifier.split("::");
@@ -244,18 +250,22 @@ fn scan_sources_with_features(
 /// [`scan_sources_with_features`] instead.
 ///
 /// `#[cfg(test)]`: nothing outside a test build calls this — production code
-/// goes through [`resolve_edge_scan`], which needs the real feature set.
+/// goes through [`resolve_edge_scan_with_features`], which needs the real
+/// feature set.
 #[cfg(test)]
 #[must_use]
 pub fn scan_sources(sources: &[(&str, &str)]) -> EdgeScan {
     scan_sources_with_features(sources, &BTreeSet::new())
 }
 
-/// [`resolve_edge_scan`] with no explicitly-requested features — the shape
-/// every caller used before `autumn build --features x` needed to widen the
-/// considered set beyond the manifest's own defaults.
+/// [`resolve_edge_scan_with_features`] with no explicitly-requested
+/// features. Every real caller now passes its own requested-features list
+/// (`build.rs`'s `--features x`, `doctor.rs`'s always-empty `&[]`), so this
+/// convenience wrapper is test-only — like [`scan_sources`], nothing outside
+/// a test build calls it.
+#[cfg(test)]
 #[must_use]
-pub fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
+fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
     resolve_edge_scan_with_features(project_root, &[])
 }
 
@@ -313,6 +323,50 @@ pub fn resolve_edge_scan_with_features(
     scan_sources_with_features(&borrowed, &default_features)
 }
 
+/// [`resolve_edge_scan_with_features`], plus `extra_file` — a path outside
+/// `project_root/src` to scan as well.
+///
+/// A project may declare its edge-capsule bin at a custom `[[bin]] path`
+/// outside `src/` (`path = "cmd/edge.rs"`). The `src/` walk above can never
+/// reach such a file, so a `edge_routes![...]` call written only there was
+/// invisible to the scan — every handler it wires looked unregistered to
+/// `autumn doctor`, even though the real build serves them fine. `extra_file`
+/// is a no-op when `None`, unreadable, or already under `src/` (the `src/`
+/// walk scanned it there already; scanning it again would double-count its
+/// functions).
+#[must_use]
+pub fn resolve_edge_scan_with_extra_file(
+    project_root: &Path,
+    requested_features: &[&str],
+    extra_file: Option<&Path>,
+) -> EdgeScan {
+    let mut scan = resolve_edge_scan_with_features(project_root, requested_features);
+    let Some(file) = extra_file else {
+        return scan;
+    };
+    if file.starts_with(project_root.join("src")) {
+        return scan;
+    }
+    let Ok(rel) = file.strip_prefix(project_root) else {
+        return scan;
+    };
+    let Ok(src) = std::fs::read_to_string(file) else {
+        return scan;
+    };
+    let default_features = std::fs::read_to_string(project_root.join("Cargo.toml"))
+        .ok()
+        .map(|manifest| enabled_features_from_manifest(&manifest, requested_features))
+        .unwrap_or_default();
+    scan_source(
+        &rel.to_string_lossy().replace('\\', "/"),
+        &src,
+        &default_features,
+        &mut scan,
+    );
+    scan.files_scanned += 1;
+    scan
+}
+
 /// Read a crate's `Cargo.toml`, seed the feature queue with `[features]
 /// default = [...]` plus `requested` (features asked for on the command
 /// line), and follow both through the feature graph in `[features]` to build
@@ -330,24 +384,30 @@ pub fn resolve_edge_scan_with_features(
 /// conservative regardless.
 ///
 /// `requested` may use Cargo's package-qualified `--features` syntax
-/// (`autumn build -p blog --features blog/extra-routes`, `pkg?/feat`) — the
-/// qualifier is stripped so the plain feature name reaches the queue instead
-/// of being dropped by the dependency-feature check below, which would
-/// silently miss it and leave a real, enabled route out of the scan (the
-/// dangerous direction this scan exists to avoid). A qualifier naming a
-/// different crate does no harm: the stripped name will not match any
-/// `#[cfg(feature = "...")]` in this crate's own sources either way.
+/// (`autumn build -p blog --features blog/extra-routes`, `pkg?/feat`). When
+/// `pkg` names *this* crate (its own `[package] name`), that is exactly a
+/// request for `feat`, so the qualifier is stripped — leaving it in would
+/// drop the feature at the dependency-feature check below and silently miss
+/// a route the real build turns on, the dangerous direction this scan exists
+/// to avoid. A qualifier naming a *different* crate is left untouched (and so
+/// still dropped there): a workspace build can turn on a same-named feature
+/// on some other package, and stripping that qualifier too would wrongly
+/// enable this crate's own `#[cfg(feature = "...")]` code that Cargo left
+/// off, the opposite mistake.
 #[must_use]
 fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
-    let features_table = toml::from_str::<toml::Table>(manifest)
-        .ok()
-        .and_then(|table| {
-            table
-                .get("features")
-                .and_then(toml::Value::as_table)
-                .cloned()
-        });
+    let table = toml::from_str::<toml::Table>(manifest).ok();
+    let features_table = table
+        .as_ref()
+        .and_then(|table| table.get("features"))
+        .and_then(toml::Value::as_table)
+        .cloned();
+    let package_name = table
+        .as_ref()
+        .and_then(|table| table.get("package"))
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str);
 
     let mut queue: Vec<String> = features_table
         .as_ref()
@@ -362,8 +422,16 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
         })
         .unwrap_or_default();
     queue.extend(requested.iter().map(|name| {
-        name.rsplit_once('/')
-            .map_or_else(|| (*name).to_owned(), |(_, feat)| feat.to_owned())
+        name.split_once('/').map_or_else(
+            || (*name).to_owned(),
+            |(pkg, feat)| {
+                if Some(pkg.trim_end_matches('?')) == package_name {
+                    feat.to_owned()
+                } else {
+                    (*name).to_owned()
+                }
+            },
+        )
     }));
 
     while let Some(name) = queue.pop() {
@@ -439,12 +507,16 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
 /// prefix, giving the full accumulated path.
 ///
 /// Without this, every function reached via `mod x;` (a separate file) —
-/// the common case, not the inline-module one — got an empty module path,
-/// which the lenient top-level fallback in [`is_registered`] treats as
-/// "any qualifier matches." That let `edge_routes![users::show]` mark an
-/// unrelated `admin::show` as registered too, for the exact `mod users;` /
-/// `mod admin;` layout this whole check exists to handle (Codex review on
-/// #2739, P2).
+/// the common case, not the inline-module one — got an empty module path.
+/// [`is_registered`] used to treat any empty path as "any qualifier
+/// matches" (a fallback for a path it genuinely could not resolve), which
+/// let `edge_routes![users::show]` mark an unrelated `admin::show` as
+/// registered too, for the exact `mod users;` / `mod admin;` layout this
+/// function exists to handle (Codex review on #2739, P2). That fallback is
+/// gone now that this function makes the path resolvable in the first
+/// place — an empty path means a genuine crate-root function, not an
+/// unresolved one, so `is_registered` no longer treats it as a wildcard
+/// either (Codex review on #2739, round 3, P2).
 ///
 /// A non-standard layout (`#[path = "..."]`, e.g.) can make this wrong, like
 /// every other heuristic in this best-effort scanner — see the module doc's
@@ -776,13 +848,21 @@ mod tests {
         // Full path text, not just the last segment.
         assert!(scan.registered.contains("handlers::greet"));
         assert!(scan.registered.contains("note"));
-        assert!(scan.unregistered().is_empty());
+        // `greet` is genuinely declared at crate root here (`src/main.rs`),
+        // not inside a `handlers` module, so the qualified entry does not
+        // match it — only the bare `note` entry does.
+        let unregistered: Vec<&str> = scan
+            .unregistered()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(unregistered, vec!["greet"]);
         assert_eq!(
             scan.registered_fns()
                 .iter()
                 .map(|f| f.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["greet", "note"]
+            vec!["note"]
         );
     }
 
@@ -1021,13 +1101,35 @@ mod tests {
     /// route the real build turns on.
     #[test]
     fn a_package_qualified_requested_feature_resolves_to_its_bare_name() {
-        let manifest = r"
+        let manifest = r#"
+            [package]
+            name = "blog"
+
             [features]
             default = []
-        ";
+        "#;
         let enabled = enabled_features_from_manifest(manifest, &["blog/extra-routes"]);
         assert!(enabled.contains("extra-routes"));
         assert!(!enabled.iter().any(|f| f.contains('/')));
+    }
+
+    /// `dep/extra` on the command line turns on `extra` in the dependency
+    /// `dep`, not in this crate — even when this crate happens to declare its
+    /// own feature literally named `extra`. Stripping the qualifier here
+    /// would wrongly enable this crate's `#[cfg(feature = "extra")]` code
+    /// that Cargo actually left off.
+    #[test]
+    fn a_dependency_qualified_requested_feature_is_not_mistaken_for_a_local_one() {
+        let manifest = r#"
+            [package]
+            name = "blog"
+
+            [features]
+            default = []
+            extra = []
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &["dep/extra"]);
+        assert!(!enabled.contains("extra"));
     }
 
     #[test]
@@ -1194,6 +1296,30 @@ mod tests {
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
         assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// `show`'s module path is genuinely empty here — declared directly in
+    /// `src/main.rs`, a crate root — not "unknown". A qualified registration
+    /// for a *different* module must not wildcard-match it just because its
+    /// path happens to be empty: that would let `edge_routes![users::show]`
+    /// silently satisfy this crate-root `show`, hiding that it is really
+    /// unregistered while a same-named `users::show` (if one existed) would
+    /// look doubly registered.
+    #[test]
+    fn a_qualified_registration_does_not_wildcard_match_a_crate_root_fn() {
+        let scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() { edge_routes![users::show]; }
+            ",
+        );
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].name, "show");
+        assert!(unregistered[0].module_path.is_empty());
+        assert!(scan.registered_fns().is_empty());
     }
 
     /// `mod users;` / `mod admin;` (separate files, not inline `mod { }`

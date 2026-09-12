@@ -283,15 +283,17 @@ fn doctor_warns_capsule_missing_when_autobins_disabled_and_undeclared() {
 fn doctor_honors_a_custom_capsule_bin_path() {
     // A custom `[[bin]] path` for `edge-capsule` must be checked directly,
     // not the conventional `src/bin/edge-capsule.rs` (which doesn't exist
-    // here at all).
+    // here at all). The registration lives ONLY in `cmd/edge.rs` — outside
+    // `src/` — so this also proves that file is scanned, not just probed for
+    // existence (issue #2244).
     let dir = project_with_manifest(
         "[workspace]\n\n[package]\nname = \"edgeapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
          [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
         &[
-            ("src/main.rs", REGISTERED_EDGE_APP),
+            ("src/main.rs", UNREGISTERED_EDGE_APP),
             (
                 "cmd/edge.rs",
-                "fn main() { autumn_edge::serve(edgeapp::edge_route_list()); }\n",
+                "fn main() { autumn_edge::serve(edge_routes![greet]); }\n",
             ),
         ],
     );
@@ -300,7 +302,8 @@ fn doctor_honors_a_custom_capsule_bin_path() {
     let edge_routes = check(&report, "edge_routes");
     assert_eq!(
         edge_routes["status"], "pass",
-        "a custom [[bin]] path must be honored, not treated as missing: {edge_routes}"
+        "a registration written only in a custom [[bin]] path must be seen, \
+         not reported as missing: {edge_routes}"
     );
 }
 

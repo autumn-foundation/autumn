@@ -10127,7 +10127,12 @@ pub fn run(opts: DoctorOptions) {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_target");
         }
-        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
+        let capsule_bin = resolve_edge_capsule_bin(std::path::Path::new("."));
+        let scan = crate::edge_scan::resolve_edge_scan_with_extra_file(
+            std::path::Path::new("."),
+            &[],
+            capsule_bin.as_deref(),
+        );
         // Probe the toolchain only when the answer can matter: a project with no
         // #[edge] routes must not pay for a `rustc` spawn on every doctor run.
         let installed = !scan.is_empty() && crate::build::edge_target_installed();
@@ -10137,14 +10142,20 @@ pub fn run(opts: DoctorOptions) {
     // 17. Edge route wiring (issue #1790): an `#[edge]` handler that also
     //     carries an auth guard fails the build, an unregistered one is never
     //     served at the edge, and a missing edge-capsule bin leaves nothing to
-    //     compile.
+    //     compile. The resolved capsule bin is also scanned when it lives
+    //     outside `src/` (a custom `[[bin]] path`), so a registration written
+    //     only there is not misreported as missing (issue #2244).
     tasks.push(Box::new(move || {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_routes");
         }
-        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
-        let capsule_bin_exists =
-            resolve_edge_capsule_bin(std::path::Path::new(".")).is_some_and(|p| p.exists());
+        let capsule_bin = resolve_edge_capsule_bin(std::path::Path::new("."));
+        let scan = crate::edge_scan::resolve_edge_scan_with_extra_file(
+            std::path::Path::new("."),
+            &[],
+            capsule_bin.as_deref(),
+        );
+        let capsule_bin_exists = capsule_bin.is_some_and(|p| p.exists());
         check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
