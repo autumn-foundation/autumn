@@ -1202,3 +1202,11 @@ path = "tests/loom_models.rs"
 
 [lints]
 workspace = true
+
+# mTLS rejection counters (#1640). Its own binary because the metric registry is
+# a process-global singleton with a bounded instrument count: sharing the
+# consolidated `integration_tests` process would evict the instruments this
+# suite asserts on before it ever read them.
+[[test]]
+name = "tls_client_auth_metrics"
+path = "tests/tls_client_auth_metrics.rs"

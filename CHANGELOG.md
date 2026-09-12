@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mutual TLS: client-certificate verification on the native listener (#1640):**
+  a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
+  not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
+  and the handshake requests and verifies a client certificate; `mode` is `off`
+  (the default), `optional` (requested, verified when presented) or `required`
+  (no certificate, no handshake). With the section absent the handshake is
+  byte-for-byte #1603's server-only TLS, and no new dependency is pulled in.
+  **Breaking:** three published types gain members — `TlsConfig` gains
+  `client_auth`, `TlsError` gains the variants that name a bad trust store (and
+  becomes `#[non_exhaustive]`, so the next one will not break you), and
+  `SecurityDump` gains `client_auth`. Only code that constructs one of those by
+  literal or matches `TlsError` exhaustively is affected, and each surfaces as a
+  compiler error, never a silent behaviour change. The HTTPS listener's
+  connect-info type also changes from `SocketAddr` to `TlsConnectInfo`, which a
+  framework layer immediately re-stamps, so `ConnectInfo<SocketAddr>`,
+  `ClientAddr`, trusted-proxy resolution and rate limiting are unchanged for
+  handlers. See [the migration guide](docs/migrations/next.md).
+  `required_paths` locks individual routes, so one process serves public and
+  mTLS-only routes; a request reaching one without a verified certificate gets
+  `403` and the standard JSON error envelope. `RequireClientCertLayer` does the
+  same for a sub-router in code. The verified identity — subject DN, issuer,
+  SANs, SHA-256 fingerprint, serial — reaches handlers through the `ClientCert` /
+  `OptionalClientCert` extractors and sits on the `PolicyContext` beside the
+  session user and token scopes, so an `#[authorize]` policy can decide on
+  machine identity (`ctx.client_has_san("URI:spiffe://…")`). The trust store and
+  an optional `crl_path` hot-reload by the same modification-time polling the
+  server certificate uses — its own loop, at its own
+  `[server.tls.client_auth] reload_interval_secs` — so a CA rotation — ship old+new in one bundle, later drop old
+  — needs no restart and drops no established connection. Every rejected
+  handshake is counted by reason (`tls_client_auth_rejected_total`) and
+  logged operator-side, rate-limited to one line per second per reason, while the
+  client sees only the standard TLS alert; startup fails fast, naming the path, on
+  a missing, unparseable or empty bundle or CRL. `autumn doctor` grades the
+  surface offline as `tls_client_auth`, and a route's mTLS requirement is a new
+  `mtls` dimension of the security-posture manifest (schema v4), so
+  `autumn routes posture diff` blocks on a route that silently drops it. Revocation is a
+  static CRL plus short-lived certificates; OCSP is not in this slice. A listener
+  with client auth active also disables TLS session resumption: rustls restores a
+  resumed connection's peer certificate from the stored session without re-running
+  the verifier, so a revoked client could otherwise reconnect until its session
+  expired. Server-only TLS keeps resumption untouched. See the
+  [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
 - **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
   README.md's `## Example` and the four `rust,no_run` snippets in
   `docs/guide/getting-started.md` (a CSRF form handler plus three
@@ -290,6 +332,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Docs gate: the drift gates must now agree on which pages are reader-facing
+  [no-plugin].**
+  `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
+  each read "the reader-facing corpus", and four of them spell that set out
+  themselves as tuples of path prefixes; three carry a comment promising the
+  spellings are kept identical, "since a page covered by one gate and not the
+  other is how a page ends up with no owner." Nothing checked that, and they had
+  drifted. `.claude/skills/` — a second skill tree the agent machinery loads by
+  name, where `run-autumn` lives — had been added to `check-docs-routes.sh` and
+  to `check-docs-orphans.sh`'s entry surfaces and never to the other three, so
+  five of the eight gates read that tree and three did not. Its SKILL.md is
+  copy-and-run text end to end, and its `autumn seed --package`, `autumn routes
+  --bin`, `-p autumn-web`, `AUTUMN_SERVER__PORT` and `AUTUMN_DATABASE__URL` were
+  ungated for command, config-key and symbol drift alike — while the same file
+  already carried `route-surface-allow` waivers for the one gate that did read
+  it. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
+  take the tree in this change, and all eight gates stay green over it. Review
+  of the gate found two further divergences of the same shape, both fixed here:
+  `check-docs-cli.sh` passed `*.md` to `git ls-files` where its siblings passed
+  `*.md` and `*.md.tmpl`, leaving `autumn-cli/src/templates/README.md.tmpl` —
+  the README `autumn new` writes into every scaffolded project, carrying a
+  reference table of `autumn dev`, `autumn migrate`, `autumn doctor`, `autumn
+  routes`, `autumn generate scaffold` and `autumn release init` — outside the
+  one gate that exists to check `autumn …` commands; and `check-docs-routes.sh`
+  read the `readme = "…"` page of every crate manifest, a crates.io landing page
+  being reader-facing by publication rather than by where it sits, while its
+  siblings did not, leaving the seven published plugin and subcrate READMEs
+  ungated for the 18 `autumn_web::…` occurrences and 3 `AUTUMN_*` variables they
+  carry. The three siblings' corpus goes 198→207, 199→207 and 199→207, with no
+  drift found in the pages newly covered. Each of the four gates gains a
+  `--corpus` mode that prints its own resolved corpus, and the new gate compares
+  those lists rather than re-deriving them: a corpus is widened in several
+  places at once — the `ls-files` globs, the scope tuples, the `.md.tmpl`
+  clause, the crate manifests — and a checker that models some of those rules
+  reports agreement over the rest, which is how the first version of it passed
+  two of these three. It therefore fails when a scope is edited rather than when
+  the pages that scope stopped covering finally rot, and a gate whose `--corpus`
+  fails or prints nothing is a failure rather than a skip. A difference between gates
+  is allowed but must be recorded in the script's `DECLARED_DIFFERENCES` table
+  with its reason — the rule that catches what a superset check cannot, namely
+  one gate widening alone while its siblings still agree with each other, which
+  is exactly how this drift passed unnoticed. A declaration is keyed by the
+  direction the difference runs in as well as its path, and states what each
+  side reads under that path as a claim checked against the tracked tree rather
+  than trusted — two ways a looser key let a note waive something it was never
+  written about. Keyed by path alone it waived its own opposite: dropping a
+  prefix from the routes gate is a loss of coverage, not the difference
+  described, and the lookup still matched. Keyed by path and direction it
+  survived on a replacement: the routes gate could stop reading the served
+  pages the note exists for and pick up some unrelated file under the same
+  prefix instead. The declarations are themselves checked before any corpus is
+  read — a prefix, a direction, a claim per side from a fixed vocabulary, and a
+  non-empty reason. The reason is enforced rather than conventional because the
+  gate's premise is that a difference gets written down, and nothing had been
+  reading it. One difference is declared today:
+  the routes gate reads all of `examples/` rather than only the `README.md`
+  under it, because `examples/wiki/content/` is embedded and served, an argument
+  about URLs that does not carry to commands or config keys. A declaration that
+  no longer describes a real difference is itself reported, so the table cannot
+  accumulate stale reasons.
 - **`autumn deploy` now creates the MediaMTX recordings directory it preflights
   (#1974).** `deploy up` fail-closed on a missing `[media.mediamtx]
   recordings_dir` while provisioning only created the config file's parent, so a
@@ -376,6 +478,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
   the final program, closing out the issue's suggested composition-test
   coverage.
+- **aws-ecs:** the generated ECS "migrate" task definition now carries the
+  full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
+  `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
+  Redis is enabled) instead of just the database URL (#2255). CI
+  (`aws-deploy.yml`) and the manual walkthrough in
+  `docs/guide/deployment.md` both copy the migrate task's secrets onto the
+  "app" task definition when registering the real image, so a narrower
+  migrate secret list silently stripped the signing secret from every real
+  app deploy, and the app failed fast on startup.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
@@ -760,6 +871,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
+  subscription (buffers -97.8%):** `close_dunning_for`
+  (`autumn-billing/src/reconcile.rs`), the step a `subscription.deleted`/
+  canceled webhook takes to settle any open dunning schedule for the
+  subscription that just ended, called `BillingStore::open_dunning()` —
+  every `Pending`/`Running` row in the **entire** `billing_dunning` table,
+  system-wide — and filtered the returned `Vec` in Rust for the one
+  `subscription_id` it wanted. The only index on that table
+  (`billing_dunning_state_idx (state, next_attempt_at)`) has no leading
+  column on `subscription_id`, so every cancellation paid for a scan of the
+  whole open-dunning backlog regardless of which subscription was canceling.
+  `BillingStore` gains a required `open_dunning_for_subscription` method
+  (both `MemoryBillingStore` and `DbBillingStore` implement it; a new
+  migration adds a partial `billing_dunning_subscription_idx (subscription_id)
+  WHERE subscription_id IS NOT NULL`), and `close_dunning_for` now calls it
+  instead of filtering client-side. Profiled against a 20,000-subscription
+  fixture (4,000 open dunning rows, ~2,857 closed historical ones) driving
+  296 real `reconcile::apply` cancellations: the open-dunning read's share of
+  the workload's `pg_stat_statements` buffers falls from 73.8% (36,118
+  buffers) to 5.8% (809 buffers); `EXPLAIN` confirms the plan moves from a
+  `Seq Scan` reading every open row on every call to an `Index Scan` on the
+  new index reading only the canceling subscription's own rows. No
+  behavior change: every existing `autumn-billing` test (162 unit/contract
+  tests plus the Postgres-backed contract suite) passes unchanged, and a
+  new contract test (`open_dunning_for_subscription_is_scoped_and_filtered`)
+  covers the NULL-subscription and cross-subscription edge cases. See
+  `docs/reports/2026-09-11-ledger-dunning-close-scan-scoped/`.
+
 - **🗃️ Ledger: `autumn generate admin`'s bulk delete is now batched
   generator-wide (statements N→1, buffers -41.5%):** three of this
   framework's own bundled admin models (`TokenAdminModel`,
@@ -869,6 +1008,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark's total past a flat percentage floor — the case for shipping
   it is the function-level number plus zero behavior change and zero new
   dependencies.
+- **⚡ Bolt: drop four needless `Service::clone()`s from the ingress
+  middleware fast paths (instructions -5.5%, allocation bytes -10.6%):**
+  `autumn/benches/request_pipeline.rs` (the committed ingress-pipeline
+  profiler, issue #2193) profiled under `valgrind --tool=dhat` showed
+  `TrustedProxiesService`, `MethodOverrideService`, `SubmitTokenService` and
+  `idempotency::IdempotencyReplayService` each allocating on effectively
+  every request — 2.7 MB of the run's 17.6 MB marginal allocation bytes —
+  from `tower::util::boxed_clone_sync::CloneService::clone_box`. Each of
+  these `call()`s did a `let mut inner = self.inner.clone(); std::mem::swap(
+  &mut self.inner, &mut inner);` before `Box::pin`-ing the result, a pattern
+  copied from sibling middlewares that genuinely need to move an owned `S`
+  into an `async move` block. These four don't: on their common-case path
+  (no CAPTCHA/replay/override/guard applicable — every GET, every non-form
+  POST) nothing runs between entry and the delegating call, so
+  `self.inner.call(req)` can be boxed directly with `&mut self.inner`,
+  never touching `Clone`. `self.inner` is, at this point in the stack, a
+  `BoxCloneSyncService` whose `Clone` impl allocates a fresh
+  `Box<dyn CloneService>` to duplicate the remaining downstream stack — the
+  exact cost issue #2214 already eliminated from four *other* middlewares by
+  converting their `from_fn` closures to named-future `Service`s; this
+  targets the same mechanism on the four `Service`s #2214 didn't touch
+  (`SubmitTokenService`/`IdempotencyReplayService` split their existing
+  branch structure so only the guarded/replay path still clones;
+  `TrustedProxiesService` and `MethodOverrideService`'s ineligible-request
+  branch never needed the clone at all). Behavior is unchanged: all 98
+  existing unit tests across the four modules and all 105 existing
+  CSRF/idempotency/submit-token/trusted-proxy/`ingress_named_futures`
+  integration tests pass unmodified. Independently corroborated by two
+  pre-existing gates neither of which this change touches:
+  `tests/config_alloc_gate.rs`'s exact in-process `allocation-counter`
+  measurement of a single `/ping` request through the production stack
+  (140 → 132 blocks, 27,982 → 25,022 bytes) and
+  `tests/integration/middleware_stack_depth.rs`'s clone-event probe (9 → 7
+  traversals, still inside its documented `6..=9` window — the same counter
+  #2214 introduced for exactly this class of fix). Measured end to end via
+  `request_pipeline.rs` (`valgrind --tool=callgrind`, base-subtracted,
+  mean of 3 runs each side to bound run-to-run hash-seed variance):
+  marginal instructions/3000-request run 289,823,338 → 273,790,211 (-5.53%);
+  via `valgrind --tool=dhat`: marginal allocation bytes 17,617,058 →
+  16,108,256 (-8.56%), blocks 90,507 → 86,307 (-4.64%).
 
 ### Fixed
 
