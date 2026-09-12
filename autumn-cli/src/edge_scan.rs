@@ -1466,14 +1466,29 @@ fn collect_out_of_line_mods(
 /// exists — a non-standard `#[path = "..."]` override, like every other
 /// heuristic in this best-effort scanner, is not resolved (see the module
 /// doc's "Recognition limits").
+///
+/// A raw identifier (`mod r#type;`) keeps its `r#` prefix as a Rust path
+/// segment — `syn::Ident::to_string()` preserves it verbatim (verified
+/// directly) — but Rust's own file-system module-resolution convention
+/// strips it: `mod r#type;` resolves to `type.rs`, never `r#type.rs`
+/// (verified directly against a real build). Every accumulated directory
+/// segment needs the same normalization, not just the leaf `name` — a
+/// nested `mod r#type { mod inner; }` accumulates `r#type` into
+/// `dir_segments` too (Codex review on #2739, round 22, P2).
 fn resolve_out_of_line_module_file(
     root_dir: &Path,
     dir_segments: &[String],
     name: &str,
 ) -> Option<PathBuf> {
+    fn strip_raw(segment: &str) -> &str {
+        segment.strip_prefix("r#").unwrap_or(segment)
+    }
     let dir = dir_segments
         .iter()
-        .fold(root_dir.to_path_buf(), |dir, segment| dir.join(segment));
+        .fold(root_dir.to_path_buf(), |dir, segment| {
+            dir.join(strip_raw(segment))
+        });
+    let name = strip_raw(name);
     let flat = dir.join(format!("{name}.rs"));
     if flat.is_file() {
         return Some(flat);
@@ -4377,5 +4392,53 @@ mod tests {
         assert_eq!(registered[0].file, "cmd/routes.rs");
         assert_eq!(registered[0].module_path, vec!["routes".to_owned()]);
         assert_eq!(registered[0].crate_root, "bin:edge-capsule");
+    }
+
+    /// Same as above, but the out-of-line submodule is declared with a
+    /// keyword-escaping raw identifier (`mod r#type;`) — `syn::Ident::to_string()`
+    /// keeps the `r#` prefix verbatim, but Rust's own file-system
+    /// module-resolution convention strips it (`mod r#type;` resolves to
+    /// `type.rs`, never `r#type.rs`, verified directly against a real
+    /// build), so the file lookup must normalize it away even though the
+    /// registration path keeps it (Codex review on #2739, round 22, P2).
+    #[test]
+    fn a_custom_out_of_tree_bins_raw_identifier_submodule_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "cmd/edge.rs"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "mod r#type;\nfn main() { edge_routes![r#type::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/type.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "cmd/type.rs");
     }
 }
