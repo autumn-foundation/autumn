@@ -110,9 +110,11 @@ pub fn project_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
 fn count_pairs(
     headers: &[(String, String)],
 ) -> std::collections::BTreeMap<(String, String), usize> {
-    let mut counts = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
     for pair in headers {
-        *counts.entry(pair.clone()).or_insert(0) += 1;
+        let count = counts.entry(pair.clone()).or_insert(0_usize);
+        *count = count.saturating_add(1);
     }
     counts
 }
