@@ -431,13 +431,16 @@ fn resolve_edge_scan_impl(
     // the safe direction: every `#[cfg(feature = "...")]` then stays
     // unresolved, and the function it gates stays in the scan.
     let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
-    let default_features = manifest
-        .as_deref()
-        .map(|manifest| enabled_features_from_manifest(manifest, requested_features))
-        .unwrap_or_default();
     let table = manifest
         .as_deref()
         .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
+    let resolver_v1 = resolver_v1_is_in_effect(project_root, table.as_ref());
+    let default_features = manifest
+        .as_deref()
+        .map(|manifest| {
+            enabled_features_from_manifest_for_resolver(manifest, requested_features, resolver_v1)
+        })
+        .unwrap_or_default();
     let crate_name = table.as_ref().and_then(rust_crate_name_from_manifest);
     let custom_lib_path = table.as_ref().and_then(custom_lib_path_from_manifest);
 
@@ -587,8 +590,9 @@ pub fn resolve_edge_scan_with_extra_file(
 }
 
 /// The scanned crate's own `[package] name`, when the manifest table parses
-/// far enough to say. Used only by [`enabled_features_from_manifest`], which
-/// matches Cargo's own `-p <package>` / `--features pkg/feat` CLI syntax —
+/// far enough to say. Used only by
+/// [`enabled_features_from_manifest_for_resolver`], which matches Cargo's
+/// own `-p <package>` / `--features pkg/feat` CLI syntax —
 /// that syntax names the *package*, hyphens and all, never the Rust crate
 /// identifier `path::item` syntax uses (see [`rust_crate_name_from_manifest`]
 /// for that one).
@@ -789,15 +793,129 @@ impl TargetCfgPredicate {
     }
 }
 
+/// Whether Cargo's *feature resolver* is version 1 for this scan.
+///
+/// Verified directly, not assumed: a real `cargo rustc --target
+/// wasm32-wasip1 -- --print cfg` on a package with `[features] default =
+/// ["foo/x"]` and `foo` declared ONLY under `[target.'cfg(windows)'.dependencies]`
+/// (`optional = true`) shows `feature="foo"` active for that build under
+/// resolver v1 — Cargo's own docs confirm this is the documented
+/// difference: "the version `1` resolver will unify features for a package
+/// no matter where it is specified," while version 2 "avoids unifying
+/// features for ... platform-specific dependencies for another platform."
+/// Explicitly setting `resolver = "2"` on the same manifest reproduces the
+/// `TargetCfgPredicate`-filtered behavior this scan otherwise always
+/// assumed. Assuming v2 for a genuinely-v1 project is the dangerous
+/// direction: a `#[cfg(feature = "foo")]` route the real build turns on
+/// would look cfg'd-out here (Codex review on #2739, round 22, P1).
+///
+/// Cargo's own resolver-selection rule, each branch verified directly:
+/// - A package's own `[package] resolver` (or, absent that, its own
+///   `edition`: 2015/2018 imply `"1"`, 2021/2024 imply `"2"`) decides,
+///   UNLESS it is part of a workspace.
+/// - A workspace governs every member regardless of the member's own
+///   `resolver`/`edition`. An explicit `[workspace] resolver` wins outright.
+/// - Without one, a NON-virtual workspace (it has its own `[package]`, i.e.
+///   the workspace root is itself a package) defaults from THAT root
+///   package's own edition, never the member's.
+/// - Without one, a VIRTUAL workspace (`[workspace]`, no `[package]`)
+///   always defaults to `"1"` — REGARDLESS of any member's edition. This is
+///   not a rare corner case: Cargo prints its own warning for exactly this
+///   shape ("virtual workspace defaulting to `resolver = \"1\"` despite one
+///   or more workspace members being on edition 2021 which implies
+///   `resolver = \"2\"`"), so an ordinary virtual workspace that never
+///   explicitly opted in still hits this today.
+///
+/// [`find_ancestor_workspace_manifest`]'s search does not verify that
+/// `project_root` is actually listed in that workspace's `members` — like
+/// every other heuristic in this module, resolving path globs and
+/// `exclude` is out of scope for a textual scan; the (rare) cost of that is
+/// treating an unrelated ancestor's `[workspace]` as this project's own.
+fn resolver_v1_is_in_effect(project_root: &Path, table: Option<&toml::Table>) -> bool {
+    if let Some(t) = table
+        && t.contains_key("workspace")
+    {
+        return workspace_implies_resolver_v1(t);
+    }
+    if let Some(workspace_table) = find_ancestor_workspace_manifest(project_root) {
+        return workspace_implies_resolver_v1(&workspace_table);
+    }
+    let Some(package) = table
+        .and_then(|t| t.get("package"))
+        .and_then(toml::Value::as_table)
+    else {
+        return true;
+    };
+    if let Some(resolver) = package.get("resolver").and_then(toml::Value::as_str) {
+        return resolver == "1";
+    }
+    edition_implies_resolver_v1(package)
+}
+
+/// `table` is known to contain a `[workspace]` key — governs every member's
+/// resolver version per the rules in [`resolver_v1_is_in_effect`]'s own doc.
+fn workspace_implies_resolver_v1(table: &toml::Table) -> bool {
+    let workspace = table.get("workspace").and_then(toml::Value::as_table);
+    if let Some(resolver) = workspace
+        .and_then(|w| w.get("resolver"))
+        .and_then(toml::Value::as_str)
+    {
+        return resolver == "1";
+    }
+    table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        // virtual workspace, no explicit resolver: always "1"
+        .is_none_or(edition_implies_resolver_v1)
+}
+
+/// Cargo's own default: edition 2015/2018 (or no `edition` key at all, which
+/// is 2015) implies resolver v1; 2021 and 2024 imply v2.
+fn edition_implies_resolver_v1(package_table: &toml::Table) -> bool {
+    !matches!(
+        package_table.get("edition").and_then(toml::Value::as_str),
+        Some("2021" | "2024")
+    )
+}
+
+/// Best-effort discovery of the nearest ancestor directory whose
+/// `Cargo.toml` declares a `[workspace]` table — Cargo's own workspace
+/// root, when `project_root` is a member of one. Walks upward from
+/// `project_root`'s PARENT (not `project_root` itself — a self-owned
+/// `[workspace]`, when the scanned package is itself the workspace root, is
+/// handled directly by [`resolver_v1_is_in_effect`] without needing a
+/// filesystem walk at all), stopping at the first `[workspace]` found or
+/// the filesystem root.
+fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> {
+    let mut dir = project_root.parent();
+    while let Some(candidate) = dir {
+        if let Ok(content) = std::fs::read_to_string(candidate.join("Cargo.toml"))
+            && let Ok(table) = toml::from_str::<toml::Table>(&content)
+            && table.contains_key("workspace")
+        {
+            return Some(table);
+        }
+        dir = candidate.parent();
+    }
+    None
+}
+
 /// Whether `<name>` is declared `optional = true` in `[dependencies]` or in
-/// a `[target.'cfg(...)'.dependencies]` table whose target actually applies
-/// to the edge capsule's own build (see
-/// [`target_key_matches_edge_capsule`]) — dev/build dependency tables are
-/// still not consulted, matching this scanner's other best-effort limits. A
-/// version-string dependency (`name = "1"`) is never optional; only the
-/// expanded table form can set the flag.
+/// a `[target.'cfg(...)'.dependencies]` table — dev/build dependency tables
+/// are still not consulted, matching this scanner's other best-effort
+/// limits. A version-string dependency (`name = "1"`) is never optional;
+/// only the expanded table form can set the flag.
+///
+/// `resolver_v1` (see [`resolver_v1_is_in_effect`]) decides which target
+/// tables count: under Cargo's feature resolver v2, only one whose target
+/// actually applies to the edge capsule's own build (see
+/// [`target_key_matches_edge_capsule`]) does; under v1, every target table
+/// counts regardless of its own predicate, since that resolver version
+/// unifies a target-specific dependency's features into the package
+/// REGARDLESS OF WHICH TARGET IS ACTUALLY BEING BUILT — verified directly
+/// (see `resolver_v1_is_in_effect`'s own doc for the exact experiment).
 #[must_use]
-fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
+fn is_optional_dependency(table: &toml::Table, name: &str, resolver_v1: bool) -> bool {
     let declares_optional = |deps: &toml::Table| {
         deps.get(name)
             .and_then(toml::Value::as_table)
@@ -819,7 +937,9 @@ fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
         .is_some_and(|targets| {
             targets
                 .iter()
-                .filter(|(target_key, _)| target_key_matches_edge_capsule(target_key))
+                .filter(|(target_key, _)| {
+                    resolver_v1 || target_key_matches_edge_capsule(target_key)
+                })
                 .map(|(_, target)| target)
                 .filter_map(toml::Value::as_table)
                 .any(|target| in_table("dependencies", target))
@@ -860,8 +980,8 @@ fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &st
 /// package name into `_` for the crate identifier (a package named
 /// `my-app` compiles to `extern crate my_app`, never `my-app` — that is not
 /// a legal Rust identifier). [`resolve_edge_scan_with_extra_file`] uses this
-/// for [`EdgeScan::crate_name`]; [`enabled_features_from_manifest`] does not
-/// — see [`package_name_from_manifest`].
+/// for [`EdgeScan::crate_name`]; [`enabled_features_from_manifest_for_resolver`]
+/// does not — see [`package_name_from_manifest`].
 #[must_use]
 fn rust_crate_name_from_manifest(table: &toml::Table) -> Option<String> {
     table
@@ -870,6 +990,20 @@ fn rust_crate_name_from_manifest(table: &toml::Table) -> Option<String> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned)
         .or_else(|| package_name_from_manifest(table).map(|name| name.replace('-', "_")))
+}
+
+/// [`enabled_features_from_manifest_for_resolver`] assuming Cargo's feature
+/// resolver v2 (`resolver_v1 = false`) — the common case every test in this
+/// module that isn't specifically about resolver-v1 unification exercises.
+///
+/// `#[cfg(test)]`: production code calls
+/// [`enabled_features_from_manifest_for_resolver`] directly, since it needs
+/// the real, manifest-derived resolver version (see
+/// [`resolver_v1_is_in_effect`]).
+#[cfg(test)]
+#[must_use]
+fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSet<String> {
+    enabled_features_from_manifest_for_resolver(manifest, requested, false)
 }
 
 /// Read a crate's `Cargo.toml`, seed the feature queue with `[features]
@@ -906,8 +1040,15 @@ fn rust_crate_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// on some other package, and stripping that qualifier too would wrongly
 /// enable this crate's own `#[cfg(feature = "...")]` code that Cargo left
 /// off, the opposite mistake.
+///
+/// `resolver_v1` (see [`resolver_v1_is_in_effect`]) is forwarded to
+/// [`is_optional_dependency`] for the strong-dependency-feature check below.
 #[must_use]
-fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSet<String> {
+fn enabled_features_from_manifest_for_resolver(
+    manifest: &str,
+    requested: &[&str],
+    resolver_v1: bool,
+) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
     let table = toml::from_str::<toml::Table>(manifest).ok();
     let features_table = table
@@ -974,7 +1115,7 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
             if !pkg.ends_with('?')
                 && table
                     .as_ref()
-                    .is_some_and(|t| is_optional_dependency(t, pkg))
+                    .is_some_and(|t| is_optional_dependency(t, pkg, resolver_v1))
                 && !implicit_feature_is_suppressed(features_table.as_ref(), pkg)
             {
                 queue.push(pkg.to_owned());
@@ -2780,6 +2921,26 @@ mod tests {
         assert!(!enabled.contains("dep"));
     }
 
+    /// The same manifest as above, but under Cargo's feature resolver v1:
+    /// verified directly (`cargo rustc --target wasm32-wasip1 -- --print
+    /// cfg`, resolver v1) that `cfg(windows)`'s own optional dependency IS
+    /// unified in regardless of the actual build target — resolver v1
+    /// unifies target-specific dependency features "no matter where" they
+    /// are declared, a documented Cargo behavior, not a scanner heuristic
+    /// (Codex review on #2739, round 22, P1).
+    #[test]
+    fn a_windows_target_specific_dependency_is_enabled_under_resolver_v1() {
+        let manifest = r#"
+            [target.'cfg(windows)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest_for_resolver(manifest, &[], true);
+        assert!(enabled.contains("dep"));
+    }
+
     /// `cfg(debug_assertions)` must NOT enable a target-specific optional
     /// dependency — verified directly with
     /// `rustc --print cfg --target wasm32-wasip1 -C debug-assertions=off`
@@ -2814,6 +2975,217 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("dep"));
+    }
+
+    // --- resolver_v1_is_in_effect ---
+
+    #[test]
+    fn resolver_v1_is_in_effect_honors_an_explicit_resolver_field() {
+        let table: toml::Table = toml::from_str(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\nresolver = \"1\"\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    #[test]
+    fn resolver_v1_is_in_effect_is_false_for_an_explicit_resolver_2_edition_2018() {
+        let table: toml::Table = toml::from_str(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2018\"\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    #[test]
+    fn resolver_v1_is_in_effect_defaults_from_edition_2018() {
+        let table: toml::Table =
+            toml::from_str("[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2018\"\n")
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    #[test]
+    fn resolver_v1_is_in_effect_defaults_from_edition_2021() {
+        let table: toml::Table =
+            toml::from_str("[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    #[test]
+    fn resolver_v1_is_in_effect_defaults_to_true_with_no_edition_at_all() {
+        let table: toml::Table =
+            toml::from_str("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    /// An ancestor workspace's own `resolver = "1"` governs the member
+    /// regardless of the member's own edition-2021-implied v2 (Codex review
+    /// on #2739, round 22, P1 — verified directly against a real `cargo
+    /// rustc --target wasm32-wasip1` build).
+    #[test]
+    fn resolver_v1_is_in_effect_honors_an_ancestor_workspaces_explicit_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mainpkg\"]\nresolver = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        assert!(resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A virtual workspace (no `[package]` of its own) with no explicit
+    /// `resolver` field always defaults to `"1"`, regardless of any
+    /// member's own edition — verified directly against Cargo's own
+    /// warning for exactly this shape ("virtual workspace defaulting to
+    /// `resolver = \"1\"`...").
+    #[test]
+    fn resolver_v1_is_in_effect_defaults_true_for_a_virtual_workspace_with_no_explicit_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mainpkg\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        assert!(resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A NON-virtual workspace (it has its own `[package]`) with no explicit
+    /// `resolver` field defaults from the ROOT package's own edition, not
+    /// the member's — verified directly (a 2021-edition root plus a
+    /// 2018-edition member yields resolver v2).
+    #[test]
+    fn resolver_v1_is_in_effect_defaults_from_the_root_packages_edition_in_a_non_virtual_workspace()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"mainpkg\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        assert!(!resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// The scanned package's own manifest can itself declare `[workspace]`
+    /// (a non-virtual workspace root that is also a package) — this must be
+    /// recognized without needing a filesystem walk at all.
+    #[test]
+    fn resolver_v1_is_in_effect_honors_a_self_owned_workspace_resolver() {
+        let table: toml::Table = toml::from_str(
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = []\nresolver = \"1\"\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolver_v1_is_in_effect(dir.path(), Some(&table)));
+    }
+
+    /// Integration-level: a `#[cfg(feature = "dep")]`-gated `#[edge]`
+    /// handler, `dep` optional and declared ONLY under
+    /// `[target.'cfg(windows)'.dependencies]`, referenced via `default =
+    /// ["dep/extra"]` — under an edition-2018 (resolver v1) manifest, the
+    /// real wasm32-wasip1 build turns this feature on (verified directly),
+    /// so the scan must include the handler rather than treating it as
+    /// cfg'd-out (Codex review on #2739, round 22, P1).
+    #[test]
+    fn resolve_edge_scan_includes_a_resolver_v1_unified_target_specific_feature_route() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+            edition = "2018"
+
+            [features]
+            default = ["dep/extra"]
+
+            [target.'cfg(windows)'.dependencies]
+            dep = { version = "1", optional = true }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[cfg(feature = "dep")]
+            #[edge]
+            pub fn show() {}
+            "#,
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.names(), vec!["show"]);
+    }
+
+    /// Same manifest, but edition 2021 (resolver v2): the real build never
+    /// turns `dep`'s feature on for wasm32-wasip1, so the handler stays
+    /// cfg'd-out — the existing, still-correct behavior this fix must not
+    /// regress.
+    #[test]
+    fn resolve_edge_scan_excludes_a_resolver_v2_target_specific_feature_route() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+            edition = "2021"
+
+            [features]
+            default = ["dep/extra"]
+
+            [target.'cfg(windows)'.dependencies]
+            dep = { version = "1", optional = true }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[cfg(feature = "dep")]
+            #[edge]
+            pub fn show() {}
+            "#,
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert!(scan.is_empty());
     }
 
     /// Verified directly: a bare `#[cfg(target_has_atomic)]` (no value) does
