@@ -134,22 +134,66 @@ CODE_REGION = re.compile(
     re.M | re.S,
 )
 
-# Markup that carries text a reader never sees. Order matters: comments before
-# tags (a comment is not a tag), destinations before tags (so `](…)` is gone
-# before `<…>` is considered).
-NON_RENDERING = (
-    re.compile(r'<!--.*?-->', re.S),                          # HTML comment
-    re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M),      # ref definition
-    re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>'),       # autolink
-    re.compile(r'\]\([^)]*\)'),                               # link destination
-    re.compile(r'</?[A-Za-z][^>]*>'),                         # HTML tag + attrs
-)
+# Markup that carries text a reader never sees.
+HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
+REF_DEFINITION = re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M)
+AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
+HTML_TAG = re.compile(r'</?[A-Za-z][^>]*>')
+
+# A destination can contain balanced parentheses, so it is scanned rather than
+# matched. The corpus has one: `](javascript:alert(1))` in rich-text.md.
+DEST_SCAN_LIMIT = 500
+
+
+def _strip_link_destinations(text):
+    """Remove `](…)` destinations, honouring nested parentheses.
+
+    A regex cannot do this. `\]\([^)]*\)` stops at the FIRST `)`, so
+    `[flow](./guide_(v1)/two-factor)` leaves `/two-factor)` behind and the term
+    counts even though the reader sees only "flow" — the gate would stay green
+    after the visible term was deleted from the page.
+
+    Unbalanced input is deliberately left ALONE. A stray `](` in prose must not
+    swallow the rest of the file, and malformed markdown renders literally, so
+    its text really is on the page and really should count. The scan is bounded
+    for the same reason: a destination is not a paragraph.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while True:
+        j = text.find('](', i)
+        if j < 0:
+            out.append(text[i:])
+            return ''.join(out)
+        out.append(text[i:j + 1])           # keep the link TEXT and its `]`
+        k = j + 2
+        depth = 1
+        limit = min(n, k + DEST_SCAN_LIMIT)
+        while k < limit and depth:
+            c = text[k]
+            if c == '\\':                   # an escaped paren is not a paren
+                k += 2
+                continue
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            k += 1
+        if depth:                           # unbalanced -> renders literally
+            out.append('(')
+            i = j + 2
+        else:
+            out.append(' ')
+            i = k
 
 
 def _strip_markup(chunk):
-    for pattern in NON_RENDERING:
-        chunk = pattern.sub(' ', chunk)
-    return chunk
+    chunk = HTML_COMMENT.sub(' ', chunk)
+    chunk = REF_DEFINITION.sub(' ', chunk)
+    chunk = AUTOLINK.sub(' ', chunk)
+    chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
+    return HTML_TAG.sub(' ', chunk)
 
 
 def prose(text):
@@ -320,12 +364,33 @@ def self_test():
     if not re.search(r'\b2fa\b', '<span id="2fa">TOTP</span>', re.I):
         failures.append('precondition: raw HTML attribute should match the row')
 
+    # 14. a destination with BALANCED parentheses is still a destination. The
+    # regex this replaced stopped at the first `)` and leaked the tail, so the
+    # gate stayed green with the visible term gone from the page.
+    nested = 'See [flow](./guide_(v1)/two-factor) and TOTP.'
+    d, _ = one(nested)
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a balanced-paren destination must not satisfy a row')
+    if not re.search(r'two[- ]factor', re.sub(r'\]\([^)]*\)', ' ', nested), re.I):
+        failures.append('precondition: the old regex should have leaked the tail')
+
+    # 15. an escaped paren does not close a destination.
+    d, _ = one(r'See [flow](./a\)two-factor) and TOTP.')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('an escaped paren must not close a destination')
+
+    # 16. UNBALANCED `](` is malformed markdown: it renders literally, so its
+    # text is on the page and must still count — and must not swallow the file.
+    d, _ = one('Stray ](./two-factor and more prose.')
+    if d:
+        failures.append('unbalanced `](` renders literally and should count')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (13 properties).')
+    print('Self-test OK (16 properties).')
     return 0
 
 
