@@ -172,7 +172,22 @@ REF_DEFINITION = re.compile(
     re.M,
 )
 AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
-HTML_TAG = re.compile(r'</?[A-Za-z][^>]*>')
+
+# A tag ends at the first `>` that is NOT inside a quoted attribute value, so
+# `<span id=">x">` is one tag rather than a tag plus the stray text `x">`.
+# `scripts/check-docs-orphans.sh` parses attributes the same way.
+_ATTR_SOUP = r'(?:[^>"\']|"[^"]*"|\'[^\']*\')*'
+HTML_TAG = re.compile(r'</?[A-Za-z][A-Za-z0-9:-]*' + _ATTR_SOUP + r'>')
+
+# `<script>` and `<style>` BODIES are not text. Stripping the tags and keeping
+# the CSS or JavaScript between them would count a term no reader can see — a
+# different visibility rule from ordinary inner text, which does render and is
+# kept. `check-docs-orphans.sh` keeps the same raw-text set for the same
+# reason; this gate needs only the two that never render at all.
+RAW_TEXT_BLOCK = re.compile(
+    r'<(script|style)' + _ATTR_SOUP + r'>.*?</\1' + _ATTR_SOUP + r'>',
+    re.I | re.S,
+)
 
 # A destination can contain balanced parentheses, so it is scanned rather than
 # matched. The corpus has one: `](javascript:alert(1))` in rich-text.md.
@@ -223,6 +238,7 @@ def _strip_link_destinations(text):
 
 
 def _strip_markup(chunk):
+    chunk = RAW_TEXT_BLOCK.sub(' ', chunk)   # before tags: drop body AND tags
     chunk = REF_DEFINITION.sub(' ', chunk)
     chunk = AUTOLINK.sub(' ', chunk)
     chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
@@ -520,12 +536,27 @@ def self_test():
     if len(d) != 1 or d[0][3] != 'reader word absent':
         failures.append('a ref-definition continuation title must not count')
 
+    # 20. A `>` INSIDE A QUOTED ATTRIBUTE does not end the tag. Ending at the
+    # first `>` left `two-factor">TOTP` searchable while the browser renders
+    # only "TOTP".
+    d, _ = one('<span id=">two-factor">TOTP</span> enrollment.')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a quoted > must not end an HTML tag')
+
+    # 21-22. `<script>` and `<style>` BODIES never render. Their visibility
+    # differs from ordinary inner text, which does render and must still count
+    # (property 10) — so this drops the body, not merely the tags.
+    for tag in ('style', 'script'):
+        d, _ = one(f'<{tag}>.two-factor {{ color: red }}</{tag}>\nTOTP setup.')
+        if len(d) != 1 or d[0][3] != 'reader word absent':
+            failures.append(f'a <{tag}> body must not satisfy a reader-word row')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (23 properties).')
+    print('Self-test OK (26 properties).')
     return 0
 
 
