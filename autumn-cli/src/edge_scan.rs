@@ -473,12 +473,22 @@ fn resolve_edge_scan_impl(
         }
     }
 
-    // The capsule's own tree, when its root lives somewhere the `src/` walk
-    // cannot give it the right identity on its own (see
-    // `resolve_edge_scan_with_extra_file`'s doc for the exact cases).
-    if let Some(file) = capsule_bin_file
-        && !bin_path_is_a_conventional_root(file, project_root)
-    {
+    // The capsule's own tree — always scanned this way, even for one of
+    // Cargo's own two `src/bin/` auto-discovery shapes
+    // (`src/bin/<name>.rs`, `src/bin/<name>/main.rs`): those get the right
+    // ROOT identity from `crate_context_from_file`'s own `src/bin/`
+    // handling, but that heuristic cannot tell a real second flat bin file
+    // apart from an out-of-line submodule the first one pulls in via `mod
+    // routes;` from the very same `src/bin/` directory — both look
+    // identical on disk. With `autobins = false` and no separate `[[bin]]`
+    // entry for it, such a file is not a crate root at all, yet the
+    // ordinary walk credited it with a phantom `bin:routes` identity
+    // regardless, so a valid `edge_routes![crate::routes::show]` could never
+    // match it (Codex review on #2739, round 22, P2 — round 21's file-shape
+    // guard only ever bypassed this for a NON-conventional root, never
+    // fixing this conventional-root case since the ordinary walk was
+    // assumed sufficient for it).
+    if let Some(file) = capsule_bin_file {
         claimed.extend(scan_bin_crate_tree(
             file,
             project_root,
@@ -531,32 +541,6 @@ fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `file` matches one of Cargo's own two auto-discovery shapes for a
-/// `[[bin]]` target root — `src/bin/<name>.rs` or `src/bin/<name>/main.rs` —
-/// the only shapes [`crate_context_from_file`]'s own `src/bin/` handling
-/// resolves correctly (it treats the first path segment under `src/bin/` as
-/// the bin's own name and everything after it as a submodule path relative
-/// to that bin's root). An explicit `[[bin]] path` override can point
-/// anywhere else under `src/bin/` too (`src/bin/tools/capsule.rs`, several
-/// segments deep, not named `main.rs`) — there, that heuristic invents a
-/// phantom bin name from an intermediate directory and misplaces the root
-/// under it as a submodule, so it needs the same explicit
-/// `scan_bin_crate_tree` treatment as a root entirely outside `src/bin/`
-/// (Codex review on #2739, round 22, P2).
-fn bin_path_is_a_conventional_root(file: &Path, project_root: &Path) -> bool {
-    let Ok(rel) = file.strip_prefix(project_root.join("src").join("bin")) else {
-        return false;
-    };
-    matches!(
-        rel.to_string_lossy()
-            .replace('\\', "/")
-            .split('/')
-            .collect::<Vec<_>>()
-            .as_slice(),
-        [_name] | [_name, "main.rs"]
-    )
-}
-
 /// Walk `project_root/src` and scan every `.rs` file below it, plus
 /// `extra_file` — the edge-capsule bin's own resolved root file, scanned as
 /// its own `[[bin]]` crate tree (root file plus every out-of-line submodule
@@ -585,13 +569,14 @@ fn bin_path_is_a_conventional_root(file: &Path, project_root: &Path) -> bool {
 /// registration written there could look invisible or wrongly scoped to
 /// `autumn doctor`, even though the real build serves the routes fine
 /// (Codex review on #2739, round 7 and round 13, P2). `extra_file` is a
-/// no-op when `None` or when it already matches one of Cargo's own two
-/// `src/bin/` auto-discovery shapes (`src/bin/<name>.rs` or
-/// `src/bin/<name>/main.rs` — see [`bin_path_is_a_conventional_root`]): the
-/// `src/` walk already gives those the right identity, but nothing else
-/// under `src/bin/` (Codex review on #2739, round 22, P2). A custom `[lib]
-/// path` is handled the same way regardless of `extra_file` — see
-/// [`resolve_edge_scan_impl`]'s own doc.
+/// no-op only when `None` — even Cargo's own two `src/bin/` auto-discovery
+/// shapes (`src/bin/<name>.rs`, `src/bin/<name>/main.rs`) still need this
+/// treatment for their own out-of-line submodules: the ordinary `src/` walk
+/// gives the ROOT the right identity there, but cannot tell a real second
+/// flat bin file under `src/bin/` apart from a submodule the first one pulls
+/// in via `mod routes;` from that same directory (Codex review on #2739,
+/// round 22, P2). A custom `[lib] path` is handled the same way regardless
+/// of `extra_file` — see [`resolve_edge_scan_impl`]'s own doc.
 #[must_use]
 pub fn resolve_edge_scan_with_extra_file(
     project_root: &Path,
@@ -1369,12 +1354,14 @@ fn resolve_out_of_line_module_file(
 /// bin identity, once by the library walk with an incorrect library-module
 /// one (Codex review on #2739, round 13, P2).
 ///
-/// A conventional `src/bin/<name>.rs` / `src/bin/<name>/main.rs` capsule
-/// never reaches this function — [`resolve_edge_scan_with_extra_file`] only
-/// calls it for `extra_file` when [`bin_path_is_a_conventional_root`] says
-/// no (`extra_file` itself is `None` for the conventional layout, same as
-/// any other case the library walk already reaches with the right identity
-/// via [`crate_context_from_file`]'s own `src/bin/` handling).
+/// [`resolve_edge_scan_with_extra_file`] calls this for `extra_file`
+/// whenever it is `Some`, including one of Cargo's own two `src/bin/`
+/// auto-discovery shapes (`src/bin/<name>.rs`, `src/bin/<name>/main.rs`):
+/// the ordinary library walk would give such a root the right identity via
+/// [`crate_context_from_file`]'s own `src/bin/` handling, but not its own
+/// out-of-line submodules, which that heuristic cannot tell apart from an
+/// unrelated second flat bin file in the same directory (Codex review on
+/// #2739, round 22, P2).
 fn scan_bin_crate_tree(
     root_file: &Path,
     project_root: &Path,
@@ -3882,6 +3869,47 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "src/bin/tools/capsule.rs");
+    }
+
+    /// Even a CONVENTIONAL flat capsule root (`src/bin/edge-capsule.rs`,
+    /// `autobins = false`) needs `scan_bin_crate_tree`'s treatment: its own
+    /// out-of-line submodule (`mod routes;`, resolving to
+    /// `src/bin/routes.rs`) is indistinguishable on disk from an unrelated
+    /// second flat bin file, so the ordinary walk's `crate_context_from_file`
+    /// heuristic credited it with a phantom `bin:routes` identity instead of
+    /// treating it as `edge-capsule`'s own `routes` submodule (Codex review
+    /// on #2739, round 22, P2).
+    #[test]
+    fn a_conventional_flat_capsule_roots_own_submodule_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nautobins = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/edge-capsule.rs"),
+            "mod routes;\nfn main() { edge_routes![crate::routes::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/routes.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("src/bin/edge-capsule.rs")),
+        );
+
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/bin/routes.rs");
+        assert_eq!(registered[0].module_path, vec!["routes".to_owned()]);
     }
 
     /// A custom `[[bin]] path` INSIDE `src/` but outside the conventional
