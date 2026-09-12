@@ -315,7 +315,17 @@ def _segments(text):
             )
             cm = close.search(text, m.end())
             end = cm.end() if cm else n
-            out.append(('code', text[m.start():end]))
+            # The BODY is code the reader sees; the info string (```rust) and
+            # the closing delimiter are metadata a renderer turns into a CSS
+            # class and a tag, never into text. Keeping them would let a row
+            # whose term happens to be a language name — `sql`, `json`, `html`
+            # — be satisfied by fences alone, on a page that never says the
+            # word. No current row changes either way; this closes it before a
+            # row like that is ever added.
+            body = text[m.start():end].split('\n')[1:]
+            if cm and body:
+                body = body[:-1]                # drop the closing delimiter
+            out.append(('code', '\n'.join(body)))
             i = end
             continue
 
@@ -643,12 +653,24 @@ def self_test():
     if d:
         failures.append('a shortcut reference renders its label and counts')
 
+    # 34. A FENCE INFO STRING is metadata, not text: a renderer turns ```rust
+    # into a CSS class. A row whose term is a language name would otherwise be
+    # satisfied by fences on a page that never says the word.
+    d, _ = one('Example:\n\n```two-factor\nlet x = 1;\n```\n')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('a fence info string must not satisfy a row')
+
+    # 35. ... while the fence BODY is code the reader sees, and still counts.
+    d, _ = one('Example:\n\n```rust\n// two-factor setup\n```\n')
+    if d:
+        failures.append('a fence body is visible code and should count')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (37 properties).')
+    print('Self-test OK (39 properties).')
     return 0
 
 
