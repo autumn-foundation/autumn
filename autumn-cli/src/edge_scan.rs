@@ -664,11 +664,14 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 ///
 /// Only a literal `wasm32-wasip1` triple, or a `cfg(...)` predicate built
 /// from a leaf naming one of `WASM32_WASIP1_CFG_VALUES`' known `(key,
-/// value)` pairs — checking *membership*, since a key like `target_feature`
-/// legitimately has several simultaneous real values — combined with
-/// `not`/`all`/`any`, is resolved; anything else (an OS-family shorthand
-/// like `windows`/`unix`, a key this table does not list, or a predicate
-/// this scan cannot parse) is treated as NOT applying. That is the opposite
+/// value)` pairs — checking *membership*, since a key like
+/// `target_has_atomic` legitimately has several simultaneous real values —
+/// or a `target_feature = "..."` leaf (always false: unlike every other key,
+/// Cargo's own dependency-table evaluator does not resolve `target_feature`
+/// against a target's real values at all), combined with `not`/`all`/`any`,
+/// is resolved; anything else (an OS-family shorthand like `windows`/`unix`,
+/// a key this table does not list, or a predicate this scan cannot parse) is
+/// treated as NOT applying. That is the opposite
 /// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`],
 /// which stays conservative by assuming *true*): crediting an inapplicable
 /// target here produces a phantom route, not a merely missed one, so
@@ -713,14 +716,24 @@ enum TargetCfgPredicate {
 /// the rest, but it is still a real, always-true cfg for this target —
 /// wasm32-wasip1 always builds with `panic = "abort"` — so it belongs here
 /// on the same footing. A `cfg(...)` key can list MULTIPLE
-/// simultaneous values for one target — `target_feature` and
-/// `target_has_atomic` both do here — and a real predicate checks
-/// *membership* in that set: `cfg(target_has_atomic = "32")` is satisfied
-/// because "32" is one of five values this target reports for that key, not
-/// because it is the only one. Round 15 treated a multi-valued key as
-/// entirely unresolvable instead of checking membership, which is why this
-/// list holds one entry per `(key, value)` PAIR, not one entry per key — a
-/// key with several real values simply appears several times.
+/// simultaneous values for one target — `target_has_atomic` does here — and
+/// a real predicate checks *membership* in that set: `cfg(target_has_atomic
+/// = "32")` is satisfied because "32" is one of five values this target
+/// reports for that key, not because it is the only one. Round 15 treated a
+/// multi-valued key as entirely unresolvable instead of checking
+/// membership, which is why this list holds one entry per `(key, value)`
+/// PAIR, not one entry per key — a key with several real values simply
+/// appears several times.
+///
+/// Deliberately excludes `target_feature`: unlike every key here, Cargo's
+/// OWN `[target.'cfg(...)'.dependencies]` evaluator does not resolve
+/// `target_feature` against a target's real values at all — it is handled
+/// as its own special case in [`TargetCfgPredicate`]'s `Parse` impl instead,
+/// always false regardless of value or target (verified directly: a real
+/// `[target.'cfg(target_feature = "crt-static")'.dependencies]` table pulls
+/// in nothing for `--target wasm32-wasip1` even though rustc reports
+/// `crt-static` as a real default feature there — Codex review on #2739,
+/// round 23, P1).
 const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_arch", "wasm32"),
     ("target_os", "wasi"),
@@ -730,13 +743,6 @@ const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_vendor", "unknown"),
     ("target_endian", "little"),
     ("target_abi", ""),
-    ("target_feature", "bulk-memory"),
-    ("target_feature", "crt-static"),
-    ("target_feature", "multivalue"),
-    ("target_feature", "mutable-globals"),
-    ("target_feature", "nontrapping-fptoint"),
-    ("target_feature", "reference-types"),
-    ("target_feature", "sign-ext"),
     ("target_has_atomic", "8"),
     ("target_has_atomic", "16"),
     ("target_has_atomic", "32"),
@@ -769,6 +775,28 @@ impl syn::parse::Parse for TargetCfgPredicate {
         // Cargo actually includes (Codex review on #2739, round 22, P1).
         if ident == "true" || ident == "false" {
             return Ok(Self::Leaf(ident == "true"));
+        }
+        // Cargo's own dependency-table cfg evaluator does not support
+        // `target_feature` at all — verified directly: a real
+        // `[target.'cfg(target_feature = "crt-static")'.dependencies]` table
+        // pulls in nothing for `--target wasm32-wasip1` even though rustc
+        // reports `crt-static` as one of that target's own default features,
+        // and the `not(...)` form of the SAME predicate pulls the dependency
+        // in unconditionally instead — i.e. Cargo treats every
+        // `target_feature = "..."` leaf here as simply false, never true, no
+        // matter the value or the real target. This scan previously checked
+        // `target_feature` leaves against `WASM32_WASIP1_CFG_VALUES` the
+        // same way as every other key (matching rustc's real reported
+        // values, which IS how `#[cfg(target_feature = "...")]` resolves at
+        // the source-code level, just not in a `[target.'cfg(...)']` table),
+        // so `cfg(not(target_feature = "crt-static"))` was scanned as
+        // excluded when Cargo actually includes it — omitting an active
+        // `#[cfg(feature = "...")]`-gated handler that a real release build
+        // still compiles (Codex review on #2739, round 23, P1).
+        if ident == "target_feature" && input.peek(syn::Token![=]) {
+            input.parse::<syn::Token![=]>()?;
+            let _lit: syn::LitStr = input.parse()?;
+            return Ok(Self::Leaf(false));
         }
         let key_is_known = WASM32_WASIP1_CFG_VALUES.iter().any(|(key, _)| ident == key);
         if key_is_known {
@@ -1988,6 +2016,34 @@ fn collect_registrations(
             continue;
         }
         if let TokenTree::Ident(ident) = &trees[index]
+            && ident == "impl"
+            && let Some(body_index) = simple_impl_body_index(&trees, index)
+        {
+            // `#[cfg(feature = "premium")] impl Routes { fn wire() {
+            // edge_routes![show]; } }` — the catch-all `Group` branch below
+            // only recognizes a cfg attribute with NOTHING between it and
+            // the group, but an `impl` block's brace is always preceded by
+            // at least the implementing type (`Routes`, or `Trait for
+            // Type`), so that branch never saw the attribute and
+            // unconditionally recursed into a block real Rust strips
+            // entirely with the feature off, crediting an inactive handler
+            // as registered (Codex review on #2739, round 23, P2).
+            let attr_index = skip_back_over_fn_modifiers(&trees, index);
+            if let TokenTree::Group(body) = &trees[body_index]
+                && !preceding_cfg_excludes(&trees, attr_index, default_features)
+            {
+                collect_registrations(
+                    &body.stream(),
+                    crate_root,
+                    module_path,
+                    default_features,
+                    scan,
+                );
+            }
+            index = body_index + 1;
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[index]
             && ident == "fn"
             && let Some(body_index) = simple_fn_body_index(&trees, index)
         {
@@ -2110,6 +2166,50 @@ fn skip_back_over_fn_modifiers(trees: &[TokenTree], fn_index: usize) -> usize {
         }
     }
     i
+}
+
+/// For `[<generics>] <Type>` or `[<generics>] <Trait> for <Type> [where
+/// ...]` starting right after the `impl` keyword at `trees[impl_index]`,
+/// return the index of the body's brace group.
+///
+/// Scans forward token by token rather than parsing the shape explicitly —
+/// real `impl` syntax never puts a brace group anywhere before its own body
+/// (paths, bounds, and `where` clauses don't use one) — with one exception:
+/// a braced const-generic default nested inside the generic parameter list
+/// or the implementing type (`impl<const N: usize> Foo<{ N + 1 }>`), the
+/// same ambiguity `simple_fn_body_index`'s return-type loop guards against.
+/// Angle-bracket depth is tracked for exactly that reason: only a Brace
+/// group seen at depth 0 is treated as the body.
+fn simple_impl_body_index(trees: &[TokenTree], impl_index: usize) -> Option<usize> {
+    let mut i = impl_index + 1;
+    let mut angle_depth: i32 = 0;
+    loop {
+        match trees.get(i) {
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace && angle_depth == 0 => {
+                return Some(i);
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
+                angle_depth += 1;
+                i += 1;
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == '>' => {
+                angle_depth -= 1;
+                if angle_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            Some(
+                TokenTree::Ident(_)
+                | TokenTree::Punct(_)
+                | TokenTree::Literal(_)
+                | TokenTree::Group(_),
+            ) => {
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// For `fn <name>(<params>) [-> <plain return type>] { <body> }` starting at
@@ -2705,6 +2805,60 @@ mod tests {
 
             #[cfg(feature = "premium")]
             mod wiring {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// Same as the cfg'd-out inline module case above, but the
+    /// `edge_routes![]` call is inside a cfg'd-out `impl` block instead of a
+    /// `mod { ... }` — the catch-all `Group` branch only recognizes a cfg
+    /// attribute with NOTHING between it and the group, but an `impl`
+    /// block's brace is always preceded by at least the implementing type,
+    /// so without a dedicated `impl` special case (mirroring `mod` and
+    /// `fn`) this recursed unconditionally into a block real Rust strips
+    /// entirely with the feature off (Codex review on #2739, round 23, P2).
+    #[test]
+    fn cfg_feature_gated_impl_block_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct Routes;
+
+            #[cfg(feature = "premium")]
+            impl Routes {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().len() == 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// Same setup, but with `premium` on: the registration genuinely exists
+    /// in the compiled capsule, so `show` must report as registered.
+    #[test]
+    fn cfg_feature_gated_impl_block_registration_is_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct Routes;
+
+            #[cfg(feature = "premium")]
+            impl Routes {
                 fn wire() { edge_routes![crate::show]; }
             }
             "#,
@@ -3993,32 +4147,64 @@ mod tests {
     }
 
     /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
-    /// `target_has_atomic` and `target_feature` each legitimately list
-    /// SEVERAL simultaneous values for that target, and a real predicate
-    /// checks membership — `target_has_atomic = "32"` is satisfied by one of
-    /// five reported values, not because it is the target's only value
-    /// (Codex review on #2739, round 16, P1).
+    /// `target_has_atomic` legitimately lists SEVERAL simultaneous values for
+    /// that target, and a real predicate checks membership —
+    /// `target_has_atomic = "32"` is satisfied by one of five reported
+    /// values, not because it is the target's only value (Codex review on
+    /// #2739, round 16, P1).
     #[test]
     fn multi_valued_wasm32_wasip1_target_cfg_keys_also_enable_the_dependency() {
-        for cfg in [
-            r#"target_has_atomic = "32""#,
-            r#"target_feature = "bulk-memory""#,
-        ] {
-            let manifest = format!(
-                r#"
-                [target.'cfg({cfg})'.dependencies]
-                dep = {{ version = "1", optional = true }}
+        let manifest = r#"
+            [target.'cfg(target_has_atomic = "32")'.dependencies]
+            dep = { version = "1", optional = true }
 
-                [features]
-                default = ["dep/extra"]
-                "#
-            );
-            let enabled = enabled_features_from_manifest(&manifest, &[]);
-            assert!(
-                enabled.contains("dep"),
-                "cfg({cfg}) should match: {enabled:?}"
-            );
-        }
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"), "{enabled:?}");
+    }
+
+    /// Verified directly against a real Cargo build (`cargo tree --target
+    /// wasm32-wasip1`): a `[target.'cfg(target_feature = "crt-static")'.…]`
+    /// table pulls in NOTHING for wasm32-wasip1, even though rustc reports
+    /// `crt-static` as one of that target's own default features — Cargo's
+    /// dependency-table evaluator does not resolve `target_feature` against
+    /// real target data at all, unlike every other key here. Previously this
+    /// scan checked `target_feature` the same way as `target_has_atomic`
+    /// (real membership), wrongly enabling a dependency Cargo never actually
+    /// activates for the capsule (Codex review on #2739, round 23, P1).
+    #[test]
+    fn a_target_feature_target_specific_dependency_is_never_enabled() {
+        let manifest = r#"
+            [target.'cfg(target_feature = "crt-static")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"), "{enabled:?}");
+    }
+
+    /// The mirror image: `not(target_feature = "...")` is a real,
+    /// unconditionally-true predicate in Cargo's dependency-table evaluator
+    /// for every target, including wasm32-wasip1, once again verified
+    /// directly against a real `cargo tree --target wasm32-wasip1` (it
+    /// includes the dependency). A sole `#[cfg(feature = "dep")] #[edge]`
+    /// handler behind exactly this table must be scanned as enabled — Codex
+    /// review on #2739, round 23, P1.
+    #[test]
+    fn a_negated_target_feature_target_specific_dependency_is_always_enabled() {
+        let manifest = r#"
+            [target.'cfg(not(target_feature = "crt-static"))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"), "{enabled:?}");
     }
 
     /// A value NOT among the target's real values for that key must still
