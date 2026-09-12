@@ -124,18 +124,44 @@ READER_VOCABULARY = (
 )
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')
+HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
+LINK_DEST = re.compile(r'\]\([^)]*\)')
+REF_DEFINITION = re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M)
+AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
 
 
 def prose(text):
-    """Undo URL escaping before searching for a reader's word.
+    """Reduce a page to what a reader actually sees, then search that.
+
+    Every removal here is the same defect class: a byte sequence that satisfies
+    a grep without ever reaching the reader. The gate exists because the
+    baseline defect was exactly that, so a gate that counts invisible hits
+    would reproduce the bug it was written to catch.
 
     `%2F` is a slash. Left as-is it reads as a literal "2F" and makes
-    `\b2fa\b` match `…%2Faccount…` and `…MIT%2FApache…`, which is exactly how
-    the baseline defect hid from a plain grep: two of the four corpus-wide
-    "2FA" hits were punctuation. Replacing every escape with a slash both
-    removes the false hit and keeps the surrounding words separated, so a real
-    term next to an escape still matches.
+    `\b2fa\b` match `…%2Faccount…` and `…MIT%2FApache…` — two of the four
+    corpus-wide "2FA" hits were punctuation. Replacing every escape with a
+    slash removes the false hit and still separates the surrounding words, so
+    a real term next to an escape keeps matching.
+
+    The rest are markdown that does not render as body text:
+
+      - **HTML comments.** This repo waives gates in them
+        (`route-surface-allow` and friends), so a term can easily survive in a
+        comment naming it while the prose stopped saying it.
+      - **Link destinations.** `[the flow](./two-factor-setup.md)` shows the
+        reader "the flow"; the path is not on the page. The link TEXT is kept,
+        because that is what they see.
+      - **Reference definitions** (`[label]: https://…`) and **autolinks**,
+        for the same reason.
+
+    Code fences are deliberately NOT stripped: a term inside a fence renders,
+    and a reader's ctrl-F finds it.
     """
+    text = HTML_COMMENT.sub(' ', text)
+    text = REF_DEFINITION.sub(' ', text)
+    text = AUTOLINK.sub(' ', text)
+    text = LINK_DEST.sub('] ', text)
     return PERCENT_ESCAPE.sub('/', text)
 
 
@@ -222,12 +248,38 @@ def self_test():
     if len(d) != 1 or d[0][3] != 'page does not exist':
         failures.append('a missing page should be reported as a defect')
 
+    # 5-8. a term that never renders does not satisfy a row. Each of these
+    # passes a plain grep over the source and shows the reader nothing.
+    invisible = (
+        ('an HTML comment', '<!-- drift-allow: 2FA is covered -->\nTOTP setup.'),
+        ('a multi-line HTML comment', '<!--\n2FA\n-->\nTOTP setup.'),
+        ('a link destination', 'See [the flow](./two-factor-setup.md) for TOTP.'),
+        ('a reference definition', 'See [flow][f].\n\n[f]: ./2fa-guide.md\n'),
+    )
+    for what, text in invisible:
+        d, _ = one(text)
+        if len(d) != 1 or d[0][3] != 'reader word absent':
+            failures.append(f'{what} must not satisfy a reader-word row')
+
+    # ... and each of them DOES match without prose(), which is why the
+    # stripping exists. Assert the preconditions so a future edit that drops
+    # one of these rules fails here rather than passing the corpus silently.
+    for what, text in invisible:
+        if not re.search(r'\b2fa\b|\btwo[- ]factor\b', text, re.I):
+            failures.append(f'precondition: raw {what} should match the row')
+
+    # 9. link TEXT is visible and must still count, so the stripping cannot be
+    # "delete anything near a bracket".
+    d, _ = one('See [two-factor setup](./totp.md).')
+    if d:
+        failures.append('link text is reader-visible and should satisfy a row')
+
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print(f'Self-test OK ({4} properties).')
+    print('Self-test OK (9 properties).')
     return 0
 
 
