@@ -642,6 +642,24 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
         .await
 }
 
+/// The post's current `lock_version`, read directly from the database.
+///
+/// Split out from [`edit_form`] so a staleness test can capture a version
+/// stamp *before* a later request changes it — `edit_form` always reads the
+/// current value, which is right for every ordinary test but cannot express
+/// "the form this stale request carries."
+async fn lock_version_of(id: i64) -> i32 {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::schema::posts::table
+        .find(id)
+        .select(cms::schema::posts::lock_version)
+        .first::<i32>(&mut conn)
+        .await
+        .expect("the post")
+}
+
 /// Encode an editor form, stamping the post's current `lock_version`.
 ///
 /// The editor renders that hidden field on every edit and the update handler
@@ -649,19 +667,8 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
 /// make — and, before the check existed, one that silently skipped the
 /// stale-edit guard.
 async fn edit_form(id: &impl std::fmt::Display, fields: &[(&str, &str)]) -> String {
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
     let id: i64 = id.to_string().parse().expect("a post id");
-    let version = {
-        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        cms::schema::posts::table
-            .find(id)
-            .select(cms::schema::posts::lock_version)
-            .first::<i32>(&mut conn)
-            .await
-            .expect("the post")
-            .to_string()
-    };
+    let version = lock_version_of(id).await.to_string();
     let mut all: Vec<(&str, &str)> = fields.to_vec();
     all.push(("lock_version", version.as_str()));
     form(&all)
@@ -701,6 +708,236 @@ async fn create_post(
         .expect("id is the last path segment")
         .parse()
         .expect("id is numeric")
+}
+
+/// A blank/whitespace-only title on a status that requires one (`publish`,
+/// `private`, `future`) used to reach `AutumnError::unprocessable_msg` three
+/// layers into the create transaction — the state machine's `can_publish`
+/// guard for private/future, `normalize_post`'s direct-create check for
+/// publish — producing the generic `application/problem+json`/error-page
+/// response and discarding whatever body, excerpt and taxonomy picks the
+/// author had already entered. It is now caught pre-flight and redisplays the
+/// editor at 422 with the draft intact and a message next to Title.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for status in ["publish", "private", "future"] {
+        let mut fields = vec![
+            ("title", "   "),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body nobody should lose."),
+            ("status", status),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ];
+        if status == "future" {
+            fields.push(("publish_at", "2999-01-01T00:00"));
+        }
+        let resp = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected {status} submission must not redirect"
+        );
+        resp.assert_body_contains("A body nobody should lose.")
+            .assert_body_contains("must have a title");
+    }
+}
+
+/// The same redisplay, exercised on `update` against an existing post — the
+/// state machine's `can_publish` guard is what `update` hits (see
+/// [`create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact`]),
+/// and the post must still be a draft afterwards: a rejected transition must
+/// not have partially applied.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_draft() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(
+        &client,
+        &cookie,
+        "Original Title",
+        "Original body.",
+        "draft",
+    )
+    .await;
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "   "),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "An edit nobody should lose."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    resp.assert_body_contains("An edit nobody should lose.")
+        .assert_body_contains("must have a title");
+
+    // Not published — the rejected transition never reached the write path.
+    sign_out(&client);
+    let front = client.get("/original-title").send().await;
+    assert_eq!(
+        front.status, 404,
+        "the post must still be an unreachable draft"
+    );
+}
+
+/// The redisplay must not silently repair a stale edit.
+///
+/// `EditorContext`/`editor` are shared between the GET routes (which always
+/// want the row's *current* `lock_version`) and the validation-error 422
+/// branch (which must echo back exactly what was submitted, stale or not) —
+/// see `EditorValues::lock_version`. Getting this backwards would make a
+/// rejected-then-corrected submission pass optimistic locking against an
+/// edit it never actually saw, silently overwriting it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_rejected_submission_does_not_launder_a_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Concurrent Post", "v1", "draft").await;
+    let stale_version = lock_version_of(id).await;
+
+    // A concurrent edit lands and succeeds, bumping `lock_version`.
+    let bump = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Concurrent Post"),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "v2, from someone else"),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    assert_eq!(bump.status, 303, "the concurrent edit should succeed");
+    assert_ne!(
+        lock_version_of(id).await,
+        stale_version,
+        "the concurrent edit must have advanced the lock version"
+    );
+
+    // The original editor, unaware of the concurrent edit, submits the stale
+    // `lock_version` it loaded with — but also a blank title while trying to
+    // publish, which the pre-flight check rejects. The redisplay must carry
+    // the *stale* version back, not the row's now-current one.
+    let stale_form = form(&[
+        ("title", "   "),
+        ("slug", ""),
+        ("excerpt", ""),
+        ("body", "v1, edited but never saved"),
+        ("status", "publish"),
+        ("password", ""),
+        ("taxonomy_names[post_tag]", ""),
+        ("comment_status", "open"),
+        ("lock_version", &stale_version.to_string()),
+    ]);
+    let rejected = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form)
+        .send()
+        .await;
+    rejected
+        .assert_status(422)
+        .assert_body_contains(&format!(r#"value="{stale_version}""#));
+
+    // Correcting just the title and resubmitting the same (still-stale) form
+    // must now be caught by optimistic locking — not silently accepted.
+    let resubmitted = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form.replacen("title=+++", "title=Fixed", 1))
+        .send()
+        .await;
+    resubmitted.assert_status(409);
+}
+
+/// A scheduled post's date needs to be both present and in the future — see
+/// `require_future_publish_date`. Both failures used to reach the same
+/// generic error page via `?`; both now redisplay the editor.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_with_a_past_or_missing_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A past date.
+    let past = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Backdated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("publish_at", "2000-01-01T00:00"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    past.assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("publish date in the future");
+
+    // No date at all.
+    let missing = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Undated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    missing
+        .assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("Pick a publish date");
 }
 
 #[tokio::test]

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **🧭 Wayfinder: redisplay the admin post editor on failure in `examples/cms`
+  (error-path 0/5 → 5/5) [no-plugin]:** an error-path inventory of `cms`'s
+  admin content editor — `create`/`update` behind `/admin/content/{post_type}`,
+  `supported`-tier and the richest hand-written form in the example fleet
+  (title, slug, body, excerpt, status, scheduled date, taxonomies, featured
+  image, parent/order, comments/sticky/password) — found five recoverable
+  failure modes (a blank/whitespace title while publishing, going private, or
+  scheduling; a scheduled date in the past; no scheduled date at all) each
+  reached `AutumnError` via `?` (the state machine's `can_publish` guard,
+  `normalize_post`'s direct-create check, `require_future_publish_date`) and
+  produced the generic `application/problem+json`/error-page response instead
+  of redisplaying the form: 0 of 5 failure modes were adjacent to cause,
+  persisted in place, said how to recover, or preserved the author's draft.
+  Same anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530),
+  `reddit-clone`'s create-community form (#2665) and `blog`'s post editor
+  (#2687), on the example fleet's largest form yet to carry it. Fix:
+  `validate_submission` runs all five checks pre-flight, before any write,
+  and `create`/`update` redisplay the editor at 422 through a new
+  `EditorValues` (the submission's own values, not the database) and
+  `apply_submitted_taxonomies`/`ensure_submitted_choices_visible` (the
+  taxonomy/parent/featured-image picks the author made, re-added to their
+  bounded pickers the same way `EditorContext::load` already re-adds a post's
+  *persisted* ones), instead of the generic error page. `title`/`publish_at`
+  wire `aria-invalid`/`aria-describedby` to a `role="alert"` message; every
+  Tailwind class and control is unchanged. The hidden stale-edit
+  `lock_version` field now comes from the submission (`EditorValues::
+  lock_version`), not a fresh database read, so a submission that was already
+  stale when it hit a validation error stays stale through the redisplay
+  rather than laundering into a version the corrected resubmission would
+  silently pass. The deeper checks (`guard_deferred_transition`, the state
+  machine's `can_publish` guard, `normalize_post`'s own check) are untouched —
+  they remain the authority for the JSON API and importer. 9 new unit tests
+  (`editor_validation_tests`) and 4 new Docker-gated integration tests cover
+  the five failure modes, the stale-lock-version regression, and that a
+  rejected transition never partially applies.
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
