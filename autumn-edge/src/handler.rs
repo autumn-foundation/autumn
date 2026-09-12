@@ -194,6 +194,17 @@ impl EdgeLeaf for http::HeaderMap {}
 impl sealed::LeafSealed for crate::extract::EdgeCache {}
 impl EdgeLeaf for crate::extract::EdgeCache {}
 
+// axum implements `FromRequestParts<S> for ()` directly (see
+// `axum_core::extract::tuple`), so a handler can explicitly take a unit
+// parameter (`async fn h(_: ())`) as one real extractor — distinct from a
+// genuinely nullary handler (`async fn h()`), which uses the special-cased
+// `T = ((),)` above. That one-extractor form instantiates
+// `impl_edge_extract_for_handler_arity!(T1)` with `T1 = ()`, which needs
+// `(): EdgeLeaf` to hold — without it, this otherwise-valid axum handler was
+// wrongly rejected (Codex review on #2739, round 22, P2).
+impl sealed::LeafSealed for () {}
+impl EdgeLeaf for () {}
+
 /// Implement [`EdgeLeaf`] for a plain tuple of leaves, `(E1, .., En)` for `n`
 /// from 1 to 16 — axum's own tuple `FromRequestParts` impls go up to 16
 /// elements (`all_the_tuples_no_last_special_case!` in `axum_core::macros`),
@@ -313,6 +324,14 @@ mod tests {
         "ok"
     }
 
+    /// Distinct from `nullary` above: this handler explicitly takes one
+    /// parameter of type `()`, which axum accepts via its own
+    /// `FromRequestParts<S> for ()` impl (Codex review on #2739, round 22,
+    /// P2).
+    async fn with_unit((): ()) -> &'static str {
+        "ok"
+    }
+
     async fn with_path(Path(name): Path<String>) -> String {
         name
     }
@@ -420,6 +439,7 @@ mod tests {
     #[test]
     fn prelude_extractors_are_edge_eligible() {
         let _ = edge_get(nullary);
+        let _ = edge_get(with_unit);
         let _ = edge_get(with_path);
         let _ = edge_get(with_query);
         let _ = edge_get(with_headers);
