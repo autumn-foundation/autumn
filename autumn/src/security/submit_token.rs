@@ -601,15 +601,22 @@ where
         });
         let is_guarded = !is_exempt && is_mutating_method(req.method());
 
+        // Every GET (and every exempt/non-mutating request) takes this branch:
+        // nothing below needs `self.inner` cloned into an owned value, so
+        // `self.inner.call(req)` can be boxed directly rather than cloning
+        // `self.inner` (a `BoxCloneSyncService` at this point in the stack,
+        // whose `Clone` impl allocates a fresh box) just to move the clone
+        // into an `async move` block that would immediately `.await` it and
+        // do nothing else.
+        if !is_guarded {
+            return Box::pin(self.inner.call(req));
+        }
+
         let settings = Arc::clone(&self.settings);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            if !is_guarded {
-                return inner.call(req).await;
-            }
-
             let (submitted, req) =
                 match extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes)
                     .await

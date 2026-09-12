@@ -208,8 +208,8 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // `minio/minio` was removed from Docker Hub; `quay.io/minio/minio` is
-    // MinIO's own registry and still serves this tag.
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
     let minio = MinIO::default()
         .with_name("quay.io/minio/minio")
         .start()
@@ -335,8 +335,8 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // `minio/minio` was removed from Docker Hub; `quay.io/minio/minio` is
-    // MinIO's own registry and still serves this tag.
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
     let minio = MinIO::default()
         .with_name("quay.io/minio/minio")
         .start()

@@ -423,6 +423,12 @@ server.tls.acme.domains
 server.tls.acme.http_challenge_port
 server.tls.acme.renew_before_days
 server.tls.cert_path
+server.tls.client_auth
+server.tls.client_auth.ca_bundle_path
+server.tls.client_auth.crl_path
+server.tls.client_auth.mode
+server.tls.client_auth.reload_interval_secs
+server.tls.client_auth.required_paths
 server.tls.handshake_timeout_secs
 server.tls.key_path
 server.tls.reload_interval_secs

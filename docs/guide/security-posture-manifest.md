@@ -11,7 +11,7 @@ runtime. Reading the manifest starts with reading these tags.
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "dimensions": {
     "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
@@ -23,7 +23,8 @@ runtime. Reading the manifest starts with reading these tags.
       "entries": [
         { "path": "/posts/{id}/edit", "method": "GET", "name": "edit_post", "action": "update", "resource": "Post", "provenance": "provable" }
       ]
-    }
+    },
+    "mtls":             { "provenance": "declared",  "source": "config:server.tls.client_auth", "mode": "optional", "required_paths": [ "/internal/" ], "entries": [ … ] }
   },
   "excluded": [
     { "dimension": "repository_policy_bindings", "eventual_provenance": "provable",     "reason": "… their presence still shows as routes.entries[].policy" },
@@ -239,6 +240,27 @@ shows up as `"emitted": false` on exactly that entry. The `csrf` dimension is
 `declared` for the same reason: it mirrors the `CsrfLayer` predicate against
 your configured `enabled` flag and `exempt_paths`, but it is your configuration
 speaking, not a proof that every mutating request is checked.
+
+**Example — the `mtls` dimension** (schema v4). It mirrors the runtime
+`RequireClientCert` predicate against `[server.tls.client_auth]`: one entry per
+route, `mtls_required: true` when the listener requests client certificates
+*and* the route matches a configured `required_paths` prefix.
+
+```json
+{ "path": "/internal/keys", "method": "GET", "mtls_required": true }
+```
+
+Every route gets a row, not just the required ones — the diff's job is to notice
+a route that *stopped* requiring a certificate, which needs the negative rows
+too. `autumn routes posture diff` raises `mtls_requirement_removed` (**widening**) for
+exactly that, and `mtls_mode_weakened` when the listener's own mode drops a rank
+(`required` → `optional` → `off`), which no per-route row shows on its own. See
+the [TLS guide](./tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+
+Reading a v3 manifest stays correct: v4 only *adds* this dimension, so an older
+document reads as "no route requires mTLS" rather than failing the gate. An app
+with client auth off projects no `mtls` lines at all, so its posture digest is
+unchanged by the bump.
 
 ## `runtime-only`
 

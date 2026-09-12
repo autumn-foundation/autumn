@@ -1001,9 +1001,16 @@ where
             return Box::pin(async move { Ok(replay.into_response()) });
         }
 
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move { inner.call(req).await })
+        // The overwhelming majority of requests carry no replay marker (only
+        // the capsule replay driver ever sets one), so this runs for nearly
+        // every request through this layer. Nothing here needs `self.inner`
+        // cloned into an owned value first: `self.inner.call(req)` can be
+        // boxed directly instead of cloning `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) purely to move the clone into an
+        // `async move` block that immediately `.await`s it and does nothing
+        // else.
+        Box::pin(self.inner.call(req))
     }
 }
 

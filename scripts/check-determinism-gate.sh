@@ -141,10 +141,16 @@ GATED_MODULES=(
   # its own ungated `default_now_unix`; gating it needs an `--features acme`
   # enforcing clippy lane, which does not exist yet.
   autumn/src/tls.rs:tls
+  # mTLS client-certificate verification (#1640). Certificate validity and the
+  # rejection-log rate limiter both read real wall time, through `tls.rs`'s
+  # already-gated `now_unix`; the gate keeps a later off-seam read added beside
+  # them (in the trust-store reloader's poll loop, or the verifier) from
+  # shipping unlinted.
+  autumn/src/tls/client_auth.rs:tls
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=19
+MODULE_COUNT_FLOOR=20
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(
