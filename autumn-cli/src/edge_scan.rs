@@ -596,24 +596,32 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
         .cloned();
     let package_name = table.as_ref().and_then(package_name_from_manifest);
 
-    // `default` is itself a real, always-on feature name (Cargo treats it as
-    // such even with no explicit `[features] default = [...]` entry, an
-    // empty implicit one) — every `autumn build` run has it active, since
-    // (per the module doc) there is no `--no-default-features` flag to turn
-    // it off. Missing this left a bare `#[cfg(feature = "default")]` route
-    // looking excluded even though Cargo always compiles it (Codex review on
-    // #2739, round 9, P1).
-    let mut queue: Vec<String> = vec!["default".to_owned()];
-    queue.extend(
-        features_table
-            .as_ref()
-            .and_then(|features| features.get("default"))
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(toml::Value::as_str)
-            .map(str::to_owned),
-    );
+    // `default` is a real feature name — but, verified directly against
+    // `cargo rustc -- --print cfg`, only when the manifest actually declares
+    // `[features] default = [...]`, even an empty list. With no `[features]`
+    // table at all, or one that simply never mentions `default`, Cargo never
+    // emits `feature = "default"`, and a `#[cfg(feature = "default")]` route
+    // is compiled out of an ordinary default build exactly like any other
+    // never-enabled feature name — so seeding it unconditionally made THAT
+    // route look included when Cargo really excludes it, a phantom route
+    // that can spuriously demand a capsule/WASI target or reject `--embed`
+    // (Codex review on #2739, round 12, P2, correcting round 9's overly
+    // broad fix: `default` is only ever "always on" for a build that already
+    // declares it, never as a feature this scan may assume into existence).
+    let default_members = features_table
+        .as_ref()
+        .and_then(|features| features.get("default"))
+        .and_then(toml::Value::as_array);
+    let mut queue: Vec<String> = Vec::new();
+    if let Some(members) = default_members {
+        queue.push("default".to_owned());
+        queue.extend(
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
     queue.extend(requested.iter().map(|name| {
         name.split_once('/').map_or_else(
             || (*name).to_owned(),
@@ -1559,13 +1567,15 @@ mod tests {
         assert!(!enabled.contains("extra"));
     }
 
-    /// `default` is itself a real, always-on feature name — Cargo compiles a
-    /// `#[cfg(feature = "default")]` route in every ordinary build, `autumn
-    /// build` has no `--no-default-features` flag to turn it off — so it
-    /// must be in the enabled set even though it never appears inside its
-    /// own `default = [...]` list (Codex review on #2739, round 9, P1).
+    /// `default` is itself a real feature name when the manifest declares
+    /// `[features] default = [...]` — Cargo compiles a
+    /// `#[cfg(feature = "default")]` route in every ordinary build of such a
+    /// manifest, `autumn build` has no `--no-default-features` flag to turn
+    /// it off — so it must be in the enabled set even though it never
+    /// appears inside its own `default = [...]` list (Codex review on #2739,
+    /// round 9, P1).
     #[test]
-    fn the_default_feature_itself_is_enabled() {
+    fn the_default_feature_itself_is_enabled_when_declared() {
         let manifest = r#"
             [features]
             default = ["a"]
@@ -1576,16 +1586,49 @@ mod tests {
         assert!(enabled.contains("a"));
     }
 
-    /// Even with no `[features]` table at all, `default` is still Cargo's
-    /// always-on implicit feature.
+    /// Verified directly against `cargo rustc -- --print cfg`: with no
+    /// `[features]` table at all, Cargo never emits `feature = "default"` —
+    /// there is no implicit always-on `default` to seed. Round 9 assumed
+    /// otherwise and unconditionally seeded it, which made a
+    /// `#[cfg(feature = "default")]` route look included in a scan even
+    /// though Cargo genuinely compiles it out of such a manifest — a phantom
+    /// route, the same false-inclusion danger the round-11 module-cfg fix
+    /// closed for inline modules (Codex review on #2739, round 12, P2).
     #[test]
-    fn the_default_feature_is_enabled_with_no_features_table() {
+    fn the_default_feature_is_not_enabled_with_no_features_table() {
         let manifest = r#"
             [package]
             name = "blog"
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("default"));
+    }
+
+    /// Same as above for a `[features]` table that exists but never mentions
+    /// `default` at all — the missing key, not merely a missing table, is
+    /// what must gate this.
+    #[test]
+    fn the_default_feature_is_not_enabled_when_the_features_table_omits_it() {
+        let manifest = r"
+            [features]
+            other = []
+        ";
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("default"));
+    }
+
+    /// An explicit but empty `default = []` still counts as declared: Cargo
+    /// enables the (empty) `default` feature for such a manifest.
+    #[test]
+    fn the_default_feature_is_enabled_when_declared_empty() {
+        let manifest = r"
+            [features]
+            default = []
+            other = []
+        ";
+        let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("default"));
+        assert!(!enabled.contains("other"));
     }
 
     /// `default = ["dep/extra"]` (no `?`) also activates the optional
