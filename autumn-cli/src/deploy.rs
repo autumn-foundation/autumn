@@ -5418,10 +5418,30 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
     };
 
     let mut ops: Vec<exec::DeployOp> = Vec::new();
-    if on {
+    // The index the shared write lands at: a failure at or before it means the
+    // host was NOT changed (fail closed); a failure after it means the shared
+    // flag landed but the running unit's own file did not.
+    let shared_index = if on {
         // Shared (authoritative) flag first: a #1621 unit reacts within 500 ms of
         // this single write, so the window starts closing even if the write below
         // fails (amendment A2).
+        //
+        // #2280: the shared flag's parent (`{app_dir}/shared`) only comes into
+        // existence during `prepare-dirs` on a deploy, so a host that has NEVER
+        // been deployed has no shared dir yet — and scp does not create
+        // destination parents, so the write fails and the
+        // `AppliedSharedOnly` success path (keyed on exactly this host shape) is
+        // unreachable. mkdir -p ahead of the write, mirroring
+        // `maintenance-prepare-live-flag-dir` below. It goes AHEAD of the write,
+        // not in its place, to keep the amendment-A2 ordering: the shared flag is
+        // still written first.
+        if let Some(parent) = remote_parent_dir(&shared) {
+            ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+                "maintenance-prepare-shared-flag-dir",
+                format!("mkdir -p {}", exec::shell_quote(parent)),
+            )));
+        }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::WriteFile {
             label: "maintenance-write-shared",
             contents: exec::FileContents::Plain(body.to_owned()),
@@ -5451,31 +5471,35 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
                 mode: Some(0o600),
             });
         }
+        shared_index
     } else {
         // `rm -f` both paths in one op: absent files are the NORMAL case for at
         // least one of them (a host has either the new unit or the old), so a
-        // missing file must never fail the `off`.
+        // missing file must never fail the `off`. No mkdir needed: `rm -f` does
+        // not care that the parent does not exist.
         let mut paths = exec::shell_quote(&shared);
         if let Some(path) = &live_path {
             paths.push(' ');
             paths.push_str(&exec::shell_quote(path));
         }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
             "maintenance-clear",
             format!("rm -f {paths}"),
         )));
-    }
+        shared_index
+    };
 
     for (index, op) in ops.iter().enumerate() {
         if exec::run_ops(std::slice::from_ref(op), executor).is_err() {
             // The op label is known HERE regardless of the error's shape (an
             // upload failure carries no label), so the report can always name the
             // step without quoting the error.
+            // A failure at or before the shared write leaves the host genuinely
+            // UNCHANGED; failing anything after it means the shared flag landed
+            // but the running unit's own file did not.
             let failed_step = op.label();
-            // Op 0 is the shared path in both directions, so failing it leaves the
-            // host genuinely UNCHANGED; failing anything after it means the shared
-            // flag landed but the running unit's own file did not.
-            return if index == 0 {
+            return if index <= shared_index {
                 fleet::MaintenanceOutcome::Failed { failed_step }
             } else {
                 fleet::MaintenanceOutcome::LiveUnitUnchanged { failed_step }
@@ -11394,6 +11418,64 @@ mod tests {
                 .run_labels_for("web-a")
                 .contains(&"maintenance-prepare-live-flag-dir"),
             "no running unit means no second flag dir to prepare"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_on_prepares_the_shared_flag_dir_before_uploading() {
+        // #2280: `prepare-dirs` (which creates `{app_dir}/shared`) only runs during
+        // a deploy, so on a never-deployed host the shared flag's parent does not
+        // exist — and scp does not create destination parents, so the very first
+        // `maintenance on` failed and the `AppliedSharedOnly` success path keyed on
+        // exactly this host shape was unreachable. The dir is created up front,
+        // BEFORE the shared write (amendment A2: the shared flag is still written
+        // first, so a #1621 unit reacts within 500 ms of the write itself).
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = fleet::test_support::FleetRecorder::new().script(
+            "web-a",
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n",
+        );
+
+        drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect("a shared-only write is a success, not a failure");
+
+        let calls = recorder.calls_for("web-a");
+        let mkdir_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Run { label, shell }
+                        if *label == "maintenance-prepare-shared-flag-dir"
+                            && shell.contains("mkdir -p")
+                            && shell.contains("/srv/autumn/myapp/shared")
+                )
+            })
+            .expect("the shared flag's parent must be created before the upload");
+        let upload_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Upload { remote_path, .. }
+                        if remote_path == MAINTENANCE_SHARED_PATH
+                )
+            })
+            .expect("the shared flag is uploaded");
+        assert!(
+            mkdir_pos < upload_pos,
+            "the shared dir is created BEFORE the shared flag is written"
+        );
+        assert_eq!(
+            upload_paths(&recorder, "web-a"),
+            vec![MAINTENANCE_SHARED_PATH.to_owned()],
+            "only the shared flag can be written without a resolvable release"
         );
     }
 
