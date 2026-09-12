@@ -128,14 +128,25 @@ impl EdgeFn {
 pub struct EdgeScan {
     /// Every `#[edge]`-marked function, in scan order (files sorted by path).
     pub functions: Vec<EdgeFn>,
-    /// Full path text of each `edge_routes![...]` entry, as written
-    /// (`"users::show"`, or a bare `"greet"`).
+    /// Full path text of each `edge_routes![...]` entry, resolved against its
+    /// own module (`"users::show"` as written, or `"api::v1::show"` for a
+    /// `v1::show` entry written inside `mod api`). May hold more than one
+    /// resolved reading of the same entry (see [`registration_candidates`]),
+    /// so this is not exactly "as written" for every member — nothing outside
+    /// this module reads it directly, only through [`EdgeScan::unregistered`]
+    /// and [`EdgeScan::registered_fns`].
     pub registered: BTreeSet<String>,
     /// Number of `edge_routes![...]` invocations seen (0 means the app never
     /// registers its marked handlers, so the capsule would serve nothing).
     pub registrations: usize,
     /// Number of `.rs` files read.
     pub files_scanned: usize,
+    /// The scanned crate's own `[package] name`, when its manifest could be
+    /// read and parsed. Lets a registration written as `my_crate::show`
+    /// (Rust's own rule: a crate's name is also a valid path root to its own
+    /// items, same as `crate::show`) match a function `is_registered` would
+    /// otherwise treat as a reference to an unrelated `my_crate` module.
+    pub crate_name: Option<String>,
 }
 
 impl EdgeScan {
@@ -157,7 +168,7 @@ impl EdgeScan {
     pub fn unregistered(&self) -> Vec<&EdgeFn> {
         self.functions
             .iter()
-            .filter(|f| !is_registered(f, &self.registered))
+            .filter(|f| !is_registered(f, &self.registered, self.crate_name.as_deref()))
             .collect()
     }
 
@@ -167,7 +178,7 @@ impl EdgeScan {
     pub fn registered_fns(&self) -> Vec<&EdgeFn> {
         self.functions
             .iter()
-            .filter(|f| is_registered(f, &self.registered))
+            .filter(|f| is_registered(f, &self.registered, self.crate_name.as_deref()))
             .collect()
     }
 
@@ -198,21 +209,24 @@ impl EdgeScan {
 /// qualifier" would let an unrelated same-named function elsewhere silently
 /// satisfy a registration meant for the crate-root one.
 ///
-/// Exact equality, not a suffix match, is deliberate: a relative reference
-/// written from inside an ancestor of `f`'s module (`edge_routes![v1::greet]`
-/// for a `greet` nested two levels down) will not match here and reports as
-/// unregistered — a false-positive warning, the scanner's documented safe
-/// direction. A suffix match would fix that case but reopen the one this
-/// function exists to close: with sibling modules `mod a { mod x { #[edge]
-/// fn f() {} } }` and `mod b { mod x { #[edge] fn f() {} } }`, a suffix
-/// match on `x::f` would satisfy both, silently muting the real warning for
-/// whichever one was not actually registered.
+/// Exact equality, not a suffix match, is deliberate: with sibling modules
+/// `mod a { mod x { #[edge] fn f() {} } }` and `mod b { mod x { #[edge] fn
+/// f() {} } }`, a suffix match on `x::f` from anywhere would satisfy both,
+/// silently muting the real warning for whichever one was not actually
+/// registered. A relative reference such as `edge_routes![v1::greet]` still
+/// matches correctly when it names a real Rust path — [`registration_candidates`]
+/// resolves it against the invocation's own enclosing module before it ever
+/// reaches this function, rather than this function chasing every ancestor
+/// itself.
 ///
-/// A leading `crate` segment in the qualifier is stripped first:
-/// `edge_routes![crate::users::show]` is the same route as `users::show`,
-/// and `f.module_path` never carries that prefix, so leaving it in would
-/// make every `crate::`-qualified registration miss its own function.
-fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
+/// A leading `crate` segment in the qualifier is stripped first, and so is a
+/// leading segment equal to `crate_name` (the scanned crate's own `[package]
+/// name`, when known) — Rust treats a crate's own name as another valid path
+/// root to its items, same as `crate`. Either way `edge_routes![crate::users::show]`
+/// or `edge_routes![my_crate::users::show]` is the same route as
+/// `users::show`, and `f.module_path` never carries either prefix, so
+/// leaving it in would make such a registration miss its own function.
+fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>, crate_name: Option<&str>) -> bool {
     registered.iter().any(|entry| {
         let (qualifier, name) = entry.rsplit_once("::").unwrap_or(("", entry.as_str()));
         if name != f.name {
@@ -222,7 +236,12 @@ fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
             return true;
         }
         let mut qualifier_segments = qualifier.split("::");
-        if qualifier_segments.clone().next() == Some("crate") {
+        let root_matches = match qualifier_segments.clone().next() {
+            Some("crate") => true,
+            Some(seg) => crate_name.is_some_and(|name| name == seg),
+            None => false,
+        };
+        if root_matches {
             qualifier_segments.next();
         }
         qualifier_segments.eq(f.module_path.iter().map(String::as_str))
@@ -294,10 +313,15 @@ pub fn resolve_edge_scan_with_features(
     // A missing or unparseable Cargo.toml yields no default features, which is
     // the safe direction: every `#[cfg(feature = "...")]` then stays
     // unresolved, and the function it gates stays in the scan.
-    let default_features = std::fs::read_to_string(project_root.join("Cargo.toml"))
-        .ok()
-        .map(|manifest| enabled_features_from_manifest(&manifest, requested_features))
+    let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
+    let default_features = manifest
+        .as_deref()
+        .map(|manifest| enabled_features_from_manifest(manifest, requested_features))
         .unwrap_or_default();
+    let crate_name = manifest
+        .as_deref()
+        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok())
+        .and_then(|table| package_name_from_manifest(&table));
 
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
@@ -325,7 +349,9 @@ pub fn resolve_edge_scan_with_features(
         .iter()
         .map(|(file, src)| (file.as_str(), src.as_str()))
         .collect();
-    scan_sources_with_features(&borrowed, &default_features)
+    let mut scan = scan_sources_with_features(&borrowed, &default_features);
+    scan.crate_name = crate_name;
+    scan
 }
 
 /// [`resolve_edge_scan_with_features`], plus `extra_file` — a path outside
@@ -372,6 +398,20 @@ pub fn resolve_edge_scan_with_extra_file(
     scan
 }
 
+/// The scanned crate's own `[package] name`, when the manifest table parses
+/// far enough to say. Shared by [`enabled_features_from_manifest`]
+/// (recognizing `pkg/feat` as this crate's own feature) and
+/// [`resolve_edge_scan_with_features`] (recognizing `pkg::item` in a
+/// registration as this crate's own item, same as `crate::item`).
+#[must_use]
+fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
+    table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Read a crate's `Cargo.toml`, seed the feature queue with `[features]
 /// default = [...]` plus `requested` (features asked for on the command
 /// line), and follow both through the feature graph in `[features]` to build
@@ -408,11 +448,7 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
         .and_then(|table| table.get("features"))
         .and_then(toml::Value::as_table)
         .cloned();
-    let package_name = table
-        .as_ref()
-        .and_then(|table| table.get("package"))
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str);
+    let package_name = table.as_ref().and_then(package_name_from_manifest);
 
     let mut queue: Vec<String> = features_table
         .as_ref()
@@ -430,7 +466,7 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
         name.split_once('/').map_or_else(
             || (*name).to_owned(),
             |(pkg, feat)| {
-                if Some(pkg.trim_end_matches('?')) == package_name {
+                if Some(pkg.trim_end_matches('?')) == package_name.as_deref() {
                     feat.to_owned()
                 } else {
                     (*name).to_owned()
@@ -740,8 +776,9 @@ fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, sc
                 {
                     scan.registrations += 1;
                     for name in registered_idents(&group.stream()) {
-                        scan.registered
-                            .insert(resolve_registration_path(&name, module_path));
+                        for candidate in registration_candidates(&name, module_path) {
+                            scan.registered.insert(candidate);
+                        }
                     }
                 }
             }
@@ -751,18 +788,30 @@ fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, sc
     }
 }
 
-/// Resolve a `self`/`super`-relative registration path against
-/// `module_path`, the module the `edge_routes![...]` invocation is written
-/// in. Cargo's own path rules: a leading `self` names that module itself, so
-/// it is dropped in favor of `module_path`; a leading `super` (repeatable)
-/// goes up one level of `module_path` per occurrence. A resolution that
-/// bottoms out at the crate root is written back out with an explicit
+/// Resolve one registration entry against `module_path`, the module the
+/// `edge_routes![...]` invocation is written in, returning every reading
+/// worth trying — `is_registered` matches if any of them names the function.
+///
+/// Cargo's own path rules: a leading `self` names that module itself, so it
+/// is dropped in favor of `module_path`; a leading `super` (repeatable) goes
+/// up one level of `module_path` per occurrence. Either way, a resolution
+/// that bottoms out at the crate root is written back out with an explicit
 /// `crate` prefix (`super::show` from module `admin` becomes `crate::show`,
 /// not bare `show`) so [`is_registered`]'s exact-equality match — not the
-/// looser bare-entry rule — is what decides it. Anything else (`crate`
-/// itself, a real module name, or no qualifier at all) passes through
-/// unchanged.
-fn resolve_registration_path(entry: &str, module_path: &[String]) -> String {
+/// looser bare-entry rule — is what decides it. `self`/`super` are unambiguous,
+/// so each resolves to exactly one candidate.
+///
+/// Anything else — `crate`, a real crate-name-qualified path, or no
+/// qualifier at all — is kept as its own candidate unchanged. When it is
+/// additionally qualified (`v1::show`, not just `show`) and the invocation
+/// itself is nested in a module, a *second* candidate is added: the entry
+/// resolved as a plain relative reference to a child of that module
+/// (`v1::show` inside `mod api { ... }` also tries `api::v1::show`) — real
+/// Rust tries local scope first for a path like this, and only one of the
+/// two candidates can ever match a genuine function's module path, so this
+/// does not reopen the sibling-shadowing case [`is_registered`]'s exact
+/// match exists to close (Codex review on #2739, round 5, P2).
+fn registration_candidates(entry: &str, module_path: &[String]) -> Vec<String> {
     let segments: Vec<&str> = entry.split("::").collect();
     let (mut base, rest): (Vec<String>, &[&str]) = match segments.first().copied() {
         Some("self") => (module_path.to_vec(), &segments[1..]),
@@ -775,13 +824,22 @@ fn resolve_registration_path(entry: &str, module_path: &[String]) -> String {
             }
             (base, rest)
         }
-        _ => return entry.to_owned(),
+        Some("crate") => return vec![entry.to_owned()],
+        _ => {
+            let mut candidates = vec![entry.to_owned()];
+            if segments.len() > 1 && !module_path.is_empty() {
+                let mut relative = module_path.to_vec();
+                relative.extend(segments.iter().map(|s| (*s).to_owned()));
+                candidates.push(relative.join("::"));
+            }
+            return candidates;
+        }
     };
     if base.is_empty() {
         base.push("crate".to_owned());
     }
     base.extend(rest.iter().map(|s| (*s).to_owned()));
-    base.join("::")
+    vec![base.join("::")]
 }
 
 /// Split a macro argument list on top-level commas and keep each entry's full
@@ -1419,6 +1477,107 @@ mod tests {
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
         assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// `edge_routes![my_crate::show]` — the crate's own `[package] name`
+    /// used as a path root — is Rust's other spelling for `crate::show`.
+    /// `scan.crate_name` is set the way `resolve_edge_scan_with_features`
+    /// sets it from a real manifest; `scan_one`'s inline-source tests have
+    /// no manifest to read it from, so it is set directly here.
+    #[test]
+    fn a_crate_name_qualified_registration_matches_its_module_path() {
+        let mut scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() { edge_routes![edgeapp::show]; }
+            ",
+        );
+        scan.crate_name = Some("edgeapp".to_owned());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// A qualifier that is neither `crate` nor the scanned crate's own name
+    /// still does not wildcard-match a crate-root function — only the exact
+    /// `crate_name` earns the same treatment as `crate`.
+    #[test]
+    fn an_unrelated_qualifier_does_not_match_even_with_a_crate_name_set() {
+        let mut scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() { edge_routes![otherpkg::show]; }
+            ",
+        );
+        scan.crate_name = Some("edgeapp".to_owned());
+        assert_eq!(
+            scan.registered_fns().len(),
+            0,
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// `edge_routes![v1::show]` written inside `mod api { mod v1 { ... } }`
+    /// is an ordinary relative reference: Rust resolves `v1` against the
+    /// invocation's own module first, giving `api::v1::show`, not a
+    /// top-level `v1` module.
+    #[test]
+    fn a_relative_child_module_registration_resolves_against_its_own_module() {
+        let scan = scan_one(
+            r"
+            mod api {
+                mod v1 {
+                    #[edge]
+                    pub fn show() {}
+                }
+                fn wire() { edge_routes![v1::show]; }
+            }
+            ",
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// The relative-child-module reading must not reopen the sibling-module
+    /// shadowing case the exact-equality match exists to close: `x::f` written
+    /// inside `mod b` must resolve to `b::x::f` only, never also credit the
+    /// unrelated `a::x::f`.
+    #[test]
+    fn a_relative_child_module_registration_does_not_shadow_a_sibling() {
+        let scan = scan_one(
+            r"
+            mod a {
+                mod x {
+                    #[edge]
+                    pub fn f() {}
+                }
+            }
+            mod b {
+                mod x {
+                    #[edge]
+                    pub fn f() {}
+                }
+                fn wire() { edge_routes![x::f]; }
+            }
+            ",
+        );
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(
+            unregistered[0].module_path,
+            vec!["a".to_owned(), "x".to_owned()]
+        );
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(
+            registered[0].module_path,
+            vec!["b".to_owned(), "x".to_owned()]
+        );
     }
 
     /// `mod users;` / `mod admin;` (separate files, not inline `mod { }`

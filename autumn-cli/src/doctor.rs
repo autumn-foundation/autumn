@@ -11143,6 +11143,11 @@ fn parse_pub_field_name(line: &str) -> Option<String> {
 /// The `src/bin/edge-capsule.rs` an app with `#[edge]` routes needs.
 const EDGE_CAPSULE_BIN: &str = "src/bin/edge-capsule.rs";
 
+/// Cargo's other supported layout for the same target: a directory named
+/// after the bin with its own `main.rs`, autobin-discovered or matched by a
+/// pathless `[[bin]] name = "edge-capsule"` exactly like the flat-file form.
+const EDGE_CAPSULE_BIN_DIR: &str = "src/bin/edge-capsule/main.rs";
+
 /// Whether `root`'s `Cargo.toml` is a virtual workspace root: it has a
 /// `[workspace]` table but no `[package]` table. Real sources live under a
 /// member crate in that case, so scanning `root` itself for `#[edge]` routes
@@ -11178,11 +11183,13 @@ fn edge_virtual_workspace_warn(name: &'static str) -> CheckResult {
 ///
 /// Cargo builds an `edge-capsule` binary two ways: an explicit `[[bin]]`
 /// entry named `edge-capsule` (any `path`), or — only when `autobins` is
-/// not `false` — the conventional `src/bin/edge-capsule.rs`. A project that
-/// turns off `autobins` and never declares the target explicitly cannot
-/// build the capsule, even if that file exists on disk.
+/// not `false` — the conventional path, itself one of two layouts Cargo
+/// accepts equally: the flat `src/bin/edge-capsule.rs`, or a directory
+/// `src/bin/edge-capsule/main.rs`. A project that turns off `autobins` and
+/// never declares the target explicitly cannot build the capsule, even if
+/// one of these files exists on disk.
 fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let conventional = || root.join(EDGE_CAPSULE_BIN);
+    let conventional = || conventional_edge_capsule_bin(root);
     let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let table = toml::from_str::<toml::Table>(&content).ok()?;
 
@@ -11208,6 +11215,19 @@ fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::PathBuf
     } else {
         Some(conventional())
     }
+}
+
+/// The conventional edge-capsule bin path Cargo would actually build: the
+/// flat-file layout if it exists, else the directory layout if THAT exists,
+/// else the flat-file path anyway (so a genuinely-missing capsule still
+/// names the path a project is expected to create).
+fn conventional_edge_capsule_bin(root: &std::path::Path) -> std::path::PathBuf {
+    let flat = root.join(EDGE_CAPSULE_BIN);
+    if flat.exists() {
+        return flat;
+    }
+    let dir_style = root.join(EDGE_CAPSULE_BIN_DIR);
+    if dir_style.exists() { dir_style } else { flat }
 }
 
 /// Whether the project can compile its `#[edge]` routes at all: the
@@ -11554,6 +11574,28 @@ mod tests {
         assert_eq!(
             resolve_edge_capsule_bin(dir.path()),
             Some(dir.path().join(EDGE_CAPSULE_BIN))
+        );
+    }
+
+    /// Cargo accepts a directory-style bin target (`src/bin/edge-capsule/
+    /// main.rs`) exactly like the flat-file one for autobin discovery and
+    /// for a pathless `[[bin]] name = "edge-capsule"` entry. Without
+    /// checking for it, this resolver always points at the flat file, so
+    /// `edge_routes` wrongly reports the capsule bin as missing even though
+    /// Cargo builds it (Codex review on #2739, round 5, P2).
+    #[test]
+    fn resolve_edge_capsule_bin_recognizes_the_directory_style_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin/edge-capsule")).unwrap();
+        std::fs::write(dir.path().join(EDGE_CAPSULE_BIN_DIR), "fn main() {}\n").unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join(EDGE_CAPSULE_BIN_DIR))
         );
     }
 
