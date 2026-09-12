@@ -37,10 +37,8 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    // Docker Hub's `minio/minio` now requires auth for anonymous pulls
-    // (MinIO restricted it in 2025); `quay.io/minio/minio` mirrors the same
-    // tags and stays public, so CI runners without registry credentials
-    // still work.
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
     let container = MinIO::default()
         .with_name("quay.io/minio/minio")
         .start()

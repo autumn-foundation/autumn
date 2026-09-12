@@ -62,10 +62,8 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
 
-    // Docker Hub's `minio/minio` now requires auth for anonymous pulls
-    // (MinIO restricted it in 2025); `quay.io/minio/minio` mirrors the same
-    // tags and stays public, so CI runners without registry credentials
-    // still work.
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
     let minio = MinIO::default()
         .with_name("quay.io/minio/minio")
         .start()
