@@ -22,9 +22,6 @@ use std::process::Command;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use testcontainers::ImageExt as _;
-use testcontainers::{ContainerRequest, Image as _};
-use testcontainers_modules::minio::MinIO;
 
 const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
@@ -54,39 +51,6 @@ fn run_autumn_ok(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, S
     (stdout, stderr)
 }
 
-// ─── MinIO image source ──────────────────────────────────────────────────────
-//
-// `testcontainers-modules` pins `minio/minio` on Docker Hub, which no longer
-// serves anonymous pulls: the registry answers 401, which Docker reports as
-// "pull access denied for minio/minio, repository does not exist". MinIO
-// publishes the identical tag to quay.io, and that copy is still public, so only
-// the registry moves here — image and tag are unchanged, and the tag still comes
-// from the module, so a dependency bump keeps carrying it.
-fn minio_image() -> ContainerRequest<MinIO> {
-    MinIO::default().with_name("quay.io/minio/minio")
-}
-
-/// Guards the registry override without needing Docker.
-///
-/// The Docker sweep is the only place the two tests below run, so a silent
-/// regression here — a dependency bump reinstating the Hub name, or the
-/// `with_name` call being dropped — would surface as a red Docker job rather
-/// than a named failure. This runs in the ordinary lane instead.
-#[test]
-fn minio_image_takes_the_module_tag_from_the_public_registry() {
-    let descriptor = minio_image().descriptor();
-    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
-    assert_eq!(
-        name, "quay.io/minio/minio",
-        "Docker Hub refuses anonymous pulls of minio/minio",
-    );
-    assert_eq!(
-        tag,
-        MinIO::default().tag(),
-        "the tag must stay the module's, so a bump carries it",
-    );
-}
-
 // ─── Minimal SigV4 bucket-creation helper (test-only) ────────────────────────
 //
 // The `autumn` binary has no library target, so an integration test cannot reach
@@ -107,18 +71,12 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-/// Starts a `MinIO` testcontainer, pulling from `quay.io` instead of the
-/// crate default's `docker.io/minio/minio`. `MinIO` Inc. pulled that Docker
-/// Hub repo in 2025, so the tag `testcontainers-modules` 0.15.0 hardcodes
-/// 404s there; `quay.io/minio/minio` still mirrors the exact same
-/// tag/digest.
+/// Starts a `MinIO` testcontainer from [`minio_image`], so both tests and the
+/// registry guard below share one image definition.
 async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO> {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
 
-    MinIO::default()
-        .with_name("quay.io/minio/minio")
+    minio_image()
         .start()
         .await
         .expect("start MinIO — is Docker running?")
@@ -254,6 +212,22 @@ fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::min
     testcontainers_modules::minio::MinIO::default()
         .with_name("quay.io/minio/minio")
         .with_tag("RELEASE.2025-09-07T16-13-09Z")
+}
+
+/// Guards the registry override without needing Docker.
+///
+/// Both tests below run only in the Docker sweep, so losing the override would
+/// surface as a red job naming a registry rather than the file that forgot.
+/// This runs in the ordinary lane instead.
+#[test]
+fn minio_image_pulls_from_the_public_registry() {
+    let descriptor = minio_image().descriptor();
+    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
+    assert_eq!(
+        name, "quay.io/minio/minio",
+        "Docker Hub no longer serves minio/minio",
+    );
+    assert!(!tag.is_empty(), "the tag must be pinned explicitly");
 }
 
 #[tokio::test]
