@@ -11,6 +11,7 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
 };
 use bytes::Bytes;
+use testcontainers::ImageExt as _;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
 
@@ -36,7 +37,14 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    let container = MinIO::default().start().await.expect("start MinIO");
+    // Docker Hub refuses anonymous pulls of `minio/minio` (401, surfaced as "repository
+    // does not exist"). quay.io serves the identical tag publicly, so only the registry
+    // moves — `with_name` leaves the tag to `testcontainers-modules`.
+    let container = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .start()
+        .await
+        .expect("start MinIO");
     let port = container
         .get_host_port_ipv4(9000)
         .await

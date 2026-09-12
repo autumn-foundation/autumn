@@ -58,10 +58,15 @@ fn read_values(path: &std::path::Path) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker (testcontainers: minio)"]
 async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
 
+    // Docker Hub refuses anonymous pulls of `minio/minio` (401, surfaced as "repository
+    // does not exist"). quay.io serves the identical tag publicly, so only the registry
+    // moves — `with_name` leaves the tag to `testcontainers-modules`.
     let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
         .start()
         .await
         .expect("start MinIO — is Docker running?");
