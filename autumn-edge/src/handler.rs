@@ -52,6 +52,35 @@
 //!
 //! let _ = edge_get(handler);
 //! ```
+//!
+//! ## Why the tuple check has two layers
+//!
+//! axum also implements its extractor traits for plain tuples, so a single
+//! handler parameter can itself be a tuple of extractors
+//! (`async fn h(combo: (Path<T>, HeaderMap))`). [`EdgeExtract`]'s own tuple
+//! impls exist to accept axum's *handler-arity* tuple — the `(M, E1, ..,
+//! En)` shape [`edge_get`]'s doc explains below — and that shape is, on
+//! purpose, indistinguishable at the type level from a tuple a handler
+//! author wrote by hand: both are "some type, followed by more types."
+//! Judging each position with [`EdgeExtract`] itself (recursively) would
+//! make that ambiguity exploitable: `(Extension<Hidden>, HeaderMap)` would
+//! read as a valid handler-arity tuple with `Extension<Hidden>` sitting in
+//! the free marker slot, smuggling it straight past the whitelist. Each
+//! position is judged by [`EdgeLeaf`] instead — sealed, and never
+//! implemented for a tuple of any arity — so nesting one more tuple around
+//! `Extension<T>` cannot manufacture a leaf:
+//!
+//! ```compile_fail
+//! use autumn_edge::edge_get;
+//!
+//! type Hidden = axum::Extension<u32>;
+//!
+//! async fn handler(combo: (Hidden, http::HeaderMap)) -> &'static str {
+//!     "never reached"
+//! }
+//!
+//! let _ = edge_get(handler);
+//! ```
 
 use crate::route::EdgeState;
 
@@ -66,6 +95,13 @@ mod sealed {
     /// implemented downstream: the whitelist is exactly the types this module
     /// lists, and nothing else.
     pub trait ExtractSealed {}
+
+    /// Not nameable outside this crate, so [`super::EdgeLeaf`] cannot be
+    /// implemented downstream, and — just as load-bearing — cannot be
+    /// implemented for a tuple *inside* this module either, since nothing
+    /// outside `handler.rs` ever writes one. See [`super::EdgeLeaf`] for why
+    /// that absence is what keeps [`super::EdgeExtract`]'s tuple check sound.
+    pub trait LeafSealed {}
 }
 
 impl<H, T> sealed::Sealed<T> for H where H: axum::handler::Handler<T, EdgeState> {}
@@ -92,12 +128,16 @@ where
 
 /// The fixed set of extractors an `#[edge]` handler may take.
 ///
-/// Sealed and blanket-implemented for exactly [`axum::extract::Path`],
+/// Blanket-implemented for exactly [`axum::extract::Path`],
 /// [`axum::extract::Query`], [`http::HeaderMap`], [`EdgeCache`](crate::extract::EdgeCache),
 /// the empty tuple (a handler with no extractors), and tuples of up to eight
-/// of these — nothing else. This is what makes [`EdgeHandler`] a whitelist
-/// rather than a blacklist: a new native-only extractor needs no refusal
-/// added here, because it was never on the list to begin with.
+/// [`EdgeLeaf`] types — nothing else. This is what makes [`EdgeHandler`] a
+/// whitelist rather than a blacklist: a new native-only extractor needs no
+/// refusal added here, because it was never on the list to begin with.
+///
+/// Sealed, but — unlike [`EdgeLeaf`] — deliberately not the trait each tuple
+/// position is judged by; see the module doc's "Why the tuple check has two
+/// layers" section for why that distinction is load-bearing, not stylistic.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
     note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`, and tuples of these"
@@ -110,20 +150,37 @@ pub trait EdgeExtract: sealed::ExtractSealed {}
 impl sealed::ExtractSealed for ((),) {}
 impl EdgeExtract for ((),) {}
 
-impl<T> sealed::ExtractSealed for axum::extract::Path<T> {}
-impl<T> EdgeExtract for axum::extract::Path<T> {}
+/// One extractor an `#[edge]` handler may take, standing alone or inside the
+/// handler-arity tuple [`EdgeExtract`] validates.
+///
+/// Sealed, and — this is the part that matters — never implemented for a
+/// tuple of any arity, here or anywhere else in this crate. That absence is
+/// what makes nesting a bad extractor one tuple deeper
+/// (`(Extension<Hidden>, HeaderMap)` as a single handler parameter) fail
+/// exactly like naming it directly: no amount of wrapping ever produces an
+/// [`EdgeLeaf`] impl for a tuple, so the free marker slot in
+/// [`EdgeExtract`]'s own tuple impls (below) can never be satisfied by
+/// smuggling a rejected extractor into what looks like that slot.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
+    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`"
+)]
+pub trait EdgeLeaf: sealed::LeafSealed {}
 
-impl<T> sealed::ExtractSealed for axum::extract::Query<T> {}
-impl<T> EdgeExtract for axum::extract::Query<T> {}
+impl<T> sealed::LeafSealed for axum::extract::Path<T> {}
+impl<T> EdgeLeaf for axum::extract::Path<T> {}
 
-impl sealed::ExtractSealed for http::HeaderMap {}
-impl EdgeExtract for http::HeaderMap {}
+impl<T> sealed::LeafSealed for axum::extract::Query<T> {}
+impl<T> EdgeLeaf for axum::extract::Query<T> {}
 
-impl sealed::ExtractSealed for crate::extract::EdgeCache {}
-impl EdgeExtract for crate::extract::EdgeCache {}
+impl sealed::LeafSealed for http::HeaderMap {}
+impl EdgeLeaf for http::HeaderMap {}
 
-/// Implement [`EdgeExtract`] for a tuple of extractor types that are each
-/// `EdgeExtract`.
+impl sealed::LeafSealed for crate::extract::EdgeCache {}
+impl EdgeLeaf for crate::extract::EdgeCache {}
+
+/// Implement [`EdgeExtract`] for axum's handler-arity tuple, `(M, E1, ..,
+/// En)`, when each `Ei` is an [`EdgeLeaf`].
 ///
 /// axum's own `Handler<T, S>` blanket impl (see `impl_handler!` in
 /// `axum::handler`) does not use `T = (E1, .., En)` — it prepends a private
@@ -133,10 +190,14 @@ impl EdgeExtract for crate::extract::EdgeCache {}
 /// only judges the extractor types, and axum's own bound (required
 /// alongside this one everywhere `EdgeHandler` is used) already proves the
 /// tuple is a real, valid handler signature.
+///
+/// Each `Ei` is bounded by [`EdgeLeaf`], not [`EdgeExtract`] recursively —
+/// see the module doc for why that is the one detail this macro cannot get
+/// wrong.
 macro_rules! impl_edge_extract_for_handler_arity {
     ($($t:ident),+) => {
-        impl<M, $($t: EdgeExtract),+> sealed::ExtractSealed for (M, $($t,)+) {}
-        impl<M, $($t: EdgeExtract),+> EdgeExtract for (M, $($t,)+) {}
+        impl<M, $($t: EdgeLeaf),+> sealed::ExtractSealed for (M, $($t,)+) {}
+        impl<M, $($t: EdgeLeaf),+> EdgeExtract for (M, $($t,)+) {}
     };
 }
 

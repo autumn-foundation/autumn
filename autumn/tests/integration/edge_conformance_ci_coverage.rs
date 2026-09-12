@@ -48,10 +48,7 @@ fn edge_conformance_job_block(ci: &str) -> &str {
             !line.starts_with("   ") && line.trim_end().ends_with(':') && !line.trim().is_empty()
         })
         .map(|(at, _)| at + 1);
-    match next_job_offset {
-        Some(at) => &rest[..at],
-        None => rest,
-    }
+    next_job_offset.map_or(rest, |at| &rest[..at])
 }
 
 /// The "Build the edge capsule" step's own text, up to the next `- name:`
@@ -61,10 +58,7 @@ fn build_capsule_step_block(job: &str) -> &str {
         .find("- name: Build the edge capsule")
         .expect("edge-conformance job no longer has a \"Build the edge capsule\" step");
     let rest = &job[start..];
-    match rest[1..].find("- name:") {
-        Some(at) => &rest[..=at],
-        None => rest,
-    }
+    rest[1..].find("- name:").map_or(rest, |at| &rest[..=at])
 }
 
 #[test]
