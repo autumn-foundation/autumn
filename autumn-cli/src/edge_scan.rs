@@ -468,21 +468,48 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `[dependencies].<name>` (a plain dependency table only — target-
-/// specific and dev/build dependency tables are not consulted, matching this
-/// scanner's other best-effort limits) is declared `optional = true`. A
-/// version-string dependency (`name = "1"`) is never optional; only the
-/// expanded table form can set the flag.
+/// Whether `<name>` is declared `optional = true` in `[dependencies]` or in
+/// any `[target.'cfg(...)'.dependencies]` table (dev/build dependency tables
+/// are still not consulted, matching this scanner's other best-effort
+/// limits). A version-string dependency (`name = "1"`) is never optional;
+/// only the expanded table form can set the flag.
+///
+/// Cargo enables a target-specific optional dependency's implicit local
+/// feature the same as a top-level one whenever a `dep/feat` reference is
+/// active, regardless of whether that target `cfg` matches the build — the
+/// feature graph is resolved before target selection. Checking only
+/// `[dependencies]` missed that, so a `pkg/feat` naming a target-only
+/// optional dependency looked non-optional, its implicit feature never got
+/// queued, and a sole `#[cfg(feature = "pkg")]` route was excluded from the
+/// scan even though Cargo compiles it — this scanner's dangerous direction,
+/// a genuinely-served route silently missing (Codex review on #2739, round
+/// 8, P1).
 #[must_use]
 fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
+    let declares_optional = |deps: &toml::Table| {
+        deps.get(name)
+            .and_then(toml::Value::as_table)
+            .and_then(|dep| dep.get("optional"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    };
+    let in_table = |key: &str, tbl: &toml::Table| {
+        tbl.get(key)
+            .and_then(toml::Value::as_table)
+            .is_some_and(declares_optional)
+    };
+    if in_table("dependencies", table) {
+        return true;
+    }
     table
-        .get("dependencies")
+        .get("target")
         .and_then(toml::Value::as_table)
-        .and_then(|deps| deps.get(name))
-        .and_then(toml::Value::as_table)
-        .and_then(|dep| dep.get("optional"))
-        .and_then(toml::Value::as_bool)
-        == Some(true)
+        .is_some_and(|targets| {
+            targets
+                .values()
+                .filter_map(toml::Value::as_table)
+                .any(|target| in_table("dependencies", target))
+        })
 }
 
 /// The scanned crate's own Rust library-crate identifier — what
@@ -704,10 +731,26 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
 /// same-named function at their own root, both with an empty module path,
 /// and [`is_registered`] needs the identity to tell them apart (round 7,
 /// P2) — see [`EdgeFn::crate_root`].
+///
+/// A file outside `src/` entirely is the same story again, one level up:
+/// [`resolve_edge_scan_with_extra_file`] is the only caller that ever passes
+/// one in, always the edge-capsule bin's own `[[bin]] path` when that path
+/// points somewhere other than the conventional `src/bin/...` (a
+/// conventional path is under `src/` and so never reaches here that way —
+/// see that function's own `src/`-prefix short-circuit). It is scanned as a
+/// single file, never walked for submodules the way `src/bin/<name>/` is, so
+/// that whole file IS the custom bin's own crate root, not a module nested
+/// under the library crate's tree — treating it as the latter let a bare
+/// registration written in it credit a same-named library-crate function
+/// instead, and rejected a valid `crate::`-qualified registration to its own
+/// handler because the handler looked like it lived under a fictitious
+/// nested module (Codex review on #2739, round 8, P2).
 #[must_use]
 fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
     let without_ext = file.strip_suffix(".rs").unwrap_or(file);
-    let without_src = without_ext.strip_prefix("src/").unwrap_or(without_ext);
+    let Some(without_src) = without_ext.strip_prefix("src/") else {
+        return (format!("bin:{without_ext}"), Vec::new());
+    };
     if without_src.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -1464,6 +1507,28 @@ mod tests {
         assert!(!enabled.contains("foo"));
     }
 
+    /// Cargo resolves the feature graph before target selection, so a
+    /// `[target.'cfg(...)'.dependencies]` optional dependency's implicit
+    /// local feature turns on from a `dep/feat` reference exactly like a
+    /// top-level one — regardless of whether that target's `cfg` matches the
+    /// host doing the scan. Missing this made a target-only optional
+    /// dependency look non-optional, so its implicit feature never got
+    /// queued and a `#[cfg(feature = "dep")]` route was scanned out even
+    /// though Cargo genuinely compiles it (Codex review on #2739, round 8,
+    /// P1).
+    #[test]
+    fn a_target_specific_optional_dependency_feature_reference_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(target_arch = "wasm32")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
     /// `dep?/extra` (the weak-dependency form) makes no promise that `dep`
     /// itself is on — only that IF something else enables it, `extra`
     /// comes along too — so it must not enable `dep`.
@@ -1943,5 +2008,54 @@ mod tests {
         ]);
         assert_eq!(scan.functions[0].module_path, vec!["routes".to_owned()]);
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A custom `[[bin]] path` for the edge-capsule target pointing outside
+    /// `src/` (e.g. `path = "cmd/edge.rs"`) reaches the scan only through
+    /// `resolve_edge_scan_with_extra_file`'s `extra_file`, scanned as a
+    /// single file. It must get its own crate root, not the library crate's
+    /// — a `crate::`-qualified registration written in it should resolve to
+    /// its own handler, never to a same-named library-crate function (Codex
+    /// review on #2739, round 8, P2).
+    #[test]
+    fn a_custom_out_of_tree_bin_path_is_its_own_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "cmd/edge.rs"
+            "#,
+        )
+        .unwrap();
+        // A same-named library-crate function must not be credited by the
+        // capsule's own bare `edge_routes![crate::show]`.
+        std::fs::write(dir.path().join("src/lib.rs"), "#[edge]\npub fn show() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+
+        let unregistered = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/lib.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "cmd/edge.rs");
     }
 }
