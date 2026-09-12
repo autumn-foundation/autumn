@@ -9728,11 +9728,22 @@ pub fn run(opts: DoctorOptions) {
         check_model_private_columns_impl(&found)
     }));
 
+    // 16-17 shared (issue #2244): a virtual workspace root (`[workspace]`
+    // with no `[package]`) has no sources of its own — real sources live
+    // under a member crate. Read the manifest once here so both edge checks
+    // below can warn instead of scanning the wrong directory and silently
+    // passing.
+    let edge_virtual_workspace_root =
+        edge_manifest_is_virtual_workspace_root(std::path::Path::new("."));
+
     // 16. Edge capsule toolchain (issue #1790): a project with `#[edge]` routes
     //     needs the wasm32-wasip1 std library installed or `autumn build` cannot
     //     emit the capsule. Both the source scan and the toolchain probe run
     //     inside the task so they overlap with the other checks.
-    tasks.push(Box::new(|| {
+    tasks.push(Box::new(move || {
+        if edge_virtual_workspace_root {
+            return edge_virtual_workspace_warn("edge_target");
+        }
         let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
         // Probe the toolchain only when the answer can matter: a project with no
         // #[edge] routes must not pay for a `rustc` spawn on every doctor run.
@@ -9742,11 +9753,15 @@ pub fn run(opts: DoctorOptions) {
 
     // 17. Edge route wiring (issue #1790): an `#[edge]` handler that also
     //     carries an auth guard fails the build, an unregistered one is never
-    //     served at the edge, and a missing `src/bin/edge-capsule.rs` leaves
-    //     nothing to compile.
-    tasks.push(Box::new(|| {
+    //     served at the edge, and a missing edge-capsule bin leaves nothing to
+    //     compile.
+    tasks.push(Box::new(move || {
+        if edge_virtual_workspace_root {
+            return edge_virtual_workspace_warn("edge_routes");
+        }
         let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
-        let capsule_bin_exists = std::path::Path::new(EDGE_CAPSULE_BIN).exists();
+        let capsule_bin_exists =
+            resolve_edge_capsule_bin(std::path::Path::new(".")).is_some_and(|p| p.exists());
         check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
@@ -10734,6 +10749,67 @@ fn parse_pub_field_name(line: &str) -> Option<String> {
 /// The `src/bin/edge-capsule.rs` an app with `#[edge]` routes needs.
 const EDGE_CAPSULE_BIN: &str = "src/bin/edge-capsule.rs";
 
+/// Whether `root`'s `Cargo.toml` is a virtual workspace root: it has a
+/// `[workspace]` table but no `[package]` table. Real sources live under a
+/// member crate in that case, so scanning `root` itself for `#[edge]` routes
+/// would silently miss them. Returns `false`, not an error, when the
+/// manifest is missing or unreadable — the separate `autumn_toml` check
+/// already warns about that.
+fn edge_manifest_is_virtual_workspace_root(root: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return false;
+    };
+    content.contains("[workspace]") && !content.contains("[package]")
+}
+
+/// The shared `Warn` result for both edge checks when doctor runs from a
+/// virtual workspace root. See [`edge_manifest_is_virtual_workspace_root`].
+fn edge_virtual_workspace_warn(name: &'static str) -> CheckResult {
+    CheckResult {
+        name,
+        status: CheckStatus::Warn,
+        detail: Some("Cargo.toml is a workspace root with no [package]".into()),
+        hint: Some("Run `autumn doctor` from the member crate directory that owns your app"),
+    }
+}
+
+/// Resolve the edge-capsule binary's real source path from the manifest, or
+/// `None` when cargo could never build one.
+///
+/// Cargo builds an `edge-capsule` binary two ways: an explicit `[[bin]]`
+/// entry named `edge-capsule` (any `path`), or — only when `autobins` is
+/// not `false` — the conventional `src/bin/edge-capsule.rs`. A project that
+/// turns off `autobins` and never declares the target explicitly cannot
+/// build the capsule, even if that file exists on disk.
+fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let conventional = || root.join(EDGE_CAPSULE_BIN);
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&content).ok()?;
+
+    if let Some(bins) = table.get("bin").and_then(toml::Value::as_array) {
+        for bin in bins {
+            if bin.get("name").and_then(toml::Value::as_str) == Some("edge-capsule") {
+                return Some(
+                    bin.get("path")
+                        .and_then(toml::Value::as_str)
+                        .map_or_else(conventional, |path| root.join(path)),
+                );
+            }
+        }
+    }
+
+    let autobins_disabled = table
+        .get("package")
+        .and_then(|package| package.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        == Some(false);
+    if autobins_disabled {
+        None
+    } else {
+        Some(conventional())
+    }
+}
+
 /// Whether the project can compile its `#[edge]` routes at all: the
 /// `wasm32-wasip1` standard library has to be installed for the active
 /// toolchain, or `autumn build` cannot emit the edge capsule.
@@ -11000,6 +11076,128 @@ mod tests {
             "the warning must name the file to create"
         );
         assert!(r.hint.unwrap().contains("autumn_edge::serve"));
+    }
+
+    // ── Virtual workspace root (issue #2244) ─────────────────────────────────
+
+    #[test]
+    fn virtual_workspace_root_true_for_workspace_without_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        assert!(edge_manifest_is_virtual_workspace_root(dir.path()));
+    }
+
+    #[test]
+    fn virtual_workspace_root_false_for_a_normal_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert!(!edge_manifest_is_virtual_workspace_root(dir.path()));
+    }
+
+    #[test]
+    fn virtual_workspace_root_false_for_workspace_with_own_package() {
+        // A crate that is both the workspace root and a package (it has its
+        // own [package] table) has sources of its own, unlike a bare
+        // workspace root. Not the shape this check guards against.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert!(!edge_manifest_is_virtual_workspace_root(dir.path()));
+    }
+
+    #[test]
+    fn virtual_workspace_root_false_when_manifest_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!edge_manifest_is_virtual_workspace_root(dir.path()));
+    }
+
+    // ── Edge-capsule bin resolution (issue #2244) ────────────────────────────
+
+    #[test]
+    fn resolve_edge_capsule_bin_none_without_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_edge_capsule_bin(dir.path()), None);
+    }
+
+    #[test]
+    fn resolve_edge_capsule_bin_conventional_path_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join(EDGE_CAPSULE_BIN))
+        );
+    }
+
+    #[test]
+    fn resolve_edge_capsule_bin_none_when_autobins_disabled_and_undeclared() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nautobins = false\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_edge_capsule_bin(dir.path()), None);
+    }
+
+    #[test]
+    fn resolve_edge_capsule_bin_honors_a_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nautobins = false\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join("cmd/edge.rs"))
+        );
+    }
+
+    #[test]
+    fn resolve_edge_capsule_bin_explicit_entry_without_path_uses_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join(EDGE_CAPSULE_BIN))
+        );
+    }
+
+    #[test]
+    fn resolve_edge_capsule_bin_ignores_an_unrelated_bin_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"cli\"\npath = \"src/bin/cli.rs\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join(EDGE_CAPSULE_BIN))
+        );
     }
 
     #[test]
