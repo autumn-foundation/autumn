@@ -1995,6 +1995,10 @@ fn collect_registrations(
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut index = 0;
     while index < trees.len() {
+        if let Some(next_index) = skip_cfg_excluded_statement(&trees, index, default_features) {
+            index = next_index;
+            continue;
+        }
         if let TokenTree::Ident(ident) = &trees[index]
             && ident == "mod"
             && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
@@ -2166,6 +2170,133 @@ fn skip_back_over_fn_modifiers(trees: &[TokenTree], fn_index: usize) -> usize {
         }
     }
     i
+}
+
+/// Walk forward from `i` over one or more `#[...]` attributes, returning
+/// whether any is a `cfg(...)` that resolves false and the index right
+/// after the attribute run (unchanged if `trees[i]` is not `#` followed by a
+/// bracket group).
+fn skip_leading_cfg_attrs(
+    trees: &[TokenTree],
+    mut i: usize,
+    default_features: &BTreeSet<String>,
+) -> (bool, usize) {
+    let mut excluded = false;
+    loop {
+        let Some(TokenTree::Punct(hash)) = trees.get(i) else {
+            break;
+        };
+        if hash.as_char() != '#' {
+            break;
+        }
+        let Some(TokenTree::Group(bracket)) = trees.get(i + 1) else {
+            break;
+        };
+        if bracket.delimiter() != Delimiter::Bracket {
+            break;
+        }
+        if cfg_attribute_group_is_false(bracket, default_features) {
+            excluded = true;
+        }
+        i += 2;
+    }
+    (excluded, i)
+}
+
+/// The forward mirror of [`skip_back_over_fn_modifiers`]: whether the item
+/// starting at `i` — after any leading attributes have already been
+/// skipped — is a `mod`/`fn`/`impl` (itself, or behind `pub`/`async`/
+/// `const`/`unsafe`/`extern "ABI"`, in whatever combination those allow).
+/// Those three are each handled by their own dedicated logic above, which
+/// looks BACKWARD from the keyword and already copes with modifiers in
+/// between; the generic statement-level cfg suppression this guards must
+/// defer to them rather than also claim the same statement.
+fn is_specially_handled_item(trees: &[TokenTree], mut i: usize) -> bool {
+    loop {
+        match trees.get(i) {
+            Some(TokenTree::Ident(ident))
+                if matches!(ident.to_string().as_str(), "mod" | "fn" | "impl") =>
+            {
+                return true;
+            }
+            Some(TokenTree::Ident(ident))
+                if matches!(
+                    ident.to_string().as_str(),
+                    "pub" | "async" | "const" | "unsafe" | "extern"
+                ) =>
+            {
+                i += 1;
+            }
+            Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
+                if i >= 1 && matches!(&trees[i - 1], TokenTree::Ident(id) if id == "pub") {
+                    i += 1;
+                } else {
+                    return false;
+                }
+            }
+            Some(TokenTree::Literal(_)) => {
+                if i >= 1 && matches!(&trees[i - 1], TokenTree::Ident(id) if id == "extern") {
+                    i += 1;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// If `trees[index]` begins one or more `#[...]` attributes that resolve to
+/// an excluded `cfg(...)`, and the item they attach to is not one of the
+/// specially-handled `mod`/`fn`/`impl` items ([`is_specially_handled_item`],
+/// which already look backward for their own attribute) nor a bare `Group`
+/// (the [`collect_registrations`] catch-all already covers that case),
+/// returns the index just past the whole excluded statement — up to and
+/// including its own top-level `;` — so the caller can skip it without
+/// recursing into any group nested inside it. Returns `None` when no such
+/// statement starts here, meaning the caller should fall through to its
+/// normal per-token handling instead.
+///
+/// `#[cfg(feature = "premium")] routes.extend(edge_routes![show]);` is
+/// exactly the shape this exists for: the macro invocation sits nested
+/// inside an ordinary expression/let statement, not immediately adjacent to
+/// the attribute, so [`collect_registrations`]'s `Group` catch-all — which
+/// only ever checked whether ITS OWN position was immediately preceded by
+/// the attribute — never saw it and recursed unconditionally, crediting a
+/// registration real Rust strips out along with the rest of the statement
+/// (Codex review on #2739, round 24, P2). A `;` nested inside one of the
+/// statement's own groups belongs to a different token stream entirely and
+/// is never visited at this level, so watching for a top-level one here
+/// cannot run past this statement into the next.
+fn skip_cfg_excluded_statement(
+    trees: &[TokenTree],
+    index: usize,
+    default_features: &BTreeSet<String>,
+) -> Option<usize> {
+    if !(matches!(&trees[index], TokenTree::Punct(p) if p.as_char() == '#')
+        && matches!(trees.get(index + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket))
+    {
+        return None;
+    }
+    let (excluded, attrs_end) = skip_leading_cfg_attrs(trees, index, default_features);
+    if !excluded || is_specially_handled_item(trees, attrs_end) {
+        return None;
+    }
+    Some(
+        if matches!(trees.get(attrs_end), Some(TokenTree::Group(_))) {
+            attrs_end + 1
+        } else {
+            let mut i = attrs_end;
+            while i < trees.len() {
+                let is_semicolon = matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';');
+                i += 1;
+                if is_semicolon {
+                    break;
+                }
+            }
+            i
+        },
+    )
 }
 
 /// For `[<generics>] <Type>` or `[<generics>] <Trait> for <Type> [where
@@ -2920,6 +3051,58 @@ mod tests {
             "{:?}",
             scan.registered_fns()
         );
+    }
+
+    /// Same idea, but the `edge_routes![...]` call is nested a level deeper
+    /// still — inside a method-call argument list — rather than being the
+    /// whole statement itself. The catch-all `Group` recursion only ever
+    /// checked whether the group it was about to recurse into was ITSELF
+    /// immediately preceded by the attribute; here the attribute sits before
+    /// `routes`, not before `extend(...)`'s parenthesized group, so that
+    /// check never saw it and recursed unconditionally (Codex review on
+    /// #2739, round 24, P2).
+    #[test]
+    fn cfg_feature_gated_statement_with_a_nested_registration_call_is_excluded_when_feature_is_off()
+    {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire(routes: &mut Vec<()>) {
+                #[cfg(feature = "premium")]
+                routes.extend(edge_routes![crate::show]);
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// Same setup, but with `premium` on: the registration genuinely exists
+    /// in the compiled capsule, so `show` must report as registered.
+    #[test]
+    fn cfg_feature_gated_statement_with_a_nested_registration_call_is_included_when_feature_is_default()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire(routes: &mut Vec<()>) {
+                #[cfg(feature = "premium")]
+                routes.extend(edge_routes![crate::show]);
+            }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
     }
 
     /// A grouped return type (`-> ()`, `-> Result<(), E>`, `-> [T; N]`) has
