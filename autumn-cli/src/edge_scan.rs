@@ -2195,20 +2195,47 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         if starts_return_type_or_where {
             i += 2;
         }
+        // A braced const-generic expression in the return type (stable Rust:
+        // `fn wire() -> R<{ 1 + 2 }>` compiles today) is itself a
+        // Brace-delimited Group nested inside `<...>` — indistinguishable
+        // from the function's own body by delimiter alone. Track angle-
+        // bracket depth (angle brackets are plain `<`/`>` Punct tokens, not
+        // their own Group delimiter) so only a Brace group seen OUTSIDE any
+        // `<...>` ends this loop; previously the first Brace group at any
+        // depth was taken as the body, which for this shape pointed at the
+        // const-generic expression instead — and since the caller then
+        // resumes scanning right after that wrong index, the function's
+        // real body (and its `#[cfg(...)]`-gated `edge_routes![]` call) was
+        // reached via the outer, cfg-blind fallback instead of being
+        // correctly skipped (Codex review on #2739, round 22, P2).
+        let mut angle_depth: i32 = 0;
         loop {
             match trees.get(i) {
-                Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => return Some(i),
-                // A non-brace group is legitimate return-type/where-clause
-                // syntax — `-> ()`, `-> Result<(), E>`, `-> [T; N]`, a
-                // parenthesized trait-bound group — real Rust grammar never
-                // puts a `{ ... }` brace group in either shape, so accepting
-                // any OTHER delimiter here still cannot mistake it for the
-                // function's own body; only a Brace group ever ends this
-                // loop. Previously only bare `Ident`/`Punct`/`Literal`
-                // tokens were tolerated, so a grouped return type fell
-                // through to `None` and the unprotected old fallback then
-                // scanned the body of what could be a `#[cfg(...)]`-excluded
-                // function (Codex review on #2739, round 22, P2).
+                Some(TokenTree::Group(g))
+                    if g.delimiter() == Delimiter::Brace && angle_depth == 0 =>
+                {
+                    return Some(i);
+                }
+                Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
+                    angle_depth += 1;
+                    i += 1;
+                }
+                Some(TokenTree::Punct(p)) if p.as_char() == '>' => {
+                    angle_depth -= 1;
+                    if angle_depth < 0 {
+                        return None;
+                    }
+                    i += 1;
+                }
+                // A non-brace group, or a Brace group nested inside `<...>`,
+                // is legitimate return-type/where-clause syntax — `-> ()`,
+                // `-> Result<(), E>`, `-> [T; N]`, `-> R<{ 1 + 2 }>`, a
+                // parenthesized trait-bound group. Previously only bare
+                // `Ident`/`Punct`/`Literal` tokens were tolerated, so a
+                // grouped return type fell through to `None` and the
+                // unprotected old fallback then scanned the body of what
+                // could be a `#[cfg(...)]`-excluded function (Codex review
+                // on #2739, round 22, P2).
                 Some(
                     TokenTree::Ident(_)
                     | TokenTree::Punct(_)
@@ -2759,6 +2786,38 @@ mod tests {
 
             #[cfg(feature = "premium")]
             fn wire() -> Result<(), ()> { edge_routes![crate::show]; Ok(()) }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// A braced const-generic expression in the return type (`-> R<{ 1 + 2
+    /// }>`) is legal, stable Rust and is itself a Brace-delimited `Group`
+    /// nested inside `<...>` — indistinguishable from the function's own
+    /// body by delimiter alone. Previously the return-type/`where`-clause
+    /// loop took the FIRST Brace group it saw as the body regardless of
+    /// angle-bracket nesting, misidentifying the const-generic expression's
+    /// braces as the body and leaving the function's REAL body (and its
+    /// `#[cfg(...)]`-gated `edge_routes![]` call) to be reached only via the
+    /// outer, cfg-blind fallback scan (Codex review on #2739, round 22, P2).
+    #[test]
+    fn cfg_feature_gated_fn_with_a_braced_const_generic_return_type_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct R<const N: usize>;
+
+            #[cfg(feature = "premium")]
+            fn wire<const N: usize>() -> R<{ 1 + 2 }> { edge_routes![crate::show]; R }
             "#,
             &[],
         );

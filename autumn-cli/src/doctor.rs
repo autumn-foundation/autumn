@@ -11201,18 +11201,48 @@ pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::Pat
     let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let table = toml::from_str::<toml::Table>(&content).ok()?;
 
+    // A package literally named "edge-capsule" gets an implicit `src/main.rs`
+    // bin target of that same name — Cargo's own rule that the default
+    // binary's name is the package name, verified directly via `cargo
+    // metadata`. The SAME rule governs a pathless *explicit* `[[bin]] name =
+    // "edge-capsule"` entry when it names the package itself: `cargo
+    // metadata` on such a manifest (only `src/main.rs` present, no `path`
+    // field on the entry) also resolves it to `src/main.rs`, not
+    // `conventional_edge_capsule_bin`'s `src/bin/` shapes — so this target
+    // must be tried both when no `[[bin]]` entry exists at all AND when one
+    // exists but omits `path` (Codex review on #2739, round 22, P2).
+    let package_name_is_edge_capsule = table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        == Some("edge-capsule");
+    let pathless_target = || {
+        if package_name_is_edge_capsule {
+            let main_rs = root.join("src/main.rs");
+            if main_rs.is_file() {
+                return main_rs;
+            }
+        }
+        conventional()
+    };
+
     if let Some(bins) = table.get("bin").and_then(toml::Value::as_array) {
         for bin in bins {
             if bin.get("name").and_then(toml::Value::as_str) == Some("edge-capsule") {
                 return Some(
                     bin.get("path")
                         .and_then(toml::Value::as_str)
-                        .map_or_else(conventional, |path| root.join(path)),
+                        .map_or_else(pathless_target, |path| root.join(path)),
                 );
             }
         }
     }
 
+    // `autobins = false` only turns off Cargo's automatic `src/bin/*.rs`
+    // discovery for a package with no `[[bin]]` entries at all — it has no
+    // effect on an explicitly declared `[[bin]]` entry (handled above), so
+    // it must gate only this implicit-discovery fallback, not the explicit
+    // one above.
     let autobins_disabled = table
         .get("package")
         .and_then(|package| package.get("autobins"))
@@ -11222,28 +11252,7 @@ pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::Pat
         return None;
     }
 
-    // A package literally named "edge-capsule" gets an implicit `src/main.rs`
-    // bin target of that same name — Cargo's own rule that the default
-    // binary's name is the package name, verified directly via `cargo
-    // metadata` (no `[[bin]]` entry needed at all). That target is not one
-    // of `conventional_edge_capsule_bin`'s two `src/bin/` shapes, so without
-    // this check `autumn doctor` reported the capsule missing even though
-    // `autumn build` (which resolves the real target from Cargo metadata,
-    // not this manifest-text heuristic) finds and compiles it fine (Codex
-    // review on #2739, round 22, P2).
-    let package_name_is_edge_capsule = table
-        .get("package")
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str)
-        == Some("edge-capsule");
-    if package_name_is_edge_capsule {
-        let main_rs = root.join("src/main.rs");
-        if main_rs.is_file() {
-            return Some(main_rs);
-        }
-    }
-
-    Some(conventional())
+    Some(pathless_target())
 }
 
 /// The conventional edge-capsule bin path Cargo would actually build: the
@@ -11708,6 +11717,33 @@ mod tests {
         assert_eq!(
             resolve_edge_capsule_bin(dir.path()),
             Some(dir.path().join(EDGE_CAPSULE_BIN))
+        );
+    }
+
+    /// A pathless explicit `[[bin]] name = "edge-capsule"` entry, when the
+    /// PACKAGE is also named "edge-capsule", resolves to `src/main.rs` —
+    /// verified via `cargo metadata` on exactly this manifest shape. Before
+    /// this fix, the explicit-`[[bin]]`-loop returned `conventional()`
+    /// unconditionally for a pathless entry, never reaching the
+    /// package-named-edge-capsule check below it, so `autumn doctor`
+    /// reported the capsule missing even though `autumn build` (which reads
+    /// real Cargo metadata) found and compiled it (Codex review on #2739,
+    /// round 22, P2).
+    #[test]
+    fn resolve_edge_capsule_bin_explicit_entry_without_path_on_the_edge_capsule_package_uses_main_rs()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edge-capsule\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join("src/main.rs"))
         );
     }
 
