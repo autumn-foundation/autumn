@@ -80,6 +80,20 @@ pub fn expand(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0;
+    // Once a paired-escape scan proves the unscanned tail holds no `]` at
+    // all — quoted or otherwise — no later scan can find a close either (a
+    // shorter suffix of a `]`-free suffix is still `]`-free), so the `[[`
+    // fast path stops rescanning the tail. Without this, a run of `[` with
+    // no `]` anywhere costs a full tail scan per opener — quadratic in the
+    // input length — on a function that renders public pages and feeds.
+    let mut no_close_ahead = false;
+    // A scan that fails at a newline with no quotes met proves every later
+    // `[[` before that newline fails identically (a subsegment of a
+    // quote-free, close-free segment is too), so those scans are skipped.
+    // Without this, a run of `[` ending in a newline costs a full
+    // line-scan per opener — quadratic — just like the unpaired-close run
+    // that `collapse_bracket_run` handles.
+    let mut dead_line_end: Option<usize> = None;
 
     while i < bytes.len() {
         if bytes[i] != '[' {
@@ -87,8 +101,46 @@ pub fn expand(input: &str) -> String {
             i += 1;
             continue;
         }
-        // `[[` is an escaped literal bracket, as in WordPress.
+        // `[[` is an escaped literal bracket, as in WordPress: `[[tag]]`
+        // renders the literal `[tag]`, with the shortcode left unexpanded.
+        // The paired close is consumed too — emitting `[` for the escape
+        // and then copying the rest verbatim would leave a stray `]` (#2678).
         if bytes.get(i + 1) == Some(&'[') {
+            // A paired escape needs the inner tag's close. Unsuccessful
+            // scans must not rescan the tail on every later opener
+            // (quadratic): a scan that proves the tail has no `]` at all
+            // arms `no_close_ahead`, a scan that fails at a newline with no
+            // quotes met arms `dead_line_end`, and a scan that finds an
+            // unpaired close in a quote-free region is consumed outright by
+            // `collapse_bracket_run`.
+            if !no_close_ahead {
+                if dead_line_end.is_some_and(|end| i + 1 < end) {
+                    out.push('[');
+                    i += 2;
+                    continue;
+                }
+                let scan = scan_close(&bytes, i + 1);
+                if let Some(close) = scan.close {
+                    if scan.paired {
+                        let inner: String = bytes[i + 2..close].iter().collect();
+                        out.push('[');
+                        out.push_str(&inner);
+                        out.push(']');
+                        i = close + 2;
+                        continue;
+                    }
+                    if scan.clean {
+                        i = collapse_bracket_run(&bytes, &registry, &mut out, i, close);
+                        continue;
+                    }
+                } else if let Some(end) = scan.newline {
+                    if scan.clean {
+                        dead_line_end = Some(end);
+                    }
+                } else if !scan.saw_bracket {
+                    no_close_ahead = true;
+                }
+            }
             out.push('[');
             i += 2;
             continue;
@@ -98,26 +150,7 @@ pub fn expand(input: &str) -> String {
             i += 1;
             continue;
         };
-        let raw: String = bytes[i + 1..close].iter().collect();
-        match parse_tag(&raw) {
-            Some((name, attrs)) => match registry.get(&name) {
-                Some(handler) => {
-                    out.push_str(&handler(&attrs));
-                    i = close + 1;
-                }
-                None => {
-                    // Unregistered: emit the original text verbatim.
-                    out.push('[');
-                    out.push_str(&raw);
-                    out.push(']');
-                    i = close + 1;
-                }
-            },
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
+        i = emit_tag(&mut out, &registry, &bytes, i, close);
     }
     out
 }
@@ -125,17 +158,140 @@ pub fn expand(input: &str) -> String {
 /// Find the `]` closing the tag opened at `open`, ignoring brackets inside a
 /// quoted attribute value.
 fn find_close(chars: &[char], open: usize) -> Option<usize> {
+    scan_close(chars, open).close
+}
+
+/// The outcome of scanning for the `]` closing the tag opened at `open`,
+/// with the same quote/newline rules as [`find_close`].
+struct CloseScan {
+    /// The first unquoted `]`, if the scan found one before a newline or the
+    /// end of input.
+    close: Option<usize>,
+    /// Whether the char after `close` is another `]` — the `[[…]]` paired
+    /// escape. Only meaningful when `close` is `Some`.
+    paired: bool,
+    /// The scan met no `"` and no `\n` before resolving. A clean scan that
+    /// found an unpaired close (or failed at a newline) proves the same for
+    /// every opener inside its segment: a subsegment of a quote-free,
+    /// newline-free segment is too, and the first unquoted `]` cannot move.
+    clean: bool,
+    /// When no close was found: the newline that stopped the scan, if any.
+    newline: Option<usize>,
+    /// Whether the scan met any `]` at all, quoted or otherwise. A scan that
+    /// reaches end-of-input without meeting one proves no later scan can find
+    /// a close either (a shorter suffix of a `]`-free suffix is still
+    /// `]`-free). A quoted `]` earlier in the tail can mask a real close for
+    /// a later scan start, so only a completely `]`-free tail is conclusive.
+    saw_bracket: bool,
+}
+
+fn scan_close(chars: &[char], open: usize) -> CloseScan {
     let mut in_quotes = false;
+    let mut scan = CloseScan {
+        close: None,
+        paired: false,
+        clean: true,
+        newline: None,
+        saw_bracket: false,
+    };
     for (offset, ch) in chars.iter().enumerate().skip(open + 1) {
         match ch {
-            '"' => in_quotes = !in_quotes,
-            ']' if !in_quotes => return Some(offset),
+            '"' => {
+                in_quotes = !in_quotes;
+                scan.clean = false;
+            }
+            ']' => {
+                scan.saw_bracket = true;
+                if !in_quotes {
+                    scan.close = Some(offset);
+                    scan.paired = chars.get(offset + 1) == Some(&']');
+                    return scan;
+                }
+            }
             // A newline inside a tag means it was never a tag.
-            '\n' => return None,
+            '\n' => {
+                scan.newline = Some(offset);
+                return scan;
+            }
             _ => {}
         }
     }
-    None
+    scan
+}
+
+/// Emit the tag `[bytes[open + 1..close]]`: expand the handler when its name
+/// is registered, otherwise emit the tag verbatim. Returns the index to
+/// continue scanning from. A `raw` that is not a tag emits just `[` and
+/// reports `open + 1`, so the caller retries after the bracket.
+fn emit_tag(
+    out: &mut String,
+    registry: &std::collections::BTreeMap<String, Handler>,
+    bytes: &[char],
+    open: usize,
+    close: usize,
+) -> usize {
+    let raw: String = bytes[open + 1..close].iter().collect();
+    match parse_tag(&raw) {
+        Some((name, attrs)) => match registry.get(&name) {
+            Some(handler) => {
+                out.push_str(&handler(&attrs));
+            }
+            None => {
+                // Unregistered: emit the original text verbatim.
+                out.push('[');
+                out.push_str(&raw);
+                out.push(']');
+            }
+        },
+        None => {
+            out.push('[');
+            return open + 1;
+        }
+    }
+    close + 1
+}
+
+/// Collapse a bracket run without rescanning: `i` is a `[[`, `close` is the
+/// first `]` at or after `i` (not paired), and `[i, close]` holds no `"` or
+/// `\n`.
+///
+/// Every `[[` in the region is known to find the same `close`, unpaired, so
+/// each collapses to `[`; every single `[` is known to close at `close`, so
+/// it is processed as a tag with that close. Anything else is copied
+/// verbatim. Returns the index just past `close`. Each character is visited
+/// once, so a run of openers stays linear instead of rescanning the tail per
+/// opener.
+///
+/// The shared `close` is emitted literally only if no inner tag consumed it:
+/// a tag that parses (registered or verbatim) consumes the close exactly as
+/// the ordinary path would, so re-emitting it would duplicate the `]`.
+fn collapse_bracket_run(
+    bytes: &[char],
+    registry: &std::collections::BTreeMap<String, Handler>,
+    out: &mut String,
+    mut i: usize,
+    close: usize,
+) -> usize {
+    // The `[[` at `i` collapses to `[`.
+    out.push('[');
+    i += 2;
+    while i < close {
+        if bytes[i] == '[' && bytes.get(i + 1) == Some(&'[') {
+            out.push('[');
+            i += 2;
+        } else if bytes[i] == '[' {
+            i = emit_tag(out, registry, bytes, i, close);
+            if i == close + 1 {
+                // The tag consumed the shared close; nothing left to emit.
+                return i;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out.push(']');
+    close + 1
 }
 
 /// Parse `name attr="value" other=bare` into its name and attributes.
@@ -262,6 +418,152 @@ mod tests {
     #[test]
     fn escaped_double_brackets_render_a_literal() {
         assert_eq!(expand("[[testbox]"), "[testbox]");
+    }
+
+    #[test]
+    fn paired_double_brackets_strip_one_bracket_from_each_side() {
+        // WordPress parity: `[[tag]]` renders the literal `[tag]`.
+        assert_eq!(expand("[[x]]"), "[x]");
+        assert_eq!(expand("[[note attr=\"v\"]]"), "[note attr=\"v\"]");
+        assert_eq!(expand("[[unregistered]]"), "[unregistered]");
+        assert_eq!(
+            expand("a [[x]] b [[y]] c"),
+            "a [x] b [y] c",
+            "the escape is uniform across the whole string"
+        );
+    }
+
+    #[test]
+    fn paired_double_brackets_suppress_expansion() {
+        add_shortcode("pairednote", |_| "<aside>expanded</aside>".to_string());
+        // The escape exists to *mention* a shortcode, so a registered name
+        // must render literally, not expand.
+        assert_eq!(expand("[[pairednote]]"), "[pairednote]");
+    }
+
+    #[test]
+    fn a_triple_opening_keeps_one_extra_bracket() {
+        // `[[[x]]]` strips one pair, leaving the outermost literal pair.
+        assert_eq!(expand("[[[x]]]"), "[[x]]");
+    }
+
+    #[test]
+    fn brackets_with_no_close_anywhere_collapse_pairwise() {
+        // The no-rescan fast path must not change output: with no `]` in the
+        // tail at all, every opener is literal.
+        assert_eq!(expand("[[[["), "[[");
+        assert_eq!(expand("a [[ b"), "a [ b");
+        assert_eq!(expand("[["), "[");
+    }
+
+    #[test]
+    fn quoted_brackets_do_not_poison_later_scans() {
+        // `]`s seen only inside quotes must NOT arm the no-rescan fast path:
+        // a scan started later, past the quotes, can still find a real close,
+        // and the shortcode there must expand.
+        add_shortcode("quotegal", |_| "<em>q</em>".to_string());
+        // The first scan (from the `[[`) drowns in the quoted `]`s and fails;
+        // the later scan finds `[quotegal]`'s close and expands it.
+        assert_eq!(expand("[[\" ][quotegal]"), "[\" ]<em>q</em>");
+        assert_eq!(expand("[[\"\"][quotegal]"), "[\"\"]<em>q</em>");
+    }
+
+    #[test]
+    fn a_bracket_run_with_no_close_stays_linear() {
+        // P2 review: each `[[` rescanning the whole tail makes `expand`
+        // quadratic on `[` x N. 100k openers hold no `]` at all; the old code
+        // needed ~10^10 char inspections here, the single-scan path ~10^5.
+        let input = "[".repeat(100_000);
+        let start = std::time::Instant::now();
+        let out = expand(&input);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "bracket run took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out, "[".repeat(50_000));
+    }
+
+    #[test]
+    fn many_open_brackets_with_single_unpaired_close_stay_linear() {
+        // P2 review follow-up: the run above proved the `]`-free tail, but a
+        // run ending in ONE `]` rescanned the whole tail per opener — each
+        // `[[` found the same non-paired close and advanced only two chars.
+        // The collapse path visits each char once instead.
+        let input = format!("{}]", "[".repeat(100_000));
+        let start = std::time::Instant::now();
+        let out = expand(&input);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "bracket run with single close took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out, format!("{}]", "[".repeat(50_000)));
+    }
+
+    #[test]
+    fn bracket_run_then_newline_then_close_stays_linear() {
+        // Same as above, but the scan first fails at the newline: the tail
+        // after it is re-scanned, but each opener advances, so the whole
+        // input is still visited once.
+        let input = format!("{}\n]", "[".repeat(100_000));
+        let start = std::time::Instant::now();
+        let out = expand(&input);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "bracket run with newline and close took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out, format!("{}\n]", "[".repeat(50_000)));
+    }
+
+    #[test]
+    fn unpaired_close_run_collapses_with_correct_output() {
+        // The collapse path must render exactly what the old per-opener
+        // rescan produced: each `[[` becomes `[`, each lone `[` emits
+        // literally when its close makes it a non-tag, and `]` copies over.
+        assert_eq!(expand("[[[a]"), "[[a]");
+        assert_eq!(expand("[[[a] b"), "[[a] b");
+        assert_eq!(expand("[x] [y]"), "[x] [y]");
+        assert_eq!(expand("[[[[x]"), "[[x]");
+        assert_eq!(expand("[[a][b]"), "[a][b]");
+    }
+
+    #[test]
+    fn bracket_run_unpaired_close_then_valid_shortcode() {
+        // After collapsing a bracket run, later content keeps scanning
+        // normally — a real shortcode past the run still expands.
+        add_shortcode("late", |_| "<em>late</em>".to_string());
+        assert_eq!(expand("[[[a] [late]"), "[[a] <em>late</em>");
+    }
+
+    #[test]
+    fn paired_escape_prose_with_quoted_escapes() {
+        // `"` or `\n` in the region disables the collapse fast path (they
+        // can mask a real close), but paired escapes still render as before.
+        assert_eq!(expand("[[x\"]]"), "[x\"]]");
+        assert_eq!(expand("[[\"x]]"), "[\"x]]");
+        add_shortcode("quotecollapse", |_| "<em>q</em>".to_string());
+        assert_eq!(
+            expand("[[\"[quotecollapse]"),
+            "[\"<em>q</em>",
+            "quotes block the collapse fast path but not later expansion"
+        );
+    }
+
+    #[test]
+    fn single_brackets_with_single_close_do_not_rescan() {
+        // The `[[` collapse path also pairs up a plain run of `[`: one close
+        // lookup, no rescans.
+        let input = format!("{}]", "[".repeat(50_000));
+        let start = std::time::Instant::now();
+        let out = expand(&input);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "single-bracket run took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out, format!("{}]", "[".repeat(25_000)));
     }
 
     #[test]

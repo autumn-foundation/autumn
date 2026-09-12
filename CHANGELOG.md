@@ -454,6 +454,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cms` starter: the WordPress-style `[[tag]]` escape no longer leaves a
+  stray trailing `]` in rendered content.** `shortcodes::expand` collapsed the
+  opening `[[` to `[` but never consumed the matching second `]` at the close,
+  so `[[gallery]]` rendered as `[gallery]]` on the live page and in the Atom
+  feed — silently, with no error anywhere in the authoring flow. A paired
+  escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
+  the module's own "same syntax WordPress does" claim, and still suppresses
+  expansion of the inner shortcode (#2678).
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
