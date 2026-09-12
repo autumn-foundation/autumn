@@ -190,31 +190,12 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-/// Start a `MinIO` container for the test.
-///
-/// `MinIO` stopped publishing `minio/minio` on Docker Hub in 2025; the
-/// repository now 404s. This pins the `quay.io` mirror `MinIO` moved to,
-/// and a tag still published there, instead of the crate's Docker-Hub-only
-/// default.
-async fn start_minio() -> testcontainers::core::error::Result<
-    testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO>,
-> {
-    use testcontainers::ImageExt as _;
-    use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
-
-    MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .with_tag("RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772")
-        .start()
-        .await
-}
-
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
     use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -341,6 +322,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
     use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
