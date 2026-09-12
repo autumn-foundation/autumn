@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
+  `rich_text_area` and its five siblings in `autumn::form` hardcoded English
+  chrome: the toolbar's aria-label, its per-control names and syntax hints,
+  the hint under the editor, and the "Preview" heading. Callers had no way
+  to override this text. A new `RichTextLabels` builder carries all four
+  labels. A `_with_labels` sibling of each existing function
+  (`rich_text_area_with_labels`, `rich_text_area_htmx_with_labels`,
+  `rich_text_area_htmx_with_token_field_with_labels`, and the three
+  `required_*` counterparts) takes one. An app can now translate the
+  editor's chrome without touching the rest of the form. Additive and
+  backward-compatible: every existing function keeps rendering the default
+  English labels unchanged.
+- **`IntoChangeset::into_changeset_with` resolves a validation message by
+  field and code (#2227):** when a `#[validate(...)]` rule has no explicit
+  `message`, an unmessaged rule always produced the hardcoded English
+  `"validation failed: {code}"`. `into_changeset_with` takes a
+  `resolve: impl Fn(&str, &str) -> Option<String>` closure. `resolve` runs
+  first: return `Some(message)` to supply a translated message for a
+  `(field, code)` pair, or `None` to keep the default. An explicit `message`
+  on the validator attribute always wins; the resolver never sees it.
+  `into_changeset` is unchanged and keeps producing the same default
+  messages as before.
+- **Translatable state-transition controls via `TransitionLabels` (#2227):**
+  `autumn::widgets::transition_controls` built its group aria-label
+  (`"{field} transitions"`) and every button's `"Mark as {state}"` inside
+  itself, from positional arguments that carried no label seam. A new
+  `TransitionLabels` builder carries a group label plus `(target_state, label)`
+  overrides, and `transition_controls_with_labels` takes one. Additive and
+  backward-compatible: `transition_controls` renders exactly as before, and a
+  state with no override keeps its English default.
+- **`autumn generate scaffold --i18n` now translates the last three English
+  surfaces (#2227):** the flag used to warn about three gaps. A `richtext`
+  column's editor chrome, a `:states(…)` column's transition buttons, and
+  every inline `#[validate(...)]` message stayed English next to a
+  translated label. All three now go through the bundle. The rich-text
+  editor gets `common.richtext.toolbar` / `.hint` / `.preview` plus one key
+  per toolbar control (the Markdown syntax beside each name stays literal).
+  The transition controls get `<model>.field.<column>.transitions` and one
+  `<model>.field.<column>.transition.<state>` per distinct target state.
+  The `create`/`update` handlers build their changeset with
+  `into_changeset_with`, resolving each validator code through
+  `<model>.field.<column>.error.<code>`. Every English default is the exact
+  text the plain scaffold renders today, so an `en` app is unchanged, and
+  output without `--i18n` is byte-identical. One gap remains: the CSV
+  import report. `import_csv` runs its row handler per line, with no
+  request locale. `--import` with `--validate` under `--i18n` still shows
+  English messages there.
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
@@ -478,6 +525,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
   the final program, closing out the issue's suggested composition-test
   coverage.
+- **repository:** `retention(...)` and `upsert_many` no longer bypass
+  `position(...)`'s single-row batching guard (#2240). A `#[repository(...,
+  position(...), retention(after = ...))]` sweep could batch several
+  same-scope rows into one DELETE/UPDATE statement — each row's compaction
+  trigger only sees its own pre-statement position, so a sweep could leave a
+  gap in the ordered sequence, the same root cause already fixed for
+  `delete_many`/`update_many` (#1358). `retention(...)` now rejects
+  `position(...)` at compile time (mirroring the existing `sharded`/
+  `dependent(...)` rejections) rather than risk corrupting the sequence.
+  Separately, `upsert_many`'s generated `INSERT ... ON CONFLICT DO UPDATE`
+  chunking could reassign several same-scope rows' `position` scope column
+  in one statement, hitting the identical race already fixed for
+  `update_many`'s scope reassignment. `upsert_many` now forces a chunk size
+  of 1 whenever the repository declares `position(...)`, matching
+  `delete_many`/`update_many`'s existing fix.
+- **ci:** confirmed the workspace and the SQLite-runtime lane pass
+  `cargo clippy -- -D warnings` clean on the runners' current stable
+  (rustc 1.98.1), on a cold cache (issue #2252). The four lint categories
+  the issue named were already fixed or grandfathered in earlier PRs, with
+  no link back to the issue — `unused_async_trait_impl` carries a scoped,
+  commented `[workspace.lints.clippy]` allow in the root `Cargo.toml`; the
+  other three carry local `#[allow(...)]` annotations with the same
+  rationale pattern. This closes the one open acceptance criterion: a
+  decision recorded on toolchain pinning. The lint lanes track `stable` on
+  purpose, to catch a new lint close to when it lands. The separate `msrv`
+  job keeps its own 1.88.0 pin for the compile floor.
 - **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
   `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
   one opaque `style: form, explode: true` parameter for the whole struct
@@ -515,6 +588,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "app" task definition when registering the real image, so a narrower
   migrate secret list silently stripped the signing secret from every real
   app deploy, and the app failed fast on startup.
+- **ci:** the `minio` testcontainer used by the offsite-backup, S3-replication,
+  and avatar-blob-store Docker-dependent tests now pulls from
+  `quay.io/minio/minio` instead of the default `minio/minio`. Docker Hub
+  started refusing anonymous pulls of `minio/minio` in 2025, so every
+  unauthenticated CI runner failed these tests with "pull access denied"
+  regardless of the change under test; `quay.io/minio/minio` mirrors the same
+  release tags and stays public.
+- **cli:** `autumn upgrade` bounds the two approximations behind its codemod
+  safety posture (issue #2234, follow-up to #2231). `0.6.0-repository-with-pool-untracked`
+  now ships as `review` rather than `auto`: it still rewrites every call site,
+  but flags each one, since receiver identification is textual and can be
+  fooled by a hand-written type or a `#[repository]` from another crate. A
+  hand-written type declared inside a function body no longer vouches
+  module-wide against a call elsewhere in the file — the same block-scope fix
+  already applied to generated repository types. `configured_target_dirs` now
+  asks `cargo metadata --no-deps` for the app's build-output directory
+  instead of hand-rolling Cargo's config resolution, falling back to the
+  hand-rolled walk when the subprocess is unavailable; vendor-directory and
+  nested-crate resolution are unchanged, since `cargo metadata` reports
+  neither.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
