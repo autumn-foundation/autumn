@@ -271,10 +271,7 @@ impl Ctx<'_> {
     /// so a retry that settles the row at the same time is not overwritten.
     async fn close_dunning_for(&self, subscription_id: &str) -> Result<(), BillingError> {
         let store = self.service.store();
-        for row in store.open_dunning().await? {
-            if row.subscription_id.as_deref() != Some(subscription_id) {
-                continue;
-            }
+        for row in store.open_dunning_for_subscription(subscription_id).await? {
             let mut closed = row.clone();
             closed.state = DunningState::Canceled;
             closed.updated_at = self.now;
