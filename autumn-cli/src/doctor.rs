@@ -11219,10 +11219,31 @@ pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::Pat
         .and_then(toml::Value::as_bool)
         == Some(false);
     if autobins_disabled {
-        None
-    } else {
-        Some(conventional())
+        return None;
     }
+
+    // A package literally named "edge-capsule" gets an implicit `src/main.rs`
+    // bin target of that same name — Cargo's own rule that the default
+    // binary's name is the package name, verified directly via `cargo
+    // metadata` (no `[[bin]]` entry needed at all). That target is not one
+    // of `conventional_edge_capsule_bin`'s two `src/bin/` shapes, so without
+    // this check `autumn doctor` reported the capsule missing even though
+    // `autumn build` (which resolves the real target from Cargo metadata,
+    // not this manifest-text heuristic) finds and compiles it fine (Codex
+    // review on #2739, round 22, P2).
+    let package_name_is_edge_capsule = table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        == Some("edge-capsule");
+    if package_name_is_edge_capsule {
+        let main_rs = root.join("src/main.rs");
+        if main_rs.is_file() {
+            return Some(main_rs);
+        }
+    }
+
+    Some(conventional())
 }
 
 /// The conventional edge-capsule bin path Cargo would actually build: the
@@ -11604,6 +11625,48 @@ mod tests {
         assert_eq!(
             resolve_edge_capsule_bin(dir.path()),
             Some(dir.path().join(EDGE_CAPSULE_BIN_DIR))
+        );
+    }
+
+    /// A package literally named `edge-capsule` gets an implicit
+    /// `src/main.rs` bin target of that same name — Cargo's own default
+    /// binary naming rule, verified directly via `cargo metadata` — with no
+    /// `[[bin]]` entry needed at all. Without checking for it, this
+    /// resolver falls back to the (nonexistent) `src/bin/edge-capsule.rs`
+    /// convention, so `autumn doctor` wrongly reports the capsule missing
+    /// even though `autumn build` finds and compiles it via real Cargo
+    /// metadata (Codex review on #2739, round 22, P2).
+    #[test]
+    fn resolve_edge_capsule_bin_recognizes_the_package_named_edge_capsules_main_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edge-capsule\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join("src/main.rs"))
+        );
+    }
+
+    /// Same package name, but no `src/main.rs` at all (a library-only
+    /// package that merely happens to be named `edge-capsule`) — falls
+    /// through to the ordinary `src/bin/` convention like any other package.
+    #[test]
+    fn resolve_edge_capsule_bin_falls_back_to_convention_when_package_named_edge_capsule_has_no_main_rs()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edge-capsule\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_edge_capsule_bin(dir.path()),
+            Some(dir.path().join(EDGE_CAPSULE_BIN))
         );
     }
 
