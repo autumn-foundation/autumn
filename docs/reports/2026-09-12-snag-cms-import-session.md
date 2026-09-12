@@ -6,9 +6,10 @@
 export, re-import the same file into the same site, and (the scenario this
 session was chosen for) restore an export into a **fresh** site, including
 a file in a legacy export format (`READABLE_EXPORT_VERSIONS`'s older
-entries) — turned out over the course of the session to be a narrower
-question than "an old backup" (see the correction under 🐛 Bug filed below).
-This was the first of the
+entries) — turned out over the course of the session to be neither
+narrower nor limited to "an old backup" in the way earlier drafts of this
+report claimed (see the two corrections under 🐛 Bug filed below). This
+was the first of the
 three follow-up charters the prior session proposed
 (`docs/reports/2026-09-11-snag-cms-session.md`): "Media library and
 import/export — both have strong built-in oracles (MIME allowlist is a
@@ -112,54 +113,56 @@ independently.)
 
 ## 🐛 Bug filed
 
-**[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — legacy-format
-(version 2/3) import silently drops a same-slug sibling page when its parent
-is created later in the same run (data loss, repro 3/3).**
+**[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
+silently drops a same-slug sibling page whenever neither it nor its parent
+carries a `path` and the parent is created later in the same run (data
+loss, repro 4/4).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
-for the *current* export format (sorting posts by how many `/` their `path`
-contains, so a parent is always created before its children) is a no-op for
-version-2 and version-3 files: those predate the `path` field, so
-`identity()` falls back to the bare slug, which never contains `/` — every
-page in a legacy file sorts as depth `0`. When two same-slug pages under
-different parents are listed in the file before their respective parents,
-the import loop misidentifies the *second* one as "somebody else's row that
-merely shares the slug" against the *first* one it just created — and drops
-it permanently, with the summary screen reporting an unremarkable
-"N imported, M already present" and no orphan count. Reproduced 3/3 across
-independent fresh databases (two on version 2 — one a hand-reordered full
-export, one a minimized 4-post file — and one on version 3, all
-deterministic given the file's post ordering — not a race).
+(sorting posts by how many `/` their `path` contains, so a parent is
+always created before its children) is a no-op whenever a post's `path` is
+absent: `identity()` falls back to the bare slug, which never contains
+`/`. That is guaranteed for every version-2 and version-3 file (`path`
+was added in version 4), but — a Codex catch on this PR, confirmed by a
+fourth reproduction below — it is **not** limited to those versions:
+`ExportPost::path` is `#[serde(default)]`, so a version-4 or version-5
+file that simply omits `path` on the affected posts (while every other
+post carries one, and the file's declared `version` stays current) hits
+the identical fallback and the identical bug. The condition is "this
+post's `path` is missing," not "this file's version is old" — version
+2/3 is simply the case where the *format itself* never supplies `path` at
+all.
 
-**Correction from the first draft of this report, caught by a Codex review
-comment on this PR:** the first draft framed this as a risk to "an old real
-backup," reasoning that a page created flat and later re-parented could
-plausibly leave a lower row id under a newer sibling. That reasoning doesn't
-hold up: `ExportPost::path`'s own doc comment (`tools.rs`) says the
-pre-version-4 schema made a page's bare slug its *whole* identity — meaning
-two pages could not have shared a slug at all under that era's schema; only
-once nested-page uniqueness became per-parent (alongside `path`, at version
-4) did `/about/team` and `/company/team` become simultaneously legal. So a
-period-authentic version-2 or -3 export, produced by this software's own
-exporter of that vintage, could not have contained the colliding rows this
-repro needs. The realistic trigger is narrower: any version-2/3-*labeled*
-file the importer nonetheless accepts without checking that its content is
-even period-consistent — a hand-edited export (the code's own comment on
-`import_status` separately treats "a file... hand-edited or came from
-another tool" as a real, anticipated input class for this same importer),
-or a migration tool emitting cms's documented legacy JSON shape from
-another platform. (Not, on its own, a current export with only its version
-label changed: `identity()` prefers `post.path` whenever the file carries
-one, regardless of the declared `version`, so a genuine version-5 file
-relabeled `"version": 2` still sorts correctly — the file must actually
-omit or clear each post's `path`, not merely claim an older version
-number, which is exactly what a hand-edited or third-party-tool-produced
-file does and a relabeled current export does not. A second Codex catch
-on this PR, after this paragraph's own first correction listed the
-version-relabel case too loosely.) Filed as data loss on an input class
-this importer explicitly commits to accepting (`READABLE_EXPORT_VERSIONS`)
-and applies no such consistency check to — not as a risk to a site's own
-untouched historical backups. The issue text has been corrected to match.
+When two same-slug pages under different parents are listed in the file
+before their respective parents, and neither carries a `path`, the
+import loop misidentifies the *second* one as "somebody else's row that
+merely shares the slug" against the *first* one it just created — and
+drops it permanently, with the summary screen reporting an unremarkable
+"N imported, M already present" and no orphan count. Reproduced 4/4
+across independent fresh databases: two on version 2 (one a
+hand-reordered full export, one a minimized 4-post file), one on version
+3, and one — added after the Codex catch above — a version-5-labeled file
+with the same 4 posts, `path` simply omitted on all of them. All four are
+deterministic given the file's post ordering, not a race.
+
+**Two corrections from earlier drafts of this report, both from Codex
+review comments on this PR.** First: the original framing called this a
+risk to "an old real backup," reasoning that a page created flat and
+later re-parented could plausibly leave a lower row id under a newer
+sibling. That doesn't hold up for a *version-2/3* file specifically:
+`ExportPost::path`'s own doc comment (`tools.rs`) says the pre-version-4
+schema made a page's bare slug its whole identity, so two pages could not
+have shared a slug at all under that era's schema — a period-authentic
+version-2 or -3 export could never have contained the colliding rows this
+repro needs. Second, and this is what the version-5 reproduction above
+settles: the bug is not actually confined to old-format files at all, so
+"is this reachable from a genuine backup" has a different answer than
+either earlier draft gave — it depends only on whether the *specific
+posts in question* carry `path`, which a hand-edited file of **any**
+accepted version (2 through 5) can omit, and which the importer never
+cross-checks against the file's declared version. Filed as data loss on
+an input shape this importer accepts across every `READABLE_EXPORT_VERSIONS`
+entry and applies no path-presence consistency check to.
 
 Full repro script, root cause, and both oracles are in the issue.
 
@@ -179,7 +182,8 @@ regression test the sweep will then pick up automatically.
 
 ## Findings summary
 
-- **Bugs filed:** 1 — #2737 (data loss on legacy-format import; see above).
+- **Bugs filed:** 1 — #2737 (data loss on import of any accepted-version
+  file whose posts lack `path`; see above).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
