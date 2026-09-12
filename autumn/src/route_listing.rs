@@ -86,6 +86,22 @@ pub struct HeadersDump {
     pub csp_nonce: bool,
 }
 
+/// Resolved mTLS client-auth configuration carried across the dump boundary for
+/// the `declared` mTLS manifest dimension (issue #1640).
+///
+/// Mirrors the runtime-relevant subset of
+/// [`ClientAuthConfig`](crate::config::ClientAuthConfig): the listener mode plus
+/// the route prefixes that demand a certificate. The trust-store *paths* are
+/// deliberately absent — rotating a bundle is not a posture change, and a path
+/// in the manifest would make every filesystem-layout change a finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAuthDump {
+    /// Listener requirement level: `off`, `optional`, or `required`.
+    pub mode: String,
+    /// Route prefixes that demand a verified client certificate (sorted).
+    pub required_paths: Vec<String>,
+}
+
 /// Resolved security configuration snapshot emitted after
 /// [`SECURITY_CONFIG_MARKER`] for the manifest's `declared` dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +110,22 @@ pub struct SecurityDump {
     pub csrf: CsrfDump,
     /// Security-headers configuration.
     pub headers: HeadersDump,
+    /// mTLS client-certificate configuration (issue #1640). Defaults to `off`
+    /// with no required paths, so a dump from a build without
+    /// `[server.tls.client_auth]` reads as "no route requires mTLS".
+    #[serde(default = "ClientAuthDump::off")]
+    pub client_auth: ClientAuthDump,
+}
+
+impl ClientAuthDump {
+    /// The dump for a deployment with no client-certificate verification.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            mode: crate::config::ClientAuthMode::Off.as_str().to_owned(),
+            required_paths: Vec::new(),
+        }
+    }
 }
 
 impl SecurityDump {
@@ -148,6 +180,20 @@ impl SecurityDump {
                 hsts_include_subdomains: headers.hsts_include_subdomains,
                 csp_nonce: headers.csp_nonce.enabled,
             },
+            client_auth: config
+                .server
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_auth.as_ref())
+                .map_or_else(ClientAuthDump::off, |ca| {
+                    let mut required_paths = ca.required_paths.clone();
+                    required_paths.sort();
+                    required_paths.dedup();
+                    ClientAuthDump {
+                        mode: ca.mode.as_str().to_owned(),
+                        required_paths,
+                    }
+                }),
         }
     }
 }
@@ -783,7 +829,7 @@ pub(crate) fn append_framework_routes(
     }
 
     // Dev request inspector routes.
-    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+    if crate::config::profile_is_dev(config.profile.as_deref()) {
         let inspector_path = &config.dev.inspector_path;
         let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
         for (path, handler) in [
