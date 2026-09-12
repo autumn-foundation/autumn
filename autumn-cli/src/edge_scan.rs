@@ -35,7 +35,12 @@
 //!   function body, nested in another macro's group). A re-exported alias of the
 //!   macro under a different name is not recognized. Each comma-separated entry
 //!   keeps its full path text, so `edge_routes![handlers::greet]` registers
-//!   `handlers::greet`.
+//!   `handlers::greet`. A leading `self` or `super` in an entry is resolved
+//!   against the *inline* module the invocation itself is written in
+//!   (`self::show` inside `mod users { ... }` resolves to `users::show`)
+//!   before matching; an out-of-line invocation site (inside a separate
+//!   `mod x;` file) resolves `self`/`super` against that file's own
+//!   location instead, the same way a function's module path is derived.
 //! - A registration is matched against a function by name, plus the chain of
 //!   modules the scan saw the function declared under: *inline* (`mod users {
 //!   #[edge] fn show() {} }` gives `show` the path `users`), or derived from
@@ -494,7 +499,8 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
         scan_items(&ast.items, file, &mut module_path, default_features, scan);
     }
     if let Ok(stream) = TokenStream::from_str(src) {
-        collect_registrations(&stream, scan);
+        let mut module_path = module_path_from_file(file);
+        collect_registrations(&stream, &mut module_path, scan);
     }
 }
 
@@ -690,38 +696,92 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 }
 
 /// Find every `edge_routes![...]` invocation in a token stream and record the
-/// handler identifiers it registers.
+/// handler identifiers it registers, resolved against the module the
+/// invocation itself is written in.
 ///
 /// Token-level rather than AST-level because the invocation is equally valid in
 /// item position, inside a function body, or nested in another macro's group —
 /// and because the registration list is a plain path list, so no parsing beyond
-/// "last identifier of each comma-separated entry" is needed.
-fn collect_registrations(stream: &TokenStream, scan: &mut EdgeScan) {
+/// "last identifier of each comma-separated entry" is needed. `mod <name> {
+/// ... }` nesting is tracked the same way, by direct token pattern rather than
+/// `syn`, purely so a `self`/`super`-relative entry (`edge_routes![self::show]`)
+/// resolves against the right module instead of comparing "self" or "super"
+/// literally, which never matches a real module path (Codex review on #2739,
+/// round 4, P2). An out-of-line `mod <name>;` has no group to recurse into
+/// here; its own registrations are covered when that file is scanned on its
+/// own, seeded from its file-derived module path instead (see
+/// [`module_path_from_file`]).
+fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, scan: &mut EdgeScan) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
-    for (index, tree) in trees.iter().enumerate() {
-        match tree {
-            TokenTree::Group(group) => collect_registrations(&group.stream(), scan),
+    let mut index = 0;
+    while index < trees.len() {
+        if let TokenTree::Ident(ident) = &trees[index]
+            && ident == "mod"
+            && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
+            && let Some(TokenTree::Group(group)) = trees.get(index + 2)
+            && group.delimiter() == Delimiter::Brace
+        {
+            module_path.push(name.to_string());
+            collect_registrations(&group.stream(), module_path, scan);
+            module_path.pop();
+            index += 3;
+            continue;
+        }
+        match &trees[index] {
+            TokenTree::Group(group) => collect_registrations(&group.stream(), module_path, scan),
             TokenTree::Ident(ident) if ident == "edge_routes" => {
-                let bang =
-                    matches!(trees.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!');
-                if !bang {
-                    // `fn edge_routes()` / a path mention — not an invocation.
-                    continue;
-                }
-                let Some(TokenTree::Group(group)) = trees.get(index + 2) else {
-                    continue;
-                };
-                if group.delimiter() == Delimiter::None {
-                    continue;
-                }
-                scan.registrations += 1;
-                for name in registered_idents(&group.stream()) {
-                    scan.registered.insert(name);
+                let bang = matches!(
+                    trees.get(index + 1),
+                    Some(TokenTree::Punct(p)) if p.as_char() == '!'
+                );
+                if bang
+                    && let Some(TokenTree::Group(group)) = trees.get(index + 2)
+                    && group.delimiter() != Delimiter::None
+                {
+                    scan.registrations += 1;
+                    for name in registered_idents(&group.stream()) {
+                        scan.registered
+                            .insert(resolve_registration_path(&name, module_path));
+                    }
                 }
             }
             _ => {}
         }
+        index += 1;
     }
+}
+
+/// Resolve a `self`/`super`-relative registration path against
+/// `module_path`, the module the `edge_routes![...]` invocation is written
+/// in. Cargo's own path rules: a leading `self` names that module itself, so
+/// it is dropped in favor of `module_path`; a leading `super` (repeatable)
+/// goes up one level of `module_path` per occurrence. A resolution that
+/// bottoms out at the crate root is written back out with an explicit
+/// `crate` prefix (`super::show` from module `admin` becomes `crate::show`,
+/// not bare `show`) so [`is_registered`]'s exact-equality match — not the
+/// looser bare-entry rule — is what decides it. Anything else (`crate`
+/// itself, a real module name, or no qualifier at all) passes through
+/// unchanged.
+fn resolve_registration_path(entry: &str, module_path: &[String]) -> String {
+    let segments: Vec<&str> = entry.split("::").collect();
+    let (mut base, rest): (Vec<String>, &[&str]) = match segments.first().copied() {
+        Some("self") => (module_path.to_vec(), &segments[1..]),
+        Some("super") => {
+            let mut base = module_path.to_vec();
+            let mut rest: &[&str] = &segments;
+            while rest.first().copied() == Some("super") {
+                base.pop();
+                rest = &rest[1..];
+            }
+            (base, rest)
+        }
+        _ => return entry.to_owned(),
+    };
+    if base.is_empty() {
+        base.push("crate".to_owned());
+    }
+    base.extend(rest.iter().map(|s| (*s).to_owned()));
+    base.join("::")
 }
 
 /// Split a macro argument list on top-level commas and keep each entry's full
@@ -1320,6 +1380,45 @@ mod tests {
         assert_eq!(unregistered[0].name, "show");
         assert!(unregistered[0].module_path.is_empty());
         assert!(scan.registered_fns().is_empty());
+    }
+
+    /// `edge_routes![self::show]` written inside `mod users { ... }` names
+    /// `users::show`, the same as writing `users::show` (or just `show`)
+    /// there — `self` is Cargo's own name for "the current module", not a
+    /// literal path segment to compare against `show`'s recorded module
+    /// path of `["users"]`.
+    #[test]
+    fn a_self_qualified_registration_resolves_to_its_enclosing_module() {
+        let scan = scan_one(
+            r"
+            mod users {
+                #[edge]
+                pub fn show() {}
+
+                fn wire() { edge_routes![self::show]; }
+            }
+            ",
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// `edge_routes![super::show]` written inside a nested `mod admin { ... }`
+    /// names the parent module's `show`, not a same-named `admin::show`.
+    #[test]
+    fn a_super_qualified_registration_resolves_to_the_parent_module() {
+        let scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            mod admin {
+                fn wire() { edge_routes![super::show]; }
+            }
+            ",
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
     }
 
     /// `mod users;` / `mod admin;` (separate files, not inline `mod { }`
