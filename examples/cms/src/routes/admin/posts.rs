@@ -578,7 +578,15 @@ pub async fn edit_form(
 
     let context = EditorContext::load(&repos, &registered, Some(&post)).await?;
     let values = EditorValues::from_post(Some(&post), &context.settings);
-    let body = editor(&registered, Some(&post), &values, &context, &user, &csrf, &[]);
+    let body = editor(
+        &registered,
+        Some(&post),
+        &values,
+        &context,
+        &user,
+        &csrf,
+        &[],
+    );
     Ok(layout(
         &user,
         &csrf,
@@ -2195,7 +2203,10 @@ mod editor_validation_tests {
         let mut submitted = form("Titled", "future");
         submitted.publish_at = Some("2000-01-01T00:00".to_owned());
         let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
-        assert!(scheduled_for.is_some(), "a parseable date still round-trips");
+        assert!(
+            scheduled_for.is_some(),
+            "a parseable date still round-trips"
+        );
         assert_eq!(
             field_error(&errors, "publish_at"),
             Some("A scheduled post needs a publish date in the future")
@@ -2220,7 +2231,10 @@ mod editor_validation_tests {
         let mut submitted = form("Titled", "future");
         submitted.publish_at = Some("2999-01-01T00:00".to_owned());
         let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
-        assert!(errors.is_empty(), "a valid submission must not be rejected: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "a valid submission must not be rejected: {errors:?}"
+        );
         assert!(scheduled_for.is_some());
     }
 

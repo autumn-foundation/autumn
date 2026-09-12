@@ -757,25 +757,34 @@ async fn create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact()
 async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_draft() {
     let client = db_client().await;
     let cookie = register(&client, "owner").await;
-    let id = create_post(&client, &cookie, "Original Title", "Original body.", "draft").await;
+    let id = create_post(
+        &client,
+        &cookie,
+        "Original Title",
+        "Original body.",
+        "draft",
+    )
+    .await;
 
     let resp = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&edit_form(
-            &id,
-            &[
-                ("title", "   "),
-                ("slug", ""),
-                ("excerpt", ""),
-                ("body", "An edit nobody should lose."),
-                ("status", "publish"),
-                ("password", ""),
-                ("taxonomy_names[post_tag]", ""),
-                ("comment_status", "open"),
-            ],
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "   "),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "An edit nobody should lose."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
         )
-        .await)
         .send()
         .await;
     resp.assert_status(422);
