@@ -55,13 +55,26 @@ fn read_values(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// `MinIO` image, pinned HERE rather than by `testcontainers-modules` (#2732).
+///
+/// The module's default is `minio/minio` on Docker Hub, and that repository no
+/// longer exists — an anonymous pull 404s with "repository does not exist", so
+/// bumping `testcontainers-modules` cannot fix it. `quay.io/minio/minio` is
+/// `MinIO`'s own registry, public and anonymously pullable, and still serves
+/// the exact tag the module pinned — a registry change, not a version bump.
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
+const MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker (testcontainers: minio)"]
 async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
 
     let minio = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
         .start()
         .await
         .expect("start MinIO — is Docker running?");

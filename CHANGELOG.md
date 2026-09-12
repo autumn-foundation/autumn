@@ -477,6 +477,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI: `Test (Docker)` is green again — the `MinIO` test image is pulled from
+  `quay.io` instead of Docker Hub (#2732) [no-plugin].**
+  `docker.io/minio/minio` no longer exists: an anonymous pull returns `404 …
+  pull access denied for minio/minio, repository does not exist`. Not a
+  withdrawn tag — the whole Docker Hub repository is gone, which is why bumping
+  `testcontainers-modules` could not have fixed it. The four `MinIO::default()`
+  call sites (two in `autumn-cli`'s offsite-backup tests, one in autumn's
+  SQLite S3 replication test, one in the reddit-clone avatar test) now override
+  the image with `quay.io/minio/minio`, `MinIO`'s own registry, which is public,
+  anonymously pullable, and still serves **the exact tag the module pinned**.
+  So this is a registry change and nothing else: same image, same release, same
+  startup banner the module's `WaitFor` matches — deliberately not a version
+  bump, since releases from mid-2025 drop the web console the module configures
+  with `--console-address`. The pin now lives in this tree, which is what #2732
+  called the smallest durable fix: a third-party crate's choice of registry can
+  no longer gate this repo's CI. Only the two `autumn-cli` sites were failing
+  visibly, because the other two sit behind features the Docker sweep does not
+  enable; all four were equally broken.
+
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when

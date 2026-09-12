@@ -23,6 +23,27 @@ use std::process::Command;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+/// `MinIO` image, pinned HERE rather than by `testcontainers-modules` (#2732).
+///
+/// The module's own default is `minio/minio` on Docker Hub, and that
+/// repository no longer exists: an anonymous pull returns
+/// `404 … pull access denied for minio/minio, repository does not exist`.
+/// Not a withdrawn tag — the whole Docker Hub repo is gone, so bumping
+/// `testcontainers-modules` to a newer pin cannot fix it.
+///
+/// `quay.io/minio/minio` is `MinIO`'s own registry, public and anonymously
+/// pullable, and it still serves THE EXACT TAG the module pinned. So this is a
+/// registry change and nothing else: same image, same release, same startup
+/// banner the module waits for — deliberately not a version bump, which could
+/// have changed behaviour (releases from mid-2025 drop the web console the
+/// module configures with `--console-address`).
+///
+/// Overriding name AND tag at the call site also moves the pin into this tree,
+/// which is what #2732 called the smallest durable fix: a third-party crate's
+/// choice of registry can no longer gate this repo's CI.
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
+const MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+
 const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
@@ -193,6 +214,7 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
@@ -208,6 +230,8 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
     let minio = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
         .start()
         .await
         .expect("start MinIO — is Docker running?");
@@ -316,6 +340,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
@@ -331,6 +356,8 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
     let minio = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
         .start()
         .await
         .expect("start MinIO — is Docker running?");

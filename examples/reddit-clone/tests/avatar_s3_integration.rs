@@ -11,8 +11,19 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
 };
 use bytes::Bytes;
+use testcontainers::ImageExt as _;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
+
+/// `MinIO` image, pinned HERE rather than by `testcontainers-modules` (#2732).
+///
+/// The module's default is `minio/minio` on Docker Hub, and that repository no
+/// longer exists — an anonymous pull 404s with "repository does not exist", so
+/// bumping `testcontainers-modules` cannot fix it. `quay.io/minio/minio` is
+/// `MinIO`'s own registry, public and anonymously pullable, and still serves
+/// the exact tag the module pinned — a registry change, not a version bump.
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
+const MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
@@ -36,7 +47,12 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    let container = MinIO::default().start().await.expect("start MinIO");
+    let container = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
+        .start()
+        .await
+        .expect("start MinIO");
     let port = container
         .get_host_port_ipv4(9000)
         .await
