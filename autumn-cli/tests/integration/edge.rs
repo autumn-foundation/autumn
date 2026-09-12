@@ -73,7 +73,9 @@ fn doctor_json(root: &Path) -> (serde_json::Value, Option<i32>) {
     // one clean JSON blob: a stray character ahead of it would otherwise
     // fail with a confusing "expected value at line 1 column 1" instead of
     // this clearer panic.
-    let json_str = stdout.find('{').map_or(stdout.as_str(), |idx| &stdout[idx..]);
+    let json_str = stdout
+        .find('{')
+        .map_or(stdout.as_str(), |idx| &stdout[idx..]);
     let report = serde_json::from_str(json_str).unwrap_or_else(|e| {
         panic!(
             "`autumn doctor --json` must emit parseable JSON: {e}\nstdout:\n{stdout}\nstderr:\n{}",
@@ -236,8 +238,7 @@ fn doctor_warns_from_a_virtual_workspace_root() {
         let result = check(&report, name);
         assert_eq!(result["status"], "warn", "{result}");
         assert_eq!(
-            result["detail"],
-            "Cargo.toml is a workspace root with no [package]",
+            result["detail"], "Cargo.toml is a workspace root with no [package]",
             "{result}"
         );
         assert!(
@@ -298,8 +299,7 @@ fn doctor_honors_a_custom_capsule_bin_path() {
 
     let edge_routes = check(&report, "edge_routes");
     assert_eq!(
-        edge_routes["status"],
-        "pass",
+        edge_routes["status"], "pass",
         "a custom [[bin]] path must be honored, not treated as missing: {edge_routes}"
     );
 }

@@ -61,12 +61,6 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/edge_with_secured.rs");
     t.compile_fail("tests/compile-fail/edge_with_intercept.rs");
     t.compile_fail("tests/compile-fail/edge_with_extension.rs");
-    // The sealed `EdgeExtract` whitelist (issue #2244) closes the two
-    // bypasses the macro's own token-level `Extension` scan cannot see: a
-    // type alias hiding the name, and the whole-`Request` extractor reading
-    // `.extensions()` directly.
-    t.compile_fail("tests/compile-fail/edge_with_extension_alias.rs");
-    t.compile_fail("tests/compile-fail/edge_with_request.rs");
     t.compile_fail("tests/compile-fail/edge_on_static_get.rs");
 
     // Lifecycle macro failures (always available — the `lifecycle` macro is not

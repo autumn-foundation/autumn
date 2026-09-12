@@ -16739,7 +16739,9 @@ mod tests {
     fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
         let registration = &app().custom_layers[0];
         assert!(
-            registration.type_name.contains("::strip_edge_fallthrough_sentinel,"),
+            registration
+                .type_name
+                .contains("::strip_edge_fallthrough_sentinel,"),
             "the real registration's type_name no longer matches what \
              router::is_idempotency_transparent_app_layer looks for: {}",
             registration.type_name

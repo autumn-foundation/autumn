@@ -24,6 +24,34 @@
 //! [`EdgeHandler`], whatever name or wrapper hides it — a type alias for
 //! `Extension<T>` is still `Extension<T>` to the compiler, and the
 //! whole-`Request` extractor is simply not on the list.
+//!
+//! A type alias does not hide `Extension<T>` from [`edge_get`]:
+//!
+//! ```compile_fail
+//! use autumn_edge::edge_get;
+//!
+//! type Hidden = axum::Extension<u32>;
+//!
+//! async fn handler(_ext: Hidden) -> &'static str {
+//!     "never reached"
+//! }
+//!
+//! let _ = edge_get(handler);
+//! ```
+//!
+//! Nor does the whole-`Request` extractor, which could read `.extensions()`
+//! by hand:
+//!
+//! ```compile_fail
+//! use autumn_edge::edge_get;
+//!
+//! async fn handler(req: axum::extract::Request) -> &'static str {
+//!     let _ = req.extensions();
+//!     "never reached"
+//! }
+//!
+//! let _ = edge_get(handler);
+//! ```
 
 use crate::route::EdgeState;
 

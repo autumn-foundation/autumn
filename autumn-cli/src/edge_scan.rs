@@ -54,8 +54,9 @@
 //!   reads the crate's own `Cargo.toml`, follows `[features] default = [...]`
 //!   through the feature graph in `[features]`, and builds the set of feature
 //!   names a default build turns on. It then checks each `#[cfg(...)]` on the
-//!   same function as `#[edge]` (several such attributes are ANDed, like real
-//!   Rust). A predicate built only from `feature = "x"` leaves combined with
+//!   same function as `#[edge]` (real Rust requires every one of them to hold,
+//!   so several such attributes combine the same way). A predicate built only
+//!   from `feature = "x"` leaves combined with
 //!   `not(...)`, `all(...)`, and `any(...)` is evaluated against that set, and
 //!   the function is excluded only when such a predicate is definitely false.
 //!   Any other predicate — `target_os`, `debug_assertions`, a feature implied
@@ -191,7 +192,9 @@ fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
         name == f.name
             && (qualifier.is_empty()
                 || f.module_path.is_empty()
-                || qualifier.split("::").eq(f.module_path.iter().map(String::as_str)))
+                || qualifier
+                    .split("::")
+                    .eq(f.module_path.iter().map(String::as_str)))
     })
 }
 
@@ -215,9 +218,14 @@ fn scan_sources_with_features(
 /// Scan a set of in-memory `(file, source)` pairs, treating every feature as
 /// off (so a `#[cfg(feature = "...")]`-gated `#[edge]` function is excluded
 /// unless a `not(...)` around it makes that resolve to true). Most unit tests
-/// in this module drive this directly with inline source strings; a test that
-/// exercises `#[cfg(...)]` evaluation against a specific feature set uses
+/// in this module — and in `build.rs`'s and `doctor.rs`'s own test modules —
+/// drive this directly with inline source strings; a test that exercises
+/// `#[cfg(...)]` evaluation against a specific feature set uses
 /// [`scan_sources_with_features`] instead.
+///
+/// `#[cfg(test)]`: nothing outside a test build calls this — production code
+/// goes through [`resolve_edge_scan`], which needs the real feature set.
+#[cfg(test)]
 #[must_use]
 pub fn scan_sources(sources: &[(&str, &str)]) -> EdgeScan {
     scan_sources_with_features(sources, &BTreeSet::new())
@@ -302,7 +310,11 @@ fn default_features_from_manifest(manifest: &str) -> BTreeSet<String> {
             continue; // Already expanded — skip, so a feature cycle can't loop forever.
         }
         if let Some(sub) = features.get(&name).and_then(toml::Value::as_array) {
-            queue.extend(sub.iter().filter_map(toml::Value::as_str).map(str::to_owned));
+            queue.extend(
+                sub.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned),
+            );
         }
     }
     enabled
@@ -433,9 +445,9 @@ fn edge_fn(
 /// `feature = "x"` leaves, combined with `not`, `all`, and `any`.
 enum CfgPredicate {
     Feature(String),
-    Not(Box<CfgPredicate>),
-    All(Vec<CfgPredicate>),
-    Any(Vec<CfgPredicate>),
+    Not(Box<Self>),
+    All(Vec<Self>),
+    Any(Vec<Self>),
 }
 
 impl syn::parse::Parse for CfgPredicate {
@@ -657,7 +669,8 @@ mod tests {
             ",
         );
         assert_eq!(scan.registrations, 1);
-        assert!(scan.registered.contains("greet"));
+        // Full path text, not just the last segment.
+        assert!(scan.registered.contains("handlers::greet"));
         assert!(scan.registered.contains("note"));
         assert!(scan.unregistered().is_empty());
         assert_eq!(
@@ -965,7 +978,11 @@ mod tests {
         assert_eq!(unregistered[0].name, "show");
         assert_eq!(unregistered[0].module_path, vec!["admin".to_owned()]);
 
-        let registered: Vec<&str> = scan.registered_fns().iter().map(|f| f.name.as_str()).collect();
+        let registered: Vec<&str> = scan
+            .registered_fns()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         assert_eq!(registered, vec!["show"]);
         assert_eq!(
             scan.registered_fns()[0].module_path,
