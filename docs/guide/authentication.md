@@ -11,7 +11,7 @@ is allowed to *do* is [authorization](./authorization.md); proving identity
 
 Adding a **second factor** — two-factor authentication (2FA) with a TOTP
 authenticator app — is a flag on the generator rather than a separate
-subsystem: `autumn generate auth --totp`. The generator also scaffolds
+subsystem: `autumn generate auth User --totp`. The generator also scaffolds
 **passwordless** sign-in (`--passkeys`, `--magic-link`), which *replaces* the
 password rather than adding a factor on top of it — a different security
 property, and not 2FA. See
@@ -890,11 +890,11 @@ indistinguishable, and that logout makes the old cookie unusable. See the
   sudo-mode re-verification before destructive actions.
 - [Authorization](./authorization.md) — `Policy`, `Scope`, and `#[authorize]`
   for "may this user touch this record?".
-- Two-factor authentication (2FA / MFA) — `autumn generate auth --totp` adds a
-  TOTP second factor on top of the password.
-- Passwordless sign-in — `autumn generate auth --passkeys | --magic-link`
-  replaces the password instead of adding a factor to it. Each flag writes its
-  flows and its own project-local docs.
+- Two-factor authentication (2FA / MFA) — `autumn generate auth User --totp`
+  adds a TOTP second factor on top of the password.
+- Passwordless sign-in — `autumn generate auth User --passkeys` or
+  `--magic-link` replaces the password instead of adding a factor to it. Each
+  flag writes its flows and its own project-local docs.
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.

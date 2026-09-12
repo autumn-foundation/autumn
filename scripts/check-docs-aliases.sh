@@ -160,9 +160,10 @@ PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')
 # substitutions cannot.
 NEXT_CONSTRUCT = re.compile(
     r'(?P<comment><!--)'
+    r'|(?P<raw><(?P<rawname>script|style)\b)'
     r'|(?P<fence>^[ \t]{0,3}(?P<frun>`{3,}|~{3,})[^\n]*$)'
     r'|(?P<crun>`+)',
-    re.M,
+    re.M | re.I,
 )
 
 # Markup that carries text a reader never sees.
@@ -179,15 +180,6 @@ AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
 _ATTR_SOUP = r'(?:[^>"\']|"[^"]*"|\'[^\']*\')*'
 HTML_TAG = re.compile(r'</?[A-Za-z][A-Za-z0-9:-]*' + _ATTR_SOUP + r'>')
 
-# `<script>` and `<style>` BODIES are not text. Stripping the tags and keeping
-# the CSS or JavaScript between them would count a term no reader can see — a
-# different visibility rule from ordinary inner text, which does render and is
-# kept. `check-docs-orphans.sh` keeps the same raw-text set for the same
-# reason; this gate needs only the two that never render at all.
-RAW_TEXT_BLOCK = re.compile(
-    r'<(script|style)' + _ATTR_SOUP + r'>.*?</\1' + _ATTR_SOUP + r'>',
-    re.I | re.S,
-)
 
 # A destination can contain balanced parentheses, so it is scanned rather than
 # matched. The corpus has one: `](javascript:alert(1))` in rich-text.md.
@@ -238,7 +230,6 @@ def _strip_link_destinations(text):
 
 
 def _strip_markup(chunk):
-    chunk = RAW_TEXT_BLOCK.sub(' ', chunk)   # before tags: drop body AND tags
     chunk = REF_DEFINITION.sub(' ', chunk)
     chunk = AUTOLINK.sub(' ', chunk)
     chunk = _strip_link_destinations(chunk)  # before tags: `](…)` may hold `<…>`
@@ -266,6 +257,20 @@ def _segments(text):
         if m.group('comment'):
             end = text.find('-->', m.end())
             end = n if end < 0 else end + 3
+            out.append(('drop', text[m.start():end]))
+            i = end
+            continue
+
+        if m.group('raw'):
+            # A `<script>`/`<style>` BODY is raw text: its backticks are not
+            # code spans and its `<!--` is not a comment, so it has to be
+            # consumed here rather than stripped afterwards. Stripping it after
+            # segmentation let a backticked body split into "code" chunks and
+            # survive — the same ordering mistake as the comment case.
+            close = re.compile(r'</%s\b' % m.group('rawname'), re.I)
+            cm = close.search(text, m.end())
+            end = text.find('>', cm.end()) if cm else -1
+            end = n if end < 0 else end + 1
             out.append(('drop', text[m.start():end]))
             i = end
             continue
@@ -543,20 +548,34 @@ def self_test():
     if len(d) != 1 or d[0][3] != 'reader word absent':
         failures.append('a quoted > must not end an HTML tag')
 
-    # 21-22. `<script>` and `<style>` BODIES never render. Their visibility
+    # 21-24. `<script>` and `<style>` BODIES never render. Their visibility
     # differs from ordinary inner text, which does render and must still count
     # (property 10) — so this drops the body, not merely the tags.
+    #
+    # The BACKTICKED forms are the ones that matter: a raw-text body is raw, so
+    # its backticks are not code spans. Stripping these after segmentation let
+    # the body split into "code" chunks and survive — the same ordering mistake
+    # as the comment case, which is why raw text is consumed by the scanner.
     for tag in ('style', 'script'):
         d, _ = one(f'<{tag}>.two-factor {{ color: red }}</{tag}>\nTOTP setup.')
         if len(d) != 1 or d[0][3] != 'reader word absent':
             failures.append(f'a <{tag}> body must not satisfy a reader-word row')
+        d, _ = one(f'<{tag}>\nx = `two-factor`;\n</{tag}>\nTOTP setup.')
+        if len(d) != 1 or d[0][3] != 'reader word absent':
+            failures.append(f'a backticked <{tag}> body must not satisfy a row')
+
+    # 25. ... but a raw-text element shown INSIDE A FENCE is visible code: the
+    # fence opens first, so it wins. Same precedence rule as everything else.
+    d, _ = one('Example:\n\n```html\n<style>.two-factor{}</style>\n```\n')
+    if d:
+        failures.append('a <style> inside a fence is visible code and counts')
 
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (26 properties).')
+    print('Self-test OK (29 properties).')
     return 0
 
 
