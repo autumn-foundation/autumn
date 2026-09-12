@@ -102,6 +102,18 @@ step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no t
 step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no toolchain)"
 ./scripts/check-sqlite-unification.sh
 
+# --- 1e. Example binary-name collision gate (issues #2690/#2691) ---------------
+# Mirrors ci.yml `lint` job: `./scripts/check-example-bin-names.sh`. Same
+# shape as the gates above — seconds, no toolchain, self-testing — and it
+# covers the one invariant the compile legs cannot report on their own: two
+# members producing the same binary file name only breaks the Windows
+# linker (LNK1104, issue #2639), intermittently, so without a manifest gate
+# the reintroduction passes every other check. The script enumerates explicit
+# [[bin]] AND auto-discovered src/bin targets (#2690 corrected the old
+# "explicit disables autobins" assumption).
+step "./scripts/check-example-bin-names.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-example-bin-names.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"
