@@ -80,10 +80,19 @@
 //!   feature graph in `[features]`, and builds the set of feature names this
 //!   build turns on. It then checks each `#[cfg(...)]` on the same function
 //!   as `#[edge]` (real Rust requires every one of them to hold, so several
-//!   such attributes combine the same way). A predicate built only from
-//!   `feature = "x"` leaves combined with `not(...)`, `all(...)`, and
-//!   `any(...)` is evaluated against that set, and the function is excluded
-//!   only when such a predicate is definitely false. Any other predicate —
+//!   such attributes combine the same way), AND every *inline* `mod x { ... }`
+//!   enclosing it — real Rust strips the whole module along with everything
+//!   in it, so this scan does too, rather than only ever looking at a
+//!   function's own attributes. An *out-of-line* `mod x;`'s own `#[cfg(...)]`
+//!   is not seen this way: that module's file is scanned independently (see
+//!   above), with no link back to the declaration that named it, so a
+//!   handler under a disabled out-of-line module can still wrongly stay in
+//!   the scan — the one shape of this problem left unsolved, since fixing it
+//!   needs a real cross-file module tree this scanner does not build. A
+//!   predicate built only from `feature = "x"` leaves combined with
+//!   `not(...)`, `all(...)`, and `any(...)` is evaluated against that set,
+//!   and the function (or module) is excluded only when such a predicate is
+//!   definitely false. Any other predicate —
 //!   `target_os`, `debug_assertions`, a feature implied by an optional
 //!   dependency, or one this scan cannot parse — is treated as true, so the
 //!   function stays in the scan. `autumn build` has no `--no-default-features`
@@ -804,6 +813,12 @@ fn module_path_from_segments(path: &str) -> Vec<String> {
 /// `module_path` is the chain of inline module names enclosing the items
 /// currently being walked. It is pushed before, and popped after, each
 /// `mod routes { ... }` recursion, so it always reads as the current nesting.
+///
+/// An inline module carrying its own definitely-false `#[cfg(...)]` is never
+/// descended into at all — real Rust strips it and everything inside it, so a
+/// handler under it must not stay in the scan just because `edge_fn` only
+/// ever looks at a function's own attributes (Codex review on #2739, round
+/// 11, P2).
 fn scan_items(
     items: &[syn::Item],
     file: &str,
@@ -828,6 +843,24 @@ fn scan_items(
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
+                    // The module's own `#[cfg(...)]` gates everything inside
+                    // it, same as a function's — `edge_fn` only ever sees a
+                    // function's OWN attributes, so a handler under a
+                    // definitely-disabled `#[cfg(feature = "premium")] mod
+                    // routes { ... }` stayed in the scan even though real
+                    // Rust strips the whole module out. That is the
+                    // dangerous direction this cfg support exists to avoid:
+                    // not a missed route, but a phantom one that makes an
+                    // otherwise-default build look like it needs the edge
+                    // capsule / WASI target, or spuriously conflicts with
+                    // `--embed` (Codex review on #2739, round 11, P2).
+                    let cfg_excludes = item_mod
+                        .attrs
+                        .iter()
+                        .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+                    if cfg_excludes {
+                        continue;
+                    }
                     module_path.push(item_mod.ident.to_string());
                     scan_items(inner, file, crate_root, module_path, default_features, scan);
                     module_path.pop();
@@ -1345,6 +1378,39 @@ mod tests {
             &[],
         );
         assert!(scan.is_empty(), "{:?}", scan.functions);
+    }
+
+    /// A `#[cfg(...)]` on the *enclosing inline module*, not just the
+    /// function itself, must exclude the handler too — real Rust strips the
+    /// whole module (Codex review on #2739, round 11, P2).
+    #[test]
+    fn cfg_feature_gated_inline_module_excludes_its_handlers() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg(feature = "premium")]
+            mod routes {
+                #[edge]
+                pub fn show() {}
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.is_empty(), "{:?}", scan.functions);
+    }
+
+    #[test]
+    fn cfg_feature_gated_inline_module_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg(feature = "premium")]
+            mod routes {
+                #[edge]
+                pub fn show() {}
+            }
+            "#,
+            &["premium"],
+        );
+        assert_eq!(scan.names(), vec!["show"]);
     }
 
     #[test]

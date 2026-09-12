@@ -66,9 +66,13 @@
 //! make that ambiguity exploitable: `(Extension<Hidden>, HeaderMap)` would
 //! read as a valid handler-arity tuple with `Extension<Hidden>` sitting in
 //! the free marker slot, smuggling it straight past the whitelist. Each
-//! position is judged by [`EdgeLeaf`] instead — sealed, and never
-//! implemented for a tuple of any arity — so nesting one more tuple around
-//! `Extension<T>` cannot manufacture a leaf:
+//! position is judged by [`EdgeLeaf`] instead — sealed, and (this is the
+//! part that matters) never implemented with a free/unconstrained type
+//! parameter anywhere, tuples included: [`EdgeLeaf`] does have tuple impls,
+//! for a handler author's own `(Path<T>, HeaderMap)`-style grouping, but
+//! every position in those still has to satisfy `EdgeLeaf` itself, all the
+//! way down — so nesting one more tuple around `Extension<T>` still cannot
+//! manufacture a leaf:
 //!
 //! ```compile_fail
 //! use autumn_edge::edge_get;
@@ -150,17 +154,27 @@ pub trait EdgeExtract: sealed::ExtractSealed {}
 impl sealed::ExtractSealed for ((),) {}
 impl EdgeExtract for ((),) {}
 
-/// One extractor an `#[edge]` handler may take, standing alone or inside the
-/// handler-arity tuple [`EdgeExtract`] validates.
+/// One extractor an `#[edge]` handler may take.
 ///
-/// Sealed, and — this is the part that matters — never implemented for a
-/// tuple of any arity, here or anywhere else in this crate. That absence is
-/// what makes nesting a bad extractor one tuple deeper
+/// Standing alone, inside a tuple of leaves grouped by hand (axum implements
+/// its extractor traits for plain tuples, so `(Path<T>, HeaderMap)` is itself
+/// a single valid extractor), or inside the handler-arity tuple
+/// [`EdgeExtract`] validates.
+///
+/// Sealed. Every impl here — including the tuple ones below — bounds *each*
+/// element by [`EdgeLeaf`] itself, with no free/unconstrained type parameter
+/// anywhere. That is what makes nesting a bad extractor one tuple deeper
 /// (`(Extension<Hidden>, HeaderMap)` as a single handler parameter) fail
-/// exactly like naming it directly: no amount of wrapping ever produces an
-/// [`EdgeLeaf`] impl for a tuple, so the free marker slot in
-/// [`EdgeExtract`]'s own tuple impls (below) can never be satisfied by
-/// smuggling a rejected extractor into what looks like that slot.
+/// exactly like naming it directly: every position in every [`EdgeLeaf`]
+/// tuple impl still has to independently satisfy [`EdgeLeaf`], all the way
+/// down, so `Extension<Hidden>` never becomes a leaf just because it is
+/// sitting next to one. This is a different — and load-bearing — shape from
+/// [`EdgeExtract`]'s own tuple impls (below), which DO carry a free `M` slot
+/// for axum's unnameable marker type; recursing through `EdgeExtract` there
+/// instead of `EdgeLeaf` would let a rejected extractor hide inside that free
+/// slot, which is exactly why each position is judged by `EdgeLeaf`, never
+/// `EdgeExtract`, and why `EdgeLeaf` itself must never gain a free-parameter
+/// tuple impl of its own.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
     note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`"
@@ -178,6 +192,32 @@ impl EdgeLeaf for http::HeaderMap {}
 
 impl sealed::LeafSealed for crate::extract::EdgeCache {}
 impl EdgeLeaf for crate::extract::EdgeCache {}
+
+/// Implement [`EdgeLeaf`] for a plain tuple of leaves, `(E1, .., En)`, when
+/// each `Ei` is itself an [`EdgeLeaf`] — axum implements `FromRequestParts`
+/// for tuples, so a handler author can group extractors by hand into a
+/// single parameter (`async fn h(combo: (Path<T>, HeaderMap))`), and that
+/// grouped tuple is then itself the one extractor occupying a slot in
+/// [`EdgeExtract`]'s handler-arity tuple.
+///
+/// Unlike [`impl_edge_extract_for_handler_arity`]'s macro, there is no free
+/// marker parameter here: every `Ei` is bounded by `EdgeLeaf`, so this can
+/// never manufacture a leaf out of a rejected extractor — see [`EdgeLeaf`]'s
+/// own doc for why that distinction is load-bearing.
+macro_rules! impl_edge_leaf_for_tuple {
+    ($($t:ident),+) => {
+        impl<$($t: EdgeLeaf),+> sealed::LeafSealed for ($($t,)+) {}
+        impl<$($t: EdgeLeaf),+> EdgeLeaf for ($($t,)+) {}
+    };
+}
+
+impl_edge_leaf_for_tuple!(T1, T2);
+impl_edge_leaf_for_tuple!(T1, T2, T3);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8);
 
 /// Implement [`EdgeExtract`] for axum's handler-arity tuple, `(M, E1, ..,
 /// En)`, when each `Ei` is an [`EdgeLeaf`].
@@ -273,6 +313,15 @@ mod tests {
         )
     }
 
+    /// A handler author's own grouped tuple extractor (axum implements
+    /// `FromRequestParts` for plain tuples, so `(Path<T>, HeaderMap)` is
+    /// itself one valid extractor) must be accepted the same as writing the
+    /// two extractors as separate parameters (Codex review on #2739, round
+    /// 11, P2).
+    async fn with_grouped_tuple((Path(name), headers): (Path<String>, HeaderMap)) -> String {
+        format!("{name}{}", headers.len())
+    }
+
     /// The prelude's extractors are exactly the ones an edge handler may use;
     /// if any of these stopped satisfying the bound this would not compile.
     #[test]
@@ -283,6 +332,7 @@ mod tests {
         let _ = edge_get(with_headers);
         let _ = edge_get(with_cache);
         let _ = edge_get(with_everything);
+        let _ = edge_get(with_grouped_tuple);
     }
 
     #[test]
