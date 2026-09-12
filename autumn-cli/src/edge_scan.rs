@@ -542,16 +542,16 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// target or reject `--embed` (Codex review on #2739, round 13, P2).
 ///
 /// Only a literal `wasm32-wasip1` triple, or a `cfg(...)` predicate built
-/// from `target_arch`/`target_os`/`target_family` leaves (each compared
-/// against wasm32-wasip1's own real value — see
-/// `WASM32_WASIP1_CFG_VALUES`) combined with `not`/`all`/`any`, is resolved;
-/// anything else (an OS-family shorthand like `windows`/`unix`, a
-/// `target_env`/`target_pointer_width`/… key, or a predicate this scan
-/// cannot parse) is treated as NOT applying. That is the opposite default
-/// from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`], which
-/// stays conservative by assuming *true*): crediting an inapplicable target
-/// here produces a phantom route, not a merely missed one, so "cannot
-/// resolve" must mean "does not match."
+/// from a leaf naming one of `WASM32_WASIP1_CFG_VALUES`' known `(key,
+/// value)` pairs — checking *membership*, since a key like `target_feature`
+/// legitimately has several simultaneous real values — combined with
+/// `not`/`all`/`any`, is resolved; anything else (an OS-family shorthand
+/// like `windows`/`unix`, a key this table does not list, or a predicate
+/// this scan cannot parse) is treated as NOT applying. That is the opposite
+/// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`],
+/// which stays conservative by assuming *true*): crediting an inapplicable
+/// target here produces a phantom route, not a merely missed one, so
+/// "cannot resolve" must mean "does not match."
 #[must_use]
 fn target_key_matches_edge_capsule(target_key: &str) -> bool {
     if target_key == crate::build::EDGE_TARGET {
@@ -579,20 +579,22 @@ enum TargetCfgPredicate {
     Any(Vec<Self>),
 }
 
-/// wasm32-wasip1's own value for every single-valued `cfg(...)` key this
-/// scan resolves, verified directly against the complete
+/// wasm32-wasip1's own value(s) for every `cfg(...)` key this scan resolves,
+/// verified directly against the complete
 /// `rustc --print cfg --target wasm32-wasip1` output (Codex review on
-/// #2739, rounds 14 and 15, P1, each extending the previous round's grammar
-/// after a real predicate it did not recognize — `target_os = "wasi"`, then
-/// `target_env = "p1"` and others — was found to evaluate as "does not
-/// match" when it actually does, for the exact dangerous-direction reason
-/// this evaluator exists to avoid: a route Cargo really compiles for the
-/// capsule was scanned out). Deliberately excludes the multi-valued keys
-/// that output lists more than once for this target — `target_feature` and
-/// `target_has_atomic` — since a single `key = "value"` leaf cannot express
-/// "one of several"; a predicate built from either stays unresolvable
-/// (conservatively "does not match", this evaluator's safe direction) rather
-/// than silently checking only one of the real values.
+/// #2739, rounds 14, 15 and 16, each extending the previous round's grammar
+/// after a real predicate it did not recognize was found to evaluate as
+/// "does not match" when it actually does — the exact dangerous-direction
+/// mistake this evaluator exists to avoid: a route Cargo really compiles for
+/// the capsule was scanned out). A `cfg(...)` key can list MULTIPLE
+/// simultaneous values for one target — `target_feature` and
+/// `target_has_atomic` both do here — and a real predicate checks
+/// *membership* in that set: `cfg(target_has_atomic = "32")` is satisfied
+/// because "32" is one of five values this target reports for that key, not
+/// because it is the only one. Round 15 treated a multi-valued key as
+/// entirely unresolvable instead of checking membership, which is why this
+/// list holds one entry per `(key, value)` PAIR, not one entry per key — a
+/// key with several real values simply appears several times.
 const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_arch", "wasm32"),
     ("target_os", "wasi"),
@@ -602,18 +604,32 @@ const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_vendor", "unknown"),
     ("target_endian", "little"),
     ("target_abi", ""),
+    ("target_feature", "bulk-memory"),
+    ("target_feature", "crt-static"),
+    ("target_feature", "multivalue"),
+    ("target_feature", "mutable-globals"),
+    ("target_feature", "nontrapping-fptoint"),
+    ("target_feature", "reference-types"),
+    ("target_feature", "sign-ext"),
+    ("target_has_atomic", "8"),
+    ("target_has_atomic", "16"),
+    ("target_has_atomic", "32"),
+    ("target_has_atomic", "64"),
+    ("target_has_atomic", "ptr"),
 ];
 
 impl syn::parse::Parse for TargetCfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let ident: syn::Ident = input.parse()?;
-        if let Some((_, wasip1_value)) = WASM32_WASIP1_CFG_VALUES
-            .iter()
-            .find(|(key, _)| ident == key)
-        {
+        let key_is_known = WASM32_WASIP1_CFG_VALUES.iter().any(|(key, _)| ident == key);
+        if key_is_known {
             input.parse::<syn::Token![=]>()?;
             let lit: syn::LitStr = input.parse()?;
-            return Ok(Self::Leaf(lit.value() == *wasip1_value));
+            let value = lit.value();
+            let matches = WASM32_WASIP1_CFG_VALUES
+                .iter()
+                .any(|(key, known_value)| ident == key && value == *known_value);
+            return Ok(Self::Leaf(matches));
         }
         if ident == "not" {
             let content;
@@ -1447,15 +1463,50 @@ fn collect_registrations(
             index += 3;
             continue;
         }
-        match &trees[index] {
-            TokenTree::Group(group) => {
+        if let TokenTree::Ident(ident) = &trees[index]
+            && ident == "fn"
+            && let Some(body_index) = simple_fn_body_index(&trees, index)
+        {
+            // `#[cfg(feature = "premium")] fn wire() { edge_routes![show]; }`
+            // — a cfg'd-out FUNCTION, not just a cfg'd-out `mod { ... }`,
+            // must also exclude its own `edge_routes![]` calls. Only the
+            // simple `fn name(...) [-> plain return type] { ... }` shape is
+            // resolved (no generics, no `where` clause, no nested groups in
+            // the return type) — anything else falls through to the
+            // ordinary walk below rather than risk mis-scanning a LATER,
+            // unrelated item's body as this function's own (Codex review on
+            // #2739, round 16, P2).
+            if let TokenTree::Group(body) = &trees[body_index]
+                && !preceding_cfg_excludes(&trees, index, default_features)
+            {
                 collect_registrations(
-                    &group.stream(),
+                    &body.stream(),
                     crate_root,
                     module_path,
                     default_features,
                     scan,
                 );
+            }
+            index = body_index + 1;
+            continue;
+        }
+        match &trees[index] {
+            TokenTree::Group(group) => {
+                // A group with NOTHING between it and a preceding
+                // `#[cfg(...)]` — a bare cfg'd block statement, e.g. — must
+                // honor that cfg the same way the `mod { ... }` case above
+                // does. This does not reach a function's body (there is
+                // always a name and a parenthesized parameter list in
+                // between, handled by the `fn` special case above instead).
+                if !preceding_cfg_excludes(&trees, index, default_features) {
+                    collect_registrations(
+                        &group.stream(),
+                        crate_root,
+                        module_path,
+                        default_features,
+                        scan,
+                    );
+                }
             }
             TokenTree::Ident(ident) if ident == "edge_routes" => {
                 let bang = matches!(
@@ -1478,6 +1529,49 @@ fn collect_registrations(
         }
         index += 1;
     }
+}
+
+/// For `fn <name>(<params>) [-> <plain return type>] { <body> }` starting at
+/// `trees[fn_index]` (the `fn` keyword itself), return the index of the
+/// body's brace group.
+///
+/// Deliberately narrow: the name must be a single identifier (no generics),
+/// the parameter list must be one parenthesized group, and an optional
+/// return type must be built only from idents/`::`/`<`/`>`/`&`/lifetimes/
+/// literals with no delimited group of its own (so `Vec<EdgeRoute>` and
+/// similar plain paths resolve, but a `where` clause, a const-generic
+/// default, or any other shape does not). Returning `None` for anything
+/// outside this shape is the safe choice: forward-scanning for "the next
+/// brace group" without it risks finding a LATER, unrelated item's body
+/// instead of this function's own (e.g. a body-less `fn foo();` followed by
+/// `mod bar { ... }` — the naive scan would treat `bar`'s body as `foo`'s).
+fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
+    let mut i = fn_index + 1;
+    if !matches!(trees.get(i), Some(TokenTree::Ident(_))) {
+        return None;
+    }
+    i += 1;
+    if !matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+    {
+        return None;
+    }
+    i += 1;
+    if matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace) {
+        return Some(i);
+    }
+    if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '-')
+        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '>')
+    {
+        i += 2;
+        loop {
+            match trees.get(i) {
+                Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => return Some(i),
+                Some(TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_)) => i += 1,
+                _ => return None,
+            }
+        }
+    }
+    None
 }
 
 /// Whether the tokens immediately preceding `trees[item_index]` form one or
@@ -1945,6 +2039,96 @@ mod tests {
         assert_eq!(scan.registered_fns().len(), 1);
     }
 
+    /// Same as the cfg'd-out inline module case above, but the
+    /// `edge_routes![]` call is inside a cfg'd-out FUNCTION body instead of
+    /// a `mod { ... }` — the generic group recursion, not just the
+    /// dedicated `mod` pattern, must also honor a preceding `#[cfg(...)]`
+    /// (Codex review on #2739, round 16, P2).
+    #[test]
+    fn cfg_feature_gated_fn_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire() { edge_routes![crate::show]; }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    #[test]
+    fn cfg_feature_gated_fn_registration_is_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire() { edge_routes![crate::show]; }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// A body-less function signature (a trait method, here) must not be
+    /// mistaken for a function with a body belonging to some LATER,
+    /// unrelated item — `simple_fn_body_index` bails out rather than
+    /// forward-scanning for "the next brace group" (which would wrongly
+    /// grab `wiring`'s body), so the real registration inside `wiring`
+    /// still resolves relative to its own module, not the trait's.
+    #[test]
+    fn a_body_less_fn_signature_does_not_swallow_a_later_items_body() {
+        let scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            trait Greeter {
+                fn bar();
+            }
+
+            mod wiring {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            ",
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// A return type built only from plain path segments (no nested groups)
+    /// is also resolved, matching the shape a real wiring function tends to
+    /// have.
+    #[test]
+    fn cfg_feature_gated_fn_with_a_return_type_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire() -> Vec<String> { edge_routes![crate::show]; Vec::new() }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
     #[test]
     fn cfg_feature_gated_fn_included_when_feature_is_default() {
         let scan = scan_one_with_features(
@@ -2379,6 +2563,51 @@ mod tests {
     fn a_target_os_linux_target_specific_dependency_is_not_enabled() {
         let manifest = r#"
             [target.'cfg(target_os = "linux")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
+    /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
+    /// `target_has_atomic` and `target_feature` each legitimately list
+    /// SEVERAL simultaneous values for that target, and a real predicate
+    /// checks membership — `target_has_atomic = "32"` is satisfied by one of
+    /// five reported values, not because it is the target's only value
+    /// (Codex review on #2739, round 16, P1).
+    #[test]
+    fn multi_valued_wasm32_wasip1_target_cfg_keys_also_enable_the_dependency() {
+        for cfg in [
+            r#"target_has_atomic = "32""#,
+            r#"target_feature = "bulk-memory""#,
+        ] {
+            let manifest = format!(
+                r#"
+                [target.'cfg({cfg})'.dependencies]
+                dep = {{ version = "1", optional = true }}
+
+                [features]
+                default = ["dep/extra"]
+                "#
+            );
+            let enabled = enabled_features_from_manifest(&manifest, &[]);
+            assert!(
+                enabled.contains("dep"),
+                "cfg({cfg}) should match: {enabled:?}"
+            );
+        }
+    }
+
+    /// A value NOT among the target's real values for that key must still
+    /// evaluate as "does not match," confirming this is genuine set
+    /// membership, not "any value accepted once the key is known."
+    #[test]
+    fn a_target_has_atomic_value_the_target_does_not_report_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(target_has_atomic = "128")'.dependencies]
             dep = { version = "1", optional = true }
 
             [features]
