@@ -1372,6 +1372,20 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  sweep for now",
             ));
         }
+        if position.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support position(...) yet: the sweep batches up to \
+                 `batch_size` rows into one DELETE/UPDATE statement, and each swept row's \
+                 compaction trigger only sees its own pre-statement OLD position — several \
+                 swept rows from the same scope in one sweep statement can leave a gap in the \
+                 ordered sequence (#2240, same root cause already fixed for \
+                 delete_many/update_many by forcing chunk size 1). Remove `position(...)`, or \
+                 age rows out of the ordered list yourself via delete_many(ids) (already \
+                 single-row-chunked for position tables) from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
     }
     if position.is_some() {
         // Scoped down for this slice (issue #1358), mirroring retention(...)'s
@@ -10910,6 +10924,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let upsert_many_body = {
+            // A position-scoped table's compaction trigger fires per row and only
+            // sees its own pre-statement OLD position, so one multi-row upsert
+            // chunk that reassigns several rows' scope can under- or over-compact
+            // (#2240, same root cause already fixed for delete_many/update_many).
+            // Force every upsert chunk to a single row when a position field
+            // exists, skipping the bind-param-based cap entirely: a plain
+            // `.min(1).max(1)` on that cap is always 1, so clippy's `min_max`
+            // lint (deny-by-default) correctly flags it as dead code.
+            let chunk_size_setup = if config.position.is_some() {
+                quote! {
+                    let chunk_size: usize = 1;
+                }
+            } else {
+                quote! {
+                    let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                }
+            };
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(
                     table_name,
@@ -11204,8 +11236,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
-                        let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                        #chunk_size_setup
                         #cc_serialize
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
@@ -26435,6 +26466,27 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_position() {
+        // #2240: the sweep batches many rows into one DELETE/UPDATE statement.
+        // A position-scoped table's per-row compaction trigger only sees its
+        // own pre-statement OLD position, so sweeping several live rows from
+        // the same scope in one statement can leave a gap (same root cause
+        // already fixed for delete_many/update_many). Reject rather than
+        // silently corrupt the ordered sequence.
+        let tokens: proc_macro2::TokenStream =
+            "Post, position, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + position(...) must be rejected");
+        };
+        assert!(
+            error.to_string().contains("position"),
+            "retention + position(...) must be rejected: {error}"
+        );
+    }
+
+    #[test]
     fn retention_rejects_dependent() {
         // Regression (#1342 review): the sweep mutates rows directly and
         // does not run the cascade-aware delete path dependent(...)
@@ -27620,5 +27672,66 @@ mod tests {
                 generated.len(),
             );
         }
+    }
+
+    #[test]
+    fn repository_macro_positioned_upsert_many_forces_single_row_chunks() {
+        // #2240: `upsert_many` sends one `INSERT ... ON CONFLICT DO UPDATE`
+        // per chunk (up to 1000 rows). If the changeset reassigns a scoped
+        // `position` field, several same-scope rows can be rescoped in one
+        // statement -- each row's compaction trigger only sees its own
+        // pre-statement OLD position, so ranks can end up gapped or
+        // duplicated (same root cause already fixed for update_many's scope
+        // reassignment). Cap the chunk size at 1 whenever `position(...)` is
+        // declared.
+        let generated = repository_macro(
+            quote! { Post, position },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must still be generated for a position(...) repository");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size")
+            .expect("upsert_many must set chunk_size")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 60];
+        assert!(
+            chunk_def.contains(": usize = 1 ;"),
+            "position(...) must force upsert_many chunk size to a plain 1 row constant: {chunk_def}"
+        );
+        assert!(
+            !chunk_def.contains("1000"),
+            "position(...) must not leave a 1000-row upsert chunk cap in place: {chunk_def}"
+        );
+        let upsert_body_window = &generated[anchor..(anchor + 4000).min(generated.len())];
+        assert!(
+            !upsert_body_window.contains("__autumn_column_count"),
+            "position(...) must skip the bind-param-based chunk cap entirely, not just cap it \
+             at 1 -- clippy's min_max lint flags a `.min(1).max(1)` chain as dead code: \
+             {upsert_body_window}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_non_positioned_upsert_many_keeps_bulk_chunk_cap() {
+        // Sibling of the test above: a repository without `position(...)`
+        // must keep the original 1000-row chunk cap, i.e. this fix must not
+        // regress bulk upsert throughput for ordinary repositories.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must be generated");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size = if cols")
+            .expect("upsert_many must compute chunk_size from cols")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 160];
+        assert!(
+            chunk_def.contains("1000"),
+            "a non-position repository must keep the bulk 1000-row upsert chunk cap: {chunk_def}"
+        );
     }
 }
