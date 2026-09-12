@@ -921,13 +921,28 @@ fn edition_implies_resolver_v1(package_table: &toml::Table) -> bool {
 }
 
 /// Best-effort discovery of the nearest ancestor directory whose
-/// `Cargo.toml` declares a `[workspace]` table — Cargo's own workspace
-/// root, when `project_root` is a member of one. Walks upward from
-/// `project_root`'s PARENT (not `project_root` itself — a self-owned
-/// `[workspace]`, when the scanned package is itself the workspace root, is
-/// handled directly by [`resolver_v1_is_in_effect`] without needing a
-/// filesystem walk at all), stopping at the first `[workspace]` found or
-/// the filesystem root.
+/// `Cargo.toml` declares a `[workspace]` table that actually GOVERNS
+/// `project_root` — Cargo's own workspace root, when `project_root` is a
+/// member of one. Walks upward from `project_root`'s PARENT (not
+/// `project_root` itself — a self-owned `[workspace]`, when the scanned
+/// package is itself the workspace root, is handled directly by
+/// [`resolver_v1_is_in_effect`] without needing a filesystem walk at all).
+///
+/// A candidate ancestor whose `[workspace] exclude` covers `project_root`
+/// does NOT govern it — verified directly against a real build: nesting a
+/// package under such an ancestor and giving the two conflicting resolver
+/// versions (workspace `resolver = "2"`, package `edition = "2018"`, no
+/// override) shows the package's OWN edition-implied `"1"` in effect, the
+/// ancestor's `"2"` entirely ignored. The walk continues past an excluded
+/// ancestor to search further up, the same way Cargo's own automatic
+/// workspace-root discovery does (Codex review on #2739, round 22, P1 —
+/// `exclude` is a real, sanctioned nested-workspace pattern, not a
+/// hypothetical). [`glob_excludes`] matches the common shapes real
+/// manifests use for that field, not the full glob grammar; `members`
+/// itself is still not checked (this scanner does not confirm a workspace
+/// actually lists `project_root`, only that nothing excludes it) — the
+/// same accepted "best-effort, not a build system" trade-off as everywhere
+/// else in this module, now narrower than before this fix.
 fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> {
     let mut dir = project_root.parent();
     while let Some(candidate) = dir {
@@ -935,11 +950,60 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
             && let Ok(table) = toml::from_str::<toml::Table>(&content)
             && table.contains_key("workspace")
         {
-            return Some(table);
+            let excluded = project_root.strip_prefix(candidate).is_ok_and(|rel| {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                table
+                    .get("workspace")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|w| w.get("exclude"))
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|exclude| {
+                        let patterns: Vec<&str> =
+                            exclude.iter().filter_map(toml::Value::as_str).collect();
+                        glob_excludes(&patterns, &rel)
+                    })
+            });
+            if !excluded {
+                return Some(table);
+            }
         }
         dir = candidate.parent();
     }
     None
+}
+
+/// Whether any of `patterns` (Cargo's `[workspace] exclude = [...]` globs)
+/// matches `rel` — the forward-slash path from a workspace root to a
+/// candidate member. Supports the shapes real manifests actually use for
+/// this field: an exact path (`"mainpkg"`), a single `*` wildcard within
+/// one segment (`"crates/*"`), and excluding an entire subtree by naming
+/// its own root (`"vendor"` also excludes `"vendor/nested/pkg"`, matching
+/// Cargo's own documented "exclude these paths" semantics) — not the full
+/// glob grammar dedicated crates support (recursive `**`, character
+/// classes, brace expansion), which this field essentially never needs in
+/// practice.
+fn glob_excludes(patterns: &[&str], rel: &str) -> bool {
+    let rel_segments: Vec<&str> = rel.split('/').collect();
+    patterns.iter().any(|pattern| {
+        let pattern_segments: Vec<&str> = pattern.split('/').collect();
+        pattern_segments.len() <= rel_segments.len()
+            && pattern_segments
+                .iter()
+                .zip(&rel_segments)
+                .all(|(pattern, segment)| segment_glob_matches(pattern, segment))
+    })
+}
+
+/// A single path segment against a pattern segment with at most one `*`
+/// wildcard (matching any run of characters, including none).
+fn segment_glob_matches(pattern: &str, segment: &str) -> bool {
+    pattern
+        .split_once('*')
+        .map_or(pattern == segment, |(prefix, suffix)| {
+            segment.len() >= prefix.len() + suffix.len()
+                && segment.starts_with(prefix)
+                && segment.ends_with(suffix)
+        })
 }
 
 /// Whether `<name>` is declared `optional = true` in `[dependencies]` or in
@@ -3101,6 +3165,74 @@ mod tests {
         .unwrap();
         assert!(resolver_v1_is_in_effect(
             &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A package nested beneath a workspace but named in that workspace's
+    /// own `[workspace] exclude` is NOT governed by it at all — verified
+    /// directly against a real build (an excluded edition-2018 package
+    /// under a `resolver = "2"` ancestor still uses resolver v1, the
+    /// ancestor's setting entirely ignored). Falls back to the package's
+    /// own edition instead of adopting the ancestor's resolver (Codex
+    /// review on #2739, round 22, P1).
+    #[test]
+    fn resolver_v1_is_in_effect_ignores_an_ancestor_workspace_that_excludes_this_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"other\"]\nexclude = [\"mainpkg\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        assert!(resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// Same shape, but the nested package is NOT excluded (only some other
+    /// directory is) — the ancestor workspace's resolver still governs.
+    #[test]
+    fn resolver_v1_is_in_effect_still_honors_an_ancestor_workspace_that_excludes_something_else() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mainpkg\"]\nexclude = [\"other\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        assert!(!resolver_v1_is_in_effect(
+            &dir.path().join("mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A `crates/*` glob-shaped `exclude` entry still covers a package
+    /// nested one segment under it.
+    #[test]
+    fn resolver_v1_is_in_effect_ignores_an_ancestor_workspace_excluding_via_a_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"crates/*\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/mainpkg")).unwrap();
+        let member: toml::Table = toml::from_str(
+            "[package]\nname = \"mainpkg\"\nversion = \"0.1.0\"\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        assert!(resolver_v1_is_in_effect(
+            &dir.path().join("crates/mainpkg"),
             Some(&member)
         ));
     }
