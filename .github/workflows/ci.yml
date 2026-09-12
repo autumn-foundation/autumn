@@ -135,6 +135,15 @@ jobs:
         # the `sqlite`-excluding feature lists below, and nothing read the
         # manifests. No toolchain, ~1 second, self-testing.
         run: ./scripts/check-sqlite-unification.sh
+      - name: Example binary-name collision gate
+        # Two workspace members producing the same binary file name break the
+        # Windows linker intermittently (LNK1104, issue #2639) while staying
+        # invisible on Unix, so CI only catches the reintroduction when two
+        # links happen to overlap. This script enumerates every member's
+        # explicit [[bin]] AND auto-discovered src/bin targets (issues
+        # #2690/#2691) and fails on a duplicate name. No toolchain, ~1
+        # second, self-testing.
+        run: ./scripts/check-example-bin-names.sh
 
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
