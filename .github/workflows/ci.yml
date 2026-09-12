@@ -1269,6 +1269,8 @@ jobs:
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored
+          # autumn-billing: close_dunning_for open-row-scan profile (Ledger).
+          cargo test -p autumn-billing --test dunning_close_scan_profile -- --ignored
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
@@ -1703,6 +1705,8 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-billing \
+            --test dunning_close_scan_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
