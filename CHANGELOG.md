@@ -454,6 +454,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **testing:** every MinIO testcontainer (`autumn-cli`'s offsite-backup
+  suite, `autumn-web`'s `sqlite_replication_s3`, and the `reddit-clone`
+  example's avatar S3 test) now pulls from `quay.io/minio/minio` instead of
+  `testcontainers-modules` 0.15.0's hardcoded `docker.io/minio/minio`
+  default. MinIO Inc. pulled the `minio/minio` repository from Docker Hub in
+  2025 as part of a licensing change, so every one of these tests failed in
+  CI with a "pull access denied ... repository does not exist" error on the
+  pinned tag `RELEASE.2025-02-28T09-55-16Z` — not a flake, and not fixable
+  by retrying. `testcontainers-modules` 0.15.0 (the latest published
+  version) still hardcodes the dead Docker Hub image, so each call site now
+  overrides just the registry/owner via `ImageExt::with_name`; quay.io still
+  serves the exact same tag and digest, so no other behavior changes.
+- **auth:** confirmed, with new end-to-end tests, that stacking
+  `#[secured("admin")]` with `#[authorize(...)]` never emits two idempotency
+  replay guards in either attribute order (issue #2233). `#[secured]`'s
+  checks moved into a sibling `FromRequestParts` gate item well before this
+  investigation (issue #1668), so `should_own_replay`'s existing
+  `has_pending_authorize_attr`/`has_any_guard_gate_param` checks already
+  keep the two guards from double-claiming replay-serving — no scan or
+  runtime behavior needed to change. The new tests run real
+  `secured_macro`/`authorize_macro` output through both stacking orders and
+  assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
+  the final program, closing out the issue's suggested composition-test
+  coverage.
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
