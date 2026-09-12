@@ -454,6 +454,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn db scrub`:** the runtime-config tables are now classified as
+  payload carriers (#2366, item 1). `autumn_runtime_config_values.raw_value`
+  holds the live operator-set override for each key — which can be a secret —
+  and `autumn_runtime_config_changes` is the append-only audit log
+  (`old_value` / `new_value` / `actor`). Both carry the `autumn_` prefix, so
+  introspection excluded them from the classified universe and a successful
+  scrub left them verbatim without even warning. A scrub now warns when they
+  are present and empties them when the app opts in with `[framework] purge`.
+  (Items 2 and 3 — materialized-view refresh order through indirect
+  dependencies, and partition-key columns rewritten through the parent — are
+  still open.)
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
