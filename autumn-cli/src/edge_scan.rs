@@ -747,7 +747,29 @@ const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
 
 impl syn::parse::Parse for TargetCfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let ident: syn::Ident = input.parse()?;
+        // `syn::Ident`'s own `Parse` impl rejects `true`/`false` outright
+        // (verified directly: `syn::parse_str::<syn::Ident>("false")` fails
+        // with "expected identifier, found keyword `false`", even though
+        // `proc_macro2::Ident` itself has no such restriction) — using
+        // `IdentExt::parse_any` here, which has no keyword restriction,
+        // is what makes the `true`/`false` branch below reachable at all
+        // (Codex review on #2739, round 22, P1 — the P1 fix below was
+        // otherwise dead code).
+        let ident: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
+        // `true`/`false` tokenize as a plain `Ident` (verified directly),
+        // and are Cargo's own stable constant cfg predicates — a real
+        // `[target.'cfg(true)'.dependencies]` table applies unconditionally,
+        // to every target including wasm32-wasip1, verified directly against
+        // a real `cargo rustc --target wasm32-wasip1` build. Without this,
+        // the leading-identifier parse above still succeeds (it is a valid
+        // ident), but neither the known-key nor the `not`/`all`/`any`/
+        // `windows`/`unix` branches below recognize it, so it fell through
+        // to the final parse error — "unresolvable", which for this
+        // evaluator means "does not match" — wrongly excluding a dependency
+        // Cargo actually includes (Codex review on #2739, round 22, P1).
+        if ident == "true" || ident == "false" {
+            return Ok(Self::Leaf(ident == "true"));
+        }
         let key_is_known = WASM32_WASIP1_CFG_VALUES.iter().any(|(key, _)| ident == key);
         if key_is_known {
             if input.peek(syn::Token![=]) {
@@ -937,12 +959,20 @@ fn edition_implies_resolver_v1(package_table: &toml::Table) -> bool {
 /// ancestor to search further up, the same way Cargo's own automatic
 /// workspace-root discovery does (Codex review on #2739, round 22, P1 —
 /// `exclude` is a real, sanctioned nested-workspace pattern, not a
-/// hypothetical). [`glob_excludes`] matches the common shapes real
-/// manifests use for that field, not the full glob grammar; `members`
-/// itself is still not checked (this scanner does not confirm a workspace
-/// actually lists `project_root`, only that nothing excludes it) — the
-/// same accepted "best-effort, not a build system" trade-off as everywhere
-/// else in this module, now narrower than before this fix.
+/// hypothetical).
+///
+/// An explicit `[workspace] members` entry covering `project_root` wins
+/// over an overlapping `exclude` — verified directly: `members =
+/// ["crates/app"]` alongside `exclude = ["crates"]` still governs
+/// `crates/app` with the workspace's own resolver, Cargo's documented
+/// "members always wins" precedence for this exact overlap shape. Checked
+/// first, before `exclude`, for that reason. [`any_glob_matches`] matches the
+/// common shapes real manifests use for `members`/`exclude`, not the full
+/// glob grammar; beyond that, this scanner still does not confirm a
+/// workspace actually lists `project_root` in `members` at all (only that
+/// nothing excludes it, or something explicitly includes it) — the same
+/// accepted "best-effort, not a build system" trade-off as everywhere else
+/// in this module.
 fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> {
     let mut dir = project_root.parent();
     while let Some(candidate) = dir {
@@ -950,20 +980,33 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
             && let Ok(table) = toml::from_str::<toml::Table>(&content)
             && table.contains_key("workspace")
         {
-            let excluded = project_root.strip_prefix(candidate).is_ok_and(|rel| {
-                let rel = rel.to_string_lossy().replace('\\', "/");
+            let workspace_globs = |key: &str| -> Vec<String> {
                 table
                     .get("workspace")
                     .and_then(toml::Value::as_table)
-                    .and_then(|w| w.get("exclude"))
+                    .and_then(|w| w.get(key))
                     .and_then(toml::Value::as_array)
-                    .is_some_and(|exclude| {
-                        let patterns: Vec<&str> =
-                            exclude.iter().filter_map(toml::Value::as_str).collect();
-                        glob_excludes(&patterns, &rel)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(toml::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
                     })
+                    .unwrap_or_default()
+            };
+            let governed = project_root.strip_prefix(candidate).is_ok_and(|rel| {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let members = workspace_globs("members");
+                let member_patterns: Vec<&str> = members.iter().map(String::as_str).collect();
+                if any_glob_matches(&member_patterns, &rel) {
+                    return true;
+                }
+                let exclude = workspace_globs("exclude");
+                let exclude_patterns: Vec<&str> = exclude.iter().map(String::as_str).collect();
+                !any_glob_matches(&exclude_patterns, &rel)
             });
-            if !excluded {
+            if governed {
                 return Some(table);
             }
         }
@@ -972,17 +1015,17 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
     None
 }
 
-/// Whether any of `patterns` (Cargo's `[workspace] exclude = [...]` globs)
-/// matches `rel` — the forward-slash path from a workspace root to a
-/// candidate member. Supports the shapes real manifests actually use for
-/// this field: an exact path (`"mainpkg"`), a single `*` wildcard within
-/// one segment (`"crates/*"`), and excluding an entire subtree by naming
-/// its own root (`"vendor"` also excludes `"vendor/nested/pkg"`, matching
-/// Cargo's own documented "exclude these paths" semantics) — not the full
-/// glob grammar dedicated crates support (recursive `**`, character
-/// classes, brace expansion), which this field essentially never needs in
-/// practice.
-fn glob_excludes(patterns: &[&str], rel: &str) -> bool {
+/// Whether any of `patterns` (Cargo's `[workspace] members = [...]` or
+/// `exclude = [...]` globs) matches `rel` — the forward-slash path from a
+/// workspace root to a candidate member. Supports the shapes real manifests
+/// actually use for these fields: an exact path (`"mainpkg"`), a single `*`
+/// wildcard within one segment (`"crates/*"`), and covering an entire
+/// subtree by naming its own root (`"vendor"` also covers
+/// `"vendor/nested/pkg"`, matching Cargo's own documented semantics for
+/// both fields) — not the full glob grammar dedicated crates support
+/// (recursive `**`, character classes, brace expansion), which these
+/// fields essentially never need in practice.
+fn any_glob_matches(patterns: &[&str], rel: &str) -> bool {
     let rel_segments: Vec<&str> = rel.split('/').collect();
     patterns.iter().any(|pattern| {
         let pattern_segments: Vec<&str> = pattern.split('/').collect();
@@ -1757,9 +1800,11 @@ fn edge_fn(
 }
 
 /// A `#[cfg(...)]` predicate this scan can fully resolve: built only from
-/// `feature = "x"` leaves, combined with `not`, `all`, and `any`.
+/// `feature = "x"` leaves and the stable `true`/`false` boolean-literal
+/// predicates, combined with `not`, `all`, and `any`.
 enum CfgPredicate {
     Feature(String),
+    Bool(bool),
     Not(Box<Self>),
     All(Vec<Self>),
     Any(Vec<Self>),
@@ -1767,11 +1812,30 @@ enum CfgPredicate {
 
 impl syn::parse::Parse for CfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let ident: syn::Ident = input.parse()?;
+        // `syn::Ident`'s own `Parse` impl rejects `true`/`false` outright
+        // (verified directly — see `TargetCfgPredicate::parse`'s own doc
+        // for the exact experiment); `IdentExt::parse_any` has no such
+        // keyword restriction, which is what makes the `true`/`false`
+        // branch below reachable at all (Codex review on #2739, round 22,
+        // P2 — otherwise dead code).
+        let ident: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
         if ident == "feature" {
             input.parse::<syn::Token![=]>()?;
             let lit: syn::LitStr = input.parse()?;
             return Ok(Self::Feature(lit.value()));
+        }
+        // `true`/`false` tokenize as a plain `Ident`, not a `syn::Lit`
+        // (verified directly), and are Cargo's own stable constant cfg
+        // predicates — `#[cfg(false)]` unconditionally excludes an item,
+        // `#[cfg(true)]` unconditionally keeps it, same as an empty `cfg()`
+        // wrapped in `all`/`any`. Without recognizing them, a `#[cfg(false)]`
+        // `#[edge]` handler (or a `#[cfg(false)]`-disabled wiring function's
+        // `edge_routes![...]`) fell through to "unresolvable", which this
+        // scan's own safe-direction default treats as "not excluded" —
+        // wrongly crediting a route/registration the real build compiles out
+        // entirely (Codex review on #2739, round 22, P2).
+        if ident == "true" || ident == "false" {
+            return Ok(Self::Bool(ident == "true"));
         }
         if ident == "not" {
             let content;
@@ -1803,6 +1867,7 @@ impl CfgPredicate {
     fn eval(&self, default_features: &BTreeSet<String>) -> bool {
         match self {
             Self::Feature(name) => default_features.contains(name),
+            Self::Bool(value) => *value,
             Self::Not(inner) => !inner.eval(default_features),
             Self::All(parts) => parts.iter().all(|p| p.eval(default_features)),
             Self::Any(parts) => parts.iter().any(|p| p.eval(default_features)),
@@ -2061,10 +2126,27 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
     if matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace) {
         return Some(i);
     }
-    if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '-')
-        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '>')
-    {
-        i += 2;
+    // A return type (`-> T`), a `where` clause (`where T: Trait`), or both in
+    // sequence (`-> T where T: Trait`) are all just a flat run of simple
+    // tokens up to the body's own brace group — genuine Rust grammar never
+    // puts a `{ ... }` group inside either shape (bounds and return types
+    // don't use brace groups), so the same tolerant loop the return-type
+    // case already used for a TRAILING `where` clause (it never
+    // distinguished the two, just consumed tokens until a brace) now starts
+    // from either keyword. Previously a function with a `where` clause but
+    // NO return type (`fn routes<T>() where T: Trait { ... }`) hit neither
+    // this branch's `->` check nor the body-brace check above, falling
+    // through to `None` — the unprotected old fallback then scanned the
+    // body of what could be a `#[cfg(...)]`-excluded function, crediting a
+    // registration that does not really exist (Codex review on #2739,
+    // round 22, P2).
+    let starts_return_type_or_where = matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '-')
+        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '>');
+    let starts_where_only = matches!(trees.get(i), Some(TokenTree::Ident(id)) if id == "where");
+    if starts_return_type_or_where || starts_where_only {
+        if starts_return_type_or_where {
+            i += 2;
+        }
         loop {
             match trees.get(i) {
                 Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => return Some(i),
@@ -2680,6 +2762,37 @@ mod tests {
         );
     }
 
+    /// A generic wiring function with a `where` clause and NO return type
+    /// (`fn wire<T>() where T: Default { ... }`) hits neither the
+    /// body-brace check nor the `->` branch right after its parameter list,
+    /// since the next token is `where`, not `{` or `-`. Previously this fell
+    /// through to `None`, letting the old, unprotected fallback scan the
+    /// body of a function that could be (and, here, is) `#[cfg(...)]`-
+    /// excluded, crediting a registration that does not really exist (Codex
+    /// review on #2739, round 22, P2 — the round-21 generic-parameter fix
+    /// covered `<T>` itself but not a trailing `where` clause with no
+    /// return type).
+    #[test]
+    fn cfg_feature_gated_generic_fn_with_a_where_clause_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire<T>() where T: Default { edge_routes![crate::show]; }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
     #[test]
     fn cfg_feature_gated_fn_included_when_feature_is_default() {
         let scan = scan_one_with_features(
@@ -2704,6 +2817,52 @@ mod tests {
             &[],
         );
         assert_eq!(scan.names(), vec!["shown"]);
+    }
+
+    /// `true`/`false` tokenize as a plain `Ident`, not a `syn::Lit`, and are
+    /// Cargo's own stable constant cfg predicates: `#[cfg(false)]` always
+    /// excludes, `#[cfg(true)]` never does. Previously unrecognized, falling
+    /// through to this scan's own safe-direction default ("unresolvable
+    /// stays included"), which for a `#[cfg(false)]` handler wrongly kept a
+    /// route the real build compiles out entirely (Codex review on #2739,
+    /// round 22, P2).
+    #[test]
+    fn cfg_false_excludes_and_cfg_true_includes() {
+        let scan = scan_one(
+            r"
+            #[cfg(false)]
+            #[edge]
+            fn hidden() {}
+
+            #[cfg(true)]
+            #[edge]
+            fn shown() {}
+            ",
+        );
+        assert_eq!(scan.names(), vec!["shown"]);
+    }
+
+    /// The same `cfg(false)`/`cfg(true)` recognition on the WIRING side: a
+    /// `#[cfg(false)]`-disabled function's `edge_routes![...]` must not
+    /// credit a registration that the real build never compiles in (Codex
+    /// review on #2739, round 22, P2).
+    #[test]
+    fn cfg_false_excludes_a_registration() {
+        let scan = scan_one(
+            r"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(false)]
+            fn wire() { edge_routes![show]; }
+            ",
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
     }
 
     #[test]
@@ -3077,6 +3236,41 @@ mod tests {
         assert!(!enabled.contains("dep"));
     }
 
+    /// `[target.'cfg(true)'.dependencies]` applies unconditionally, to every
+    /// target including wasm32-wasip1 — verified directly against a real
+    /// `cargo rustc --target wasm32-wasip1` build. `true`/`false` tokenize
+    /// as a plain `Ident`, so the leading-identifier parse succeeds, but
+    /// neither the known-key nor the `not`/`all`/`any`/`windows`/`unix`
+    /// branches recognized it, falling through to the parse error this
+    /// evaluator treats as "does not match" (Codex review on #2739, round
+    /// 22, P1).
+    #[test]
+    fn a_literal_true_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(true)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// The `false` counterpart never applies to any target.
+    #[test]
+    fn a_literal_false_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(false)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
     /// The same manifest as above, but under Cargo's feature resolver v1:
     /// verified directly (`cargo rustc --target wasm32-wasip1 -- --print
     /// cfg`, resolver v1) that `cfg(windows)`'s own optional dependency IS
@@ -3302,6 +3496,31 @@ mod tests {
         .unwrap();
         assert!(resolver_v1_is_in_effect(
             &dir.path().join("crates/mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// An explicit `[workspace] members` entry covering the package wins
+    /// over an OVERLAPPING `exclude` entry — verified directly: `members =
+    /// ["crates/app"]` alongside `exclude = ["crates"]` still governs
+    /// `crates/app` with the workspace's own resolver, Cargo's documented
+    /// precedence for this exact overlap shape. Checking `exclude` alone
+    /// (without checking `members` first) would wrongly treat the package
+    /// as excluded (Codex review on #2739, round 22, P2).
+    #[test]
+    fn resolver_v1_is_in_effect_lets_explicit_membership_override_an_overlapping_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\nexclude = [\"crates\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/app")).unwrap();
+        let member: toml::Table =
+            toml::from_str("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2018\"\n")
+                .unwrap();
+        assert!(!resolver_v1_is_in_effect(
+            &dir.path().join("crates/app"),
             Some(&member)
         ));
     }
