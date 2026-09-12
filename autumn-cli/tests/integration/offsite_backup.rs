@@ -71,6 +71,23 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
+/// Starts a `MinIO` testcontainer, pulling from `quay.io` instead of the
+/// crate default's `docker.io/minio/minio`. `MinIO` Inc. pulled that Docker
+/// Hub repo in 2025, so the tag `testcontainers-modules` 0.15.0 hardcodes
+/// 404s there; `quay.io/minio/minio` still mirrors the exact same
+/// tag/digest.
+async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO> {
+    use testcontainers::ImageExt as _;
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::minio::MinIO;
+
+    MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .start()
+        .await
+        .expect("start MinIO — is Docker running?")
+}
+
 async fn create_bucket(endpoint: &str, access: &str, secret: &str, region: &str, bucket: &str) {
     let now = chrono::Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -193,9 +210,7 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -208,13 +223,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
-    let minio = MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");
@@ -320,9 +329,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -335,13 +342,7 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
-    let minio = MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");

@@ -40,6 +40,14 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
+      # Decision (issue #2252): track `stable` here on purpose, not a pinned
+      # version. A pin would hide new lints instead of catching them close to
+      # when they land. The `msrv` job below pins 1.88.0 — that is the
+      # compile floor, a separate concern from lint currency. A stable bump
+      # can arm a new lint across many call sites. Add a scoped
+      # `[workspace.lints.clippy]` allow with a comment for it (see
+      # `unused_async_trait_impl` in the root Cargo.toml). Do not add a
+      # toolchain pin instead.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
