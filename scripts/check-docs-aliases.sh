@@ -124,45 +124,74 @@ READER_VOCABULARY = (
 )
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')
-HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
-LINK_DEST = re.compile(r'\]\([^)]*\)')
-REF_DEFINITION = re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M)
-AUTOLINK = re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>')
+
+# Code renders verbatim, so these regions are carried through untouched and
+# every markup rule below is applied only OUTSIDE them. Fenced blocks first, so
+# a stray backtick inside a fence cannot start an inline span.
+CODE_REGION = re.compile(
+    r'^[ \t]*(?P<f>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=f)[ \t]*$'  # fenced block
+    r'|`+[^`\n]*`+',                                             # inline span
+    re.M | re.S,
+)
+
+# Markup that carries text a reader never sees. Order matters: comments before
+# tags (a comment is not a tag), destinations before tags (so `](…)` is gone
+# before `<…>` is considered).
+NON_RENDERING = (
+    re.compile(r'<!--.*?-->', re.S),                          # HTML comment
+    re.compile(r'^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$', re.M),      # ref definition
+    re.compile(r'<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]*>'),       # autolink
+    re.compile(r'\]\([^)]*\)'),                               # link destination
+    re.compile(r'</?[A-Za-z][^>]*>'),                         # HTML tag + attrs
+)
+
+
+def _strip_markup(chunk):
+    for pattern in NON_RENDERING:
+        chunk = pattern.sub(' ', chunk)
+    return chunk
 
 
 def prose(text):
     """Reduce a page to what a reader actually sees, then search that.
 
-    Every removal here is the same defect class: a byte sequence that satisfies
-    a grep without ever reaching the reader. The gate exists because the
-    baseline defect was exactly that, so a gate that counts invisible hits
-    would reproduce the bug it was written to catch.
+    THE RULE, stated once rather than as a list of special cases: a term counts
+    only if it survives into rendered text. Everything removed here is the same
+    defect — a byte sequence that satisfies a grep without ever reaching the
+    reader — and the gate exists because the baseline defect was exactly that.
+    A gate that counts invisible hits reproduces the bug it was written to
+    catch, so the rule is applied generally instead of one construct at a time.
 
-    `%2F` is a slash. Left as-is it reads as a literal "2F" and makes
-    `\b2fa\b` match `…%2Faccount…` and `…MIT%2FApache…` — two of the four
-    corpus-wide "2FA" hits were punctuation. Replacing every escape with a
-    slash removes the false hit and still separates the surrounding words, so
-    a real term next to an escape keeps matching.
+    Two categories:
 
-    The rest are markdown that does not render as body text:
+      - **Markup that is not text.** HTML comments (this repo waives gates in
+        them — `route-surface-allow` and friends), reference definitions,
+        autolinks, link destinations, and HTML tags *including their
+        attributes*. `<span id="2fa">TOTP</span>` shows the reader "TOTP"; the
+        `id` is not on the page. Inner text and link text are kept, because
+        those are what renders — this drops the tag, never what it wraps.
 
-      - **HTML comments.** This repo waives gates in them
-        (`route-surface-allow` and friends), so a term can easily survive in a
-        comment naming it while the prose stopped saying it.
-      - **Link destinations.** `[the flow](./two-factor-setup.md)` shows the
-        reader "the flow"; the path is not on the page. The link TEXT is kept,
-        because that is what they see.
-      - **Reference definitions** (`[label]: https://…`) and **autolinks**,
-        for the same reason.
+      - **URL escapes.** `%2F` is a slash. Left as-is it reads as a literal
+        "2F" and makes `\b2fa\b` match `…%2Faccount…` and `…MIT%2FApache…` —
+        two of the four corpus-wide "2FA" hits were punctuation. Substituting a
+        slash removes the false hit and still separates the surrounding words,
+        so a real term beside an escape keeps matching. This one applies
+        everywhere, including code: a `%2F` in a fence is a URL escape there
+        too, and matching "2FA" inside it is the same false positive.
 
-    Code fences are deliberately NOT stripped: a term inside a fence renders,
-    and a reader's ctrl-F finds it.
+    Code regions are carried through UNTOUCHED, because code renders: a term in
+    a fence or a `span` is on the page and ctrl-F finds it. That is why the
+    markup rules run per-segment rather than over the whole file — stripping
+    tags inside a fence would delete text the reader can see.
     """
-    text = HTML_COMMENT.sub(' ', text)
-    text = REF_DEFINITION.sub(' ', text)
-    text = AUTOLINK.sub(' ', text)
-    text = LINK_DEST.sub('] ', text)
-    return PERCENT_ESCAPE.sub('/', text)
+    out = []
+    pos = 0
+    for m in CODE_REGION.finditer(text):
+        out.append(_strip_markup(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_strip_markup(text[pos:]))
+    return PERCENT_ESCAPE.sub('/', ''.join(out))
 
 
 def check(rows, read=None, exists=None):
@@ -268,18 +297,35 @@ def self_test():
         if not re.search(r'\b2fa\b|\btwo[- ]factor\b', text, re.I):
             failures.append(f'precondition: raw {what} should match the row')
 
-    # 9. link TEXT is visible and must still count, so the stripping cannot be
-    # "delete anything near a bracket".
-    d, _ = one('See [two-factor setup](./totp.md).')
-    if d:
-        failures.append('link text is reader-visible and should satisfy a row')
+    # 9-12. what the markup WRAPS is visible even when the markup is not, so
+    # the stripping cannot degrade into "delete anything near a bracket or an
+    # angle bracket". Each of these renders and ctrl-F finds it.
+    visible = (
+        ('link text', 'See [two-factor setup](./totp.md).'),
+        ('HTML inner text', '<span class="x">two-factor</span> setup.'),
+        ('a fenced code block', 'Setup:\n\n```sh\n# enable two-factor\n```\n'),
+        ('an inline code span', 'Run `--totp` for `two-factor` login.'),
+    )
+    for what, text in visible:
+        d, _ = one(text)
+        if d:
+            failures.append(f'{what} is reader-visible and should satisfy a row')
+
+    # 13. an HTML ATTRIBUTE is not rendered text. `<span id="2fa">TOTP</span>`
+    # shows the reader "TOTP" only. This is the third finding in this class,
+    # which is why the rule above is general rather than another special case.
+    d, _ = one('<span id="2fa">TOTP</span> enrollment.')
+    if len(d) != 1 or d[0][3] != 'reader word absent':
+        failures.append('an HTML attribute must not satisfy a reader-word row')
+    if not re.search(r'\b2fa\b', '<span id="2fa">TOTP</span>', re.I):
+        failures.append('precondition: raw HTML attribute should match the row')
 
     if failures:
         print('SELF-TEST FAILED:', file=sys.stderr)
         for f in failures:
             print(f'  - {f}', file=sys.stderr)
         return 1
-    print('Self-test OK (9 properties).')
+    print('Self-test OK (13 properties).')
     return 0
 
 
