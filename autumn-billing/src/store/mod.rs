@@ -453,6 +453,15 @@ pub trait BillingStore: Send + Sync + 'static {
     /// Every row in `Pending` or `Running`, ordered by `next_attempt_at`.
     fn open_dunning(&self) -> StoreFuture<'_, Vec<DunningAttempt>>;
 
+    /// Every row of `subscription_id` in `Pending` or `Running`, ordered by
+    /// `next_attempt_at`. Unlike [`open_dunning`](Self::open_dunning), this
+    /// is scoped to one subscription: a canceled subscription has to close
+    /// its own open rows, not read the whole table to find them.
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        subscription_id: &'a str,
+    ) -> StoreFuture<'a, Vec<DunningAttempt>>;
+
     /// Compare-and-set write of `row`: applied only when the stored row for
     /// `invoice_id` is in one of `from` at `expected_attempt`. Returns
     /// `true` when the row was written.
