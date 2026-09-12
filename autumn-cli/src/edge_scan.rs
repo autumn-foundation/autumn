@@ -579,17 +579,29 @@ enum TargetCfgPredicate {
     Any(Vec<Self>),
 }
 
-/// wasm32-wasip1's own value for each `cfg(...)` key this scan resolves,
-/// verified directly against `rustc --print cfg --target wasm32-wasip1`
-/// (Codex review on #2739, round 14, P1, extending round 13's `target_arch`-
-/// only grammar after a real `target_os = "wasi"` predicate was found to
-/// evaluate as "does not match" when it actually does, for the exact
-/// dangerous-direction reason round 13 introduced this evaluator to avoid: a
-/// route Cargo really compiles for the capsule was scanned out).
+/// wasm32-wasip1's own value for every single-valued `cfg(...)` key this
+/// scan resolves, verified directly against the complete
+/// `rustc --print cfg --target wasm32-wasip1` output (Codex review on
+/// #2739, rounds 14 and 15, P1, each extending the previous round's grammar
+/// after a real predicate it did not recognize — `target_os = "wasi"`, then
+/// `target_env = "p1"` and others — was found to evaluate as "does not
+/// match" when it actually does, for the exact dangerous-direction reason
+/// this evaluator exists to avoid: a route Cargo really compiles for the
+/// capsule was scanned out). Deliberately excludes the multi-valued keys
+/// that output lists more than once for this target — `target_feature` and
+/// `target_has_atomic` — since a single `key = "value"` leaf cannot express
+/// "one of several"; a predicate built from either stays unresolvable
+/// (conservatively "does not match", this evaluator's safe direction) rather
+/// than silently checking only one of the real values.
 const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
     ("target_arch", "wasm32"),
     ("target_os", "wasi"),
     ("target_family", "wasm"),
+    ("target_env", "p1"),
+    ("target_pointer_width", "32"),
+    ("target_vendor", "unknown"),
+    ("target_endian", "little"),
+    ("target_abi", ""),
 ];
 
 impl syn::parse::Parse for TargetCfgPredicate {
@@ -913,7 +925,13 @@ fn scan_source_with_context(
     }
     if let Ok(stream) = TokenStream::from_str(src) {
         let mut module_path = module_path;
-        collect_registrations(&stream, crate_root, &mut module_path, scan);
+        collect_registrations(
+            &stream,
+            crate_root,
+            &mut module_path,
+            default_features,
+            scan,
+        );
     }
 }
 
@@ -969,6 +987,20 @@ fn scan_source_with_context(
 /// instead, and rejected a valid `crate::`-qualified registration to its own
 /// handler because the handler looked like it lived under a fictitious
 /// nested module (Codex review on #2739, round 8, P2).
+///
+/// `src/main.rs` — a package's own implicit default binary — is yet another
+/// crate root distinct from `src/lib.rs`'s library: when both exist, Cargo
+/// compiles them as two separate crates, and `crate::` inside `main.rs`
+/// means main.rs's own binary crate, never the library's. Giving it the
+/// library's own empty crate root conflated the two: a `crate::show`
+/// written in `main.rs` could credit an unrelated same-named `show` at
+/// `lib.rs`'s own root, and (since a crate can only ever refer to itself via
+/// `crate::`, never its own external name) a crate-name-qualified
+/// `my_app::show` — which real Rust can only ever mean "the library crate
+/// named `my_app`," reached as an extern dependency — could equally be
+/// satisfied by main.rs's own same-named function instead of the library's
+/// genuine one, silently muting the warning for whichever one was not
+/// really registered (Codex review on #2739, round 15, P2).
 #[must_use]
 fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
     let without_ext = file.strip_suffix(".rs").unwrap_or(file);
@@ -987,20 +1019,47 @@ fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
             module_path_from_segments(bin_relative),
         );
     }
+    if without_src == "main" {
+        // The package's own implicit default binary, `src/main.rs` — a
+        // separate crate from the library's `src/lib.rs`, even though both
+        // map to the same empty module path. No real `[[bin]]` can be named
+        // literally "main" while a default `src/main.rs` binary also
+        // exists (Cargo rejects the name collision), so reusing the
+        // `"bin:<name>"` convention here is always unambiguous.
+        return ("bin:main".to_owned(), Vec::new());
+    }
     (String::new(), module_path_from_segments(without_src))
 }
 
-/// Split `path` on `/`, dropping a trailing `mod`/`main`/`lib` segment (the
-/// "index" file for its directory, or a crate root) — the rule
+/// Split `path` on `/`, dropping a trailing index-file segment — the rule
 /// [`crate_context_from_file`] applies both from `src/` and, relative to a
 /// `[[bin]]` target's own root, from `src/bin/<name>/`.
+///
+/// `mod` is dropped whenever it is the last segment, at any depth: unlike
+/// `main`/`lib`, `<dir>/mod.rs` is Rust's own "index file for this
+/// directory" convention, valid for a module nested arbitrarily deep, not
+/// just at a crate root. `main`/`lib` are dropped only when they are the
+/// WHOLE path (a single segment) — they are never an index-file convention
+/// for an ordinary subdirectory, only the name of a crate root itself (a
+/// package's `src/main.rs` binary target, or a directory-style `[[bin]]`
+/// target's own `src/bin/<name>/main.rs`). Dropping them unconditionally, at
+/// any depth, wrongly stripped the segment from a genuinely nested module
+/// that merely happens to share the name — `mod routes { mod main; }`
+/// (`src/routes/main.rs`) is `routes::main` in real Rust, not `routes`
+/// (Codex review on #2739, round 15, P2).
 fn module_path_from_segments(path: &str) -> Vec<String> {
     if path.is_empty() {
         return Vec::new();
     }
     let mut segments: Vec<&str> = path.split('/').collect();
-    if matches!(segments.last(), Some(&("mod" | "main" | "lib"))) {
-        segments.pop();
+    match segments.last() {
+        Some(&"mod") => {
+            segments.pop();
+        }
+        Some(&("main" | "lib")) if segments.len() == 1 => {
+            segments.pop();
+        }
+        _ => {}
     }
     segments.into_iter().map(str::to_owned).collect()
 }
@@ -1350,10 +1409,19 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 /// here; its own registrations are covered when that file is scanned on its
 /// own, seeded from its file-derived module path instead (see
 /// [`crate_context_from_file`]).
+///
+/// `default_features` lets an inline `mod`'s own `#[cfg(...)]` exclude its
+/// registrations the same way [`scan_items`] already excludes its handlers:
+/// without this, `#[cfg(feature = "premium")] mod wiring { edge_routes![show]; }`
+/// still recorded `show` as registered with `premium` off, even though real
+/// Rust strips the whole module (and its `edge_routes![]` call) out — a
+/// capsule that genuinely serves nothing could then build and report `show`
+/// as served (Codex review on #2739, round 15, P2).
 fn collect_registrations(
     stream: &TokenStream,
     crate_root: &str,
     module_path: &mut Vec<String>,
+    default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
@@ -1365,15 +1433,29 @@ fn collect_registrations(
             && let Some(TokenTree::Group(group)) = trees.get(index + 2)
             && group.delimiter() == Delimiter::Brace
         {
-            module_path.push(name.to_string());
-            collect_registrations(&group.stream(), crate_root, module_path, scan);
-            module_path.pop();
+            if !preceding_cfg_excludes(&trees, index, default_features) {
+                module_path.push(name.to_string());
+                collect_registrations(
+                    &group.stream(),
+                    crate_root,
+                    module_path,
+                    default_features,
+                    scan,
+                );
+                module_path.pop();
+            }
             index += 3;
             continue;
         }
         match &trees[index] {
             TokenTree::Group(group) => {
-                collect_registrations(&group.stream(), crate_root, module_path, scan);
+                collect_registrations(
+                    &group.stream(),
+                    crate_root,
+                    module_path,
+                    default_features,
+                    scan,
+                );
             }
             TokenTree::Ident(ident) if ident == "edge_routes" => {
                 let bang = matches!(
@@ -1396,6 +1478,58 @@ fn collect_registrations(
         }
         index += 1;
     }
+}
+
+/// Whether the tokens immediately preceding `trees[item_index]` form one or
+/// more attributes (`#[...]`), at least one of which is a `#[cfg(...)]` that
+/// [`eval_cfg_attr`]'s own predicate grammar resolves as definitely false —
+/// the token-level counterpart [`collect_registrations`] needs since it
+/// walks a raw `TokenStream`, never a `syn::Attribute` list.
+fn preceding_cfg_excludes(
+    trees: &[TokenTree],
+    item_index: usize,
+    default_features: &BTreeSet<String>,
+) -> bool {
+    let mut i = item_index;
+    while i >= 2 {
+        let Some(TokenTree::Group(bracket)) = trees.get(i - 1) else {
+            break;
+        };
+        if bracket.delimiter() != Delimiter::Bracket {
+            break;
+        }
+        let Some(TokenTree::Punct(hash)) = trees.get(i - 2) else {
+            break;
+        };
+        if hash.as_char() != '#' {
+            break;
+        }
+        if cfg_attribute_group_is_false(bracket, default_features) {
+            return true;
+        }
+        i -= 2;
+    }
+    false
+}
+
+/// Whether `group` — the bracketed contents of one `#[...]` attribute — is a
+/// `cfg(...)` whose predicate resolves as definitely false, using the same
+/// grammar and safe-direction fallback (unparseable stays *true*, i.e. not
+/// excluded) as [`eval_cfg_attr`].
+fn cfg_attribute_group_is_false(
+    group: &proc_macro2::Group,
+    default_features: &BTreeSet<String>,
+) -> bool {
+    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+    let (Some(TokenTree::Ident(ident)), Some(TokenTree::Group(cfg_group))) =
+        (inner.first(), inner.get(1))
+    else {
+        return false;
+    };
+    if ident != "cfg" || cfg_group.delimiter() != Delimiter::Parenthesis {
+        return false;
+    }
+    syn::parse2::<CfgPredicate>(cfg_group.stream()).is_ok_and(|pred| !pred.eval(default_features))
 }
 
 /// Resolve one registration entry against `module_path`, the module the
@@ -1484,13 +1618,21 @@ fn registered_idents(stream: &TokenStream) -> Vec<String> {
 mod tests {
     use super::*;
 
+    // "src/lib.rs", not "src/main.rs": since round 15 gave the package's
+    // implicit `src/main.rs` binary its own distinct crate identity
+    // (`"bin:main"`, separate from the library's `""`), a fixture standing
+    // in for "the crate root" needs to be the library specifically — most
+    // callers only care about self-consistency (same file in, same file
+    // out) and would work with either, but the crate-name-qualified tests
+    // require a REAL library crate root to mean anything (Codex review on
+    // #2739, round 15, P2).
     fn scan_one(src: &str) -> EdgeScan {
-        scan_sources(&[("src/main.rs", src)])
+        scan_sources(&[("src/lib.rs", src)])
     }
 
     fn scan_one_with_features(src: &str, features: &[&str]) -> EdgeScan {
         let default_features: BTreeSet<String> = features.iter().map(|s| (*s).to_owned()).collect();
-        scan_sources_with_features(&[("src/main.rs", src)], &default_features)
+        scan_sources_with_features(&[("src/lib.rs", src)], &default_features)
     }
 
     #[test]
@@ -1503,7 +1645,7 @@ mod tests {
             "#,
         );
         assert_eq!(scan.names(), vec!["hello"]);
-        assert_eq!(scan.functions[0].file, "src/main.rs");
+        assert_eq!(scan.functions[0].file, "src/lib.rs");
         assert!(scan.functions[0].guards.is_empty());
         assert!(!scan.is_empty());
     }
@@ -1578,7 +1720,7 @@ mod tests {
         );
         assert_eq!(scan.registrations, 1);
         // Full path text, not just the last segment, tagged with the
-        // invocation's own crate (the library crate, `""`, for `src/main.rs`).
+        // invocation's own crate (the library crate, `""`, for `src/lib.rs`).
         assert!(
             scan.registered
                 .contains(&(String::new(), "handlers::greet".to_owned()))
@@ -1587,7 +1729,7 @@ mod tests {
             scan.registered
                 .contains(&(String::new(), "note".to_owned()))
         );
-        // `greet` is genuinely declared at crate root here (`src/main.rs`),
+        // `greet` is genuinely declared at crate root here (`src/lib.rs`),
         // not inside a `handlers` module, so the qualified entry does not
         // match it — only the bare `note` entry does.
         let unregistered: Vec<&str> = scan
@@ -1637,10 +1779,7 @@ mod tests {
         );
         let missing: Vec<String> = scan.unregistered().iter().map(|f| f.location()).collect();
         assert_eq!(missing.len(), 1);
-        assert!(
-            missing[0].starts_with("stats @ src/main.rs:"),
-            "{missing:?}"
-        );
+        assert!(missing[0].starts_with("stats @ src/lib.rs:"), "{missing:?}");
     }
 
     #[test]
@@ -1756,6 +1895,54 @@ mod tests {
             &["premium"],
         );
         assert_eq!(scan.names(), vec!["show"]);
+    }
+
+    /// A registration written inside a cfg'd-out inline module must not
+    /// count either — `edge_routes![crate::show]` inside
+    /// `#[cfg(feature = "premium")] mod wiring { ... }` does not exist in
+    /// the compiled capsule when `premium` is off, so `show` must report as
+    /// unregistered, not falsely served (Codex review on #2739, round 15,
+    /// P2).
+    #[test]
+    fn cfg_feature_gated_inline_module_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            mod wiring {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().len() == 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// Same setup, but with `premium` on: the registration genuinely exists
+    /// in the compiled capsule, so `show` must report as registered.
+    #[test]
+    fn cfg_feature_gated_inline_module_registration_is_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            mod wiring {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
     }
 
     #[test]
@@ -2154,6 +2341,36 @@ mod tests {
         assert!(enabled.contains("dep"));
     }
 
+    /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
+    /// that target reports `target_env = "p1"`, `target_pointer_width =
+    /// "32"`, and `target_vendor = "unknown"` — three more real predicates
+    /// round 14's grammar did not recognize (Codex review on #2739, round
+    /// 15, P1).
+    #[test]
+    fn further_wasm32_wasip1_target_cfg_keys_also_enable_the_dependency() {
+        for cfg in [
+            r#"target_env = "p1""#,
+            r#"target_pointer_width = "32""#,
+            r#"target_vendor = "unknown""#,
+            r#"target_endian = "little""#,
+        ] {
+            let manifest = format!(
+                r#"
+                [target.'cfg({cfg})'.dependencies]
+                dep = {{ version = "1", optional = true }}
+
+                [features]
+                default = ["dep/extra"]
+                "#
+            );
+            let enabled = enabled_features_from_manifest(&manifest, &[]);
+            assert!(
+                enabled.contains("dep"),
+                "cfg({cfg}) should match: {enabled:?}"
+            );
+        }
+    }
+
     /// A recognized key with the WRONG value (wasm32-wasip1 is not Linux)
     /// must evaluate as "does not match," not as unresolvable — the two
     /// currently produce the same top-level answer, but only because the
@@ -2245,6 +2462,13 @@ mod tests {
     /// identifier `my_app` — `-` is not legal in a Rust identifier — so
     /// `edge_routes![my_app::show]` must match, not `edge_routes![my-app::show]`
     /// (which is not even valid Rust and could never appear as written).
+    ///
+    /// Written to `src/lib.rs`, not `src/main.rs`: the crate-name-qualified
+    /// form only means anything against a real library crate — real Rust has
+    /// no way for `src/main.rs` to reference itself by the package's own
+    /// name, only `crate::` does that (round 15, P2, see
+    /// `crate_context_from_file`'s own doc on why `src/main.rs` now gets a
+    /// distinct identity from the library's).
     #[test]
     fn resolve_edge_scan_derives_the_rust_crate_name_from_a_hyphenated_package() {
         let dir = tempfile::tempdir().unwrap();
@@ -2255,7 +2479,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("src/main.rs"),
+            dir.path().join("src/lib.rs"),
             "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
         )
         .unwrap();
@@ -2397,7 +2621,7 @@ mod tests {
     }
 
     /// `show`'s module path is genuinely empty here — declared directly in
-    /// `src/main.rs`, a crate root — not "unknown". A qualified registration
+    /// `src/lib.rs`, a crate root — not "unknown". A qualified registration
     /// for a *different* module must not wildcard-match it just because its
     /// path happens to be empty: that would let `edge_routes![users::show]`
     /// silently satisfy this crate-root `show`, hiding that it is really
@@ -2651,6 +2875,83 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "src/bin/edge-capsule.rs");
+    }
+
+    /// `src/main.rs` (the package's own implicit default binary) and
+    /// `src/lib.rs` are two separate crates too, exactly like a named
+    /// `[[bin]]` — `crate::show` written in `main.rs` must credit only
+    /// `main.rs`'s own `show`, never the library's unrelated same-named one
+    /// (Codex review on #2739, round 15, P2).
+    #[test]
+    fn crate_qualified_registrations_do_not_cross_the_default_binarys_crate_boundary() {
+        let scan = scan_sources(&[
+            ("src/lib.rs", "#[edge]\npub fn show() {}\n"),
+            (
+                "src/main.rs",
+                "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+            ),
+        ]);
+
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/lib.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/main.rs");
+    }
+
+    /// A crate-name-qualified registration (`my_app::show`) can only ever
+    /// mean the library crate in real Rust — a crate has no way to refer to
+    /// itself by its own external name, only `crate::` does that. Written
+    /// from within `src/main.rs`, `edgeapp::show` must reach the library's
+    /// `show`, not `main.rs`'s own same-named one — so `main.rs`'s `show`
+    /// stays unregistered even though a same-named function elsewhere was
+    /// credited.
+    #[test]
+    fn a_crate_name_qualified_registration_does_not_match_the_default_binarys_own_function() {
+        let mut scan = scan_sources(&[
+            ("src/lib.rs", "#[edge]\npub fn show() {}\n"),
+            (
+                "src/main.rs",
+                "#[edge]\npub fn show() {}\nfn main() { edge_routes![edgeapp::show]; }\n",
+            ),
+        ]);
+        scan.crate_name = Some("edgeapp".to_owned());
+
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/main.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "src/lib.rs");
+    }
+
+    /// Also verified through a real project directory (not just in-memory
+    /// sources): `src/main.rs`'s own `show`, registered there with a bare
+    /// `edge_routes![show]`, must not accidentally satisfy the library's
+    /// unrelated `show`.
+    #[test]
+    fn resolve_edge_scan_gives_src_main_rs_its_own_crate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "#[edge]\npub fn show() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "src/lib.rs");
     }
 
     /// A *bare* registration, unlike the `crate::`-qualified one above, DOES
