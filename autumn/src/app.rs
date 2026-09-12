@@ -16725,6 +16725,27 @@ mod tests {
         );
     }
 
+    /// `app()` registers the sentinel-strip layer through the ordinary
+    /// `AppBuilder::layer` path, which the idempotency machinery otherwise
+    /// treats as "opaque" (forcing fail-closed replay) for any custom layer
+    /// it does not specifically recognize — see
+    /// `router::is_idempotency_transparent_app_layer`. Without that
+    /// recognition, every app built with the `edge` feature on would force
+    /// fail-closed idempotency, whether or not it ever calls `with_edge_kv`.
+    /// This pins the real registration's `type_name` against the substring
+    /// that recognizer matches on, so the two sides cannot drift apart.
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
+        let registration = &app().custom_layers[0];
+        assert!(
+            registration.type_name.contains("::strip_edge_fallthrough_sentinel,"),
+            "the real registration's type_name no longer matches what \
+             router::is_idempotency_transparent_app_layer looks for: {}",
+            registration.type_name
+        );
+    }
+
     #[cfg(feature = "i18n")]
     #[tokio::test]
     async fn i18n_bundle_layer_is_applied_to_static_route_rendering() {

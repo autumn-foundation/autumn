@@ -175,6 +175,16 @@ impl EdgeScan {
 /// qualifier equals `f.module_path` exactly, unless `f.module_path` is empty
 /// (a top-level function, whose real, resolved module path the scan cannot
 /// know from its declaring file alone) — then any qualifier still matches.
+///
+/// Exact equality, not a suffix match, is deliberate: a relative reference
+/// written from inside an ancestor of `f`'s module (`edge_routes![v1::greet]`
+/// for a `greet` nested two levels down) will not match here and reports as
+/// unregistered — a false-positive warning, the scanner's documented safe
+/// direction. A suffix match would fix that case but reopen the one this
+/// function exists to close: with sibling modules `mod a { mod x { #[edge]
+/// fn f() {} } }` and `mod b { mod x { #[edge] fn f() {} } }`, a suffix
+/// match on `x::f` would satisfy both, silently muting the real warning for
+/// whichever one was not actually registered.
 fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
     registered.iter().any(|entry| {
         let mut segments: Vec<&str> = entry.split("::").collect();
