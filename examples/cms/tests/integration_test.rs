@@ -703,6 +703,146 @@ async fn create_post(
         .expect("id is numeric")
 }
 
+/// A blank/whitespace-only title on a status that requires one (`publish`,
+/// `private`, `future`) used to reach `AutumnError::unprocessable_msg` three
+/// layers into the create transaction — the state machine's `can_publish`
+/// guard for private/future, `normalize_post`'s direct-create check for
+/// publish — producing the generic `application/problem+json`/error-page
+/// response and discarding whatever body, excerpt and taxonomy picks the
+/// author had already entered. It is now caught pre-flight and redisplays the
+/// editor at 422 with the draft intact and a message next to Title.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for status in ["publish", "private", "future"] {
+        let mut fields = vec![
+            ("title", "   "),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body nobody should lose."),
+            ("status", status),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ];
+        if status == "future" {
+            fields.push(("publish_at", "2999-01-01T00:00"));
+        }
+        let resp = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected {status} submission must not redirect"
+        );
+        resp.assert_body_contains("A body nobody should lose.")
+            .assert_body_contains("must have a title");
+    }
+}
+
+/// The same redisplay, exercised on `update` against an existing post — the
+/// state machine's `can_publish` guard is what `update` hits (see
+/// [`create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact`]),
+/// and the post must still be a draft afterwards: a rejected transition must
+/// not have partially applied.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_draft() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Original Title", "Original body.", "draft").await;
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&edit_form(
+            &id,
+            &[
+                ("title", "   "),
+                ("slug", ""),
+                ("excerpt", ""),
+                ("body", "An edit nobody should lose."),
+                ("status", "publish"),
+                ("password", ""),
+                ("taxonomy_names[post_tag]", ""),
+                ("comment_status", "open"),
+            ],
+        )
+        .await)
+        .send()
+        .await;
+    resp.assert_status(422);
+    resp.assert_body_contains("An edit nobody should lose.")
+        .assert_body_contains("must have a title");
+
+    // Not published — the rejected transition never reached the write path.
+    sign_out(&client);
+    let front = client.get("/original-title").send().await;
+    assert_eq!(
+        front.status, 404,
+        "the post must still be an unreachable draft"
+    );
+}
+
+/// A scheduled post's date needs to be both present and in the future — see
+/// `require_future_publish_date`. Both failures used to reach the same
+/// generic error page via `?`; both now redisplay the editor.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_with_a_past_or_missing_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A past date.
+    let past = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Backdated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("publish_at", "2000-01-01T00:00"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    past.assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("publish date in the future");
+
+    // No date at all.
+    let missing = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Undated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    missing
+        .assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("Pick a publish date");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_first_registered_account_owns_the_site() {
