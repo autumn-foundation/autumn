@@ -83,7 +83,7 @@
 //! - `#[cfg(...)]` is evaluated, but only a safe, narrow slice of it. The scan
 //!   reads the crate's own `Cargo.toml`, follows `[features] default = [...]`
 //!   plus any features the caller explicitly requested (`autumn build
-//!   --features x` — see [`resolve_edge_scan_with_features`]) through the
+//!   --features x` — see [`resolve_edge_scan_with_extra_file`]) through the
 //!   feature graph in `[features]`, and builds the set of feature names this
 //!   build turns on. It then checks each `#[cfg(...)]` on the same function
 //!   as `#[edge]` (real Rust requires every one of them to hold, so several
@@ -350,7 +350,7 @@ fn is_registered(
 /// used to evaluate `#[cfg(...)]` on `#[edge]`-marked functions.
 ///
 /// `#[cfg(test)]`: nothing outside a test build calls this. Production code
-/// (`resolve_edge_scan_with_features`) scans files straight from disk via
+/// (`resolve_edge_scan_with_extra_file`) scans files straight from disk via
 /// [`scan_source`]/[`scan_source_with_context`] instead of collecting them
 /// into an in-memory list first, so it can special-case one file (a custom
 /// `[lib] path`) without this helper's uniform per-file treatment getting in
@@ -377,7 +377,7 @@ fn scan_sources_with_features(
 /// [`scan_sources_with_features`] instead.
 ///
 /// `#[cfg(test)]`: nothing outside a test build calls this — production code
-/// goes through [`resolve_edge_scan_with_features`], which needs the real
+/// goes through [`resolve_edge_scan_with_extra_file`], which needs the real
 /// feature set.
 #[cfg(test)]
 #[must_use]
@@ -385,33 +385,34 @@ pub fn scan_sources(sources: &[(&str, &str)]) -> EdgeScan {
     scan_sources_with_features(sources, &BTreeSet::new())
 }
 
-/// [`resolve_edge_scan_with_features`] with no explicitly-requested
-/// features. Every real caller now passes its own requested-features list
-/// (`build.rs`'s `--features x`, `doctor.rs`'s always-empty `&[]`), so this
-/// convenience wrapper is test-only — like [`scan_sources`], nothing outside
-/// a test build calls it.
+/// [`resolve_edge_scan_with_extra_file`] with no explicitly-requested
+/// features and no extra file. Every real caller now passes its own
+/// requested-features list (`build.rs`'s `--features x`, `doctor.rs`'s
+/// always-empty `&[]`) and its own resolved capsule bin, so this convenience
+/// wrapper is test-only — like [`scan_sources`], nothing outside a test
+/// build calls it.
 #[cfg(test)]
 #[must_use]
 fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
-    resolve_edge_scan_with_features(project_root, &[])
+    resolve_edge_scan_with_extra_file(project_root, &[], None)
 }
 
-/// Walk `project_root/src` and scan every `.rs` file below it. Paths are
-/// recorded relative to `project_root` (`src/routes/home.rs`). A missing `src/`
-/// yields an empty scan — a project without sources simply has no edge routes.
-///
-/// `requested_features` are feature names asked for on the command line
-/// (`autumn build --features x`, forwarded here from `build.rs`), on top of
-/// the manifest's own `[features] default = [...]`. Without them, a route
-/// gated on a non-default feature the caller explicitly requested would look
-/// cfg'd-out to this scan even though the real build the caller is about to
-/// run turns it on — exactly the dangerous direction (a route that will
-/// really be served, silently missing from the scan) this module's `#[cfg]`
-/// evaluation is designed to never risk.
-#[must_use]
-pub fn resolve_edge_scan_with_features(
+/// Shared implementation behind [`resolve_edge_scan_with_extra_file`] (its
+/// own doc has the full picture — feature resolution, the `src/` walk, the
+/// custom-path cases): read the manifest once, resolve
+/// BOTH a custom `[lib] path` and a custom edge-capsule `[[bin]] path` (when
+/// either is given/present) to their own crate-tree scan, then fill in the
+/// rest from the ordinary `src/` walk. Sharing this is what makes the two
+/// custom-path features compose — a project can use a custom library path
+/// and a custom capsule path at once, and each gets scanned with its own
+/// crate identity regardless of the other (Codex review on #2739, round 21,
+/// P2, after `resolve_edge_scan_with_extra_file` grew its own separate copy
+/// of this logic in round 13 that a later round's `[lib] path` fix never
+/// reached).
+fn resolve_edge_scan_impl(
     project_root: &Path,
     requested_features: &[&str],
+    capsule_bin_file: Option<&Path>,
 ) -> EdgeScan {
     // A missing or unparseable Cargo.toml yields no default features, which is
     // the safe direction: every `#[cfg(feature = "...")]` then stays
@@ -427,6 +428,50 @@ pub fn resolve_edge_scan_with_features(
     let crate_name = table.as_ref().and_then(rust_crate_name_from_manifest);
     let custom_lib_path = table.as_ref().and_then(custom_lib_path_from_manifest);
 
+    let mut scan = EdgeScan {
+        crate_name,
+        ..EdgeScan::default()
+    };
+    let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
+
+    // A custom `[lib] path` (e.g. `src/app.rs`, or even `lib/app.rs` outside
+    // `src/` entirely) IS this crate's library root, the same way a custom
+    // `[[bin]] path` is its own bin's root (see
+    // `resolve_edge_scan_with_extra_file`'s doc). One outside `src/` is
+    // otherwise invisible to the `src/` walk below the same way an
+    // out-of-tree capsule bin is, so it needs the same `scan_bin_crate_tree`
+    // treatment (Codex review on #2739, round 21, P1) — one still inside
+    // `src/` is already reached by that walk, so it only needs its identity
+    // corrected, which the walk's own per-file check (below) does without
+    // the overhead of a separate mod-graph traversal.
+    if let Some(lib_path) = &custom_lib_path {
+        let lib_file = project_root.join(lib_path);
+        if !lib_file.starts_with(project_root.join("src")) && lib_file.is_file() {
+            claimed.extend(scan_bin_crate_tree(
+                &lib_file,
+                project_root,
+                "",
+                &default_features,
+                &mut scan,
+            ));
+        }
+    }
+
+    // The capsule's own tree, when its root lives somewhere the `src/` walk
+    // cannot give it the right identity on its own (see
+    // `resolve_edge_scan_with_extra_file`'s doc for the exact cases).
+    if let Some(file) = capsule_bin_file
+        && !file.starts_with(project_root.join("src").join("bin"))
+    {
+        claimed.extend(scan_bin_crate_tree(
+            file,
+            project_root,
+            "bin:edge-capsule",
+            &default_features,
+            &mut scan,
+        ));
+    }
+
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
     // Sorted so warnings, doctor details, and the build's route list are stable
@@ -439,6 +484,7 @@ pub fn resolve_edge_scan_with_features(
     // scanners do.
     let sources: Vec<(String, String)> = files
         .iter()
+        .filter(|path| !claimed.contains(path.as_path()))
         .filter_map(|path| {
             let src = std::fs::read_to_string(path).ok()?;
             let rel = path
@@ -450,23 +496,21 @@ pub fn resolve_edge_scan_with_features(
         })
         .collect();
 
-    let mut scan = EdgeScan::default();
     for (rel, src) in &sources {
-        // A custom `[lib] path` (e.g. `src/app.rs`) IS this crate's library
-        // root, the same way a custom `[[bin]] path` is its own bin's root
-        // (see `resolve_edge_scan_with_extra_file`'s doc) — without this, it
-        // was scanned as an ordinary library submodule instead (module path
-        // `app`, say), so a registration meaning the crate root
-        // (`edge_routes![my_app::show]`, `crate_name` stripped to nothing)
-        // could never match it (Codex review on #2739, round 20, P2).
+        // A custom `[lib] path` still under `src/` was found by the walk
+        // above like any other file; it only needs its crate identity
+        // corrected here — without this it was scanned as an ordinary
+        // library submodule instead (module path `app`, say), so a
+        // registration meaning the crate root (`edge_routes![my_app::show]`,
+        // `crate_name` stripped to nothing) could never match it (Codex
+        // review on #2739, round 20, P2).
         if Some(rel.as_str()) == custom_lib_path.as_deref() {
             scan_source_with_context(rel, src, "", Vec::new(), &default_features, &mut scan);
         } else {
             scan_source(rel, src, &default_features, &mut scan);
         }
     }
-    scan.files_scanned = sources.len();
-    scan.crate_name = crate_name;
+    scan.files_scanned += sources.len();
     scan
 }
 
@@ -482,10 +526,22 @@ fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// [`resolve_edge_scan_with_features`], plus `extra_file` — the edge-capsule
-/// bin's own resolved root file, scanned as its own `[[bin]]` crate tree
-/// (root file plus every out-of-line submodule it transitively declares)
-/// rather than as part of the library.
+/// Walk `project_root/src` and scan every `.rs` file below it, plus
+/// `extra_file` — the edge-capsule bin's own resolved root file, scanned as
+/// its own `[[bin]]` crate tree (root file plus every out-of-line submodule
+/// it transitively declares) rather than as part of the library. Paths are
+/// recorded relative to `project_root` (`src/routes/home.rs`). A missing
+/// `src/` yields an empty scan — a project without sources simply has no
+/// edge routes.
+///
+/// `requested_features` are feature names asked for on the command line
+/// (`autumn build --features x`, forwarded here from `build.rs`), on top of
+/// the manifest's own `[features] default = [...]`. Without them, a route
+/// gated on a non-default feature the caller explicitly requested would look
+/// cfg'd-out to this scan even though the real build the caller is about to
+/// run turns it on — exactly the dangerous direction (a route that will
+/// really be served, silently missing from the scan) this module's `#[cfg]`
+/// evaluation is designed to never risk.
 ///
 /// A project may declare its edge-capsule bin at a custom `[[bin]] path`
 /// (`path = "cmd/edge.rs"`, or even `path = "src/edge.rs"` — inside `src/`
@@ -499,70 +555,16 @@ fn custom_lib_path_from_manifest(table: &toml::Table) -> Option<String> {
 /// `autumn doctor`, even though the real build serves the routes fine
 /// (Codex review on #2739, round 7 and round 13, P2). `extra_file` is a
 /// no-op when `None` or already under the conventional `src/bin/` (the
-/// `src/` walk already gives that the right identity).
+/// `src/` walk already gives that the right identity). A custom `[lib]
+/// path` is handled the same way regardless of `extra_file` — see
+/// [`resolve_edge_scan_impl`]'s own doc.
 #[must_use]
 pub fn resolve_edge_scan_with_extra_file(
     project_root: &Path,
     requested_features: &[&str],
     extra_file: Option<&Path>,
 ) -> EdgeScan {
-    let Some(file) = extra_file else {
-        return resolve_edge_scan_with_features(project_root, requested_features);
-    };
-    if file.starts_with(project_root.join("src").join("bin")) {
-        return resolve_edge_scan_with_features(project_root, requested_features);
-    }
-
-    let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
-    let default_features = manifest
-        .as_deref()
-        .map(|manifest| enabled_features_from_manifest(manifest, requested_features))
-        .unwrap_or_default();
-    let crate_name = manifest
-        .as_deref()
-        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok())
-        .and_then(|table| rust_crate_name_from_manifest(&table));
-
-    let mut scan = EdgeScan {
-        crate_name,
-        ..EdgeScan::default()
-    };
-
-    // Scan the capsule's own tree FIRST, so its file set is known before the
-    // library walk below — excluding those files there is what stops a root
-    // file living inside `src/` from being double-scanned under two
-    // different (and for the library one, wrong) crate identities.
-    let capsule_files = scan_bin_crate_tree(
-        file,
-        project_root,
-        "bin:edge-capsule",
-        &default_features,
-        &mut scan,
-    );
-
-    let mut files = Vec::new();
-    collect_rs_files(&project_root.join("src"), &mut files);
-    files.sort();
-
-    let sources: Vec<(String, String)> = files
-        .iter()
-        .filter(|path| !capsule_files.contains(path.as_path()))
-        .filter_map(|path| {
-            let src = std::fs::read_to_string(path).ok()?;
-            let rel = path
-                .strip_prefix(project_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            Some((rel, src))
-        })
-        .collect();
-    for (rel, src) in &sources {
-        scan_source(rel, src, &default_features, &mut scan);
-    }
-    scan.files_scanned += sources.len();
-
-    scan
+    resolve_edge_scan_impl(project_root, requested_features, extra_file)
 }
 
 /// The scanned crate's own `[package] name`, when the manifest table parses
@@ -838,7 +840,7 @@ fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &st
 /// outright, and even without that override Cargo turns every `-` in the
 /// package name into `_` for the crate identifier (a package named
 /// `my-app` compiles to `extern crate my_app`, never `my-app` — that is not
-/// a legal Rust identifier). [`resolve_edge_scan_with_features`] uses this
+/// a legal Rust identifier). [`resolve_edge_scan_with_extra_file`] uses this
 /// for [`EdgeScan::crate_name`]; [`enabled_features_from_manifest`] does not
 /// — see [`package_name_from_manifest`].
 #[must_use]
@@ -1701,6 +1703,40 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         return None;
     }
     i += 1;
+    // Tolerate a simple generic-parameter list (`<T, U: Bound<V>>`) between
+    // the function name and its parameter list, the same way the return-type
+    // case below tolerates a simple ungrouped token run (Codex review on
+    // #2739, round 21, P2).
+    if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
+        let mut depth: i32 = 0;
+        loop {
+            match trees.get(i) {
+                Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
+                    depth += 1;
+                    i += 1;
+                }
+                Some(TokenTree::Punct(p)) if p.as_char() == '>' => {
+                    depth -= 1;
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(
+                    TokenTree::Ident(_)
+                    | TokenTree::Punct(_)
+                    | TokenTree::Literal(_)
+                    | TokenTree::Group(_),
+                ) => {
+                    i += 1;
+                }
+                _ => return None,
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+    }
     if !matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
     {
         return None;
@@ -2292,6 +2328,31 @@ mod tests {
 
             #[cfg(feature = "premium")]
             fn wire() -> Vec<String> { edge_routes![crate::show]; Vec::new() }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// A generic wiring function (`fn wire<T>() { ... }`) must not defeat
+    /// `simple_fn_body_index`'s narrow token-shape match — falling through to
+    /// the old, unprotected fallback would wrongly credit a registration
+    /// whose enclosing function is cfg'd out (Codex review on #2739, round
+    /// 21, P2).
+    #[test]
+    fn cfg_feature_gated_generic_fn_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire<T: Default>() { edge_routes![crate::show]; }
             "#,
             &[],
         );
@@ -3043,7 +3104,7 @@ mod tests {
     /// `default = [...]` — the real build turns it on, so the scan must too
     /// (Codex review on #2739, P1).
     #[test]
-    fn resolve_edge_scan_with_features_honors_explicitly_requested_features() {
+    fn resolve_edge_scan_with_extra_file_honors_explicitly_requested_features() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
@@ -3073,7 +3134,7 @@ mod tests {
         assert!(resolve_edge_scan(dir.path()).is_empty());
         // With it requested, exactly as `--features premium` would forward,
         // the route must be found.
-        let scan = resolve_edge_scan_with_features(dir.path(), &["premium"]);
+        let scan = resolve_edge_scan_with_extra_file(dir.path(), &["premium"], None);
         assert_eq!(scan.names(), vec!["premium_only"]);
     }
 
@@ -3212,7 +3273,7 @@ mod tests {
 
     /// `edge_routes![my_crate::show]` — the crate's own `[package] name`
     /// used as a path root — is Rust's other spelling for `crate::show`.
-    /// `scan.crate_name` is set the way `resolve_edge_scan_with_features`
+    /// `scan.crate_name` is set the way `resolve_edge_scan_with_extra_file`
     /// sets it from a real manifest; `scan_one`'s inline-source tests have
     /// no manifest to read it from, so it is set directly here.
     #[test]
@@ -3504,6 +3565,80 @@ mod tests {
         let scan = resolve_edge_scan(dir.path());
         assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same as above, but the custom `[lib] path` points OUTSIDE `src/`
+    /// entirely — the ordinary `src/`-directory walk never reaches it at
+    /// all, so it needs its own dedicated scan via `scan_bin_crate_tree`
+    /// (Codex review on #2739, round 21, P1).
+    #[test]
+    fn resolve_edge_scan_honors_a_custom_lib_path_outside_src() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"lib/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("lib/app.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A project combining an out-of-`src/` custom `[lib] path` AND an
+    /// out-of-tree custom `[[bin]]` path at once: both must get their own,
+    /// independent crate roots, and a bare `edge_routes![show]` inside the
+    /// bin crate must not be credited by the library's same-named function
+    /// (Codex review on #2739, round 21, P2).
+    #[test]
+    fn resolve_edge_scan_with_extra_file_honors_a_custom_lib_path_outside_src_alongside_a_custom_bin_path()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [lib]
+            path = "lib/app.rs"
+
+            [[bin]]
+            name = "edge-capsule"
+            path = "cmd/edge.rs"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("lib/app.rs"), "#[edge]\npub fn show() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+
+        let unregistered = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(unregistered[0].file, "lib/app.rs");
+
+        let registered = scan.registered_fns();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].file, "cmd/edge.rs");
     }
 
     /// A *bare* registration, unlike the `crate::`-qualified one above, DOES
