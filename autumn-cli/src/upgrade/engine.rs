@@ -631,13 +631,17 @@ pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
 /// `#[repository] trait AuditRepository` in one place and writes
 /// `struct PgAuditRepository` in another has two different types spelled the
 /// same, and an unqualified call cannot be attributed to either.
+///
+/// Scoped the same way as [`generated_repository_types`] (issue #2234): a
+/// struct declared in a function body is visible only there, so it must not
+/// veto an unrelated call elsewhere in the module.
 #[must_use]
 pub fn defined_type_names(source: &str) -> Vec<(String, Vec<String>)> {
     let Ok(stream) = source.parse::<TokenStream>() else {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_defined_types(&stream, Context::Code, &[], &mut found);
+    collect_defined_types(&stream, Context::Code, &[], Scope::Module, &mut found);
     found
 }
 
@@ -645,6 +649,7 @@ fn collect_defined_types(
     stream: &TokenStream,
     context: Context,
     module: &[String],
+    scope: Scope,
     found: &mut Vec<(String, Vec<String>)>,
 ) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
@@ -654,27 +659,45 @@ fn collect_defined_types(
                 if context == Context::Code
                     && matches!(keyword.to_string().as_str(), "struct" | "enum" | "union") =>
             {
-                if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
+                // A struct declared in a function body is visible only in that
+                // body, so it is not evidence for the whole module — the
+                // mirror of the same rule in `collect_repository_types`.
+                if scope == Scope::Module
+                    && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
+                {
                     found.push((name.to_string(), module.to_vec()));
                 }
             }
             // `type Alias = …;`, but not the `type` of an associated item
             // binding, which is followed by `=` only after a generic list.
             TokenTree::Ident(keyword) if context == Context::Code && keyword == "type" => {
-                if let Some(TokenTree::Ident(name)) = trees.get(index + 1) {
+                if scope == Scope::Module
+                    && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
+                {
                     found.push((name.to_string(), module.to_vec()));
                 }
             }
             TokenTree::Group(group) => {
+                // `mod name { … }` opens a module; every other brace is just a
+                // block, and the path it holds is the one it inherits.
                 let nested = module_name_before(&trees, index).map(|name| {
                     let mut nested = module.to_vec();
                     nested.push(name);
                     nested
                 });
+                // Anything that is not a `mod` body is a block: a `mod`
+                // written *inside* one is still only visible there, so the
+                // scope never widens again once it has narrowed.
+                let inner_scope = if nested.is_some() && scope == Scope::Module {
+                    Scope::Module
+                } else {
+                    Scope::Block
+                };
                 collect_defined_types(
                     &group.stream(),
                     group_context(&trees, index, context),
                     nested.as_deref().unwrap_or(module),
+                    inner_scope,
                     found,
                 );
             }
@@ -1300,6 +1323,22 @@ mod tests {
         assert!(
             defined_type_names("macro_rules! m { () => { struct PgAuditRepository; } }").is_empty()
         );
+    }
+
+    #[test]
+    fn a_block_local_handwritten_type_is_not_module_wide_evidence() {
+        // Mirrors `a_block_local_repository_is_not_module_wide_evidence`
+        // (issue #2234): a struct declared in a function body is visible only
+        // in that body, so recording it against the enclosing module let it
+        // refuse an otherwise-valid unqualified call elsewhere in the module.
+        for source in [
+            "fn f() { struct PgAuditRepository; }",
+            "mod repositories { fn f() { struct PgAuditRepository; } }",
+            // A `mod` nested inside a block is still only visible in the block.
+            "fn f() { mod inner { struct PgAuditRepository; } }",
+        ] {
+            assert!(defined_type_names(source).is_empty(), "for {source}");
+        }
     }
 
     #[test]
