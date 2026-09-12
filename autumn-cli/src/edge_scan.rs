@@ -531,6 +531,32 @@ fn is_optional_dependency(table: &toml::Table, name: &str) -> bool {
         })
 }
 
+/// Whether some feature entry, anywhere in `features_table`, explicitly
+/// names `dep:<pkg>` — Cargo's own syntax to depend on an optional
+/// dependency being enabled without also turning on its implicit same-named
+/// local feature.
+///
+/// Verified directly against `cargo rustc -- --print cfg`: once a manifest
+/// uses `dep:pkg` *anywhere* in `[features]`, Cargo suppresses `pkg`'s
+/// implicit feature crate-wide, even for an unrelated `default = ["pkg/feat"]`
+/// entry that would otherwise turn it on — the same round-9-style trap of
+/// assuming a Cargo feature-graph rule holds unconditionally when it is
+/// actually gated by something else in the manifest. Missing this made a
+/// `#[cfg(feature = "pkg")]` route look included in the scan even though
+/// such a manifest's real build compiles it out (Codex review on #2739,
+/// round 13, P2).
+#[must_use]
+fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
+    let needle = format!("dep:{pkg}");
+    features_table.is_some_and(|features| {
+        features.values().any(|entries| {
+            entries
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.as_str() == Some(&needle)))
+        })
+    })
+}
+
 /// The scanned crate's own Rust library-crate identifier — what
 /// `edge_routes![this_name::item]` would actually have to spell to reach one
 /// of its items, same as `crate::item`. This is not always the bare
@@ -647,11 +673,14 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
             // dependency sharing its name with an unrelated local feature
             // must not have that feature turned on here (Codex review on
             // #2739, round 7, P2). The weak form (`pkg?/feat`) makes no
-            // such promise either way.
+            // such promise either way. That implicit feature is itself
+            // suppressed crate-wide once any feature entry spells `dep:pkg`
+            // — see `implicit_feature_is_suppressed` (round 13, P2).
             if !pkg.ends_with('?')
                 && table
                     .as_ref()
                     .is_some_and(|t| is_optional_dependency(t, pkg))
+                && !implicit_feature_is_suppressed(features_table.as_ref(), pkg)
             {
                 queue.push(pkg.to_owned());
             }
@@ -1667,6 +1696,46 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(!enabled.contains("foo"));
+    }
+
+    /// Verified directly against `cargo rustc -- --print cfg`: once any
+    /// feature entry anywhere in the manifest spells `dep:foo`, Cargo
+    /// suppresses `foo`'s implicit local feature crate-wide — even for an
+    /// unrelated `default = ["foo/bar"]` entry that would otherwise turn it
+    /// on. Missing this made `foo` look enabled here even though such a
+    /// manifest's real build never sets `cfg(feature = "foo")` (Codex review
+    /// on #2739, round 13, P2).
+    #[test]
+    fn a_dep_colon_reference_suppresses_the_implicit_feature_even_via_an_unrelated_entry() {
+        let manifest = r#"
+            [dependencies]
+            foo = { version = "1", optional = true }
+
+            [features]
+            default = ["foo/bar"]
+            explicit = ["dep:foo"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("foo"));
+    }
+
+    /// Without any `dep:foo` in the picture, the strong form still enables
+    /// the optional dependency's implicit feature as usual — the suppression
+    /// is specific to `dep:foo` appearing somewhere, not a general change in
+    /// behavior.
+    #[test]
+    fn a_dep_colon_reference_to_an_unrelated_package_does_not_suppress_anything() {
+        let manifest = r#"
+            [dependencies]
+            foo = { version = "1", optional = true }
+            other = { version = "1", optional = true }
+
+            [features]
+            default = ["foo/bar"]
+            explicit = ["dep:other"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("foo"));
     }
 
     /// Cargo resolves the feature graph before target selection, so a

@@ -193,12 +193,13 @@ impl EdgeLeaf for http::HeaderMap {}
 impl sealed::LeafSealed for crate::extract::EdgeCache {}
 impl EdgeLeaf for crate::extract::EdgeCache {}
 
-/// Implement [`EdgeLeaf`] for a plain tuple of leaves, `(E1, .., En)`, when
-/// each `Ei` is itself an [`EdgeLeaf`] — axum implements `FromRequestParts`
-/// for tuples, so a handler author can group extractors by hand into a
-/// single parameter (`async fn h(combo: (Path<T>, HeaderMap))`), and that
-/// grouped tuple is then itself the one extractor occupying a slot in
-/// [`EdgeExtract`]'s handler-arity tuple.
+/// Implement [`EdgeLeaf`] for a plain tuple of leaves, `(E1, .., En)` for `n`
+/// from 1 to 8, when each `Ei` is itself an [`EdgeLeaf`] — axum implements
+/// `FromRequestParts` for tuples (including the 1-element case), so a
+/// handler author can group extractors by hand into a single parameter
+/// (`async fn h(combo: (Path<T>, HeaderMap))`, or even `(Path<T>,)` alone),
+/// and that grouped tuple is then itself the one extractor occupying a slot
+/// in [`EdgeExtract`]'s handler-arity tuple.
 ///
 /// Unlike [`impl_edge_extract_for_handler_arity`]'s macro, there is no free
 /// marker parameter here: every `Ei` is bounded by `EdgeLeaf`, so this can
@@ -211,6 +212,7 @@ macro_rules! impl_edge_leaf_for_tuple {
     };
 }
 
+impl_edge_leaf_for_tuple!(T1);
 impl_edge_leaf_for_tuple!(T1, T2);
 impl_edge_leaf_for_tuple!(T1, T2, T3);
 impl_edge_leaf_for_tuple!(T1, T2, T3, T4);
@@ -322,6 +324,14 @@ mod tests {
         format!("{name}{}", headers.len())
     }
 
+    /// The one-element case of the same grouping (`(Path<T>,)` alone) — axum
+    /// implements `FromRequestParts` for 1-tuples too, so this must be
+    /// accepted the same as writing `Path<T>` directly (Codex review on
+    /// #2739, round 13, P2).
+    async fn with_one_element_grouped_tuple((Path(name),): (Path<String>,)) -> String {
+        name
+    }
+
     /// The prelude's extractors are exactly the ones an edge handler may use;
     /// if any of these stopped satisfying the bound this would not compile.
     #[test]
@@ -333,6 +343,7 @@ mod tests {
         let _ = edge_get(with_cache);
         let _ = edge_get(with_everything);
         let _ = edge_get(with_grouped_tuple);
+        let _ = edge_get(with_one_element_grouped_tuple);
     }
 
     #[test]
