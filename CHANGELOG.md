@@ -455,11 +455,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
-  recognizes `[dependencies.autumn_web]` (Cargo's underscore-normalized
-  subtable spelling), the same way the `--oauth`/`--passkeys` patchers already
-  do. Before this fix, a project declaring `autumn-web` under that spelling
-  silently kept the `mail` feature unset after `autumn generate auth --mail`,
-  with no error — the generated mail routes would then fail to compile.
+  recognizes a `[dependencies.autumn_web]` subtable that renames the package
+  back with `package = "autumn-web"` (Cargo's underscore-normalized table key
+  plus the explicit rename it requires — Cargo does not treat `-`/`_` as
+  interchangeable in a dependency table key on its own). Before this fix, a
+  project declaring `autumn-web` this way silently kept the `mail` feature
+  unset after `autumn generate auth --mail`, with no error — the generated
+  mail routes would then fail to compile.
 - **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
   `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
   one opaque `style: form, explode: true` parameter for the whole struct

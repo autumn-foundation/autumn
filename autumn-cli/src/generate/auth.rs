@@ -20,8 +20,8 @@ use super::emit::Plan;
 use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, schema_has_table,
-    unique_index_sql, update_main_rs,
+    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, declares_package,
+    schema_has_table, unique_index_sql, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -1707,6 +1707,7 @@ pub fn run_with_options(
 ///   `[dependencies.autumn_web]` spelling — both are valid TOML keys for the same
 ///   dependency, as `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` already
 ///   check)
+#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
     const FEATURE: &str = "\"mail\"";
@@ -1773,7 +1774,24 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
+        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
+        // unrelated package `autumn_web` unless its body renames it back with
+        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
+        // that declaration before treating the underscore form as a match, the
+        // same way `find_section_start_with_autumn_web_package` does.
+        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
+            let body_end = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |p| i + 1 + p);
+            lines[i + 1..body_end].iter().any(|l| {
+                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
+                declares_package(code, CRATE)
+            })
+        };
+
+        if trimmed == subtable_header || underscore_aliases_autumn_web {
             // Scan ahead within the subtable.
             let mut j = i + 1;
             let mut found_features = false;
@@ -14303,18 +14321,24 @@ mod tests {
         );
     }
 
-    /// Characterization test (Echo clone-class survey, `ensure_autumn_web_*_feature`
-    /// family): `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` both check
-    /// `[dependencies.autumn_web]` (Cargo's underscore-normalized table header,
-    /// valid alongside the hyphenated `autumn-web` spelling) via a
-    /// `subtable_header_underscore` variable. `ensure_autumn_web_mail_feature` was
-    /// written first (#706) and never gained that check, so it silently leaves the
-    /// `mail` feature unset when a project's Cargo.toml uses the underscore form —
-    /// see `cargo_toml_gets_mail_feature_subtable_underscore_form` below for the
-    /// missed-fix half of this pair.
+    /// Cargo does not normalize `-`/`_` in a dependency table key: `[dependencies.autumn_web]`
+    /// names an unrelated package `autumn_web` unless its body renames it back with
+    /// `package = "autumn-web"` (`cargo metadata` on a manifest with
+    /// `[dependencies.async_trait]` and no `package` key: "no matching package found ...
+    /// perhaps you meant: async-trait" — it does not fall back to the hyphenated name).
+    /// Every fixture below therefore carries that `package` line, matching how `autumn
+    /// new`/`cargo add --rename` would actually produce this form.
+    ///
+    /// `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` both check
+    /// `[dependencies.autumn_web]` via a `subtable_header_underscore` variable, but —
+    /// like `ensure_autumn_web_mail_feature` before this fix — neither verifies the
+    /// `package` rename, so they too would incorrectly match (and mutate) an unrelated
+    /// `autumn_web` dependency that isn't actually this framework. That's tracked
+    /// separately (see the clone-class findings issue for this file) rather than fixed
+    /// here, since this PR is scoped to `ensure_autumn_web_mail_feature` alone.
     #[test]
     fn cargo_toml_gets_oauth2_feature_subtable_underscore_form() {
-        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
         let out = ensure_autumn_web_oauth2_feature(input);
         assert!(
             out.contains("features = [\"oauth2\"]"),
@@ -14324,7 +14348,7 @@ mod tests {
 
     #[test]
     fn cargo_toml_gets_webauthn_feature_subtable_underscore_form() {
-        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
         let out = ensure_autumn_web_webauthn_feature(input);
         assert!(
             out.contains("features = [\"webauthn\"]"),
@@ -14332,17 +14356,33 @@ mod tests {
         );
     }
 
-    /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize
-    /// `[dependencies.autumn_web]` the same way its `oauth2`/`webauthn` siblings do
-    /// (see `cargo_toml_gets_oauth2_feature_subtable_underscore_form` above). Before
-    /// this fix the function silently returned the TOML unmodified for this form.
+    /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize a
+    /// properly `package`-renamed `[dependencies.autumn_web]` the same way its
+    /// `oauth2`/`webauthn` siblings do (see
+    /// `cargo_toml_gets_oauth2_feature_subtable_underscore_form` above). Before this
+    /// fix the function silently returned the TOML unmodified for this form.
     #[test]
     fn cargo_toml_gets_mail_feature_subtable_underscore_form() {
-        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
         let out = ensure_autumn_web_mail_feature(input);
         assert!(
             out.contains("features = [\"mail\"]"),
             "mail feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Negative case for the fix above: `[dependencies.autumn_web]` with no `package`
+    /// rename names a real (if unlikely) dependency on a crate literally called
+    /// `autumn_web` — not this framework. `ensure_autumn_web_mail_feature` must leave
+    /// it untouched rather than injecting `mail` into an unrelated dependency's
+    /// features.
+    #[test]
+    fn cargo_toml_mail_feature_ignores_unrenamed_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert_eq!(
+            out, input,
+            "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
         );
     }
 

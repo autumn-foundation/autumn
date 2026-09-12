@@ -3992,7 +3992,14 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// silently misses forms like `package= "..."` or `package ="..."`. Also
 /// tolerant of TOML's single-quoted literal-string form (`package =
 /// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
-fn declares_package(text: &str, target: &str) -> bool {
+///
+/// `pub(super)`: also called from `super::auth`'s `ensure_autumn_web_*_feature`
+/// helpers, which must not treat a `[dependencies.autumn_web]` subtable as the
+/// framework dependency unless it actually renames the package this way — Cargo
+/// does not normalize `-`/`_` in a dependency table key itself (confirmed via
+/// `cargo metadata`: `[dependencies.async_trait]` with no `package` key fails
+/// to resolve, suggesting the hyphenated name instead of aliasing to it).
+pub(super) fn declares_package(text: &str, target: &str) -> bool {
     let body = match (text.find('{'), text.rfind('}')) {
         (Some(open), Some(close)) if close > open => &text[open + 1..close],
         _ => text,
