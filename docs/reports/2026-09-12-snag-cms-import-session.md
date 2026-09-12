@@ -4,8 +4,11 @@
 
 *Persona × workflow*: a site owner backs up and restores their content —
 export, re-import the same file into the same site, and (the scenario this
-session was chosen for) restore an export into a **fresh** site, including an
-**old backup taken in a legacy export format**. This was the first of the
+session was chosen for) restore an export into a **fresh** site, including
+a file in a legacy export format (`READABLE_EXPORT_VERSIONS`'s older
+entries) — turned out over the course of the session to be a narrower
+question than "an old backup" (see the correction under 🐛 Bug filed below).
+This was the first of the
 three follow-up charters the prior session proposed
 (`docs/reports/2026-09-11-snag-cms-session.md`): "Media library and
 import/export — both have strong built-in oracles (MIME allowlist is a
@@ -81,10 +84,6 @@ other's state.
   `Content-Type` was not independently driven over HTTP this session either
   (only read in `media.rs`) — same gap the prior session left open, carried
   into the next-charter list below rather than claimed as covered here.
-- **A row whose blob store bytes were never restored answers 404 for a
-  `file: null` handle** — read but not separately re-verified this session,
-  since the prior session and the code's own comment already cover it
-  directly; not re-litigated here.
 
 **Investigated and ruled out (would have been a false report):** a `500`
 (not `404`) the first time `/media/{slug}` was hit against a restore target
@@ -113,15 +112,38 @@ contains, so a parent is always created before its children) is a no-op for
 version-2 and version-3 files: those predate the `path` field, so
 `identity()` falls back to the bare slug, which never contains `/` — every
 page in a legacy file sorts as depth `0`. When two same-slug pages under
-different parents are listed in the file before their respective parents (a
-plain function of the exporting site's row-id order, e.g. a page created
-flat and re-parented later), the import loop misidentifies the *second* one
-as "somebody else's row that merely shares the slug" against the *first*
-one it just created — and drops it permanently, with the summary screen
-reporting an unremarkable "N imported, M already present" and no orphan
-count. Reproduced 3/3 across independent fresh databases (two on version 2 —
-one a hand-reordered full export, one a minimized 4-post file — and one on
-version 3, all deterministic given the file's post ordering — not a race).
+different parents are listed in the file before their respective parents,
+the import loop misidentifies the *second* one as "somebody else's row that
+merely shares the slug" against the *first* one it just created — and drops
+it permanently, with the summary screen reporting an unremarkable
+"N imported, M already present" and no orphan count. Reproduced 3/3 across
+independent fresh databases (two on version 2 — one a hand-reordered full
+export, one a minimized 4-post file — and one on version 3, all
+deterministic given the file's post ordering — not a race).
+
+**Correction from the first draft of this report, caught by a Codex review
+comment on this PR:** the first draft framed this as a risk to "an old real
+backup," reasoning that a page created flat and later re-parented could
+plausibly leave a lower row id under a newer sibling. That reasoning doesn't
+hold up: `ExportPost::path`'s own doc comment (`tools.rs`) says the
+pre-version-4 schema made a page's bare slug its *whole* identity — meaning
+two pages could not have shared a slug at all under that era's schema; only
+once nested-page uniqueness became per-parent (alongside `path`, at version
+4) did `/about/team` and `/company/team` become simultaneously legal. So a
+period-authentic version-2 or -3 export, produced by this software's own
+exporter of that vintage, could not have contained the colliding rows this
+repro needs. The realistic trigger is narrower: any version-2/3-*labeled*
+file the importer nonetheless accepts without checking that its content is
+even period-consistent — a hand-edited export (the code's own comment on
+`import_status` separately treats "a file... hand-edited or came from
+another tool" as a real, anticipated input class for this same importer), a
+migration tool emitting cms's documented legacy JSON shape from another
+platform, or a file whose version label was simply changed. Filed as data
+loss on an input class this importer explicitly commits to accepting
+(`READABLE_EXPORT_VERSIONS`) and applies no such consistency check to —
+not as a risk to a site's own untouched historical backups. The issue text
+has been corrected to match.
+
 Full repro script, root cause, and both oracles are in the issue.
 
 Not added as a regression test in this PR: `.github/workflows/ci.yml`'s
@@ -157,11 +179,11 @@ regression test the sweep will then pick up automatically.
 ## Proposed next charters
 
 1. **Media library upload itself** (still untouched by either cms session):
-   the MIME allowlist is now confirmed on both the upload *and* import
-   paths, but the upload form's own multipart handling — oversized files,
-   zero-byte files, a filename that is only an extension, concurrent
-   uploads racing the `OrphanedBlobGuard` cleanup — has not been driven at
-   all yet.
+   the MIME allowlist is confirmed on the import path, but the upload
+   form's own rejection of a disallowed `Content-Type` — plus its other
+   multipart handling: oversized files, zero-byte files, a filename that
+   is only an extension, concurrent uploads racing the
+   `OrphanedBlobGuard` cleanup — has not been driven at all yet.
 2. **The scheduled-publishing sweep, end-to-end** — still open from the
    prior session's list; a good pairing with this one, since
    `import_status`'s "an elapsed `future` schedule becomes a publish"
