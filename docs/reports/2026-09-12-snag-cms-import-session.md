@@ -72,12 +72,15 @@ other's state.
   comment "the site's own metadata is more current than the file's").
   Changed an attachment's `alt_text` on the restore-target site, re-imported
   the original export: the local edit survived untouched.
-- **MIME allowlist enforced on import, not just upload** (oracle: the
+- **MIME allowlist enforced on the import path** (oracle: the
   platform-contract security comment in `media.rs`/`tools.rs` — an import is
   a file, and a tampered one can claim disallowed bytes are something else).
   A crafted export naming an attachment `mime_type: "text/html"` was refused
   outright (422, "this export cannot be restored as it stands") rather than
-  silently stored.
+  silently stored. The *upload* form's own rejection of a disallowed
+  `Content-Type` was not independently driven over HTTP this session either
+  (only read in `media.rs`) — same gap the prior session left open, carried
+  into the next-charter list below rather than claimed as covered here.
 - **A row whose blob store bytes were never restored answers 404 for a
   `file: null` handle** — read but not separately re-verified this session,
   since the prior session and the code's own comment already cover it
@@ -102,7 +105,7 @@ is what closed this out as a self-inflicted setup gap rather than a finding.
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — legacy-format
 (version 2/3) import silently drops a same-slug sibling page when its parent
-is created later in the same run (data loss, repro 4/4).**
+is created later in the same run (data loss, repro 3/3).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 for the *current* export format (sorting posts by how many `/` their `path`
@@ -116,7 +119,8 @@ flat and re-parented later), the import loop misidentifies the *second* one
 as "somebody else's row that merely shares the slug" against the *first*
 one it just created — and drops it permanently, with the summary screen
 reporting an unremarkable "N imported, M already present" and no orphan
-count. Reproduced 4/4 (two independent fresh databases on version 2, one on
+count. Reproduced 3/3 across independent fresh databases (two on version 2 —
+one a hand-reordered full export, one a minimized 4-post file — and one on
 version 3, all deterministic given the file's post ordering — not a race).
 Full repro script, root cause, and both oracles are in the issue.
 
