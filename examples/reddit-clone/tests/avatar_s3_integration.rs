@@ -43,10 +43,8 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
     let container = MinIO::default()
-        .with_name("quay.io/minio/minio")
+        .with_name(MINIO_IMAGE)
         .start()
         .await
         .expect("start MinIO");
