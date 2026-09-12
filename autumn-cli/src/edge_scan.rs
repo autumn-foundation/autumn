@@ -46,12 +46,19 @@
 //!   #[edge] fn show() {} }` gives `show` the path `users`), or derived from
 //!   the declaring file's own location for an *out-of-line* `mod users;`
 //!   (`src/users.rs` also gives `users`, following Rust's directory-mirrors-
-//!   modules convention). A bare entry (`greet`, no `::`) matches a function
-//!   with that name in any module — the old, lenient rule. A qualified entry
-//!   (`users::show`, or `crate::users::show` with the `crate::` prefix
-//!   stripped first) matches only a function whose own module path is
-//!   exactly `users` — including a crate-root function (an empty module
-//!   path), which only a qualifier of `crate` (or none) can match.
+//!   modules convention) — except under `src/bin/`, where each `<name>.rs`
+//!   or `<name>/main.rs` is its own separate Cargo crate root, not a
+//!   submodule of the app's library crate. A bare entry (`greet`, no `::`)
+//!   matches a function with that name in any module — the old, lenient
+//!   rule. A qualified entry (`users::show`, or `crate::users::show` /
+//!   `my_crate::users::show` with the `crate::` / crate-name prefix stripped
+//!   first) matches only a function whose own module path is exactly
+//!   `users` — including a crate-root function (an empty module path),
+//!   which only a `crate` or crate-name qualifier (or none) can match. A
+//!   *relative* qualified entry (`v1::show` written inside `mod api { mod
+//!   v1 { ... } } }`, meaning `api::v1::show` in real Rust) is not resolved
+//!   — genuinely ambiguous without full symbol resolution — so it reports
+//!   as unregistered, the documented safe direction.
 //! - Only free functions are scanned, including those declared in inline
 //!   modules (`mod routes { ... }`) or out-of-line ones (`mod routes;`
 //!   backed by `src/routes.rs` or `src/routes/mod.rs`). A function generated
@@ -141,10 +148,11 @@ pub struct EdgeScan {
     pub registrations: usize,
     /// Number of `.rs` files read.
     pub files_scanned: usize,
-    /// The scanned crate's own `[package] name`, when its manifest could be
-    /// read and parsed. Lets a registration written as `my_crate::show`
-    /// (Rust's own rule: a crate's name is also a valid path root to its own
-    /// items, same as `crate::show`) match a function `is_registered` would
+    /// The scanned crate's own Rust library-crate identifier (see
+    /// [`rust_crate_name_from_manifest`]), when its manifest could be read
+    /// and parsed. Lets a registration written as `my_crate::show` (Rust's
+    /// own rule: a crate's name is also a valid path root to its own items,
+    /// same as `crate::show`) match a function `is_registered` would
     /// otherwise treat as a reference to an unrelated `my_crate` module.
     pub crate_name: Option<String>,
 }
@@ -213,19 +221,21 @@ impl EdgeScan {
 /// `mod a { mod x { #[edge] fn f() {} } }` and `mod b { mod x { #[edge] fn
 /// f() {} } }`, a suffix match on `x::f` from anywhere would satisfy both,
 /// silently muting the real warning for whichever one was not actually
-/// registered. A relative reference such as `edge_routes![v1::greet]` still
-/// matches correctly when it names a real Rust path — [`registration_candidates`]
-/// resolves it against the invocation's own enclosing module before it ever
-/// reaches this function, rather than this function chasing every ancestor
-/// itself.
+/// registered. A relative reference such as `edge_routes![v1::greet]`,
+/// written from inside an ancestor of the real `greet`'s module, is the
+/// same trade-off in a different shape and is left unresolved by
+/// [`registration_candidates`] for the same reason — see its own doc for
+/// why trying it as a second candidate was reverted.
 ///
 /// A leading `crate` segment in the qualifier is stripped first, and so is a
-/// leading segment equal to `crate_name` (the scanned crate's own `[package]
-/// name`, when known) — Rust treats a crate's own name as another valid path
-/// root to its items, same as `crate`. Either way `edge_routes![crate::users::show]`
-/// or `edge_routes![my_crate::users::show]` is the same route as
-/// `users::show`, and `f.module_path` never carries either prefix, so
-/// leaving it in would make such a registration miss its own function.
+/// leading segment equal to `crate_name` (the scanned crate's own Rust
+/// library-crate identifier, when known — see
+/// [`rust_crate_name_from_manifest`]) — Rust treats a crate's own name as
+/// another valid path root to its items, same as `crate`. Either way
+/// `edge_routes![crate::users::show]` or `edge_routes![my_crate::users::show]`
+/// is the same route as `users::show`, and `f.module_path` never carries
+/// either prefix, so leaving it in would make such a registration miss its
+/// own function.
 fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>, crate_name: Option<&str>) -> bool {
     registered.iter().any(|entry| {
         let (qualifier, name) = entry.rsplit_once("::").unwrap_or(("", entry.as_str()));
@@ -321,7 +331,7 @@ pub fn resolve_edge_scan_with_features(
     let crate_name = manifest
         .as_deref()
         .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok())
-        .and_then(|table| package_name_from_manifest(&table));
+        .and_then(|table| rust_crate_name_from_manifest(&table));
 
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
@@ -399,10 +409,11 @@ pub fn resolve_edge_scan_with_extra_file(
 }
 
 /// The scanned crate's own `[package] name`, when the manifest table parses
-/// far enough to say. Shared by [`enabled_features_from_manifest`]
-/// (recognizing `pkg/feat` as this crate's own feature) and
-/// [`resolve_edge_scan_with_features`] (recognizing `pkg::item` in a
-/// registration as this crate's own item, same as `crate::item`).
+/// far enough to say. Used only by [`enabled_features_from_manifest`], which
+/// matches Cargo's own `-p <package>` / `--features pkg/feat` CLI syntax —
+/// that syntax names the *package*, hyphens and all, never the Rust crate
+/// identifier `path::item` syntax uses (see [`rust_crate_name_from_manifest`]
+/// for that one).
 #[must_use]
 fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
     table
@@ -412,15 +423,42 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The scanned crate's own Rust library-crate identifier — what
+/// `edge_routes![this_name::item]` would actually have to spell to reach one
+/// of its items, same as `crate::item`. This is not always the bare
+/// `[package] name`: `[lib] name = "..."` can rename the library target
+/// outright, and even without that override Cargo turns every `-` in the
+/// package name into `_` for the crate identifier (a package named
+/// `my-app` compiles to `extern crate my_app`, never `my-app` — that is not
+/// a legal Rust identifier). [`resolve_edge_scan_with_features`] uses this
+/// for [`EdgeScan::crate_name`]; [`enabled_features_from_manifest`] does not
+/// — see [`package_name_from_manifest`].
+#[must_use]
+fn rust_crate_name_from_manifest(table: &toml::Table) -> Option<String> {
+    table
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| package_name_from_manifest(table).map(|name| name.replace('-', "_")))
+}
+
 /// Read a crate's `Cargo.toml`, seed the feature queue with `[features]
 /// default = [...]` plus `requested` (features asked for on the command
 /// line), and follow both through the feature graph in `[features]` to build
 /// the full set of feature names actually enabled.
 ///
 /// Only follows features the crate declares in its own `[features]` table. A
-/// dependency-feature reference (`pkg/feat`, `pkg?/feat`, `dep:pkg`) is not a
-/// feature name of this crate, so it stops there rather than being treated as
-/// one — `cfg(feature = "...")` never names a dependency's feature anyway.
+/// dependency-feature reference's own suffix (`pkg/feat`'s `feat`, or
+/// `pkg?/feat`'s) is not a feature name of this crate, so it is never queued
+/// as one — `cfg(feature = "...")` never names a dependency's feature
+/// anyway. Its `pkg` half is different: naming an optional dependency this
+/// way *without* the `?` weak-dependency marker also turns that dependency
+/// on, and Cargo auto-generates a same-named local feature for every
+/// optional dependency, so `pkg/feat` (unlike `pkg?/feat`) queues `pkg`
+/// itself too — skipping that would leave a `#[cfg(feature = "pkg")]`
+/// route out of the scan even though Cargo really compiles it, the
+/// dangerous direction this scan exists to avoid.
 /// A requested name is still recorded as enabled even without a `[features]`
 /// table to expand it through — an app can request a feature that exists
 /// only to gate `#[cfg(feature = "...")]` code, with no `[features]` entry of
@@ -476,7 +514,18 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
     }));
 
     while let Some(name) = queue.pop() {
-        if name.contains('/') || name.starts_with("dep:") {
+        if name.starts_with("dep:") {
+            continue;
+        }
+        if let Some((pkg, _feat)) = name.split_once('/') {
+            // The strong form (`pkg/feat`, no `?`) also activates the
+            // optional dependency `pkg` itself, and Cargo auto-generates a
+            // same-named local feature for every optional dependency — so
+            // queue `pkg` for normal expansion. The weak form (`pkg?/feat`)
+            // makes no such promise.
+            if !pkg.ends_with('?') {
+                queue.push(pkg.to_owned());
+            }
             continue;
         }
         if !enabled.insert(name.clone()) {
@@ -565,6 +614,13 @@ fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan:
 /// "Recognition limits". A wrong prefix can only ever produce an extra
 /// false-positive "unregistered" warning, never a missed one: this scanner's
 /// documented safe direction.
+///
+/// `src/bin/<name>.rs` (or the directory form, `src/bin/<name>/main.rs`) is
+/// none of the above: Cargo treats it as its OWN crate root, one `[[bin]]`
+/// target entirely separate from the app's library crate, however deep its
+/// own path under `src/` looks. `crate::show` inside it means that bin
+/// target's own crate root, so the path derived here is relative to the bin
+/// target's root, not to `src/` itself (Codex review on #2739, round 6, P2).
 #[must_use]
 fn module_path_from_file(file: &str) -> Vec<String> {
     let without_ext = file.strip_suffix(".rs").unwrap_or(file);
@@ -572,7 +628,24 @@ fn module_path_from_file(file: &str) -> Vec<String> {
     if without_src.is_empty() {
         return Vec::new();
     }
-    let mut segments: Vec<&str> = without_src.split('/').collect();
+    if let Some(rest) = without_src.strip_prefix("bin/") {
+        // `<name>` alone (the flat `src/bin/<name>.rs` form) has nothing left
+        // once the bin target's own name is dropped — it IS that crate's root.
+        let bin_relative = rest.split_once('/').map_or("", |(_name, tail)| tail);
+        return module_path_from_segments(bin_relative);
+    }
+    module_path_from_segments(without_src)
+}
+
+/// Split `path` on `/`, dropping a trailing `mod`/`main`/`lib` segment (the
+/// "index" file for its directory, or a crate root) — the rule
+/// [`module_path_from_file`] applies both from `src/` and, relative to a
+/// `[[bin]]` target's own root, from `src/bin/<name>/`.
+fn module_path_from_segments(path: &str) -> Vec<String> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let mut segments: Vec<&str> = path.split('/').collect();
     if matches!(segments.last(), Some(&("mod" | "main" | "lib"))) {
         segments.pop();
     }
@@ -801,16 +874,21 @@ fn collect_registrations(stream: &TokenStream, module_path: &mut Vec<String>, sc
 /// looser bare-entry rule — is what decides it. `self`/`super` are unambiguous,
 /// so each resolves to exactly one candidate.
 ///
-/// Anything else — `crate`, a real crate-name-qualified path, or no
-/// qualifier at all — is kept as its own candidate unchanged. When it is
-/// additionally qualified (`v1::show`, not just `show`) and the invocation
-/// itself is nested in a module, a *second* candidate is added: the entry
-/// resolved as a plain relative reference to a child of that module
-/// (`v1::show` inside `mod api { ... }` also tries `api::v1::show`) — real
-/// Rust tries local scope first for a path like this, and only one of the
-/// two candidates can ever match a genuine function's module path, so this
-/// does not reopen the sibling-shadowing case [`is_registered`]'s exact
-/// match exists to close (Codex review on #2739, round 5, P2).
+/// Anything else — `crate`, a crate-name-qualified path, a real module path,
+/// a plain relative child-module reference, or no qualifier at all — is kept
+/// as its own single candidate, unresolved. A plain qualified entry
+/// (`v1::show`, no `self`/`super`/`crate`/crate-name prefix) is genuinely
+/// ambiguous without full symbol resolution: real Rust would resolve it
+/// against the invocation's local scope first, which can be a child module
+/// of `module_path` — but trying that reading *in addition to* the as-written
+/// one, tried once, produced a real false positive: with a genuine top-level
+/// `v1::show` AND a nested `api::v1::show`, an entry `v1::show` written
+/// inside `mod api` would then satisfy both, hiding a real "unregistered"
+/// warning for whichever one Rust does not actually mean (Codex review on
+/// #2739, round 6, P2, reverting round 5's attempt at this). Leaving it
+/// unresolved keeps the scanner's documented safe direction: a relative
+/// reference like this reports as an extra false-positive "unregistered"
+/// warning instead.
 fn registration_candidates(entry: &str, module_path: &[String]) -> Vec<String> {
     let segments: Vec<&str> = entry.split("::").collect();
     let (mut base, rest): (Vec<String>, &[&str]) = match segments.first().copied() {
@@ -824,16 +902,7 @@ fn registration_candidates(entry: &str, module_path: &[String]) -> Vec<String> {
             }
             (base, rest)
         }
-        Some("crate") => return vec![entry.to_owned()],
-        _ => {
-            let mut candidates = vec![entry.to_owned()];
-            if segments.len() > 1 && !module_path.is_empty() {
-                let mut relative = module_path.to_vec();
-                relative.extend(segments.iter().map(|s| (*s).to_owned()));
-                candidates.push(relative.join("::"));
-            }
-            return candidates;
-        }
+        _ => return vec![entry.to_owned()],
     };
     if base.is_empty() {
         base.push("crate".to_owned());
@@ -1250,6 +1319,36 @@ mod tests {
         assert!(!enabled.contains("extra"));
     }
 
+    /// `default = ["dep/extra"]` (no `?`) also activates the optional
+    /// dependency `dep` itself — Cargo auto-generates a same-named local
+    /// feature for every optional dependency — so a `#[cfg(feature =
+    /// "dep")]` route this manifest gates that way is really compiled and
+    /// must not be scanned out.
+    #[test]
+    fn a_strong_dependency_feature_reference_also_enables_the_dependency_itself() {
+        let manifest = r#"
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+        assert!(!enabled.contains("extra"));
+        assert!(!enabled.iter().any(|f| f.contains('/')));
+    }
+
+    /// `dep?/extra` (the weak-dependency form) makes no promise that `dep`
+    /// itself is on — only that IF something else enables it, `extra`
+    /// comes along too — so it must not enable `dep`.
+    #[test]
+    fn a_weak_dependency_feature_reference_does_not_enable_the_dependency() {
+        let manifest = r#"
+            [features]
+            default = ["dep?/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
     #[test]
     fn cfg_transitive_default_feature_is_included() {
         let mut features = BTreeSet::new();
@@ -1307,7 +1406,53 @@ mod tests {
         assert_eq!(scan.names(), vec!["shown"]);
     }
 
-    /// `autumn build --features premium` must not lose a route gated on
+    /// A hyphenated package name (`my-app`) compiles to the Rust crate
+    /// identifier `my_app` — `-` is not legal in a Rust identifier — so
+    /// `edge_routes![my_app::show]` must match, not `edge_routes![my-app::show]`
+    /// (which is not even valid Rust and could never appear as written).
+    #[test]
+    fn resolve_edge_scan_derives_the_rust_crate_name_from_a_hyphenated_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.crate_name.as_deref(), Some("my_app"));
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    #[test]
+    fn rust_crate_name_from_manifest_converts_hyphens_to_underscores() {
+        let table =
+            toml::from_str::<toml::Table>("[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n")
+                .unwrap();
+        assert_eq!(
+            rust_crate_name_from_manifest(&table).as_deref(),
+            Some("my_app")
+        );
+    }
+
+    #[test]
+    fn rust_crate_name_from_manifest_prefers_an_explicit_lib_name() {
+        let table = toml::from_str::<toml::Table>(
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"totally_different\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rust_crate_name_from_manifest(&table).as_deref(),
+            Some("totally_different")
+        );
+    }
+
     /// `premium` just because `premium` is not in the manifest's own
     /// `default = [...]` — the real build turns it on, so the scan must too
     /// (Codex review on #2739, P1).
@@ -1522,11 +1667,15 @@ mod tests {
     }
 
     /// `edge_routes![v1::show]` written inside `mod api { mod v1 { ... } }`
-    /// is an ordinary relative reference: Rust resolves `v1` against the
-    /// invocation's own module first, giving `api::v1::show`, not a
-    /// top-level `v1` module.
+    /// is an ordinary relative reference: real Rust resolves `v1` against
+    /// the invocation's own module first, giving `api::v1::show`. This
+    /// scanner deliberately does not resolve that — round 5 tried it and
+    /// round 6's Codex review found a real false positive it could cause
+    /// (see [`registration_candidates`]'s doc) — so this reports as a
+    /// false-positive "unregistered" warning, the documented safe direction,
+    /// rather than as a match.
     #[test]
-    fn a_relative_child_module_registration_resolves_against_its_own_module() {
+    fn a_relative_child_module_registration_is_left_unresolved() {
         let scan = scan_one(
             r"
             mod api {
@@ -1538,14 +1687,21 @@ mod tests {
             }
             ",
         );
-        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
-        assert_eq!(scan.registered_fns().len(), 1);
+        let unregistered: Vec<&EdgeFn> = scan.unregistered();
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert_eq!(
+            unregistered[0].module_path,
+            vec!["api".to_owned(), "v1".to_owned()]
+        );
+        assert!(scan.registered_fns().is_empty());
     }
 
-    /// The relative-child-module reading must not reopen the sibling-module
-    /// shadowing case the exact-equality match exists to close: `x::f` written
-    /// inside `mod b` must resolve to `b::x::f` only, never also credit the
-    /// unrelated `a::x::f`.
+    /// Leaving a relative reference unresolved must not accidentally
+    /// wildcard-match either side of a sibling-module pair: with `mod a {
+    /// mod x { ... } }` and `mod b { mod x { ... } }`, `edge_routes![x::f]`
+    /// written inside `mod b` matches neither — the exact scenario the
+    /// exact-equality match in `is_registered` exists to keep from silently
+    /// muting a real "unregistered" warning.
     #[test]
     fn a_relative_child_module_registration_does_not_shadow_a_sibling() {
         let scan = scan_one(
@@ -1565,18 +1721,11 @@ mod tests {
             }
             ",
         );
-        let unregistered: Vec<&EdgeFn> = scan.unregistered();
-        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
-        assert_eq!(
-            unregistered[0].module_path,
-            vec!["a".to_owned(), "x".to_owned()]
-        );
-
-        let registered = scan.registered_fns();
-        assert_eq!(registered.len(), 1, "{registered:?}");
-        assert_eq!(
-            registered[0].module_path,
-            vec!["b".to_owned(), "x".to_owned()]
+        assert_eq!(scan.unregistered().len(), 2, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
         );
     }
 
@@ -1605,5 +1754,40 @@ mod tests {
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].name, "show");
         assert_eq!(registered[0].module_path, vec!["users".to_owned()]);
+    }
+
+    /// `src/bin/<name>.rs` is Cargo's own crate root for that `[[bin]]`
+    /// target, not a `bin::edge_capsule` submodule of the app's library
+    /// crate — so a handler declared directly in it has an empty module
+    /// path, and `edge_routes![crate::show]` written in that same file
+    /// matches it.
+    #[test]
+    fn a_flat_bin_target_file_is_its_own_crate_root() {
+        let scan = scan_sources(&[(
+            "src/bin/edge-capsule.rs",
+            "#[edge]\npub fn show() {}\nfn main() { edge_routes![crate::show]; }\n",
+        )]);
+        assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same as above for the directory-style bin layout
+    /// (`src/bin/<name>/main.rs`), and its own sibling submodule
+    /// (`src/bin/<name>/routes.rs`) is relative to THAT crate's root, not to
+    /// `src/`.
+    #[test]
+    fn a_directory_style_bin_targets_own_submodule_is_relative_to_its_root() {
+        let scan = scan_sources(&[
+            (
+                "src/bin/edge-capsule/main.rs",
+                "mod routes; fn main() { edge_routes![routes::show]; }\n",
+            ),
+            (
+                "src/bin/edge-capsule/routes.rs",
+                "#[edge]\npub fn show() {}\n",
+            ),
+        ]);
+        assert_eq!(scan.functions[0].module_path, vec!["routes".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 }
