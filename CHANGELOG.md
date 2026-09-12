@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
+  `rich_text_area` and its five siblings in `autumn::form` hardcoded English
+  chrome: the toolbar's aria-label, its per-control names and syntax hints,
+  the hint under the editor, and the "Preview" heading. Callers had no way
+  to override this text. A new `RichTextLabels` builder carries all four
+  labels. A `_with_labels` sibling of each existing function
+  (`rich_text_area_with_labels`, `rich_text_area_htmx_with_labels`,
+  `rich_text_area_htmx_with_token_field_with_labels`, and the three
+  `required_*` counterparts) takes one. An app can now translate the
+  editor's chrome without touching the rest of the form. Additive and
+  backward-compatible: every existing function keeps rendering the default
+  English labels unchanged.
+- **`IntoChangeset::into_changeset_with` resolves a validation message by
+  field and code (#2227):** when a `#[validate(...)]` rule has no explicit
+  `message`, an unmessaged rule always produced the hardcoded English
+  `"validation failed: {code}"`. `into_changeset_with` takes a
+  `resolve: impl Fn(&str, &str) -> Option<String>` closure. `resolve` runs
+  first: return `Some(message)` to supply a translated message for a
+  `(field, code)` pair, or `None` to keep the default. An explicit `message`
+  on the validator attribute always wins; the resolver never sees it.
+  `into_changeset` is unchanged and keeps producing the same default
+  messages as before.
+- **Translatable state-transition controls via `TransitionLabels` (#2227):**
+  `autumn::widgets::transition_controls` built its group aria-label
+  (`"{field} transitions"`) and every button's `"Mark as {state}"` inside
+  itself, from positional arguments that carried no label seam. A new
+  `TransitionLabels` builder carries a group label plus `(target_state, label)`
+  overrides, and `transition_controls_with_labels` takes one. Additive and
+  backward-compatible: `transition_controls` renders exactly as before, and a
+  state with no override keeps its English default.
+- **`autumn generate scaffold --i18n` now translates the last three English
+  surfaces (#2227):** the flag used to warn about three gaps. A `richtext`
+  column's editor chrome, a `:states(…)` column's transition buttons, and
+  every inline `#[validate(...)]` message stayed English next to a
+  translated label. All three now go through the bundle. The rich-text
+  editor gets `common.richtext.toolbar` / `.hint` / `.preview` plus one key
+  per toolbar control (the Markdown syntax beside each name stays literal).
+  The transition controls get `<model>.field.<column>.transitions` and one
+  `<model>.field.<column>.transition.<state>` per distinct target state.
+  The `create`/`update` handlers build their changeset with
+  `into_changeset_with`, resolving each validator code through
+  `<model>.field.<column>.error.<code>`. Every English default is the exact
+  text the plain scaffold renders today, so an `en` app is unchanged, and
+  output without `--i18n` is byte-identical. One gap remains: the CSV
+  import report. `import_csv` runs its row handler per line, with no
+  request locale. `--import` with `--validate` under `--i18n` still shows
+  English messages there.
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
