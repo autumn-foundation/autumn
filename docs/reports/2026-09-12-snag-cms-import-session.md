@@ -146,13 +146,20 @@ repro needs. The realistic trigger is narrower: any version-2/3-*labeled*
 file the importer nonetheless accepts without checking that its content is
 even period-consistent — a hand-edited export (the code's own comment on
 `import_status` separately treats "a file... hand-edited or came from
-another tool" as a real, anticipated input class for this same importer), a
-migration tool emitting cms's documented legacy JSON shape from another
-platform, or a file whose version label was simply changed. Filed as data
-loss on an input class this importer explicitly commits to accepting
-(`READABLE_EXPORT_VERSIONS`) and applies no such consistency check to —
-not as a risk to a site's own untouched historical backups. The issue text
-has been corrected to match.
+another tool" as a real, anticipated input class for this same importer),
+or a migration tool emitting cms's documented legacy JSON shape from
+another platform. (Not, on its own, a current export with only its version
+label changed: `identity()` prefers `post.path` whenever the file carries
+one, regardless of the declared `version`, so a genuine version-5 file
+relabeled `"version": 2` still sorts correctly — the file must actually
+omit or clear each post's `path`, not merely claim an older version
+number, which is exactly what a hand-edited or third-party-tool-produced
+file does and a relabeled current export does not. A second Codex catch
+on this PR, after this paragraph's own first correction listed the
+version-relabel case too loosely.) Filed as data loss on an input class
+this importer explicitly commits to accepting (`READABLE_EXPORT_VERSIONS`)
+and applies no such consistency check to — not as a risk to a site's own
+untouched historical backups. The issue text has been corrected to match.
 
 Full repro script, root cause, and both oracles are in the issue.
 
