@@ -233,6 +233,61 @@ sink stores audit events somewhere that can be pruned in place and you want
 `retention.audit_archives` to reach it — see
 [Data Retention for Framework-Owned Data](../guide/data-retention.md).
 
+### openapi: `Parameter` gains a `description` field
+
+**Why:** A `Query<T>` field that decodes as an array of objects
+(`?items[0][sku]=A-1`) has no OpenAPI `style` that describes it — neither
+RFC 6570 nor OAS 3.x define one. `Parameter` now carries a `description` so
+the generated spec names that encoding instead of staying silent about it
+(issue #2251).
+
+Only code that constructs a `Parameter` *by struct literal*, outside this
+crate, has to change. Every route macro and the OpenAPI generator itself
+already build one field at a time and are unaffected.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+    description: None,
+};
+
+// …or, now that `Parameter` derives `Default`:
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    ..Default::default()
+};
+```
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+`..Default::default()`), which no mechanical rewrite can choose safely.
+
 ### SSG: `ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`, and generated pages carry their declared `Content-Type`
 
 **Why:** The static-first serve path used to reverse-engineer each cached page's

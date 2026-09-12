@@ -135,6 +135,15 @@ jobs:
         # the `sqlite`-excluding feature lists below, and nothing read the
         # manifests. No toolchain, ~1 second, self-testing.
         run: ./scripts/check-sqlite-unification.sh
+      - name: Example binary-name collision gate
+        # Two workspace members producing the same binary file name break the
+        # Windows linker intermittently (LNK1104, issue #2639) while staying
+        # invisible on Unix, so CI only catches the reintroduction when two
+        # links happen to overlap. This script enumerates every member's
+        # explicit [[bin]] AND auto-discovered src/bin targets (issues
+        # #2690/#2691) and fails on a duplicate name. No toolchain, ~1
+        # second, self-testing.
+        run: ./scripts/check-example-bin-names.sh
 
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
@@ -1269,6 +1278,8 @@ jobs:
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored
+          # autumn-billing: close_dunning_for open-row-scan profile (Ledger).
+          cargo test -p autumn-billing --test dunning_close_scan_profile -- --ignored
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
@@ -1703,6 +1714,8 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-billing \
+            --test dunning_close_scan_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored

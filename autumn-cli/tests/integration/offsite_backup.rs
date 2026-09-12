@@ -213,6 +213,7 @@ async fn start_minio() -> testcontainers::core::error::Result<
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
@@ -226,7 +227,11 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = start_minio()
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
+    let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .start()
         .await
         .expect("start MinIO — is Docker running?");
     let minio_host = minio.get_host().await.unwrap();
@@ -334,6 +339,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
@@ -347,7 +353,11 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = start_minio()
+    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
+    // repository itself now 404s); the same tag is still mirrored on Quay.
+    let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .start()
         .await
         .expect("start MinIO — is Docker running?");
     let minio_host = minio.get_host().await.unwrap();
