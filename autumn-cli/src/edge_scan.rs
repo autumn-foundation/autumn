@@ -542,14 +542,16 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// target or reject `--embed` (Codex review on #2739, round 13, P2).
 ///
 /// Only a literal `wasm32-wasip1` triple, or a `cfg(...)` predicate built
-/// from `target_arch = "wasm32"` leaves combined with `not`/`all`/`any`, is
-/// resolved; anything else (an OS-family shorthand like `windows`/`unix`, a
-/// `target_os`/`target_family`/… key, or a predicate this scan cannot parse)
-/// is treated as NOT applying. That is the opposite default from function-
-/// level `#[cfg(...)]` evaluation ([`eval_cfg_attr`], which stays
-/// conservative by assuming *true*): crediting an inapplicable target here
-/// produces a phantom route, not a merely missed one, so "cannot resolve"
-/// must mean "does not match."
+/// from `target_arch`/`target_os`/`target_family` leaves (each compared
+/// against wasm32-wasip1's own real value — see
+/// `WASM32_WASIP1_CFG_VALUES`) combined with `not`/`all`/`any`, is resolved;
+/// anything else (an OS-family shorthand like `windows`/`unix`, a
+/// `target_env`/`target_pointer_width`/… key, or a predicate this scan
+/// cannot parse) is treated as NOT applying. That is the opposite default
+/// from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`], which
+/// stays conservative by assuming *true*): crediting an inapplicable target
+/// here produces a phantom route, not a merely missed one, so "cannot
+/// resolve" must mean "does not match."
 #[must_use]
 fn target_key_matches_edge_capsule(target_key: &str) -> bool {
     if target_key == crate::build::EDGE_TARGET {
@@ -569,24 +571,37 @@ fn target_key_matches_edge_capsule(target_key: &str) -> bool {
 /// leaves, combined with `not`, `all`, and `any` — see
 /// [`target_key_matches_edge_capsule`].
 enum TargetCfgPredicate {
-    Wasm32,
-    NotWasm32,
+    /// A `key = "value"` leaf this scan recognizes, already compared against
+    /// wasm32-wasip1's own known value for that key.
+    Leaf(bool),
     Not(Box<Self>),
     All(Vec<Self>),
     Any(Vec<Self>),
 }
 
+/// wasm32-wasip1's own value for each `cfg(...)` key this scan resolves,
+/// verified directly against `rustc --print cfg --target wasm32-wasip1`
+/// (Codex review on #2739, round 14, P1, extending round 13's `target_arch`-
+/// only grammar after a real `target_os = "wasi"` predicate was found to
+/// evaluate as "does not match" when it actually does, for the exact
+/// dangerous-direction reason round 13 introduced this evaluator to avoid: a
+/// route Cargo really compiles for the capsule was scanned out).
+const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
+    ("target_arch", "wasm32"),
+    ("target_os", "wasi"),
+    ("target_family", "wasm"),
+];
+
 impl syn::parse::Parse for TargetCfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let ident: syn::Ident = input.parse()?;
-        if ident == "target_arch" {
+        if let Some((_, wasip1_value)) = WASM32_WASIP1_CFG_VALUES
+            .iter()
+            .find(|(key, _)| ident == key)
+        {
             input.parse::<syn::Token![=]>()?;
             let lit: syn::LitStr = input.parse()?;
-            return Ok(if lit.value() == "wasm32" {
-                Self::Wasm32
-            } else {
-                Self::NotWasm32
-            });
+            return Ok(Self::Leaf(lit.value() == *wasip1_value));
         }
         if ident == "not" {
             let content;
@@ -606,8 +621,9 @@ impl syn::parse::Parse for TargetCfgPredicate {
                 Self::Any(parts)
             });
         }
-        // `windows`, `unix`, `target_os`, `target_family`, ... — not part of
-        // the resolvable grammar; the caller treats this as "does not match."
+        // `windows`, `unix`, `target_env`, `target_pointer_width`, ... — not
+        // part of the resolvable grammar; the caller treats this as "does
+        // not match."
         Err(input.error("target cfg predicate not resolvable by this scan"))
     }
 }
@@ -615,8 +631,7 @@ impl syn::parse::Parse for TargetCfgPredicate {
 impl TargetCfgPredicate {
     fn eval(&self) -> bool {
         match self {
-            Self::Wasm32 => true,
-            Self::NotWasm32 => false,
+            Self::Leaf(matches) => *matches,
             Self::Not(inner) => !inner.eval(),
             Self::All(parts) => parts.iter().all(Self::eval),
             Self::Any(parts) => parts.iter().any(Self::eval),
@@ -2096,6 +2111,57 @@ mod tests {
     fn a_not_wasm32_target_specific_dependency_is_not_enabled() {
         let manifest = r#"
             [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"));
+    }
+
+    /// Verified directly against `rustc --print cfg --target wasm32-wasip1`:
+    /// that target reports `target_os = "wasi"`, a real and commonly used
+    /// predicate distinct from `target_arch = "wasm32"` — round 13's grammar
+    /// only recognized the latter, so this predicate evaluated as "does not
+    /// match" even though it genuinely does, excluding a route Cargo really
+    /// compiles for the capsule (Codex review on #2739, round 14, P1).
+    #[test]
+    fn a_target_os_wasi_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(target_os = "wasi")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// Same for `target_family = "wasm"`, wasm32-wasip1's third resolvable
+    /// key.
+    #[test]
+    fn a_target_family_wasm_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(target_family = "wasm")'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"));
+    }
+
+    /// A recognized key with the WRONG value (wasm32-wasip1 is not Linux)
+    /// must evaluate as "does not match," not as unresolvable — the two
+    /// currently produce the same top-level answer, but only because the
+    /// wrong-value case is an explicit `Leaf(false)`, not a parse failure.
+    #[test]
+    fn a_target_os_linux_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(target_os = "linux")'.dependencies]
             dep = { version = "1", optional = true }
 
             [features]

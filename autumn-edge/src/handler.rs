@@ -134,10 +134,11 @@ where
 ///
 /// Blanket-implemented for exactly [`axum::extract::Path`],
 /// [`axum::extract::Query`], [`http::HeaderMap`], [`EdgeCache`](crate::extract::EdgeCache),
-/// the empty tuple (a handler with no extractors), and tuples of up to eight
-/// [`EdgeLeaf`] types — nothing else. This is what makes [`EdgeHandler`] a
-/// whitelist rather than a blacklist: a new native-only extractor needs no
-/// refusal added here, because it was never on the list to begin with.
+/// the empty tuple (a handler with no extractors), and tuples of up to
+/// sixteen [`EdgeLeaf`] types — nothing else. This is what makes
+/// [`EdgeHandler`] a whitelist rather than a blacklist: a new native-only
+/// extractor needs no refusal added here, because it was never on the list
+/// to begin with.
 ///
 /// Sealed, but — unlike [`EdgeLeaf`] — deliberately not the trait each tuple
 /// position is judged by; see the module doc's "Why the tuple check has two
@@ -194,7 +195,10 @@ impl sealed::LeafSealed for crate::extract::EdgeCache {}
 impl EdgeLeaf for crate::extract::EdgeCache {}
 
 /// Implement [`EdgeLeaf`] for a plain tuple of leaves, `(E1, .., En)` for `n`
-/// from 1 to 8, when each `Ei` is itself an [`EdgeLeaf`] — axum implements
+/// from 1 to 16 — axum's own tuple `FromRequestParts` impls go up to 16
+/// elements (`all_the_tuples_no_last_special_case!` in `axum_core::macros`),
+/// so stopping short would reject an otherwise-valid grouping axum itself
+/// accepts — when each `Ei` is itself an [`EdgeLeaf`]. axum implements
 /// `FromRequestParts` for tuples (including the 1-element case), so a
 /// handler author can group extractors by hand into a single parameter
 /// (`async fn h(combo: (Path<T>, HeaderMap))`, or even `(Path<T>,)` alone),
@@ -220,9 +224,24 @@ impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5);
 impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6);
 impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7);
 impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
+impl_edge_leaf_for_tuple!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
+impl_edge_leaf_for_tuple!(
+    T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15
+);
+impl_edge_leaf_for_tuple!(
+    T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16
+);
 
 /// Implement [`EdgeExtract`] for axum's handler-arity tuple, `(M, E1, ..,
-/// En)`, when each `Ei` is an [`EdgeLeaf`].
+/// En)` for `n` from 1 to 16 (axum's own `impl_handler!` — see
+/// `all_the_tuples!` in `axum_core::macros` — goes up to 16 extractors, so
+/// stopping short would reject an otherwise-valid handler axum itself
+/// accepts), when each `Ei` is an [`EdgeLeaf`].
 ///
 /// axum's own `Handler<T, S>` blanket impl (see `impl_handler!` in
 /// `axum::handler`) does not use `T = (E1, .., En)` — it prepends a private
@@ -251,6 +270,18 @@ impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5);
 impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6);
 impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7);
 impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
+impl_edge_extract_for_handler_arity!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
+impl_edge_extract_for_handler_arity!(
+    T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15
+);
+impl_edge_extract_for_handler_arity!(
+    T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16
+);
 
 /// Adapt a `GET` handler into the `MethodRouter` an
 /// [`EdgeRoute`](crate::route::EdgeRoute) carries.
@@ -332,6 +363,58 @@ mod tests {
         name
     }
 
+    /// axum's own handler-arity impl (`impl_handler!` via `all_the_tuples!`
+    /// in `axum_core::macros`) goes up to 16 extractors; stopping the
+    /// `EdgeExtract`/`EdgeLeaf` tuple macros at 8 rejected a handler axum
+    /// itself accepts. 16 separate extractors, then the same 16 grouped as
+    /// one hand-written tuple, both exercise the new maximum arity (Codex
+    /// review on #2739, round 14, P2).
+    #[allow(clippy::too_many_arguments)]
+    async fn with_sixteen_extractors(
+        _e1: HeaderMap,
+        _e2: HeaderMap,
+        _e3: HeaderMap,
+        _e4: HeaderMap,
+        _e5: HeaderMap,
+        _e6: HeaderMap,
+        _e7: HeaderMap,
+        _e8: HeaderMap,
+        _e9: HeaderMap,
+        _e10: HeaderMap,
+        _e11: HeaderMap,
+        _e12: HeaderMap,
+        _e13: HeaderMap,
+        _e14: HeaderMap,
+        _e15: HeaderMap,
+        cache: EdgeCache,
+    ) -> String {
+        cache.get_string("k").unwrap_or_default()
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn with_sixteen_grouped_extractors(
+        _group: (
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+            HeaderMap,
+        ),
+    ) -> &'static str {
+        "ok"
+    }
+
     /// The prelude's extractors are exactly the ones an edge handler may use;
     /// if any of these stopped satisfying the bound this would not compile.
     #[test]
@@ -344,6 +427,8 @@ mod tests {
         let _ = edge_get(with_everything);
         let _ = edge_get(with_grouped_tuple);
         let _ = edge_get(with_one_element_grouped_tuple);
+        let _ = edge_get(with_sixteen_extractors);
+        let _ = edge_get(with_sixteen_grouped_extractors);
     }
 
     #[test]
