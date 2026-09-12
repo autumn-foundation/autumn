@@ -187,17 +187,11 @@ impl EdgeScan {
 /// whichever one was not actually registered.
 fn is_registered(f: &EdgeFn, registered: &BTreeSet<String>) -> bool {
     registered.iter().any(|entry| {
-        let mut segments: Vec<&str> = entry.split("::").collect();
-        let Some(name) = segments.pop() else {
-            return false;
-        };
+        let (qualifier, name) = entry.rsplit_once("::").unwrap_or(("", entry.as_str()));
         name == f.name
-            && (segments.is_empty()
+            && (qualifier.is_empty()
                 || f.module_path.is_empty()
-                || segments
-                    .iter()
-                    .copied()
-                    .eq(f.module_path.iter().map(String::as_str)))
+                || qualifier.split("::").eq(f.module_path.iter().map(String::as_str)))
     })
 }
 
