@@ -15,6 +15,12 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
 
+// Docker Hub no longer serves anonymous pulls of `minio/minio` (any tag,
+// including `latest`, 401s `insufficient_scope`) — MinIO restricted the
+// repository some time in 2025. Quay.io still mirrors the same tags
+// anonymously, so pull from there instead (issue #2727 CI investigation).
+const MINIO_IMAGE: &str = "quay.io/minio/minio";
+
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
 const BUCKET: &str = "test-avatars";
