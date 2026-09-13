@@ -1039,7 +1039,31 @@ def pattern_pins(body):
 # A fence opener, with its language. Only ```toml blocks are handed to the TOML
 # parser; every other block stays on the pattern path.
 FENCE_MARK = re.compile(r'^[^\S\n]*(?P<mark>`{3,}|~{3,})[^\S\n]*'
-                        r'(?P<info>[^`~\n]*)$')
+                        r'(?P<info>[^\n]*)$')
+
+
+def fence_opener(line):
+    """A fence opener as (fence character, info string), or None.
+
+    CommonMark restricts the info string of a BACKTICK fence only, and only as
+    to backticks: ```` ```lang`x` ```` would be ambiguous with inline code. A
+    tilde fence's info string may hold anything, backticks and tildes included.
+
+    Excluding both characters from every info string — which is what this
+    pattern did — repeats the bug `fence_language` was written to fix, one
+    character over. An ordinary annotation such as
+    ```` ```toml title="~/Cargo.toml" ```` matched the opener NOT AT ALL, so
+    the block was neither parsed nor masked and its whole body went to the
+    pattern path; a `[patch.crates-io]` pin under that opener was then reported
+    against the exemption this gate documents a few hundred lines up.
+    """
+    match = FENCE_MARK.match(line)
+    if match is None:
+        return None
+    mark, info = match['mark'][0], match['info']
+    if mark == '`' and '`' in info:
+        return None
+    return mark, info
 
 
 def fence_language(info):
@@ -1068,16 +1092,16 @@ def toml_fences(text):
     lines = text.splitlines()
     i = 0
     while i < len(lines):
-        opener = FENCE_MARK.match(lines[i])
-        if not opener:
+        opener = fence_opener(lines[i])
+        if opener is None:
             i += 1
             continue
-        mark = opener.group('mark')[0]
+        mark, info = opener
         start = i + 1
         end = start
         while end < len(lines) and not lines[end].strip().startswith(mark * 3):
             end += 1
-        if fence_language(opener.group('info')) == 'toml':
+        if fence_language(info) == 'toml':
             yield start + 1, '\n'.join(lines[start:end])
         i = end + 1
 
@@ -1659,6 +1683,33 @@ def self_test():
     expect('annotated toml fence is still parsed',
            list(pins('```toml title="Cargo.toml"\n[dependencies]\n'
                      'autumn-web = "0.5"\n```\n')),
+           [(3, 'autumn-web', '0.5')])
+    # A BACKTICK fence's info string may hold a tilde — a path annotation is
+    # the obvious way to write one. Excluding tildes from every info string
+    # reopened the hole above, one character over.
+    expect('tilde in a backtick info string is still an opener',
+           fence_opener('```toml title="~/Cargo.toml"'),
+           ('`', 'toml title="~/Cargo.toml"'))
+    expect('tilde-annotated toml fence is parsed',
+           list(pins('```toml title="~/Cargo.toml"\n[dependencies]\n'
+                     'autumn-web = "0.5"\n```\n')),
+           [(3, 'autumn-web', '0.5')])
+    expect('tilde-annotated patch fence stays exempt',
+           list(pins('```toml title="~/Cargo.toml"\n[patch.crates-io]\n'
+                     'autumn-web = { path = "../fork", version = "0.5" }\n'
+                     '```\n')),
+           [])
+    # …and the one restriction CommonMark does place stays enforced: a
+    # backtick in a BACKTICK fence's info string is ambiguous with inline code,
+    # so that line opens nothing.
+    expect('backtick in a backtick info string is not an opener',
+           fence_opener('```toml `x`'), None)
+    # A TILDE fence carries no such restriction, on either character.
+    expect('tilde fence info string takes both characters',
+           fence_opener('~~~toml title="`~/Cargo.toml`"'),
+           ('~', 'toml title="`~/Cargo.toml`"'))
+    expect('tilde-fenced toml is parsed',
+           list(pins('~~~toml\n[dependencies]\nautumn-web = "0.5"\n~~~\n')),
            [(3, 'autumn-web', '0.5')])
 
     # ---- the surface line survives a README pin that is not a version ----
