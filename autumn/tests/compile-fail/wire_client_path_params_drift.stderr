@@ -1,0 +1,8 @@
+error[E0080]: evaluation panicked: wire contract broken in client `CatalogClient`: it declares path parameters (id) for endpoint `get_item`, but that endpoint's route path no longer takes exactly those, in that order
+  --> tests/compile-fail/wire_client_path_params_drift.rs:18:1
+   |
+18 | / wire_client! {
+19 | |     name = CatalogClient,
+20 | |     endpoints = [get_item_endpoint(id)],
+21 | | }
+   | |_^ evaluation of `_` failed here
