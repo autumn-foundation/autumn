@@ -836,7 +836,7 @@ impl EditorContext {
 fn apply_submitted_taxonomies(context: &mut EditorContext, form: &PostForm) {
     for field in &mut context.taxonomies {
         if field.hierarchical {
-            field.selected = form.taxonomies.get(field.slug).cloned().unwrap_or_default();
+            field.selected = submitted_term_ids(form, field.slug);
         } else {
             field.names = form
                 .taxonomy_names
@@ -845,6 +845,30 @@ fn apply_submitted_taxonomies(context: &mut EditorContext, form: &PostForm) {
                 .unwrap_or_default();
         }
     }
+}
+
+/// The ids `form` submitted for one hierarchical taxonomy, deduplicated and
+/// capped at `MAX_TERMS_PER_SAVE` — bounded on the way out of the submission,
+/// before a sort, a collection into a second `Vec`, or a per-checkbox
+/// `contains` scan ever sees them.
+///
+/// This runs on an already-rejected submission a crafted request fully
+/// controls, not a validated save: `field.selected` and the missing-id
+/// lookup below both read straight from `form.taxonomies`, and an early cap
+/// here is what stops a request repeating a taxonomy checkbox far past
+/// `MAX_TERMS_PER_SAVE` from making either one collect, sort or scan an
+/// oversized list — the query bound `resolve_term_ids` and the earlier
+/// `ensure_submitted_choices_visible` fix apply is too late to help either.
+fn submitted_term_ids(form: &PostForm, taxonomy_slug: &str) -> Vec<i64> {
+    let mut seen = std::collections::HashSet::new();
+    form.taxonomies
+        .get(taxonomy_slug)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .take(MAX_TERMS_PER_SAVE)
+        .collect()
 }
 
 /// Make sure a submission's chosen parent, featured image and hierarchical
@@ -886,22 +910,13 @@ async fn ensure_submitted_choices_visible(
         }
         let present: std::collections::HashSet<i64> =
             field.terms.iter().map(|term| term.id).collect();
-        let mut missing: Vec<i64> = form
-            .taxonomies
-            .get(field.slug)
+        // Already deduplicated and capped at `MAX_TERMS_PER_SAVE` by
+        // `submitted_term_ids` — filtering `present` out afterwards only
+        // ever shrinks that bounded list, never grows it.
+        let missing: Vec<i64> = submitted_term_ids(form, field.slug)
             .into_iter()
-            .flatten()
-            .copied()
             .filter(|id| !present.contains(id))
             .collect();
-        // Deduplicated and bounded the same way `resolve_term_ids` bounds a
-        // save, before any of it reaches the database: this is a display
-        // convenience for an already-rejected submission, not a save, so a
-        // crafted request repeating thousands of ids must not make it
-        // allocate, query and render an unbounded list.
-        missing.sort_unstable();
-        missing.dedup();
-        missing.truncate(MAX_TERMS_PER_SAVE);
         if missing.is_empty() {
             continue;
         }
