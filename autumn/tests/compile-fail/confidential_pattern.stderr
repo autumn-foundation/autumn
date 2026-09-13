@@ -1,0 +1,5 @@
+error[E0599]: no method named `like` found for struct `BlindIndexPredicate<F>` in the current scope
+ --> tests/compile-fail/confidential_pattern.rs:4:73
+  |
+4 | fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).like("%@example.com"); }
+  |                                                                         ^^^^ method not found in `BlindIndexPredicate<Email>`

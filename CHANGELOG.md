@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `#[confidential]` model fields with distinct ciphertext/blind-index storage metadata, a blind-index-only equality capability, focused incompatible-mode diagnostics, and a documented raw-Diesel enforcement boundary.
+
 ### Added
 
 - **Build-checked typed contracts between two Autumn services (#1755):** the day

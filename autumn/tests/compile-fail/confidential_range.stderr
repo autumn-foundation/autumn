@@ -1,0 +1,14 @@
+error[E0599]: `BlindIndexPredicate<Email>` is not an iterator
+ --> tests/compile-fail/confidential_range.rs:4:73
+  |
+4 | fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).gt(token()); }
+  |                                                                         ^^ `BlindIndexPredicate<Email>` is not an iterator
+  |
+ ::: src/confidential.rs
+  |
+  | pub struct BlindIndexPredicate<F> {
+  | --------------------------------- doesn't satisfy `BlindIndexPredicate<Email>: Iterator`
+  |
+  = note: the following trait bounds were not satisfied:
+          `BlindIndexPredicate<Email>: Iterator`
+          which is required by `&mut BlindIndexPredicate<Email>: Iterator`

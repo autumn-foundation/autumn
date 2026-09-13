@@ -1,0 +1,5 @@
+error: `#[confidential]` cannot be combined with `#[searchable]`: confidential values have separate randomized-ciphertext and blind-index storage and support only named blind-index equality
+ --> tests/compile-fail/confidential_search.rs:3:34
+  |
+3 | pub struct Record { pub id: i32, #[confidential] #[searchable] pub email: String }
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

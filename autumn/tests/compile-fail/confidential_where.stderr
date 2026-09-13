@@ -1,0 +1,48 @@
+error[E0277]: the trait bound `BlindIndexPredicate<Email>: Expression` is not satisfied
+ --> tests/compile-fail/confidential_where.rs:8:35
+  |
+8 |     let _ = records::table.filter(predicate);
+  |                            ------ ^^^^^^^^^ the trait `Expression` is not implemented for `BlindIndexPredicate<Email>`
+  |                            |
+  |                            required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `Expression`:
+            &T
+            AliasedField<S, C>
+            Box<T>
+            CaseWhen<diesel::expression::case_when::non_public_types::CaseWhenConditionsIntermediateNode<W, T, Whens>, E>
+            CaseWhen<diesel::expression::case_when::non_public_types::CaseWhenConditionsLeaf<W, T>, diesel::expression::case_when::non_public_types::ElseExpression<E>>
+            CaseWhen<diesel::expression::case_when::non_public_types::CaseWhenConditionsLeaf<W, T>, diesel::expression::case_when::non_public_types::NoElseExpression>
+            Exists<T>
+            In<T, U>
+          and $N others
+  = note: required for `SelectStatement<diesel::query_builder::FromClause<table>>` to implement `FilterDsl<BlindIndexPredicate<Email>>`
+  = note: 1 redundant requirement hidden
+  = note: required for `table` to implement `FilterDsl<BlindIndexPredicate<Email>>`
+note: required by a bound in `diesel::QueryDsl::filter`
+ --> $CARGO/diesel-$VERSION/src/query_dsl/mod.rs
+  |
+  |     fn filter<Predicate>(self, predicate: Predicate) -> Filter<Self, Predicate>
+  |        ------ required by a bound in this associated function
+  |     where
+  |         Self: methods::FilterDsl<Predicate>,
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `QueryDsl::filter`
+
+error[E0277]: the trait bound `BlindIndexPredicate<Email>: NonAggregate` is not satisfied
+ --> tests/compile-fail/confidential_where.rs:8:28
+  |
+8 |     let _ = records::table.filter(predicate);
+  |                            ^^^^^^ the trait `ValidGrouping<()>` is not implemented for `BlindIndexPredicate<Email>`
+  |
+  = help: the following other types implement trait `ValidGrouping<GroupByClause>`:
+            `&T` implements `ValidGrouping<GB>`
+            `()` implements `ValidGrouping<GB>`
+            `(T, T1)` implements `ValidGrouping<__GroupByClause>`
+            `(T, T1, T2)` implements `ValidGrouping<__GroupByClause>`
+            `(T, T1, T2, T3)` implements `ValidGrouping<__GroupByClause>`
+            `(T, T1, T2, T3, T4)` implements `ValidGrouping<__GroupByClause>`
+            `(T, T1, T2, T3, T4, T5)` implements `ValidGrouping<__GroupByClause>`
+            `(T, T1, T2, T3, T4, T5, T6)` implements `ValidGrouping<__GroupByClause>`
+          and $N others
+  = note: required for `BlindIndexPredicate<Email>` to implement `NonAggregate`
+  = note: required for `SelectStatement<diesel::query_builder::FromClause<table>>` to implement `FilterDsl<BlindIndexPredicate<Email>>`

@@ -1,0 +1,5 @@
+error[E0599]: no method named `asc` found for struct `BlindIndexPredicate<F>` in the current scope
+ --> tests/compile-fail/confidential_order.rs:4:73
+  |
+4 | fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).asc(); }
+  |                                                                         ^^^ method not found in `BlindIndexPredicate<Email>`
