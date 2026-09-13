@@ -1116,7 +1116,14 @@ def fenced_toml_pins(body):
         try:
             doc = tomllib.loads(fence)
         except (tomllib.TOMLDecodeError, ValueError, TypeError):
-            for lineno, crate, spec in pattern_pins(fence):
+            # Comments are blanked before the pattern sees the fence, not just
+            # inside a table it has already captured. A WHOLE declaration can be
+            # commented out — `# autumn-web = "0.5"` above a live pin is how
+            # anyone shows a before-and-after — and reporting it is a false
+            # positive on a page doing nothing wrong. The fence is known TOML
+            # here, which is what makes this safe; the same blanking must never
+            # be applied to a whole markdown page, where `#` opens a heading.
+            for lineno, crate, spec in pattern_pins(without_toml_comments(fence)):
                 yield first_line + lineno - 1, crate, spec
             continue
         fence_lines = fence.splitlines()
@@ -1709,6 +1716,17 @@ def self_test():
     expect('comment stripper preserves length',
            len(without_toml_comments('a = 1 # note\nb = 2\n')),
            len('a = 1 # note\nb = 2\n'))
+    # A WHOLE declaration commented out, in a fence that does not parse. The
+    # live pin beside it is still read; the commented one is not a pin at all.
+    expect('commented-out declaration is not a pin',
+           list(pins(fenced('[dependencies]', '# autumn-web = "0.5"',
+                            'autumn-web = "0.7"', 'oops ='))),
+           [(4, 'autumn-web', '0.7')])
+    # …and a commented subtable header does not open a section either.
+    expect('commented subtable header is inert',
+           list(pins(fenced('# [dependencies.autumn-web]', '# version = "0.5"',
+                            'oops ='))),
+           [])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
