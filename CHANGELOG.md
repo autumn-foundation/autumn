@@ -415,6 +415,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password protection across page/feed/API, permalink-structure changes not
   404ing existing URLs, revision restore, export/import idempotence, and a CSRF
   round trip.
+- **`LazyDb`, a lazy database connection extractor (#2264):** `Db` is a
+  `FromRequestParts` extractor. Axum runs it before the body extractor
+  (`Form`, `Json`, `Multipart`, ...) in the same handler. A handler that took
+  both held a pooled connection for as long as the client took to send its
+  body. A slow upload could pin `pool_size` connections and starve every
+  other request. `LazyDb` takes the same argument position but defers the
+  checkout. It records what the checkout will need at extraction time and
+  only takes a connection when the handler calls `LazyDb::checkout`, after
+  the body is already read. `#[commentable]`'s own `post_comment` handler now
+  uses it. Additive: existing `Db` handlers are unaffected.
 
 ### Changed
 

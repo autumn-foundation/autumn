@@ -171,7 +171,7 @@ const RESULT_UNWRAP_METHODS: &[&str] = &["expect", "unwrap"];
 /// Exact type names that name a database handle.
 const HANDLE_TYPES: &[&str] = &[
     "Db",
-    "DeferredDb",
+    "LazyDb",
     "ShardedDb",
     "ShardedReadDb",
     "TestDb",

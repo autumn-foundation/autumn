@@ -2551,6 +2551,11 @@ impl Drop for TxDepthGuard<'_> {
 /// requests that use `Db` will receive a `503 Service Unavailable`
 /// response.
 ///
+/// A handler that also takes a body extractor (`Form`, `Json`, `Multipart`,
+/// ...) should take [`LazyDb`] instead. `Db` checks out a connection before
+/// axum reads the body. It holds that connection for as long as the client
+/// takes to send the body.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -3328,33 +3333,57 @@ impl RequestDbContext {
     }
 }
 
-/// A database checkout that has been *prepared* but not *taken*.
+/// A database checkout that is *prepared* but not yet *taken*.
 ///
-/// [`Db`] is a `FromRequestParts` extractor, so axum runs it before the final
-/// `FromRequest` extractor reads the request body. A handler taking both
-/// therefore holds a pooled connection for as long as the client takes to send
-/// its body — and the client controls that. A handful of slow-body requests can
-/// pin `pool_size` connections and starve unrelated database work, with no
-/// request timeout configured by default to stop them.
+/// `Db` is a `FromRequestParts` extractor. Axum runs it before the
+/// `FromRequest` body extractor (`Form`, `Json`, `Multipart`, ...). A handler
+/// that takes `Db` before a body extractor holds a pooled connection for as
+/// long as the client takes to send its body. The client controls that
+/// delay. A few slow uploads can pin every connection in `pool_size` and
+/// stop all other database work.
 ///
-/// This captures what the checkout needs from the request parts — statement
-/// timeout, route key, metrics, interceptors, clock — and takes the connection
-/// only when [`DeferredDb::checkout`] is awaited, which the handler does after
-/// the body is in hand.
+/// `LazyDb` fixes this. Use it instead of `Db` in a handler that also takes a
+/// body extractor, in the same argument position:
 ///
-/// `pub(crate)` deliberately: the general answer is a lazy `Db` for every
-/// handler (#2264), and shipping a second public extractor would make that
-/// harder to land rather than easier.
-pub(crate) struct DeferredDb {
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[post("/comments")]
+/// async fn post_comment(
+///     lazy_db: LazyDb,
+///     axum::extract::Form(form): axum::extract::Form<CommentForm>,
+/// ) -> AutumnResult<&'static str> {
+///     let mut db = lazy_db.checkout().await?;
+///     save_comment(&mut db, &form.body).await?;
+///     Ok("posted")
+/// }
+///
+/// # #[derive(serde::Deserialize)]
+/// # struct CommentForm { body: String }
+/// # async fn save_comment(_db: &mut Db, _body: &str) -> AutumnResult<()> { Ok(()) }
+/// ```
+///
+/// Axum still runs `LazyDb::from_request_parts` before the body is read. But
+/// extraction only records what a checkout will need: the pool handle,
+/// statement timeout, route key, metrics, interceptors, clock. No connection
+/// is taken until the handler calls [`LazyDb::checkout`], after the body
+/// extractor has already run.
+pub struct LazyDb {
     pool: Pool<RuntimeConnection>,
     ctx: RequestDbContext,
     #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
     capture_gap: Option<std::sync::Arc<str>>,
 }
 
-impl DeferredDb {
-    /// Take the connection. Called once the request body has been read.
-    pub(crate) async fn checkout(self) -> Result<Db, AutumnError> {
+impl LazyDb {
+    /// Take the connection. Call this once the request body has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when the pool cannot hand out a connection —
+    /// the same failure [`Db`]'s own extractor would return, just reported
+    /// here instead of at extraction time.
+    pub async fn checkout(self) -> Result<Db, AutumnError> {
         let result = Db::checkout(DbCheckoutParams {
             pool: &self.pool,
             pool_name: "primary",
@@ -3378,7 +3407,7 @@ impl DeferredDb {
     }
 }
 
-impl<S> FromRequestParts<S> for DeferredDb
+impl<S> FromRequestParts<S> for LazyDb
 where
     S: DbState + Send + Sync,
 {
@@ -5157,6 +5186,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// #2264: `Db` is a `FromRequestParts` extractor. Axum runs it before a
+    /// body extractor (`Form`, `Json`, ...) reads the request body. A handler
+    /// that takes both holds a pooled connection for as long as the client
+    /// takes to send its body.
+    ///
+    /// `LazyDb` must not touch the pool during extraction. It defers the
+    /// checkout to `LazyDb::checkout`, called once the body is already read.
+    /// The pool here can never complete a checkout (`test_urls::unreachable`).
+    /// So `Db` extraction fails right away, while `LazyDb` extraction still
+    /// succeeds. Only its later `checkout()` call sees the same failure.
+    #[tokio::test]
+    async fn lazy_db_extraction_does_not_check_out_a_connection() {
+        use axum::http::Request;
+
+        let config = DatabaseConfig {
+            url: Some(crate::test_urls::unreachable("lazy-db-no-checkout")),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap().unwrap();
+        let state = TestReadState { primary: pool };
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        assert!(
+            Db::from_request_parts(&mut parts, &state).await.is_err(),
+            "sanity check: the eager extractor must fail against a pool \
+             that can never complete a checkout"
+        );
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        let lazy = LazyDb::from_request_parts(&mut parts, &state)
+            .await
+            .expect("LazyDb must extract without touching the pool");
+        assert!(
+            lazy.checkout().await.is_err(),
+            "the checkout failure is deferred, not avoided"
+        );
     }
 
     #[tokio::test]
