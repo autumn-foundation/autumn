@@ -523,8 +523,12 @@ PIN = re.compile(
 # A `key = <string>` in either TOML string form, for the keys read out of an
 # inline table or a subtable body.
 VERSION_KEY = re.compile(r'version\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
+# Line-anchored, for a SUBTABLE body where `package` is a key of its own.
 PACKAGE_KEY = re.compile(
     r'(?m)^[^\S\n]*package\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
+# Unanchored, for an INLINE table where it sits mid-line among the other keys.
+PACKAGE_KEY_INLINE = re.compile(
+    r'package\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
 
 
 def _string(match):
@@ -575,7 +579,11 @@ def requirement(spec):
     # tells the reader to run. A bare `*` (already a range above) and a `0.*`
     # have no single floor: the first spans everything, the second a whole
     # major, and `upgrading.md` lists both among the forms with no floor.
-    if spec.endswith('.*'):
+    # `x` and `X` are wildcards too, and Cargo canonicalizes `0.5.x` to `0.5.*`
+    # — verified against cargo itself, which resolves both spellings. Handling
+    # only the literal `.*` left the x-form falling through to the numeric check
+    # below and out as None, which is a silent pass.
+    if spec[-1:] in ('*', 'x', 'X') and spec[-2:-1] == '.':
         head = spec[:-2]
         if head.count('.') != 1 or not all(p.isdigit() for p in head.split('.')):
             return None
@@ -696,6 +704,35 @@ def subtable_pins(body):
         yield lineno, crate, _string(version)
 
 
+# `web = { package = "autumn-web", version = "0.5" }` — an inline table on a key
+# that does not itself start with `autumn`, renamed to a crate that does. `PIN`
+# anchors on the key, so it cannot see these.
+#
+# The PARSER already resolves a rename from any dependency table, which is why
+# this only has to exist for the fragment fallback: a fence that both renames
+# and fails to parse would otherwise lose its pin, and the asymmetry between the
+# two paths is itself the kind of thing that turns into a finding later.
+RENAMED_PIN = re.compile(r'(?<![\w.-])([A-Za-z0-9_-]+)\s*=\s*\{([^{}]*)\}')
+
+
+def renamed_pins(body):
+    """Yield (line_no, crate, spec) for inline tables renamed to an autumn crate.
+
+    Keys that already start with `autumn` are left to `PIN`, so nothing is
+    reported twice.
+    """
+    for match in RENAMED_PIN.finditer(body):
+        if match.group(1).startswith('autumn'):
+            continue
+        package = _string(PACKAGE_KEY_INLINE.search(match.group(2)))
+        if not package or not package.startswith('autumn'):
+            continue
+        spec = _string(VERSION_KEY.search(match.group(2)))
+        if spec is None or requirement(spec) is None:
+            continue
+        yield body.count('\n', 0, match.start()) + 1, package, spec
+
+
 def pattern_pins(body):
     """Yield (line_no, crate, spec) for every pin a PATTERN can see.
 
@@ -712,6 +749,7 @@ def pattern_pins(body):
     to parse. `toml` fences go through `fenced_toml_pins`.
     """
     yield from subtable_pins(body)
+    yield from renamed_pins(body)
     for match in PIN.finditer(body):
         spec = match['basic'] if match['basic'] is not None else match['literal']
         if spec is None:
@@ -1213,6 +1251,30 @@ def self_test():
     # A whole-major or bare wildcard has no single floor; both stay ranges.
     expect('major wildcard skipped', requirement('0.*'), None)
     expect('bare wildcard skipped', requirement('*'), None)
+    # Cargo canonicalizes `0.5.x` to `0.5.*` and accepts either case; verified
+    # against cargo itself, which resolves both spellings.
+    expect('x wildcard has a floor', requirement('0.5.x'), '0.5')
+    expect('X wildcard has a floor', requirement('0.5.X'), '0.5')
+    expect('x wildcard is read', list(pins(fenced('autumn-web = "0.5.x"'))),
+           [(2, 'autumn-web', '0.5.x')])
+    expect('major x wildcard skipped', requirement('0.x'), None)
+
+    # A rename on a key that is not itself `autumn*`, in a fence that does NOT
+    # parse — so the parser cannot resolve it and the pattern must.
+    expect('rename in an unparseable fence',
+           list(pins(fenced('web = { package = "autumn-web", '
+                            'version = "0.5" }', 'oops ='))),
+           [(2, 'autumn-web', '0.5')])
+    expect('rename in prose',
+           list(pins('use `web = { package = "autumn-web", version = "0.5" }`')),
+           [(1, 'autumn-web', '0.5')])
+    # A rename to a non-autumn crate is not this gate's business.
+    expect('rename to a foreign crate ignored',
+           list(pins('web = { package = "axum", version = "0.5" }')), [])
+    # An `autumn*` key is PIN's; it must not be reported by both readers.
+    expect('autumn key is not double-read',
+           list(pins('autumn-web = { version = "0.5" }')),
+           [(1, 'autumn-web', '0.5')])
 
     # Literal strings on the PATTERN path, which is prose AND the fallback for
     # a fence that does not parse — where the parser-side fix cannot reach.
