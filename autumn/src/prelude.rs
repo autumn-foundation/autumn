@@ -78,6 +78,10 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Lazy database connection extractor. Use instead of `Db` alongside a body
+/// extractor. See [`crate::db::LazyDb`].
+#[cfg(feature = "db")]
+pub use crate::db::LazyDb;
 /// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
 #[cfg(feature = "db")]
 pub use crate::db::{IsolationLevel, TxOptions};
