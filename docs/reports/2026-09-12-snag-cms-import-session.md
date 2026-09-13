@@ -123,10 +123,14 @@ already spoken for — either by a persisted top-level (or otherwise
 depth-tied) row `find_local` matches, or, more broadly still, by *any*
 earlier import's `_import_source_slug` marker with that same bare slug,
 even one attached to a page that is correctly, deeply nested and has
-nothing to do with the top level at all. Neither the earlier claimant nor
-the later, dropped page needs to be pathless — either can reach the same
-bare identity string via an explicit `path` set to that literal slug
-(data loss, repro 11/11).**
+nothing to do with the top level at all. Either the earlier claimant or
+the later, dropped page may be path-bearing rather than pathless — either
+can reach the same bare identity string via an explicit `path` set to
+that literal slug — but **at least one side must still misrepresent its
+own true, fully-qualified position** (in every reproduction here, via an
+omitted `path` on a page that is actually nested elsewhere); two pages
+that both carry accurate, matching paths are not this bug (data loss,
+repro 11/11).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -388,11 +392,14 @@ regression test the sweep will then pick up automatically.
   in the same run before its own parent existed), or, more broadly, by
   *any* earlier import's leftover marker sharing that bare slug, even one
   attached to a page that is correctly, deeply nested and was never
-  top-level at all; neither page needs to be pathless, since an explicit
-  `path` set to the bare slug itself reaches the same identity string —
-  and no error, orphan count, or other signal is given; see above — not a
-  risk to ordinary pathless *posts*, which never collide on slug in the
-  first place, only to same-slug *pages* under different parents).
+  top-level at all; either page may be path-bearing rather than pathless,
+  since an explicit `path` set to the bare slug itself reaches the same
+  identity string, but *at least one side* must still misrepresent its
+  own true, fully-qualified position — two pages both carrying accurate,
+  matching paths are not this bug — and no error, orphan count, or other
+  signal is given; see above — not a risk to ordinary pathless *posts*,
+  which never collide on slug in the first place, only to same-slug
+  *pages* under different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
