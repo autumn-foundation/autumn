@@ -592,10 +592,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by its slug. A pre-upgrade site's old, bare markers are kept as a list
   rather than collapsed to one, so two completed pages that happen to share
   that same old marker are both still recognized on a later re-import, rather
-  than one of them getting duplicated. A genuinely top-level post's stable
-  identity is now marked with a leading slash a legacy marker could never
-  carry, so a brand new top-level page can no longer be mistaken for a
-  pre-upgrade site's unrelated, already-completed nested one.
+  than one of them getting duplicated. A genuinely top-level post's marker
+  key is now marked with a leading slash a legacy marker could never carry,
+  so a brand new top-level page can no longer be mistaken for a pre-upgrade
+  site's unrelated, already-completed nested one — the underlying *position*
+  a marker is built from stays undecorated and purely positional at every
+  recursive step, so a page imported once as a pathless legacy child and
+  later re-imported as one explicit `path` (what the CMS's own exporter
+  always writes) still resolve to the same position. Recursively resolving
+  an already-completed legacy parent's own expected parent is now bounded
+  the same way every other ancestry walk in this module is, so a
+  hand-edited file naming two pre-upgrade pages as each other's parent can
+  no longer hang the import.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
