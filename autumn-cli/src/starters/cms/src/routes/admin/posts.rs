@@ -320,6 +320,25 @@ fn validate_submission(
         errors.push(error);
     }
 
+    // Caught here, not just at the eventual `resolve_term_ids` save check:
+    // an over-limit taxonomy selection colliding with an unrelated error
+    // (a blank title, a bad schedule) must not silently turn into a
+    // "valid"-looking one on the 422 redisplay just because the picker
+    // can only recover so many missing checkboxes from the database. This
+    // makes the overflow itself the reported error, so the count is never
+    // gone — just too high — regardless of how many of the selected terms
+    // still have a rendered checkbox to uncheck.
+    if form
+        .taxonomies
+        .values()
+        .any(|ids| ids.iter().collect::<std::collections::HashSet<_>>().len() > MAX_TERMS_PER_SAVE)
+    {
+        errors.push((
+            "taxonomies",
+            format!("At most {MAX_TERMS_PER_SAVE} terms can be applied per taxonomy in one save"),
+        ));
+    }
+
     (scheduled_for, errors)
 }
 
@@ -1025,6 +1044,7 @@ fn editor(
     let can_publish = user.role().can(Capability::PublishPosts);
     let title_error = field_error(errors, "title");
     let publish_at_error = field_error(errors, "publish_at");
+    let taxonomies_error = field_error(errors, "taxonomies");
 
     html! {
         form action=(action) method="post" class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
@@ -1171,6 +1191,12 @@ fn editor(
                                 }
                             }
                         }
+                    }
+                }
+
+                @if let Some(msg) = taxonomies_error {
+                    div class="bg-red-50 border border-red-200 rounded-lg p-3" {
+                        p class="text-red-600 text-sm" role="alert" { (msg) }
                     }
                 }
 
@@ -2342,6 +2368,42 @@ mod editor_validation_tests {
             "a valid submission must not be rejected: {errors:?}"
         );
         assert!(scheduled_for.is_some());
+    }
+
+    /// The overflow itself must be the reported error — not silently dropped
+    /// selections that make an over-limit submission look valid on
+    /// redisplay. See `ensure_submitted_choices_visible`'s doc comment for
+    /// why the picker can only ever recover `MAX_TERMS_PER_SAVE` of a larger
+    /// missing set.
+    #[test]
+    fn validate_submission_rejects_more_than_max_terms_per_save() {
+        let settings = crate::settings::Settings::default();
+        let mut submitted = form("Titled", "draft");
+        submitted.taxonomies.insert(
+            "category".to_owned(),
+            (1..=(MAX_TERMS_PER_SAVE as i64 + 1)).collect(),
+        );
+        let (_, errors) = validate_submission(&submitted, "draft", &settings);
+        assert!(
+            field_error(&errors, "taxonomies").is_some(),
+            "an over-limit selection must be flagged, not silently trimmed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_submission_accepts_exactly_max_terms_per_save() {
+        let settings = crate::settings::Settings::default();
+        let mut submitted = form("Titled", "draft");
+        submitted.taxonomies.insert(
+            "category".to_owned(),
+            (1..=MAX_TERMS_PER_SAVE as i64).collect(),
+        );
+        let (_, errors) = validate_submission(&submitted, "draft", &settings);
+        assert_eq!(
+            field_error(&errors, "taxonomies"),
+            None,
+            "exactly the limit must not be rejected: {errors:?}"
+        );
     }
 
     #[test]
