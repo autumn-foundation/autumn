@@ -490,24 +490,42 @@ def published_crates(root):
     `todo-app = "0.1"` in a page is not this gate's business; and a third-party
     pin never is. Membership is read from the manifests rather than hard-coded
     so a new plugin crate is covered the day it is published.
+
+    The manifests are PARSED, not matched, for the same reason the `toml`
+    fences are: a pattern reading only `name = "…"` misses the equally valid
+    `name = 'autumn-foo'`, and the crate would then be absent from this set, so
+    every stale pin on it is dropped at `crate not in crates` — a silent pass
+    reached through the truth set rather than through the corpus, which is the
+    quietest place for one to hide. `package_readmes()` in the shared corpus
+    block above already parses for exactly this reason.
     """
     listing = subprocess.run(
         ['git', 'ls-files', '-z', 'Cargo.toml', '*/Cargo.toml'],
         cwd=root, capture_output=True, text=True, check=True).stdout
     out = set()
     for rel in (f for f in listing.split('\0') if f):
-        text = pathlib.Path(root, rel).read_text(encoding='utf-8')
-        package = re.search(r'(?ms)^\[package\]\n(.*?)(?=^\[|\Z)', text)
-        if not package:
+        try:
+            manifest = tomllib.loads(
+                pathlib.Path(root, rel).read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            # A manifest that will not parse is Cargo's problem, not this
+            # gate's; `check-crate-metadata.sh` owns manifest well-formedness.
             continue
-        name = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', package.group(1))
-        if not name or not name.group(1).startswith('autumn'):
+        package = manifest.get('package')
+        if not isinstance(package, dict):
             continue
-        # `publish = false` keeps a member off crates.io. Absent means published,
+        name = package.get('name')
+        if not isinstance(name, str) or not name.startswith('autumn'):
+            continue
+        # `publish = false` keeps a member off crates.io, and a LIST form
+        # publishes only to the registries it names. Absent means published,
         # which is Cargo's own default.
-        if re.search(r'(?m)^\s*publish\s*=\s*false', package.group(1)):
+        publish = package.get('publish')
+        if publish is False:
             continue
-        out.add(name.group(1))
+        if isinstance(publish, list) and 'crates-io' not in publish:
+            continue
+        out.add(name)
     return out
 
 
