@@ -415,20 +415,31 @@ async fn permalink_search_ancestry_batch_profile() {
         }
         let (single_calls, single_buffers, any_calls) = print_profile(
             &mut conn,
-            &format!("tier {} ({} leaves, shared 8-level chain)", tier.token, tier.leaves),
+            &format!(
+                "tier {} ({} leaves, shared 8-level chain)",
+                tier.token, tier.leaves
+            ),
         );
-        tier_results.push((tier.token, tier.leaves, single_calls, single_buffers, any_calls));
+        tier_results.push((
+            tier.token,
+            tier.leaves,
+            single_calls,
+            single_buffers,
+            any_calls,
+        ));
     }
 
     println!("\n=== statement-count scaling across tiers ===");
     println!(
         "{:<12} {:>8} {:>14} {:>16} {:>28}",
-        "tier", "leaves", "\"id = $1\"", "\"id = $1\" buffers", "\"id = ANY($1)\" (incl. search's own 1)"
+        "tier",
+        "leaves",
+        "\"id = $1\"",
+        "\"id = $1\" buffers",
+        "\"id = ANY($1)\" (incl. search's own 1)"
     );
     for (token, leaves, single_calls, single_buffers, any_calls) in &tier_results {
-        println!(
-            "{token:<12} {leaves:>8} {single_calls:>14} {single_buffers:>16} {any_calls:>28}"
-        );
+        println!("{token:<12} {leaves:>8} {single_calls:>14} {single_buffers:>16} {any_calls:>28}");
     }
 
     explain(
