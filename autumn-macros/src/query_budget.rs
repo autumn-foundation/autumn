@@ -201,6 +201,17 @@ const HANDLE_TYPES: &[&str] = &[
     "PooledConnection",
 ];
 
+/// Wrapper types safe to peer inside when looking for a specifically-`LazyDb`
+/// parameter (`Result<LazyDb, E>`, the shape a handler catching extraction
+/// failure uses; `Option`/`Arc`/`Rc`/`Box` and the common extractor wrappers,
+/// for the same reason `TRANSPARENT_WRAPPERS`/`EXTRACTOR_WRAPPERS` name them
+/// elsewhere in this codebase). Deliberately a *whitelist*, unlike
+/// `type_is_handle`'s own unrestricted generic-argument peering: an
+/// arbitrary, unrecognized wrapper (`Cart<LazyDb>`) must not qualify, since
+/// it may define its own domain `checkout()` (Codex review, PR #2762,
+/// round 7).
+const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
+
 /// Offered when the fix is to stop issuing a query per row.
 const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
                           handler out with `#[query_budget(unbounded, reason = ...)]`. See \
@@ -1857,7 +1868,18 @@ fn type_is_lazy_db(ty: &Type) -> bool {
             if segment.ident == "LazyDb" {
                 return true;
             }
-            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+            // Unlike `type_is_handle`'s own generic-argument peering (which
+            // accepts *any* wrapper name — a pre-existing characteristic of
+            // that broader "is this some handle" check, left alone here),
+            // this only looks inside a wrapper the analysis knows is
+            // transparent. An arbitrary `Cart<LazyDb>` must not qualify: an
+            // arbitrary type may define its own domain `checkout()`, and
+            // `LazyDb`'s exemption is specifically for the framework
+            // extractor, not for "a `LazyDb` is mentioned somewhere in this
+            // type" (Codex review, PR #2762, round 7).
+            if LAZY_DB_WRAPPERS.contains(&segment.ident.to_string().as_str())
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            {
                 return args.args.iter().any(|arg| match arg {
                     syn::GenericArgument::Type(inner) => type_is_lazy_db(inner),
                     _ => false,
@@ -2651,6 +2673,27 @@ mod tests {
             }
             "#,
             &["loop", "first"],
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_nested_in_an_arbitrary_wrapper_is_not_exempt() {
+        // `type_is_lazy_db`'s generic-argument peering is a *whitelist*
+        // (`LAZY_DB_WRAPPERS`), unlike `type_is_handle`'s own unrestricted
+        // version: `Cart<LazyDb>` still makes `cart` a generic handle (that
+        // broader, pre-existing behaviour is untouched), but must not make
+        // it specifically `LazyDb` — `Cart` may define its own domain
+        // `checkout()`, unrelated to a connection handoff (Codex review,
+        // PR #2762, round 7).
+        assert_error_contains(
+            "0",
+            r"
+            async fn h(cart: Cart<LazyDb>) -> AutumnResult<Receipt> {
+                let receipt = cart.checkout().await?;
+                Ok(receipt)
+            }
+            ",
+            &["1"],
         );
     }
 

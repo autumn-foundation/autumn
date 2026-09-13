@@ -3597,11 +3597,35 @@ fn type_handle(ty: &Type, generics: &HashSet<String>) -> Option<Handle> {
                 if transparent {
                     return types.next().and_then(|inner| type_handle(inner, generics));
                 }
-                return types.find_map(|inner| {
-                    (type_named(inner, HANDLE_TYPES) || type_named(inner, OUTBOUND_TYPES))
-                        .then(|| type_handle(inner, generics))
-                        .flatten()
-                });
+                return types
+                    .find_map(|inner| {
+                        (type_named(inner, HANDLE_TYPES) || type_named(inner, OUTBOUND_TYPES))
+                            .then(|| type_handle(inner, generics))
+                            .flatten()
+                    })
+                    .map(|handle| {
+                        // The exact-name-anywhere leniency above is safe for
+                        // ordinary handle *recognition* (a pre-existing
+                        // characteristic of this branch, left as is), but
+                        // `Handle::LazyDb` specifically unlocks `checkout`'s
+                        // transparent-provenance rule, and an arbitrary,
+                        // non-transparent wrapper (`Cart<LazyDb>`) may define
+                        // its own domain `checkout()`. `Result` is excepted:
+                        // it is not in `TRANSPARENT_WRAPPERS` (unlike `Arc`/
+                        // `Option`/...) but is the documented shape a handler
+                        // catching extraction failure uses
+                        // (`Result<LazyDb, AutumnError>`), so it needs the
+                        // same `LazyDb` provenance a bare parameter gets.
+                        // Anything else reaching `Handle::LazyDb` only
+                        // through this non-transparent position downgrades
+                        // to a plain `Db` instead of exempting it (Codex
+                        // review, PR #2762, round 7).
+                        if matches!(handle, Handle::LazyDb) && name != "Result" {
+                            Handle::Db
+                        } else {
+                            handle
+                        }
+                    });
             }
             None
         }
@@ -6057,6 +6081,46 @@ mod tests {
                 crate::billing::render_receipt(&receipt);
                 Ok(())
             }",
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_nested_in_an_arbitrary_wrapper_is_not_a_lazy_db_handle() {
+        // `type_handle`'s "exact name in any position" leniency for an
+        // unrecognized generic wrapper is a pre-existing characteristic
+        // (also true for a plain `Cart<Db>`, verified separately) — left
+        // alone here. But `Handle::LazyDb` specifically unlocks `checkout`'s
+        // transparent-provenance rule, and an arbitrary `Cart` may define
+        // its own domain `checkout()`, unrelated to a connection handoff.
+        // `Cart<LazyDb>` must downgrade to a plain `Db` rather than `LazyDb`,
+        // so its `checkout()` is treated the same as `AuditDb`'s above, not
+        // exempted (Codex review, PR #2762, round 7).
+        assert_clean(
+            GRANT,
+            r"async fn h(cart: Cart<LazyDb>) -> R {
+                let receipt = cart.checkout().await?;
+                crate::billing::render_receipt(&receipt);
+                Ok(())
+            }",
+        );
+    }
+
+    #[test]
+    fn a_result_wrapped_lazy_db_keeps_its_provenance_through_checkout() {
+        // The `Cart<LazyDb>` downgrade above must not catch the legitimate
+        // `Result<LazyDb, AutumnError>` shape a handler catching extraction
+        // failure uses (the same signature `query_budget.rs`'s own
+        // `lazy_db_names` recognizes) — `Result` is not in
+        // `TRANSPARENT_WRAPPERS`, so without an explicit exception it would
+        // hit the very same non-transparent branch as `Cart<LazyDb>`.
+        assert_error_contains(
+            GRANT,
+            r#"async fn h(lazy_db: Result<LazyDb, AutumnError>) -> R {
+                let mut db = lazy_db.expect("lazy db").checkout().await?;
+                crate::billing::issue_refund(&mut db, 7).await?;
+                Ok(())
+            }"#,
+            &["issue_refund", "effect handle"],
         );
     }
 
