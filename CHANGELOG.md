@@ -7290,6 +7290,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marginal allocation blocks/query and bytes/query (dhat) are unchanged
   (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
   allocation-bound, so only the instruction floor is claimed.
+- **`autumn deploy up` now has a direct test that it refuses the whole fleet
+  when any host fails preflight (#2269, #1621 AC-7 follow-up):** the behavior
+  was correct, but only proven by code reading and by an adjacent `deploy
+  check` test — `run_up_with` takes `checks` as already-graded input, so it
+  cannot exercise the refusal, and `run_up` itself needs disk/network I/O to
+  drive directly. The refusal is now its own function,
+  `refuse_if_preflight_failed`, called by `run_up` right after
+  `collect_fleet_preflight` and before any executor is built. One new test
+  drives that same gate against a three-host fleet with one failing host and
+  asserts zero executors are built and the fleet's call tape stays empty —
+  mirroring `execute_first_deploy`'s existing
+  `preflight_failure_aborts_before_any_executor_call` one level up, at the
+  fleet driver. A second new test asserts the call order inside `run_up`'s
+  own source (mirroring the existing
+  `media_provisioning_is_deferred_past_app_cutover_in_up` pattern), so a
+  refactor that moved the gate after the `run_up_with` hand-off — the exact
+  risk the issue named — fails a test even though the gate function itself
+  still works.
 
 ## [0.7.0] - 2026-08-23
 
