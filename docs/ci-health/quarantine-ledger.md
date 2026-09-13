@@ -146,74 +146,118 @@ _None as of 2026-09-05._
   entry immediately below for a coordination defect this fix's merge
   timing collided with (independent, not a defect in the fix itself).
 
-### Escape: independent duplicate fix for the same MinIO/Docker-Hub outage collided at merge, ~8.4h of spurious Lint failures on unrelated branches
+### Escape: at least six independent fixes for the same MinIO/Docker-Hub outage collided at merge, ~8.7h of spurious Lint failures on unrelated branches
 
-- **Not a flake, not a product bug — a coordination gap between two
-  concurrently-authored fixes for the same external-dependency outage.**
-  PR #2740 (this ledger's own MinIO→Quay fix, above) merged
-  2026-09-12T17:03:52Z. An independent PR, **#2743** ("fix: pull MinIO
-  testcontainer images from quay.io, not Docker Hub"), merged
-  **2026-09-12T17:46:17Z — 43 minutes later** — fixing the identical
-  Docker-Hub-repository-gone outage, authored without visibility into
-  #2740 (different session, same underlying `ci.yml` failure independently
-  diagnosed). Both PRs touched
-  `examples/reddit-clone/tests/avatar_s3_integration.rs`: #2740 added
-  `.with_name("quay.io/minio/minio")` inline at the one call site; #2743,
-  based on a pre-#2740 checkout, added a separate `const MINIO_IMAGE: &str
-  = "quay.io/minio/minio"` at the top of the same file without wiring it
-  in (the inline literal from #2740 was already there by the time #2743's
-  merge commit landed). Neither PR's own CI run could have caught this —
-  each was green against its own base — so it surfaced only as `-D
-  dead-code` (`-D warnings`) once both were on `trunk-dev` together.
+- **Correction (post-review, via a Codex review comment on PR #2768): the
+  original version of this entry named the wrong commits and the wrong
+  count.** It attributed the cleanup to #2749/#2750/#2751/#2752 and framed
+  this as a two-PR (#2740/#2743) collision. Checked directly against each
+  commit's actual diff rather than its title or PR number: #2750
+  (`cfb5d93`), #2751 (`6dd7bb1`), and #2749 (`4eeeeac`) are **empty
+  merges** — no file changes at all, because by the time each squash-merge
+  landed, `trunk-dev` already carried equivalent content from a different,
+  concurrently-merging branch. #2752 (`1c5312e`) touches
+  `autumn-cli/src/generate/auth.rs`/`schema_edit.rs`/`CHANGELOG.md` only —
+  nothing MinIO-related. Corrected below from the actual diffs (`git show
+  --stat`/`-p` on every commit that touched the three affected test
+  files), not from any commit's own self-description — even the commit
+  that removed the dead helper (#2756) misattributes what added it.
+- **Not a flake, not a product bug — a coordination gap, and a wider one
+  than first recorded.** The same universally-visible `ci.yml` failure
+  (every `Test (Docker)` run 404ing on the dead `minio/minio` Docker Hub
+  repository, regardless of a PR's own diff) was independently diagnosed
+  and fixed inside **at least six separate PRs** within a ~6.5 hour
+  window, none aware of the others — consistent with this role's own and
+  every other session's "red CI is work now" posture: whoever hit the
+  failure on their own PR fixed it in place rather than waiting.
+  Chronology, verified against each commit's actual file-level diff:
+  - **#2740** (`abacf9e`, this ledger's own fix, merged
+    2026-09-12T17:03:51-05:00): inlined
+    `.with_name("quay.io/minio/minio")` at all four call sites across
+    `offsite_backup.rs` (both tests), `sqlite_replication_s3.rs`, and
+    `avatar_s3_integration.rs`. **No helper function or constant** — the
+    original entry's claim that this PR added `minio_image()` is wrong.
+  - **#2743** (`d2693c1`, independent, 17:46:17-05:00, 43 min later):
+    added `const MINIO_IMAGE` to `avatar_s3_integration.rs` without wiring
+    it into the call site (which already carried #2740's identical inline
+    literal by merge time) — the first dead-code seed.
+  - **#2725** (`e2cd122`, an unrelated `autumn upgrade` codemod PR, one of
+    whose several squashed sub-commits is "fix: use the MINIO_IMAGE const
+    the merge from trunk-dev introduced", 23:19:07Z): wired
+    `avatar_s3_integration.rs`'s call site to `MINIO_IMAGE`, closing that
+    file's dead-code gap.
+  - **#2722** (`e9f90a7`, an unrelated replay-guard test PR, sub-commit
+    "fix: point MinIO testcontainers at quay.io", 23:21:15Z): introduced a
+    **new** `start_minio()` helper in `offsite_backup.rs`, replacing both
+    tests' inline literals from #2740.
+  - **#2720** (`0917af7`, an unrelated `SeqKey` append-ordering PR,
+    sub-commit "fix: MinIO Docker tests point at quay.io", 23:22:06Z —
+    **one minute after #2722**): independently introduced a **second,
+    competing** `minio_image()` helper in the same file, duplicating
+    `start_minio()`'s purpose with a different tag-pinning strategy, and
+    left it uncalled (dead code) — the second signature.
+  - **#2756** (`a7c7c46`, 2026-09-13T02:09:18Z): removed the uncalled
+    `minio_image()` from #2720, keeping `start_minio()`.
+  - **#2729** (`6e71bfb`, a large, unrelated wire-contracts feature PR
+    whose long-lived branch had merged `trunk-dev` in three times over
+    the same window and picked up a MinIO fix each time, sub-commits
+    titled "fix(test): reconcile the two MinIO registry fixes the merge
+    combined" and "fix(test): collapse the duplicate MinIO image helpers
+    into one", 2026-09-13T02:30:05Z — **the actual final resolution**,
+    21 minutes after #2756, not #2756 itself): consolidated back onto a
+    single `minio_image()` (reintroduced, since this branch's own copy
+    survived its merges) with `start_minio()` now calling it, and **added
+    a new regression test**, `minio_image_pulls_from_the_public_registry`
+    — a `#[test]` (not `#[ignore]`d, so it runs in the ordinary lane
+    without Docker) asserting the descriptor's registry and that a tag is
+    pinned, specifically so a future regression "surfaces as a red job
+    naming a registry rather than the file that forgot" (its own doc
+    comment). This is a genuine positive outcome of the churn: the repo
+    now has a fast, Docker-free guard against this exact class of break.
+  - Confirmed directly against `autumn-cli/tests/integration/offsite_backup.rs`
+    at `trunk-dev`'s current tip (`6e71bfb`): `start_minio()` calls
+    `minio_image()`, both tests call `start_minio()`, and
+    `minio_image_pulls_from_the_public_registry` passes — one
+    source of truth, no dead code, regression-guarded.
 - **Impact, measured**: sampling `ci.yml` `pull_request` runs from
-  2026-09-12T17:46:17Z (the #2743 merge) to 2026-09-13T02:09:18Z (the last
-  cleanup commit, below) — roughly 8.4 hours — found the same `-D
-  dead-code` `Lint` failure on at least 6 distinct, unrelated WIP branches
-  (confirmed by job log inspection, not inferred from branch name):
-  `claude/friendly-ritchie-uw76a2`, `claude/tender-galileo-6f3dr7`,
-  `claude/epic-clarke-8nbaes`, `claude/brave-goldberg-gyr60j` (hit twice,
-  both signatures below), `claude/busy-cerf-9zos9k`, plus the two
-  `fix/reddit-clone-minio-*` and `fix/minio-quay-registry` branches
-  visibly spun up by other sessions independently chasing the same error.
-  Two distinct signatures, both dead-code, both in MinIO-related test
-  files: `` error: function `minio_image` is never used ``
-  (`autumn-cli/tests/integration/offsite_backup.rs:216`) and `` error:
-  constant `MINIO_IMAGE` is never used ``
-  (`examples/reddit-clone/tests/avatar_s3_integration.rs:22`). Every hit
-  failed only `Lint`/`Clippy` (and the `Test suite` aggregator that
-  depends on it) — no runtime test behavior was affected, consistent with
-  this being purely a merge-time dead-code artifact, not a functional
-  regression.
-- **Resolution**: five follow-up commits, all authored independently of
-  this ledger's own tracking, untangled the collision on `trunk-dev`
-  piecemeal: #2750 and #2751 (both 2026-09-12T23:41-23:48Z) rewired
-  reddit-clone's test to actually reference the `MINIO_IMAGE` constant
-  instead of the duplicate inline literal; #2749 (23:55:48Z) did the same
-  for the constant's remaining unused-ness; #2752 (23:41:28Z) fixed an
-  unrelated `Cargo` subtable-form gate that had also gone stale in the
-  same window; #2756 (2026-09-13T02:09:18Z) removed the now-fully-orphaned
-  `minio_image()` helper in `offsite_backup.rs`. `trunk-dev`'s tip has
-  carried a clean, single-source-of-truth fix (one call site per test,
-  each using its own local constant, no orphaned helpers) since
-  2026-09-13T02:09:18Z — confirmed directly against
-  `autumn-cli/tests/integration/offsite_backup.rs` at `trunk-dev`'s
-  current tip (`6e71bfb`): `minio_image()` has two live call sites, no
-  dead code.
+  2026-09-12T17:46:17Z (the #2743 merge, first dead-code seed) to
+  2026-09-13T02:30:05Z (the #2729 merge, actual final resolution) —
+  roughly 8.7 hours — found the same `-D dead-code` `Lint` failure on at
+  least 6 distinct, unrelated WIP branches (confirmed by job log
+  inspection, not inferred from branch name): `claude/friendly-ritchie-uw76a2`,
+  `claude/tender-galileo-6f3dr7`, `claude/epic-clarke-8nbaes`,
+  `claude/brave-goldberg-gyr60j` (hit twice, both signatures below),
+  `claude/busy-cerf-9zos9k`, plus the `fix/reddit-clone-minio-*` and
+  `fix/minio-quay-registry` branches visibly spun up by other sessions
+  independently chasing the same error. Two distinct signatures, both
+  dead-code, both in MinIO-related test files: `` error: function
+  `minio_image` is never used `` (`autumn-cli/tests/integration/offsite_backup.rs:216`,
+  from #2720's copy) and `` error: constant `MINIO_IMAGE` is never used ``
+  (`examples/reddit-clone/tests/avatar_s3_integration.rs:22`, from #2743's
+  unwired constant). Every hit failed only `Lint`/`Clippy` (and the `Test
+  suite` aggregator that depends on it) — no runtime test behavior was
+  affected, consistent with this being purely a merge-time dead-code
+  artifact, not a functional regression.
 - **Mechanism classification**: neither a test defect nor a product
-  defect — a **process/coordination gap**. Nothing in `ci.yml` or the
-  repo's tooling flags "another open PR already fixes this exact
-  failure" before merge; the same visible, identical, 100%-reproducible
-  Docker Hub outage was independently diagnosed and fixed by more than
-  one session within the same hour, and GitHub's normal one-PR-at-a-time
-  merge serialization is what turned two individually-correct fixes into
-  a combined dead-code break. No action taken here beyond recording it:
-  the fallout is already fully resolved on `trunk-dev`, and the affected
-  branches only need an ordinary rebase to pick up the clean state — this
-  is Tier 1 escape-analysis evidence per this role's own evidentiary
-  tiers, not a new quarantine candidate.
+  defect — a **process/coordination gap**, and a six-way one, not a
+  two-way one. Nothing in `ci.yml` or the repo's own tooling flags
+  "another open PR already fixes this exact failure" before merge, and
+  nothing flags "this long-lived branch's last trunk-dev merge already
+  picked up a fix for this" either — so a failure visible to literally
+  every open PR at once (Docker Hub removing a dependency image) drew
+  independent, uncoordinated fixes from whichever PR happened to notice
+  it first, repeatedly, including inside PRs whose own subject matter
+  (an `autumn upgrade` codemod, a replay-guard test, a `SeqKey` ordering
+  fix, a wire-contracts feature) had nothing to do with MinIO. No action
+  needed here beyond recording it accurately: the fallout is already
+  fully resolved on `trunk-dev`, with a regression test added, and the
+  affected branches only need an ordinary rebase to pick up the clean
+  state. This is Tier 1 escape-analysis evidence per this role's own
+  evidentiary tiers, not a new quarantine candidate.
 - **Closed**: 2026-09-13 (🚦 Semaphore), recorded after the fact — the
-  fallout resolved itself via the five commits above before this pass
-  began.
+  fallout resolved itself via the six PRs above before this pass began;
+  corrected 2026-09-13 (same day) after a Codex review comment on the
+  ledger's own PR (#2768) caught the misattribution.
 
 ## Under active investigation, not yet quarantined
 
