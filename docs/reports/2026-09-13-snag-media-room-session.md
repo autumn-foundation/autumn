@@ -71,8 +71,22 @@ Time-boxed to one sitting (~1.5 hours wall clock, most of it a genuinely slow
   env-overridable constants, not app config): joined a room, did nothing for
   6s, then confirmed the roster (with the now-stale token) and a heartbeat
   both returned `404`, and — since that was the room's only participant — the
-  room itself was gone (rejoining the same `room_id` also `404`s). Matches
-  the claim exactly; no lingering "seat" survived past the TTL.
+  room itself was gone (rejoining the same `room_id` also `404`s). Participant
+  reaping itself matches the claim exactly (no lingering "seat" survived past
+  the TTL), but a Codex review on this PR correctly flagged that this
+  particular test scenario (the reaped participant being the room's *sole*
+  member) sits in tension with `docs/guide/media.md`'s reaper-section wording
+  that a reaped client's "live `MediaMTX` path is untouched, so it can simply
+  re-join": here, re-joining the *same* `room_id` is not actually possible —
+  the room itself was dropped along with its last participant (per
+  `reap_stale`'s own documented behavior: an emptied room is dropped), so
+  "simply re-join" only holds when at least one other member kept the room
+  alive. The guide's wording doesn't call out that qualification. This reads
+  as a documentation-precision gap rather than a code bug (dropping a
+  zero-member room is itself correct and separately documented, in
+  `rooms.rs`'s own module doc), so it goes in the digest below rather than as
+  a filed issue — but the original draft of this bullet overstated the match
+  by not naming the caveat, which is worth being explicit about.
 - **Data tour** — emoji, an RTL-override control character (`U+202E`), an
   embedded NUL byte, empty string, whitespace-only, a `DROP TABLE`-shaped
   string, and a literal `<script>` tag as `display_name`: every one
@@ -93,18 +107,23 @@ Time-boxed to one sitting (~1.5 hours wall clock, most of it a genuinely slow
   validation on this field anywhere in `InMemoryRoomStore::join_room`. This
   looked like a resource-exhaustion lead at first, especially next to the
   module's own comment that the 10,000-room registry cap exists to guard
-  "against unbounded memory growth from a create loop." But
-  `docs/guide/media.md` already carries an explicit, unambiguous warning
-  directly above this surface: create/join "ship **no** built-in
-  authentication or rate limiting... they **must** be mounted behind your
-  application's own auth / rate-limit middleware," and names the room cap as
-  "defense-in-depth," explicitly "neither substitutes for your auth layer."
-  A large-`display_name` amplification is the same already-disclosed
-  unauthenticated-abuse risk the docs tell an integrator to gate externally,
-  just a bigger per-request multiplier — not an undisclosed hole, and the
-  6-seats-per-room hard cap bounds the blast radius to `6 ×`
-  request-body-limit (32 MiB default) per room regardless. Not filed; see
-  digest below for the narrower, actionable slice of this.
+  "against unbounded memory growth from a create loop." The first draft of
+  this bullet dismissed it as fully subsumed by `docs/guide/media.md`'s
+  existing warning that create/join "ship **no** built-in authentication or
+  rate limiting... they **must** be mounted behind your application's own
+  auth / rate-limit middleware." A Codex review on this PR correctly pushed
+  back on that: authentication and *request-count* rate limiting (the
+  documented mitigation) do not bound *per-request payload size* at all — an
+  authenticated, rate-limit-compliant client can still send a handful of
+  ~32 MiB `display_name`s per minute and hold each one in memory until
+  leave/reap, up to 6 per room across up to 10,000 rooms. So this is not
+  simply a bigger multiplier on the already-disclosed no-auth-by-default risk;
+  it is a distinct gap that following the docs' own recommended mitigation
+  does not close. Still not filed as a bug — no crash/hang/data-loss was
+  observed, and nothing in the docs promises a `display_name` size ceiling,
+  so there is no contradicted claim to cite as an oracle — but the digest
+  entry below is corrected to reflect that a field-size cap (or a
+  route-specific body-size limit) is the actual fix, not "add auth."
 - **Home page's "Rooms" list going stale after a reap.** The example's own
   `RoomLog` (a demo-only, append-only list backing the home page's table and
   `/api/rooms`) keeps listing a room forever, even after the plugin's real
@@ -158,23 +177,40 @@ Time-boxed to one sitting (~1.5 hours wall clock, most of it a genuinely slow
 
 ## Findings summary
 
-- **Bugs filed:** none. Every oracle checked this session (capacity ceiling
-  under load and under concurrency, fail-closed leave/heartbeat/roster, live
-  idle-reaping, data-tour round-tripping) matched the implementation and the
-  documentation.
+- **Bugs filed:** none. The core oracles checked this session (capacity
+  ceiling under load and under concurrency, fail-closed leave/heartbeat/
+  roster, participant-level idle reaping, data-tour round-tripping) matched
+  the implementation and the documentation. Two review-caught nuances did
+  not clear the bar for a filed bug but sharpened the picture — see the
+  digest: the reaper guide's "can simply re-join" wording doesn't hold for a
+  reaped sole member (the room itself is also dropped), and the unbounded
+  `display_name` size is a gap the docs' own recommended auth/rate-limiting
+  mitigation does not actually close.
 - **Digest (oracle-less, not filed as bugs):**
-  - `display_name` has no length cap in `InMemoryRoomStore::join_room`. Not a
-    documented-claim violation (the already-disclosed "no auth/rate-limit"
-    warning covers unauthenticated abuse of this surface generally), but a
-    cheap, narrow hardening a maintainer may still want: a modest
-    server-side cap (a few hundred bytes is plenty for a display name) would
-    shrink the per-request amplification factor without needing the
-    integrator to have their own middleware in place yet. Worth a fix-on-touch
-    if `rooms.rs` is edited for another reason; not worth a dedicated PR on
-    its own given the existing disclosure.
+  - `display_name` has no length cap in `InMemoryRoomStore::join_room`, and
+    (per the Codex correction above) this is **not** fully addressed by
+    adding the docs' recommended auth/rate-limiting: an authenticated,
+    rate-limit-compliant client can still hold up to ~32 MiB per
+    `display_name`, 6 per room, across up to 10,000 rooms — request-count
+    throttling doesn't bound per-request payload size. The actionable fix is
+    a field-size cap (a few hundred bytes is plenty for a display name) or a
+    route-specific body-size limit on `join`/`heartbeat`, not "add auth."
+    Worth a fix-on-touch if `rooms.rs` is edited for another reason; not
+    filed as a bug this session because no crash/hang/data-loss was observed
+    and no documented claim promises a size ceiling, but it's a sharper,
+    more clearly actionable gap than the original draft credited.
   - The demo's home-page room list (`RoomLog`) has no way to reflect a room
     the reaper removed — cosmetic/demo-scope only, already self-disclosed in
     the source comment.
+  - `docs/guide/media.md`'s reaper section says a reaped participant "can
+    simply re-join," but when the reaped participant was the room's only
+    member, the room itself is dropped along with it (documented separately
+    in `rooms.rs`'s own module doc), so re-joining the *same* `room_id`
+    actually `404`s — confirmed live this session. The guide's wording holds
+    for a room kept alive by another member but doesn't call out the
+    sole-member case; worth a one-line qualification
+    ("...so it can simply re-join, provided the room still has another
+    member keeping it alive") next time `docs/guide/media.md` is touched.
 - **Solid areas** (toured, held up, no further attention needed absent new
   changes to the surface): room capacity enforcement (including under
   concurrent load), fail-closed auth on leave/heartbeat/roster, the
