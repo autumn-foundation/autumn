@@ -424,7 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It was gated in one place over eight pages —
   `repo_hygiene::first_run_docs_match_current_release_line` holds a hand-listed
   `FIRST_RUN_DOCS` array to the published pin — while the corpus is 212 pages
-  carrying 69 pins; that test is also existential rather than per-occurrence, so
+  carrying 74 pins; that test is also existential rather than per-occurrence, so
   a page carrying both a correct and a stale pin passed it. The CHANGELOG
   records the class being swept by hand twice before (the `0.6.0` install-pin
   alignment across five pages, and the getting-started rewrite that found a
@@ -438,7 +438,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHOW rather than offer is waived beside the passage with a
   `<!-- version-pin-allow: … — reason -->` marker, so the waiver is deleted by
   the commit that deletes the sentence; the corpus has one, the reproduced
-  plugin-contract panic text in `docs/plugins.md`. Baseline: 69 pins checked,
+  plugin-contract panic text in `docs/plugins.md`. Baseline: 74 pins checked,
   1 defect (the `skills/autumn-patterns/SKILL.md` pin under **Fixed**), 1
   waived. Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit
   rather than after its corpus had a chance to drift — #2709 exists because the

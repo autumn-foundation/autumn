@@ -21,7 +21,7 @@
 # array — `README.md`, `getting-started.md`, `docs-smoke.md`, `deployment.md`,
 # `websockets.md`, `tutorial/01-project-setup.md`, `tutorial/12-whats-next.md`
 # and `macro-transparency.md` — to the published pin. The reader-facing corpus
-# is 212 pages and carries 57 pins. The other 204 pages were ungated, and the
+# is 212 pages and carries 74 pins. The other 204 pages were ungated, and the
 # CHANGELOG records the class being swept by hand twice already: "aligned the
 # `autumn-cli` install pin to the workspace `0.6.0` across …" (0.6.0, five
 # pages) and the getting-started rewrite that found a guide "announcing the
@@ -67,6 +67,22 @@
 #      `autumn-web = "0.7"`, `autumn-web = { version = "0.7", … }`, and the
 #      inline-code spelling prose uses (`autumn-storage-s3 = "0.7"`) — names the
 #      published release line, as `x.y` or the exact `x.y.z`.
+#
+#      Two spellings are easy to miss and were both missed by the first version
+#      of this gate, each a silent hole rather than a wrong answer:
+#
+#        - A Cargo COMPARISON OPERATOR. `autumn-web = "=0.6.0"` is the opening
+#          instruction of every migration guide ("Pin your current dependency …
+#          and commit"), four of them here, and a pattern anchored at a digit
+#          reaches none. `=`, `^` and `~` all name a line and are checked; `>`,
+#          `<`, `*` and comma-joined ranges name BOUNDS, which "is this stale?"
+#          cannot be asked of, and are skipped deliberately.
+#        - A MULTILINE inline table. `skills/autumn-web/SKILL.md` opens
+#          `autumn-web = { version = "0.7", features = [` and closes it nine
+#          lines later; read one line at a time it does not exist. Pins are
+#          extracted from the whole comment-blanked page, with line numbers
+#          recovered from the match offset.
+#
 #   2. The published line is read from README.md's quickstart
 #      (`cargo install autumn-cli --version <x.y.z>`) — the same single source
 #      of truth `scripts/check-quickstart.sh` and
@@ -448,8 +464,51 @@ def published_crates(root):
 # in a fence or in the inline-code spelling prose uses. The crate name is
 # anchored at a word boundary so `bench-autumn-web = "…"` is not read as a pin
 # on `autumn-web`.
+#
+# The quoted branch takes ANY string and lets `requirement()` below decide
+# whether it names a release. Anchoring it at a digit instead skipped every
+# operator form, and `autumn-web = "=0.6.0"` is the first instruction in every
+# migration guide ("Pin your current dependency … and commit") — four of them
+# in this corpus, none of which reached the check.
+#
+# The inline-table branch forbids braces inside itself rather than merely
+# stopping at the first `}`. That is what lets the pattern run across NEWLINES
+# safely, which it must: a dependency table is routinely opened on one line and
+# closed several later, and `\{[^{}]*\}` still cannot swallow a neighbouring
+# block the way `[^}]*` spanning lines would.
 PIN = re.compile(
-    r'(?<![\w.-])(autumn[a-z0-9-]*)\s*=\s*(?:"([0-9][^"]*)"|\{([^}]*)\})')
+    r'(?<![\w.-])(autumn[a-z0-9-]*)\s*=\s*(?:"([^"\n]*)"|\{([^{}]*)\})')
+
+# Cargo comparison operators that still name ONE release line, against the ones
+# that name a RANGE instead.
+#
+# `=0.6.0` is as concrete an instruction as a bare pin, and `^`/`~` are the
+# default caret and the tilde — all three say "this release line", so all three
+# are checked. A `>=`, `>`, `<`, `<=` or `*` requirement names BOUNDS rather
+# than a version, and a comma joins several of them into one range; "is this
+# stale?" is not a question those can be asked, and reporting them would put
+# noise on a correct page. They are skipped deliberately, not missed.
+PINNING_OPS = ('=', '^', '~')
+RANGE_OPS = ('>', '<', '*')
+
+
+def requirement(spec):
+    """The release version a Cargo requirement names, or None if it names none.
+
+    None covers three populations, all of them correct pages: a range rather
+    than a pin (`>=0.5`), a placeholder (`{X.Y.Z}` in `docs/migrations/next.md`,
+    `<declared>` in the skill), and anything else that is not a version.
+    """
+    spec = spec.strip()
+    if not spec or ',' in spec:
+        return None
+    if spec.startswith(RANGE_OPS):
+        return None
+    for op in PINNING_OPS:
+        if spec.startswith(op):
+            spec = spec[len(op):].strip()
+            break
+    return spec if spec[:1].isdigit() else None
 
 # `<!-- version-pin-allow: autumn-web = "0.6" — reason -->`. The reason is
 # required: a waiver without one outlives the passage it was written for.
@@ -507,19 +566,34 @@ def waived(text):
 
 
 def pins(text):
-    """Yield (line_no, crate, version) for every pin a reader can see."""
-    for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
-        for match in PIN.finditer(line):
-            crate = match.group(1)
-            version = match.group(2)
-            if version is None:
-                inner = re.search(r'version\s*=\s*"([^"]+)"', match.group(3) or '')
-                if not inner:
-                    # `{ path = "../autumn" }` or `{ workspace = true }` pins no
-                    # version, so there is nothing here to be stale.
-                    continue
-                version = inner.group(1)
-            yield lineno, crate, version
+    """Yield (line_no, crate, version) for every pin a reader can see.
+
+    Matched over the whole comment-blanked document rather than one line at a
+    time. An inline dependency table is routinely opened on one line and closed
+    several later — `skills/autumn-web/SKILL.md` spells a nine-feature table
+    that way — and a line-at-a-time reading skips those ENTIRELY: a silent hole
+    in a gate whose whole purpose is not to have one. Line numbers are
+    recovered from the match offset, so a defect still points at the line the
+    pin opens on.
+    """
+    body = blank_comments(text)
+    for match in PIN.finditer(body):
+        spec = match.group(2)
+        if spec is None:
+            inner = re.search(r'version\s*=\s*"([^"\n]*)"', match.group(3) or '')
+            if not inner:
+                # `{ path = "../autumn" }` or `{ workspace = true }` pins no
+                # version, so there is nothing here to be stale.
+                continue
+            spec = inner.group(1)
+        if requirement(spec) is None:
+            continue
+        # The spec is yielded AS WRITTEN, not normalized: a report saying
+        # `autumn-web = "0.5.0"` against a page that says `"=0.5.0"` sends the
+        # reader looking for text that is not there, and a waiver marker is
+        # written by copying the pin off the page. `requirement()` is applied
+        # again by the caller to compare it.
+        yield body.count('\n', 0, match.start()) + 1, match.group(1), spec
 
 
 # A migration guide's own release line, from its filename: `0.4.0.md` -> 0.4.0.
@@ -603,22 +677,24 @@ def check(root):
             continue
         allowed = waived(text)
         cap = ceiling(path, published)
-        for lineno, crate, version in pins(text):
+        for lineno, crate, spec in pins(text):
             if crate not in crates:
                 continue
-            verdict = acceptable(version, cap,
+            # `spec` is the page's own spelling (`=0.4.0`); `requirement` is
+            # what it names (`0.4.0`). Compare the second, report the first.
+            verdict = acceptable(requirement(spec), cap,
                                  allow_older=bool(MIGRATION_PAGE.match(path)))
             if verdict is None or verdict:
                 checked += 1
                 continue
-            if lineno in allowed.get((crate, version), ()):  
+            if lineno in allowed.get((crate, spec), ()):
                 waived_count += 1
                 continue
             checked += 1
             want = series(published) if not MIGRATION_PAGE.match(path) else \
                 series('.'.join(str(p) for p in cap))
             problems.append(
-                f'{path}:{lineno}  {crate} = "{version}"  '
+                f'{path}:{lineno}  {crate} = "{spec}"  '
                 f'(this corpus publishes {series(published)}; '
                 f'this page may pin at most {want})')
     return problems, checked, waived_count
@@ -720,6 +796,52 @@ def self_test():
            list(pins('autumn-web = { path = "../autumn" }')), [])
     expect('workspace dep has no version',
            list(pins('autumn-web = { workspace = true }')), [])
+
+    # Cargo requirement operators. Every migration guide opens with
+    # `autumn-web = "=0.6.0"`, so the exact form has to reach the check.
+    # The spec is reported AS WRITTEN, so a defect quotes text that is really
+    # on the page and a waiver can be written by copying it.
+    expect('exact-pin operator', list(pins('autumn-web = "=0.4.0"')),
+           [(1, 'autumn-web', '=0.4.0')])
+    expect('caret operator', list(pins('autumn-web = "^0.7"')),
+           [(1, 'autumn-web', '^0.7')])
+    expect('tilde operator', list(pins('autumn-web = "~0.7"')),
+           [(1, 'autumn-web', '~0.7')])
+    expect('requirement strips the operator', requirement('=0.4.0'), '0.4.0')
+    expect('requirement keeps a bare version', requirement('0.7'), '0.7')
+    # A range names bounds, not a version; asking whether it is stale is not a
+    # question it can answer, so it is skipped rather than reported.
+    expect('lower-bound range skipped', list(pins('autumn-web = ">=0.5"')), [])
+    expect('comma range skipped',
+           list(pins('autumn-web = ">=0.5, <0.8"')), [])
+    expect('wildcard skipped', list(pins('autumn-web = "*"')), [])
+    # Placeholders in `docs/migrations/next.md` and the skill are not versions.
+    expect('brace placeholder skipped',
+           list(pins('autumn-web = "={X.Y.Z}"')), [])
+    expect('angle placeholder skipped',
+           list(pins('autumn-web = "<declared>"')), [])
+
+    # A dependency table opened on one line and closed several later. Read one
+    # line at a time this is invisible, which is the hole this covers; the line
+    # number reported is the one the pin OPENS on.
+    multiline = ('autumn-web = { version = "0.5", features = [\n'
+                 '    "mail",\n'
+                 '    "ws",\n'
+                 '] }\n')
+    expect('multiline inline table', list(pins(multiline)),
+           [(1, 'autumn-web', '0.5')])
+    # …and it must actually be REFUSED, not merely listed.
+    expect('multiline stale pin is refused',
+           acceptable(requirement('0.5'), (0, 7, 0), allow_older=False), False)
+    expect('exact stale pin is refused',
+           acceptable(requirement('=0.5.0'), (0, 7, 0), allow_older=False),
+           False)
+    # Two tables in one page must not be fused into one match across the gap.
+    two = ('autumn-web = { version = "0.7" }\n'
+           '\n'
+           'autumn-edge = { version = "0.7" }\n')
+    expect('adjacent tables stay separate', list(pins(two)),
+           [(1, 'autumn-web', '0.7'), (3, 'autumn-edge', '0.7')])
     # A longer crate name must not be read as a pin on a shorter one.
     expect('no prefix bleed', list(pins('bench-autumn-web = "0.1"')), [])
     # A comment renders as nothing, so it carries no pin a reader can paste.

@@ -494,7 +494,7 @@ jobs:
         # It was gated in one place over eight pages —
         # `repo_hygiene::first_run_docs_match_current_release_line` holds a
         # hand-listed `FIRST_RUN_DOCS` array to the published pin — while the
-        # reader-facing corpus is 212 pages carrying 69 pins. That test is also
+        # reader-facing corpus is 212 pages carrying 74 pins. That test is also
         # existential rather than per-occurrence: it asks whether a page
         # `contains` the right pin anywhere, so a page carrying both a correct
         # and a stale pin passes. The CHANGELOG records the class being swept by
