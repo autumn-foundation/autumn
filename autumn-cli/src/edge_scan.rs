@@ -2173,25 +2173,39 @@ fn scan_bin_crate_tree(
         let Ok(ast) = syn::parse_file(&src) else {
             continue;
         };
+        let declaring_dir = file.parent().unwrap_or_else(|| Path::new(""));
         for (nested, name, path_value) in out_of_line_mod_declarations(&ast.items, default_features)
         {
             let mut dir_segments = module_path.clone();
-            dir_segments.extend(nested);
+            dir_segments.extend(nested.iter().cloned());
             // A `#[path = "..."]` override resolves relative to the
-            // DIRECTORY THAT `dir_segments` (the module's own enclosing
-            // path) IMPLIES, exactly the same rule (and the same
-            // `dir_segments` accumulation this loop already builds for the
-            // conventional case) [`path_attribute_module_paths`] applies
-            // for the ordinary `src/` walk — round 31 only ever wired that
-            // fix into the `src/` walk, leaving a custom crate tree's own
-            // `#[path]`-redirected submodule unresolved here (Codex review
-            // on #2739, round 35, P1).
+            // directory the DECLARING FILE ITSELF physically lives in, not
+            // the directory its full logical module path (`dir_segments`)
+            // would imply — Rust's real rule, verified directly: a custom
+            // capsule root's `mod wiring;` reaching `cmd/wiring.rs`, which
+            // itself has `#[path = "actual.rs"] mod handlers;`, resolves
+            // that override to `cmd/actual.rs` (beside `wiring.rs`), never
+            // `cmd/wiring/actual.rs`. `dir_segments` includes `module_path`
+            // — segments accumulated from ALL ancestor OUT-OF-LINE files up
+            // to the tree root — which corresponds to a real subdirectory
+            // only for the conventional (non-`#[path]`) resolution above;
+            // an out-of-line file's OWN directory is wherever it actually
+            // sits on disk (`declaring_dir`, this iteration's own `file`),
+            // regardless of how many out-of-line `mod` levels led here. Only
+            // `nested` — segments from an INLINE `mod { ... }` block inside
+            // THIS SAME file — still folds in as a subdirectory relative to
+            // `declaring_dir`, the same rule the ordinary `src/` walk's own
+            // `path_attribute_module_paths` already applies (Codex review on
+            // #2739, round 35, P1, fixed incompletely; round 39, P2, this
+            // fold's own base was still wrong for a non-root declaring file).
             let resolved = path_value.map_or_else(
                 || resolve_out_of_line_module_file(root_dir, &dir_segments, &name),
                 |path_value| {
-                    let dir = dir_segments
+                    let dir = nested
                         .iter()
-                        .fold(root_dir.to_path_buf(), |dir, segment| dir.join(segment));
+                        .fold(declaring_dir.to_path_buf(), |dir, segment| {
+                            dir.join(segment)
+                        });
                     Some(lexically_normalize_path(&dir.join(&path_value)))
                 },
             );
@@ -2918,14 +2932,18 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                 // if-let/while-let condition or a for-loop's pattern
                 // (verified directly via a real build). A pattern's own
                 // brace is always followed by more of the condition — `=`
-                // for an if-let/while-let, `in` for a for-loop — before the
-                // real body brace arrives; the real body brace, reached in
-                // statement position, is never followed by either (only
-                // possibly `else`, handled below), so this alone tells them
-                // apart without parsing the pattern itself (Codex review on
-                // #2739, round 38, P2).
+                // for an if-let/while-let, `in` for a for-loop, or `|` before
+                // another alternative in an unparenthesized or-pattern
+                // (`if let Foo { x } | Bar { x } = value() { .. }`, also
+                // verified directly) — before the real body brace arrives;
+                // the real body brace, reached in statement position, is
+                // never followed by any of the three (only possibly `else`,
+                // handled below), so this alone tells them apart without
+                // parsing the pattern itself (Codex review on #2739, round
+                // 38, P2, extended in round 39, P2 for or-patterns).
                 if matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '=')
                     || matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if id == "in")
+                    || matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '|')
                 {
                     i += 1;
                     continue;
@@ -3306,6 +3324,33 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
                         return None;
                     }
                     i += 1;
+                }
+                // A top-level `;` ends a bodyless declaration (`fn
+                // disabled() -> ();`, legal in a trait) — verified directly
+                // via a real build. Previously this fell into the tolerant
+                // catch-all below, which accepted `;` as ordinary
+                // punctuation and kept scanning past it into a LATER,
+                // unrelated item's own brace (e.g. a trait's own closing
+                // brace, or the next method's body) and returned that as if
+                // it were `disabled`'s body — so the caller resumed scanning
+                // past the real end of the excluded declaration, running
+                // straight through a subsequent active method's own
+                // `edge_routes![]` call along with it (Codex review on
+                // #2739, round 39, P2).
+                // A top-level `;` ends a bodyless declaration (`fn
+                // disabled() -> ();`, legal in a trait) — verified directly
+                // via a real build. Previously this fell into the tolerant
+                // catch-all below, which accepted `;` as ordinary
+                // punctuation and kept scanning past it into a LATER,
+                // unrelated item's own brace (e.g. a trait's own closing
+                // brace, or the next method's body) and returned that as if
+                // it were `disabled`'s body — so the caller resumed scanning
+                // past the real end of the excluded declaration, running
+                // straight through a subsequent active method's own
+                // `edge_routes![]` call along with it (Codex review on
+                // #2739, round 39, P2).
+                Some(TokenTree::Punct(p)) if p.as_char() == ';' && angle_depth == 0 => {
+                    return None;
                 }
                 // A non-brace group, or a Brace group nested inside `<...>`,
                 // is legitimate return-type/where-clause syntax — `-> ()`,
@@ -7712,5 +7757,137 @@ mod tests {
             scan.registered_fns()
         );
         assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// An unparenthesized or-pattern over struct-LIKE enum-variant patterns
+    /// (`E::A { x } | E::B { x }`, no wrapping tuple parens around the
+    /// brace, unlike a tuple-variant payload) has MULTIPLE top-level
+    /// struct-pattern braces, each followed by `|` except the last —
+    /// verified directly via a real build. The round-38 fix only recognized
+    /// `=`/`in` after a pattern's brace, so an or-pattern's first brace
+    /// (followed by `|`) was still mistaken for the real body, crediting
+    /// `edge_routes![show]` from inside the still-excluded `if let` body as
+    /// a separate, live statement (Codex review on #2739, round 39, P2).
+    #[test]
+    fn cfg_false_if_let_or_pattern_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            enum E {
+                A { x: i32 },
+                B { x: i32 },
+            }
+
+            fn value() -> E {
+                E::A { x: 1 }
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if let E::A { x } | E::B { x } = value() {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// A cfg'd-out bodyless trait method with a return type (`fn disabled()
+    /// -> ();`) is legal Rust — verified directly via a real build.
+    /// `simple_fn_body_index`'s return-type-tolerant loop previously
+    /// accepted the declaration's own `;` as ordinary punctuation and kept
+    /// scanning past it, mistaking the NEXT method's body brace for
+    /// `disabled`'s own — so that unrelated, still-active method's body
+    /// (and its `edge_routes![show]` call) was treated as part of the
+    /// excluded declaration and never visited (Codex review on #2739,
+    /// round 39, P2).
+    #[test]
+    fn cfg_false_bodyless_trait_method_with_return_type_does_not_swallow_the_next_methods_body() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            trait Wiring {
+                #[cfg(feature = "premium")]
+                fn disabled() -> ();
+
+                fn routes() {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// A `#[path]` override nested inside an out-of-line child of a custom
+    /// capsule root — `cmd/edge.rs` has `mod wiring;`, and `cmd/wiring.rs`
+    /// itself has `#[path = "actual.rs"] mod handlers;` — resolves relative
+    /// to `wiring.rs`'s OWN directory (`cmd/`), never a subdirectory named
+    /// after its full logical module path (`cmd/wiring/`) — verified
+    /// directly via a real build. `scan_bin_crate_tree`'s BFS previously
+    /// folded the full accumulated `module_path` (correct for the
+    /// conventional, non-`#[path]` case, where it really does correspond to
+    /// nested subdirectories) onto `root_dir` for the `#[path]` case too,
+    /// so it searched `cmd/wiring/actual.rs` — a file that doesn't exist —
+    /// and never found `show` at all, rather than merely getting its module
+    /// path wrong (Codex review on #2739, round 39, P2).
+    #[test]
+    fn resolve_edge_scan_resolves_a_nested_path_attribute_in_a_custom_capsule_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "mod wiring;\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/wiring.rs"),
+            "#[path = \"actual.rs\"]\nmod handlers;\nfn wire() { edge_routes![crate::wiring::handlers::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "cmd/actual.rs");
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["wiring".to_owned(), "handlers".to_owned()]
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 }
