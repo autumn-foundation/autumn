@@ -347,9 +347,16 @@ where the *later*, dropped page itself carries an explicit path equal to
 the bare slug rather than omitting `path`. Every case that *does* involve
 file ordering within a single run is a pure function of that ordering,
 not a race — but, per these reproductions, neither same-run ordering, the
-persisted row's own `path` history, that row being top-level, nor even
-the incoming page's own pathlessness is actually a precondition of the
-bug at all; only the coincidence of the two file-identity *strings* is.
+persisted row's own `path` history, nor that row being top-level is
+actually a precondition of the bug at all. What *is* required — per the
+boundary above — is that the incoming page's file identity coincides with
+an already-claimed identity that does *not* accurately describe some
+row's true position: either a persisted row's ancestry-derived
+`local_identity` (Path A — a row that need not have any "file identity"
+at all; it could equally have been created directly through the admin
+UI, with `local_identity` computed purely from its live database
+ancestry), or an earlier import's `_import_source_slug` marker (Path B).
+Two pages that both carry accurate, matching identities are not this bug.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
