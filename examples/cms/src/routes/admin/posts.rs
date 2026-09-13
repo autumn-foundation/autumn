@@ -612,8 +612,13 @@ struct TaxonomyField {
     terms: Vec<Term>,
     /// Whether the taxonomy holds more terms than the window is showing.
     truncated: bool,
-    /// Which of them this post carries.
-    selected: Vec<i64>,
+    /// Which of them this post carries. A `HashSet` rather than a `Vec`
+    /// because the redisplay path (see `submitted_term_ids`) fills this from
+    /// an author's submission with no upper bound of its own — checking it
+    /// once per rendered checkbox must stay O(1) regardless of how many ids
+    /// were submitted, not scale with that count the way a linear `contains`
+    /// would.
+    selected: std::collections::HashSet<i64>,
     /// The comma-separated names, for a flat taxonomy's box.
     names: String,
 }
@@ -687,7 +692,8 @@ impl EditorContext {
                 .iter()
                 .filter(|term| term.taxonomy == taxonomy.slug)
                 .collect();
-            let selected: Vec<i64> = mine.iter().map(|term| term.id).collect();
+            let selected: std::collections::HashSet<i64> =
+                mine.iter().map(|term| term.id).collect();
             // A hierarchical taxonomy lists terms as checkboxes; a flat one
             // takes names, so it needs no term list.
             let (terms, truncated) = if taxonomy.hierarchical {
@@ -847,27 +853,25 @@ fn apply_submitted_taxonomies(context: &mut EditorContext, form: &PostForm) {
     }
 }
 
-/// The ids `form` submitted for one hierarchical taxonomy, deduplicated and
-/// capped at `MAX_TERMS_PER_SAVE` — bounded on the way out of the submission,
-/// before a sort, a collection into a second `Vec`, or a per-checkbox
-/// `contains` scan ever sees them.
+/// The ids `form` submitted for one hierarchical taxonomy, deduplicated via
+/// a `HashSet` — a single pass over the submission, with no second sort or
+/// `Vec` allocation.
 ///
-/// This runs on an already-rejected submission a crafted request fully
-/// controls, not a validated save: `field.selected` and the missing-id
-/// lookup below both read straight from `form.taxonomies`, and an early cap
-/// here is what stops a request repeating a taxonomy checkbox far past
-/// `MAX_TERMS_PER_SAVE` from making either one collect, sort or scan an
-/// oversized list — the query bound `resolve_term_ids` and the earlier
-/// `ensure_submitted_choices_visible` fix apply is too late to help either.
-fn submitted_term_ids(form: &PostForm, taxonomy_slug: &str) -> Vec<i64> {
-    let mut seen = std::collections::HashSet::new();
+/// Deliberately **not** capped at `MAX_TERMS_PER_SAVE`, unlike a save:
+/// checking these against `field.terms` (the picker's own already-bounded
+/// list) costs one hash lookup per id regardless of how many were
+/// submitted, so there is no per-id cost here left to bound. Capping it
+/// anyway would silently turn a genuinely-oversized selection into a
+/// "valid"-looking 50-item one on redisplay — hiding the real problem
+/// instead of letting the eventual save's `resolve_term_ids` report it.
+/// `ensure_submitted_choices_visible` bounds the one place that *does* have
+/// a per-id cost: how many of these get fetched from the database.
+fn submitted_term_ids(form: &PostForm, taxonomy_slug: &str) -> std::collections::HashSet<i64> {
     form.taxonomies
         .get(taxonomy_slug)
         .into_iter()
         .flatten()
         .copied()
-        .filter(|id| seen.insert(*id))
-        .take(MAX_TERMS_PER_SAVE)
         .collect()
 }
 
@@ -910,12 +914,15 @@ async fn ensure_submitted_choices_visible(
         }
         let present: std::collections::HashSet<i64> =
             field.terms.iter().map(|term| term.id).collect();
-        // Already deduplicated and capped at `MAX_TERMS_PER_SAVE` by
-        // `submitted_term_ids` — filtering `present` out afterwards only
-        // ever shrinks that bounded list, never grows it.
+        // Bounded here, not in `submitted_term_ids`: each of these costs a
+        // row in the `IN (...)` query below, so — unlike `field.selected`,
+        // which just needs correct `checked` state — this is the one place
+        // in this loop with a real per-id cost, and `take` stops at the
+        // bound without a sort over however many ids were submitted.
         let missing: Vec<i64> = submitted_term_ids(form, field.slug)
             .into_iter()
             .filter(|id| !present.contains(id))
+            .take(MAX_TERMS_PER_SAVE)
             .collect();
         if missing.is_empty() {
             continue;
