@@ -869,31 +869,42 @@ pub async fn unlock(
 /// *page-typed* result — `search()` and `listing()` both did, up to
 /// `MAX_PAGE_DEPTH` round trips for each hierarchical hit on a page. This
 /// batches the same way `site::nav_for` already does for the nav menu: one
-/// `posts_with_ancestors` call loads every result's own row plus every
-/// ancestor across the whole batch, at most `MAX_PAGE_DEPTH` queries total
-/// regardless of how many results or how many of them are pages, and
-/// `permalink_from` (the pure, map-based twin of `Repos::permalink`) builds
-/// each URL from that map afterwards with no further database access.
+/// `posts_with_ancestors` call loads every ancestor across the whole batch,
+/// at most `MAX_PAGE_DEPTH` queries total regardless of how many results or
+/// how many of them are pages, and `permalink_from` (the pure, map-based
+/// twin of `Repos::permalink`) builds each URL from that map afterwards
+/// with no further database access.
+///
+/// Seeded from each post's own already-loaded `parent_id`, not from the
+/// post's own `id` — `posts_with_ancestors` also re-fetches whatever ids it
+/// is given, and re-fetching the result rows themselves would race a
+/// concurrent reparent: `ancestry_from` walks from `post.parent_id` (the
+/// value already in hand from the listing/search query), so if that read
+/// re-fetched a *different*, newer `parent_id` for the same row, the two
+/// would disagree and the ancestor lookup would come up empty, truncating
+/// the permalink. Starting one level up avoids the mismatch entirely, and
+/// costs one fewer batched query per request than re-fetching the leaves.
 async fn permalinks_for(
     repos: &Repos,
     posts: &[Post],
     settings: &Settings,
 ) -> AutumnResult<Vec<(Post, String)>> {
-    let page_ids: Vec<i64> = posts
+    let parent_ids: Vec<i64> = posts
         .iter()
         .filter(|post| post.post_type == "page")
-        .map(|post| post.id)
+        .filter_map(|post| post.parent_id)
         .collect();
     // `blog_index`/`term_archive`/`author_archive`/`date_archive` all list
-    // `post_type = "post"` results, so `page_ids` is empty on every one of
-    // them — skip the connection checkout entirely rather than pay for one
-    // just to run a query `posts_with_ancestors` would immediately no-op.
-    let ancestors = if page_ids.is_empty() {
+    // `post_type = "post"` results, and a top-level page has no parent, so
+    // `parent_ids` is empty on every one of them — skip the connection
+    // checkout entirely rather than pay for one just to run a query
+    // `posts_with_ancestors` would immediately no-op.
+    let ancestors = if parent_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
         repos
             .with_conn(async move |conn| {
-                crate::content::posts_with_ancestors(conn, &page_ids).await
+                crate::content::posts_with_ancestors(conn, &parent_ids).await
             })
             .await?
     };
