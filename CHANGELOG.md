@@ -565,6 +565,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project declaring `autumn-web` this way silently kept the `mail` feature
   unset after `autumn generate auth --mail`, with no error — the generated
   mail routes would then fail to compile.
+- **`autumn release init --target aws-app-runner`:** `main.tf`'s
+  `aws_apprunner_service` no longer ignores the whole `instance_configuration`
+  block (#2256). The cutover call in `docs/guide/deployment.md` sets only
+  `instance_role_arn` outside Terraform, but the old `ignore_changes` list
+  named the entire block, so a later change to `var.instance_cpu` or
+  `var.instance_memory` never reached AWS — `terraform apply` silently kept
+  the service at its old size. `ignore_changes` now targets
+  `instance_configuration[0].instance_role_arn` only, so cpu/memory resizing
+  works through Terraform again while the role stays cutover-managed.
 - **query strings:** an append (`tags[]=`) after an out-of-range explicit
   index no longer sorts wrong or collides with it (#2253). `Segment::Index`
   saturates an absurd index to `usize::MAX` for ordering only; an append
