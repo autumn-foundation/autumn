@@ -1355,6 +1355,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: batch `examples/cms`'s search/listing permalink resolution
+  (statements 16-80→0, buffers -42%..-80%):** `Repos::permalink`
+  (`examples/cms/src/routes/site.rs`) resolves a `page`-typed post's
+  permalink by walking its ancestor chain one row at a time via
+  `page_ancestry` — up to `MAX_PAGE_DEPTH` (8) sequential single-row
+  `find_by_id` round trips. Both `search()` and the shared `listing()`
+  helper (`examples/cms/src/routes/front.rs`) called it once per result, so
+  every `page`-typed hit in a results page paid its own full ancestor walk
+  on `/search`, an unauthenticated, unbounded-traffic public route — the
+  same defect shape already found and fixed for the nav menu
+  (`site::nav_for`/`content::posts_with_ancestors`), never applied to these
+  two call sites. A new `permalinks_for` helper batches both call sites the
+  same way `nav_for` already does: one `posts_with_ancestors` call resolves
+  every ancestor across the whole batch, and the existing pure
+  `site::permalink_from` builds each URL from that map with no further
+  database access (and no connection checkout at all when no result is
+  `page`-typed — the common case for `blog_index`/`term_archive`/
+  `author_archive`/`date_archive`, which only ever list `post_type = "post"`
+  results). Seeded from each post's own already-loaded `parent_id`, not the
+  post's own `id`: re-fetching the result rows themselves, as
+  `posts_with_ancestors` does for its `nav_for` caller, would race a
+  concurrent reparent between the listing query and this one, and disagree
+  with the already-loaded `parent_id` `ancestry_from` actually walks from —
+  caught in review before merge. Profiled through the real `/search` route
+  against a ~10,500-row fixture (10,000 flat posts, 500 background pages,
+  plus three "documentation section" tiers of 2/5/10 sibling leaf pages
+  sharing one 8-level ancestor chain): the unbatched single-row lookup
+  scaled exactly linearly with leaf count (16/40/80 calls) and dropped to
+  zero at every tier after the fix, with `posts`-table buffers for the
+  ancestor work down 42.1%/71.1%/80.0%. No behavior change: a new
+  equivalence test
+  (`search_resolves_hierarchical_page_permalinks_from_the_batched_lookup`)
+  covers two sibling leaves sharing one parent chain resolving their own
+  full nested paths, and the full existing 196-test Docker-gated suite
+  passes unchanged. See
+  `docs/reports/2026-09-13-ledger-cms-search-listing-permalink-ancestry-batch/`.
+
 - **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
   subscription (buffers -97.8%):** `close_dunning_for`
   (`autumn-billing/src/reconcile.rs`), the step a `subscription.deleted`/
