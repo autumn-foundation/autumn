@@ -2909,7 +2909,29 @@ fn skip_cfg_excluded_statement(
 fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
     loop {
         match trees.get(i) {
-            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => break,
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
+                // A struct/tuple-struct PATTERN can itself contain a brace
+                // group — `if let Foo { x } = value() { .. }`, `for Foo { x }
+                // in items { .. }` — so the first Brace reached is not always
+                // the real body: unlike an expression, Rust's grammar does
+                // not forbid an unparenthesized struct pattern in an
+                // if-let/while-let condition or a for-loop's pattern
+                // (verified directly via a real build). A pattern's own
+                // brace is always followed by more of the condition — `=`
+                // for an if-let/while-let, `in` for a for-loop — before the
+                // real body brace arrives; the real body brace, reached in
+                // statement position, is never followed by either (only
+                // possibly `else`, handled below), so this alone tells them
+                // apart without parsing the pattern itself (Codex review on
+                // #2739, round 38, P2).
+                if matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '=')
+                    || matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if id == "in")
+                {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
             Some(_) => i += 1,
             None => return None,
         }
@@ -3012,6 +3034,22 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
         )
     {
         return braced_or_semicolon_item_end(trees, item_start + 1);
+    }
+    // A foreign block (`extern "C" { ... }`, bare `extern { ... }`) or an
+    // async block used as a statement (`async { ... }`) leaves nothing but
+    // the brace itself after its modifiers are skipped — neither has a
+    // name/keyword of its own between the modifiers and the body, unlike
+    // `struct`/`macro_rules`/etc above, and neither ever takes a trailing
+    // `;` — verified directly via a real build. `unsafe extern "C" { ... }`
+    // already reaches its brace correctly through the `"unsafe"` branch at
+    // the top of this function (control_flow_block_end's opaque scan skips
+    // over `extern "ABI"` on the way there); this is specifically for the
+    // modifier combinations that don't start with one of that branch's
+    // keywords, so `extern "C" { ... }` alone still needs it (Codex review
+    // on #2739, round 38, P2).
+    if matches!(trees.get(item_start), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
+    {
+        return Some(item_start);
     }
     None
 }
@@ -7527,5 +7565,152 @@ mod tests {
         let registered = scan.registered_fns();
         assert_eq!(registered.len(), 1, "{registered:?}");
         assert_eq!(registered[0].file, "cmd/type.rs");
+    }
+
+    /// `if let Foo { x } = value() { .. }` has a struct PATTERN of its own,
+    /// with its own brace group, before the real body's brace — unlike an
+    /// expression, Rust's grammar allows a bare struct pattern here, so the
+    /// naive "first Brace ends the block" rule finds the pattern's brace
+    /// instead of the body's. A cfg'd-out one previously credited
+    /// `edge_routes![show]` INSIDE the still-excluded body as if it were a
+    /// separate, live statement, registering a handler real Rust drops
+    /// along with the rest of the `if let` (Codex review on #2739, round 38,
+    /// P2).
+    #[test]
+    fn cfg_false_if_let_struct_pattern_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct Foo {
+                x: i32,
+            }
+
+            fn value() -> Foo {
+                Foo { x: 1 }
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if let Foo { x } = value() {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// A `for Foo { x } in items { .. }` loop has the identical struct-
+    /// pattern-brace ambiguity as the `if let` case above, in its own
+    /// pattern rather than a `let`.
+    #[test]
+    fn cfg_false_for_loop_struct_pattern_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct Foo {
+                x: i32,
+            }
+
+            fn items() -> Vec<Foo> {
+                Vec::new()
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                for Foo { x } in items() {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// A cfg'd-out `extern "C" { ... }` foreign block (no leading `unsafe`)
+    /// has no trailing `;` — verified directly via a real build — and after
+    /// `skip_forward_over_item_modifiers` skips `extern`/the ABI literal,
+    /// nothing distinguishes it from an ordinary bare Brace: the old code
+    /// only recognized `struct`/`enum`/`union`/`trait` there, so the generic
+    /// scan-to-`;` fallback ran through the excluded block and matched the
+    /// FIRST semicolon inside it (or past it), consuming the still-real
+    /// `edge_routes![show];` that followed along with it (Codex review on
+    /// #2739, round 38, P2).
+    #[test]
+    fn cfg_false_extern_block_without_unsafe_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                extern "C" {
+                    fn premium_only();
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// `unsafe extern "C" { ... }` already reaches its own brace correctly
+    /// through the `"unsafe"` branch at the top of
+    /// `statement_without_semicolon_end` (which hands off to
+    /// `control_flow_block_end`'s opaque scan) — this locks that in as a
+    /// regression test alongside the no-`unsafe` case above, which needed
+    /// the fix.
+    #[test]
+    fn cfg_false_extern_block_with_unsafe_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                unsafe extern "C" {
+                    fn premium_only();
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
     }
 }
