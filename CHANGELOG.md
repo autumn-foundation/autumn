@@ -1292,6 +1292,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [migration guide](docs/migrations/next.md#static_get-feature_flag-is-now-a-compile-error)
   and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
+- **repository:** **Breaking:** `#[repository(api = "...", owner = column)]`
+  with no `policy = Type` is now a compile error (🛡 Warden). `owner =
+  <column>` only emits opt-in `list_scoped(owner_id, ..)` /
+  `search_page_scoped(owner_id, ..)` methods for a hand-written handler to
+  call with an explicit owner id — the auto-generated `api = "..."` CRUD
+  handlers (`_api_list`/`_api_get`/`_api_create`/`_api_update`/`_api_delete`)
+  never call them, and only `policy` actually gates the single-record
+  handlers (`policy_check_show`/`policy_check_update_pre`/
+  `policy_check_delete_pre` are generated purely from `has_policy`; there is
+  no `scope`-driven equivalent). Declared on its own next to `api = "..."`,
+  `owner` therefore compiled to a fully public REST API that read, at the
+  declaration site, like a per-owner-scoped one: `GET <api>` returned every
+  user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any authenticated
+  caller read/overwrite/delete any other user's row by id, since
+  `find_by_id`/`update`/`delete_by_id` are not owner-filtered either.
+  `scope = Type` alone does not close this either — it only filters `GET
+  <api>`'s SQL query and has no effect on the single-record routes, which
+  stay fully open (an initial version of this fix wrongly accepted `scope`
+  as an alternative to `policy`; caught in review before merge).
+  **Migration:** add `policy = Type` (whose `can_show`/`can_update`/
+  `can_delete` can compare `ctx.user_id_i64()` against the owner column) —
+  keep `scope = Type` alongside it if you want the list endpoint's cheaper
+  SQL-level filter too — or drop `api = "..."` and call the generated
+  `list_scoped`/`search_page_scoped` methods from your own hand-written,
+  owner-checked routes instead. See the
+  [migration guide](docs/migrations/next.md#repository-owner--column-next-to-api---now-requires-policy)
+  and `docs/security/2026-09-13-repository-owner-api-bypass/`.
+
 ### Performance
 
 - **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
