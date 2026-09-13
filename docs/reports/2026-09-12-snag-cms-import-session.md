@@ -299,6 +299,22 @@ each verified live rather than accepted from reasoning alone:
   its file identity *string* collides with an already-claimed one, by
   either mechanism.
 
+  **A necessary boundary, raised by a further Codex comment on the same
+  point:** this does *not* mean any two pages that both carry explicit,
+  *accurate* `path` values can collide. If the earlier page had instead
+  been imported with its own correct `path: "a/team"` (rather than
+  omitted), its marker would be keyed on `"a/team"`, never `"team"` at
+  all — no poisoning, no collision, by design. And if *both* colliding
+  entries explicitly declare the identical `path: "team"` — genuinely
+  asserting the same canonical identity regardless of what their separate
+  `parent` fields say — skipping the second is arguably *correct*
+  idempotent behavior per `ExportPost::path`'s own documented role ("what
+  identifies it"), not data loss. The bug requires that at least one side
+  reach the colliding identity string *without* it accurately describing
+  that page's true, fully-qualified position — via an omitted `path`
+  (falling back to the bare slug while the page is actually nested
+  elsewhere) being the concrete mechanism in every reproduction here.
+
 Either way — via `find_local`'s bare-identity match against a persisted
 top-level row, and/or via the `_import_source_slug` marker matching *any*
 earlier pathless import regardless of where that import's page actually
