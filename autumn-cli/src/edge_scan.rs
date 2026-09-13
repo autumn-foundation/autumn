@@ -893,10 +893,18 @@ impl syn::parse::Parse for TargetCfgPredicate {
         if !input.peek(syn::Token![=]) {
             return Ok(Self::Leaf(false));
         }
-        // A `key = "value"` pair this scan does not recognize the key
-        // for — not part of the resolvable grammar either; the caller
-        // treats the whole predicate as "does not match."
-        Err(input.error("target cfg predicate not resolvable by this scan"))
+        // A `key = "value"` pair this scan does not recognize the key for
+        // gets the identical treatment, for the identical reason — verified
+        // directly the same way: `[target.'cfg(not(my_key = "x"))'.…]`
+        // includes the dependency for wasm32-wasip1, the bare, un-negated
+        // form of the same predicate does not. Consume the `= "value"` so
+        // the rest of the enclosing `not`/`all`/`any` still parses, rather
+        // than erroring here and failing the WHOLE predicate the same
+        // wrong way the bare-flag case did before round 26 (Codex review
+        // on #2739, round 28, P1).
+        input.parse::<syn::Token![=]>()?;
+        input.parse::<syn::LitStr>()?;
+        Ok(Self::Leaf(false))
     }
 }
 
@@ -2428,7 +2436,8 @@ fn skip_cfg_excluded_statement(
     if matches!(trees.get(attrs_end), Some(TokenTree::Group(_))) {
         return Some(attrs_end + 1);
     }
-    // `if`/`match`/`while`/`loop`/`for`/`unsafe` used as a whole statement
+    // `if`/`match`/`while`/`loop`/`for`/`unsafe`, a bare anonymous `const {
+    // ... }` block, and a labeled block/loop, used as a whole statement,
     // never end in `;` — real Rust's grammar simply doesn't require or
     // allow one there (a trailing `;` after `if cond { .. }` would be an
     // EXTRA, separate empty statement, not part of it). The generic
@@ -2438,14 +2447,10 @@ fn skip_cfg_excluded_statement(
     // the excluded `if`'s own closing brace and into the next, unrelated,
     // still-real statement, stopping only at ITS semicolon — dropping a
     // genuine registration the real build still compiles in (Codex review
-    // on #2739, round 25, P2).
-    if let Some(TokenTree::Ident(ident)) = trees.get(attrs_end)
-        && matches!(
-            ident.to_string().as_str(),
-            "if" | "match" | "while" | "loop" | "for" | "unsafe"
-        )
-        && let Some(block_end) = control_flow_block_end(trees, attrs_end + 1)
-    {
+    // on #2739, round 25, P2, extended in round 28, P2 for `const { ... }`
+    // and labeled blocks/loops, the identical ambiguity in a different
+    // spelling).
+    if let Some(block_end) = statement_without_semicolon_end(trees, attrs_end) {
         return Some(block_end + 1);
     }
     let mut i = attrs_end;
@@ -2490,6 +2495,52 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
         };
     }
     Some(i)
+}
+
+/// The end of a semicolon-free block-like statement starting at `i`, or
+/// `None` when `trees[i..]` doesn't start one of these shapes at all (the
+/// caller then falls back to scanning for a top-level `;`).
+///
+/// Covers `if`/`match`/`while`/`loop`/`for`/`unsafe` (via
+/// [`control_flow_block_end`]); a bare, anonymous `const { ... }` block
+/// (stable since Rust 1.79, verified directly via a real build that it
+/// compiles as a statement with no trailing `;` needed) — distinguished
+/// from an ordinary `const NAME: TYPE = ...;` ITEM by checking whether the
+/// very next token is a Brace group directly, since an item's own name
+/// always intervenes and a block never has one; and a labeled block or
+/// loop (`'label: { ... }`, `'label: loop { ... }`, `'label: while ... {
+/// ... }`, `'label: for ... in ... { ... }` — verified directly that a bare
+/// labeled block also compiles as a semicolon-free statement), which
+/// shares the exact same property as its unlabeled form and is folded in
+/// via the same two helpers (Codex review on #2739, round 28, P2).
+fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usize> {
+    if let Some(TokenTree::Ident(ident)) = trees.get(i) {
+        match ident.to_string().as_str() {
+            "if" | "match" | "while" | "loop" | "for" | "unsafe" => {
+                return control_flow_block_end(trees, i + 1);
+            }
+            "const" => {
+                return matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
+                    .then_some(i + 1);
+            }
+            _ => {}
+        }
+    }
+    if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '\'')
+        && matches!(trees.get(i + 1), Some(TokenTree::Ident(_)))
+        && matches!(trees.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+    {
+        return match trees.get(i + 3) {
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => Some(i + 3),
+            Some(TokenTree::Ident(ident))
+                if matches!(ident.to_string().as_str(), "loop" | "while" | "for") =>
+            {
+                control_flow_block_end(trees, i + 4)
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 /// For `[<generics>] <Type>` or `[<generics>] <Trait> for <Type> [where
@@ -3550,6 +3601,118 @@ mod tests {
         );
     }
 
+    /// Same idea, but the excluded statement is a bare, anonymous `const {
+    /// ... }` block (stable since Rust 1.79) instead of an `if` — another
+    /// semicolon-free statement shape `skip_cfg_excluded_statement`'s
+    /// scan-to-`;` fallback cannot see the end of, so it would run right
+    /// through it into the next, still-real `edge_routes![show];` (Codex
+    /// review on #2739, round 28, P2).
+    #[test]
+    fn cfg_false_const_block_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[edge]
+            pub fn premium() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                const {
+                    edge_routes![crate::premium];
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "premium");
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// Same idea again, but the excluded statement is a labeled loop
+    /// (`'label: loop { ... }`) — labeled blocks/loops share the exact same
+    /// "no `;` needed" property as their unlabeled form (Codex review on
+    /// #2739, round 28, P2).
+    #[test]
+    fn cfg_false_labeled_loop_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[edge]
+            pub fn premium() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                'outer: loop {
+                    edge_routes![crate::premium];
+                    break 'outer;
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "premium");
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// An ordinary `const NAME: TYPE = { ... };` ITEM (not the bare
+    /// anonymous block form) must still be recognized as ending in `;`, not
+    /// mistaken for the semicolon-free block form — its own name always
+    /// intervenes between `const` and any brace, so
+    /// `statement_without_semicolon_end`'s Brace-directly-after-`const`
+    /// check correctly declines it and the generic scan-to-`;` fallback
+    /// still applies, correctly skipping the WHOLE statement (including
+    /// the excluded `premium` registration nested inside its own braced
+    /// initializer) without ever recursing into it.
+    #[test]
+    fn cfg_false_const_item_with_a_braced_initializer_does_not_swallow_the_following_registration()
+    {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[edge]
+            pub fn premium() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                const VALUE: () = { edge_routes![crate::premium]; };
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "premium");
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
     /// A grouped return type (`-> ()`, `-> Result<(), E>`, `-> [T; N]`) has
     /// a non-brace `Group` token (a parenthesized or bracketed group) inside
     /// it — previously unrecognized by the return-type/`where`-clause
@@ -4386,6 +4549,40 @@ mod tests {
     fn an_unknown_bare_flag_target_specific_dependency_is_not_enabled() {
         let manifest = r#"
             [target.'cfg(my_custom_flag)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"), "{enabled:?}");
+    }
+
+    /// The same "unknown is absent, not unparseable" fix, but for a `key =
+    /// "value"` pair whose key this scan doesn't recognize, not just a bare
+    /// flag — verified directly the same way (`cargo tree --target
+    /// wasm32-wasip1` on `[target.'cfg(not(my_key = "x"))'.…]` includes the
+    /// dependency; the bare, un-negated form does not) (Codex review on
+    /// #2739, round 28, P1).
+    #[test]
+    fn a_not_unknown_valued_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(not(my_key = "x"))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"), "{enabled:?}");
+    }
+
+    /// The un-negated mirror: an unknown `key = "value"` pair alone is
+    /// false, so the dependency stays disabled.
+    #[test]
+    fn an_unknown_valued_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(my_key = "x")'.dependencies]
             dep = { version = "1", optional = true }
 
             [features]
