@@ -1270,6 +1270,20 @@ fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &st
     })
 }
 
+/// Whether `[features]` declares an entry literally named `pkg` — a real,
+/// explicit feature that merely happens to share an optional dependency's
+/// name, as opposed to Cargo's own auto-generated implicit feature of the
+/// same name (which only exists when no such explicit entry is present).
+/// [`enabled_features_from_manifest_for_resolver`] checks this BEFORE
+/// consulting [`implicit_feature_is_suppressed`]: `dep:pkg` used elsewhere
+/// suppresses the auto-generated implicit feature, but has no bearing on
+/// an explicit one, which `pkg/feat` syntax still turns on regardless
+/// (Codex review on #2739, round 34, P1).
+#[must_use]
+fn has_explicit_feature_entry(features_table: Option<&toml::Table>, pkg: &str) -> bool {
+    features_table.is_some_and(|features| features.contains_key(pkg))
+}
+
 /// The scanned crate's own Rust library-crate identifier — what
 /// `edge_routes![this_name::item]` would actually have to spell to reach one
 /// of its items, same as `crate::item`. This is not always the bare
@@ -1407,14 +1421,27 @@ fn enabled_features_from_manifest_for_resolver(
             // dependency sharing its name with an unrelated local feature
             // must not have that feature turned on here (Codex review on
             // #2739, round 7, P2). The weak form (`pkg?/feat`) makes no
-            // such promise either way. That implicit feature is itself
+            // such promise either way. That IMPLICIT feature is itself
             // suppressed crate-wide once any feature entry spells `dep:pkg`
-            // — see `implicit_feature_is_suppressed` (round 13, P2).
+            // — see `implicit_feature_is_suppressed` (round 13, P2) — but
+            // an EXPLICIT `[features] pkg = [...]` entry is a different
+            // feature that merely happens to share the dependency's name,
+            // and `pkg/feat` still turns it on regardless of `dep:pkg`
+            // appearing elsewhere: verified directly (`cargo rustc --
+            // --print cfg`) that `feature="pkg"` is active for
+            // `default = ["pkg/feat"]` + an explicit `pkg = []` + an
+            // unrelated `other = ["dep:pkg"]`, and is NOT active with the
+            // explicit `pkg = []` entry removed (the round-13 case this
+            // suppression still correctly covers). Checking for an
+            // explicit entry first, before consulting the suppression at
+            // all, is what distinguishes the two (Codex review on #2739,
+            // round 34, P1).
             if !pkg.ends_with('?')
                 && table
                     .as_ref()
                     .is_some_and(|t| is_optional_dependency(t, pkg, resolver_v1))
-                && !implicit_feature_is_suppressed(features_table.as_ref(), pkg)
+                && (has_explicit_feature_entry(features_table.as_ref(), pkg)
+                    || !implicit_feature_is_suppressed(features_table.as_ref(), pkg))
             {
                 queue.push(pkg.to_owned());
             }
@@ -5034,6 +5061,32 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(!enabled.contains("foo"));
+    }
+
+    /// The `dep:foo`-anywhere suppression above is specific to the
+    /// AUTO-GENERATED implicit feature — it has no bearing on an EXPLICIT
+    /// `[features] foo = [...]` entry, which merely happens to share the
+    /// optional dependency's name. Verified directly against `cargo rustc
+    /// -- --print cfg`: `feature="foo"` is still active for exactly this
+    /// manifest shape (`default = ["foo/bar"]` + explicit `foo = []` +
+    /// unrelated `explicit = ["dep:foo"]`), unlike the previous test which
+    /// has no explicit `foo` entry at all. Missing this made the scan
+    /// treat a route gated on `foo` as compiled out even though a real
+    /// release build still sets `cfg(feature = "foo")` (Codex review on
+    /// #2739, round 34, P1).
+    #[test]
+    fn an_explicit_feature_sharing_an_optional_dependencys_name_is_still_enabled() {
+        let manifest = r#"
+            [dependencies]
+            foo = { version = "1", optional = true }
+
+            [features]
+            default = ["foo/bar"]
+            foo = []
+            explicit = ["dep:foo"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("foo"), "{enabled:?}");
     }
 
     /// Without any `dep:foo` in the picture, the strong form still enables
