@@ -518,6 +518,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`unique_violation_field` on SQLite (#2698):** diesel boxes a `SQLite`
+  unique-constraint violation's error information as a bare `String`, whose
+  `constraint_name()` always returns `None` — there is no `SQLite`
+  equivalent of Postgres's named constraint. `unique_violation_field`
+  matched purely on `constraint_name()`, so every generated app's
+  friendly-conflict handling for a `--unique` column (`autumn generate
+  scaffold`, the teams starter's pending-invitation index) was unreachable
+  on `SQLite`: a real duplicate insert reached the blanket `500` instead of
+  the mapped message. It now falls back to parsing `SQLite`'s own message
+  text (e.g. `UNIQUE constraint failed: widgets.email`) to resolve the
+  violated column when no constraint name is reported. Postgres behavior
+  and the function's signature are unchanged.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
