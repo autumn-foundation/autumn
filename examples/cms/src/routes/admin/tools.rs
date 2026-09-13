@@ -669,6 +669,25 @@ impl ParentRef {
             ParentRef::Path(id) | ParentRef::Bare(id) => id,
         }
     }
+
+    /// Finds this reference among content the file does not declare
+    /// (#2763).
+    ///
+    /// `Path` names an exact position. Match it exactly, like any
+    /// file-declared identity.
+    ///
+    /// `Bare` names only a slug, never a position. Match it by slug. An
+    /// exact-position match would fail as soon as the target post moved.
+    async fn resolve_local(
+        &self,
+        repos: &Repos,
+        post_type: &str,
+    ) -> AutumnResult<Option<crate::models::Post>> {
+        match self {
+            ParentRef::Path(id) => find_local(repos, post_type, id).await,
+            ParentRef::Bare(slug) => find_local_by_slug(repos, post_type, slug).await,
+        }
+    }
 }
 
 /// The identity of a post's parent, as the file describes it.
@@ -794,14 +813,16 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 /// unaffected by the allocator suffixing an ancestor's slug.
 ///
 /// Only when the parent is not part of this file — content this import does
-/// not itself declare — does this fall back to that parent's real, current
-/// position: the one signal available for content this importer does not
-/// track. `parent_now` is that fallback's input, and only ever applies at
-/// the top of the recursion, where the caller has already resolved it; a
-/// parent found one or more levels up the file's own chain has no such
-/// value computed for it, so a *second* external parent further up a
-/// legacy chain falls back to its own bare slug instead. Bounded by
-/// `MAX_PAGE_DEPTH` like every other ancestry walk in this module.
+/// not itself declare — does this anchor to that parent's row id instead
+/// (#2763). A row id never changes. A position-based anchor went stale the
+/// moment an editor moved that external parent. A later re-import then
+/// computed a different key than the one on record, and filed a duplicate.
+/// `parent_now` is that anchor's input. It applies only at the top of the
+/// recursion, where the caller has already resolved it. A parent found
+/// further up the file's own chain has no such value, so a second external
+/// parent higher in a legacy chain falls back to its own bare slug instead.
+/// Bounded by `MAX_PAGE_DEPTH` like every other ancestry walk in this
+/// module.
 ///
 /// This is the plain, undecorated position — not yet a marker key. Every
 /// recursive step composes on this exact value, deliberately, so a chain
@@ -813,7 +834,6 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 /// own exporter always writes one — could no longer recognize its own,
 /// already-imported pages by position alone.
 fn stable_identity<'a>(
-    repos: &'a Repos,
     posts: &'a [ExportPost],
     graph: &'a FileGraph,
     index: usize,
@@ -834,21 +854,13 @@ fn stable_identity<'a>(
             match graph.find(post.post_type.as_str(), &parent) {
                 Some(parent_index) => {
                     let parent_stable =
-                        stable_identity(repos, posts, graph, parent_index, memo, None, depth + 1)
-                            .await?;
+                        stable_identity(posts, graph, parent_index, memo, None, depth + 1).await?;
                     format!("{parent_stable}/{}", post.slug)
                 }
-                None => match parent_now.map(|id| repos.posts.find_by_id(id)) {
-                    Some(query) => match query.await? {
-                        Some(parent_row) => {
-                            format!(
-                                "{}/{}",
-                                local_identity(repos, &parent_row).await?,
-                                post.slug
-                            )
-                        }
-                        None => post.slug.clone(),
-                    },
+                // Anchor to the id, not the position. The id does not
+                // change when this external parent moves (#2763).
+                None => match parent_now {
+                    Some(parent_id) => format!("id:{parent_id}/{}", post.slug),
                     None => post.slug.clone(),
                 },
             }
@@ -858,6 +870,35 @@ fn stable_identity<'a>(
         memo[index] = Some(value.clone());
         Ok(value)
     })
+}
+
+/// The marker `stable_identity` recorded for this post before #2763
+/// shipped, if its parent is external: the parent's *position* then, not
+/// its row id now. `None` when the parent is in this file (that marker
+/// never embedded a position) or could not be resolved.
+async fn legacy_external_marker(
+    repos: &Repos,
+    graph: &FileGraph<'_>,
+    post: &ExportPost,
+    parent_now: Option<i64>,
+) -> AutumnResult<Option<String>> {
+    let Some(parent) = parent_identity(post) else {
+        return Ok(None);
+    };
+    if graph.find(post.post_type.as_str(), &parent).is_some() {
+        return Ok(None);
+    }
+    let Some(parent_id) = parent_now else {
+        return Ok(None);
+    };
+    let Some(parent_row) = repos.posts.find_by_id(parent_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(disambiguated_identity(format!(
+        "{}/{}",
+        local_identity(repos, &parent_row).await?,
+        post.slug
+    ))))
 }
 
 /// Turns a `stable_identity` position into a safe marker key.
@@ -926,16 +967,7 @@ fn resolved_post_id<'a>(
             return Ok(Some(*id));
         }
         let stable = disambiguated_identity(
-            stable_identity(
-                import.repos,
-                import.posts,
-                import.graph,
-                index,
-                stable_memo,
-                None,
-                0,
-            )
-            .await?,
+            stable_identity(import.posts, import.graph, index, stable_memo, None, 0).await?,
         );
         // Its own marker: a qualified key like this one names exactly one
         // row, so the first (and only) candidate is enough.
@@ -957,7 +989,8 @@ fn resolved_post_id<'a>(
                     Some(parent_index) => {
                         resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
                     }
-                    None => find_local(import.repos, &post.post_type, parent.as_str())
+                    None => parent
+                        .resolve_local(import.repos, &post.post_type)
                         .await?
                         .map(|found| found.id),
                 },
@@ -1041,6 +1074,35 @@ async fn find_local(
         }
     }
     Ok(None)
+}
+
+/// Finds a stored post of `post_type` with this slug, at any position
+/// (#2763).
+///
+/// A `Bare` parent reference is a legacy slug. It never names a position.
+/// Prefer an exact, top-level match first — the same match `find_local`
+/// makes, and what a bare reference has always resolved to when a
+/// same-slug page also exists at another position. Only when no candidate
+/// is top-level does this accept a single, unambiguous one at any
+/// position: two such candidates mean the reference cannot pick one.
+async fn find_local_by_slug(
+    repos: &Repos,
+    post_type: &str,
+    slug: &str,
+) -> AutumnResult<Option<crate::models::Post>> {
+    if let Some(top_level) = find_local(repos, post_type, slug).await? {
+        return Ok(Some(top_level));
+    }
+    let mut candidates = repos
+        .posts
+        .find_by_slug(slug.to_owned())
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate.post_type == post_type);
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) => Ok(Some(only)),
+        _ => Ok(None),
+    }
 }
 
 /// The status an imported post should land in.
@@ -1305,7 +1367,8 @@ pub async fn import(
                     };
                     resolved_post_id(&import, &mut stable_memo, parent_index, 0).await?
                 }
-                None => match find_local(&repos, &post.post_type, parent.as_str())
+                None => match parent
+                    .resolve_local(&repos, &post.post_type)
                     .await?
                     .map(|found| found.id)
                 {
@@ -1324,7 +1387,6 @@ pub async fn import(
         // also what gets recorded below, if this post turns out to be new.
         let marker_identity = disambiguated_identity(
             stable_identity(
-                &repos,
                 &payload.posts,
                 &graph,
                 index,
@@ -1334,7 +1396,7 @@ pub async fn import(
             )
             .await?,
         );
-        let marker_owned = match imported_source_slugs
+        let mut marker_owned = match imported_source_slugs
             .get(&(post.post_type.clone(), marker_identity.clone()))
         {
             // A qualified key like this one names exactly one row.
@@ -1360,6 +1422,20 @@ pub async fn import(
             }
             None => None,
         };
+        // A site that imported this page before #2763 shipped still
+        // carries a marker anchored to its external parent's old
+        // *position*, not the parent's row id. Tried last, and only when
+        // nothing above matched, so upgrading does not duplicate it.
+        if marker_owned.is_none()
+            && let Some(legacy_marker) =
+                legacy_external_marker(&repos, &graph, post, parent_now).await?
+            && legacy_marker != marker_identity
+            && let Some(&id) = imported_source_slugs
+                .get(&(post.post_type.clone(), legacy_marker))
+                .and_then(|ids| ids.first())
+        {
+            marker_owned = repos.posts.find_by_id(id).await?;
+        }
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating
         // it as such dropped a page out of the site's own backup.
@@ -1639,6 +1715,14 @@ pub async fn import(
         // shape, and there the parent is *skipped* as already-present — so it
         // is absent from the map, and consulting only the map would drop the
         // child to the top level and change its canonical path.
+        //
+        // `find_local` here still expects an exact position, even for a
+        // bare, external `parent_identity` (#2763). That is safe: the
+        // creation pass above already resolved and applied a bare
+        // external parent through `ParentRef::resolve_local`, so
+        // `already_linked` below is already true for it and this lookup's
+        // result is never used. It matters only for a *file-declared*
+        // parent, which always names an exact position.
         let parent_id = match by_file_identity.get(&(post_type.as_str(), parent_identity.as_str()))
         {
             Some(id) => Some(*id),

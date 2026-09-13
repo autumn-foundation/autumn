@@ -11697,6 +11697,138 @@ async fn re_importing_a_backup_recognizes_a_child_of_a_moved_ancestor() {
     );
 }
 
+/// A re-import must still recognize a page whose parent is external — local
+/// content the file itself never declares — even after an editor moves
+/// that parent (#2763).
+///
+/// Only `P` is in the file. `A` already exists. On first import, `P`'s
+/// marker anchors to `A`'s row id. An editor then moves `A` under a new
+/// parent. The re-import must recompute the same anchor: `A`'s id, not its
+/// new position.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_moved_external_parent() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `A` is created directly, the same way an editor would — not through
+    // an import. The file below never names it as one of its own posts.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // A separate top-level page, then the editor moves `A` underneath it.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A`, unqualified,
+    // as its parent — the file never described `A` at all.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    // `A`'s move stands, and no duplicate `p` appeared anywhere.
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
 /// Re-importing a whole multi-level, pathless backup must still recognize
 /// every page in the chain, not just the immediate parent of whichever page
 /// is being checked.

@@ -664,6 +664,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved by full identity rather than by the ambiguous, slug-keyed lookup
   the legacy `parent` field alone needs, so it can no longer be confused
   with an unrelated post sharing that same slug elsewhere in the file.
+- **`cms` example — import stopped losing a page nested under a moved,
+  external parent (#2763):** a follow-up to #2737. A pathless page's marker
+  qualified against a parent *outside* the file — pre-existing local
+  content the import does not itself declare — used to embed that parent's
+  current position. An editor moving the parent made the position stale, so
+  a later re-import computed a different marker and filed a duplicate. The
+  marker now anchors to the parent's row id instead, which does not change
+  when the parent moves. A bare, legacy `parent` reference to such a parent
+  is also now matched by slug alone, not by exact position, since a bare
+  reference never named one — matching it by position made it fail the
+  moment its target nested or moved. New test:
+  `re_importing_a_backup_recognizes_a_moved_external_parent`.
 - **edge:** a batch of P2/P3 follow-ups deferred from the edge capsule's
   first slice (#1790/#2243), closing issue #2244:
   - `EdgeHandler` now checks a sealed `EdgeExtract` whitelist (`Path`,
