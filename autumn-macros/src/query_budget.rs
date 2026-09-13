@@ -1410,16 +1410,32 @@ impl Analyzer {
             Expr::Paren(p) => self.expr_is_lazy_db(&p.expr),
             Expr::Group(g) => self.expr_is_lazy_db(&g.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_lazy_db(&u.expr),
+            // `Result<LazyDb, E>` is a signature shape `type_is_lazy_db`
+            // already recognizes (mirroring how `type_is_handle` treats
+            // `Result<Db, E>`), so a handler catching extraction failure —
+            // `lazy_db: Result<LazyDb, AutumnError>` — must still see
+            // `lazy_db.expect(...).checkout()` as the same zero-cost
+            // transition `lazy_db.checkout()` is. Narrow on purpose, mirroring
+            // `expr_is_handle`'s own `RESULT_UNWRAP_METHODS` arm: only
+            // `.expect(...)`/`.unwrap()` on an already-`LazyDb`-tracked
+            // receiver, not `HANDLE_ACCESSORS`/`HANDLE_BUILDERS` in general —
+            // those recognize a handle from a name convention with no type
+            // behind it, which can say "some handle" but never "specifically
+            // `LazyDb`" (Codex review, PR #2762, round 6).
+            Expr::MethodCall(mc) => {
+                RESULT_UNWRAP_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_lazy_db(&mc.receiver)
+            }
             // A `LazyDb` selected through a conditional is still a `LazyDb`:
             // `let selected = if flag { first } else { second };`. Sound for
             // the same reason `expr_is_handle`'s identical shape is — real
             // Rust requires every arm of a value-producing `if`/`match` to
             // share one type, so if any arm is `LazyDb`, every reachable arm
             // is (Codex review, PR #2762, round 5). Deliberately still omits
-            // `Expr::Try`/`Expr::MethodCall`/`Expr::Field`: those recognize a
-            // handle from a *name convention* with no type behind it
-            // (`HANDLE_ACCESSORS`, `member_is_handle_accessor`), which can
-            // say "some handle" but never "specifically `LazyDb`."
+            // `Expr::Try` and `Expr::Field`: those recognize a handle from a
+            // *name convention* with no type behind it (`HANDLE_ACCESSORS`,
+            // `member_is_handle_accessor`), which can say "some handle" but
+            // never "specifically `LazyDb`."
             Expr::If(i) => {
                 self.block_tail_is_lazy_db(&i.then_branch)
                     || i.else_branch
@@ -2604,6 +2620,37 @@ mod tests {
                 Ok(render(&rows))
             }
             ",
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_unwrapped_from_a_result_still_tracks_its_checked_out_db() {
+        // A handler that catches extraction failure itself —
+        // `lazy_db: Result<LazyDb, AutumnError>` — is a signature shape
+        // `type_is_lazy_db` already recognizes (mirroring how `type_is_handle`
+        // treats `Result<Db, E>`), so `method_chain`'s root-based cost
+        // exemption already fired for `lazy_db.expect(...).checkout()`
+        // before this fix. But `expr_is_lazy_db` had no `Expr::MethodCall`
+        // arm at all, so `awaited_expr_is_fresh_handle`'s `HANDLE_TRANSITIONS`
+        // check — looking at `checkout`'s *immediate* receiver,
+        // `lazy_db.expect(...)`, not the outer chain's root — never
+        // recognized it as `LazyDb`, so `db` was never tracked as a handle
+        // and every query through it, including this N+1 loop, went
+        // uncounted (Codex review, PR #2762, round 6). Asserts the loop is
+        // now caught rather than that the whole handler is clean, so this
+        // fails loudly if the fix regresses instead of silently compiling.
+        assert_error_contains(
+            "1",
+            r#"
+            async fn h(lazy_db: Result<LazyDb, AutumnError>, ids: Vec<i64>) -> AutumnResult<Markup> {
+                let mut db = lazy_db.expect("lazy db").checkout().await?;
+                for id in &ids {
+                    posts::table.find(*id).first(&mut *db).await?;
+                }
+                Ok(render(&()))
+            }
+            "#,
+            &["loop", "first"],
         );
     }
 
