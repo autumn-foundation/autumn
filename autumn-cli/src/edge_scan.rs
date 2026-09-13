@@ -1697,11 +1697,13 @@ fn scan_items(
                     // not a missed route, but a phantom one that makes an
                     // otherwise-default build look like it needs the edge
                     // capsule / WASI target, or spuriously conflicts with
-                    // `--embed` (Codex review on #2739, round 11, P2).
+                    // `--embed` (Codex review on #2739, round 11, P2 —
+                    // extended to a `cfg_attr`-injected exclusion in round
+                    // 33, P2).
                     let cfg_excludes = item_mod
                         .attrs
                         .iter()
-                        .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+                        .any(|attr| attr_cfg_excludes(attr, default_features));
                     if cfg_excludes {
                         continue;
                     }
@@ -1751,7 +1753,7 @@ fn collect_out_of_line_mods(
         let cfg_excludes = item_mod
             .attrs
             .iter()
-            .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+            .any(|attr| attr_cfg_excludes(attr, default_features));
         if cfg_excludes {
             continue;
         }
@@ -1819,7 +1821,23 @@ fn path_attribute_module_paths(
         collect_path_attribute_mods(&ast.items, default_features, &mut inline_path, &mut found);
         let declaring_dir = declaring_file.parent().unwrap_or(declaring_file);
         for (inline, name, path_value) in found {
-            let target_file = lexically_normalize_path(&declaring_dir.join(&path_value));
+            // A `#[path]` override nested inside an INLINE module resolves
+            // relative to the DIRECTORY THAT MODULE PATH IMPLIES, not the
+            // declaring file's own physical directory — verified directly:
+            // `mod api { #[path = "actual.rs"] mod handlers; }` in
+            // `src/lib.rs` compiles by finding `src/api/actual.rs`, never
+            // `src/actual.rs`. Same rule an ordinary out-of-line `mod
+            // handlers;` (no `#[path]`) already follows via
+            // `resolve_out_of_line_module_file`'s own `dir_segments`
+            // accumulation — this mirrors it by folding each inline
+            // segment in as a subdirectory before joining the attribute's
+            // own value (Codex review on #2739, round 33, P2).
+            let inline_dir = inline
+                .iter()
+                .fold(declaring_dir.to_path_buf(), |dir, segment| {
+                    dir.join(segment)
+                });
+            let target_file = lexically_normalize_path(&inline_dir.join(&path_value));
             let target_rel = target_file
                 .strip_prefix(project_root)
                 .unwrap_or(&target_file)
@@ -1850,7 +1868,7 @@ fn collect_path_attribute_mods(
         let cfg_excludes = item_mod
             .attrs
             .iter()
-            .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+            .any(|attr| attr_cfg_excludes(attr, default_features));
         if cfg_excludes {
             continue;
         }
@@ -2234,15 +2252,9 @@ fn edge_fn(
     // Rust: any one of them resolving to definitely false excludes it — and
     // so does a `cfg(...)` injected by an ACTIVE `cfg_attr(...)` (Codex
     // review on #2739, round 29, P2).
-    let cfg_excludes = attrs.iter().any(|attr| {
-        if eval_cfg_attr(attr, default_features) == Some(false) {
-            return true;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        attr.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
-    });
+    let cfg_excludes = attrs
+        .iter()
+        .any(|attr| attr_cfg_excludes(attr, default_features));
     if cfg_excludes {
         return None;
     }
@@ -2352,6 +2364,32 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
     syn::parse2::<CfgPredicate>(list.tokens.clone())
         .ok()
         .map(|pred| pred.eval(default_features))
+}
+
+/// Whether `attr`, on its own, excludes whatever it's attached to: either a
+/// literal `#[cfg(...)]` that [`eval_cfg_attr`] resolves as definitely
+/// false, or an active `#[cfg_attr(condition, cfg(inner), ...)]` whose
+/// injected `cfg(...)` [`cfg_attr_injects_a_false_cfg`] resolves as
+/// definitely false the same way. Every AST-level cfg-exclusion check in
+/// this module should go through this rather than `eval_cfg_attr` alone —
+/// `mod`-level exclusion checks (inline-module discovery in [`scan_items`],
+/// out-of-line discovery in [`collect_out_of_line_mods`] and
+/// [`collect_path_attribute_mods`]) previously only checked the literal
+/// form, so `#[cfg_attr(feature = "outer", cfg(feature = "inner"))] mod
+/// premium { ... }` with only `outer` on kept scanning a module real Rust
+/// strips out entirely (verified directly via a real build: the module
+/// name itself becomes unresolved) — both its `#[edge]` handlers and its
+/// `edge_routes![]` registrations were credited as active (Codex review on
+/// #2739, round 33, P2; [`edge_fn`]'s own version of this check, added in
+/// round 29, was the only one already correct).
+fn attr_cfg_excludes(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> bool {
+    if eval_cfg_attr(attr, default_features) == Some(false) {
+        return true;
+    }
+    let syn::Meta::List(list) = &attr.meta else {
+        return false;
+    };
+    attr.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
 }
 
 /// Find every `edge_routes![...]` invocation in a token stream and record the
@@ -3142,21 +3180,47 @@ fn preceding_cfg_excludes(
 /// Whether `group` — the bracketed contents of one `#[...]` attribute — is a
 /// `cfg(...)` whose predicate resolves as definitely false, using the same
 /// grammar and safe-direction fallback (unparseable stays *true*, i.e. not
-/// excluded) as [`eval_cfg_attr`].
+/// excluded) as [`eval_cfg_attr`] — or an active `#[cfg_attr(condition,
+/// cfg(inner), ...)]` whose injected `cfg(...)` resolves as definitely
+/// false the same way [`cfg_attr_injects_a_false_cfg`] does at the
+/// `syn::Attribute` level. Every other cfg-check in [`collect_registrations`]
+/// (`mod` detection, the bare-`Group` catch-all, the statement-level
+/// `edge_routes![]` check, [`skip_leading_cfg_attrs`]'s statement-skip
+/// suppression) goes through [`preceding_cfg_excludes`] or
+/// [`skip_leading_cfg_attrs`], both built on this one function — without
+/// this, a `cfg_attr`-injected exclusion on an inline `mod` was invisible to
+/// the TOKEN-level registration walk even after [`attr_cfg_excludes`] fixed
+/// every AST-level one, so `#[cfg_attr(feature = "outer", cfg(feature =
+/// "inner"))] mod premium { edge_routes![show]; }` with only `outer` on
+/// still credited `show` as registered (Codex review on #2739, round 33,
+/// P2).
 fn cfg_attribute_group_is_false(
     group: &proc_macro2::Group,
     default_features: &BTreeSet<String>,
 ) -> bool {
     let inner: Vec<TokenTree> = group.stream().into_iter().collect();
-    let (Some(TokenTree::Ident(ident)), Some(TokenTree::Group(cfg_group))) =
+    let (Some(TokenTree::Ident(ident)), Some(TokenTree::Group(payload))) =
         (inner.first(), inner.get(1))
     else {
         return false;
     };
-    if ident != "cfg" || cfg_group.delimiter() != Delimiter::Parenthesis {
+    if payload.delimiter() != Delimiter::Parenthesis {
         return false;
     }
-    syn::parse2::<CfgPredicate>(cfg_group.stream()).is_ok_and(|pred| !pred.eval(default_features))
+    if ident == "cfg" {
+        return syn::parse2::<CfgPredicate>(payload.stream())
+            .is_ok_and(|pred| !pred.eval(default_features));
+    }
+    if ident == "cfg_attr" {
+        return syn::parse2::<syn::Meta>(group.stream())
+            .ok()
+            .and_then(|meta| match meta {
+                syn::Meta::List(list) if list.path.is_ident("cfg_attr") => Some(list),
+                _ => None,
+            })
+            .is_some_and(|list| cfg_attr_injects_a_false_cfg(&list, default_features));
+    }
+    false
 }
 
 /// Resolve one registration entry against `module_path`, the module the
@@ -3740,6 +3804,69 @@ mod tests {
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
         assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// A `cfg(...)` INJECTED by an active `#[cfg_attr(condition,
+    /// cfg(inner))]` on an inline `mod` must exclude it entirely, the same
+    /// way a literal `#[cfg(...)]` already does — verified directly via a
+    /// real build (`#[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+    /// mod premium { ... }` with only `outer` on fails to resolve
+    /// `premium` at all). Both the `#[edge]` handler discovery half
+    /// (`scan_items`'s inline-mod check) and the `edge_routes![]`
+    /// registration half (`collect_registrations`'s token-level check) must
+    /// honor it (Codex review on #2739, round 33, P2).
+    #[test]
+    fn cfg_attr_injected_false_cfg_on_an_inline_module_excludes_it_entirely() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+            mod premium {
+                #[edge]
+                pub fn extra() {}
+
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &["outer"],
+        );
+        assert_eq!(
+            scan.names(),
+            vec!["show".to_owned()],
+            "{:?}",
+            scan.functions
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// Same setup, but with `inner` ALSO on: the injected cfg genuinely
+    /// holds, so the module (its handler and its registration both) is
+    /// real.
+    #[test]
+    fn cfg_attr_injected_true_cfg_on_an_inline_module_includes_it() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+            mod premium {
+                #[edge]
+                pub fn extra() {}
+
+                fn wire() {
+                    edge_routes![crate::show];
+                    edge_routes![crate::premium::extra];
+                }
+            }
+            "#,
+            &["outer", "inner"],
+        );
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
     /// Same idea, but the cfg'd-out module has a `pub` visibility modifier
@@ -6566,11 +6693,19 @@ mod tests {
 
     /// Same idea, but the `#[path]`-attributed `mod` is nested inside an
     /// INLINE module — the override's real module path must include that
-    /// enclosing inline segment too, not just the mod's own name.
+    /// enclosing inline segment too, not just the mod's own name, AND the
+    /// target file must be resolved relative to the DIRECTORY THAT MODULE
+    /// PATH IMPLIES (`src/api/actual.rs`), not the declaring file's own
+    /// physical directory (`src/actual.rs`) — verified directly via a real
+    /// build that `mod api { #[path = "actual.rs"] mod handlers; }` in
+    /// `src/lib.rs` finds `src/api/actual.rs` (Codex review on #2739,
+    /// round 33, P2 — round 31's own fix joined `#[path]`'s value directly
+    /// onto the declaring file's directory, ignoring any enclosing inline
+    /// module).
     #[test]
     fn resolve_edge_scan_resolves_a_path_attribute_mod_nested_inside_an_inline_module() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/api")).unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
@@ -6588,7 +6723,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("src/actual.rs"),
+            dir.path().join("src/api/actual.rs"),
             "#[edge]\npub fn show() {}\n",
         )
         .unwrap();
