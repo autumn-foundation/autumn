@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
+  `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
+  as audit-only data (#2263):** `#[commentable]` must hide a soft-deleted
+  parent only when that model's own `#[repository(..., soft_delete)]` opted
+  in — a `deleted_at` column with no such opt-in is ordinary audit history,
+  and `probe_parent` already resolves the real answer from the
+  `RepositoryFacts` registry (`commentable_model_for_spec` +
+  `model_soft_deletes`) rather than the column's presence. That registry
+  lookup matches the registered `#[commentable]` descriptor by **pointer
+  identity**, and all three write functions took an owned copy of the spec
+  (`let spec = *spec`) for their transaction closure — `CommentableSpec` is
+  `Copy`, so this compiled cleanly, but the copy lives at a new stack
+  address, so the identity check always missed and silently fell back to the
+  column-derived answer on every write. A parent with only an audit
+  `deleted_at` (no `soft_delete` repository) was wrongly `404`d by
+  `add_comment` and `delete_comment` the moment that column was ever
+  non-null, even though the repository's own finders kept returning the row.
+  `comment_thread`'s read path never copied the spec, so reads were already
+  unaffected. Fixed without changing these functions' public signatures:
+  each now resolves the soft-delete answer from `spec` **before** copying
+  it — while its identity still matches the registry — and passes the
+  resolved `bool` down explicitly, so `probe_parent` no longer re-derives it
+  from a spec that may already be a copy.
+  Tenant scoping was not affected: it resolves through the separate
+  `request_tenant`/`__autumn_m2m_tenant_scope` path before any copy
+  happens, and already correctly ignores a `tenant_id` column on a
+  non-`tenant_scoped` repository. Added regression coverage for both the
+  audit-`deleted_at` shape and the denormalized-`tenant_id` shape (router
+  and generated-trait level), plus the corresponding rule in
+  `docs/guide/commentable.md`.
+
 ### Added
 
 - **Build-checked typed contracts between two Autumn services (#1755):** the day
