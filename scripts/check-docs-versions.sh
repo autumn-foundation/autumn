@@ -765,7 +765,16 @@ def waived(text):
 # `autumn-cli`'s `generate auth --mail` patcher already exists because real
 # projects write their dependency this way.
 SUBTABLE = re.compile(
-    r'^[^\S\n]*\[(?:workspace\.)?(?:dev-|build-)?dependencies'
+    r'^[^\S\n]*\['
+    # `workspace.` and `target.'cfg(…)'.` are the two prefixes Cargo puts in
+    # front of a dependency table, and `_dependency_tables` walks both on the
+    # parsed path. The fallback has to know them too: `docs/guide/edge.md` and
+    # `autumn-edge/README.md` both pin `autumn-web` under
+    # `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, so this is a
+    # shape the corpus really uses — it reaches the parser today only because
+    # those fences happen to parse.
+    r'(?:workspace\.|target\.(?:\'[^\']*\'|"[^"]*"|[^.\]]+)\.)?'
+    r'(?:dev-|build-)?dependencies'
     r'\.["\']?([A-Za-z0-9_-]+)["\']?\][^\S\n]*$', re.M)
 
 # The `version` key inside a subtable body, in either TOML string form and
@@ -1540,6 +1549,28 @@ def self_test():
            list(pins('"autumn-web" = "0.5"')), [(1, 'autumn-web', '0.5')])
     expect('quoted subtable key',
            list(pins('[dependencies."autumn-web"]\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+
+    # ---- target-specific subtables on the fallback path ----
+    # `docs/guide/edge.md` and `autumn-edge/README.md` both pin `autumn-web`
+    # under a `[target.'cfg(…)'.dependencies]` table, so this is a shape the
+    # corpus really uses; it reaches the parser today only because those
+    # fences parse. The fallback has to know the same prefixes.
+    expect('target subtable, cfg predicate',
+           list(pins('[target.\'cfg(not(target_arch = "wasm32"))\''
+                     '.dependencies.autumn-web]\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+    expect('target subtable, plain triple',
+           list(pins('[target.x86_64-pc-windows-msvc.dependencies.autumn-web]'
+                     '\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+    expect('target dev-dependencies subtable',
+           list(pins('[target."cfg(unix)".dev-dependencies.autumn-web]'
+                     '\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+    # The prefix is optional, not required: a plain subtable still works.
+    expect('plain subtable still works',
+           list(pins('[dependencies.autumn-web]\nversion = "0.5"\n')),
            [(2, 'autumn-web', '0.5')])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
