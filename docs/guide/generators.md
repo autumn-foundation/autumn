@@ -1332,9 +1332,9 @@ autumn generate scaffold Post title:String comments:commentable
   onto the generated repository and registers the model with the framework's
   comment router.
 - The **model's own migration** also gets an `AFTER DELETE` trigger (#2265).
-  `commentable_id` has no foreign key, so nothing else removes a deleted
-  parent's comments. The trigger does, on any hard delete — through the
-  repository, raw SQL, or an admin tool.
+  `commentable_id` has no foreign key. Nothing else removes a deleted
+  parent's comments. The trigger removes them on any hard delete — a
+  delete through the repository, raw SQL, or an admin tool.
 - **No comment routes are generated at all.** Mount the framework's once:
 
   ```rust

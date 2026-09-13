@@ -313,10 +313,11 @@ const DDL: &[&str] = &[
     "CREATE INDEX idx_cmt_comments_target \
      ON cmt_comments (commentable_type, commentable_id)",
     "CREATE INDEX idx_cmt_comments_parent ON cmt_comments (parent_id)",
-    // Issue #2265: `cmt_posts`' own cleanup trigger, the same shape `autumn
-    // generate scaffold … comments:commentable` writes into a real parent
-    // migration. A hard delete has no foreign key to cascade from, so this
-    // is the only thing that stops a deleted post's comments outliving it.
+    // Issue #2265: `cmt_posts`' own cleanup trigger. `autumn generate
+    // scaffold … comments:commentable` writes this same shape into a real
+    // parent migration. A hard delete has no foreign key to cascade from.
+    // This trigger is the only thing that stops a deleted post's comments
+    // from outliving it.
     "CREATE OR REPLACE FUNCTION cmt_comments_delete_for_parent() \
      RETURNS TRIGGER AS $$ \
      BEGIN \
@@ -816,11 +817,12 @@ async fn delete_comment_cascades_to_descendants_and_decrements() {
     assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
 }
 
-/// Issue #2265: a hard-deleted PARENT has no foreign key to cascade from, so
-/// its comments must go through the parent's own cleanup trigger instead —
-/// the same trigger `autumn generate scaffold … comments:commentable` writes.
-/// A bare `DELETE FROM cmt_posts` mimics a delete the framework never sees
-/// (raw SQL, an admin tool, `psql`), which is exactly how the bug reproduces.
+/// Issue #2265: a hard-deleted PARENT has no foreign key to cascade from.
+/// Its comments must go through the parent's own cleanup trigger instead.
+/// `autumn generate scaffold … comments:commentable` writes that same
+/// trigger. A bare `DELETE FROM cmt_posts` mimics a delete the framework
+/// never sees: raw SQL, an admin tool, or `psql`. That is how the bug
+/// reproduces.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn hard_deleting_the_parent_removes_its_comments() {

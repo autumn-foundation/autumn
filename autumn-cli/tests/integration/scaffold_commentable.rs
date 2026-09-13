@@ -321,9 +321,9 @@ fn destroy_scaffold_keeps_the_shared_migration_another_model_still_needs() {
     assert!(photo.contains("#[commentable("), "{photo}");
 }
 
-/// Issue #2265: a hard-deleted parent has no foreign key to cascade from, so
-/// the scaffold must write its own cleanup trigger into the parent's own
-/// migration — not just the shared table.
+/// Issue #2265: a hard-deleted parent has no foreign key to cascade from.
+/// So the scaffold must write its own cleanup trigger into the parent's
+/// own migration — not just the shared table.
 #[test]
 fn commentable_emits_a_parent_cleanup_trigger() {
     let (_tmp, project) = scaffolded("cmt-trigger-app");
@@ -352,8 +352,8 @@ fn commentable_emits_a_parent_cleanup_trigger() {
 }
 
 /// A second commentable model must get its OWN trigger, bound to its own
-/// discriminator — not share the first model's, which would delete the
-/// wrong parent's comments.
+/// discriminator. It must not share the first model's trigger. A shared
+/// trigger would delete the wrong parent's comments.
 #[test]
 fn a_second_commentable_model_gets_its_own_cleanup_trigger() {
     let (_tmp, project) = scaffolded("cmt-second-trigger-app");

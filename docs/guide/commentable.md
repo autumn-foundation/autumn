@@ -103,10 +103,10 @@ concurrent writer can re-tenant or delete the row underneath it.
 ### Hard deletes (#2265)
 
 The write-path check stops an unknown parent from getting a comment. It does
-not clean up an *existing* parent's comments when that parent is deleted
-later — `commentable_id` has no `ON DELETE CASCADE` to fall back on.
+not clean up an existing parent's comments when that parent is later
+deleted. `commentable_id` has no `ON DELETE CASCADE` to fall back on.
 
-So the scaffold writes one more thing: an `AFTER DELETE` trigger on the
+The scaffold writes one more thing: an `AFTER DELETE` trigger on the
 parent's own table. `autumn generate scaffold post … comments:commentable`
 adds this trigger to `post`'s own migration, next to the `CREATE TABLE`:
 
@@ -117,13 +117,13 @@ CREATE TRIGGER posts_delete_comments
     EXECUTE FUNCTION comments_delete_for_parent('Post');
 ```
 
-This runs for **every** delete of a `posts` row — through the repository, a
+This runs for **every** delete of a `posts` row: through the repository, a
 raw `DELETE`, or an admin tool. It only fires on a **hard** delete. A model
-with `soft_delete` never removes the parent row, so the trigger never runs
-for it; `add_comment`'s own check already refuses a soft-deleted parent.
+with `soft_delete` never removes the parent row. So the trigger never runs
+for it. `add_comment`'s own check already refuses a soft-deleted parent.
 
-A hand-written `#[commentable]` model gets no trigger for free — write your
-own, matching the model's `type_name` and comments table.
+A hand-written `#[commentable]` model gets no trigger for free. Write your
+own trigger. Match it to the model's `type_name` and comments table.
 
 ## The repository helpers
 
