@@ -2252,26 +2252,35 @@ fn scan_bin_crate_tree(
     let root_file = lexically_normalize_path(root_file);
     let root_file = root_file.as_path();
     let root_dir = root_file.parent().unwrap_or_else(|| Path::new(""));
-    // Two SEPARATE dedup sets, not one: a file's own out-of-line children
-    // are discovered (parsed and enqueued) only the FIRST time that file is
-    // reached, bounding the traversal against a module cycle the same way
-    // the old single `visited` set did — but each distinct (file,
-    // module_path) IDENTITY is still scanned and credited on its own. Real
-    // Rust allows the SAME file to be `#[path]`-included under multiple
-    // module names (`#[path = "shared.rs"] mod a;` and `#[path =
-    // "shared.rs"] mod b;` elsewhere both compile it, once per name —
-    // verified directly via a real build), and this BFS can enqueue both
-    // aliases once `path_attribute_module_paths`'s own round-40 fix stopped
-    // dropping the second one; deduping by file path ALONE here undid that
-    // fix specifically for a custom crate tree, silently skipping whichever
-    // alias was dequeued second (Codex review on #2739, round 42, P2).
-    let mut children_enqueued: BTreeSet<PathBuf> = BTreeSet::new();
+    // Cycle safety here mirrors rustc's own: verified directly via a real
+    // build, `#[path = "b.rs"] mod b;` in `a.rs` and `#[path = "a.rs"] mod
+    // a;` in `b.rs` fails with rustc's own "circular modules: a.rs -> b.rs
+    // -> a.rs" — a file including ITSELF, directly or transitively, never
+    // compiles at all. Two INDEPENDENT aliases of the same file (`#[path =
+    // "shared.rs"] mod a;` and `#[path = "shared.rs"] mod b;`, neither a
+    // descendant of the other) are not a cycle and both compile fine, each
+    // with its own copy of that file's own further submodules — verified
+    // directly too: `shared.rs`'s own `#[path = "child.rs"] mod child;`
+    // compiles as BOTH `a::child` and `b::child`. So cycle detection here
+    // tracks each branch's own ANCESTOR chain (the files from the tree
+    // root down to here) rather than a single global "seen" set: a file
+    // is skipped only when it already appears in ITS OWN branch's
+    // ancestors, never merely because a DIFFERENT branch reached it first.
+    // A single global `visited`-by-file set (round 42's fix, before this)
+    // stopped a shared file's OWN children from ever being (re-)discovered
+    // under its second alias, since the first alias to reach it "used up"
+    // the file for children-discovery purposes entirely (Codex review on
+    // #2739, round 43, P2).
     let mut scanned_identities: BTreeSet<(PathBuf, Vec<String>)> = BTreeSet::new();
-    let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>)> =
+    let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>, Vec<PathBuf>)> =
         std::collections::VecDeque::new();
-    queue.push_back((root_file.to_path_buf(), Vec::new()));
+    queue.push_back((
+        root_file.to_path_buf(),
+        Vec::new(),
+        vec![root_file.to_path_buf()],
+    ));
 
-    while let Some((file, module_path)) = queue.pop_front() {
+    while let Some((file, module_path, ancestors)) = queue.pop_front() {
         if !scanned_identities.insert((file.clone(), module_path.clone())) {
             continue; // This exact file/module-path identity is already scanned.
         }
@@ -2293,9 +2302,6 @@ fn scan_bin_crate_tree(
         );
         scan.files_scanned += 1;
 
-        if !children_enqueued.insert(file.clone()) {
-            continue; // This file's own submodules were already discovered via a prior alias.
-        }
         let Ok(ast) = syn::parse_file(&src) else {
             continue;
         };
@@ -2338,9 +2344,14 @@ fn scan_bin_crate_tree(
             let Some(resolved) = resolved else {
                 continue;
             };
+            if ancestors.contains(&resolved) {
+                continue; // A real cycle — rustc itself rejects this at compile time.
+            }
             let mut child_module_path = dir_segments;
             child_module_path.push(name);
-            queue.push_back((resolved, child_module_path));
+            let mut child_ancestors = ancestors.clone();
+            child_ancestors.push(resolved.clone());
+            queue.push_back((resolved, child_module_path, child_ancestors));
         }
     }
 
@@ -8352,5 +8363,106 @@ mod tests {
             module_paths.contains(&vec!["b".to_owned()]),
             "{module_paths:?}"
         );
+    }
+
+    /// A shared `#[path]`-included file's OWN out-of-line submodule is
+    /// re-traversed for EACH of the file's aliases, not just the first one
+    /// to reach it — verified directly via a real build: `shared.rs`'s own
+    /// `#[path = "child.rs"] mod child;` compiles as both `a::child` and
+    /// `b::child` when `shared.rs` itself is reached as both `mod a;` and
+    /// `mod b;`. Round 42's fix kept both of `shared.rs`'s own identities
+    /// but still discovered its children only once (via a single, global
+    /// per-file "children enqueued" set), so `child`'s module path came out
+    /// right for whichever alias reached it first and simply missing for
+    /// the other (Codex review on #2739, round 43, P2).
+    #[test]
+    fn resolve_edge_scan_traverses_a_shared_path_files_children_for_every_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            r#"
+            #[path = "shared.rs"]
+            mod a;
+            #[path = "shared.rs"]
+            mod b;
+            fn main() {
+                edge_routes![crate::a::child::show];
+                edge_routes![crate::b::child::show];
+            }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/shared.rs"),
+            "#[path = \"child.rs\"]\npub mod child;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/child.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let module_paths: BTreeSet<Vec<String>> = scan
+            .functions
+            .iter()
+            .map(|f| f.module_path.clone())
+            .collect();
+        assert!(
+            module_paths.contains(&vec!["a".to_owned(), "child".to_owned()]),
+            "{module_paths:?}"
+        );
+        assert!(
+            module_paths.contains(&vec!["b".to_owned(), "child".to_owned()]),
+            "{module_paths:?}"
+        );
+    }
+
+    /// A genuine `#[path]`-induced module cycle (`a.rs` -> `#[path =
+    /// "b.rs"] mod b;` -> `b.rs` -> `#[path = "a.rs"] mod a;`, pointing
+    /// back) never compiles at all in real Rust (rustc rejects it as
+    /// "circular modules") — verified directly via a real build. This scan
+    /// must still terminate on such input rather than loop forever, the
+    /// same safety the old single global `visited`-by-file set gave before
+    /// round 43 replaced it with per-branch ancestor tracking to fix the
+    /// shared-alias case above.
+    #[test]
+    fn resolve_edge_scan_terminates_on_a_circular_path_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            "#[path = \"a.rs\"]\nmod a;\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("cmd/a.rs"), "#[path = \"b.rs\"]\nmod b;\n").unwrap();
+        std::fs::write(dir.path().join("cmd/b.rs"), "#[path = \"a.rs\"]\nmod a;\n").unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+        assert!(scan.functions.is_empty(), "{:?}", scan.functions);
     }
 }
