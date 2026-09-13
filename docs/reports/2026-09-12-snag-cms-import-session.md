@@ -450,7 +450,22 @@ regression test the sweep will then pick up automatically.
    and, for the cross-run reproductions specifically, closing only one of
    them is not enough on its own. Recursively resolving each post's
    `parent` chain (rather than counting `/`) would close the *same-run*
-   ordering cases, which go through `find_local` alone. But in the
+   ordering cases for files where that chain is actually unambiguous —
+   a version-4/5 file with `path` present, where `parent_identity` reads
+   an unambiguous path prefix (`tools.rs:656-663`), or a pathless file
+   where no two entries share a bare parent slug. It does not close them
+   in general: a Codex catch on this PR pointed out that for an entirely
+   pathless file, `parent_identity` falls back to the bare `parent` slug
+   verbatim (`tools.rs:659-665`), so two branches like `/a/section/team`
+   and `/b/section/team` — each exposing only `parent: "section"`, with
+   both `section` entries themselves pathless — give recursion no way to
+   tell which `section` a given child belongs to; reconstruction from
+   bare slugs alone is exactly as ambiguous as the `find_local` match it
+   is meant to replace. A real fix along these lines needs to either
+   require an unambiguous chain (reject or fall back to today's
+   ancestry-blind behavior when a bare parent slug is not unique in the
+   file) or resolve ambiguous pathless chains some other way — not
+   attempt silent reconstruction. Separately, in the
    `cms13`/`cms14` cross-run reproductions, `find_local` *also* matches
    (confirmed by querying `cms13`'s `post_meta` table directly: the
    persisted top-level page and the incoming pathless page share the
