@@ -160,6 +160,20 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
+/// Async methods that turn an *already-tracked* handle into a fresher one of
+/// a possibly different type, rather than issuing a query — currently only
+/// `LazyDb::checkout` (autumn/src/db.rs, #2264), which turns a prepared-but-
+/// not-taken checkout into a live `Db`.
+///
+/// Deliberately not added to `HANDLE_ACCESSORS`: that list matches a bare
+/// method name on *any* receiver, and "checkout" is also a real domain verb —
+/// `autumn-billing`'s own `self.checkout(&snapshot)` is a Stripe
+/// checkout-completed reconciliation, not a connection checkout. Gating on
+/// `self.expr_is_handle(&mc.receiver)` (see `awaited_expr_is_fresh_handle`)
+/// keeps that call unaffected: its receiver is a plain `&Ctx`, never a
+/// tracked handle, so the `&&` never reaches this list.
+const HANDLE_TRANSITIONS: &[&str] = &["checkout"];
+
 /// `Result`/`Option`-unwrapping methods that stand in for the `?` operator
 /// (`ctx.conn().await.expect("connection")`, the documented shape in
 /// `autumn/src/seed.rs`) without themselves issuing a query. Deliberately
@@ -1266,7 +1280,19 @@ impl Analyzer {
             // query" when both share this shape, so this stays a real,
             // acknowledged boundary of the analysis rather than a bug
             // fixable by another naming heuristic.
-            Expr::MethodCall(mc) => HANDLE_ACCESSORS.contains(&mc.method.to_string().as_str()),
+            //
+            // `HANDLE_TRANSITIONS` (`checkout`) is not the same kind of fix:
+            // it requires the receiver itself to already be a tracked handle
+            // (`self.expr_is_handle`, one hop, no recursion), so it does not
+            // reopen the `state.db().find_recipients(...)` regression above —
+            // that receiver (`state.db()`) is a call, never a bare tracked
+            // name.
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                HANDLE_ACCESSORS.contains(&method.as_str())
+                    || (HANDLE_TRANSITIONS.contains(&method.as_str())
+                        && self.expr_is_handle(&mc.receiver))
+            }
             _ => false,
         }
     }

@@ -115,6 +115,14 @@ const TRANSPARENT_BUILDERS: &[&str] = &[
     "returning",
     "values",
     "set",
+    // `LazyDb::checkout` (autumn/src/db.rs, #2264): turns a prepared-but-not-
+    // taken checkout into a live `Db`, the same handle under a new type. Safe
+    // here (unlike adding it to `HANDLE_ACCESSORS`, which matches on the bare
+    // name alone): this only fires when the receiver is *already* a tracked
+    // handle, so `autumn-billing`'s own unrelated `self.checkout(&snapshot)`
+    // (a Stripe checkout-completed reconciliation, not a connection) is never
+    // affected — its receiver is a plain `&Ctx`, never classified as one.
+    "checkout",
     // `Option`/`Result` unwrapping keeps whatever the handle accessor
     // returned: `state.webhook_outbound().unwrap().dispatch(...)`.
     "unwrap",
