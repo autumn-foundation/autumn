@@ -1,23 +1,32 @@
-//! Drives real requests through the production **bot-protection / CAPTCHA**
-//! middleware (`autumn_web::security::BotProtectionLayer`,
-//! `autumn::src::security::captcha::BotProtectionService`) so its per-request
-//! cost can be profiled — the ingress-stack cost `request_pipeline.rs`
-//! deliberately excludes (bot protection is opt-in via
+//! Drives real GET traffic through the production **bot-protection / CAPTCHA**
+//! middleware (`autumn_web::security::captcha::BotProtectionService`) so its
+//! per-request cost can be profiled — the ingress-stack cost
+//! `request_pipeline.rs` deliberately excludes (bot protection is opt-in via
 //! `config.bot_protection.enabled` and no other committed bench touches it).
 //!
 //! `BotProtectionService::call` has four early-return branches before the
 //! real token-scan/verification work (safe method, exempt path, dev bypass,
-//! non-form content-type). This bench's `/route-a` exercises the **safe
-//! method** branch — the one every plain `GET` takes on any site that turns
-//! bot protection on, since Turnstile/hCaptcha widgets only ever guard
-//! mutating `POST` forms. `/route-b` sends a `POST` with a valid token via
-//! `TestCaptchaProvider`, so it runs the real verification path end to end,
-//! as a no-regression control for the code the fix does not touch.
+//! non-form content-type). This bench exercises the **safe method** branch —
+//! the one every plain `GET` takes on any site that turns bot protection on,
+//! since Turnstile/hCaptcha widgets only ever guard mutating `POST` forms.
 //!
-//! Two otherwise-identical trivial handlers at equal-length paths with an
-//! identical response body (`"ok"`) — the same discipline `throttle_check.rs`
-//! documents — so the two routes differ only by the guard branch each one
-//! hits, not by response size or path length.
+//! Mounted via `TestApp::config(...)` with `bot_protection.enabled = true`
+//! (`dev_bypass = true` so no outbound network call to a real Turnstile/
+//! hCaptcha endpoint is needed — irrelevant to what's measured here anyway,
+//! since the safe-method branch returns before `dev_bypass` is even checked),
+//! the same convention `csrf_verify.rs` uses for `security.csrf.enabled`.
+//! This is load-bearing, not stylistic: going through `AutumnConfig` routes
+//! construction through the real `build_bot_protection_layer` +
+//! `try_build_router_inner` path (issue #2193's tuple-composed `inner_stack`,
+//! ONE `.layer()` call for the whole group), so `BotProtectionService::inner`
+//! is the concrete next-layer type in that tuple. An earlier version of this
+//! bench instead attached `BotProtectionLayer` via `TestApp::layer(...)`
+//! (`AppBuilder::layer`'s `IntoAppLayer` slot), which type-erases the layer's
+//! wrapped service to `ErasedAppService` (`BoxCloneSyncService`) — making
+//! `self.inner.clone()` hit `CloneService::clone_box`'s box allocation
+//! regardless of what the fix under test does, an artifact of *that* slot's
+//! erasure boundary rather than of the production mount point. Caught in
+//! review (Codex) on the first version of this bench.
 //!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing beyond a sanity check that traffic isn't silently being denied: it
@@ -27,162 +36,85 @@
 //! cargo build --release -p autumn-web --bench captcha_check
 //! BIN=$(find target/release/deps -maxdepth 1 -name "captcha_check-*" -type f ! -name "*.d")
 //!
-//! # Instruction profile — separate `--route` invocations so each isolates
-//! # one branch's marginal cost (a combined `both` run interleaves one GET +
-//! # one POST per round and cannot be split back apart afterward).
-//! valgrind --tool=callgrind --callgrind-out-file=exempt-0.out    "$BIN" --iterations 0    --route exempt
-//! valgrind --tool=callgrind --callgrind-out-file=exempt-1000.out "$BIN" --iterations 1000 --route exempt
-//! callgrind_annotate --threshold=80 exempt-1000.out | head -40
+//! # Instruction profile
+//! valgrind --tool=callgrind --callgrind-out-file=callgrind-0.out    "$BIN" --iterations 0
+//! valgrind --tool=callgrind --callgrind-out-file=callgrind-1000.out "$BIN" --iterations 1000
+//! callgrind_annotate --threshold=80 callgrind-1000.out | head -40
 //! # marginal Ir/request = (1000-iteration total - 0-iteration total) / 1000
 //!
 //! # Allocation profile (valgrind's built-in dhat tool — no crate dependency).
 //! # Two runs, subtracted, isolate the marginal per-request cost from process
 //! # startup/router construction/warm-up (see `request_pipeline.rs`).
-//! valgrind --tool=dhat --dhat-out-file=dhat-exempt-base.json "$BIN" --iterations 0   --route exempt
-//! valgrind --tool=dhat --dhat-out-file=dhat-exempt-run.json  "$BIN" --iterations 200 --route exempt
+//! valgrind --tool=dhat --dhat-out-file=dhat-base.json "$BIN" --iterations 0
+//! valgrind --tool=dhat --dhat-out-file=dhat-run.json  "$BIN" --iterations 200
 //! # allocations/request = (total_run - total_base) / 200
 //! ```
 //!
-//! `--iterations N` issues one request per round (route selected by
-//! `--route`) after a fixed 50-round warm-up. `--route exempt|checked|both`
-//! (default `both`) restricts the loop to one route, for an isolated
-//! callgrind/dhat A/B.
+//! `--iterations N` issues one GET per round after a fixed 50-round warm-up.
 
 use std::hint::black_box;
 
+use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
-use autumn_web::security::{BotProtectionLayer, TestCaptchaProvider};
+use autumn_web::security::BotProtectionConfig;
 use autumn_web::test::TestApp;
 
-// Equal-length paths (8 chars each) and an identical response body: the
-// isolated A/B must differ only by which `BotProtectionService::call` branch
-// each route takes, not by a longer route string or response payload padding
-// out the byte count on one side (same discipline `throttle_check.rs`
-// documents for its `/route-a` + `/route-b` pair).
-#[get("/route-a")]
-async fn exempt_get() -> &'static str {
+#[get("/notes")]
+async fn list_notes() -> &'static str {
     "ok"
 }
-
-#[post("/route-b")]
-async fn checked_post() -> &'static str {
-    "ok"
-}
-
-const VALID_TOKEN: &str = "bolt-captcha-bench-token";
-const FORM_FIELD: &str = "cf-turnstile-response";
 
 fn main() {
-    // A single sequential pass over the full argument list — see
-    // `throttle_check.rs` for why per-flag `.position()`/`.nth()` lookups
-    // silently swallow a typo'd flag or a stray positional argument instead
-    // of failing loudly.
-    let mut iterations: u32 = 2_000;
-    let mut route: String = "both".to_owned();
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < raw_args.len() {
-        match raw_args[i].as_str() {
-            "--iterations" => {
-                let raw = raw_args.get(i + 1).expect("--iterations requires a value");
-                iterations = raw.parse().unwrap_or_else(|e| {
-                    panic!("--iterations value {raw:?} is not a valid u32: {e}")
-                });
-                i += 2;
-            }
-            "--route" => {
-                raw_args
-                    .get(i + 1)
-                    .expect("--route requires a value")
-                    .clone_into(&mut route);
-                i += 2;
-            }
-            other => panic!(
-                "unrecognized argument {other:?}; this bench only accepts \
-                 --iterations <N> and --route exempt|checked|both"
-            ),
-        }
-    }
-
-    let (hit_exempt, hit_checked) = match route.as_str() {
-        "exempt" => (true, false),
-        "checked" => (false, true),
-        "both" => (true, true),
-        other => panic!("--route must be one of exempt|checked|both, got {other:?}"),
-    };
+    let iterations: u32 = std::env::args()
+        .position(|a| a == "--iterations")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
 
-    let layer = BotProtectionLayer::new(std::sync::Arc::new(TestCaptchaProvider::new(VALID_TOKEN)));
-    let client = TestApp::new()
-        .layer(layer)
-        .routes(routes![exempt_get, checked_post])
-        .build();
+    let config = AutumnConfig {
+        profile: Some("test".into()),
+        bot_protection: BotProtectionConfig {
+            enabled: true,
+            dev_bypass: true,
+            ..BotProtectionConfig::default()
+        },
+        ..AutumnConfig::default()
+    };
 
-    let checked_body = format!("{FORM_FIELD}={VALID_TOKEN}");
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![list_notes])
+        .build();
 
     rt.block_on(async {
         for _ in 0..50 {
-            if hit_exempt {
-                let resp = client.get("/route-a").send().await;
-                assert_eq!(
-                    resp.status,
-                    StatusCode::OK,
-                    "warm-up GET must not be denied"
-                );
-            }
-            if hit_checked {
-                let resp = client
-                    .post("/route-b")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(checked_body.clone())
-                    .send()
-                    .await;
-                assert_eq!(
-                    resp.status,
-                    StatusCode::OK,
-                    "warm-up POST must pass verification"
-                );
-            }
+            let resp = client.get("/notes").send().await;
+            assert_eq!(
+                resp.status,
+                StatusCode::OK,
+                "warm-up GET must not be denied"
+            );
         }
 
         for _ in 0..iterations {
-            if hit_exempt {
-                let resp = client.get("/route-a").send().await;
-                // Asserted, not just `black_box`ed: a silent denial partway
-                // through a long run would corrupt every DHAT/callgrind
-                // number after it without this failing loudly (same
-                // reasoning `throttle_check.rs` documents).
-                assert_eq!(
-                    resp.status,
-                    StatusCode::OK,
-                    "measured GET was unexpectedly denied"
-                );
-                black_box(resp.status);
-            }
-            if hit_checked {
-                let resp = client
-                    .post("/route-b")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(checked_body.clone())
-                    .send()
-                    .await;
-                assert_eq!(
-                    resp.status,
-                    StatusCode::OK,
-                    "measured POST was unexpectedly denied"
-                );
-                black_box(resp.status);
-            }
+            let resp = client.get("/notes").send().await;
+            // Asserted, not just `black_box`ed: a silent denial partway
+            // through a long run would corrupt every DHAT/callgrind number
+            // after it without this failing loudly (same reasoning
+            // `throttle_check.rs` documents).
+            assert_eq!(
+                resp.status,
+                StatusCode::OK,
+                "measured GET was unexpectedly denied"
+            );
+            black_box(resp.status);
         }
     });
 
-    let per_round = u32::from(hit_exempt) + u32::from(hit_checked);
-    println!(
-        "completed {} requests",
-        iterations * per_round + 50 * per_round
-    );
+    println!("completed {} requests", iterations + 50);
 }
