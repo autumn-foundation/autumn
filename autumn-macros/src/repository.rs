@@ -1237,6 +1237,32 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
+    // Warden 2026-09-13: `owner = <column>` has no effect on the generated
+    // `api = "..."` CRUD routes. It only emits opt-in `list_scoped`/
+    // `search_page_scoped` repository methods for a hand-written handler to
+    // call with an explicit owner id — the auto-generated `_api_list`,
+    // `_api_get`, `_api_update` and `_api_delete` handlers never call them,
+    // and always fall back to the plain, unscoped `page`/`find_by_id`/
+    // `update`/`delete_by_id`. Without `policy = Type` or `scope = Type` (both
+    // of which the auto-API *does* enforce — see `has_policy`/`scope_type`
+    // above), `owner = <column>` next to `api = "..."` silently ships a fully
+    // public CRUD API over what looks, from the declaration, like a
+    // per-owner-scoped one: any authenticated caller can read every row via
+    // `GET <api>`, and read/overwrite/delete any single row by id via
+    // `GET`/`PUT`/`DELETE <api>/{id}`, regardless of `owner_column`.
+    if api_path.is_some() && owner_column.is_some() && policy_type.is_none() && scope_type.is_none()
+    {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "owner = <column> has no effect on the generated `api = \"...\"` CRUD routes: only \
+             `policy = Type` or `scope = Type` gate them. Left on its own, `GET <api>` and \
+             `GET`/`PUT`/`DELETE <api>/{id}` are NOT scoped by owner and read/modify every \
+             user's rows. Add `policy = Type` (and reference `owner_id`/`ctx.user_id_i64()` from \
+             it) or `scope = Type` alongside `owner = ...`, or drop `api = \"...\"` and call the \
+             generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` methods \
+             from your own hand-written, owner-checked routes instead",
+        ));
+    }
     if validate_on_update_fetch && no_upsert_trait {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -24196,8 +24222,10 @@ mod tests {
     #[test]
     fn parse_repo_args_with_owner() {
         // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        // No `api = "..."` here: paired with `api` and no `policy`/`scope`,
+        // `owner` alone is now a hard compile error (Warden 2026-09-13) — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(
             config.owner_column.as_deref(),
@@ -24212,8 +24240,13 @@ mod tests {
         // applied to BOTH the COUNT and the page query, before the allowlisted
         // sort/filter helpers, so `total` and the returned rows can never be
         // widened past the owner's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `list_scoped` generation
+        // is gated purely on `owner_column`, not on `api`, and `api` +
+        // `owner` with no `policy`/`scope` is now a compile error — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { Post, owner = author_id },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24247,8 +24280,13 @@ mod tests {
         // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
         // hydration query by owner — all three, or `total`/rows would disagree
         // and the endpoint could leak another user's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `search_page_scoped`
+        // generation is gated on `owner_column` + `searchable`, not on `api`,
+        // and `api` + `owner` with no `policy`/`scope` is now a compile error
+        // — see `repository_owner_api_without_policy_or_scope_is_rejected`.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { Post, owner = author_id, searchable },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24282,6 +24320,74 @@ mod tests {
                 "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
             ),
             "search_page_scoped hydration query must filter by owner: {body}"
+        );
+    }
+
+    // Warden 2026-09-13: `owner = <column>` never gated the generated
+    // `api = "..."` CRUD routes — only the opt-in `list_scoped`/
+    // `search_page_scoped` methods a hand-written handler must call
+    // explicitly. `#[repository(api = "...", owner = author_id)]` with no
+    // `policy`/`scope` therefore compiled to a fully public REST API (every
+    // row readable via `GET <api>`, any single row readable/overwritable/
+    // deletable by id via `GET`/`PUT`/`DELETE <api>/{id}`) despite reading,
+    // at the declaration site, like a per-owner-scoped one. Reject the
+    // combination at compile time instead of silently shipping it.
+    #[test]
+    fn repository_owner_api_without_policy_or_scope_is_rejected() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> next to api = \"...\" with no policy/scope must be rejected: \
+                 it silently ships an unscoped CRUD API"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_is_accepted() {
+        // Adding `policy = Type` alongside `owner` + `api` is the documented
+        // way out: the auto-API's `has_policy` branch (`__check_policy_scoped`)
+        // actually gates `show`/`update`/`delete`, and a `policy`-aware list
+        // body gates `GET <api>` too. `owner_column` still drives
+        // `list_scoped`/`search_page_scoped` for any hand-written route that
+        // wants the cheaper SQL-level filter instead.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy"#
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_scope_is_accepted() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, scope = PostScope"#
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + scope = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_without_api_is_accepted() {
+        // `owner =` with no `api =` at all is unaffected: it only emits the
+        // opt-in `list_scoped`/`search_page_scoped` methods for a
+        // hand-written route to call, and generates no HTTP surface of its
+        // own to leave unscoped.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> with no api = \"...\" must be accepted"
         );
     }
 

@@ -1003,6 +1003,56 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### repository: `owner = column` next to `api = "..."` now requires `policy` or `scope`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them, and the list
+endpoint's own precedence considers only `scope`/`policy`/neither. Declared
+on its own next to `api = "..."`, `owner` therefore compiled to a fully
+public REST API that read, at the declaration site, like a per-owner-scoped
+one: `GET <api>` returned every user's rows, and `GET`/`PUT`/`DELETE
+<api>/{id}` let any authenticated caller read, overwrite, or delete any
+other user's row by id.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes.
+
+**After (`{X.Z}`):** add `policy = Type` (compare `ctx.user_id_i64()` against
+the owner column in `can_show`/`can_update`/`can_delete`), or `scope = Type`
+(filter the list query by the current user), alongside `owner = ...`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — which of `policy`/`scope` fits (and what the
+policy/scope actually checks) is an application decision no codemod can make.
+
 ### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
 
 **Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and

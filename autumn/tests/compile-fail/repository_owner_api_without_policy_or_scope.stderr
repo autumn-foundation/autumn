@@ -1,0 +1,12 @@
+error: owner = <column> has no effect on the generated `api = "..."` CRUD routes: only `policy = Type` or `scope = Type` gate them. Left on its own, `GET <api>` and `GET`/`PUT`/`DELETE <api>/{id}` are NOT scoped by owner and read/modify every user's rows. Add `policy = Type` (and reference `owner_id`/`ctx.user_id_i64()` from it) or `scope = Type` alongside `owner = ...`, or drop `api = "..."` and call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` methods from your own hand-written, owner-checked routes instead
+  --> tests/compile-fail/repository_owner_api_without_policy_or_scope.rs:33:1
+   |
+33 | / #[autumn_web::repository(
+34 | |     OwnerApiBypassNote,
+35 | |     table = "owner_api_bypass_notes",
+36 | |     api = "/api/owner-bypass-notes",
+37 | |     owner = author_id
+38 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)

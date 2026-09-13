@@ -1,0 +1,58 @@
+=== autumn-macros repository:: unit tests (322 passed, includes 4 new + 2 updated owner tests) ===
+test repository::tests::the_dependent_cascade_maintains_the_children_own_counters ... ok
+test repository::tests::the_invalidator_is_must_use ... ok
+test repository::tests::versioned_config_is_false_by_default ... ok
+test repository::tests::trait_level_and_method_level_edges_union_rather_than_replace ... ok
+test repository::tests::update_captures_before_and_moves_after ... ok
+test repository::tests::vh_codegen_moves_both_disposable_values_into_compute_diff ... ok
+test repository::tests::vh_codegen_moves_the_disposable_value_into_compute_delete_changes ... ok
+test repository::tests::vh_codegen_moves_the_disposable_value_into_compute_insert_changes ... ok
+test repository::tests::write_methods_cover_the_always_generated_crud_surface ... ok
+test repository::tests::write_methods_drop_upsert_many_when_it_is_not_generated ... ok
+test repository::tests::write_methods_exclude_purge_on_a_ledgered_repository ... ok
+test repository::tests::write_methods_include_position_moves_when_declared ... ok
+test repository::tests::vh_codegen_still_serializes_each_record_exactly_once ... ok
+test repository::tests::write_methods_include_soft_delete_and_derived_deletes ... ok
+test repository::tests::versioned_tenant_scoped_delete_many_chunk_is_a_block_expression ... ok
+
+test result: ok. 322 passed; 0 failed; 0 ignored; 0 measured; 1106 filtered out; finished in 0.74s
+
+
+[exited with code 0]
+
+=== trybuild compile_fail (fixture now rejects the vulnerable declaration) ===
+[0mtest [0m[1mtests/compile-fail/lifecycle_terminal_has_no_exit.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/lifecycle_start_only_on_initial.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/lifecycle_unknown_initial.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/lifecycle_terminal_source.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/lifecycle_unreachable_state.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/lifecycle_dead_end_state.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/repository_ledgered_requires_soft_delete.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/repository_ledgered_purge_rejected.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/repository_ledgered_sensitive_columns.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/repository_owner_api_without_policy_or_scope.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_on_enum.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_shard_key_unknown.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/validate_nested_collides_with_validate_ext.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_m2m_helper_collision.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_commentable_missing_counter_column.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_commentable_counter_not_i64.rs[0m ... [0m[32mok
+
+=== full compile_fail suite result ===
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2017 filtered out; finished in 425.83s
+
+
+=== generated .stderr for the new fixture ===
+error: owner = <column> has no effect on the generated `api = "..."` CRUD routes: only `policy = Type` or `scope = Type` gate them. Left on its own, `GET <api>` and `GET`/`PUT`/`DELETE <api>/{id}` are NOT scoped by owner and read/modify every user's rows. Add `policy = Type` (and reference `owner_id`/`ctx.user_id_i64()` from it) or `scope = Type` alongside `owner = ...`, or drop `api = "..."` and call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` methods from your own hand-written, owner-checked routes instead
+  --> tests/compile-fail/repository_owner_api_without_policy_or_scope.rs:33:1
+   |
+33 | / #[autumn_web::repository(
+34 | |     OwnerApiBypassNote,
+35 | |     table = "owner_api_bypass_notes",
+36 | |     api = "/api/owner-bypass-notes",
+37 | |     owner = author_id
+38 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)
