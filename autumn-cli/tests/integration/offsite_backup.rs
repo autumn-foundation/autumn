@@ -207,19 +207,6 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub.
-/// Docker Hub no longer serves that repository at all (`MinIO` Inc. dropped
-/// it), so every pull now fails with "pull access denied ... repository does
-/// not exist". Point at `MinIO`'s other public registry, `quay.io/minio/minio`,
-/// instead. This tag choice is independent of `testcontainers-modules`, so it
-/// stays pullable even if a future crate bump changes the crate's own default.
-fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
-    use testcontainers::ImageExt as _;
-    testcontainers_modules::minio::MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .with_tag("RELEASE.2025-09-07T16-13-09Z")
-}
-
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
