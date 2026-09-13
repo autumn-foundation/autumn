@@ -872,25 +872,45 @@ fn stable_identity<'a>(
     })
 }
 
+/// The marker `stable_identity` would have recorded for this post before
+/// #2763 shipped, computed from the parent's *current* row (#2763).
+///
+/// Exact, not a guess: this is one specific string, built the same way the
+/// pre-#2763 scheme always built it, so a direct match is trusted the same
+/// way any other qualified marker in this file is — by the string alone,
+/// with no further check. It is only ever *right* when the parent has not
+/// moved since the original import: recomputing from a *moved* parent's
+/// current row produces its new position, not the old one the marker
+/// actually named, so a mismatch here does not mean the row is missing —
+/// see `recovered_legacy_owner` for that case.
+async fn legacy_marker_at_current_position(
+    repos: &Repos,
+    parent_id: i64,
+    slug: &str,
+) -> AutumnResult<Option<String>> {
+    Ok(match repos.posts.find_by_id(parent_id).await? {
+        Some(parent_row) => Some(disambiguated_identity(format!(
+            "{}/{}",
+            local_identity(repos, &parent_row).await?,
+            slug
+        ))),
+        None => None,
+    })
+}
+
 /// Finds a row a prior import already created for this externally-parented
-/// post, when no marker lookup above found one (#2763).
+/// post, when the parent has moved since and
+/// `legacy_marker_at_current_position` cannot find it (#2763).
 ///
-/// A marker recorded before this fix shipped names the parent's *position*
-/// at that import, a scheme this fix no longer computes. Recomputing that
-/// position from the parent's *current* row does not recover it either,
-/// once the parent has moved since. So this never recomputes anything: it
-/// looks for any recorded marker of `post_type` ending in `/{slug}` — the
-/// shape every *qualified* marker this importer ever wrote has, old scheme
-/// or new.
-///
-/// A qualified marker names exactly one row by itself, the same invariant
-/// every other marker lookup in this file relies on. A single match is
-/// trusted directly, by that string alone — not by its owner's current
-/// parent, which an editor may since have changed, exactly as an ordinary
-/// marker match elsewhere in this loop trusts a page an editor has moved.
-/// Only when more than one distinct marker shares the suffix — two
-/// unrelated historical imports whose posts happen to end in this slug —
-/// does the current parent decide, and only an exact match counts.
+/// The parent's *old* position — what that marker actually named — is
+/// gone, not just unreachable by id, once the parent has moved: nothing
+/// here recomputes it. Instead this checks the row's real, current parent,
+/// which is accurate no matter how many times an ancestor has moved.
+/// Only a candidate whose actual `parent_id` still equals `parent_id` is
+/// accepted, among every marker for `post_type` ending in `/{slug}` — a
+/// shared suffix alone is not enough, since an unrelated page under a
+/// different parent can share it by coincidence; only the real parent
+/// tells them apart.
 async fn recovered_legacy_owner(
     repos: &Repos,
     imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
@@ -899,19 +919,10 @@ async fn recovered_legacy_owner(
     parent_id: i64,
 ) -> AutumnResult<Option<crate::models::Post>> {
     let suffix = format!("/{slug}");
-    let matches: Vec<&[i64]> = imported_source_slugs
-        .iter()
-        .filter(|((candidate_type, marker), _)| {
-            candidate_type == post_type && marker.ends_with(&suffix)
-        })
-        .map(|(_, ids)| ids.as_slice())
-        .collect();
-    if let [ids] = matches.as_slice()
-        && let Some(&id) = ids.first()
-    {
-        return repos.posts.find_by_id(id).await;
-    }
-    for ids in matches {
+    for ((candidate_type, marker), ids) in imported_source_slugs {
+        if candidate_type != post_type || !marker.ends_with(&suffix) {
+            continue;
+        }
         for &id in ids {
             if let Some(candidate) = repos.posts.find_by_id(id).await?
                 && candidate.parent_id == Some(parent_id)
@@ -1453,14 +1464,28 @@ pub async fn import(
             && graph.find(post.post_type.as_str(), &parent).is_none()
             && let Some(parent_id) = parent_now
         {
-            marker_owned = recovered_legacy_owner(
-                &repos,
-                &imported_source_slugs,
-                &post.post_type,
-                &post.slug,
-                parent_id,
-            )
-            .await?;
+            // The parent has not moved: this recomputes the exact old
+            // marker, so a match is exact and needs no further check.
+            if let Some(legacy_marker) =
+                legacy_marker_at_current_position(&repos, parent_id, &post.slug).await?
+                && let Some(&id) = imported_source_slugs
+                    .get(&(post.post_type.clone(), legacy_marker))
+                    .and_then(|ids| ids.first())
+            {
+                marker_owned = repos.posts.find_by_id(id).await?;
+            }
+            // The parent has moved: recover by the row's real parent
+            // instead, since its old position can no longer be recomputed.
+            if marker_owned.is_none() {
+                marker_owned = recovered_legacy_owner(
+                    &repos,
+                    &imported_source_slugs,
+                    &post.post_type,
+                    &post.slug,
+                    parent_id,
+                )
+                .await?;
+            }
         }
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating
