@@ -2143,7 +2143,6 @@ fn path_attribute_module_paths(
             .replace('\\', "/");
         let (crate_root, base_module_path) = crate_context_from_file(&declaring_rel, table);
         let found = out_of_line_mod_declarations(&ast.items, default_features);
-        let declaring_dir = declaring_file.parent().unwrap_or(declaring_file);
         for (inline, name, path_value) in found {
             let mut module_path = base_module_path.clone();
             module_path.extend(inline.iter().cloned());
@@ -2160,11 +2159,28 @@ fn path_attribute_module_paths(
                 // accumulation — this mirrors it by folding each inline
                 // segment in as a subdirectory before joining the attribute's
                 // own value (Codex review on #2739, round 33, P2).
-                let inline_dir = inline
+                //
+                // Fresh evidence beyond that top-level case is the SAME
+                // shape declared inside an already out-of-line file: for
+                // `src/foo.rs` (reached via a plain, non-aliased `mod foo;`)
+                // containing `mod inline { #[path = "actual.rs"] mod
+                // handlers; }`, rustc loads `src/foo/inline/actual.rs` —
+                // verified directly via a real build — never `src/inline/
+                // actual.rs`. The declaring FILE's own physical parent
+                // directory (`src/`, from `declaring_file.parent()`) is the
+                // wrong base here: `foo.rs`'s own conventional child
+                // directory is `src/foo/`, exactly what `base_module_path`
+                // (the file's own logical module path, already used by the
+                // conventional branch below via `resolve_out_of_line_module_file`)
+                // already names, so folding `base_module_path` then `inline`
+                // onto `src/` directly — instead of the declaring file's own
+                // parent directory — gives the right base for both the
+                // top-level and the nested case alike (Codex review on
+                // #2739, round 46, P2).
+                let inline_dir = base_module_path
                     .iter()
-                    .fold(declaring_dir.to_path_buf(), |dir, segment| {
-                        dir.join(segment)
-                    });
+                    .chain(inline.iter())
+                    .fold(project_root.join("src"), |dir, segment| dir.join(segment));
                 let target_file = lexically_normalize_path(&inline_dir.join(&path_value));
                 let target_rel = target_file
                     .strip_prefix(project_root)
@@ -7749,6 +7765,53 @@ mod tests {
         assert_eq!(
             scan.functions[0].module_path,
             vec!["api".to_owned(), "handlers".to_owned()]
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same idea again, but the enclosing inline module is declared inside
+    /// an already OUT-OF-LINE file (`src/foo.rs`, reached via a plain,
+    /// non-aliased `mod foo;`) rather than directly in `src/lib.rs` —
+    /// verified directly via a real build that `mod inline { #[path =
+    /// "actual.rs"] mod handlers; }` in `src/foo.rs` finds
+    /// `src/foo/inline/actual.rs`, never `src/inline/actual.rs`. The
+    /// declaring file's own physical PARENT directory (`src/`, from
+    /// `declaring_file.parent()`) is the wrong base for this fold: `foo.rs`
+    /// itself is not `src/lib.rs`, so its own conventional child directory
+    /// is `src/foo/`, not `src/` (Codex review on #2739, round 46, P2).
+    #[test]
+    fn resolve_edge_scan_resolves_a_path_attribute_mod_nested_inside_an_inline_module_of_an_out_of_line_file()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/foo/inline")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/foo.rs"),
+            r#"
+            mod inline {
+                #[path = "actual.rs"]
+                mod handlers;
+            }
+            fn wire() { edge_routes![crate::foo::inline::handlers::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/foo/inline/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["foo".to_owned(), "inline".to_owned(), "handlers".to_owned()]
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
