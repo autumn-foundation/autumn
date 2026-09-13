@@ -2771,16 +2771,25 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
 /// `'label: for ... in ... { ... }` — verified directly that a bare labeled
 /// block also compiles as a semicolon-free statement), which shares the
 /// exact same property as its unlabeled form and is folded in via the same
-/// two helpers (Codex review on #2739, round 28, P2); and a `struct`/
-/// `enum`/`union`/`trait` item (possibly behind `pub`/`pub(...)`, skipped
-/// via [`skip_forward_over_item_modifiers`]) via
+/// two helpers (Codex review on #2739, round 28, P2); a `struct`/`enum`/
+/// `union`/`trait` item (possibly behind `pub`/`pub(...)`, skipped via
+/// [`skip_forward_over_item_modifiers`]) via
 /// [`braced_or_semicolon_item_end`] — unlike everything else handled here,
 /// such an item does NOT always skip a trailing `;` (a tuple or unit
 /// struct still needs one), but it's included in this same dispatch
 /// because the naive scan-to-`;` fallback gets it wrong in the OTHER
 /// direction: a struct/enum/union/trait with a braced body has no `;` to
 /// find, so that fallback runs straight through it into the next,
-/// unrelated, still-real statement (Codex review on #2739, round 30, P2).
+/// unrelated, still-real statement (Codex review on #2739, round 30, P2);
+/// and `macro_rules! name { ... }` — the identical brace-or-semicolon
+/// ambiguity in a different spelling, verified directly via a real build:
+/// the brace form (`macro_rules! name { ... }`) needs no trailing `;`, but
+/// the parenthesized/bracketed forms (`macro_rules! name(...);`,
+/// `macro_rules! name[...];`) do, so it reuses
+/// [`braced_or_semicolon_item_end`] directly (starting right after
+/// `macro_rules` itself — the `!` and the macro's own name are just more
+/// pass-through tokens to that scan) rather than a dedicated helper (Codex
+/// review on #2739, round 32, P2).
 fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usize> {
     if let Some(TokenTree::Ident(ident)) = trees.get(i) {
         match ident.to_string().as_str() {
@@ -2790,6 +2799,9 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
             "const" => {
                 return matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
                     .then_some(i + 1);
+            }
+            "macro_rules" => {
+                return braced_or_semicolon_item_end(trees, i + 1);
             }
             _ => {}
         }
@@ -4235,6 +4247,69 @@ mod tests {
                 struct Premium(i32);
                 #[cfg(feature = "premium")]
                 struct PremiumUnit;
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// A cfg'd-out `macro_rules! name { ... }` definition (the brace form)
+    /// has no trailing `;` — verified directly via a real build — so the
+    /// generic scan-to-`;` fallback would run right through it into the
+    /// next, unrelated, still-real `edge_routes![show]` invocation and
+    /// consume that too (Codex review on #2739, round 32, P2).
+    #[test]
+    fn cfg_false_macro_rules_brace_form_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                macro_rules! unused {
+                    () => {};
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// The parenthesized `macro_rules! name(...);` form DOES need a
+    /// trailing `;`, unlike the brace form above — verified directly via a
+    /// real build — so `braced_or_semicolon_item_end` must still find it
+    /// correctly.
+    #[test]
+    fn cfg_false_macro_rules_paren_form_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                macro_rules! unused(
+                    () => {};
+                );
                 edge_routes![crate::show];
             }
             "#,
