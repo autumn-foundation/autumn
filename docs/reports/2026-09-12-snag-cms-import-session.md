@@ -370,12 +370,19 @@ version-2 or -3 export could never have contained the colliding rows this
 repro needs. Second, and this is what the version-5 reproduction above
 settles: the bug is not actually confined to old-format files at all, so
 "is this reachable from a genuine backup" has a different answer than
-either earlier draft gave — it depends only on whether the *specific
-posts in question* carry `path`, which a hand-edited file of **any**
-accepted version (2 through 5) can omit, and which the importer never
-cross-checks against the file's declared version. Filed as data loss on
-an input shape this importer accepts across every `READABLE_EXPORT_VERSIONS`
-entry and applies no path-presence consistency check to.
+either earlier draft gave. It is **not**, per the `cms16` finding later
+in this section, simply a matter of whether the *specific posts in
+question* carry `path` — a page carrying `path: "team"` can be the
+*dropped* page just as easily as a pathless one, provided some other
+row's identity fails to reflect its own true position. Reachability
+depends on whether an omitted or otherwise inaccurate fully-qualified
+identity collides with an already-claimed one (a persisted row's
+`local_identity`, or an earlier import's `_import_source_slug` marker) —
+which a hand-edited file of **any** accepted version (2 through 5) can
+produce, and which the importer never cross-checks against the file's
+declared version. Filed as data loss on an input shape this importer
+accepts across every `READABLE_EXPORT_VERSIONS` entry and applies no
+identity-consistency check to.
 
 Full repro script, root cause, and both oracles are in the issue.
 
