@@ -27,10 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add_comment` and `delete_comment` the moment that column was ever
   non-null, even though the repository's own finders kept returning the row.
   `comment_thread`'s read path never copied the spec, so reads were already
-  unaffected. Fixed by widening these three functions to
-  `spec: &'static CommentableSpec` — every real caller already passes the
-  registered static — and moving the reference itself into the closure
-  instead of the value, which keeps the identity check intact.
+  unaffected. Fixed without changing these functions' public signatures:
+  each now resolves the soft-delete answer from `spec` **before** copying
+  it — while its identity still matches the registry — and passes the
+  resolved `bool` down explicitly, so `probe_parent` no longer re-derives it
+  from a spec that may already be a copy.
   Tenant scoping was not affected: it resolves through the separate
   `request_tenant`/`__autumn_m2m_tenant_scope` path before any copy
   happens, and already correctly ignores a `tenant_id` column on a
