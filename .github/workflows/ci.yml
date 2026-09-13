@@ -485,6 +485,48 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-macro-args.sh --self-test && ./scripts/check-docs-macro-args.sh
+      - name: Release-line pin gate
+        # The eighth thing a reader copies off a page, and the one every other
+        # gate is implicitly relative to: the dependency pin that decides WHICH
+        # autumn-web the rest of the page describes. A correct `autumn_web::…`
+        # path against the wrong release line is still a build error.
+        #
+        # It was gated in one place over eight pages —
+        # `repo_hygiene::first_run_docs_match_current_release_line` holds a
+        # hand-listed `FIRST_RUN_DOCS` array to the published pin — while the
+        # reader-facing corpus is 212 pages carrying 69 pins. That test is also
+        # existential rather than per-occurrence: it asks whether a page
+        # `contains` the right pin anywhere, so a page carrying both a correct
+        # and a stale pin passes. The CHANGELOG records the class being swept by
+        # hand twice already ("aligned the `autumn-cli` install pin to the
+        # workspace `0.6.0` across …", and a guide found "announcing the '0.4
+        # release line' while pinning 0.6 commands").
+        #
+        # The baseline run found one: `skills/autumn-patterns/SKILL.md` pinned
+        # `autumn-web = { version = "0.5", features = ["test-support"] }` in the
+        # `[dev-dependencies]` block of its testing section — the line a reader
+        # adds the first time they write a test, two release lines behind the
+        # `0.7` the same corpus pins in 47 other places. It entered the tree
+        # already stale, which is why a release-time sweep would not have caught
+        # it and a gate does.
+        #
+        # That pin does not fail as a version complaint. `autumn-web` pulls
+        # `libsqlite3-sys`, which carries `links = "sqlite3"`, and Cargo permits
+        # one package per `links` value in a graph — so two lines of autumn-web
+        # resolve to a NATIVE LIBRARY conflict naming neither autumn-web nor the
+        # page. Verified against crates.io in both directions: the 0.5 pin exits
+        # 101 at resolve time, the 0.7 pin resolves clean.
+        #
+        # Truth set is README.md's quickstart pin, the same single source
+        # `check-quickstart.sh` installs from, so a release bump moves this
+        # gate's expectation by editing one line and cannot disagree with the
+        # first-run test about what "current" means. Migration guides are held
+        # to their OWN version instead, since a before-block is the page's whole
+        # purpose.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-versions.sh --self-test && ./scripts/check-docs-versions.sh
       - name: Corpus scope agreement gate
         # The gates above each read "the reader-facing corpus", and each spells
         # that set itself. Three of them carry a comment promising the spellings
@@ -500,7 +542,7 @@ jobs:
         # and `AUTUMN_DATABASE__URL` were ungated while the same file already
         # carried `route-surface-allow` waivers for the gate that did read it.
         #
-        # This step compares the four declarations rather than the corpus, so it
+        # This step compares the gates' declarations rather than the corpus, so it
         # fails when a scope is edited rather than when the pages that scope
         # stopped covering finally rot. A difference between them is allowed but
         # must be written down, which is the rule that catches the case a
