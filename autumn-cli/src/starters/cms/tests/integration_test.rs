@@ -11697,6 +11697,946 @@ async fn re_importing_a_backup_recognizes_a_child_of_a_moved_ancestor() {
     );
 }
 
+/// A re-import must still recognize a page whose parent is external — local
+/// content the file itself never declares — even after an editor moves
+/// that parent (#2763).
+///
+/// Only `P` is in the file. `A` already exists. On first import, `P`'s
+/// marker anchors to `A`'s row id. An editor then moves `A` under a new
+/// parent. The re-import must recompute the same anchor: `A`'s id, not its
+/// new position.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_moved_external_parent() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `A` is created directly, the same way an editor would — not through
+    // an import. The file below never names it as one of its own posts.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // A separate top-level page, then the editor moves `A` underneath it.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("a"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A`, unqualified,
+    // as its parent — the file never described `A` at all.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    // `A`'s move stands, and no duplicate `p` appeared anywhere.
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
+/// A re-import must still recognize a page whose marker a pre-#2763 site
+/// recorded against its external parent's *old* position, when that
+/// parent then moved before the site upgraded to this fix (#2763).
+///
+/// The stored marker (`a/p`) reflects `A`'s position at the *original*
+/// import. Recomputing that marker from `A`'s *current* row cannot recover
+/// it once `A` has moved since — the old position is gone, not just
+/// unreachable by id. Recognizing `P` here must not depend on recomputing
+/// any position at all: it must find the old marker by its slug suffix and
+/// confirm it by `P`'s real, current parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_marker_after_the_parent_moved() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `A`'s position at
+    // this import (`a`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(p_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The editor moves `A` — before the site ever upgrades to this fix.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("a"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The site now upgrades to this fix and re-imports the same backup.
+    // `P`'s marker still reads `a/p`, and `A`'s position is now `x/a`.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
+/// A re-import must still recognize a page whose own marker predates
+/// #2763, when an editor has since moved that *page itself* — not its
+/// external parent (#2763).
+///
+/// `P`'s marker (`a/p`) is a single, unambiguous match for its slug
+/// suffix, so recovering it must trust that string directly rather than
+/// requiring `P`'s *current* parent to still be `A`: an editor moving `P`
+/// away from `A` is exactly the case an ordinary marker match already
+/// tolerates elsewhere in this importer, and recovering a legacy marker
+/// must not regress it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_marker_after_the_child_moved() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `A`'s position at
+    // this import (`a`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(p_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The editor moves `P` itself — not `A` — before the site upgrades.
+    let b_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "B"),
+                ("slug", "b"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating B: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", b_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+
+    // The site now upgrades to this fix and re-imports the same backup.
+    // `P`'s file entry still names `A`, and `P`'s marker still reads
+    // `a/p`, but `P`'s real parent is now `B`.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    // The editor's move stands, and no duplicate `p` appeared under `A`.
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under `A`"
+    );
+}
+
+/// Importing a genuinely new page must not be dropped just because an
+/// unrelated page, under a different external parent, already carries a
+/// pre-#2763 marker ending in the same slug (#2763).
+///
+/// Recovering a legacy marker by its slug suffix alone cannot tell `p`
+/// under `A` apart from an unrelated `p` under `Other` sharing that
+/// suffix. Only the candidate's real, current parent can — a shared
+/// suffix must not be trusted on its own.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_an_unrelated_pre_upgrade_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An unrelated page, external to every file this test imports, whose
+    // marker predates #2763: `other/p`, not the id-anchored shape this fix
+    // now records.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Other"),
+            ("slug", "other"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating Other: {}", created.text());
+
+    let unrelated_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "other", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, unrelated_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    let unrelated_p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(unrelated_p_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("other/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A different external parent, never before related to any `p`.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    // A genuinely new file, naming a `p` this site has never imported
+    // under `A`. Its slug collides with the unrelated page above only by
+    // coincidence.
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Both pages exist: the unrelated one, untouched, and the new one.
+    sign_out(&client);
+    client.get("/other/p").send().await.assert_ok();
+    client.get("/a/p").send().await.assert_ok();
+}
+
+/// A new descendant of a page whose own marker predates #2763 must nest
+/// under that page's real row, not land at the top level (#2763).
+///
+/// `P`'s marker (`a/p`) is the pre-#2763 shape. `C` names `P` as its
+/// parent, and `P` is also declared in this same file, so `C`'s parent
+/// resolves through `resolved_post_id` — which needs the same legacy
+/// recovery the main loop uses, or it can never find `P`'s real id.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_pre_upgrade_legacy_parent_nests_it_correctly() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(p_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A backup that names `P` again, and adds a new child `C` under it.
+    let second_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "p", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/a/p/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the import must not have created a second, top-level `c`"
+    );
+}
+
+/// Importing a genuinely new page must not be confused with an unrelated,
+/// *current-scheme* marker whose row an editor has since dragged under the
+/// same external parent by coincidence (#2763).
+///
+/// `P`'s marker is `id:<B>/p` — the shape this fix itself now writes, not
+/// a legacy one. An editor moving `P` to `A` afterwards must not make the
+/// legacy-recovery suffix scan mistake it for a *different* `p` this file
+/// is naming under `A` for the first time: an `id:`-anchored marker is
+/// never a legacy candidate, no matter whose slug it ends in.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_a_relocated_current_scheme_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "B"),
+            ("slug", "b"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating B: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/b/p").send().await.assert_ok();
+
+    // A different external parent, then the editor drags `P` under it
+    // directly — not through any import.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+    let (p_id, a_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let p = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p");
+        let a = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("a"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a");
+        (p, a)
+    };
+    let a_id_str = a_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", a_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/a/p").send().await.assert_ok();
+
+    // A genuinely new file, naming a different `P2` under `A` — its slug
+    // collides with the relocated page above only by coincidence.
+    let cookie = sign_in(&client, "owner").await;
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P2", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // The new page exists under `A`, alongside the relocated one.
+    sign_out(&client);
+    let new_under_a: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::title.eq("P2"))
+            .filter({{crate_name}}::schema::posts::parent_id.eq(a_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count")
+    };
+    assert_eq!(new_under_a, 1, "the new `P2` must exist under `A`");
+    client.get("/a/p").send().await.assert_ok();
+}
+
+/// Importing a genuinely new page must not be confused with an unrelated
+/// *legacy-scheme* marker whose row an editor has since dragged under the
+/// same external parent by coincidence (#2763).
+///
+/// `P`'s marker is `b/p` — legacy-shaped, but recorded for parent `B`, not
+/// `A`. A shared `/p` suffix and a coincidentally-matching current parent
+/// are not enough: the marker's own recorded parent segment (`b`) must
+/// also agree with `A`'s slug, or an unrelated page's move can steal a
+/// genuinely new page's identity.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_a_relocated_legacy_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "B"),
+            ("slug", "b"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating B: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `B`'s position at
+    // this import (`b`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(p_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("b/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A different external parent, then the editor drags `P` under it
+    // directly — not through any import.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("a"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    let a_id_str = a_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", a_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/a/p").send().await.assert_ok();
+
+    // A genuinely new file, naming a different `P2` under `A` — its slug
+    // collides with the relocated page above only by coincidence.
+    let cookie = sign_in(&client, "owner").await;
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P2", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // The new page exists under `A`, alongside the relocated one.
+    sign_out(&client);
+    let new_under_a: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::title.eq("P2"))
+            .filter({{crate_name}}::schema::posts::parent_id.eq(a_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count")
+    };
+    assert_eq!(new_under_a, 1, "the new `P2` must exist under `A`");
+    client.get("/a/p").send().await.assert_ok();
+}
+
 /// Re-importing a whole multi-level, pathless backup must still recognize
 /// every page in the chain, not just the immediate parent of whichever page
 /// is being checked.
