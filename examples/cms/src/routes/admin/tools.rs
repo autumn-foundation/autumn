@@ -672,41 +672,38 @@ fn parent_identity(post: &ExportPost) -> Option<String> {
 /// no slash, so it looks top level. The old key ran such a page before its
 /// own parent was even created.
 ///
-/// This walks `parent_identity` against the file's other posts instead. It
-/// finds the real depth, no matter which field names the parent.
+/// This walks `parent_identity` up the file's own posts instead. `by_identity`
+/// maps each post's own `(post_type, identity)` to its index, so each step
+/// finds the parent in one lookup instead of scanning the whole file.
 ///
-/// The result is memoized by post index. The walk is bounded, like every
-/// other ancestry walk in this module — a hand-edited file could name a page
-/// as its own ancestor.
+/// Walks up rather than down, and bounded by `MAX_PAGE_DEPTH` with a
+/// seen-set, for the same reason `trashed_ancestor` (in `content.rs`) is: a
+/// hand-edited file could chain a post deeper than any real page tree goes,
+/// or even name a page as its own ancestor.
 fn file_depth(
     posts: &[ExportPost],
+    by_identity: &std::collections::HashMap<(&str, String), usize>,
     index: usize,
-    memo: &mut [Option<usize>],
-    visiting: &mut [bool],
 ) -> usize {
-    if let Some(depth) = memo[index] {
-        return depth;
+    let mut seen = vec![index];
+    let mut cursor = index;
+    let mut depth = 0_usize;
+    while depth < content::MAX_PAGE_DEPTH + 2 {
+        let Some(parent) = parent_identity(&posts[cursor]) else {
+            break;
+        };
+        let key = (posts[cursor].post_type.as_str(), parent);
+        let Some(&parent_index) = by_identity.get(&key) else {
+            break;
+        };
+        if seen.contains(&parent_index) {
+            // A cycle in the file's parent references. Stop here.
+            break;
+        }
+        seen.push(parent_index);
+        cursor = parent_index;
+        depth += 1;
     }
-    if visiting[index] {
-        // A cycle in the file's parent references. Stop, and treat this post
-        // as top level.
-        return 0;
-    }
-    visiting[index] = true;
-    let depth = parent_identity(&posts[index])
-        .and_then(|parent| {
-            posts.iter().enumerate().find(|(other, candidate)| {
-                *other != index
-                    && candidate.post_type == posts[index].post_type
-                    && identity(candidate) == parent
-            })
-        })
-        .map(|(parent_index, _)| {
-            (file_depth(posts, parent_index, memo, visiting) + 1).min(content::MAX_PAGE_DEPTH + 2)
-        })
-        .unwrap_or(0);
-    visiting[index] = false;
-    memo[index] = Some(depth);
     depth
 }
 
@@ -722,6 +719,39 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
     } else {
         format!("{}/{}", ancestry.join("/"), post.slug)
     })
+}
+
+/// The identity a marker should record for an imported row: the file's own
+/// slug, qualified by its resolved parent's real position.
+///
+/// Not `identity(post)`. That string can be bare only because `path` was
+/// omitted — the same shape a genuinely top-level page's identity has. Two
+/// different pages can then compute the identical marker key. Only one keeps
+/// a place in the marker map; the other's own history is lost, so a retry
+/// can miss it, or an unrelated later import can match the wrong row.
+///
+/// Qualifying by the parent's real `local_identity`, not by the file's own
+/// declared parent string, keeps the key correct even for a slug the
+/// allocator had to suffix: the file's own slug is what a retry recomputes
+/// too. It also keeps the key pointed at the same row even after an editor
+/// moves that row — the marker is about which *file entry* a row came from,
+/// not about where the row lives right now.
+async fn resolved_identity(
+    repos: &Repos,
+    post: &ExportPost,
+    parent_now: Option<i64>,
+) -> AutumnResult<String> {
+    let Some(parent_id) = parent_now else {
+        return Ok(post.slug.clone());
+    };
+    let Some(parent) = repos.posts.find_by_id(parent_id).await? else {
+        return Ok(post.slug.clone());
+    };
+    Ok(format!(
+        "{}/{}",
+        local_identity(repos, &parent).await?,
+        post.slug
+    ))
 }
 
 /// A stored post of `post_type` whose own identity matches, if there is one.
@@ -957,11 +987,16 @@ pub async fn import(
     // among its siblings.
     //
     // Depth comes from `file_depth`, not from counting slashes in
-    // `identity()` — see its own comment for why.
-    let mut depth_memo: Vec<Option<usize>> = vec![None; payload.posts.len()];
-    let mut depth_visiting: Vec<bool> = vec![false; payload.posts.len()];
+    // `identity()`. See `file_depth`'s own comment for why.
+    let mut by_identity: std::collections::HashMap<(&str, String), usize> =
+        std::collections::HashMap::new();
+    for (i, post) in payload.posts.iter().enumerate() {
+        by_identity
+            .entry((post.post_type.as_str(), identity(post)))
+            .or_insert(i);
+    }
     let mut order: Vec<usize> = (0..payload.posts.len()).collect();
-    order.sort_by_key(|&i| file_depth(&payload.posts, i, &mut depth_memo, &mut depth_visiting));
+    order.sort_by_key(|&i| file_depth(&payload.posts, &by_identity, i));
     let ordered: Vec<&ExportPost> = order.into_iter().map(|i| &payload.posts[i]).collect();
 
     for post in ordered {
@@ -995,20 +1030,14 @@ pub async fn import(
             },
             None => None,
         };
-        // A marker records the *file* identity, not the row's real position.
-        // A pathless page's identity is only its slug. An unrelated page
-        // elsewhere in the tree can compute that same bare slug.
-        //
-        // An unfinished row is trusted anyway: the ancestry pass below still
-        // has to place it. A finished row is trusted only when its actual
-        // parent still matches what this file says the parent should be.
-        // Otherwise the marker match is a coincidence, not the same page
-        // resumed.
+        // Looked up by `resolved_identity`, not the raw `file_identity` — see
+        // its own comment for why a bare identity cannot be trusted as a
+        // marker key. Kept around: it is also what gets recorded below, if
+        // this post turns out to be new.
+        let marker_identity = resolved_identity(&repos, post, parent_now).await?;
         let marker_owned =
-            match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
-                Some(id) => repos.posts.find_by_id(*id).await?.filter(|candidate| {
-                    !completed_imports.contains(&candidate.id) || candidate.parent_id == parent_now
-                }),
+            match imported_source_slugs.get(&(post.post_type.clone(), marker_identity.clone())) {
+                Some(id) => repos.posts.find_by_id(*id).await?,
                 None => None,
             };
         // Matched on the *path*, not the bare slug: a local `/about/team`
@@ -1174,7 +1203,8 @@ pub async fn import(
         // Not the file's status verbatim: an elapsed schedule becomes a
         // publication. See `import_status`.
         let wanted_status = import_status(&post.status, post.published_at).to_owned();
-        let source_slug = file_identity.clone();
+        // The same qualified identity `marker_owned` looked up above.
+        let source_slug = marker_identity;
         // The insert, the marker, the terms and the status are one transaction.
         //
         // The insert used to sit outside it, because the `Repos` allocator

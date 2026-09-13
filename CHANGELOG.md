@@ -557,22 +557,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`cms` example — import no longer drops a page that shares a bare slug
-  with an unrelated one (#2737):** a page's file identity falls back to its
-  bare slug when the file has no `path` for it — the version-2/3 shape, and
-  also a version-5 entry that simply omits `path`. Two importer checks used
-  that bare identity on its own and could match it against the wrong page.
-  The "shallowest first" sort counted only `identity()`'s own slashes, so a
-  page nested through `parent` alone (no `path`) sorted as if it were top
-  level and could run before its own parent existed, landing at the top
-  level by mistake. The `_import_source_slug` marker recorded that same bare
-  identity at creation time, not the row's real position, so a later,
-  unrelated import naming an accurate top-level page with the same slug
-  matched the marker and was silently skipped. Both are fixed: the sort now
-  walks the file's own parent references to find each post's real depth, and
-  both the marker and the plain slug match now also require the matched
-  row's actual parent to agree with what the current file says the parent
-  should be.
+- **`cms` example — import no longer drops, nor later duplicates, a page that
+  shares a bare slug with an unrelated one (#2737):** a page's file identity
+  falls back to its bare slug when the file has no `path` for it — the
+  version-2/3 shape, and also a version-5 entry that simply omits `path`.
+  Two importer checks used that bare identity on its own and could match it
+  against the wrong page. The "shallowest first" sort counted only
+  `identity()`'s own slashes, so a page nested through `parent` alone (no
+  `path`) sorted as if it were top level and could run before its own parent
+  existed, landing at the top level by mistake. The `_import_source_slug`
+  marker recorded that same bare identity at creation time, not the row's
+  real position, so a later, unrelated import naming an accurate top-level
+  page with the same slug matched the marker and was silently skipped. Both
+  are fixed: the sort now walks the file's own parent references to find
+  each post's real depth, the plain slug match now also requires the
+  matched row's actual parent to agree with what the current file says the
+  parent should be, and the marker now records each row's identity
+  qualified by its resolved parent rather than the bare slug alone — so two
+  pages that only *look* alike keep separate markers, a later re-import
+  still recognizes a row an editor has since moved without re-parenting or
+  duplicating it, and the fix does not trade the original data loss for a
+  duplicate on a later run.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
