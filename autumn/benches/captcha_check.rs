@@ -116,9 +116,7 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    let layer = BotProtectionLayer::new(std::sync::Arc::new(TestCaptchaProvider::new(
-        VALID_TOKEN,
-    )));
+    let layer = BotProtectionLayer::new(std::sync::Arc::new(TestCaptchaProvider::new(VALID_TOKEN)));
     let client = TestApp::new()
         .layer(layer)
         .routes(routes![exempt_get, checked_post])
@@ -130,7 +128,11 @@ fn main() {
         for _ in 0..50 {
             if hit_exempt {
                 let resp = client.get("/route-a").send().await;
-                assert_eq!(resp.status, StatusCode::OK, "warm-up GET must not be denied");
+                assert_eq!(
+                    resp.status,
+                    StatusCode::OK,
+                    "warm-up GET must not be denied"
+                );
             }
             if hit_checked {
                 let resp = client
