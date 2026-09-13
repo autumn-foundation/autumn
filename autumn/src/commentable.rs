@@ -733,7 +733,7 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 // association's actual shape at every call site.
 pub async fn add_comment(
     conn: &mut RuntimeConnection,
-    spec: &CommentableSpec,
+    spec: &'static CommentableSpec,
     parent_type: &str,
     parent_id: i64,
     author_id: i64,
@@ -755,20 +755,22 @@ pub async fn add_comment(
         )));
     }
 
-    // Owned copies so the transaction closure — which must be `'static`-ish
-    // across the `scope_boxed` boundary — can move them.
-    let spec = *spec;
+    // `spec` stays the SAME `&'static` reference the registry holds — never
+    // copied by value — so `probe_parent`'s `commentable_model_for_spec`
+    // pointer lookup still matches it inside the transaction closure. Only
+    // the borrowed `str` arguments need an owned copy for the `'static`-ish
+    // `scope_boxed` boundary.
     let parent_type = parent_type.to_owned();
     let body = body.to_owned();
     let tenant = tenant.map(str::to_owned);
 
     scoped_immediate_transaction::<Comment, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, spec, parent_id, tenant.as_deref()).await?;
 
             if let Some(reply_to) = reply_to {
                 let parent_depth =
-                    comment_depth(conn, &spec, &parent_type, parent_id, reply_to).await?;
+                    comment_depth(conn, spec, &parent_type, parent_id, reply_to).await?;
                 let depth = parent_depth.saturating_add(1);
                 if depth > i64::from(spec.max_depth) {
                     return Err(AutumnError::unprocessable_msg(format!(
@@ -780,7 +782,7 @@ pub async fn add_comment(
 
             let inserted = insert_comment(
                 conn,
-                &spec,
+                spec,
                 &parent_type,
                 parent_id,
                 author_id,
@@ -824,7 +826,7 @@ pub async fn add_comment(
 /// - Any database error.
 pub async fn delete_comment(
     conn: &mut RuntimeConnection,
-    spec: &CommentableSpec,
+    spec: &'static CommentableSpec,
     parent_type: &str,
     parent_id: i64,
     comment_id: i64,
@@ -833,7 +835,8 @@ pub async fn delete_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    let spec = *spec;
+    // `spec` is not copied — see `add_comment`'s comment on why the `&'static`
+    // reference itself has to reach `lock_parent` unchanged.
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);
 
@@ -868,9 +871,9 @@ pub async fn delete_comment(
                 return Err(AutumnError::not_found_msg("Comment not found"));
             };
 
-            lock_parent(conn, &spec, target.commentable_id, tenant.as_deref()).await?;
+            lock_parent(conn, spec, target.commentable_id, tenant.as_deref()).await?;
 
-            let removed = delete_subtree(conn, &spec, &parent_type, parent_id, comment_id).await?;
+            let removed = delete_subtree(conn, spec, &parent_type, parent_id, comment_id).await?;
 
             if removed > 0
                 && let Some(counter_column) = spec.counter_column
@@ -916,7 +919,7 @@ pub async fn delete_comment(
 /// - Any database error.
 pub async fn recompute_comment_count(
     conn: &mut RuntimeConnection,
-    spec: &CommentableSpec,
+    spec: &'static CommentableSpec,
     parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
@@ -929,13 +932,14 @@ pub async fn recompute_comment_count(
         return Ok(0);
     };
 
-    let spec = *spec;
+    // `spec` is not copied — see `add_comment`'s comment on why the `&'static`
+    // reference itself has to reach `lock_parent` unchanged.
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);
 
     scoped_immediate_transaction::<i64, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, spec, parent_id, tenant.as_deref()).await?;
 
             let comments = quote_ident(spec.comments_table);
             let type_column = quote_ident(spec.type_column);
