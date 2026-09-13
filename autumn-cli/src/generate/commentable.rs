@@ -2583,4 +2583,18 @@ mod tests {
         .expect("write");
         assert!(another_model_is_still_commentable(single.path(), "post"));
     }
+
+    /// Two parent models must get two distinct triggers, each bound to its
+    /// own type name — not one trigger that deletes the wrong parent's rows.
+    #[test]
+    fn parent_cleanup_sql_names_each_parent_and_type_distinctly() {
+        let posts = parent_cleanup_sql(DatabaseBackend::Postgres, "posts", "Post");
+        let photos = parent_cleanup_sql(DatabaseBackend::Postgres, "photos", "Photo");
+        assert!(posts.contains("posts_delete_comments"));
+        assert!(posts.contains("'Post'"));
+        assert!(!posts.contains("photos_delete_comments"));
+        assert!(photos.contains("photos_delete_comments"));
+        assert!(photos.contains("'Photo'"));
+        assert!(!photos.contains("posts_delete_comments"));
+    }
 }

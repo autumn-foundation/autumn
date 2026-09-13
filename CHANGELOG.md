@@ -7290,6 +7290,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marginal allocation blocks/query and bytes/query (dhat) are unchanged
   (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
   allocation-bound, so only the instruction floor is claimed.
+- **`comments:commentable` (#2265): a hard-deleted parent no longer leaves
+  orphaned comment rows behind.** `commentable_id` has no foreign key, so
+  nothing cascaded a deleted parent's comments away, and no generated route
+  could reach them afterward. `autumn generate scaffold … comments:commentable`
+  now writes an `AFTER DELETE` trigger into the parent's own migration. The
+  trigger removes that parent's comments on any hard delete — through the
+  repository, raw SQL, or an admin tool. Soft-deleted parents are unaffected,
+  since the row itself is never removed. Covered by a new database-level test
+  (`autumn/tests/integration/commentable.rs`) and new scaffold-output tests
+  (`autumn-cli`'s `scaffold_commentable.rs`).
 
 ## [0.7.0] - 2026-08-23
 
