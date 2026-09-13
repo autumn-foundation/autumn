@@ -658,6 +658,29 @@ fn resolve_edge_scan_impl(
 
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
+
+    // A custom `[lib] path` REPLACES the conventional `src/lib.rs` as this
+    // crate's library root — Cargo compiles only the custom file, never
+    // `src/lib.rs`, even when the latter still exists on disk with its own
+    // `#[edge]` handlers — verified directly via a real build: a
+    // `compile_error!` placed in an unrelated `src/lib.rs` does not fail a
+    // build whose `[lib] path` points elsewhere. Left in `files`, that dead
+    // `src/lib.rs` was scanned by the ordinary walk below as if it were an
+    // active source, so a stale handler in it could be reported as a real,
+    // uncompiled-but-unregistered route and wrongly fail preflight. Excluded
+    // here whenever the manifest's custom path resolves (after normalizing
+    // any `.`/`..` components the same way `scan_bin_crate_tree`'s own root
+    // does) to a different file than the conventional one — the ordinary
+    // `claimed` exclusion below only ever covers files the custom tree's own
+    // `mod` declarations actually reach, never this now-inactive file
+    // itself (Codex review on #2739, round 46, P2).
+    if let Some(lib_path) = &custom_lib_path {
+        let conventional_lib_file = project_root.join("src/lib.rs");
+        let custom_lib_file = lexically_normalize_path(&project_root.join(lib_path));
+        if custom_lib_file != conventional_lib_file {
+            files.retain(|path| path != &conventional_lib_file);
+        }
+    }
     // Sorted so warnings, doctor details, and the build's route list are stable
     // across platforms and filesystem orderings.
     files.sort();
@@ -7719,6 +7742,42 @@ mod tests {
         let scan = resolve_edge_scan(dir.path());
         assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
         assert_eq!(scan.functions[0].module_path, Vec::<String>::new());
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A custom `[lib] path` REPLACES the conventional `src/lib.rs` as this
+    /// crate's library root — Cargo never compiles `src/lib.rs` at all once
+    /// `[lib] path` points elsewhere, even when the file still exists on
+    /// disk with its own `#[edge]` handler — verified directly via a real
+    /// build (a `compile_error!` placed in such a `src/lib.rs` does not fail
+    /// the build). The ordinary `src/`-directory walk previously still
+    /// scanned that now-inactive file, reporting its stale, never-compiled
+    /// handler as a real but unregistered route and wrongly failing
+    /// preflight for an otherwise valid capsule (Codex review on #2739,
+    /// round 46, P2).
+    #[test]
+    fn resolve_edge_scan_excludes_the_inactive_conventional_lib_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![my_app::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[edge]\npub fn stale() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].name, "show");
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
