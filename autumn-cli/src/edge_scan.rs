@@ -417,7 +417,7 @@ fn scan_sources_with_features(
 ) -> EdgeScan {
     let mut scan = EdgeScan::default();
     for (file, src) in sources {
-        scan_source(file, src, default_features, &mut scan);
+        scan_source(file, src, None, default_features, &mut scan);
         scan.files_scanned += 1;
     }
     scan
@@ -556,7 +556,8 @@ fn resolve_edge_scan_impl(
     // (`crate_context_from_file`, which assumes file path mirrors module
     // path) needs to be corrected for exactly these files (Codex review on
     // #2739, round 31, P2).
-    let path_overrides = path_attribute_module_paths(project_root, &default_features);
+    let path_overrides =
+        path_attribute_module_paths(project_root, table.as_ref(), &default_features);
 
     // Read first, scan second, so the filesystem half and the pure half stay
     // separable: `scan_sources` is the same entry point the unit tests drive
@@ -587,7 +588,7 @@ fn resolve_edge_scan_impl(
                 &mut scan,
             );
         } else {
-            scan_source(rel, src, &default_features, &mut scan);
+            scan_source(rel, src, table.as_ref(), &default_features, &mut scan);
         }
     }
     scan.files_scanned += sources.len();
@@ -1497,8 +1498,14 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// The two halves are independent on purpose — a file whose *items* fail to
 /// parse can still contribute registrations, and vice versa.
-fn scan_source(file: &str, src: &str, default_features: &BTreeSet<String>, scan: &mut EdgeScan) {
-    let (crate_root, module_path) = crate_context_from_file(file);
+fn scan_source(
+    file: &str,
+    src: &str,
+    table: Option<&toml::Table>,
+    default_features: &BTreeSet<String>,
+    scan: &mut EdgeScan,
+) {
+    let (crate_root, module_path) = crate_context_from_file(file, table);
     scan_source_with_context(file, src, &crate_root, module_path, default_features, scan);
 }
 
@@ -1615,7 +1622,7 @@ fn scan_source_with_context(
 /// genuine one, silently muting the warning for whichever one was not
 /// really registered (Codex review on #2739, round 15, P2).
 #[must_use]
-fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
+fn crate_context_from_file(file: &str, table: Option<&toml::Table>) -> (String, Vec<String>) {
     let without_ext = file.strip_suffix(".rs").unwrap_or(file);
     let Some(without_src) = without_ext.strip_prefix("src/") else {
         return (format!("bin:{without_ext}"), Vec::new());
@@ -1625,12 +1632,26 @@ fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
     }
     if let Some(rest) = without_src.strip_prefix("bin/") {
         // `<name>` alone (the flat `src/bin/<name>.rs` form) has nothing left
-        // once the bin target's own name is dropped — it IS that crate's root.
+        // once the bin target's own name is dropped — it IS that crate's root
+        // — but only when Cargo actually compiles `<name>` as one: with
+        // `[package] autobins = false` and no `[[bin]]` entry naming it,
+        // Cargo gives it no crate of its own at all, so this file (whether
+        // it's that bin's own root or one of ITS OWN further submodules,
+        // like `src/bin/<name>/routes.rs`) is only ever reachable, if at
+        // all, as an ordinary submodule of whichever crate's own `mod`
+        // declaration actually references it — this per-file directory walk
+        // cannot trace that (the same class of limit as a
+        // `#[path]`-redirected file's own further submodules, round 31).
+        // Falling through to the ordinary library-relative treatment below
+        // at least avoids asserting the definitely-wrong `bin:<name>`
+        // identity for it (Codex review on #2739, round 35, P2).
         let (name, bin_relative) = rest.split_once('/').unwrap_or((rest, ""));
-        return (
-            format!("bin:{name}"),
-            module_path_from_segments(bin_relative),
-        );
+        if src_bin_target_is_real(table, name) {
+            return (
+                format!("bin:{name}"),
+                module_path_from_segments(bin_relative),
+            );
+        }
     }
     if without_src == "main" {
         // The package's own implicit default binary, `src/main.rs` — a
@@ -1638,10 +1659,98 @@ fn crate_context_from_file(file: &str) -> (String, Vec<String>) {
         // map to the same empty module path. No real `[[bin]]` can be named
         // literally "main" while a default `src/main.rs` binary also
         // exists (Cargo rejects the name collision), so reusing the
-        // `"bin:<name>"` convention here is always unambiguous.
-        return ("bin:main".to_owned(), Vec::new());
+        // `"bin:<name>"` convention here is always unambiguous — but only
+        // when `src/main.rs` is actually compiled as a target at all:
+        // verified directly that `[package] autobins = false` suppresses
+        // Cargo's automatic discovery of `src/main.rs` too, not just
+        // `src/bin/*.rs` (a real build with `autobins = false` and no
+        // `[[bin]]` entry produces no binary whatsoever, `src/main.rs`
+        // included) — the identical mistake `src_bin_target_is_real` exists
+        // to avoid, applied to the one bin name Cargo reserves for this
+        // file specifically (Codex review on #2739, round 35, P2).
+        if src_main_is_real(table) {
+            return ("bin:main".to_owned(), Vec::new());
+        }
     }
     (String::new(), module_path_from_segments(without_src))
+}
+
+/// Whether `name` (the first path segment under `src/bin/`, shared by both
+/// its own root file and every one of ITS OWN further submodules — a
+/// flat-file bin's root IS `name` with nothing left over, a directory-style
+/// one's root is `name/main.rs` and a sibling `name/routes.rs` is still
+/// part of the SAME crate) is a bin target Cargo actually compiles: either
+/// automatic `src/bin/` discovery (the default, unless `[package] autobins
+/// = false`), which claims `name` unconditionally regardless of which
+/// shape backs it, or an explicit `[[bin]]` entry naming it — via its own
+/// `path` matching either conventional shape for `name`, or, absent a
+/// `path`, its own `name` field matching directly (Cargo infers the same
+/// conventional shape autobins would).
+///
+/// With `autobins = false` and no `[[bin]]` entry for it, nothing under
+/// `src/bin/<name>/` (or the flat `src/bin/<name>.rs`) is compiled as its
+/// own crate at all — such a file can instead be an ordinary submodule
+/// loaded by some OTHER real target's own `mod name;` (e.g. an explicit
+/// `[[bin]] path = "src/bin.rs"` target whose own out-of-line submodules
+/// live under `src/bin/`, following Rust's own directory-mirrors-modules
+/// convention for wherever `bin.rs` itself lives) (Codex review on #2739,
+/// round 35, P2).
+#[must_use]
+fn src_bin_target_is_real(table: Option<&toml::Table>, name: &str) -> bool {
+    let autobins_disabled = table
+        .and_then(|t| t.get("package"))
+        .and_then(|p| p.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        == Some(false);
+    if !autobins_disabled {
+        return true;
+    }
+    let Some(bins) = table
+        .and_then(|t| t.get("bin"))
+        .and_then(toml::Value::as_array)
+    else {
+        return false;
+    };
+    bins.iter().any(|bin| {
+        bin.get("path").and_then(toml::Value::as_str).map_or_else(
+            || bin.get("name").and_then(toml::Value::as_str) == Some(name),
+            |path| {
+                let normalized = path.strip_prefix("./").unwrap_or(path);
+                normalized == format!("src/bin/{name}.rs")
+                    || normalized == format!("src/bin/{name}/main.rs")
+            },
+        )
+    })
+}
+
+/// Whether `src/main.rs` is actually compiled as the package's implicit
+/// default binary: real unless `[package] autobins = false` (verified
+/// directly — see [`src_bin_target_is_real`]) AND no explicit `[[bin]]`
+/// entry's `path` names it directly (a `name`-only entry can't infer
+/// `src/main.rs`, since Cargo's own name-inference for a pathless `[[bin]]`
+/// entry always looks under `src/bin/`, never `src/main.rs` itself, no
+/// matter what the entry is named).
+#[must_use]
+fn src_main_is_real(table: Option<&toml::Table>) -> bool {
+    let autobins_disabled = table
+        .and_then(|t| t.get("package"))
+        .and_then(|p| p.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        == Some(false);
+    if !autobins_disabled {
+        return true;
+    }
+    let Some(bins) = table
+        .and_then(|t| t.get("bin"))
+        .and_then(toml::Value::as_array)
+    else {
+        return false;
+    };
+    bins.iter().any(|bin| {
+        bin.get("path")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|path| path.strip_prefix("./").unwrap_or(path) == "src/main.rs")
+    })
 }
 
 /// Split `path` on `/`, dropping a trailing index-file segment — the rule
@@ -1747,8 +1856,10 @@ fn scan_items(
 /// Find every out-of-line `mod name;` declaration reachable from `items`
 /// (descending into inline `mod a { ... }` blocks the same way [`scan_items`]
 /// does, cfg-excluded ones included), returning each as `(enclosing_path,
-/// name)` — `enclosing_path` is the chain of *inline* module names between
-/// `items`' own file and the declaration, empty for a top-level one.
+/// name, path_attribute_value)` — `enclosing_path` is the chain of *inline*
+/// module names between `items`' own file and the declaration, empty for a
+/// top-level one; `path_attribute_value` is `Some` when the declaration
+/// carries a `#[path = "..."]` override.
 ///
 /// [`scan_bin_crate_tree`] uses this to follow a custom `[[bin]] path]`'s own
 /// module graph: unlike the library's `src/` walk (which reaches every file
@@ -1756,11 +1867,18 @@ fn scan_items(
 /// references it), a bin target outside the conventional layout has no such
 /// directory convention to lean on, so its submodules are invisible unless
 /// this scan actually follows its `mod` declarations (Codex review on #2739,
-/// round 13, P2).
+/// round 13, P2). [`path_attribute_module_paths`] reuses this same
+/// collector for the ordinary `src/` walk's own `#[path]` overrides, simply
+/// filtering for the entries where `path_attribute_value` is `Some` —
+/// before round 35 that was a second, near-identical collector
+/// (`collect_path_attribute_mods`); [`scan_bin_crate_tree`]'s own use of
+/// this function never saw a `#[path]` value at all, so a custom crate
+/// tree's own `#[path]`-redirected submodule was invisible to it entirely,
+/// found by neither collector (Codex review on #2739, round 35, P1).
 fn out_of_line_mod_declarations(
     items: &[syn::Item],
     default_features: &BTreeSet<String>,
-) -> Vec<(Vec<String>, String)> {
+) -> Vec<(Vec<String>, String, Option<String>)> {
     let mut out = Vec::new();
     let mut path = Vec::new();
     collect_out_of_line_mods(items, default_features, &mut path, &mut out);
@@ -1771,7 +1889,7 @@ fn collect_out_of_line_mods(
     items: &[syn::Item],
     default_features: &BTreeSet<String>,
     path: &mut Vec<String>,
-    out: &mut Vec<(Vec<String>, String)>,
+    out: &mut Vec<(Vec<String>, String, Option<String>)>,
 ) {
     for item in items {
         let syn::Item::Mod(item_mod) = item else {
@@ -1790,7 +1908,11 @@ fn collect_out_of_line_mods(
                 collect_out_of_line_mods(inner, default_features, path, out);
                 path.pop();
             }
-            None => out.push((path.clone(), item_mod.ident.to_string())),
+            None => out.push((
+                path.clone(),
+                item_mod.ident.to_string(),
+                path_attribute_value(&item_mod.attrs),
+            )),
         }
     }
 }
@@ -1824,6 +1946,7 @@ fn collect_out_of_line_mods(
 /// best-effort trade-off as every other heuristic in this module.
 fn path_attribute_module_paths(
     project_root: &Path,
+    table: Option<&toml::Table>,
     default_features: &BTreeSet<String>,
 ) -> BTreeMap<String, (String, Vec<String>)> {
     let mut files = Vec::new();
@@ -1842,12 +1965,13 @@ fn path_attribute_module_paths(
             .unwrap_or(declaring_file)
             .to_string_lossy()
             .replace('\\', "/");
-        let (crate_root, base_module_path) = crate_context_from_file(&declaring_rel);
-        let mut inline_path = Vec::new();
-        let mut found = Vec::new();
-        collect_path_attribute_mods(&ast.items, default_features, &mut inline_path, &mut found);
+        let (crate_root, base_module_path) = crate_context_from_file(&declaring_rel, table);
+        let found = out_of_line_mod_declarations(&ast.items, default_features);
         let declaring_dir = declaring_file.parent().unwrap_or(declaring_file);
         for (inline, name, path_value) in found {
+            let Some(path_value) = path_value else {
+                continue;
+            };
             // A `#[path]` override nested inside an INLINE module resolves
             // relative to the DIRECTORY THAT MODULE PATH IMPLIES, not the
             // declaring file's own physical directory — verified directly:
@@ -1877,41 +2001,6 @@ fn path_attribute_module_paths(
         }
     }
     overrides
-}
-
-/// Every out-of-line `mod name;` carrying a `#[path = "..."]` override,
-/// found the same way [`collect_out_of_line_mods`] finds every out-of-line
-/// `mod`, returned as `(enclosing_inline_path, name, path_attribute_value)`.
-fn collect_path_attribute_mods(
-    items: &[syn::Item],
-    default_features: &BTreeSet<String>,
-    path: &mut Vec<String>,
-    out: &mut Vec<(Vec<String>, String, String)>,
-) {
-    for item in items {
-        let syn::Item::Mod(item_mod) = item else {
-            continue;
-        };
-        let cfg_excludes = item_mod
-            .attrs
-            .iter()
-            .any(|attr| attr_cfg_excludes(attr, default_features));
-        if cfg_excludes {
-            continue;
-        }
-        match &item_mod.content {
-            Some((_, inner)) => {
-                path.push(item_mod.ident.to_string());
-                collect_path_attribute_mods(inner, default_features, path, out);
-                path.pop();
-            }
-            None => {
-                if let Some(path_value) = path_attribute_value(&item_mod.attrs) {
-                    out.push((path.clone(), item_mod.ident.to_string(), path_value));
-                }
-            }
-        }
-    }
 }
 
 /// The string value of a `#[path = "..."]` attribute, if `attrs` has one.
@@ -2084,11 +2173,29 @@ fn scan_bin_crate_tree(
         let Ok(ast) = syn::parse_file(&src) else {
             continue;
         };
-        for (nested, name) in out_of_line_mod_declarations(&ast.items, default_features) {
+        for (nested, name, path_value) in out_of_line_mod_declarations(&ast.items, default_features)
+        {
             let mut dir_segments = module_path.clone();
             dir_segments.extend(nested);
-            let Some(resolved) = resolve_out_of_line_module_file(root_dir, &dir_segments, &name)
-            else {
+            // A `#[path = "..."]` override resolves relative to the
+            // DIRECTORY THAT `dir_segments` (the module's own enclosing
+            // path) IMPLIES, exactly the same rule (and the same
+            // `dir_segments` accumulation this loop already builds for the
+            // conventional case) [`path_attribute_module_paths`] applies
+            // for the ordinary `src/` walk — round 31 only ever wired that
+            // fix into the `src/` walk, leaving a custom crate tree's own
+            // `#[path]`-redirected submodule unresolved here (Codex review
+            // on #2739, round 35, P1).
+            let resolved = path_value.map_or_else(
+                || resolve_out_of_line_module_file(root_dir, &dir_segments, &name),
+                |path_value| {
+                    let dir = dir_segments
+                        .iter()
+                        .fold(root_dir.to_path_buf(), |dir, segment| dir.join(segment));
+                    Some(lexically_normalize_path(&dir.join(&path_value)))
+                },
+            );
+            let Some(resolved) = resolved else {
                 continue;
             };
             let mut child_module_path = dir_segments;
@@ -2399,10 +2506,10 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 /// injected `cfg(...)` [`cfg_attr_injects_a_false_cfg`] resolves as
 /// definitely false the same way. Every AST-level cfg-exclusion check in
 /// this module should go through this rather than `eval_cfg_attr` alone —
-/// `mod`-level exclusion checks (inline-module discovery in [`scan_items`],
-/// out-of-line discovery in [`collect_out_of_line_mods`] and
-/// [`collect_path_attribute_mods`]) previously only checked the literal
-/// form, so `#[cfg_attr(feature = "outer", cfg(feature = "inner"))] mod
+/// `mod`-level exclusion checks (inline-module discovery in [`scan_items`]
+/// and out-of-line discovery in [`collect_out_of_line_mods`]) previously
+/// only checked the literal form, so `#[cfg_attr(feature = "outer",
+/// cfg(feature = "inner"))] mod
 /// premium { ... }` with only `outer` on kept scanning a module real Rust
 /// strips out entirely (verified directly via a real build: the module
 /// name itself becomes unresolved) — both its `#[edge]` handlers and its
@@ -6708,6 +6815,142 @@ mod tests {
         let scan = resolve_edge_scan(dir.path());
         assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
         assert_eq!(scan.functions[0].module_path, vec!["routes".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A custom `[lib] path`'s own out-of-line submodule can ALSO carry a
+    /// `#[path = "..."]` override — `scan_bin_crate_tree`'s BFS (following
+    /// `mod` declarations directly, since a non-conventional crate tree has
+    /// no directory convention to fall back on) previously never consulted
+    /// the attribute at all, so the redirected file was invisible to it
+    /// entirely: neither the ordinary `src/` walk's own `#[path]`-override
+    /// pass (round 31, scoped to that walk only) nor this BFS ever reached
+    /// it (Codex review on #2739, round 35, P1).
+    #[test]
+    fn resolve_edge_scan_follows_a_path_attribute_in_a_custom_lib_paths_crate_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/app.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "#[path = \"actual.rs\"]\nmod handlers;\nfn wire() { edge_routes![my_app::handlers::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].module_path, vec!["handlers".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// With `[package] autobins = false` and no `[[bin]]` entry naming it,
+    /// `src/bin/foo.rs` is not compiled as its own crate at all — verified
+    /// directly via a real build (no binary is produced, and `cargo
+    /// metadata` lists no `bin` target). Here it is an ordinary library
+    /// submodule instead, reached via `mod bin { mod foo; }` in `src/lib.rs`
+    /// (a real, if coincidentally-named, inline module — Rust resolves its
+    /// own out-of-line `foo` at `src/bin/foo.rs` by the same
+    /// directory-mirrors-modules rule). Before this fix, the plain `src/`
+    /// walk unconditionally classified any file under `src/bin/` as its own
+    /// `bin:<name>` crate regardless of `autobins`, so `foo`'s real module
+    /// path (`bin::foo`) was never matched by `edge_routes![crate::bin::foo::show]`
+    /// (Codex review on #2739, round 35, P2).
+    #[test]
+    fn resolve_edge_scan_treats_an_unreal_src_bin_file_as_an_ordinary_library_submodule_when_autobins_is_off()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nautobins = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r"
+            mod bin {
+                mod foo;
+            }
+            fn wire() { edge_routes![crate::bin::foo::show]; }
+            ",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/foo.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].crate_root, "");
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["bin".to_owned(), "foo".to_owned()]
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same idea, but an EXPLICIT `[[bin]] name = "foo"` entry names it —
+    /// `foo` genuinely is its own bin crate despite `autobins = false`, so
+    /// `src/bin/foo.rs` must still get the `bin:foo` identity.
+    #[test]
+    fn resolve_edge_scan_still_recognizes_an_explicitly_declared_bin_when_autobins_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nautobins = false\n\n\
+             [[bin]]\nname = \"foo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/foo.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].crate_root, "bin:foo");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// The identical `autobins = false` mistake, but for `src/main.rs`
+    /// itself — verified directly via a real build that `autobins = false`
+    /// suppresses Cargo's automatic discovery of `src/main.rs` too, not
+    /// just `src/bin/*.rs` (a real build with no `[[bin]]` entry produces no
+    /// binary whatsoever). Without a real bin target, `src/main.rs` here
+    /// falls back to an ordinary (if inert) library-relative treatment
+    /// rather than the definitely-wrong `bin:main` identity.
+    #[test]
+    fn resolve_edge_scan_does_not_treat_src_main_as_its_own_crate_when_autobins_is_off_and_undeclared()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nautobins = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "#[edge]\npub fn show() {}\nfn wire() { edge_routes![crate::show]; }\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].crate_root, "", "{:?}", scan.functions);
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
