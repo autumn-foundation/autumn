@@ -3182,13 +3182,45 @@ fn skip_cfg_excluded_statement(
     // and consumed every remaining arm, including a later, unrelated,
     // still-active one's own `edge_routes![show]` (Codex review on #2739,
     // round 42, P2).
+    // An ungrouped generic-argument comma (`Result<(), ()>`) is ALSO a
+    // top-level, ungrouped comma — angle brackets are plain `<`/`>` Punct
+    // tokens, not their own Group delimiter — so the comma-as-terminator
+    // rule above needs the same angle-bracket-depth tracking every other
+    // generics-aware scan in this file already uses, or it stops
+    // mid-type-argument-list instead of at the statement's real end,
+    // recursing into the excluded statement's own initializer block
+    // (verified directly via a real build: `#[cfg(false)] let _:
+    // Result<(), ()> = { show(); Ok(()) };` drops the whole statement,
+    // `show()` included). Depth is clamped at 0 rather than erroring out on
+    // a negative count (as the narrower generics-only scans elsewhere do):
+    // unlike those, this fallback also runs over ordinary comparison/shift
+    // `>`/`<` operators with no matching partner, and clamping keeps a
+    // later, real top-level comma or semicolon recognized regardless (Codex
+    // review on #2739, round 44, P2).
     let mut i = attrs_end;
+    let mut angle_depth: u32 = 0;
     while i < trees.len() {
-        let is_terminator =
-            matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';' || p.as_char() == ',');
-        i += 1;
-        if is_terminator {
-            break;
+        match &trees[i] {
+            TokenTree::Punct(p) if p.as_char() == '-' => {
+                let is_arrow =
+                    matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>');
+                i += usize::from(is_arrow) + 1;
+            }
+            TokenTree::Punct(p) if p.as_char() == '<' => {
+                angle_depth += 1;
+                i += 1;
+            }
+            TokenTree::Punct(p) if p.as_char() == '>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+                i += 1;
+            }
+            TokenTree::Punct(p) if p.as_char() == ';' || p.as_char() == ',' => {
+                i += 1;
+                if angle_depth == 0 {
+                    break;
+                }
+            }
+            _ => i += 1,
         }
     }
     Some(i)
@@ -8771,5 +8803,41 @@ mod tests {
             )),
             "{identities:?}"
         );
+    }
+
+    /// An ungrouped generic-argument comma (`Result<(), ()>`) is ALSO a
+    /// top-level, ungrouped comma at this token-level scan's flat depth —
+    /// verified directly via a real build: the whole cfg'd-out `let _:
+    /// Result<(), ()> = { edge_routes![show]; Ok(()) };` drops the
+    /// registration inside its own initializer block along with it. The
+    /// round-42 comma-as-terminator fix (for match arms) didn't track
+    /// angle-bracket depth, so it stopped mid-type-argument-list instead of
+    /// at the statement's real end, recursing into the still-excluded
+    /// initializer block and crediting `show` (Codex review on #2739,
+    /// round 44, P2).
+    #[test]
+    fn cfg_false_let_with_generic_type_argument_comma_does_not_leak_its_initializer() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                let _: Result<(), ()> = {
+                    edge_routes![crate::show];
+                    Ok(())
+                };
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
     }
 }
