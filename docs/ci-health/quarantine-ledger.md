@@ -200,7 +200,7 @@ _None as of 2026-09-05._
   explicitly: "fix: use the MINIO_IMAGE const **the merge from trunk-dev
   introduced**" — it is repairing dead code its own branch picked up from
   merging `trunk-dev`, not freshly diagnosing the Docker Hub outage.
-  Separated below into two independent-diagnosis fixes reacted to by two
+  Separated below into four independent-diagnosis fixes reacted to by two
   reconciliation commits, not six of a kind. Separately, the claimed "at
   least 6 distinct, unrelated WIP branches" named only five (counting
   `brave-goldberg-gyr60j` once, since its two hits are one branch) — the
@@ -637,7 +637,11 @@ without also filling in the intake form above.
   three signatures included, six signatures total) in the sampled
   window.** Sampled `ci.yml` `pull_request` runs from roughly
   2026-09-12T13:58Z to 2026-09-13T09:02Z (~19 hours, ~130+ runs spanning
-  both pages of the query). Every failure in that window attributed to
+  both pages of the query) — **best-effort, not proven-exhaustive**: the
+  two pages were fetched separately against a table under continuous
+  concurrent writes with no anchor to a stable run ID between them, the
+  same pagination risk this ledger already flagged in the 2026-09-11
+  entry above. Every failure this sample surfaced was attributed to
   one of: the pre-existing MinIO/Docker-Hub outage (pre-#2740, before
   17:03:52Z), the #2740/#2743 dead-code escape documented above
   (17:46:17Z-02:09:18Z), or a WIP branch's own in-progress bug (a

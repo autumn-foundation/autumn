@@ -9,11 +9,13 @@ commit's own self-description — even the commit that removed the dead helper
 misattributes what added it): #2749, #2750, and #2751 are empty merges (no
 file changes — `trunk-dev` already carried equivalent content from a
 different, concurrently-merging branch by the time each landed), and #2752
-never touched either MinIO test file. The real chronology involves **at
-least six independent PRs**, not two, several of which reached this fix as a
-side-effect of an unrelated feature branch's own "drive red CI to green"
-work. Corrected throughout below; see the ledger's own corrected entry for
-the full per-commit accounting.
+never touched either MinIO test file. The real chronology involves **six
+commits total, not two** — four independent outage diagnoses plus two
+reactive reconciliation commits (the exact split the third correction below
+works out; this first pass had not yet separated the two categories),
+several of which reached this fix as a side-effect of an unrelated feature
+branch's own "drive red CI to green" work. Corrected throughout below; see
+the ledger's own corrected entry for the full per-commit accounting.
 
 **Second correction (post-review, via three further Codex review comments on
 PR #2768):** (1) the lint-fallout window actually ends at #2756
@@ -86,8 +88,16 @@ it became dispatchable at 2026-09-08T15:07:44Z).
 
 Sampled `ci.yml` `pull_request`-triggered runs from roughly
 2026-09-12T13:58Z to 2026-09-13T09:02Z (~19 hours, two `perPage=100` pages of
-the workflow-run list — ~130+ runs combined, not "100+ each"). Triaged every
-non-cancelled failure by job/log inspection rather than by branch name:
+the workflow-run list — ~130+ runs combined, not "100+ each"). **Caveat,
+per this ledger's own documented pagination risk** (see the 2026-09-11
+report's correction, and `quarantine-ledger.md` lines ~579-593): the two
+pages were fetched separately against a table under continuous concurrent
+writes, with no anchor to a stable run ID or commit boundary between them,
+so a run could in principle have been skipped or double-counted at the page
+edge. This scan is a best-effort sample, not a proven-exhaustive one; treat
+the zero-hit conclusion below accordingly. Triaged every
+non-cancelled failure this sample did surface by job/log inspection rather
+than by branch name:
 
 - **A pre-existing, already-tracked outage accounts for the earliest
   failures**: `blissful-rubin-dzer7y` at 2026-09-12T15:48:35Z (before #2740
