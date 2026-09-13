@@ -22,8 +22,8 @@ literally rather than simulated.
 Time-boxed to one sitting (spread across ~2 hours of active work, with a
 gap in between). Same environment constraint as the prior session: no
 Docker daemon in this sandbox, so PostgreSQL 16 ran as a native
-`pg_ctlcluster` service; fourteen separate databases (`cms` through
-`cms14`, `cms7` unused — a naming slip, not a missing trial) were created
+`pg_ctlcluster` service; fifteen separate databases (`cms` through
+`cms15`, `cms7` unused — a naming slip, not a missing trial) were created
 over the course of the session to model independent site instances
 without touching each other's state, as later reproductions (round six
 onward, prompted by Codex review comments) needed fresh databases beyond
@@ -118,11 +118,12 @@ independently.)
 ## 🐛 Bug filed
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
-silently drops a pathless nested page whenever a page with that bare slug
-is *already persisted* as a top-level (or otherwise depth-tied) row —
-whether that row is a pre-existing page on the site, one from an earlier,
-separate import, or one created moments earlier in the same run while its
-own parent was still unresolved (data loss, repro 9/9).**
+silently drops a pathless nested page whenever that same bare slug is
+already spoken for — either by a persisted top-level (or otherwise
+depth-tied) row `find_local` matches, or, more broadly still, by *any*
+earlier pathless import's `_import_source_slug` marker, even one attached
+to a page that is correctly, deeply nested and has nothing to do with the
+top level at all (data loss, repro 10/10).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -254,14 +255,36 @@ each verified live rather than accepted from reasoning alone:
   `find_local` alone, or to the marker key alone, is insufficient for the
   cross-run reproductions specifically: closing either one leaves this
   exact input still dropped via the other.
+- **And the marker path (Path B) doesn't need a top-level row at all — a
+  Codex catch on this PR found it fires even against a page that is
+  correctly, deeply nested and has nothing to do with the top level.**
+  `record_import_source` always records the *file's own* `identity()`
+  string as the marker key — never the row's actual resolved position —
+  so a pathless page whose `parent` already exists at import time, and
+  which therefore gets created at its *correct* nested location, still
+  leaves behind a marker keyed on its bare slug alone. Verified with a
+  tenth reproduction (`cms15`): imported `A` (top-level) and a pathless
+  `Team` under `a` in one file — `Team` lands correctly at `/a/team`
+  (confirmed `200`), and `post_meta` shows its `_import_source_slug` is
+  the bare `"team"`, not `"a/team"`. A wholly separate, later import of
+  `B` (top-level) plus a pathless `Team` under `b` then drops the second
+  `Team` (`"1 already present"`, `/b/team` → 404) — even though
+  `find_local("page", "team")` would find *no* top-level `team` row at
+  all (`/a/team`'s `Team` is genuinely, correctly nested, not sitting at
+  the bare path), so Path A does not apply here. This is Path B firing
+  completely alone, and it means the earlier framing of the general
+  condition — "a page already persisted as a top-level row" — was too
+  narrow: any earlier pathless import of a page with that slug, correctly
+  nested anywhere, poisons the bare-slug marker namespace for every
+  subsequent import indefinitely.
 
-Either way — via `find_local`'s bare-identity match (true for every
-reproduction here, including the cross-run ones), reinforced by the
-`_import_source_slug` marker coincidentally also matching for the two
-cross-run ones — the import loop misidentifies the pathless nested page as
+Either way — via `find_local`'s bare-identity match against a persisted
+top-level row, and/or via the `_import_source_slug` marker matching *any*
+earlier pathless import regardless of where that import's page actually
+ended up — the import loop misidentifies the pathless nested page as
 content that is already accounted for, and drops it permanently, with the
 summary screen reporting an unremarkable "N imported, M already present"
-and no orphan count. Reproduced 9/9
+and no orphan count. Reproduced 10/10
 across independent fresh databases: two on version 2 (one a
 hand-reordered full export, one a minimized 4-post file), one on version
 3, one a version-5-labeled file with `path` omitted on all four posts,
@@ -270,13 +293,16 @@ page follows its own parent in the file, one where the earlier same-slug
 page is a genuine, permanently top-level page rather than a
 temporarily-unresolved one, one where the earlier same-slug page comes
 from a wholly separate, already-completed prior import rather than the
-same run, and one where that earlier, separately-imported page carried an
+same run, one where that earlier, separately-imported page carried an
 explicit `path` equal to its own bare slug rather than omitting `path`
-altogether. Every case that *does* involve file ordering within a single
-run is a pure function of that ordering, not a race — but, per the last
-three reproductions, neither same-run ordering nor the persisted row's own
-`path` history is actually a precondition of the bug at all; only the
-*incoming* page's own pathlessness is.
+altogether, and one where the earlier same-slug page is not top-level at
+all but correctly, deeply nested — dropping the later page purely through
+the marker path, with no top-level row for `find_local` to match. Every
+case that *does* involve file ordering within a single run is a pure
+function of that ordering, not a race — but, per the last four
+reproductions, neither same-run ordering, the persisted row's own `path`
+history, nor even that row being top-level is actually a precondition of
+the bug at all; only the *incoming* page's own pathlessness is.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
@@ -316,13 +342,15 @@ regression test the sweep will then pick up automatically.
 ## Findings summary
 
 - **Bugs filed:** 1 — #2737 (data loss on import: a pathless nested page is
-  silently dropped whenever a page with that same bare slug is already
-  persisted as a top-level row — pre-existing on the site, from an
-  earlier separate import, or created moments earlier in the same run
-  before its own parent existed — and no error, orphan count, or other
-  signal is given; see above — not a risk to ordinary pathless *posts*,
-  which never collide on slug in the first place, only to same-slug
-  *pages* under different parents).
+  silently dropped whenever that same bare slug is already spoken for —
+  either by a page persisted as a top-level row (pre-existing on the
+  site, from an earlier separate import, or created moments earlier in
+  the same run before its own parent existed), or, more broadly, by *any*
+  earlier pathless import's leftover marker, even one attached to a page
+  that is correctly, deeply nested and was never top-level at all — and no
+  error, orphan count, or other signal is given; see above — not a risk to
+  ordinary pathless *posts*, which never collide on slug in the first
+  place, only to same-slug *pages* under different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
@@ -365,13 +393,18 @@ regression test the sweep will then pick up automatically.
    skip there, a Codex catch on this PR. So fixing the marker lookup's key
    alone would still leave the cross-run cases dropped via `find_local`
    immediately afterward, and fixing `find_local`'s ancestry-blindness
-   alone would still leave them dropped via the marker match. A complete
-   fix needs both: `find_local`'s comparison of an incoming page's *file*
-   identity against a persisted row's *ancestry-derived* identity should
-   account for where the incoming page's file `parent` chain actually says
-   it belongs, and the `imported_source_slugs` lookup needs a key that
-   can't coincidentally collide between two unrelated posts across
-   separate import runs (e.g. incorporating the resolved parent chain
-   rather than the bare identity alone) — flagged in the issue as work for
-   whoever picks it up, not
+   alone would still leave them dropped via the marker match. Worse, the
+   marker lookup's own key problem is not confined to top-level rows
+   either — a Codex catch on this PR (`cms15`) showed `record_import_source`
+   always records a page's *file* identity, never its actual resolved
+   position, so a pathless page correctly nested anywhere still poisons
+   the bare-slug marker namespace for every later import indefinitely,
+   with no top-level row for an ancestry-aware `find_local` to ever catch.
+   A complete fix needs both: `find_local`'s comparison of an incoming
+   page's *file* identity against a persisted row's *ancestry-derived*
+   identity should account for where the incoming page's file `parent`
+   chain actually says it belongs, and the `imported_source_slugs` lookup
+   needs a key derived from each page's *actual* resolved position (e.g.
+   its resolved parent chain) rather than the bare file identity alone —
+   flagged in the issue as work for whoever picks it up, not
    attempted here.
