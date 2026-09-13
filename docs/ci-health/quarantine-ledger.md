@@ -146,7 +146,7 @@ _None as of 2026-09-05._
   entry immediately below for a coordination defect this fix's merge
   timing collided with (independent, not a defect in the fix itself).
 
-### Escape: at least six independent fixes for the same MinIO/Docker-Hub outage collided at merge, ~8.7h of spurious Lint failures on unrelated branches
+### Escape: at least six independent fixes for the same MinIO/Docker-Hub outage collided at merge, ~8.4h of spurious Lint failures on unrelated branches
 
 - **Correction (post-review, via a Codex review comment on PR #2768): the
   original version of this entry named the wrong commits and the wrong
@@ -162,6 +162,21 @@ _None as of 2026-09-05._
   --stat`/`-p` on every commit that touched the three affected test
   files), not from any commit's own self-description — even the commit
   that removed the dead helper (#2756) misattributes what added it.
+- **Second correction (post-review, via a further Codex review comment on
+  PR #2768): the lint-fallout window ends at #2756, not #2729.** The
+  first correction pass (above) still closed the window at #2729
+  (2026-09-13T02:30:05Z) and called it "the actual final resolution."
+  Checked directly against the tree at `a7c7c46` (#2756, 02:09:18Z):
+  `start_minio()` already has its two live callers, `MINIO_IMAGE` is
+  already wired into the avatar test's call site, and `minio_image()` is
+  already removed — zero dead code, full stop. #2729 (21 minutes later)
+  refactors that already-clean tree (reintroducing and then re-collapsing
+  its own branch's separate `minio_image()` copy, entirely within its own
+  single squashed commit — trunk-dev itself never saw that intermediate
+  state) and adds the regression test; it is a subsequent architectural
+  cleanup and a genuinely good side effect, not part of resolving the
+  fallout, which had already ended. The impact window and all timing
+  below are corrected to close at #2756.
 - **Not a flake, not a product bug — a coordination gap, and a wider one
   than first recorded.** The same universally-visible `ci.yml` failure
   (every `Test (Docker)` run 404ing on the dead `minio/minio` Docker Hub
@@ -172,12 +187,12 @@ _None as of 2026-09-05._
   failure on their own PR fixed it in place rather than waiting.
   Chronology, verified against each commit's actual file-level diff:
   - **#2740** (`abacf9e`, this ledger's own fix, merged
-    2026-09-12T17:03:51-05:00): inlined
+    2026-09-12T17:03:51Z): inlined
     `.with_name("quay.io/minio/minio")` at all four call sites across
     `offsite_backup.rs` (both tests), `sqlite_replication_s3.rs`, and
     `avatar_s3_integration.rs`. **No helper function or constant** — the
     original entry's claim that this PR added `minio_image()` is wrong.
-  - **#2743** (`d2693c1`, independent, 17:46:17-05:00, 43 min later):
+  - **#2743** (`d2693c1`, independent, 17:46:17Z, 43 min later):
     added `const MINIO_IMAGE` to `avatar_s3_integration.rs` without wiring
     it into the call site (which already carried #2740's identical inline
     literal by merge time) — the first dead-code seed.
@@ -197,33 +212,38 @@ _None as of 2026-09-05._
     `start_minio()`'s purpose with a different tag-pinning strategy, and
     left it uncalled (dead code) — the second signature.
   - **#2756** (`a7c7c46`, 2026-09-13T02:09:18Z): removed the uncalled
-    `minio_image()` from #2720, keeping `start_minio()`.
+    `minio_image()` from #2720, keeping `start_minio()`. **This is where
+    the lint-fallout window actually ends** — confirmed against the tree
+    at this commit: `start_minio()` has two live callers, `MINIO_IMAGE` is
+    wired into the avatar test, no unused helper remains. Zero dead code.
   - **#2729** (`6e71bfb`, a large, unrelated wire-contracts feature PR
     whose long-lived branch had merged `trunk-dev` in three times over
     the same window and picked up a MinIO fix each time, sub-commits
     titled "fix(test): reconcile the two MinIO registry fixes the merge
     combined" and "fix(test): collapse the duplicate MinIO image helpers
-    into one", 2026-09-13T02:30:05Z — **the actual final resolution**,
-    21 minutes after #2756, not #2756 itself): consolidated back onto a
-    single `minio_image()` (reintroduced, since this branch's own copy
-    survived its merges) with `start_minio()` now calling it, and **added
-    a new regression test**, `minio_image_pulls_from_the_public_registry`
-    — a `#[test]` (not `#[ignore]`d, so it runs in the ordinary lane
-    without Docker) asserting the descriptor's registry and that a tag is
-    pinned, specifically so a future regression "surfaces as a red job
-    naming a registry rather than the file that forgot" (its own doc
-    comment). This is a genuine positive outcome of the churn: the repo
-    now has a fast, Docker-free guard against this exact class of break.
+    into one", 2026-09-13T02:30:05Z, 21 minutes *after* #2756 already
+    closed the fallout): a **subsequent, unrelated refactor of an
+    already-clean tree**, not part of resolving the escape. It
+    reintroduces and then re-collapses its own branch's separate
+    `minio_image()` copy entirely within its own single squashed commit
+    (`trunk-dev` itself never saw that intermediate duplicate state), and
+    lands one clean genuine improvement as a side effect: a new
+    regression test, `minio_image_pulls_from_the_public_registry` — a
+    `#[test]` (not `#[ignore]`d, so it runs in the ordinary lane without
+    Docker) asserting the descriptor's registry and that a tag is pinned,
+    specifically so a future regression "surfaces as a red job naming a
+    registry rather than the file that forgot" (its own doc comment).
   - Confirmed directly against `autumn-cli/tests/integration/offsite_backup.rs`
-    at `trunk-dev`'s current tip (`6e71bfb`): `start_minio()` calls
-    `minio_image()`, both tests call `start_minio()`, and
-    `minio_image_pulls_from_the_public_registry` passes — one
-    source of truth, no dead code, regression-guarded.
+    at `trunk-dev`'s current tip (`6e71bfb`, post-#2729's later refactor):
+    `start_minio()` calls `minio_image()`, both tests call `start_minio()`,
+    and `minio_image_pulls_from_the_public_registry` passes — one source
+    of truth, no dead code, regression-guarded. This describes the
+    current state, not the fallout's resolution point (#2756, above).
 - **Impact, measured**: sampling `ci.yml` `pull_request` runs from
   2026-09-12T17:46:17Z (the #2743 merge, first dead-code seed) to
-  2026-09-13T02:30:05Z (the #2729 merge, actual final resolution) —
-  roughly 8.7 hours — found the same `-D dead-code` `Lint` failure on at
-  least 6 distinct, unrelated WIP branches (confirmed by job log
+  2026-09-13T02:09:18Z (the #2756 merge, where the tree is first
+  confirmed clean) — roughly 8.4 hours — found the same `-D dead-code`
+  `Lint` failure on at least 6 distinct, unrelated WIP branches (confirmed by job log
   inspection, not inferred from branch name): `claude/friendly-ritchie-uw76a2`,
   `claude/tender-galileo-6f3dr7`, `claude/epic-clarke-8nbaes`,
   `claude/brave-goldberg-gyr60j` (hit twice, both signatures below),
