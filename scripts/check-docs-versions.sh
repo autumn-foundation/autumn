@@ -455,12 +455,23 @@ def published_version(root):
 
 
 def workspace_version(root):
-    manifest = pathlib.Path(root, 'Cargo.toml').read_text(encoding='utf-8')
-    section = re.search(r'(?ms)^\[workspace\.package\]\n(.*?)(?=^\[|\Z)', manifest)
-    if section:
-        found = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', section.group(1))
-        if found:
-            return found.group(1)
+    """`[workspace.package] version`, parsed rather than matched.
+
+    The last manifest reader in this file to still use a pattern, and it had
+    the same double-quote-only assumption the others were converted out of: a
+    valid `version = '0.7.0'` read as MISSING and failed the docs job over a
+    manifest Cargo accepts.
+    """
+    try:
+        manifest = tomllib.loads(
+            pathlib.Path(root, 'Cargo.toml').read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
+        raise SystemExit(f'Cargo.toml could not be read as TOML: {err}')
+    workspace = manifest.get('workspace')
+    package = workspace.get('package') if isinstance(workspace, dict) else None
+    version = package.get('version') if isinstance(package, dict) else None
+    if isinstance(version, str):
+        return version
     raise SystemExit('Cargo.toml must set [workspace.package] version')
 
 
@@ -587,7 +598,7 @@ def published_crates(root):
 # fences alone. That is the same mistake `check-docs-scope.sh` records this repo
 # shipping once, one layer down.
 PIN = re.compile(
-    r'(?<![\w.-])(?P<crate>autumn[a-z0-9-]*)\s*=\s*'
+    r'(?<![\w.-])["\']?(?P<crate>autumn[a-z0-9-]*)["\']?\s*=\s*'
     r'(?:"(?P<basic>[^"\n]*)"'
     r"|'(?P<literal>[^'\n]*)'"
     r'|\{(?P<table>[^{}]*)\})')
@@ -702,15 +713,27 @@ def waived(text):
     OPENS on, so a reason that wraps is still scoped by where it was written.
     """
     lines = text.splitlines()
-    # Block index per line, where a run of blank lines separates blocks.
+    # Block index per line, where a RUN of blank lines is ONE separator.
+    #
+    # Counting every blank line as its own separator put a passage in block 0
+    # and a waiver two blank lines below it in block 2, so `own - 1` named a
+    # block that does not exist and the waiver silently did nothing — the pin
+    # it was written for was reported anyway, and CI rejected a page whose
+    # author had done everything right. A blank line between a fence and the
+    # comment under it is ordinary markdown, so this was reachable by writing
+    # the waiver the obvious way.
     block_of = []
     block = 0
+    in_blank_run = True      # leading blank lines open no block
     for line in lines:
         if line.strip():
             block_of.append(block)
+            in_blank_run = False
         else:
             block_of.append(None)
-            block += 1
+            if not in_blank_run:
+                block += 1
+                in_blank_run = True
     out = {}
     for match in WAIVER.finditer(text):
         opens_at = text.count('\n', 0, match.start())
@@ -743,7 +766,7 @@ def waived(text):
 # projects write their dependency this way.
 SUBTABLE = re.compile(
     r'^[^\S\n]*\[(?:workspace\.)?(?:dev-|build-)?dependencies'
-    r'\.([A-Za-z0-9_-]+)\][^\S\n]*$', re.M)
+    r'\.["\']?([A-Za-z0-9_-]+)["\']?\][^\S\n]*$', re.M)
 
 # The `version` key inside a subtable body, in either TOML string form and
 # anchored at the start of its line so a `version` inside some other value is
@@ -791,7 +814,8 @@ def subtable_pins(body):
 # this only has to exist for the fragment fallback: a fence that both renames
 # and fails to parse would otherwise lose its pin, and the asymmetry between the
 # two paths is itself the kind of thing that turns into a finding later.
-RENAMED_PIN = re.compile(r'(?<![\w.-])([A-Za-z0-9_-]+)\s*=\s*\{([^{}]*)\}')
+RENAMED_PIN = re.compile(
+    r'(?<![\w.-])["\']?([A-Za-z0-9_-]+)["\']?\s*=\s*\{([^{}]*)\}')
 
 
 def renamed_pins(body):
@@ -801,10 +825,16 @@ def renamed_pins(body):
     reported twice.
     """
     for match in RENAMED_PIN.finditer(body):
-        if match.group(1).startswith('autumn'):
-            continue
         package = _string(PACKAGE_KEY_INLINE.search(match.group(2)))
         if not package or not package.startswith('autumn'):
+            continue
+        # Suppress only what `PIN` will report as the SAME crate. An earlier
+        # version skipped every key starting with `autumn`, which was too
+        # broad in both directions: `autumn_web = { package = "autumn-web" }`
+        # vanished entirely, because `PIN` stops at the underscore and cannot
+        # match that key either, and an `autumn-alias` key renamed to a real
+        # crate was dropped unless the alias itself happened to be published.
+        if package == match.group(1):
             continue
         spec = _string(VERSION_KEY.search(match.group(2)))
         if spec is None or requirement(spec) is None:
@@ -1109,6 +1139,29 @@ def check(root):
             f'README.md pins autumn-cli {published}, which is newer than the '
             f'workspace version {workspace}; the quickstart must pin the '
             f'latest published release')
+        return problems, 0, 0
+    # A PRERELEASE published version cannot be compared by release line, and
+    # accepting it would be worse than refusing it. Cargo does not resolve an
+    # ordinary `^0.8` requirement against a `0.8.0-rc.1` candidate — it reports
+    # "candidate versions found which didn't match" and asks for the prerelease
+    # to be named explicitly — so every `autumn-web = "0.8"` in the corpus would
+    # reduce to the same 0.8 line, pass this gate, and resolve for nobody.
+    #
+    # This repo does not cut semver prereleases: there are no `-rc`/`-beta`
+    # tags, and `docs/release-checklist.md` calls the thing it publishes a
+    # "release candidate" while giving its version as an ordinary `0.7.0`. So
+    # rather than build prerelease-compatibility logic for a release shape that
+    # has never existed here, the gate says plainly that it cannot judge this
+    # one. Failing loudly beats a green run over a corpus none of which
+    # resolves.
+    if core(published) != published:
+        problems.append(
+            f'README.md pins the prerelease {published}. This gate compares '
+            f'release LINES, and Cargo will not resolve a plain `^x.y` '
+            f'requirement against a prerelease candidate, so every pin in the '
+            f'corpus would be accepted while none of them resolves. Pin a '
+            f'published release, or teach this gate to require '
+            f'prerelease-compatible requirements before shipping one.')
         return problems, 0, 0
 
     crates = published_crates(root)
@@ -1444,6 +1497,50 @@ def self_test():
     expect('prerelease pin is read',
            list(pins(fenced('autumn-web = "0.6.0-beta.1"'))),
            [(2, 'autumn-web', '0.6.0-beta.1')])
+
+    # ---- a waiver separated by MORE than one blank line ----
+    # A blank line between a fence and the comment under it is ordinary
+    # markdown, so counting each blank as its own separator made the obvious
+    # spelling silently do nothing.
+    two_blanks = ('autumn-web = "0.6"\n'
+                  '\n'
+                  '\n'
+                  '<!-- version-pin-allow: autumn-web = "0.6" — reason -->\n')
+    covered = waived(two_blanks)
+    expect('waiver reaches across a blank RUN',
+           1 in covered.get(('autumn-web', '0.6'), set()), True)
+    # One blank line must still work, and a passage two blocks up must not be
+    # swept in.
+    one_blank = ('autumn-web = "0.5"\n'
+                 '\n'
+                 'autumn-web = "0.6"\n'
+                 '\n'
+                 '<!-- version-pin-allow: autumn-web = "0.6" — reason -->\n')
+    covered = waived(one_blank)
+    expect('waiver covers the adjacent block',
+           3 in covered.get(('autumn-web', '0.6'), set()), True)
+    expect('waiver does not reach two blocks up',
+           1 in covered.get(('autumn-web', '0.6'), set()), False)
+
+    # ---- an autumn-PREFIXED alias carrying a rename ----
+    # `PIN` stops at the underscore and cannot match this key, and skipping
+    # every `autumn`-prefixed key made the declaration vanish from both paths.
+    expect('underscore alias with a rename',
+           list(pins('autumn_web = { package = "autumn-web", '
+                     'version = "0.5" }')),
+           [(1, 'autumn-web', '0.5')])
+    # A key that IS the crate stays with `PIN`, reported once.
+    expect('self-named key is not double-read',
+           list(pins('autumn-web = { package = "autumn-web", '
+                     'version = "0.5" }')),
+           [(1, 'autumn-web', '0.5')])
+
+    # ---- quoted dependency keys, which TOML allows and the parser accepts ----
+    expect('quoted key on the pattern path',
+           list(pins('"autumn-web" = "0.5"')), [(1, 'autumn-web', '0.5')])
+    expect('quoted subtable key',
+           list(pins('[dependencies."autumn-web"]\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
