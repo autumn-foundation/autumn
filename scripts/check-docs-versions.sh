@@ -134,6 +134,30 @@
 #     the gate useless on the four pages where version text matters most. A
 #     pin NEWER than the page's own version is still a defect — that is a
 #     guide describing a release it predates.
+#   - A `[patch.crates-io]` (or any `[patch.<registry>]`) entry. This one is a
+#     deliberate NO, not an oversight, and it is written down because it looks
+#     like an oversight: `_dependency_tables` walks `dependencies`,
+#     `dev-dependencies`, `build-dependencies`, `target.*` and `workspace.*`,
+#     and stops there.
+#
+#     A patch entry is not a release-line pin. It exists to redirect a
+#     dependency AWAY from the published registry — this workspace's own root
+#     manifest says `autumn-web = { path = "autumn" }`, with no version at all
+#     — so a `version` beside it constrains the replacement source rather than
+#     declaring which release a reader should install. A page demonstrating a
+#     patch onto an older fork is CORRECT, and holding it to the published line
+#     would report it. That is the false-positive shape `check-docs-cli.sh`
+#     warns about in its own header: a gate people learn to ignore has stopped
+#     working, and one wrong report on a right page buys that faster than ten
+#     missed ones.
+#
+#     Known asymmetry, stated rather than papered over: the parser skips a
+#     patch table because it never descends into `patch`, while the PATTERN has
+#     no notion of TOML sections, so the same declaration written in prose IS
+#     reported. Making the pattern section-aware is the complexity that
+#     motivated parsing in the first place, and no tracked markdown in this
+#     repo contains a `[patch.…]` table at all, so the inconsistency is
+#     documented and left rather than built around.
 #
 # MIGRATION PAGES, precisely: the rule is `pin <= page version`, not
 # `pin == page version`, because the "before" block is the whole point of the
@@ -1271,6 +1295,20 @@ def self_test():
     # A rename to a non-autumn crate is not this gate's business.
     expect('rename to a foreign crate ignored',
            list(pins('web = { package = "axum", version = "0.5" }')), [])
+
+    # A `[patch.…]` entry redirects a dependency AWAY from the registry, so its
+    # version is not a release-line pin and a page patching onto an older fork
+    # is correct. Asserted so a later contributor does not "fix" the parser into
+    # reporting it — the omission is the decision, not a gap.
+    expect('patch table is not a release pin',
+           list(pins(fenced('[patch.crates-io]',
+                            'autumn-web = { path = "../fork", '
+                            'version = "0.5" }'))),
+           [])
+    expect('patch table with no version is inert',
+           list(pins(fenced('[patch.crates-io]',
+                            'autumn-web = { path = "autumn" }'))),
+           [])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
