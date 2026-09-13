@@ -850,7 +850,15 @@ def _dependency_tables(doc):
     # A fence that IS a dependency table body with the `[dependencies]` header
     # left off — which is how most snippets in this corpus are written.
     out.append(doc)
-    return out
+    # Deduplicate the TRAVERSAL, by table identity, rather than the
+    # declarations: if some shape ever makes one table reachable twice, walking
+    # it twice would double-report its pins, while dropping declarations that
+    # merely have equal values loses real occurrences.
+    unique = []
+    for table in out:
+        if not any(table is already for already in unique):
+            unique.append(table)
+    return unique
 
 
 def _declared(table):
@@ -868,18 +876,36 @@ def _declared(table):
                 yield key, package if isinstance(package, str) else key, version
 
 
-def _pin_line(body_lines, key, spec):
+def _pin_line(body_lines, key, spec, taken):
     """Where inside a fence this pin is written, as a 0-based offset.
 
     `tomllib` reports no positions, so the line is recovered by looking for the
     dependency's key and then the version literal at or below it. That covers
     the inline form (both on one line), the multiline table (key on the opening
     line) and the subtable (key in the header, version below).
+
+    `taken` holds the offsets already claimed by pins from this same fence, and
+    both searches skip them. Without it, the SAME key declared in two tables —
+    `[dependencies]` and `[dev-dependencies]` are the ordinary pairing — both
+    resolve to the first line, so the two occurrences collapse onto one report.
+
+    The line a repeated key lands on follows the order `_dependency_tables`
+    walks, not the order the tables appear in the fence, so a fence that writes
+    `[dev-dependencies]` above `[dependencies]` attributes the two the other way
+    round. Both are reported and both are judged; only which report carries
+    which line number can swap. There is no position information to do better
+    with, and being one line out is a far smaller defect than dropping the
+    occurrence entirely.
     """
-    declared = next((i for i, line in enumerate(body_lines) if key in line), 0)
+    declared = next((i for i, line in enumerate(body_lines)
+                     if key in line and i not in taken), None)
+    if declared is None:
+        declared = next((i for i, line in enumerate(body_lines) if key in line),
+                        0)
     quoted = (f'"{spec}"', f"'{spec}'")
     return next((i for i in range(declared, len(body_lines))
-                 if any(q in body_lines[i] for q in quoted)), declared)
+                 if i not in taken and any(q in body_lines[i] for q in quoted)),
+                declared)
 
 
 def fenced_toml_pins(body):
@@ -908,14 +934,22 @@ def fenced_toml_pins(body):
                 yield first_line + lineno - 1, crate, spec
             continue
         fence_lines = fence.splitlines()
-        seen = set()
+        # Offsets already claimed, so two declarations of one key land on two
+        # lines. This deduplicates the LINE, never the declaration: an earlier
+        # version keyed a `seen` set on (key, crate, spec) and so discarded the
+        # second of two identical pins in `[dependencies]` and
+        # `[dev-dependencies]` — a real second occurrence, silently dropped,
+        # which is the per-occurrence promise this gate makes over the
+        # existential `FIRST_RUN_DOCS` test it replaces. It also let a
+        # line-scoped waiver on the survivor conceal an unwaived duplicate.
+        taken = set()
         for table in _dependency_tables(doc):
             for key, crate, spec in _declared(table):
-                if requirement(spec) is None or (key, crate, spec) in seen:
+                if requirement(spec) is None:
                     continue
-                seen.add((key, crate, spec))
-                yield (first_line + _pin_line(fence_lines, key, spec),
-                       crate, spec)
+                offset = _pin_line(fence_lines, key, spec, taken)
+                taken.add(offset)
+                yield first_line + offset, crate, spec
 
 
 def mask_toml_fences(text):
@@ -1309,6 +1343,24 @@ def self_test():
            list(pins(fenced('[patch.crates-io]',
                             'autumn-web = { path = "autumn" }'))),
            [])
+
+    # PER-OCCURRENCE, which is the whole promise over the existential
+    # `FIRST_RUN_DOCS` test: one key declared in two tables is two pins on two
+    # lines, not one. Deduplicating equal declarations dropped the second.
+    expect('repeated key across tables is two pins',
+           list(pins(fenced('[dependencies]', 'autumn-web = "0.5"', '',
+                            '[dev-dependencies]', 'autumn-web = "0.5"'))),
+           [(3, 'autumn-web', '0.5'), (6, 'autumn-web', '0.5')])
+    # …including when the two name DIFFERENT lines, which must not be swapped
+    # onto one another.
+    expect('repeated key with differing versions',
+           list(pins(fenced('[dependencies]', 'autumn-web = "0.5"', '',
+                            '[dev-dependencies]', 'autumn-web = "0.6"'))),
+           [(3, 'autumn-web', '0.5'), (6, 'autumn-web', '0.6')])
+    # A single declaration must still report exactly once.
+    expect('single declaration reports once',
+           list(pins(fenced('[dependencies]', 'autumn-web = "0.5"'))),
+           [(3, 'autumn-web', '0.5')])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
