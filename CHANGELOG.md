@@ -583,15 +583,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run — so the fix does not trade the original data loss for a duplicate on
   a later run. A pre-upgrade site's markers, recorded under the old, bare
   scheme, are still recognized too. Resolving a completed ancestor's real id
-  now also goes through that same qualified marker rather than the bare
-  identity, so importing an updated backup that adds a new page to an
-  otherwise unchanged, already-settled tree nests it under its real parent
-  instead of leaving it at the top level. A bare, legacy `parent` reference
-  now also resolves against a sibling that carries an explicit `path`, since
-  both name a page by its slug. A pre-upgrade site's old, bare markers are
-  kept as a list rather than collapsed to one, so two completed pages that
-  happen to share that same old marker are both still recognized on a later
-  re-import, rather than one of them getting duplicated.
+  now also goes through that same qualified marker, with a legacy fallback of
+  its own, rather than the bare identity alone, so importing an updated
+  backup that adds a new page to an otherwise unchanged, already-settled tree
+  — pre-upgrade or not — nests it under its real parent instead of leaving it
+  at the top level. A bare, legacy `parent` reference now also resolves
+  against a sibling that carries an explicit `path`, since both name a page
+  by its slug. A pre-upgrade site's old, bare markers are kept as a list
+  rather than collapsed to one, so two completed pages that happen to share
+  that same old marker are both still recognized on a later re-import, rather
+  than one of them getting duplicated. A genuinely top-level post's stable
+  identity is now marked with a leading slash a legacy marker could never
+  carry, so a brand new top-level page can no longer be mistaken for a
+  pre-upgrade site's unrelated, already-completed nested one.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

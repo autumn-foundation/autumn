@@ -791,6 +791,14 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 /// value computed for it, so a *second* external parent further up a
 /// legacy chain falls back to its own bare slug instead. Bounded by
 /// `MAX_PAGE_DEPTH` like every other ancestry walk in this module.
+///
+/// A result with no slash at all — a genuinely top-level post, qualified by
+/// nothing — is given a leading one. Nothing else in this file ever writes
+/// a leading slash, old code included, so `/team` can only ever have come
+/// from this function: unlike a bare `team`, which is also exactly what a
+/// pathless post's identity was under the pre-`stable_identity` scheme
+/// regardless of where it actually nested, `/team` cannot be confused with
+/// a leftover marker for some unrelated, actually-nested page.
 fn stable_identity<'a>(
     repos: &'a Repos,
     posts: &'a [ExportPost],
@@ -805,7 +813,7 @@ fn stable_identity<'a>(
             return Ok(cached.clone());
         }
         let post = &posts[index];
-        let value = if let Some(path) = &post.path {
+        let raw = if let Some(path) = &post.path {
             path.clone()
         } else if depth > content::MAX_PAGE_DEPTH + 2 {
             post.slug.clone()
@@ -834,50 +842,104 @@ fn stable_identity<'a>(
         } else {
             post.slug.clone()
         };
+        let value = if raw.contains('/') {
+            raw
+        } else {
+            format!("/{raw}")
+        };
         memo[index] = Some(value.clone());
         Ok(value)
     })
 }
 
+/// Everything about this run that resolving a file-declared post's real
+/// database id needs, bundled so passing it around does not mean naming six
+/// arguments at every call site.
+struct ImportGraph<'a> {
+    repos: &'a Repos,
+    posts: &'a [ExportPost],
+    graph: &'a FileGraph<'a>,
+    imported_source_slugs: &'a std::collections::HashMap<(String, String), Vec<i64>>,
+    created_ids: &'a [(i64, String, String, Option<String>)],
+    completed_imports: &'a std::collections::HashSet<i64>,
+}
+
 /// The real database id of a post already declared in this file, resolved
 /// through everything this run can know about it: a row created earlier in
-/// this same run, a row a completed marker names, or a local row whose own
-/// raw identity matches exactly.
+/// this same run, a row a completed marker names — its new, stable one or,
+/// failing that, the old bare one a pre-upgrade import left — or a local row
+/// whose own raw identity matches exactly.
 ///
 /// The marker check goes through `stable_identity`, not the bare
 /// `identity()`: a completed, nested ancestor's own marker is qualified, so
 /// looking it up by the bare identity alone always misses it. That miss is
 /// what let a newly added descendant of an otherwise unchanged, already
-/// settled tree land at the top level instead of under its real parent.
-async fn resolved_post_id(
-    repos: &Repos,
-    posts: &[ExportPost],
-    graph: &FileGraph<'_>,
-    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
-    created_ids: &[(i64, String, String, Option<String>)],
-    stable_memo: &mut Vec<Option<String>>,
+/// settled tree land at the top level instead of under its real parent. The
+/// legacy fallback needs this post's own expected parent to disambiguate a
+/// bare key that names more than one row, so it resolves that parent the
+/// same way the main loop resolves any other — recursively, through this
+/// same function.
+fn resolved_post_id<'a>(
+    import: &'a ImportGraph<'a>,
+    stable_memo: &'a mut Vec<Option<String>>,
     index: usize,
-) -> AutumnResult<Option<i64>> {
-    let post = &posts[index];
-    let own_identity = identity(post);
-    if let Some((id, _, _, _)) = created_ids
-        .iter()
-        .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &own_identity)
-    {
-        return Ok(Some(*id));
-    }
-    let stable = stable_identity(repos, posts, graph, index, stable_memo, None, 0).await?;
-    // Its own marker: a qualified key like this one names exactly one row,
-    // so the first (and only) candidate is enough.
-    if let Some(&id) = imported_source_slugs
-        .get(&(post.post_type.clone(), stable))
-        .and_then(|ids| ids.first())
-    {
-        return Ok(Some(id));
-    }
-    Ok(find_local(repos, &post.post_type, &own_identity)
-        .await?
-        .map(|found| found.id))
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<Option<i64>>> + Send + 'a>> {
+    Box::pin(async move {
+        let post = &import.posts[index];
+        let own_identity = identity(post);
+        if let Some((id, _, _, _)) = import
+            .created_ids
+            .iter()
+            .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &own_identity)
+        {
+            return Ok(Some(*id));
+        }
+        let stable = stable_identity(
+            import.repos,
+            import.posts,
+            import.graph,
+            index,
+            stable_memo,
+            None,
+            0,
+        )
+        .await?;
+        // Its own marker: a qualified key like this one names exactly one
+        // row, so the first (and only) candidate is enough.
+        if let Some(&id) = import
+            .imported_source_slugs
+            .get(&(post.post_type.clone(), stable.clone()))
+            .and_then(|ids| ids.first())
+        {
+            return Ok(Some(id));
+        }
+        if stable != own_identity
+            && let Some(ids) = import
+                .imported_source_slugs
+                .get(&(post.post_type.clone(), own_identity.clone()))
+        {
+            let expected_parent = match parent_identity(post) {
+                Some(parent) => match import.graph.find(post.post_type.as_str(), &parent) {
+                    Some(parent_index) => {
+                        resolved_post_id(import, stable_memo, parent_index).await?
+                    }
+                    None => find_local(import.repos, &post.post_type, &parent)
+                        .await?
+                        .map(|found| found.id),
+                },
+                None => None,
+            };
+            if let Some(candidate) =
+                pick_marker_candidate(import.repos, ids, import.completed_imports, expected_parent)
+                    .await?
+            {
+                return Ok(Some(candidate.id));
+            }
+        }
+        Ok(find_local(import.repos, &post.post_type, &own_identity)
+            .await?
+            .map(|found| found.id))
+    })
 }
 
 /// The first marker candidate whose real parent still agrees with
@@ -1181,16 +1243,15 @@ pub async fn import(
         let parent_now = match parent_identity(post) {
             Some(parent) => match graph.find(post.post_type.as_str(), &parent) {
                 Some(parent_index) => {
-                    resolved_post_id(
-                        &repos,
-                        &payload.posts,
-                        &graph,
-                        &imported_source_slugs,
-                        &created_ids,
-                        &mut stable_memo,
-                        parent_index,
-                    )
-                    .await?
+                    let import = ImportGraph {
+                        repos: &repos,
+                        posts: &payload.posts,
+                        graph: &graph,
+                        imported_source_slugs: &imported_source_slugs,
+                        created_ids: &created_ids,
+                        completed_imports: &completed_imports,
+                    };
+                    resolved_post_id(&import, &mut stable_memo, parent_index).await?
                 }
                 None => match find_local(&repos, &post.post_type, &parent)
                     .await?

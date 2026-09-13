@@ -11941,6 +11941,173 @@ async fn re_importing_a_backup_recognizes_both_sides_of_a_pre_upgrade_bare_colli
     client.get("/b/team").send().await.assert_ok();
 }
 
+/// A new, genuinely top-level page must not be dropped merely because a
+/// pre-upgrade site already has a completed, *nested* page whose old, bare
+/// marker happens to equal that same slug.
+///
+/// `stable_identity` gives a top-level post's marker a leading slash
+/// (`/team`), so it cannot be confused with an old, unprefixed marker
+/// (`team`) left by a pathless post that was actually nested elsewhere.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_new_top_level_page_is_not_confused_with_a_pre_upgrade_nested_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Rewrite `Team`'s marker to the old, pre-upgrade bare shape.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_id: i64 = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("team"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("team");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(team_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A separate, later import: a *different*, genuinely top-level `Team`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/team").send().await.assert_ok();
+}
+
+/// Adding a new descendant to a pre-upgrade tree whose completed ancestors
+/// still carry the old, bare markers must still nest the new page under its
+/// real parent.
+///
+/// `resolved_post_id`'s own legacy fallback resolves the parent's expected
+/// position recursively — the same way the main loop resolves any other
+/// parent — so it is not limited to the qualified marker `stable_identity`
+/// now writes going forward.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_pre_upgrade_settled_tree_nests_it_correctly() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/b").send().await.assert_ok();
+
+    // Rewrite both markers to their old, pre-upgrade bare shape.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        for slug in ["a", "b"] {
+            let id: i64 = cms::schema::posts::table
+                .filter(cms::schema::posts::slug.eq(slug))
+                .select(cms::schema::posts::id)
+                .first(&mut conn)
+                .await
+                .expect("the row");
+            diesel::update(
+                cms::schema::post_meta::table
+                    .filter(cms::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set(cms::schema::post_meta::meta_value.eq(slug))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+        }
+    }
+
+    // An updated backup: the same `A` and `B`, plus a brand new `C`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the new page must nest under its real parent, not land at the top level"
+    );
+}
+
 /// A file where two pages name each other as parent must not hang or crash
 /// the import, and must not create an actual cycle in the database.
 ///
