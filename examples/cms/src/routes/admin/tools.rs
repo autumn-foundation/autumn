@@ -904,21 +904,28 @@ async fn legacy_marker_at_current_position(
 ///
 /// The parent's *old* position — what that marker actually named — is
 /// gone, not just unreachable by id, once the parent has moved: nothing
-/// here recomputes it. Instead this checks the row's real, current parent,
-/// which is accurate no matter how many times an ancestor has moved.
-/// Only a candidate whose actual `parent_id` still equals `parent_id` is
-/// accepted, among every *legacy-shaped* marker for `post_type` ending in
-/// `/{slug}` — a shared suffix alone is not enough, since an unrelated
-/// page under a different parent can share it by coincidence; only the
-/// real parent tells them apart.
+/// here recomputes it. Two things about the marker itself take its place.
 ///
-/// An `id:`-anchored marker is excluded, not merely another candidate to
-/// filter by parent: it already names its own parent's id inside the
-/// string, so a stale one is never a legacy marker to recover — it is a
-/// *current-scheme* marker for some other parent entirely, and a row an
-/// editor has since dragged under this parent by coincidence must not be
-/// mistaken for this post's own row. `id:` never starts a real ancestor
-/// identity — a slug cannot contain `:` — so this is exact, not a guess.
+/// First, the marker's own direct-parent segment — the slug immediately
+/// before `/{slug}`, however deep the recorded position was — must equal
+/// `parent_id`'s own *current* slug. An editor's move changes a parent's
+/// *position*, not normally its slug, so this still holds after any
+/// number of moves; it is what a marker recorded for some other parent
+/// entirely, coincidentally now sharing `parent_id` as its current
+/// parent, can never satisfy — unlike a shared `/{slug}` suffix alone,
+/// which proves nothing about which parent a marker was ever about.
+///
+/// Second, only a candidate whose actual, current `parent_id` still
+/// equals `parent_id` is accepted — accurate no matter how many times an
+/// ancestor has moved, and the same check that rules out an unrelated
+/// page merely sharing this suffix.
+///
+/// An `id:`-anchored marker is excluded outright, not merely another
+/// candidate to filter: it already names its own parent's id inside the
+/// string, so a stale one is never legacy material — it is a
+/// *current-scheme* marker for some other parent entirely. `id:` never
+/// starts a real ancestor identity — a slug cannot contain `:` — so this
+/// is exact, not a guess.
 async fn recovered_legacy_owner(
     repos: &Repos,
     imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
@@ -926,9 +933,17 @@ async fn recovered_legacy_owner(
     slug: &str,
     parent_id: i64,
 ) -> AutumnResult<Option<crate::models::Post>> {
+    let Some(parent_row) = repos.posts.find_by_id(parent_id).await? else {
+        return Ok(None);
+    };
     let suffix = format!("/{slug}");
     for ((candidate_type, marker), ids) in imported_source_slugs {
         if candidate_type != post_type || marker.starts_with("id:") || !marker.ends_with(&suffix) {
+            continue;
+        }
+        let without_suffix = &marker[..marker.len() - suffix.len()];
+        let parent_segment = without_suffix.rsplit('/').next().unwrap_or(without_suffix);
+        if parent_segment != parent_row.slug {
             continue;
         }
         for &id in ids {
@@ -953,8 +968,10 @@ async fn recovered_legacy_owner(
 /// Neither tier recovers a row whose external parent *and* the row itself
 /// have both moved since the original import: the exact marker no longer
 /// matches (the parent moved), and the row's own current parent no longer
-/// agrees either (the row moved). Telling that row apart from a genuinely
-/// new, unrelated one sharing its slug would need every page to carry a
+/// agrees either (the row moved) — the same gap applies if the parent was
+/// also re-slugged, since the suffix scan's parent check reads its
+/// *current* slug. Telling such a row apart from a genuinely new,
+/// unrelated one sharing its slug would need every page to carry a
 /// permanent identity of its own, not only the ones this importer created
 /// — a materially bigger change than this fix, and the same one #2763
 /// itself named as the alternative to accepting this gap.
