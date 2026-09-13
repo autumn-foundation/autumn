@@ -328,10 +328,16 @@ fn validate_submission(
     // makes the overflow itself the reported error, so the count is never
     // gone — just too high — regardless of how many of the selected terms
     // still have a rendered checkbox to uncheck.
+    //
+    // `taxonomy_selection_overflows` rather than a plain `.collect::<HashSet<_>>().len()`:
+    // a crafted request can repeat the taxonomy field enough times to make
+    // materializing every id — even deduplicated — a meaningful allocation in
+    // its own right. Detecting "more than 50" only ever needs to hold 51 of
+    // them at a time.
     if form
         .taxonomies
         .values()
-        .any(|ids| ids.iter().collect::<std::collections::HashSet<_>>().len() > MAX_TERMS_PER_SAVE)
+        .any(|ids| taxonomy_selection_overflows(ids))
     {
         errors.push((
             "taxonomies",
@@ -340,6 +346,24 @@ fn validate_submission(
     }
 
     (scheduled_for, errors)
+}
+
+/// Whether `ids` names more than `MAX_TERMS_PER_SAVE` distinct terms.
+///
+/// Stops inserting as soon as the answer is known, so a submission with far
+/// more entries than the limit — duplicates or not — never grows the working
+/// set past `MAX_TERMS_PER_SAVE + 1`. A `.collect::<HashSet<_>>().len()` over
+/// the same slice would materialize every distinct id first and answer the
+/// same yes/no question after paying for all of them.
+fn taxonomy_selection_overflows(ids: &[i64]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(MAX_TERMS_PER_SAVE + 1);
+    for &id in ids {
+        seen.insert(id);
+        if seen.len() > MAX_TERMS_PER_SAVE {
+            return true;
+        }
+    }
+    false
 }
 
 // ── List ────────────────────────────────────────────────────────────────────
