@@ -507,8 +507,31 @@ def published_crates(root):
 # safely, which it must: a dependency table is routinely opened on one line and
 # closed several later, and `\{[^{}]*\}` still cannot swallow a neighbouring
 # block the way `[^}]*` spanning lines would.
+#
+# BOTH TOML string forms, here as well as in the parser. A basic `"0.5"` and a
+# literal `'0.5'` are the same declaration, and the pattern path is not only
+# prose — it is also the fallback for a `toml` fence that does not parse, so a
+# double-quote-only pattern left the literal-string fix working on parseable
+# fences alone. That is the same mistake `check-docs-scope.sh` records this repo
+# shipping once, one layer down.
 PIN = re.compile(
-    r'(?<![\w.-])(autumn[a-z0-9-]*)\s*=\s*(?:"([^"\n]*)"|\{([^{}]*)\})')
+    r'(?<![\w.-])(?P<crate>autumn[a-z0-9-]*)\s*=\s*'
+    r'(?:"(?P<basic>[^"\n]*)"'
+    r"|'(?P<literal>[^'\n]*)'"
+    r'|\{(?P<table>[^{}]*)\})')
+
+# A `key = <string>` in either TOML string form, for the keys read out of an
+# inline table or a subtable body.
+VERSION_KEY = re.compile(r'version\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
+PACKAGE_KEY = re.compile(
+    r'(?m)^[^\S\n]*package\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
+
+
+def _string(match):
+    """The one non-None alternative of a two-form quoted capture."""
+    if match is None:
+        return None
+    return next((g for g in match.groups() if g is not None), None)
 
 # Cargo comparison operators that still name ONE release line, against the ones
 # that name a RANGE instead.
@@ -529,6 +552,12 @@ def requirement(spec):
     None covers three populations, all of them correct pages: a range rather
     than a pin (`>=0.5`), a placeholder (`{X.Y.Z}` in `docs/migrations/next.md`,
     `<declared>` in the skill), and anything else that is not a version.
+
+    Whatever this DOES return is a bare `x.y` or `x.y.z` that `acceptable()` can
+    judge. That is an invariant, not a coincidence, and `--self-test` asserts it:
+    `check()` reads a None verdict from `acceptable()` as "not this gate's
+    business" and passes it, so any spec this function admits but that one
+    cannot parse becomes a silent hole. A `0.5.*` did exactly that.
     """
     spec = spec.strip()
     if not spec or ',' in spec:
@@ -539,7 +568,25 @@ def requirement(spec):
         if spec.startswith(op):
             spec = spec[len(op):].strip()
             break
-    return spec if spec[:1].isdigit() else None
+    # A wildcard in a LATER position has a floor and names a line: `0.5.*` is
+    # `0.5.0`, the same as `0.5`. That is not this gate's invention —
+    # `docs/guide/upgrading.md` documents `autumn upgrade` reading it that way,
+    # so a gate that skipped it would disagree with the tool the same corpus
+    # tells the reader to run. A bare `*` (already a range above) and a `0.*`
+    # have no single floor: the first spans everything, the second a whole
+    # major, and `upgrading.md` lists both among the forms with no floor.
+    if spec.endswith('.*'):
+        head = spec[:-2]
+        if head.count('.') != 1 or not all(p.isdigit() for p in head.split('.')):
+            return None
+        spec = head
+    if not spec[:1].isdigit():
+        return None
+    # Anything left that `acceptable()` could not judge would pass silently.
+    parts = spec.split('.')
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+        return None
+    return spec
 
 # `<!-- version-pin-allow: autumn-web = "0.6" — reason -->`. The reason is
 # required: a waiver without one outlives the passage it was written for.
@@ -608,8 +655,14 @@ def waived(text):
 # `autumn-cli`'s `generate auth --mail` patcher already exists because real
 # projects write their dependency this way.
 SUBTABLE = re.compile(
-    r'^[^\S\n]*\[(?:dev-|build-)?dependencies\.([A-Za-z0-9_-]+)\][^\S\n]*$',
-    re.M)
+    r'^[^\S\n]*\[(?:workspace\.)?(?:dev-|build-)?dependencies'
+    r'\.([A-Za-z0-9_-]+)\][^\S\n]*$', re.M)
+
+# The `version` key inside a subtable body, in either TOML string form and
+# anchored at the start of its line so a `version` inside some other value is
+# not mistaken for it.
+SUBTABLE_VERSION = re.compile(
+    r'(?m)^[^\S\n]*version\s*=\s*(?:"([^"\n]*)"|\'([^\'\n]*)\')')
 
 # The start of the next TOML section, which is where a subtable's body ends.
 NEXT_SECTION = re.compile(r'^[^\S\n]*\[', re.M)
@@ -632,15 +685,15 @@ def subtable_pins(body):
         start = match.end()
         following = NEXT_SECTION.search(body, start)
         section = body[start:following.start() if following else len(body)]
-        version = re.search(r'(?m)^[^\S\n]*version\s*=\s*"([^"\n]*)"', section)
+        version = SUBTABLE_VERSION.search(section)
         if not version:
             continue
-        renamed = re.search(r'(?m)^[^\S\n]*package\s*=\s*"([^"\n]*)"', section)
-        crate = renamed.group(1) if renamed else match.group(1)
-        if requirement(version.group(1)) is None:
+        renamed = _string(PACKAGE_KEY.search(section))
+        crate = renamed if renamed else match.group(1)
+        if requirement(_string(version)) is None:
             continue
         lineno = body.count('\n', 0, start + version.start()) + 1
-        yield lineno, crate, version.group(1)
+        yield lineno, crate, _string(version)
 
 
 def pattern_pins(body):
@@ -660,14 +713,14 @@ def pattern_pins(body):
     """
     yield from subtable_pins(body)
     for match in PIN.finditer(body):
-        spec = match.group(2)
+        spec = match['basic'] if match['basic'] is not None else match['literal']
         if spec is None:
-            inner = re.search(r'version\s*=\s*"([^"\n]*)"', match.group(3) or '')
-            if not inner:
+            inner = _string(VERSION_KEY.search(match['table'] or ''))
+            if inner is None:
                 # `{ path = "../autumn" }` or `{ workspace = true }` pins no
                 # version, so there is nothing here to be stale.
                 continue
-            spec = inner.group(1)
+            spec = inner
         if requirement(spec) is None:
             continue
         # The spec is yielded AS WRITTEN, not normalized: a report saying
@@ -675,7 +728,7 @@ def pattern_pins(body):
         # reader looking for text that is not there, and a waiver marker is
         # written by copying the pin off the page. `requirement()` is applied
         # again by the caller to compare it.
-        yield body.count('\n', 0, match.start()) + 1, match.group(1), spec
+        yield body.count('\n', 0, match.start()) + 1, match['crate'], spec
 
 
 # A fence opener, with its language. Only ```toml blocks are handed to the TOML
@@ -721,6 +774,17 @@ def _dependency_tables(doc):
                     table = cfg.get(name)
                     if isinstance(table, dict):
                         out.append(table)
+    # `[workspace.dependencies]` is where an Autumn workspace declares the
+    # framework once for every member to inherit with `workspace = true`, so it
+    # is the single most load-bearing pin a multi-crate project has. Appending
+    # `doc` below does not reach it: that yields the key `workspace`, whose
+    # value is a table with no `version` of its own.
+    workspace = doc.get('workspace')
+    if isinstance(workspace, dict):
+        for name in DEP_TABLES:
+            table = workspace.get(name)
+            if isinstance(table, dict):
+                out.append(table)
     # A fence that IS a dependency table body with the `[dependencies]` header
     # left off — which is how most snippets in this corpus are written.
     out.append(doc)
@@ -1124,6 +1188,57 @@ def self_test():
     expect('text fence stays on the pattern',
            list(pins('```text\nautumn-web = "0.6"\n```\n')),
            [(2, 'autumn-web', '0.6')])
+
+    # `[workspace.dependencies]` is where a multi-crate project declares the
+    # framework once for every member to inherit — the most load-bearing pin
+    # such a project has, and not reached by appending the document.
+    expect('workspace.dependencies',
+           list(pins(fenced('[workspace.dependencies]',
+                            'autumn-web = "0.5"'))),
+           [(3, 'autumn-web', '0.5')])
+    expect('workspace dependency subtable',
+           list(pins('[workspace.dependencies.autumn-web]\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+
+    # A wildcard in a LATER position has a floor and names a line, exactly as
+    # `docs/guide/upgrading.md` documents `autumn upgrade` reading it.
+    expect('later-position wildcard has a floor', requirement('0.5.*'), '0.5')
+    expect('wildcard pin is refused when stale',
+           acceptable(requirement('0.5.*'), (0, 7, 0), allow_older=False),
+           False)
+    expect('wildcard pin on the current line passes',
+           acceptable(requirement('0.7.*'), (0, 7, 0), allow_older=False), True)
+    expect('wildcard pin is read', list(pins(fenced('autumn-web = "0.5.*"'))),
+           [(2, 'autumn-web', '0.5.*')])
+    # A whole-major or bare wildcard has no single floor; both stay ranges.
+    expect('major wildcard skipped', requirement('0.*'), None)
+    expect('bare wildcard skipped', requirement('*'), None)
+
+    # Literal strings on the PATTERN path, which is prose AND the fallback for
+    # a fence that does not parse — where the parser-side fix cannot reach.
+    expect('literal string in prose',
+           list(pins("add `autumn-web = '0.5'` to it")),
+           [(1, 'autumn-web', '0.5')])
+    expect('literal string in an unparseable fence',
+           list(pins(fenced('[dependencies]', "autumn-web = '0.5'", 'oops ='))),
+           [(3, 'autumn-web', '0.5')])
+    expect('literal string in a subtable',
+           list(pins("[dependencies.autumn-web]\nversion = '0.5'\n")),
+           [(2, 'autumn-web', '0.5')])
+
+    # THE INVARIANT behind all of the above: `check()` reads a None verdict as
+    # "not this gate's business" and passes it, so anything `requirement()`
+    # admits must be something `acceptable()` can actually judge. A `0.5.*`
+    # broke this and passed silently; this asserts the class cannot return.
+    admitted = ['0.7', '0.7.0', '=0.6.0', '^0.7', '~0.7', '0.5.*', '=0.5.*',
+                '0.5', '10.20.30', ' 0.7 ']
+    for spec in admitted:
+        got = requirement(spec)
+        if got is None:
+            continue
+        if acceptable(got, (0, 7, 0), allow_older=False) is None:
+            failures.append(f'requirement({spec!r}) -> {got!r}, which '
+                            f'acceptable() cannot judge')
     # A longer crate name must not be read as a pin on a shorter one.
     expect('no prefix bleed', list(pins('bench-autumn-web = "0.1"')), [])
     # A comment renders as nothing, so it carries no pin a reader can paste.
