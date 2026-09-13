@@ -2097,11 +2097,36 @@ fn path_attribute_value(
         if attr.path().is_ident("cfg_attr")
             && let syn::Meta::List(list) = &attr.meta
         {
-            let (condition, metas) = cfg_attr_payload(list, default_features)?;
-            if condition != Some(true) {
-                return None;
-            }
-            return metas.iter().find_map(path_name_value_str);
+            return path_value_from_cfg_attr_metas(list, default_features);
+        }
+        None
+    })
+}
+
+/// The `path = "..."` meta inside an active `#[cfg_attr(condition, ...)]`'s
+/// payload, recursing into a NESTED `cfg_attr` meta the same way
+/// [`cfg_attr_active_marker_names`] does — `#[cfg_attr(feature = "a",
+/// cfg_attr(feature = "b", path = "actual.rs"))]` must surface `actual.rs`
+/// once both conditions hold, not stop at the literal name `cfg_attr`
+/// (verified directly via a real build). The outer, one-level case was
+/// round 40's fix; this is the same gap one level deeper, which rustc
+/// itself expands just as readily (Codex review on #2739, round 41, P1).
+fn path_value_from_cfg_attr_metas(
+    list: &syn::MetaList,
+    default_features: &BTreeSet<String>,
+) -> Option<String> {
+    let (condition, metas) = cfg_attr_payload(list, default_features)?;
+    if condition != Some(true) {
+        return None;
+    }
+    metas.iter().find_map(|meta| {
+        if let Some(value) = path_name_value_str(meta) {
+            return Some(value);
+        }
+        if meta.path().is_ident("cfg_attr")
+            && let syn::Meta::List(inner) = meta
+        {
+            return path_value_from_cfg_attr_metas(inner, default_features);
         }
         None
     })
@@ -3083,6 +3108,23 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
 /// `macro_rules` itself — the `!` and the macro's own name are just more
 /// pass-through tokens to that scan) rather than a dedicated helper (Codex
 /// review on #2739, round 32, P2).
+///
+/// The index right after a simple path (`name`, `a::b::c`) starting at `i`,
+/// where `trees[i]` is already known to be an `Ident` — used to look past a
+/// macro invocation's qualifier (`crate::configure!`, `self::configure!`)
+/// before checking for the `!` and brace-delimited group that follow.
+/// Returns `i + 1` unchanged when no `::` continues the path.
+fn simple_path_end(trees: &[TokenTree], i: usize) -> usize {
+    let mut end = i + 1;
+    while matches!(trees.get(end), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+        && matches!(trees.get(end + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+        && matches!(trees.get(end + 2), Some(TokenTree::Ident(_)))
+    {
+        end += 3;
+    }
+    end
+}
+
 fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usize> {
     if let Some(TokenTree::Ident(ident)) = trees.get(i) {
         match ident.to_string().as_str() {
@@ -3099,19 +3141,23 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
             _ => {}
         }
         // ANY OTHER macro invocation statement using brace delimiters
-        // (`configure! { ... }`, not `configure!(...)`/`configure![...]`)
-        // needs no trailing `;` either — verified directly via a real
-        // build. `macro_rules` above is the same rule with an extra
+        // (`configure! { ... }`, not `configure!(...)`/`configure![...]`) —
+        // possibly through a qualified path (`crate::configure! { ... }`,
+        // `self::configure! { ... }`, `a::b::configure! { ... }`, all
+        // verified directly via a real build) — needs no trailing `;`
+        // either. `macro_rules` above is the same rule with an extra
         // "macro's own name" token between `!` and the group; an ordinary
         // invocation has nothing between them, so this checks the group
-        // directly. None of the specific keywords above can themselves be
-        // followed by `!` (they're reserved words, never valid macro
-        // names), so there's no overlap with them (Codex review on #2739,
-        // round 36, P2).
-        if matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
-            && matches!(trees.get(i + 2), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
+        // directly, after skipping over any leading `path::segments::`.
+        // None of the specific keywords above can themselves be followed by
+        // `!` or `::` (they're reserved words, never valid path segments),
+        // so there's no overlap with them (Codex review on #2739, round 36,
+        // P2, extended in round 41, P2 for a qualified macro path).
+        let path_end = simple_path_end(trees, i);
+        if matches!(trees.get(path_end), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            && matches!(trees.get(path_end + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
         {
-            return Some(i + 2);
+            return Some(path_end + 1);
         }
     }
     if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '\'')
@@ -8098,5 +8144,81 @@ mod tests {
             module_paths.contains(&vec!["b".to_owned()]),
             "{module_paths:?}"
         );
+    }
+
+    /// A qualified brace-delimited macro invocation (`crate::configure! {
+    /// ... }`, `self::configure! { ... }`) needs no trailing `;` either,
+    /// exactly like the unqualified form — verified directly via a real
+    /// build. The round-36 fix only recognized the bare `configure! { ...
+    /// }` shape (requiring `!` immediately after the first identifier), so
+    /// a cfg'd-out qualified invocation let the generic scan-to-`;`
+    /// fallback run through it into the next, unrelated, still-real
+    /// `edge_routes![show]` invocation and consume that too (Codex review
+    /// on #2739, round 41, P2).
+    #[test]
+    fn cfg_false_qualified_brace_delimited_macro_invocation_does_not_swallow_the_following_registration()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            macro_rules! configure {
+                ($($t:tt)*) => {};
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                crate::configure! { a b c }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// A `#[cfg_attr]` NESTED inside another `#[cfg_attr]`'s own payload can
+    /// still introduce a `path = "..."` override once BOTH conditions hold
+    /// — verified directly via a real build. `path_attribute_value`'s
+    /// round-40 fix only checked the immediate payload's metas, not a
+    /// nested `cfg_attr` meta inside it, so this two-level form still fell
+    /// back to the conventional (nonexistent) `handlers.rs` instead of the
+    /// real `actual.rs` (Codex review on #2739, round 41, P1).
+    #[test]
+    fn resolve_edge_scan_expands_a_path_attribute_introduced_by_a_nested_cfg_attr() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[features]\na = []\nb = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", path = "actual.rs"))]
+            mod handlers;
+            fn wire() { edge_routes![crate::handlers::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(dir.path(), &["a", "b"], None);
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "src/actual.rs");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 }
