@@ -464,17 +464,47 @@ def workspace_version(root):
     raise SystemExit('Cargo.toml must set [workspace.package] version')
 
 
+def core(version):
+    """A semver string without its prerelease or build metadata.
+
+    `0.6.0-beta.1` -> `0.6.0`, `0.7.0+build.5` -> `0.7.0`.
+
+    A prerelease suffix does not change which RELEASE LINE a requirement names,
+    and the line is the only question this gate asks. Refusing these was not a
+    harmless omission: `QUICKSTART_CLI_VERSION` exists to gate "a release
+    candidate that was just published to crates.io" (`check-quickstart.sh`,
+    wired into `quickstart-gate.yml`), so during an RC cycle README pins
+    `0.8.0-rc.1` — and this gate answered with "README.md pins a malformed
+    autumn-cli version", checked ZERO pins, and failed CI at the exact moment a
+    release was being cut. A gate that breaks the release process it exists to
+    protect is worse than one that does not run.
+    """
+    for separator in ('-', '+'):
+        head, found, _ = version.partition(separator)
+        if found:
+            version = head
+    return version
+
+
 def triple(text):
-    """`x.y.z` as a tuple, or None. Anything else is not a release version."""
-    parts = text.split('.')
+    """`x.y.z` as a tuple, or None. Anything else is not a release version.
+
+    Prerelease and build metadata are stripped first, so `0.8.0-rc.1` is the
+    0.8 line exactly as `0.8.0` is.
+    """
+    parts = core(text).split('.')
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
         return None
     return tuple(int(p) for p in parts)
 
 
 def series(version):
-    """`0.7.0` -> `0.7`. The release LINE, which is what a pin usually names."""
-    major, minor = version.split('.')[:2]
+    """`0.7.0` -> `0.7`. The release LINE, which is what a pin usually names.
+
+    Metadata is stripped first, so an RC reports its own line (`0.8.0-rc.1` ->
+    `0.8`) rather than a suffix fragment.
+    """
+    major, minor = core(version).split('.')[:2]
     return f'{major}.{minor}'
 
 
@@ -632,8 +662,15 @@ def requirement(spec):
         spec = head
     if not spec[:1].isdigit():
         return None
+    # A PRERELEASE requirement is a real pin: Cargo accepts `0.6.0-beta.1`, and
+    # this repo's release machinery cuts release candidates
+    # (`QUICKSTART_CLI_VERSION`). Its line is its core, so the metadata is
+    # dropped for the comparison while `spec` keeps the page's own spelling for
+    # the report and for waiver matching. Refusing it was the same silent pass
+    # the wildcard forms above were: `requirement()` returns None, so the pin is
+    # never yielded and nothing is ever judged.
+    parts = core(spec).split('.')
     # Anything left that `acceptable()` could not judge would pass silently.
-    parts = spec.split('.')
     if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
         return None
     return spec
@@ -1036,7 +1073,11 @@ def acceptable(version, cap, allow_older):
     Returns None when `version` is not a release version at all, which is not
     something this gate has an opinion about.
     """
-    parts = version.split('.')
+    # Compared on the CORE, so a prerelease is judged by the line it belongs to
+    # — `0.7.0-rc.1` is the 0.7 line. Splitting the raw spelling instead left a
+    # two-component prerelease (`0.6-beta`) matching neither branch and falling
+    # out as None, which `check()` passes.
+    parts = core(version).split('.')
     if len(parts) == 2 and all(p.isdigit() for p in parts):
         got = (int(parts[0]), int(parts[1]))
         return got <= cap[:2] if allow_older else got == cap[:2]
@@ -1379,6 +1420,30 @@ def self_test():
     expect('single declaration reports once',
            list(pins(fenced('[dependencies]', 'autumn-web = "0.5"'))),
            [(3, 'autumn-web', '0.5')])
+
+    # ---- prereleases, which this repo's release machinery actually cuts ----
+    expect('core strips a prerelease', core('0.6.0-beta.1'), '0.6.0')
+    expect('core strips build metadata', core('0.7.0+build.5'), '0.7.0')
+    expect('core leaves a plain version', core('0.7.0'), '0.7.0')
+    expect('triple reads an rc', triple('0.8.0-rc.1'), (0, 8, 0))
+    expect('series reads an rc', series('0.8.0-rc.1'), '0.8')
+    # The spelling survives for the report and for waiver matching.
+    expect('prerelease keeps its spelling',
+           requirement('0.6.0-beta.1'), '0.6.0-beta.1')
+    expect('stale prerelease is refused',
+           acceptable(requirement('0.6.0-beta.1'), (0, 7, 0),
+                      allow_older=False), False)
+    expect('current-line prerelease passes',
+           acceptable(requirement('0.7.0-rc.1'), (0, 7, 0),
+                      allow_older=False), True)
+    # A two-component prerelease matched neither branch before `core` was
+    # applied on both sides, and fell out as an unjudgeable None.
+    expect('two-component prerelease is judged',
+           acceptable(requirement('0.6-beta'), (0, 7, 0), allow_older=False),
+           False)
+    expect('prerelease pin is read',
+           list(pins(fenced('autumn-web = "0.6.0-beta.1"'))),
+           [(2, 'autumn-web', '0.6.0-beta.1')])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
