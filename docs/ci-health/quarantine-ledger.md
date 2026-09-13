@@ -137,16 +137,30 @@ _None as of 2026-09-05._
   restoring `MinIO::default()` without `.with_name(...)` would reproduce
   the identical 404 immediately.
 - **Closed**: 2026-09-12, pending this PR's own CI run for the CI-native
-  confirmation noted above (🚦 Semaphore). **Confirmed 2026-09-13**: PR
-  #2740's own `Test (Docker)` check run (job 103543584136, part of workflow
-  run 34688787858) completed `success` at 2026-09-12T11:55:09Z — the real
-  pull against `quay.io/minio/minio` that could not be exercised in this
-  sandbox has now been exercised by CI itself. This entry's fix is
-  CI-natively verified, not just locally clippy-clean. See the new escape
-  entry immediately below for a coordination defect this fix's merge
-  timing collided with (independent, not a defect in the fix itself).
+  confirmation noted above (🚦 Semaphore). **Confirmed 2026-09-13, then
+  scope-corrected same day (post-review, via a Codex review comment on PR
+  #2768): CI-native verification covers only two of the three fixed
+  files, not "this entry's fix" as a whole.** PR #2740's own `Test
+  (Docker)` check run (job 103543584136, part of workflow run
+  34688787858) completed `success` at 2026-09-12T11:55:09Z, and that run
+  does exercise the real `quay.io/minio/minio` pull for
+  `autumn-cli/tests/integration/offsite_backup.rs` (via the `autumn-cli`
+  Docker sweep) and `autumn/tests/integration/sqlite_replication_s3.rs`
+  (via the `autumn` Docker sweep) — both confirmed CI-natively, not just
+  locally clippy-clean. **`examples/reddit-clone/tests/avatar_s3_integration.rs`
+  is not part of either sweep** (per this repo's own `AGENTS.md`: only the
+  `autumn` consolidated `integration_tests` binary and `autumn-cli`'s
+  `cli_tests` binary are swept for `#[ignore]`d Docker tests; a separate
+  example crate's own test target is reached by neither, and `ci.yml` has
+  no dedicated job for it either — confirmed by grep, no match), so its
+  `avatar_blob_store_roundtrip` test's actual registry pull remains
+  compile-and-clippy-verified only, not CI-exercised, regardless of how
+  many times this file was subsequently touched by the escape below. See
+  the new escape entry immediately below for a coordination defect this
+  fix's merge timing collided with (independent, not a defect in the fix
+  itself).
 
-### Escape: four independent fixes for the same MinIO/Docker-Hub outage collided at merge, needing two reconciliation commits — ~8.4h of spurious Lint failures on 5 branches
+### Escape: four independent fixes for the same MinIO/Docker-Hub outage collided at merge, needing two reconciliation commits — ~8.3h of spurious Lint failures (two disjoint intervals) on 5 branches
 
 - **Correction (post-review, via a Codex review comment on PR #2768): the
   original version of this entry named the wrong commits and the wrong
@@ -195,6 +209,22 @@ _None as of 2026-09-05._
   are other sessions' own independent attempts at fixing the outage
   itself, a different category of evidence. Reduced to the 5 branches
   actually confirmed by job-log inspection.
+- **Fourth correction (post-review, via two further Codex review comments
+  on PR #2768): the lint fallout is two disjoint intervals, not one
+  continuous window, and #2740's CI-native verification (above) does not
+  cover all three files it touched.** Checked directly against the tree
+  at each intermediate commit: `avatar_s3_integration.rs`'s dead-code seed
+  (from #2743) was fixed by #2725 at 23:19:07Z, and `offsite_backup.rs`'s
+  competing `minio_image()` helper was not introduced until #2720 at
+  23:22:06Z — so the tree was briefly, fully dead-code-free for those ~3
+  minutes in between, not continuously broken from #2743 to #2756. The
+  true accounting is two intervals: 17:46:17Z–23:19:07Z (~5h33m, the
+  `MINIO_IMAGE`-unused signature only) and 23:22:06Z–02:09:18Z (~2h47m,
+  the `minio_image()`-unused signature only), totaling ~8.3h, not one
+  continuous ~8.4h span. Separately: the MinIO/Quay entry's "CI-natively
+  verified" note (above) has been scope-corrected — `avatar_s3_integration.rs`'s
+  test is outside both Docker sweeps and was never actually run by that
+  green `Test (Docker)` job.
 - **Not a flake, not a product bug — a coordination gap.** The same
   universally-visible `ci.yml` failure (every `Test (Docker)` run 404ing
   on the dead `minio/minio` Docker Hub repository, regardless of a PR's
@@ -233,7 +263,9 @@ _None as of 2026-09-05._
     23:22:06Z, one minute after #2722): independently introduced a
     **second, competing** `minio_image()` helper in the same file,
     duplicating `start_minio()`'s purpose with a different tag-pinning
-    strategy, and left it uncalled (dead code) — the second signature.
+    strategy, and left it uncalled (dead code) — the second signature,
+    **reopening the fallout window three minutes after #2725 (below)
+    had briefly closed it**.
 
   **Reconciliation commits, reacting to the above collision rather than
   independently diagnosing the outage (2):**
@@ -242,12 +274,14 @@ _None as of 2026-09-05._
     merge from trunk-dev introduced**", 23:19:07Z): wired
     `avatar_s3_integration.rs`'s call site to #2743's constant, closing
     that file's dead-code gap — its own message names this as repairing
-    merge-introduced dead code, not a fresh diagnosis.
+    merge-introduced dead code, not a fresh diagnosis. **This closes the
+    first interval**: at this commit the whole tree is briefly
+    dead-code-free (`offsite_backup.rs` had neither helper yet).
   - **#2756** (`a7c7c46`, 2026-09-13T02:09:18Z, 9h05 after #2740): removed
     the uncalled `minio_image()` from #2720, keeping `start_minio()`. Its
-    own diff touches nothing but that deletion. **This is where the
-    lint-fallout window actually ends** — confirmed against the tree at
-    this commit: `start_minio()` has two live callers, `MINIO_IMAGE` is
+    own diff touches nothing but that deletion. **This closes the second
+    interval, ending the fallout for good** — confirmed against the tree
+    at this commit: `start_minio()` has two live callers, `MINIO_IMAGE` is
     wired into the avatar test, no unused helper remains. Zero dead code.
 
   **Later, unrelated to either the collision or its cleanup:**
@@ -272,10 +306,11 @@ _None as of 2026-09-05._
   and `minio_image_pulls_from_the_public_registry` passes — one source of
   truth, no dead code, regression-guarded. This describes the current
   state, not the fallout's resolution point (#2756, above).
-- **Impact, measured**: sampling `ci.yml` `pull_request` runs from
-  2026-09-12T17:46:17Z (the #2743 merge, first dead-code seed) to
-  2026-09-13T02:09:18Z (the #2756 merge, where the tree is first
-  confirmed clean) — roughly 8.4 hours — found the same `-D dead-code`
+- **Impact, measured**: sampling `ci.yml` `pull_request` runs across the
+  two disjoint fallout intervals — 2026-09-12T17:46:17Z (#2743, first
+  dead-code seed) to 23:19:07Z (#2725, briefly clean), and 23:22:06Z
+  (#2720, reopened) to 2026-09-13T02:09:18Z (#2756, clean for good) —
+  roughly 8.3 hours combined — found the same `-D dead-code`
   `Lint` failure on 5 distinct, unrelated WIP branches (confirmed by job
   log inspection, not inferred from branch name): `claude/friendly-ritchie-uw76a2`,
   `claude/tender-galileo-6f3dr7`, `claude/epic-clarke-8nbaes`,
@@ -598,8 +633,9 @@ without also filling in the intake form above.
   it (macOS half only, `samples: "20"`) stands unchanged from the
   2026-09-10 pass.
 - **2026-09-13 update — 5th consecutive pass, harness still undispatched;
-  zero new organic hits on any of the three tracked signatures in the
-  sampled window.** Sampled `ci.yml` `pull_request` runs from roughly
+  zero new organic hits on any of the four tracked tests (`live_upgrade`'s
+  three signatures included, six signatures total) in the sampled
+  window.** Sampled `ci.yml` `pull_request` runs from roughly
   2026-09-12T13:58Z to 2026-09-13T09:02Z (~19 hours, ~130+ runs spanning
   both pages of the query). Every failure in that window attributed to
   one of: the pre-existing MinIO/Docker-Hub outage (pre-#2740, before

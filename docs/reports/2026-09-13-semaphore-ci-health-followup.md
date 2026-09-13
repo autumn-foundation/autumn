@@ -42,15 +42,35 @@ branches (`fix/reddit-clone-minio-*`, `fix/minio-quay-registry`) that are
 actually other sessions' own outage-fix attempts, not dead-code victims;
 corrected to the 5 branches actually confirmed by job-log inspection.
 
+**Fourth correction (post-review, via two further Codex review comments on
+PR #2768):** (1) the lint fallout is actually **two disjoint intervals**,
+not one continuous window: `avatar_s3_integration.rs`'s dead-code seed was
+fixed by #2725 at 23:19:07Z, and `offsite_backup.rs`'s competing
+`minio_image()` helper was not introduced until #2720 at 23:22:06Z — so the
+tree was briefly, fully dead-code-free for about 3 minutes in between.
+Corrected to two intervals (17:46:17Z–23:19:07Z, ~5h33m, and
+23:22:06Z–02:09:18Z, ~2h47m) totaling ~8.3h, not one continuous ~8.4h span.
+(2) PR #2740's green `Test (Docker)` run verifies the Quay redirect only for
+the two files reached by this repo's Docker sweeps
+(`offsite_backup.rs`, `sqlite_replication_s3.rs`); `avatar_s3_integration.rs`'s
+own test is outside both sweeps (confirmed against `AGENTS.md` and a
+repo-wide search of `ci.yml` — no match) and was never actually run by that
+job, so calling the whole fix "CI-natively verified" overstated it. (3) The
+"four actively-tracked flaky signatures" phrase below is ambiguous: there
+are four tracked *tests*, but `live_upgrade` alone carries three distinct
+signatures, for six signatures total — reworded below.
+
 Follow-up to `docs/reports/2026-09-11-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. No fix PR from
 this pass — the one substantive finding (a merge-time collision among several
 independently-authored fixes for the same outage) had already fully resolved
 itself on `trunk-dev` before this pass began; what remains is recording it
 accurately as escape-analysis evidence per this role's own evidentiary tiers.
-The other finding is confirmation, not a new defect: PR #2740's own
-`Test (Docker)` run (previously "pending") completed successfully, so that
-fix is now CI-natively verified rather than merely clippy-clean.
+The other finding is confirmation, not a new defect (with a scope caveat):
+PR #2740's own `Test (Docker)` run (previously "pending") completed
+successfully, CI-natively verifying the fix for the two files reached by
+this repo's Docker sweeps — not the third file, which no CI job actually
+runs (see the fourth correction above).
 
 ## 🎯 Verdict path
 
@@ -76,8 +96,9 @@ non-cancelled failure by job/log inspection rather than by branch name:
   with the original Docker-Hub-repository-gone panic — the same outage
   #2740 fixed 75 minutes later. Not new.
 - **A merge-time collision among four independent fixes for that same
-  outage produced ~8.4 hours of spurious `Lint`/`Clippy` dead-code
-  failures on 5 unrelated branches, needing two further reconciliation
+  outage produced ~8.3 hours of spurious `Lint`/`Clippy` dead-code
+  failures, across two disjoint intervals, on 5 unrelated branches,
+  needing two further reconciliation
   commits to fully clean up.** The same universally-visible failure
   (every `Test (Docker)` run 404ing on the dead `minio/minio` Docker Hub
   repository, regardless of a PR's own diff) was independently
@@ -98,10 +119,13 @@ non-cancelled failure by job/log inspection rather than by branch name:
   independently diagnosing anything: #2725 (an unrelated `autumn upgrade`
   codemod PR, sub-commit explicitly titled "fix: use the MINIO_IMAGE
   const **the merge from trunk-dev introduced**," 23:19:07Z) wired
-  #2743's constant into its call site; #2756 (2026-09-13T02:09:18Z, 9h05
-  after #2740) deleted #2720's uncalled helper — its diff touches nothing
-  else. **The tree is confirmed dead-code-free at #2756**, ending the
-  fallout window there. #2729 (a large, unrelated wire-contracts feature
+  #2743's constant into its call site — landing *before* #2722/#2720, so
+  the tree was briefly, fully dead-code-free for about 3 minutes
+  (23:19:07Z–23:22:06Z: `avatar_s3_integration.rs` already fixed, and
+  `offsite_backup.rs` had neither helper yet); #2756
+  (2026-09-13T02:09:18Z, 9h05 after #2740) deleted #2720's uncalled
+  helper — its diff touches nothing else, and this is where the tree is
+  clean for good. #2729 (a large, unrelated wire-contracts feature
   PR whose long-lived branch had merged `trunk-dev` three times over the
   same window and picked up a MinIO fix each time) merged 21 minutes
   later, at 02:30:05Z, but that is a subsequent refactor of the
@@ -138,9 +162,10 @@ non-cancelled failure by job/log inspection rather than by branch name:
   `claude/happy-edison-fstb1z` `Clippy` churn (9 runs, one person iterating
   on not-yet-fixed lint issues) continued. None of these are cross-branch
   or environment-dependent.
-- **Zero hits on any of the four actively-tracked flaky signatures**
-  (`live_upgrade`'s three signatures, `cache_stampede`, `sim_fault_plan`,
-  `job_tracking_stores_integration`) in the sampled window.
+- **Zero hits on any of the four actively-tracked flaky tests** —
+  `live_upgrade` (three distinct signatures), `cache_stampede`,
+  `sim_fault_plan`, `job_tracking_stores_integration` (six signatures
+  total) — in the sampled window.
 
 ## 🔍 Diagnosis
 
@@ -163,9 +188,13 @@ own correctness was ever in question: the failures were exclusively
 
 PR #2740's own `Test (Docker)` check (job 103543584136, workflow run
 34688787858) completed `success` at 2026-09-12T11:55:09Z, which the
-2026-09-12 ledger entry had flagged as still-pending. That closes the loop:
-the Quay redirect is now CI-natively verified, not merely `clippy`-clean
-locally.
+2026-09-12 ledger entry had flagged as still-pending. That closes the loop
+for `offsite_backup.rs` and `sqlite_replication_s3.rs` — both reached by this
+repo's Docker sweeps, so the Quay redirect is now CI-natively verified for
+those two, not merely `clippy`-clean locally. `avatar_s3_integration.rs`'s
+own test sits outside both sweeps and outside any other `ci.yml` job
+(confirmed by a repo-wide grep and against `AGENTS.md`'s own description of
+sweep scope), so its registry pull remains compile-and-lint-verified only.
 
 ## 🔧 Treatment
 
@@ -177,17 +206,20 @@ found via triage is filed/recorded rather than silently noted and moved
 past.
 
 - `docs/ci-health/quarantine-ledger.md` updated:
-  - Closed the MinIO/Quay entry's pending CI-native verification (confirmed
-    success).
+  - Closed the MinIO/Quay entry's pending CI-native verification, then
+    scope-corrected it to name exactly the two files that verification
+    actually covers.
   - Added a new "Escape" entry documenting the four-PR collision and its
-    two reconciliation commits, the measured ~8.4h blast radius (5
-    confirmed branches, 2 failure signatures), the actual per-commit
-    resolution chronology, and the coordination-gap mechanism
-    classification — then corrected that same entry three times, same
-    day, after Codex review comments caught first the misattributed
+    two reconciliation commits, the measured ~8.3h blast radius across
+    two disjoint intervals (5 confirmed branches, 2 failure signatures),
+    the actual per-commit resolution chronology, and the coordination-gap
+    mechanism classification — then corrected that same entry four times,
+    same day, after Codex review comments caught first the misattributed
     commits, then the window's wrong end-commit, then the conflation of
     independent diagnoses with reactive cleanups and an overstated branch
-    count (see the correction notes at the top of this report).
+    count, then the single-continuous-window overstatement and the
+    verification-scope overstatement (see the correction notes at the top
+    of this report).
   - Added a 2026-09-13 dated update to the `live_upgrade` entry (5th
     consecutive pass, harness still at 0 dispatches, ~90h idle, zero new
     hits on any tracked signature in this pass's window) and to the
@@ -208,8 +240,8 @@ No rerun campaign this pass — organic sampling plus one escape write-up.
 
 | Item | This pass | Status |
 |---|---|---|
-| MinIO/Quay fix (#2740) | CI-native `Test (Docker)` run confirmed success | Closed, fully verified |
-| MinIO-fix collision escape (4 diagnoses + 2 reconciliations) | ~8.4h window, 5 branches, 2 signatures, all `Lint`-only | Closed — resolved before this pass began; ledger attribution, window end-point, and diagnosis/cleanup split all corrected same-day per Codex review |
+| MinIO/Quay fix (#2740) | CI-native `Test (Docker)` run confirmed success | Closed — verified for the 2 files reached by the Docker sweeps; `avatar_s3_integration.rs` remains compile/lint-only |
+| MinIO-fix collision escape (4 diagnoses + 2 reconciliations) | ~8.3h across 2 disjoint intervals, 5 branches, 2 signatures, all `Lint`-only | Closed — resolved before this pass began; ledger attribution, window structure, verification scope, and diagnosis/cleanup split all corrected same-day per Codex review |
 | `live_upgrade` (3 signatures) | 0 new hits in ~19h window | Unchanged; harness still undispatched, 5th day |
 | `cache_stampede` | 0 new hits | Unchanged, undiagnosed |
 | `sim_fault_plan` | 0 new hits | Unchanged, undiagnosed |
