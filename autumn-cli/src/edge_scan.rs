@@ -2091,6 +2091,13 @@ fn path_attribute_module_paths(
     collect_rs_files(&project_root.join("src"), &mut files);
     files.sort();
     let mut overrides: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+    // Every CONVENTIONAL (non-`#[path]`) out-of-line `mod name;`
+    // declaration found across the whole `src/` tree, alongside the real
+    // file it resolves to. Collected in this same pass so a SECOND pass
+    // (below) can find, for each `#[path]`-aliased target already in
+    // `overrides`, any ALSO-conventionally-reachable identity for that
+    // same physical file.
+    let mut conventional_declarations: Vec<(String, String, Vec<String>)> = Vec::new();
     for declaring_file in &files {
         let Ok(src) = std::fs::read_to_string(declaring_file) else {
             continue;
@@ -2107,38 +2114,69 @@ fn path_attribute_module_paths(
         let found = out_of_line_mod_declarations(&ast.items, default_features);
         let declaring_dir = declaring_file.parent().unwrap_or(declaring_file);
         for (inline, name, path_value) in found {
-            let Some(path_value) = path_value else {
-                continue;
-            };
-            // A `#[path]` override nested inside an INLINE module resolves
-            // relative to the DIRECTORY THAT MODULE PATH IMPLIES, not the
-            // declaring file's own physical directory — verified directly:
-            // `mod api { #[path = "actual.rs"] mod handlers; }` in
-            // `src/lib.rs` compiles by finding `src/api/actual.rs`, never
-            // `src/actual.rs`. Same rule an ordinary out-of-line `mod
-            // handlers;` (no `#[path]`) already follows via
-            // `resolve_out_of_line_module_file`'s own `dir_segments`
-            // accumulation — this mirrors it by folding each inline
-            // segment in as a subdirectory before joining the attribute's
-            // own value (Codex review on #2739, round 33, P2).
-            let inline_dir = inline
-                .iter()
-                .fold(declaring_dir.to_path_buf(), |dir, segment| {
-                    dir.join(segment)
-                });
-            let target_file = lexically_normalize_path(&inline_dir.join(&path_value));
-            let target_rel = target_file
-                .strip_prefix(project_root)
-                .unwrap_or(&target_file)
-                .to_string_lossy()
-                .replace('\\', "/");
             let mut module_path = base_module_path.clone();
-            module_path.extend(inline);
-            module_path.push(name);
-            overrides
-                .entry(target_rel)
-                .or_default()
-                .push((crate_root.clone(), module_path));
+            module_path.extend(inline.iter().cloned());
+            module_path.push(name.clone());
+            if let Some(path_value) = path_value {
+                // A `#[path]` override nested inside an INLINE module resolves
+                // relative to the DIRECTORY THAT MODULE PATH IMPLIES, not the
+                // declaring file's own physical directory — verified directly:
+                // `mod api { #[path = "actual.rs"] mod handlers; }` in
+                // `src/lib.rs` compiles by finding `src/api/actual.rs`, never
+                // `src/actual.rs`. Same rule an ordinary out-of-line `mod
+                // handlers;` (no `#[path]`) already follows via
+                // `resolve_out_of_line_module_file`'s own `dir_segments`
+                // accumulation — this mirrors it by folding each inline
+                // segment in as a subdirectory before joining the attribute's
+                // own value (Codex review on #2739, round 33, P2).
+                let inline_dir = inline
+                    .iter()
+                    .fold(declaring_dir.to_path_buf(), |dir, segment| {
+                        dir.join(segment)
+                    });
+                let target_file = lexically_normalize_path(&inline_dir.join(&path_value));
+                let target_rel = target_file
+                    .strip_prefix(project_root)
+                    .unwrap_or(&target_file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                overrides
+                    .entry(target_rel)
+                    .or_default()
+                    .push((crate_root.clone(), module_path));
+            } else if let Some(target_file) = resolve_out_of_line_module_file(
+                &project_root.join("src"),
+                &{
+                    let mut dir_segments = base_module_path.clone();
+                    dir_segments.extend(inline);
+                    dir_segments
+                },
+                &name,
+            ) {
+                let target_rel = target_file
+                    .strip_prefix(project_root)
+                    .unwrap_or(&target_file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                conventional_declarations.push((target_rel, crate_root.clone(), module_path));
+            }
+        }
+    }
+    // A file reached both conventionally (`mod handlers;`) AND via a
+    // `#[path]` alias (`#[path = "handlers.rs"] mod alias;`) is compiled
+    // under BOTH names by real Rust — verified directly via a real build.
+    // `overrides` above only ever recorded the alias side; add the
+    // conventional identity too, but ONLY for a target that already has an
+    // alias recorded (this loop, not the one above, is where a plain,
+    // never-aliased file's identity is decided — leaving it to the
+    // ordinary walk's own `crate_context_from_file` guess, unchanged, so
+    // this fix cannot touch the vast majority of files that have nothing
+    // to do with `#[path]` at all) (Codex review on #2739, round 45, P2).
+    for (target_rel, crate_root, module_path) in conventional_declarations {
+        if let Some(identities) = overrides.get_mut(&target_rel)
+            && !identities.contains(&(crate_root.clone(), module_path.clone()))
+        {
+            identities.push((crate_root, module_path));
         }
     }
     overrides
@@ -3261,6 +3299,21 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                 // review on #2739, round 44, P2).
                 if i > 0
                     && matches!(trees.get(i - 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                {
+                    i += 1;
+                    continue;
+                }
+                // An async block used in the condition or scrutinee (`if
+                // async { predicate().await }.await { .. }`, real, valid
+                // Rust — verified directly via a real build) has its OWN
+                // brace group immediately preceded by the `async` keyword
+                // itself, before the real body's own brace arrives later.
+                // A genuine body's own opening brace is never itself
+                // preceded by the literal keyword `async` in valid Rust
+                // grammar (there is no "async if"), so this cannot misfire
+                // on a real body either (Codex review on #2739, round 45,
+                // P2).
+                if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "async")
                 {
                     i += 1;
                     continue;
@@ -8839,5 +8892,93 @@ mod tests {
         );
         assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
         assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// An async block used in the condition or scrutinee (`if async {
+    /// predicate().await }.await { .. }`) has its OWN brace group
+    /// immediately preceded by the `async` keyword itself — verified
+    /// directly via a real build. The round-44 fix for a macro's own brace
+    /// (preceded by `!`) didn't cover this shape, so a cfg'd-out `if` with
+    /// an async-block condition let the real body's own `edge_routes![show]`
+    /// get credited as a separate, live statement (Codex review on #2739,
+    /// round 45, P2).
+    #[test]
+    fn cfg_false_if_with_async_block_condition_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            async fn predicate() -> bool { true }
+
+            async fn wire() {
+                #[cfg(feature = "premium")]
+                if async { predicate().await }.await {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// A file reached both conventionally (`mod handlers;`) AND via a
+    /// `#[path]` alias (`#[path = "handlers.rs"] mod alias;`) is compiled
+    /// under BOTH names by real Rust — verified directly via a real build.
+    /// `path_attribute_module_paths` previously recorded only the alias
+    /// identity for such a file, so the conventional registration
+    /// (`edge_routes![crate::handlers::show]`) never matched (Codex review
+    /// on #2739, round 45, P2).
+    #[test]
+    fn resolve_edge_scan_keeps_the_conventional_identity_beside_a_path_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            mod handlers;
+            #[path = "handlers.rs"]
+            mod alias;
+            fn wire() {
+                edge_routes![crate::handlers::show];
+                edge_routes![crate::alias::show];
+            }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/handlers.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let module_paths: BTreeSet<Vec<String>> = scan
+            .functions
+            .iter()
+            .map(|f| f.module_path.clone())
+            .collect();
+        assert!(
+            module_paths.contains(&vec!["handlers".to_owned()]),
+            "{module_paths:?}"
+        );
+        assert!(
+            module_paths.contains(&vec!["alias".to_owned()]),
+            "{module_paths:?}"
+        );
     }
 }
