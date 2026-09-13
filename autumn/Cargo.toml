@@ -574,6 +574,17 @@ required-features = ["db"]
 name = "csrf_verify"
 harness = false
 
+# Bot-protection / CAPTCHA workload for profilers: drives real GET traffic
+# through `security::BotProtectionService`'s safe-method exempt branch — the
+# branch every GET takes when bot protection is enabled — so its per-request
+# cost is attributable in a profiler. Does not exercise the token-verification
+# path (no `AutumnConfig`-driven way to inject a non-network-calling provider
+# there; see the file header for detail). Asserts nothing — see the file
+# header for the exact commands.
+[[bench]]
+name = "captcha_check"
+harness = false
+
 # Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
 # drives real GET traffic through a `#[throttle]`-guarded handler and an
 # identical unthrottled handler, interleaved, so a profiler can attribute the
