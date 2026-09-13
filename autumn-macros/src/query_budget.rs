@@ -1409,6 +1409,26 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_is_lazy_db(&r.expr),
             Expr::Paren(p) => self.expr_is_lazy_db(&p.expr),
             Expr::Group(g) => self.expr_is_lazy_db(&g.expr),
+            Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_lazy_db(&u.expr),
+            // A `LazyDb` selected through a conditional is still a `LazyDb`:
+            // `let selected = if flag { first } else { second };`. Sound for
+            // the same reason `expr_is_handle`'s identical shape is — real
+            // Rust requires every arm of a value-producing `if`/`match` to
+            // share one type, so if any arm is `LazyDb`, every reachable arm
+            // is (Codex review, PR #2762, round 5). Deliberately still omits
+            // `Expr::Try`/`Expr::MethodCall`/`Expr::Field`: those recognize a
+            // handle from a *name convention* with no type behind it
+            // (`HANDLE_ACCESSORS`, `member_is_handle_accessor`), which can
+            // say "some handle" but never "specifically `LazyDb`."
+            Expr::If(i) => {
+                self.block_tail_is_lazy_db(&i.then_branch)
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_is_lazy_db(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_lazy_db(&arm.body)),
+            Expr::Block(b) => self.block_tail_is_lazy_db(&b.block),
+            Expr::Unsafe(u) => self.block_tail_is_lazy_db(&u.block),
             _ => false,
         }
     }
@@ -1417,6 +1437,14 @@ impl Analyzer {
     fn block_tail_is_handle(&self, block: &Block) -> bool {
         match block.stmts.last() {
             Some(Stmt::Expr(expr, None)) => self.expr_is_handle(expr),
+            _ => false,
+        }
+    }
+
+    /// [`Self::block_tail_is_handle`]'s `lazy_db_names` counterpart.
+    fn block_tail_is_lazy_db(&self, block: &Block) -> bool {
+        match block.stmts.last() {
+            Some(Stmt::Expr(expr, None)) => self.expr_is_lazy_db(expr),
             _ => false,
         }
     }
@@ -2548,6 +2576,29 @@ mod tests {
             async fn h(lazy_db: LazyDb) -> AutumnResult<Markup> {
                 let selected;
                 selected = lazy_db;
+                let mut db = selected.checkout().await?;
+                let rows = posts::table.load(&mut *db).await?;
+                Ok(render(&rows))
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_selected_through_a_conditional_stays_tracked() {
+        // `expr_is_lazy_db` must mirror `expr_is_handle`'s `Expr::If`/
+        // `Expr::Match`/`Expr::Block` arms, not just `Expr::Path`/`Assign`:
+        // `let selected = if flag { first } else { second };` is sound to
+        // treat as `LazyDb` on *any* arm being one, the same way
+        // `expr_is_handle` already does for a generic handle — real Rust
+        // requires every arm of a value-producing `if` to share one type, so
+        // if either arm is `LazyDb`, both are (Codex review, PR #2762,
+        // round 5).
+        assert_clean(
+            "1",
+            r"
+            async fn h(first: LazyDb, second: LazyDb, flag: bool) -> AutumnResult<Markup> {
+                let selected = if flag { first } else { second };
                 let mut db = selected.checkout().await?;
                 let rows = posts::table.load(&mut *db).await?;
                 Ok(render(&rows))
