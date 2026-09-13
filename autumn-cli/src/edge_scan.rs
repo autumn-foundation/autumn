@@ -1785,12 +1785,30 @@ fn resolve_out_of_line_module_file(
 /// same way every other heuristic in this best-effort scanner accepts a
 /// narrower-than-Cargo's-own-semantics trade-off). A leading `..` with
 /// nothing to pop against is kept as-is rather than discarded.
+///
+/// Only pops when `out`'s LAST component is a real, `Normal` one — not
+/// merely non-empty. `PathBuf::pop()` alone can't tell "a real directory
+/// name to cancel against" from "an earlier unresolved `..` that was kept
+/// because it had nothing to pop against either": for `../../shared/lib.rs`,
+/// the first `..` has nothing to pop and is kept as-is, but the SECOND `..`
+/// would then happily pop that kept `..` off (a `PathBuf` popping its own
+/// last component regardless of what kind it is), lexically cancelling two
+/// components that don't actually cancel and normalizing to `shared/lib.rs`
+/// — a different file entirely from the one a real `rustc`/Cargo build
+/// resolves (Codex review on #2739, round 30, P2).
 fn lexically_normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if out.pop() => {}
+            std::path::Component::ParentDir
+                if matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) =>
+            {
+                out.pop();
+            }
             other => out.push(other),
         }
     }
@@ -1918,8 +1936,10 @@ fn attr_names_including_cfg_attr(
         let Some(name) = attr_name(attr) else {
             continue;
         };
-        if name == "cfg_attr" {
-            names.extend(cfg_attr_active_marker_names(attr, default_features));
+        if name == "cfg_attr"
+            && let syn::Meta::List(list) = &attr.meta
+        {
+            names.extend(cfg_attr_active_marker_names(list, default_features));
         } else {
             names.push(name);
         }
@@ -1927,12 +1947,18 @@ fn attr_names_including_cfg_attr(
     names
 }
 
-/// Parses `#[cfg_attr(condition, meta1, meta2, ...)]`'s payload into the
-/// condition's resolution — `None` for "unresolvable", the same convention
-/// [`eval_cfg_attr`] uses for a plain `#[cfg(...)]` — and its meta list
-/// (empty if the part after the condition fails to parse as one). `None`
-/// overall means `attr` isn't a `cfg_attr` with a payload shaped this way at
-/// all.
+/// Parses a `cfg_attr(condition, meta1, meta2, ...)` meta list's tokens into
+/// the condition's resolution — `None` for "unresolvable", the same
+/// convention [`eval_cfg_attr`] uses for a plain `#[cfg(...)]` — and its
+/// meta list (empty if the part after the condition fails to parse as one).
+/// `None` overall means the tokens aren't shaped like a `cfg_attr` payload
+/// at all (no top-level `,`).
+///
+/// Takes the raw `MetaList` rather than a whole `syn::Attribute` so this
+/// also works one level down, on a `cfg_attr(...)` meta NESTED inside
+/// another `cfg_attr`'s own payload (`#[cfg_attr(feature = "a",
+/// cfg_attr(feature = "b", edge))]` — real, valid Rust: rustc expands
+/// `cfg_attr` recursively, verified directly via a real build).
 ///
 /// Splits the raw tokens on the first top-level `,` by hand, rather than
 /// parsing `condition` and the rest through one combined `syn::parse::Parse`
@@ -1942,12 +1968,9 @@ fn attr_names_including_cfg_attr(
 /// every conservative "unresolvable stays visible" rule built on top of
 /// this.
 fn cfg_attr_payload(
-    attr: &syn::Attribute,
+    list: &syn::MetaList,
     default_features: &BTreeSet<String>,
 ) -> Option<(Option<bool>, Vec<syn::Meta>)> {
-    let syn::Meta::List(list) = &attr.meta else {
-        return None;
-    };
     let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
     let comma_index = tokens
         .iter()
@@ -1969,21 +1992,37 @@ fn cfg_attr_payload(
 
 /// The attribute names inside `#[cfg_attr(condition, meta1, meta2, ...)]`'s
 /// payload, once `condition` is resolved against `default_features` —
-/// empty when it definitely resolves false.
+/// empty when it definitely resolves false. Recurses into a NESTED
+/// `cfg_attr(...)` meta the same way — `#[cfg_attr(feature = "a",
+/// cfg_attr(feature = "b", edge))]` must surface `edge` once both
+/// conditions hold, not the literal name `cfg_attr` (Codex review on
+/// #2739, round 30, P1 — the direct, one-level `cfg_attr(cond, edge)` case
+/// was round 27's fix; this is the same gap one level deeper, which rustc
+/// itself expands just as readily).
 fn cfg_attr_active_marker_names(
-    attr: &syn::Attribute,
+    list: &syn::MetaList,
     default_features: &BTreeSet<String>,
 ) -> Vec<String> {
-    let Some((condition, metas)) = cfg_attr_payload(attr, default_features) else {
+    let Some((condition, metas)) = cfg_attr_payload(list, default_features) else {
         return Vec::new();
     };
     if condition == Some(false) {
         return Vec::new();
     }
-    metas
-        .iter()
-        .filter_map(|meta| meta.path().segments.last().map(|s| s.ident.to_string()))
-        .collect()
+    let mut names = Vec::new();
+    for meta in &metas {
+        let Some(name) = meta.path().segments.last().map(|s| s.ident.to_string()) else {
+            continue;
+        };
+        if name == "cfg_attr" {
+            if let syn::Meta::List(inner) = meta {
+                names.extend(cfg_attr_active_marker_names(inner, default_features));
+            }
+        } else {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Whether an active `#[cfg_attr(condition, cfg(inner_condition), ...)]`
@@ -1993,22 +2032,21 @@ fn cfg_attr_active_marker_names(
 /// directly: a real build of `#[cfg_attr(feature = "outer", cfg(feature =
 /// "inner"))] fn show() { ... }` with only `outer` enabled reports `show`
 /// as "configured out," rustc's own diagnostic naming the injected
-/// `cfg(...)` as the reason.
+/// `cfg(...)` as the reason. Recurses into a nested `cfg_attr(...)` meta
+/// the same way [`cfg_attr_active_marker_names`] does, for the identical
+/// reason.
 ///
-/// Both halves must be DEFINITE, matching this scan's standing conservative
-/// default everywhere else (only a PROVEN exclusion ever excludes): an
-/// unresolvable outer condition, or an unresolvable injected predicate,
-/// must not force an exclusion that might not be real — the opposite
-/// direction from [`cfg_attr_active_marker_names`], which stays
+/// Every condition along the way must be DEFINITE, matching this scan's
+/// standing conservative default everywhere else (only a PROVEN exclusion
+/// ever excludes): an unresolvable outer condition, or an unresolvable
+/// injected predicate, must not force an exclusion that might not be real —
+/// the opposite direction from [`cfg_attr_active_marker_names`], which stays
 /// conservative by keeping a marker VISIBLE on the same kind of
 /// uncertainty, since here the dangerous mistake is excluding a route that
 /// still compiles in, not crediting a phantom one (Codex review on #2739,
 /// round 29, P2).
-fn cfg_attr_injects_a_false_cfg(
-    attr: &syn::Attribute,
-    default_features: &BTreeSet<String>,
-) -> bool {
-    let Some((condition, metas)) = cfg_attr_payload(attr, default_features) else {
+fn cfg_attr_injects_a_false_cfg(list: &syn::MetaList, default_features: &BTreeSet<String>) -> bool {
+    let Some((condition, metas)) = cfg_attr_payload(list, default_features) else {
         return false;
     };
     if condition != Some(true) {
@@ -2018,9 +2056,11 @@ fn cfg_attr_injects_a_false_cfg(
         let syn::Meta::List(inner) = meta else {
             return false;
         };
-        inner.path.is_ident("cfg")
-            && syn::parse2::<CfgPredicate>(inner.tokens.clone())
-                .is_ok_and(|pred| !pred.eval(default_features))
+        if inner.path.is_ident("cfg") {
+            return syn::parse2::<CfgPredicate>(inner.tokens.clone())
+                .is_ok_and(|pred| !pred.eval(default_features));
+        }
+        inner.path.is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(inner, default_features)
     })
 }
 
@@ -2043,8 +2083,13 @@ fn edge_fn(
     // so does a `cfg(...)` injected by an ACTIVE `cfg_attr(...)` (Codex
     // review on #2739, round 29, P2).
     let cfg_excludes = attrs.iter().any(|attr| {
-        eval_cfg_attr(attr, default_features) == Some(false)
-            || cfg_attr_injects_a_false_cfg(attr, default_features)
+        if eval_cfg_attr(attr, default_features) == Some(false) {
+            return true;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
+        attr.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
     });
     if cfg_excludes {
         return None;
@@ -2410,22 +2455,12 @@ fn skip_leading_cfg_attrs(
     (excluded, i)
 }
 
-/// The forward mirror of [`skip_back_over_fn_modifiers`]: whether the item
-/// starting at `i` — after any leading attributes have already been
-/// skipped — is a `mod`/`fn`/`impl` (itself, or behind `pub`/`async`/
-/// `const`/`unsafe`/`extern "ABI"`, in whatever combination those allow).
-/// Those three are each handled by their own dedicated logic above, which
-/// looks BACKWARD from the keyword and already copes with modifiers in
-/// between; the generic statement-level cfg suppression this guards must
-/// defer to them rather than also claim the same statement.
-fn is_specially_handled_item(trees: &[TokenTree], mut i: usize) -> bool {
+/// The forward mirror of [`skip_back_over_fn_modifiers`]: the index right
+/// after any leading `pub`/`pub(...)`/`async`/`const`/`unsafe`/`extern
+/// "ABI"` modifiers starting at `i`, in whatever combination those allow.
+fn skip_forward_over_item_modifiers(trees: &[TokenTree], mut i: usize) -> usize {
     loop {
         match trees.get(i) {
-            Some(TokenTree::Ident(ident))
-                if matches!(ident.to_string().as_str(), "mod" | "fn" | "impl") =>
-            {
-                return true;
-            }
             Some(TokenTree::Ident(ident))
                 if matches!(
                     ident.to_string().as_str(),
@@ -2438,19 +2473,34 @@ fn is_specially_handled_item(trees: &[TokenTree], mut i: usize) -> bool {
                 if i >= 1 && matches!(&trees[i - 1], TokenTree::Ident(id) if id == "pub") {
                     i += 1;
                 } else {
-                    return false;
+                    break;
                 }
             }
             Some(TokenTree::Literal(_)) => {
                 if i >= 1 && matches!(&trees[i - 1], TokenTree::Ident(id) if id == "extern") {
                     i += 1;
                 } else {
-                    return false;
+                    break;
                 }
             }
-            _ => return false,
+            _ => break,
         }
     }
+    i
+}
+
+/// Whether the item starting at `i` — after any leading attributes have
+/// already been skipped — is a `mod`/`fn`/`impl` (itself, or behind any
+/// combination of [`skip_forward_over_item_modifiers`]'s modifiers). Those
+/// three are each handled by their own dedicated logic above, which looks
+/// BACKWARD from the keyword and already copes with modifiers in between;
+/// the generic statement-level cfg suppression this guards must defer to
+/// them rather than also claim the same statement.
+fn is_specially_handled_item(trees: &[TokenTree], i: usize) -> bool {
+    matches!(
+        trees.get(skip_forward_over_item_modifiers(trees, i)),
+        Some(TokenTree::Ident(ident)) if matches!(ident.to_string().as_str(), "mod" | "fn" | "impl")
+    )
 }
 
 /// If `trees[index]` begins one or more `#[...]` attributes that resolve to
@@ -2553,9 +2603,10 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
     Some(i)
 }
 
-/// The end of a semicolon-free block-like statement starting at `i`, or
-/// `None` when `trees[i..]` doesn't start one of these shapes at all (the
-/// caller then falls back to scanning for a top-level `;`).
+/// The end of a statement or item starting at `i` that this scan's generic
+/// scan-to-`;` fallback cannot correctly bound on its own, or `None` when
+/// `trees[i..]` doesn't start one of these shapes at all (the caller then
+/// falls back to that generic scan).
 ///
 /// Covers `if`/`match`/`while`/`loop`/`for`/`unsafe` (via
 /// [`control_flow_block_end`]); a bare, anonymous `const { ... }` block
@@ -2563,12 +2614,21 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
 /// compiles as a statement with no trailing `;` needed) — distinguished
 /// from an ordinary `const NAME: TYPE = ...;` ITEM by checking whether the
 /// very next token is a Brace group directly, since an item's own name
-/// always intervenes and a block never has one; and a labeled block or
-/// loop (`'label: { ... }`, `'label: loop { ... }`, `'label: while ... {
-/// ... }`, `'label: for ... in ... { ... }` — verified directly that a bare
-/// labeled block also compiles as a semicolon-free statement), which
-/// shares the exact same property as its unlabeled form and is folded in
-/// via the same two helpers (Codex review on #2739, round 28, P2).
+/// always intervenes and a block never has one; a labeled block or loop
+/// (`'label: { ... }`, `'label: loop { ... }`, `'label: while ... { ... }`,
+/// `'label: for ... in ... { ... }` — verified directly that a bare labeled
+/// block also compiles as a semicolon-free statement), which shares the
+/// exact same property as its unlabeled form and is folded in via the same
+/// two helpers (Codex review on #2739, round 28, P2); and a `struct`/
+/// `enum`/`union`/`trait` item (possibly behind `pub`/`pub(...)`, skipped
+/// via [`skip_forward_over_item_modifiers`]) via
+/// [`braced_or_semicolon_item_end`] — unlike everything else handled here,
+/// such an item does NOT always skip a trailing `;` (a tuple or unit
+/// struct still needs one), but it's included in this same dispatch
+/// because the naive scan-to-`;` fallback gets it wrong in the OTHER
+/// direction: a struct/enum/union/trait with a braced body has no `;` to
+/// find, so that fallback runs straight through it into the next,
+/// unrelated, still-real statement (Codex review on #2739, round 30, P2).
 fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usize> {
     if let Some(TokenTree::Ident(ident)) = trees.get(i) {
         match ident.to_string().as_str() {
@@ -2596,7 +2656,71 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
             _ => None,
         };
     }
+    let item_start = skip_forward_over_item_modifiers(trees, i);
+    if let Some(TokenTree::Ident(ident)) = trees.get(item_start)
+        && matches!(
+            ident.to_string().as_str(),
+            "struct" | "enum" | "union" | "trait"
+        )
+    {
+        return braced_or_semicolon_item_end(trees, item_start + 1);
+    }
     None
+}
+
+/// The end of a `struct`/`enum`/`union`/`trait` item's declaration starting
+/// right after its own keyword at `i`. A struct/enum/union with a braced
+/// body (`struct Foo { field: T }`), or a trait, ends at that brace with NO
+/// trailing `;`; a tuple struct (`struct Foo(T);`) or unit struct (`struct
+/// Foo;`) ends at a `;` instead — both shapes are handled here since the
+/// caller cannot know which one it's looking at without scanning.
+///
+/// Tracks angle-bracket depth the same way [`simple_impl_body_index`] does
+/// (a braced const-generic default in the item's own generics, or its
+/// implementing type, isn't mistaken for its body) and skips a `->` arrow
+/// as one atomic unit for the identical reason
+/// [`simple_fn_body_index`]'s return-type loop does (a `where T: Fn() ->
+/// U` clause on the item itself is scanned directly here; an associated
+/// function's own arrow, inside the item's body, is never reached — the
+/// body is nested inside the Brace group this loop simply returns at).
+fn braced_or_semicolon_item_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
+    let mut angle_depth: i32 = 0;
+    loop {
+        match trees.get(i) {
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace && angle_depth == 0 => {
+                return Some(i);
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == ';' && angle_depth == 0 => {
+                return Some(i);
+            }
+            Some(TokenTree::Punct(p))
+                if p.as_char() == '-'
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+            {
+                i += 2;
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
+                angle_depth += 1;
+                i += 1;
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == '>' => {
+                angle_depth -= 1;
+                if angle_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            Some(
+                TokenTree::Ident(_)
+                | TokenTree::Punct(_)
+                | TokenTree::Literal(_)
+                | TokenTree::Group(_),
+            ) => {
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// For `[<generics>] <Type>` or `[<generics>] <Trait> for <Type> [where
@@ -3122,6 +3246,58 @@ mod tests {
             &[],
         );
         assert_eq!(scan.names(), vec!["hello"]);
+    }
+
+    /// `#[cfg_attr(feature = "a", cfg_attr(feature = "b", edge))]` — rustc
+    /// expands `cfg_attr` recursively (verified directly via a real build:
+    /// with both features on, a function marked ONLY this way and denying
+    /// `dead_code` still compiles clean because the nested `allow` reached
+    /// it too) — but this scan previously only ever collected the
+    /// IMMEDIATE payload's meta names, so a nested `cfg_attr`'s own `edge`
+    /// was never discovered, just the literal name `cfg_attr` (Codex review
+    /// on #2739, round 30, P1).
+    #[test]
+    fn an_edge_marker_behind_a_nested_cfg_attr_is_found() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", edge))]
+            pub fn hello() {}
+            "#,
+            &["a", "b"],
+        );
+        assert_eq!(scan.names(), vec!["hello"]);
+    }
+
+    /// Same nesting, but only the OUTER condition holds — the inner
+    /// `cfg_attr` never activates, so its `edge` marker never applies
+    /// either.
+    #[test]
+    fn an_edge_marker_behind_a_nested_cfg_attr_with_only_the_outer_condition_on_is_not_found() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", edge))]
+            pub fn hello() {}
+            "#,
+            &["a"],
+        );
+        assert!(scan.is_empty(), "{:?}", scan.functions);
+    }
+
+    /// The same nesting fix applies to an injected `cfg(...)` exclusion,
+    /// not just a marker: `#[cfg_attr(feature = "a", cfg_attr(feature =
+    /// "b", cfg(feature = "c")))]` with `a`/`b` on and `c` off must still
+    /// exclude the function.
+    #[test]
+    fn an_edge_fn_with_a_nested_cfg_attr_injected_false_cfg_is_excluded() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", cfg(feature = "c")))]
+            #[edge]
+            pub fn hello() {}
+            "#,
+            &["a", "b"],
+        );
+        assert!(scan.is_empty(), "{:?}", scan.functions);
     }
 
     #[test]
@@ -3813,6 +3989,106 @@ mod tests {
         );
         assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
         assert_eq!(scan.unregistered()[0].name, "premium");
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// A cfg'd-out `struct` with a BRACED body has no trailing `;` — so the
+    /// generic scan-to-`;` fallback, having no way to know this item ends
+    /// at its own closing brace rather than a semicolon, would run right
+    /// through it into the next, unrelated, still-real
+    /// `edge_routes![show];` and consume that too (Codex review on #2739,
+    /// round 30, P2).
+    #[test]
+    fn cfg_false_struct_item_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                struct Premium {
+                    field: i32,
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// Same idea for `pub enum` (a visibility modifier before the item
+    /// keyword, exercising `skip_forward_over_item_modifiers`) and `trait`,
+    /// both also braced-body items with no trailing `;`.
+    #[test]
+    fn cfg_false_pub_enum_and_trait_items_do_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                pub enum Premium {
+                    A,
+                    B,
+                }
+                #[cfg(feature = "premium")]
+                trait PremiumTrait {
+                    fn method(&self);
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// A tuple struct (`struct Foo(T);`) or unit struct (`struct Foo;`)
+    /// DOES need a trailing `;`, unlike the braced-body form above —
+    /// `braced_or_semicolon_item_end` must still find it correctly rather
+    /// than mistaking the tuple's own parenthesized group for a Brace body
+    /// it isn't.
+    #[test]
+    fn cfg_false_tuple_and_unit_struct_items_do_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                struct Premium(i32);
+                #[cfg(feature = "premium")]
+                struct PremiumUnit;
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
         assert_eq!(
             scan.registered_fns().len(),
             1,
@@ -4724,6 +5000,21 @@ mod tests {
         assert_eq!(
             lexically_normalize_path(Path::new("../a/b")),
             Path::new("../a/b")
+        );
+    }
+
+    /// CONSECUTIVE leading `..` components must not cancel each other out —
+    /// `PathBuf::pop()` alone can't tell "a real directory name to cancel
+    /// against" from "an earlier unresolved `..` kept for lack of one," so
+    /// naively popping on `out.pop()`'s success wrongly cancelled the
+    /// second `..` against the first, normalizing `../../shared/lib.rs` to
+    /// `shared/lib.rs` — a different file entirely from the one a real
+    /// `rustc`/Cargo build resolves (Codex review on #2739, round 30, P2).
+    #[test]
+    fn lexically_normalize_path_keeps_consecutive_leading_parent_dir_components() {
+        assert_eq!(
+            lexically_normalize_path(Path::new("../../shared/lib.rs")),
+            Path::new("../../shared/lib.rs")
         );
     }
 
