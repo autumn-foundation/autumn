@@ -452,6 +452,112 @@ fn resolve_edge_scan(project_root: &Path) -> EdgeScan {
     resolve_edge_scan_with_extra_file(project_root, &[], None)
 }
 
+/// The ordinary `src/` walk's own file list, filtered against what the
+/// custom `[lib] path`/capsule `[[bin]] path` trees already scanned:
+/// `claimed` (from a custom `[lib] path`) is always excluded — that tree
+/// IS the one-and-only library, so there is no separate identity left to
+/// credit. `capsule_claimed` is more nuanced: a file the CAPSULE tree
+/// touched is not always capsule-exclusive, since real Rust independently
+/// compiles the same physical file twice when the capsule reaches it via
+/// an EXPLICIT `#[path]` alias to an otherwise-ordinary library file
+/// (`#[path = "../handlers.rs"] mod local_handlers;` in a capsule root,
+/// where `src/handlers.rs` is ALSO the library's own `mod handlers;`
+/// target) — verified directly via a real build. Unconditionally excluding
+/// it, as this scan previously did, dropped the library's own separate
+/// registration match entirely.
+///
+/// The exception in `capsule_aliased` is scoped to files reached via an
+/// explicit `#[path]` alias specifically, never the tree's own root or a
+/// CONVENTIONALLY resolved submodule: those two stay unconditionally
+/// excluded, preserving round 22's fix, where a capsule's own
+/// conventionally-reached `src/bin/` submodule must NOT also be scanned
+/// under the ordinary walk's `src/bin/` heuristic's own (there, phantom)
+/// identity for that same file (Codex review on #2739, round 44, P2).
+fn ordinary_walk_sources(
+    files: &[PathBuf],
+    project_root: &Path,
+    claimed: &BTreeSet<PathBuf>,
+    capsule_claimed: &BTreeSet<PathBuf>,
+    capsule_aliased: &BTreeSet<PathBuf>,
+) -> Vec<(String, String)> {
+    files
+        .iter()
+        .filter_map(|path| {
+            let rel = path
+                .strip_prefix(project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if claimed.contains(path.as_path()) {
+                return None;
+            }
+            if capsule_claimed.contains(path.as_path()) && !capsule_aliased.contains(path.as_path())
+            {
+                return None;
+            }
+            let src = std::fs::read_to_string(path).ok()?;
+            Some((rel, src))
+        })
+        .collect()
+}
+
+/// Scans each of `sources` under its own identity — an entry in
+/// `path_overrides`, when this file has one, otherwise
+/// [`crate_context_from_file`]'s ordinary directory-guessed identity.
+///
+/// A capsule-aliased file (`capsule_aliased`, from
+/// [`ordinary_walk_sources`]'s own doc) is scanned here for its SEPARATE,
+/// genuinely-independent library identity specifically, bypassing
+/// `path_overrides` even when it has an entry for this exact file:
+/// `path_overrides` was built by walking EVERY file under `src/`,
+/// including the capsule's own tree, so it ALSO independently recorded
+/// this exact file's override under the capsule's OWN identity (the same
+/// one `scan_bin_crate_tree` already credited it under, via `scan`'s
+/// caller). Consulting it here would credit that same wrong
+/// (capsule-relative) identity a second time instead of the ordinary
+/// walk's own natural guess (Codex review on #2739, round 44, P2).
+fn scan_ordinary_sources(
+    sources: &[(String, String)],
+    project_root: &Path,
+    table: Option<&toml::Table>,
+    path_overrides: &BTreeMap<String, Vec<(String, Vec<String>)>>,
+    capsule_aliased: &BTreeSet<PathBuf>,
+    default_features: &BTreeSet<String>,
+    scan: &mut EdgeScan,
+) {
+    let capsule_aliased_rel: BTreeSet<String> = capsule_aliased
+        .iter()
+        .map(|path| {
+            path.strip_prefix(project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
+    for (rel, src) in sources {
+        let path_override = if capsule_aliased_rel.contains(rel.as_str()) {
+            None
+        } else {
+            path_overrides.get(rel.as_str())
+        };
+        if let Some(identities) = path_override {
+            for (crate_root, module_path) in identities {
+                scan_source_with_context(
+                    rel,
+                    src,
+                    crate_root,
+                    module_path.clone(),
+                    default_features,
+                    scan,
+                );
+            }
+        } else {
+            scan_source(rel, src, table, default_features, scan);
+        }
+    }
+}
+
 /// Shared implementation behind [`resolve_edge_scan_with_extra_file`] (its
 /// own doc has the full picture — feature resolution, the `src/` walk, the
 /// custom-path cases): read the manifest once, resolve
@@ -491,6 +597,7 @@ fn resolve_edge_scan_impl(
         ..EdgeScan::default()
     };
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut capsule_claimed: BTreeSet<PathBuf> = BTreeSet::new();
 
     // A custom `[lib] path` (e.g. `src/app.rs`, `src/custom/app.rs`, or even
     // `lib/app.rs` outside `src/` entirely) IS this crate's library root, the
@@ -508,13 +615,9 @@ fn resolve_edge_scan_impl(
     if let Some(lib_path) = &custom_lib_path {
         let lib_file = project_root.join(lib_path);
         if lib_file.is_file() {
-            claimed.extend(scan_bin_crate_tree(
-                &lib_file,
-                project_root,
-                "",
-                &default_features,
-                &mut scan,
-            ));
+            let (touched, _aliased) =
+                scan_bin_crate_tree(&lib_file, project_root, "", &default_features, &mut scan);
+            claimed.extend(touched);
         }
     }
 
@@ -533,14 +636,17 @@ fn resolve_edge_scan_impl(
     // guard only ever bypassed this for a NON-conventional root, never
     // fixing this conventional-root case since the ordinary walk was
     // assumed sufficient for it).
+    let mut capsule_aliased: BTreeSet<PathBuf> = BTreeSet::new();
     if let Some(file) = capsule_bin_file {
-        claimed.extend(scan_bin_crate_tree(
+        let (touched, aliased) = scan_bin_crate_tree(
             file,
             project_root,
             "bin:edge-capsule",
             &default_features,
             &mut scan,
-        ));
+        );
+        capsule_claimed.extend(touched);
+        capsule_aliased.extend(aliased);
     }
 
     let mut files = Vec::new();
@@ -563,38 +669,25 @@ fn resolve_edge_scan_impl(
     // separable: `scan_sources` is the same entry point the unit tests drive
     // with inline sources. An unreadable file is skipped, like the sibling
     // scanners do.
-    let sources: Vec<(String, String)> = files
-        .iter()
-        .filter(|path| !claimed.contains(path.as_path()))
-        .filter_map(|path| {
-            let src = std::fs::read_to_string(path).ok()?;
-            let rel = path
-                .strip_prefix(project_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            Some((rel, src))
-        })
-        .collect();
+    let sources: Vec<(String, String)> = ordinary_walk_sources(
+        &files,
+        project_root,
+        &claimed,
+        &capsule_claimed,
+        &capsule_aliased,
+    );
 
     let sources_rel: BTreeSet<&str> = sources.iter().map(|(rel, _)| rel.as_str()).collect();
 
-    for (rel, src) in &sources {
-        if let Some(identities) = path_overrides.get(rel.as_str()) {
-            for (crate_root, module_path) in identities {
-                scan_source_with_context(
-                    rel,
-                    src,
-                    crate_root,
-                    module_path.clone(),
-                    &default_features,
-                    &mut scan,
-                );
-            }
-        } else {
-            scan_source(rel, src, table.as_ref(), &default_features, &mut scan);
-        }
-    }
+    scan_ordinary_sources(
+        &sources,
+        project_root,
+        table.as_ref(),
+        &path_overrides,
+        &capsule_aliased,
+        &default_features,
+        &mut scan,
+    );
     scan.files_scanned += sources.len();
 
     // A `#[path]` override can redirect to a file OUTSIDE `src/` entirely
@@ -2234,7 +2327,7 @@ fn scan_bin_crate_tree(
     crate_root: &str,
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
-) -> BTreeSet<PathBuf> {
+) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
     // A manifest-specified path (a custom `[lib] path` or `[[bin]] path`)
     // can spell its root with a `..` component (`"src/sub/../app.rs"`).
     // Unlike a `.` component, Rust's own `Path`/`PathBuf` equality does NOT
@@ -2272,6 +2365,7 @@ fn scan_bin_crate_tree(
     // the file for children-discovery purposes entirely (Codex review on
     // #2739, round 43, P2).
     let mut scanned_identities: BTreeSet<(PathBuf, Vec<String>)> = BTreeSet::new();
+    let mut aliased: BTreeSet<PathBuf> = BTreeSet::new();
     // A queued file's `resolution_base` is the directory ITS OWN top-level
     // (non-inline) out-of-line `mod name;` declarations resolve relative
     // to — kept as its own PHYSICAL value, separate from `module_path`
@@ -2344,14 +2438,14 @@ fn scan_bin_crate_tree(
             // threaded through the queue) folded with `nested`, never
             // `root_dir` + the full logical `dir_segments` — those only
             // coincide up to the first `#[path]` in the chain.
-            let (resolved, child_resolution_base) = path_value.map_or_else(
+            let (resolved, child_resolution_base, is_aliased) = path_value.map_or_else(
                 || {
                     let base = nested
                         .iter()
                         .fold(resolution_base.clone(), |dir, segment| dir.join(segment));
                     let resolved = resolve_out_of_line_module_file(&base, &[], &name);
                     let child_base = base.join(&name);
-                    (resolved, child_base)
+                    (resolved, child_base, false)
                 },
                 |path_value| {
                     let dir = nested
@@ -2363,7 +2457,7 @@ fn scan_bin_crate_tree(
                     let child_base = resolved
                         .parent()
                         .map_or_else(|| dir.clone(), Path::to_path_buf);
-                    (Some(resolved), child_base)
+                    (Some(resolved), child_base, true)
                 },
             );
             let Some(resolved) = resolved else {
@@ -2371,6 +2465,9 @@ fn scan_bin_crate_tree(
             };
             if ancestors.contains(&resolved) {
                 continue; // A real cycle — rustc itself rejects this at compile time.
+            }
+            if is_aliased {
+                aliased.insert(resolved.clone());
             }
             let mut child_module_path = dir_segments;
             child_module_path.push(name);
@@ -2388,10 +2485,14 @@ fn scan_bin_crate_tree(
     // Every physical file this BFS reached under any identity — the caller
     // uses this to keep the ordinary `src/` walk from ALSO scanning (and
     // double-crediting) the same file under its own conventional identity.
-    scanned_identities
+    // `aliased` is the subset reached via an explicit `#[path]` — see
+    // `resolve_edge_scan_impl`'s own use of both for why that subset needs
+    // separate tracking (Codex review on #2739, round 44, P2).
+    let touched: BTreeSet<PathBuf> = scanned_identities
         .into_iter()
         .map(|(file, _)| file)
-        .collect()
+        .collect();
+    (touched, aliased)
 }
 
 /// The last `::` segment of an attribute path, e.g. `edge` for
@@ -3112,6 +3213,26 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
     loop {
         match trees.get(i) {
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
+                // A brace-delimited macro invocation in the condition or
+                // scrutinee (`match value!{} { .. }`) has its OWN brace
+                // group — the macro's argument list — directly preceded by
+                // `!`, immediately before the real body's own brace arrives
+                // right after it. Verified directly via a real build: the
+                // whole cfg'd-out `match value!{} { _ => show() }` drops
+                // `show()` along with it, so crediting a registration
+                // inside what this loop mistook for the body (the macro's
+                // empty `{}` argument group) is wrong the same way a
+                // struct-pattern brace is. A body's own opening brace is
+                // never itself preceded by `!` in valid Rust grammar (that
+                // only ever precedes a macro invocation's own delimiter),
+                // so this check cannot misfire on a genuine body (Codex
+                // review on #2739, round 44, P2).
+                if i > 0
+                    && matches!(trees.get(i - 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                {
+                    i += 1;
+                    continue;
+                }
                 // A struct/tuple-struct PATTERN can itself contain a brace
                 // group — `if let Foo { x } = value() { .. }`, `for Foo { x }
                 // in items { .. }` — so the first Brace reached is not always
@@ -8546,5 +8667,109 @@ mod tests {
             vec!["handlers".to_owned(), "child".to_owned()]
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A brace-delimited macro invocation used as a match SCRUTINEE
+    /// (`match value!{} { .. }`) has its OWN brace group — the macro's
+    /// argument list — directly preceded by `!`, immediately before the
+    /// real match body's own brace. Verified directly via a real build:
+    /// the whole cfg'd-out match (scrutinee and all) drops its body along
+    /// with it. `control_flow_block_end` previously took the FIRST brace
+    /// group reached as the body unconditionally, so it mistook the
+    /// macro's own (here, empty) argument group for the body and credited
+    /// `edge_routes![show]` from the REAL body as a separate, live
+    /// statement (Codex review on #2739, round 44, P2).
+    #[test]
+    fn cfg_false_match_with_macro_scrutinee_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            macro_rules! value {
+                () => { 1 };
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                match value!{} {
+                    _ => edge_routes![crate::show],
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// The same physical file can be reached BOTH by the ordinary library
+    /// `src/` walk (`mod handlers;` in `src/lib.rs`) AND, independently, by
+    /// a capsule's own `[[bin]] path` tree via a `#[path]`-aliased
+    /// declaration (`#[path = "../handlers.rs"] mod local_handlers;` in
+    /// `src/bin/edge-capsule.rs`) — real Rust compiles it twice, once per
+    /// identity, verified directly via a real build. `resolve_edge_scan_impl`
+    /// filtered the ordinary `src/` walk's file list against `claimed` (the
+    /// SET OF PHYSICAL PATHS `scan_bin_crate_tree` touched), dropping the
+    /// file from the library scan entirely once the capsule tree touched it
+    /// under its own identity — losing the library's own separate
+    /// registration match (Codex review on #2739, round 44, P2).
+    #[test]
+    fn resolve_edge_scan_keeps_the_librarys_own_identity_for_a_file_the_capsule_also_touches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "mod handlers;\nfn wire() { edge_routes![my_app::handlers::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/handlers.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/edge-capsule.rs"),
+            r#"
+            #[path = "../handlers.rs"]
+            mod local_handlers;
+            fn main() { edge_routes![crate::local_handlers::show]; }
+            "#,
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("src/bin/edge-capsule.rs")),
+        );
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let identities: BTreeSet<(String, Vec<String>)> = scan
+            .functions
+            .iter()
+            .map(|f| (f.crate_root.clone(), f.module_path.clone()))
+            .collect();
+        assert!(
+            identities.contains(&(String::new(), vec!["handlers".to_owned()])),
+            "{identities:?}"
+        );
+        assert!(
+            identities.contains(&(
+                "bin:edge-capsule".to_owned(),
+                vec!["local_handlers".to_owned()]
+            )),
+            "{identities:?}"
+        );
     }
 }
