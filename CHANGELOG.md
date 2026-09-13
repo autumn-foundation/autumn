@@ -557,6 +557,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn generate auth`:** the `--oauth2` and WebAuthn `Cargo.toml` patchers
+  no longer treat an unrenamed `[dependencies.autumn_web]` subtable as this
+  framework's dependency (part of #2753's clone-class findings; the `mail`
+  patcher gained this gate in #2752). Cargo does not normalize `-`/`_` in a
+  dependency table key: without `package = "autumn-web"` in the table body,
+  `[dependencies.autumn_web]` names a different package literally called
+  `autumn_web`, and both patchers could silently inject their feature into that
+  unrelated dependency's feature list. The underscore spelling is now only
+  matched when the table body renames the package back, via the existing
+  `declares_package` check.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
