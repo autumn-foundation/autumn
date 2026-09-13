@@ -553,6 +553,15 @@ enum Handle {
     Repository(Option<Subject>),
     /// A `Db` / connection handle: the target of raw diesel executors.
     Db,
+    /// A `LazyDb`: a checkout that has not been taken yet. Distinct from
+    /// `Db` so `checkout`'s transparent-provenance rule can require the
+    /// receiver be *exactly* `LazyDb`, not any `*Db`-suffixed type — a
+    /// custom `AuditDb` maps to `Db` (see `type_handle`'s suffix rule), and
+    /// its own domain `checkout()` must not inherit handle identity the way
+    /// `LazyDb::checkout` does (Codex review, PR #2762, round 4). Once
+    /// checked out, the result is an ordinary `Db` — this variant exists
+    /// only for the not-yet-checked-out value.
+    LazyDb,
     /// An outbound HTTP client.
     Client,
     /// The webhook fan-out manager.
@@ -1615,7 +1624,13 @@ impl Analyzer {
                 }
             }
             Some(Handle::Repository(model)) => self.repository_chain(on_handle, model.as_ref()),
-            Some(Handle::Db) => self.tenant_methods(on_handle),
+            // `Handle::LazyDb` reuses `Db`'s chain analysis: the only real
+            // method it exposes is `checkout` (not in `CROSS_TENANT_METHODS`,
+            // so this is a no-op for the documented `lazy_db.checkout()`
+            // idiom), and `expr_handle`'s own `checkout` special case is what
+            // turns the *result* into a proper `Handle::Db` for everything
+            // after it.
+            Some(Handle::Db | Handle::LazyDb) => self.tenant_methods(on_handle),
             Some(Handle::Client) => self.outbound_chain(on_handle),
             Some(Handle::Webhook) => self.webhook_chain(on_handle),
             Some(Handle::WriteBuilder {
@@ -2527,20 +2542,24 @@ impl Analyzer {
                     return Some(inner);
                 }
                 // `LazyDb::checkout` (autumn/src/db.rs, #2264) turns a
-                // prepared-but-not-taken checkout into a live `Db`, the same
-                // handle under a new type — but only when the receiver is a
-                // `Db`-kind handle (`LazyDb` collapses into `Handle::Db`, see
-                // `HANDLE_TYPES`). Gating on the variant, not just "the
-                // receiver is *some* tracked handle," matters: a
-                // `CartRepository` is `Handle::Repository`, and its own
-                // `checkout()` domain method (unrelated to a connection)
-                // must not inherit that repository's provenance just because
-                // the name matches (Codex review, PR #2762, round 3).
-                // `autumn-billing`'s `self.checkout(&snapshot)` (a Stripe
-                // reconciliation) is unaffected either way: its receiver is a
-                // plain `&Ctx`, never a tracked handle at all.
-                if name == "checkout" && matches!(inner, Handle::Db) {
-                    return Some(inner);
+                // prepared-but-not-taken checkout into a live `Db`. Gating on
+                // `Handle::LazyDb` specifically, not just "the receiver is
+                // *some* tracked handle" (or even "is `Db`-shaped"), matters
+                // twice over: a `CartRepository` is `Handle::Repository`, and
+                // a custom `AuditDb` — matched by `type_handle`'s `*Db`
+                // suffix rule — is plain `Handle::Db`; either one's own
+                // `checkout()` domain method (unrelated to a connection) must
+                // not inherit handle provenance just because the name or
+                // type-name shape matches (Codex review, PR #2762, rounds 3
+                // and 4). `autumn-billing`'s `self.checkout(&snapshot)` (a
+                // Stripe reconciliation) is unaffected either way: its
+                // receiver is a plain `&Ctx`, never a tracked handle at all.
+                // The result becomes an ordinary `Db`, not `Handle::LazyDb`:
+                // the value really is a live connection now, and every other
+                // `Handle::Db` rule (raw-executor detection, tenant checks)
+                // needs to see it as one.
+                if name == "checkout" && matches!(inner, Handle::LazyDb) {
+                    return Some(Handle::Db);
                 }
                 (TRANSPARENT_BUILDERS.contains(&name.as_str())
                     || CROSS_TENANT_METHODS.contains(&name.as_str()))
@@ -3549,6 +3568,13 @@ fn type_handle(ty: &Type, generics: &HashSet<String>) -> Option<Handle> {
             }
             if name.ends_with("Repository") {
                 return Some(Handle::Repository(Some(repository_subject(&path.path))));
+            }
+            // Checked before the general `HANDLE_TYPES`/`*Db`-suffix rule
+            // below: `LazyDb` needs its own variant so `checkout`'s
+            // transparent-provenance rule can require the receiver be
+            // exactly `LazyDb`, not merely `Db`-shaped (see `Handle::LazyDb`).
+            if name == "LazyDb" {
+                return Some(Handle::LazyDb);
             }
             if HANDLE_TYPES.contains(&name.as_str()) || name.ends_with("Db") {
                 return Some(Handle::Db);
@@ -6000,10 +6026,10 @@ mod tests {
 
     #[test]
     fn lazy_dbs_checked_out_db_still_carries_handle_provenance() {
-        // The fix that scopes `checkout` transparency to `Handle::Db` must
-        // not lose the provenance tracking `LazyDb::checkout` needs in the
-        // first place: the `Db` it hands back is still an effect handle, so
-        // passing it to an opaque helper is still refused.
+        // The fix that scopes `checkout` transparency to `Handle::LazyDb`
+        // must not lose the provenance tracking `LazyDb::checkout` needs in
+        // the first place: the `Db` it hands back is still an effect handle,
+        // so passing it to an opaque helper is still refused.
         assert_error_contains(
             GRANT,
             r"async fn h(lazy_db: LazyDb) -> R {
@@ -6012,6 +6038,25 @@ mod tests {
                 Ok(())
             }",
             &["issue_refund", "effect handle"],
+        );
+    }
+
+    #[test]
+    fn a_custom_db_suffixed_types_own_checkout_result_is_not_a_handle() {
+        // `type_handle` maps *any* `*Db`-suffixed type to `Handle::Db` (a
+        // deliberately broad heuristic — see `HANDLE_TYPES`'s own doc), so
+        // gating `checkout` transparency on `Handle::Db` alone would still
+        // let a custom `AuditDb`'s own domain `checkout()` inherit handle
+        // provenance the same way a `*Repository`'s did before round 3.
+        // Only `Handle::LazyDb` — reserved for the exact type name `LazyDb`
+        // — may pass through `checkout` (Codex review, PR #2762, round 4).
+        assert_clean(
+            GRANT,
+            r"async fn h(audit: AuditDb) -> R {
+                let receipt = audit.checkout().await?;
+                crate::billing::render_receipt(&receipt);
+                Ok(())
+            }",
         );
     }
 

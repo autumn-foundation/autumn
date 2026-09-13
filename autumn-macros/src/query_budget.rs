@@ -807,6 +807,21 @@ impl Analyzer {
                     } else {
                         self.handles.remove(&ident.to_string());
                     }
+                    // `lazy_db_names` must track an assignment the same way
+                    // `handles` does: `let selected; selected = lazy_db;` is
+                    // the deferred-initialisation idiom this same file's own
+                    // annotation-preserving code uses elsewhere, and without
+                    // this, `selected.checkout()` would fall back to the
+                    // ordinary "counted call" path — silently reintroducing
+                    // the exact `#[query_budget(1)]` false rejection this
+                    // whole `lazy_db_names` mechanism exists to avoid, just
+                    // reached through `=` instead of `let` (Codex review,
+                    // PR #2762, round 4).
+                    if self.expr_is_lazy_db(&a.right) {
+                        self.lazy_db_names.insert(ident.to_string());
+                    } else {
+                        self.lazy_db_names.remove(&ident.to_string());
+                    }
                 }
                 cost
             }
@@ -2516,6 +2531,28 @@ mod tests {
             }
             ",
             &["1"],
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_assigned_through_deferred_initialisation_stays_tracked() {
+        // `Expr::Assign` (`selected = lazy_db;`) must update `lazy_db_names`
+        // exactly like a `let` does: the deferred-initialisation idiom
+        // (`let selected; selected = lazy_db;`) is ordinary Rust, and a gap
+        // here would silently reintroduce the same `#[query_budget(1)]`
+        // false rejection round 2 fixed for `let`, just reached through `=`
+        // instead (Codex review, PR #2762, round 4).
+        assert_clean(
+            "1",
+            r"
+            async fn h(lazy_db: LazyDb) -> AutumnResult<Markup> {
+                let selected;
+                selected = lazy_db;
+                let mut db = selected.checkout().await?;
+                let rows = posts::table.load(&mut *db).await?;
+                Ok(render(&rows))
+            }
+            ",
         );
     }
 
