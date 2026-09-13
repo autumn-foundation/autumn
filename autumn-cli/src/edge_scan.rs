@@ -2758,10 +2758,7 @@ fn skip_leading_cfg_attrs(
     default_features: &BTreeSet<String>,
 ) -> (bool, usize) {
     let mut excluded = false;
-    loop {
-        let Some(TokenTree::Punct(hash)) = trees.get(i) else {
-            break;
-        };
+    while let Some(TokenTree::Punct(hash)) = trees.get(i) {
         if hash.as_char() != '#' {
             break;
         }
