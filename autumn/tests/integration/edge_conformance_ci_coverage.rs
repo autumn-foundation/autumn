@@ -66,6 +66,16 @@ fn build_edge_capsule_step_reuses_the_conformance_suites_target_dir() {
     let root = workspace_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
         .expect("read .github/workflows/ci.yml");
+    // `.gitattributes` leaves ci.yml's own line-ending as `text=auto`, so a
+    // Windows checkout normalizes it to CRLF — verified directly against the
+    // real CI failure this caused: `edge_conformance_job_block`'s own search
+    // for the job key is anchored on a LITERAL trailing `\n` immediately
+    // after the colon (`"\n  edge-conformance:\n"`), which a `\r\n` line
+    // ending never satisfies (the byte right after the colon is `\r`, not
+    // `\n`), so the job block was never found at all on `windows-latest`
+    // even though the job is right there in the file. Normalizing away every
+    // `\r` up front makes every anchored search below line-ending-agnostic.
+    let ci = ci.replace('\r', "");
 
     let job = edge_conformance_job_block(&ci);
     let build_step = build_capsule_step_block(job);
