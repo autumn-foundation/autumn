@@ -149,8 +149,13 @@ version-2 or -3 export (one an old exporter of this software actually
 produced) never carries `path` at all, since that format predates the
 field — but an arbitrary file merely *labeled* version 2 or 3 is not
 guaranteed to lack it (nothing stops a hand-crafted file from including
-`path` values despite an old version label, in which case it sorts
-correctly and does not trigger the bug), and conversely a version-4 or
+`path` values despite an old version label; if those values are accurate
+— fully qualifying each page's real position — the file sorts correctly
+and does not trigger the bug, but nothing checks accuracy: an explicit
+but *inaccurate* `path` set to a bare slug, e.g. `"team"` for a page
+whose real position is actually nested, reaches the identical bare
+identity and the identical bug, per the boundary established above), and
+conversely a version-4 or
 -5 file that simply omits `path` on some posts, while declaring a current
 version, hits the identical fallback and the identical bug — confirmed by
 a fourth reproduction below, a Codex catch on this PR.
