@@ -1927,48 +1927,101 @@ fn attr_names_including_cfg_attr(
     names
 }
 
+/// Parses `#[cfg_attr(condition, meta1, meta2, ...)]`'s payload into the
+/// condition's resolution — `None` for "unresolvable", the same convention
+/// [`eval_cfg_attr`] uses for a plain `#[cfg(...)]` — and its meta list
+/// (empty if the part after the condition fails to parse as one). `None`
+/// overall means `attr` isn't a `cfg_attr` with a payload shaped this way at
+/// all.
+///
+/// Splits the raw tokens on the first top-level `,` by hand, rather than
+/// parsing `condition` and the rest through one combined `syn::parse::Parse`
+/// impl, specifically so an UNPARSEABLE condition still doesn't lose access
+/// to the meta list after it: `?`-propagating a parse failure from a
+/// combined parser would bail out before ever reaching the metas, defeating
+/// every conservative "unresolvable stays visible" rule built on top of
+/// this.
+fn cfg_attr_payload(
+    attr: &syn::Attribute,
+    default_features: &BTreeSet<String>,
+) -> Option<(Option<bool>, Vec<syn::Meta>)> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
+    let comma_index = tokens
+        .iter()
+        .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))?;
+    let condition_tokens: proc_macro2::TokenStream =
+        tokens[..comma_index].iter().cloned().collect();
+    let condition = syn::parse2::<CfgPredicate>(condition_tokens)
+        .ok()
+        .map(|pred| pred.eval(default_features));
+    let rest_tokens: proc_macro2::TokenStream = tokens[comma_index + 1..].iter().cloned().collect();
+    let metas = syn::parse::Parser::parse2(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        rest_tokens,
+    )
+    .map(|metas| metas.into_iter().collect())
+    .unwrap_or_default();
+    Some((condition, metas))
+}
+
 /// The attribute names inside `#[cfg_attr(condition, meta1, meta2, ...)]`'s
 /// payload, once `condition` is resolved against `default_features` —
-/// empty when it definitely resolves false. Splits the payload's raw tokens
-/// on the first top-level `,` by hand (rather than parsing `condition` and
-/// the rest through one `syn::parse::Parse` impl) specifically so an
-/// UNPARSEABLE condition still doesn't lose access to the meta list after
-/// it: `?`-propagating a parse failure from a combined parser would bail
-/// out before ever reaching the metas, defeating the conservative
-/// "unresolvable stays visible" rule this function exists to apply.
+/// empty when it definitely resolves false.
 fn cfg_attr_active_marker_names(
     attr: &syn::Attribute,
     default_features: &BTreeSet<String>,
 ) -> Vec<String> {
-    let syn::Meta::List(list) = &attr.meta else {
+    let Some((condition, metas)) = cfg_attr_payload(attr, default_features) else {
         return Vec::new();
     };
-    let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
-    let Some(comma_index) = tokens
-        .iter()
-        .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
-    else {
-        return Vec::new();
-    };
-    let condition_tokens: proc_macro2::TokenStream =
-        tokens[..comma_index].iter().cloned().collect();
-    let condition_excludes = syn::parse2::<CfgPredicate>(condition_tokens)
-        .is_ok_and(|pred| !pred.eval(default_features));
-    if condition_excludes {
+    if condition == Some(false) {
         return Vec::new();
     }
-    let rest_tokens: proc_macro2::TokenStream = tokens[comma_index + 1..].iter().cloned().collect();
-    syn::parse::Parser::parse2(
-        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-        rest_tokens,
-    )
-    .map(|metas| {
-        metas
-            .iter()
-            .filter_map(|meta| meta.path().segments.last().map(|s| s.ident.to_string()))
-            .collect()
+    metas
+        .iter()
+        .filter_map(|meta| meta.path().segments.last().map(|s| s.ident.to_string()))
+        .collect()
+}
+
+/// Whether an active `#[cfg_attr(condition, cfg(inner_condition), ...)]`
+/// injects an exclusion this scan can PROVE — `condition` DEFINITELY
+/// resolves true (so the injected attribute really is present) AND the
+/// injected `cfg(...)`'s own predicate DEFINITELY resolves false. Verified
+/// directly: a real build of `#[cfg_attr(feature = "outer", cfg(feature =
+/// "inner"))] fn show() { ... }` with only `outer` enabled reports `show`
+/// as "configured out," rustc's own diagnostic naming the injected
+/// `cfg(...)` as the reason.
+///
+/// Both halves must be DEFINITE, matching this scan's standing conservative
+/// default everywhere else (only a PROVEN exclusion ever excludes): an
+/// unresolvable outer condition, or an unresolvable injected predicate,
+/// must not force an exclusion that might not be real — the opposite
+/// direction from [`cfg_attr_active_marker_names`], which stays
+/// conservative by keeping a marker VISIBLE on the same kind of
+/// uncertainty, since here the dangerous mistake is excluding a route that
+/// still compiles in, not crediting a phantom one (Codex review on #2739,
+/// round 29, P2).
+fn cfg_attr_injects_a_false_cfg(
+    attr: &syn::Attribute,
+    default_features: &BTreeSet<String>,
+) -> bool {
+    let Some((condition, metas)) = cfg_attr_payload(attr, default_features) else {
+        return false;
+    };
+    if condition != Some(true) {
+        return false;
+    }
+    metas.iter().any(|meta| {
+        let syn::Meta::List(inner) = meta else {
+            return false;
+        };
+        inner.path.is_ident("cfg")
+            && syn::parse2::<CfgPredicate>(inner.tokens.clone())
+                .is_ok_and(|pred| !pred.eval(default_features))
     })
-    .unwrap_or_default()
 }
 
 /// Build an [`EdgeFn`] when `attrs` contains an `#[edge]` marker and no
@@ -1986,10 +2039,13 @@ fn edge_fn(
         return None;
     }
     // Several `#[cfg(...)]` attributes on one function are ANDed, like real
-    // Rust: any one of them resolving to definitely false excludes it.
-    let cfg_excludes = attrs
-        .iter()
-        .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+    // Rust: any one of them resolving to definitely false excludes it — and
+    // so does a `cfg(...)` injected by an ACTIVE `cfg_attr(...)` (Codex
+    // review on #2739, round 29, P2).
+    let cfg_excludes = attrs.iter().any(|attr| {
+        eval_cfg_attr(attr, default_features) == Some(false)
+            || cfg_attr_injects_a_false_cfg(attr, default_features)
+    });
     if cfg_excludes {
         return None;
     }
@@ -3013,6 +3069,59 @@ mod tests {
             &["strict-auth"],
         );
         assert_eq!(scan.functions[0].guards, vec!["secured".to_owned()]);
+    }
+
+    /// `#[cfg_attr(feature = "outer", cfg(feature = "inner"))]` injects a
+    /// real `#[cfg(feature = "inner")]` once `outer` is on — verified
+    /// directly via a real build reporting the function "configured out"
+    /// with only `outer` enabled and `inner` off. This scan's exclusion
+    /// check previously only ever looked at each attribute's own top-level
+    /// `cfg(...)`, never a `cfg(...)` injected through an active
+    /// `cfg_attr`, so it credited a phantom edge route the real build
+    /// strips out entirely (Codex review on #2739, round 29, P2).
+    #[test]
+    fn an_edge_fn_with_a_cfg_attr_injected_false_cfg_is_excluded() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+            #[edge]
+            pub fn hello() {}
+            "#,
+            &["outer"],
+        );
+        assert!(scan.is_empty(), "{:?}", scan.functions);
+    }
+
+    /// Same shape, but `inner` is ALSO on this time — the injected cfg
+    /// genuinely holds, so the function is a real edge handler.
+    #[test]
+    fn an_edge_fn_with_a_cfg_attr_injected_true_cfg_is_included() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+            #[edge]
+            pub fn hello() {}
+            "#,
+            &["outer", "inner"],
+        );
+        assert_eq!(scan.names(), vec!["hello"]);
+    }
+
+    /// The outer `cfg_attr` condition itself being off means the injected
+    /// `cfg(...)` never applies at all — the function must stay a real
+    /// edge handler, not be excluded by a cfg that was never really
+    /// present.
+    #[test]
+    fn an_edge_fn_with_an_inactive_cfg_attr_injected_cfg_is_included() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "outer", cfg(feature = "inner"))]
+            #[edge]
+            pub fn hello() {}
+            "#,
+            &[],
+        );
+        assert_eq!(scan.names(), vec!["hello"]);
     }
 
     #[test]
