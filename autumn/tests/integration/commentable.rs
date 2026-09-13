@@ -216,6 +216,58 @@ pub struct CmtSoft {
 pub trait CmtSoftRepository {}
 
 diesel::table! {
+    cmt_denorm_tenants (id) {
+        id -> Int8,
+        title -> Text,
+        tenant_id -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// `tenant_id` here is denormalized data, not a scoping key: the repository
+/// never declares `tenant_scoped` (issue #2263). Comments must work with no
+/// tenant context at all, and must never match on this column.
+#[autumn_web::model(table = "cmt_denorm_tenants")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtDenormTenant {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+#[autumn_web::repository(CmtDenormTenant, table = "cmt_denorm_tenants")]
+pub trait CmtDenormTenantRepository {}
+
+diesel::table! {
+    cmt_audits (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// `deleted_at` here is audit history, not a tombstone: the repository never
+/// declares `soft_delete` (issue #2263). A non-null value must not hide the
+/// parent — comments keep working exactly as the repository's own finders do.
+#[autumn_web::model(table = "cmt_audits")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtAudited {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(CmtAudited, table = "cmt_audits")]
+pub trait CmtAuditedRepository {}
+
+diesel::table! {
     cmt_hards (id) {
         id -> Int8,
         title -> Text,
@@ -282,6 +334,12 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE cmt_softs \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
+    "CREATE TABLE cmt_denorm_tenants \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE cmt_audits \
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
     "CREATE TABLE cmt_hards \
@@ -397,8 +455,22 @@ async fn seed_tenanted(conn: &mut AsyncPgConnection, tenant: &str, title: &str) 
         .bind::<Text, _>(title)
         .get_result::<IdRow>(conn)
         .await
-        .expect("seed tenanted")
+        .expect("seed cmt_tenanted")
         .id
+}
+
+/// Same shape as [`seed_tenanted`], for the `cmt_denorm_tenants` table whose
+/// `tenant_id` is denormalized data rather than a scoping key.
+async fn seed_denorm_tenant(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
+    diesel::sql_query(
+        "INSERT INTO cmt_denorm_tenants (tenant_id, title) VALUES ($1, $2) RETURNING id",
+    )
+    .bind::<Text, _>(tenant)
+    .bind::<Text, _>(title)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("seed cmt_denorm_tenants")
+    .id
 }
 
 async fn counter(conn: &mut AsyncPgConnection, table: &str, id: i64) -> i64 {
@@ -974,6 +1046,47 @@ async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
     assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
 }
 
+/// Issue #2263: `cmt_audits.deleted_at` is audit history, not a tombstone —
+/// `CmtAuditedRepository` never declares `soft_delete`. A non-null value must
+/// not hide the parent, or the comment thread would disagree with the
+/// repository's own finders about whether the record exists.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_audit_deleted_at_column_does_not_hide_the_parent() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtAuditedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_audits", "title", "t").await;
+
+    repo.add_comment(target, author, "before", None)
+        .await
+        .expect("live parent accepts comments");
+
+    // Stamp the audit column — this repository never opted into `soft_delete`,
+    // so the value carries no meaning for comment visibility.
+    diesel::sql_query("UPDATE cmt_audits SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the audit column");
+
+    let comment = repo
+        .add_comment(target, author, "after", None)
+        .await
+        .expect("an audit deleted_at without soft_delete must not hide the parent");
+    assert_eq!(comment.body, "after");
+    let thread = repo
+        .comment_thread(target)
+        .await
+        .expect("the thread must still read");
+    assert_eq!(
+        flatten(&thread),
+        vec![(0, "before".to_owned()), (0, "after".to_owned())]
+    );
+    assert_eq!(counter(&mut conn, "cmt_audits", target).await, 2);
+}
+
 /// The two 404s on the delete path: an unknown comment, and a comment that
 /// belongs to a **different record of the same model**. The second is what
 /// stops any signed-in user deleting any comment by walking ids.
@@ -1172,6 +1285,33 @@ async fn a_tenant_scoped_repository_with_no_context_refuses_to_comment() {
     assert_eq!(counter(&mut conn, "cmt_tenanted", acme).await, 0);
 }
 
+/// Issue #2263: `cmt_denorm_tenants.tenant_id` is denormalized data —
+/// `CmtDenormTenantRepository` never declares `tenant_scoped`. Comments must
+/// work with no tenant context at all, unlike the `tenant_scoped` case above.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_denormalized_tenant_column_does_not_require_a_tenant_context() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtDenormTenantRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_denorm_tenant(&mut conn, "acme", "theirs").await;
+
+    // No `CURRENT_TENANT` scope anywhere in this test.
+    let comment = repo
+        .add_comment(target, author, "no tenant needed", None)
+        .await
+        .expect("a non-tenant_scoped repository must not require a tenant context");
+    assert_eq!(comment.body, "no tenant needed");
+
+    let thread = repo
+        .comment_thread(target)
+        .await
+        .expect("reads must not require a tenant context either");
+    assert_eq!(flatten(&thread), vec![(0, "no tenant needed".to_owned())]);
+    assert_eq!(counter(&mut conn, "cmt_denorm_tenants", target).await, 1);
+}
+
 // ── The generic router ──────────────────────────────────────────────────────
 //
 // One pair of routes serves every registered model. Nothing else in the suite
@@ -1273,6 +1413,34 @@ async fn router_renders_the_thread_for_any_registered_model() {
     );
     // Signed out: the thread renders, every form is gone.
     assert!(!body.contains("<form"), "{body}");
+}
+
+/// Issue #2263's sharpest reproduction: `CmtDenormTenant` carries a
+/// `tenant_id` column, but its repository never declares `tenant_scoped`. The
+/// router is mounted with **no tenancy middleware at all** — before this
+/// fix, that combination 500'd on every request. Both a read and a write must
+/// succeed instead.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_serves_a_denormalized_tenant_column_with_no_tenancy_middleware() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_denorm_tenant(&mut conn, "acme", "hello").await;
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call_with_author(
+        app.clone(),
+        form_post(&format!("/comments/CmtDenormTenant/{target}"), "body=hi"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200, "no tenant middleware, no 500: {body}");
+
+    let (status, body) = call(app, get(&format!("/comments/CmtDenormTenant/{target}"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("hi"), "{body}");
 }
 
 /// The registry is the whole gate: a type no model claims cannot be reached.

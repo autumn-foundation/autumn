@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`#[commentable]`'s comment router no longer infers tenant scoping or
+  soft-delete from column presence alone (#2263):** a `tenant_id` or
+  `deleted_at` column on the parent model does not, by itself, prove the
+  repository opted into `tenant_scoped` or `soft_delete` — a model can carry
+  either column for other reasons (denormalized reporting data, an audit
+  trail) without its repository scoping or hiding on it. `request_tenant` and
+  `probe_parent` in `autumn/src/commentable.rs` already resolve both flags
+  from the repository's own `#[repository(...)]` opt-ins via the
+  `RepositoryFacts` registry (`model_requires_tenant`, `model_soft_deletes`),
+  not from the column alone; a registration is still absent for a model with
+  no `#[repository]` at all, and the column is the conservative fallback only
+  then. This change adds the regression coverage that pins the two exact
+  shapes the issue reported — a `tenant_id` column with a non-`tenant_scoped`
+  repository (previously would have been a hard `500` on every comment-router
+  request with no tenancy middleware to opt out of), and a `deleted_at` column
+  with no `soft_delete` opt-in (previously would have `404`d a parent the
+  repository's own finders still return) — plus the matching documentation in
+  `docs/guide/commentable.md`.
+
 ### Added
 
 - **Build-checked typed contracts between two Autumn services (#1755):** the day

@@ -322,6 +322,23 @@ is written or read. `across_tenants()` opts out; a `tenant_scoped` repository
 with no tenant context is an error. A model without the column emits no tenant
 predicate at all.
 
+**The column alone does not scope.** A `tenant_id` column with no
+`tenant_scoped` repository is treated as ordinary data: comments work with no
+tenant context, and never match on it. Scoping follows the repository's own
+opt-in, not the column's presence — a model can carry `tenant_id` for other
+reasons (denormalized reporting, a foreign import) without becoming
+tenant-scoped.
+
+## Soft-deleted parents
+
+`add_comment` and `comment_thread` refuse a soft-deleted parent with `404`
+(see "Why `commentable_id` has no foreign key" above) — but only when the
+parent's own repository opts into `#[repository(…, soft_delete)]`. A
+`deleted_at` column with no such repository is audit history, not a
+tombstone: the row stays fully commentable, exactly as the repository's own
+finders would still return it. As with tenancy, the repository's opt-in
+decides — never the column's presence alone.
+
 ## What this deliberately does not do
 
 - **Voting on comments** — composes with [`#[votable]`](votable.md).
