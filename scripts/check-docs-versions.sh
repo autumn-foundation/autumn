@@ -174,6 +174,21 @@
 #     situation a reader is in.
 #     What is left is mild staleness at the patch level, and gating it would
 #     refuse `=0.7.0` on the day `0.7.1` lands — on pages that still work.
+#   - An inline table on the PATTERN path whose strings contain a BRACE. The
+#     `\{[^{}]*\}` branch stops at any brace, so such a table is not matched at
+#     all, and on the fallback its pin is missed.
+#
+#     Left as a known limit rather than fixed, on two grounds. The shape that
+#     motivated it is not valid Cargo: `features = ["x{y}"]` fails to resolve
+#     (exit 101 — a feature name takes `[A-Za-z0-9_+.-]` only), so a manifest
+#     written that way does not build, and no inline table in this corpus
+#     carries a brace inside a string. And the fix is a string-aware
+#     brace-matcher — MORE hand-written TOML in the fallback, which is the one
+#     component in this file that has produced a defect on nearly every commit
+#     touching it, in both directions. Adding parser surface there is the
+#     opposite of where that evidence points; the fallback's shape is a
+#     question for a maintainer (see the PR), not something to answer by
+#     growing it further.
 #
 # MIGRATION PAGES, precisely: the rule is `pin <= page version`, not
 # `pin == page version`, because the "before" block is the whole point of the
@@ -559,6 +574,24 @@ def published_crates(root):
     listing = subprocess.run(
         ['git', 'ls-files', '-z', 'Cargo.toml', '*/Cargo.toml'],
         cwd=root, capture_output=True, text=True, check=True).stdout
+    # `publish` may be INHERITED: a member writing `publish.workspace = true`
+    # takes `[workspace.package] publish`. Read once, so a member that defers
+    # is resolved rather than read as a table — which matched neither the
+    # `false` nor the list test below, and so counted a deliberately
+    # unpublished crate as published. The damage from that is a FALSE
+    # POSITIVE: an old pin on a private `autumn-*` crate would be failed
+    # against a release line the crate does not have.
+    try:
+        root_manifest = tomllib.loads(
+            pathlib.Path(root, 'Cargo.toml').read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        root_manifest = {}
+    workspace = root_manifest.get('workspace')
+    workspace_package = (workspace.get('package')
+                         if isinstance(workspace, dict) else None)
+    inherited = (workspace_package.get('publish')
+                 if isinstance(workspace_package, dict) else None)
+
     out = set()
     for rel in (f for f in listing.split('\0') if f):
         try:
@@ -576,14 +609,29 @@ def published_crates(root):
             continue
         # `publish = false` keeps a member off crates.io, and a LIST form
         # publishes only to the registries it names. Absent means published,
-        # which is Cargo's own default.
-        publish = package.get('publish')
-        if publish is False:
-            continue
-        if isinstance(publish, list) and 'crates-io' not in publish:
+        # which is Cargo's own default. `_publish_state` holds that rule —
+        # shared with `--self-test` rather than restated there, so the tested
+        # logic is the logic that runs.
+        if _publish_state(package.get('publish'), inherited) == 'excluded':
             continue
         out.add(name)
     return out
+
+
+def _publish_state(publish, inherited):
+    """The membership verdict `published_crates` reaches for one `publish`.
+
+    Factored out so `--self-test` can exercise the inheritance rule without a
+    synthetic workspace on disk; `published_crates` applies these same three
+    steps in this same order.
+    """
+    if isinstance(publish, dict) and publish.get('workspace') is True:
+        publish = inherited
+    if publish is False:
+        return 'excluded'
+    if isinstance(publish, list) and 'crates-io' not in publish:
+        return 'excluded'
+    return 'included'
 
 
 # ---------------------------------------------------------------------------
@@ -1727,6 +1775,23 @@ def self_test():
            list(pins(fenced('# [dependencies.autumn-web]', '# version = "0.5"',
                             'oops ='))),
            [])
+
+    # `publish` may be INHERITED from `[workspace.package]`. A member deferring
+    # with `publish.workspace = true` must resolve to the workspace's value,
+    # not be read as a table and counted as published — which would fail an old
+    # pin on a crate that has no published release line at all.
+    expect('inherited publish = false excludes',
+           _publish_state({'workspace': True}, inherited=False), 'excluded')
+    expect('inherited private registry excludes',
+           _publish_state({'workspace': True}, inherited=['private']),
+           'excluded')
+    expect('inherited crates-io includes',
+           _publish_state({'workspace': True}, inherited=['crates-io']),
+           'included')
+    expect('inherited absent includes',
+           _publish_state({'workspace': True}, inherited=None), 'included')
+    expect('a direct publish = false still excludes',
+           _publish_state(False, inherited=None), 'excluded')
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
