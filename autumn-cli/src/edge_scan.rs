@@ -3478,6 +3478,21 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                     i += 1;
                     continue;
                 }
+                // An inline `const { .. }` block used in the condition or
+                // scrutinee (`if const { true } { .. }`, real, valid Rust —
+                // verified directly via a real build) has its OWN brace
+                // group immediately preceded by the `const` keyword itself,
+                // the identical shape as the `async`/`async move` cases
+                // above. A genuine body's own opening brace is never itself
+                // preceded by the literal keyword `const` in valid Rust
+                // grammar (there is no "const if"), so this cannot misfire
+                // on a real body either (Codex review on #2739, round 46,
+                // P2).
+                if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "const")
+                {
+                    i += 1;
+                    continue;
+                }
                 // A struct/tuple-struct PATTERN can itself contain a brace
                 // group — `if let Foo { x } = value() { .. }`, `for Foo { x }
                 // in items { .. }` — so the first Brace reached is not always
@@ -9303,6 +9318,40 @@ mod tests {
             fn wire() {
                 #[cfg(feature = "premium")]
                 if { true } {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// An inline `const { .. }` block used as the WHOLE `if` condition
+    /// (`if const { true } { .. }`) is real, valid Rust verified directly
+    /// via a real build — its own brace group is immediately preceded by
+    /// the `const` keyword, the identical shape as the `async`/`async move`
+    /// cases. `control_flow_block_end` previously had no exception for
+    /// `const`, so it mistook this condition block for the real body,
+    /// leaving the actual body an ordinary, unexcluded sibling group that
+    /// credited `show` (Codex review on #2739, round 46, P2).
+    #[test]
+    fn cfg_false_if_with_inline_const_block_condition_does_not_leak_its_body_as_a_separate_statement()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if const { true } {
                     edge_routes![crate::show];
                 }
             }
