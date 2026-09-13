@@ -1046,6 +1046,19 @@ async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
     assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
 }
 
+#[test]
+fn debug_cmt_audited_repository_facts() {
+    let spec = CmtAudited::commentable_spec();
+    eprintln!("spec.parent_soft_delete = {:?}", spec.parent_soft_delete);
+    let model = autumn_web::commentable::commentable_model_for_spec(spec);
+    eprintln!("commentable_model_for_spec = {model:?}");
+    if let Some(m) = model {
+        eprintln!("model_soft_deletes({m:?}) = {:?}", autumn_web::commentable::model_soft_deletes(m));
+    }
+    eprintln!("core::any::type_name::<CmtAudited>() = {:?}", core::any::type_name::<CmtAudited>());
+    panic!("diagnostic dump above");
+}
+
 /// Issue #2263: `cmt_audits.deleted_at` is audit history, not a tombstone —
 /// `CmtAuditedRepository` never declares `soft_delete`. A non-null value must
 /// not hide the parent, or the comment thread would disagree with the
