@@ -1039,7 +1039,25 @@ def pattern_pins(body):
 # A fence opener, with its language. Only ```toml blocks are handed to the TOML
 # parser; every other block stays on the pattern path.
 FENCE_MARK = re.compile(r'^[^\S\n]*(?P<mark>`{3,}|~{3,})[^\S\n]*'
-                        r'(?P<lang>[^\s`~]*)[^\S\n]*$')
+                        r'(?P<info>[^`~\n]*)$')
+
+
+def fence_language(info):
+    """The language of a fence, from its CommonMark INFO STRING.
+
+    The info string is everything after the opening marker, and only its first
+    word is the language: ```` ```toml title="Cargo.toml" ```` is TOML, and so
+    is ```` ```toml,ignore ```` — a form this repo already uses elsewhere
+    (`rust,ignore`, `rust,no_run`).
+
+    Requiring the language to be the whole info string was worse than it looks.
+    ```` ```toml title="…" ```` matched the opener pattern not at all, so the
+    block was neither parsed NOR masked, and its whole body went to the pattern
+    path. An annotated `[patch.crates-io]` block then had its pin reported —
+    a false positive, and one that contradicted the patch exemption this gate
+    documents a few hundred lines up.
+    """
+    return info.strip().split()[0].split(',')[0].lower() if info.strip() else ''
 
 # The dependency tables Cargo reads a version out of.
 DEP_TABLES = ('dependencies', 'dev-dependencies', 'build-dependencies')
@@ -1059,7 +1077,7 @@ def toml_fences(text):
         end = start
         while end < len(lines) and not lines[end].strip().startswith(mark * 3):
             end += 1
-        if opener.group('lang').lower() == 'toml':
+        if fence_language(opener.group('info')) == 'toml':
             yield start + 1, '\n'.join(lines[start:end])
         i = end + 1
 
@@ -1621,6 +1639,39 @@ def self_test():
                             'autumn-web = { path = "autumn" }'))),
            [])
 
+    # ---- fence INFO STRINGS: only the first word is the language ----
+    expect('bare language', fence_language('toml'), 'toml')
+    expect('attribute after the language',
+           fence_language('toml title="Cargo.toml"'), 'toml')
+    expect('comma-separated attributes', fence_language('toml,ignore'), 'toml')
+    expect('empty info string', fence_language(''), '')
+    expect('a different language is not toml', fence_language('rust,ignore'),
+           'rust')
+    # The consequence that made this matter: an ANNOTATED toml fence did not
+    # match the opener at all, so it was neither parsed nor masked, and a
+    # `[patch.…]` block inside it had its pin reported — contradicting the
+    # exemption documented above.
+    expect('annotated patch fence stays exempt',
+           list(pins('```toml title="Cargo.toml"\n[patch.crates-io]\n'
+                     'autumn-web = { path = "../fork", version = "0.5" }\n'
+                     '```\n')),
+           [])
+    expect('annotated toml fence is still parsed',
+           list(pins('```toml title="Cargo.toml"\n[dependencies]\n'
+                     'autumn-web = "0.5"\n```\n')),
+           [(3, 'autumn-web', '0.5')])
+
+    # ---- the surface line survives a README pin that is not a version ----
+    # `series()` raises without two numeric components, and this line printed
+    # BEFORE the problems did, so the gate answered a malformed pin with a
+    # traceback instead of the message it had already prepared.
+    expect('surface line tolerates a malformed pin',
+           'unreadable' in describe_surface('garbage', '0.7.0'), True)
+    expect('surface line is normal for a real pin',
+           describe_surface('0.7.0', '0.7.0'),
+           'surface: published release line 0.7 (README quickstart), '
+           'workspace 0.7.0')
+
     # PER-OCCURRENCE, which is the whole promise over the existential
     # `FIRST_RUN_DOCS` test: one key declared in two tables is two pins on two
     # lines, not one. Deduplicating equal declarations dropped the second.
@@ -1861,12 +1912,29 @@ def self_test():
     return 1 if failures else 0
 
 
+def describe_surface(published, workspace):
+    """The `surface:` line, readable even when the pin is not a version.
+
+    `series()` needs two numeric components and raises without them, and this
+    line was formatted BEFORE the problems were printed — so a README pinning
+    `garbage` produced a traceback instead of the targeted "pins a malformed
+    autumn-cli version" message `check()` had already prepared. The gate's own
+    diagnostic broke on precisely the input it exists to report, which is the
+    worst moment to lose it.
+    """
+    try:
+        line = series(published)
+    except ValueError:
+        line = f'unreadable ({published!r})'
+    return (f'surface: published release line {line} '
+            f'(README quickstart), workspace {workspace}')
+
+
 def main():
     problems, checked, waived_count = check(ROOT)
     pages = len(corpus(ROOT))
     print(f'corpus: {pages} reader-facing markdown files')
-    print(f'surface: published release line {series(published_version(ROOT))} '
-          f'(README quickstart), workspace {workspace_version(ROOT)}')
+    print(describe_surface(published_version(ROOT), workspace_version(ROOT)))
     print(f'checked: {checked} `autumn-* = "…"` pins')
     print()
     if problems:
