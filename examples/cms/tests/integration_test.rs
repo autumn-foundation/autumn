@@ -11753,6 +11753,70 @@ async fn re_importing_a_backup_recognizes_a_three_level_pathless_chain() {
     );
 }
 
+/// Importing an updated backup that adds a new descendant to an otherwise
+/// unchanged, already-settled pathless tree must nest that descendant under
+/// its real parent, not leave it at the top level.
+///
+/// `A` and `B` are unchanged and already completed, so they are skipped
+/// before either reaches `created_ids`. Resolving `C`'s parent by the bare
+/// legacy identity `b` cannot find the settled `/a/b` row. Resolving it
+/// through `resolved_post_id` — which checks `B`'s own qualified marker,
+/// not the bare identity — can.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_settled_tree_nests_it_correctly() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/b").send().await.assert_ok();
+
+    // The same `A` and `B`, unchanged, plus a brand new `C` nested under `B`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the new page must nest under its real parent, not land at the top level"
+    );
+}
+
 /// A file where two pages name each other as parent must not hang or crash
 /// the import, and must not create an actual cycle in the database.
 ///

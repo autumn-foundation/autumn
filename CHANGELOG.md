@@ -582,7 +582,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pathless chain where every ancestor is already settled from an earlier
   run — so the fix does not trade the original data loss for a duplicate on
   a later run. A pre-upgrade site's markers, recorded under the old, bare
-  scheme, are still recognized too.
+  scheme, are still recognized too. Resolving a completed ancestor's real id
+  now also goes through that same qualified marker rather than the bare
+  identity, so importing an updated backup that adds a new page to an
+  otherwise unchanged, already-settled tree nests it under its real parent
+  instead of leaving it at the top level.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

@@ -804,6 +804,42 @@ fn stable_identity<'a>(
     })
 }
 
+/// The real database id of a post already declared in this file, resolved
+/// through everything this run can know about it: a row created earlier in
+/// this same run, a row a completed marker names, or a local row whose own
+/// raw identity matches exactly.
+///
+/// The marker check goes through `stable_identity`, not the bare
+/// `identity()`: a completed, nested ancestor's own marker is qualified, so
+/// looking it up by the bare identity alone always misses it. That miss is
+/// what let a newly added descendant of an otherwise unchanged, already
+/// settled tree land at the top level instead of under its real parent.
+async fn resolved_post_id(
+    repos: &Repos,
+    posts: &[ExportPost],
+    by_identity: &std::collections::HashMap<(&str, String), usize>,
+    imported_source_slugs: &std::collections::HashMap<(String, String), i64>,
+    created_ids: &[(i64, String, String, Option<String>)],
+    stable_memo: &mut Vec<Option<String>>,
+    index: usize,
+) -> AutumnResult<Option<i64>> {
+    let post = &posts[index];
+    let own_identity = identity(post);
+    if let Some((id, _, _, _)) = created_ids
+        .iter()
+        .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &own_identity)
+    {
+        return Ok(Some(*id));
+    }
+    let stable = stable_identity(repos, posts, by_identity, index, stable_memo, None, 0).await?;
+    if let Some(id) = imported_source_slugs.get(&(post.post_type.clone(), stable)) {
+        return Ok(Some(*id));
+    }
+    Ok(find_local(repos, &post.post_type, &own_identity)
+        .await?
+        .map(|found| found.id))
+}
+
 /// A stored post of `post_type` whose own identity matches, if there is one.
 async fn find_local(
     repos: &Repos,
@@ -1074,18 +1110,27 @@ pub async fn import(
         // re-link — which is still needed for a parent the file names but
         // does not contain.
         //
-        // The third step matters whenever the parent's own slug was
-        // suffixed by the allocator: a completed marker match skips before
-        // adding to `created_ids`, and `find_local` cannot find a suffixed
-        // slug by the file's bare one. The parent's own marker — recorded
-        // under this same bare identity, since a top-level post's qualified
-        // identity is just its slug — still can.
+        // A parent this same file also declares is resolved through
+        // `resolved_post_id`, which knows how to find it whether it was
+        // just created, or is a completed row — nested or not — that only
+        // its own marker still names. A parent this file does not declare
+        // is content this import does not track: the best this can do is
+        // match it by its current local identity, or by a marker some
+        // earlier, separate import left for that same bare slug.
         let parent_now = match parent_identity(post) {
-            Some(parent) => match created_ids
-                .iter()
-                .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &parent)
-            {
-                Some((id, _, _, _)) => Some(*id),
+            Some(parent) => match by_identity.get(&(post.post_type.as_str(), parent.clone())) {
+                Some(&parent_index) => {
+                    resolved_post_id(
+                        &repos,
+                        &payload.posts,
+                        &by_identity,
+                        &imported_source_slugs,
+                        &created_ids,
+                        &mut stable_memo,
+                        parent_index,
+                    )
+                    .await?
+                }
                 None => match find_local(&repos, &post.post_type, &parent)
                     .await?
                     .map(|found| found.id)
