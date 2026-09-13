@@ -567,6 +567,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The in-process TLS listener now advertises ALPN `[b"h2", b"http/1.1"]`
+  (#2321):** `build_server_config` never set `alpn_protocols`, so rustls
+  completed the handshake with no protocol selected and every browser —
+  every `[server.tls]` deployment, static-cert or ACME — silently fell back
+  to HTTP/1.1, losing multiplexing even though the serve path's
+  `hyper_util::server::conn::auto` already speaks h2 once a client sends the
+  preface. Both TLS modes funnel through `build_server_config_with_client_auth`,
+  which now sets the advertisement once, identically for the server-only and
+  client-auth arms. `h2` is listed first, then `http/1.1`, so ALPN-less and
+  http/1.1-only clients are unaffected. New regression tests pin the ALPN on
+  all three public entry points (`build_server_config`,
+  `build_server_config_with_resolver`, `build_server_config_with_client_auth`
+  with a real client verifier) so an accidental revert to no-ALPN fails the
+  suite. Not covered here: real-browser `wss://`/SSE/graceful-shutdown
+  behavior over h2 — the acceptance criteria ask for Chrome/Firefox
+  verification before the issue is closed, which needs a live listener, not
+  a unit test.
+
 - **`cms` example — import no longer drops, nor later duplicates, a page that
   shares a bare slug with an unrelated one (#2737):** a page's file identity
   falls back to its bare slug when the file has no `path` for it — the
