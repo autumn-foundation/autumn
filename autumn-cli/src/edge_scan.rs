@@ -577,21 +577,57 @@ fn resolve_edge_scan_impl(
         })
         .collect();
 
+    let sources_rel: BTreeSet<&str> = sources.iter().map(|(rel, _)| rel.as_str()).collect();
+
     for (rel, src) in &sources {
-        if let Some((crate_root, module_path)) = path_overrides.get(rel.as_str()) {
-            scan_source_with_context(
-                rel,
-                src,
-                crate_root,
-                module_path.clone(),
-                &default_features,
-                &mut scan,
-            );
+        if let Some(identities) = path_overrides.get(rel.as_str()) {
+            for (crate_root, module_path) in identities {
+                scan_source_with_context(
+                    rel,
+                    src,
+                    crate_root,
+                    module_path.clone(),
+                    &default_features,
+                    &mut scan,
+                );
+            }
         } else {
             scan_source(rel, src, table.as_ref(), &default_features, &mut scan);
         }
     }
     scan.files_scanned += sources.len();
+
+    // A `#[path]` override can redirect to a file OUTSIDE `src/` entirely
+    // (`#[path = "../routes.rs"] mod handlers;` in `src/lib.rs` compiles a
+    // file the ordinary, `src/`-only walk above never reaches) — verified
+    // directly via a real build. `path_attribute_module_paths` already
+    // recorded its identity; read and scan it directly here, once per
+    // recorded identity the same way an in-`src/` override target already
+    // is above, since it was never in `files`/`sources` to begin with
+    // (Codex review on #2739, round 40, P1).
+    for (target_rel, identities) in &path_overrides {
+        if sources_rel.contains(target_rel.as_str()) {
+            continue;
+        }
+        let target_path = project_root.join(target_rel);
+        if claimed.contains(&target_path) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&target_path) else {
+            continue;
+        };
+        for (crate_root, module_path) in identities {
+            scan_source_with_context(
+                target_rel,
+                &src,
+                crate_root,
+                module_path.clone(),
+                &default_features,
+                &mut scan,
+            );
+        }
+        scan.files_scanned += 1;
+    }
     scan
 }
 
@@ -1911,7 +1947,7 @@ fn collect_out_of_line_mods(
             None => out.push((
                 path.clone(),
                 item_mod.ident.to_string(),
-                path_attribute_value(&item_mod.attrs),
+                path_attribute_value(&item_mod.attrs, default_features),
             )),
         }
     }
@@ -1944,15 +1980,24 @@ fn collect_out_of_line_mods(
 /// genuinely ambiguous corner of Rust's `#[path]` interaction with nested
 /// modules this scan does not attempt to resolve — the same accepted,
 /// best-effort trade-off as every other heuristic in this module.
+///
+/// Maps to a `Vec` of identities, not one: Rust allows the SAME file to be
+/// `#[path]`-included under multiple names (`#[path = "shared.rs"] mod a;`
+/// and `#[path = "shared.rs"] mod b;` elsewhere both compile `shared.rs`,
+/// once per name — verified directly via a real build). A single-value map
+/// previously let the second registration silently overwrite the first, so
+/// the file was scanned under only one of its two real identities and a
+/// registration naming the other never matched (Codex review on #2739,
+/// round 40, P2).
 fn path_attribute_module_paths(
     project_root: &Path,
     table: Option<&toml::Table>,
     default_features: &BTreeSet<String>,
-) -> BTreeMap<String, (String, Vec<String>)> {
+) -> BTreeMap<String, Vec<(String, Vec<String>)>> {
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
     files.sort();
-    let mut overrides = BTreeMap::new();
+    let mut overrides: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
     for declaring_file in &files {
         let Ok(src) = std::fs::read_to_string(declaring_file) else {
             continue;
@@ -1997,29 +2042,68 @@ fn path_attribute_module_paths(
             let mut module_path = base_module_path.clone();
             module_path.extend(inline);
             module_path.push(name);
-            overrides.insert(target_rel, (crate_root.clone(), module_path));
+            overrides
+                .entry(target_rel)
+                .or_default()
+                .push((crate_root.clone(), module_path));
         }
     }
     overrides
 }
 
-/// The string value of a `#[path = "..."]` attribute, if `attrs` has one.
-fn path_attribute_value(attrs: &[syn::Attribute]) -> Option<String> {
+/// The string value of a plain `#[path = "..."]` meta, if `meta` is one.
+fn path_name_value_str(meta: &syn::Meta) -> Option<String> {
+    if !meta.path().is_ident("path") {
+        return None;
+    }
+    let syn::Meta::NameValue(name_value) = meta else {
+        return None;
+    };
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Str(lit_str),
+        ..
+    }) = &name_value.value
+    else {
+        return None;
+    };
+    Some(lit_str.value())
+}
+
+/// The string value of a `#[path = "..."]` attribute, if `attrs` has one —
+/// including one introduced by an active `#[cfg_attr(condition, path =
+/// "...")]`, which expands to a real `#[path = "..."]` exactly like any
+/// other `cfg_attr`-gated attribute once `condition` holds (verified
+/// directly via a real build: with the gating feature enabled, `mod
+/// handlers;` behind `#[cfg_attr(feature = "alt", path = "actual.rs")]`
+/// compiles `actual.rs`, not `handlers.rs`). Before this, only a literal
+/// `#[path]` was recognized, so a `cfg_attr`-conditional one fell back to
+/// the conventional file (or reported unresolved entirely, in a custom
+/// crate tree outside `src/`), missing the real file real Rust compiles
+/// (Codex review on #2739, round 40, P1).
+///
+/// Only a condition that DEFINITELY resolves true applies the override —
+/// the opposite conservative direction from [`attr_names_including_cfg_attr`]:
+/// an unresolvable condition here falls through to no override (the same
+/// "not resolved" fallback an ordinary non-`#[path]` mod already gets),
+/// rather than risk following a path override that isn't really active.
+fn path_attribute_value(
+    attrs: &[syn::Attribute],
+    default_features: &BTreeSet<String>,
+) -> Option<String> {
     attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("path") {
-            return None;
+        if let Some(value) = path_name_value_str(&attr.meta) {
+            return Some(value);
         }
-        let syn::Meta::NameValue(name_value) = &attr.meta else {
-            return None;
-        };
-        let syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Str(lit_str),
-            ..
-        }) = &name_value.value
-        else {
-            return None;
-        };
-        Some(lit_str.value())
+        if attr.path().is_ident("cfg_attr")
+            && let syn::Meta::List(list) = &attr.meta
+        {
+            let (condition, metas) = cfg_attr_payload(list, default_features)?;
+            if condition != Some(true) {
+                return None;
+            }
+            return metas.iter().find_map(path_name_value_str);
+        }
+        None
     })
 }
 
@@ -7889,5 +7973,130 @@ mod tests {
             vec!["wiring".to_owned(), "handlers".to_owned()]
         );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// `#[cfg_attr(feature = "alt", path = "actual.rs")] mod handlers;`
+    /// expands to a real `#[path = "actual.rs"]` once `alt` is enabled,
+    /// exactly like any other `cfg_attr`-gated attribute — verified
+    /// directly via a real build. Before this, only a literal `#[path]`
+    /// was recognized, so the scan fell back to the conventional
+    /// `handlers.rs` (which doesn't exist here) instead of the real
+    /// `actual.rs` (Codex review on #2739, round 40, P1).
+    #[test]
+    fn resolve_edge_scan_expands_a_path_attribute_introduced_by_cfg_attr() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[features]\nalt = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[cfg_attr(feature = "alt", path = "actual.rs")]
+            mod handlers;
+            fn wire() { edge_routes![crate::handlers::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(dir.path(), &["alt"], None);
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "src/actual.rs");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// `#[path = "../routes.rs"] mod handlers;` in `src/lib.rs` compiles a
+    /// file OUTSIDE `src/` entirely — verified directly via a real build.
+    /// The ordinary walk only ever reads files found under `project_root/src`
+    /// (`collect_rs_files`), so a target this far outside was recorded by
+    /// `path_attribute_module_paths` but never actually read or scanned at
+    /// all, and its sole `#[edge]` handler was invisible to the whole scan
+    /// (Codex review on #2739, round 40, P1).
+    #[test]
+    fn resolve_edge_scan_scans_a_path_attributes_target_outside_src() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[path = "../routes.rs"]
+            mod handlers;
+            fn wire() { edge_routes![crate::handlers::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("routes.rs"), "#[edge]\npub fn show() {}\n").unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "routes.rs");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// The same file can be `#[path]`-included under two different module
+    /// names — `#[path = "shared.rs"] mod a;` and `#[path = "shared.rs"]
+    /// mod b;` both compile `shared.rs`, once per name — verified directly
+    /// via a real build. `path_attribute_module_paths` previously kept only
+    /// ONE identity per target file (a plain map overwrite), so the file
+    /// was scanned as only `b`, and a registration naming the other
+    /// (`edge_routes![a::show]`) never matched (Codex review on #2739,
+    /// round 40, P2).
+    #[test]
+    fn resolve_edge_scan_preserves_every_identity_for_a_shared_path_attribute_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[path = "shared.rs"]
+            mod a;
+            #[path = "shared.rs"]
+            mod b;
+            fn wire() {
+                edge_routes![crate::a::show];
+                edge_routes![crate::b::show];
+            }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/shared.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let module_paths: BTreeSet<Vec<String>> = scan
+            .functions
+            .iter()
+            .map(|f| f.module_path.clone())
+            .collect();
+        assert!(
+            module_paths.contains(&vec!["a".to_owned()]),
+            "{module_paths:?}"
+        );
+        assert!(
+            module_paths.contains(&vec!["b".to_owned()]),
+            "{module_paths:?}"
+        );
     }
 }
