@@ -898,13 +898,50 @@ async fn legacy_marker_at_current_position(
     })
 }
 
+/// An index over `imported_source_slugs`'s *legacy-shaped* markers, built
+/// once per import rather than scanned per post (#2763).
+///
+/// Keyed by `(post_type, direct-parent segment, own slug)` — the same two
+/// facts `recovered_legacy_owner` checks a candidate against, extracted
+/// from the marker string up front. `imported_source_slugs` itself already
+/// exists so a bulk import pays for the marker table once; without this
+/// index, recovering every pathless post with an external parent rescanned
+/// the whole table each time, `O(posts × markers)` on a populated site. An
+/// `id:`-anchored marker is excluded here too, for the same reason
+/// `recovered_legacy_owner` always excluded it.
+fn legacy_marker_index(
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+) -> std::collections::HashMap<(String, String, String), Vec<i64>> {
+    let mut index: std::collections::HashMap<(String, String, String), Vec<i64>> =
+        std::collections::HashMap::new();
+    for ((post_type, marker), ids) in imported_source_slugs {
+        if marker.starts_with("id:") {
+            continue;
+        }
+        let Some((prefix, own_slug)) = marker.rsplit_once('/') else {
+            continue;
+        };
+        let parent_segment = prefix.rsplit('/').next().unwrap_or(prefix);
+        index
+            .entry((
+                post_type.clone(),
+                parent_segment.to_owned(),
+                own_slug.to_owned(),
+            ))
+            .or_default()
+            .extend(ids);
+    }
+    index
+}
+
 /// Finds a row a prior import already created for this externally-parented
 /// post, when the parent has moved since and
 /// `legacy_marker_at_current_position` cannot find it (#2763).
 ///
 /// The parent's *old* position — what that marker actually named — is
 /// gone, not just unreachable by id, once the parent has moved: nothing
-/// here recomputes it. Two things about the marker itself take its place.
+/// here recomputes it. Two things about the marker itself take its place,
+/// both read from `legacy_marker_index` rather than the raw marker string.
 ///
 /// First, the marker's own direct-parent segment — the slug immediately
 /// before `/{slug}`, however deep the recorded position was — must equal
@@ -919,16 +956,9 @@ async fn legacy_marker_at_current_position(
 /// equals `parent_id` is accepted — accurate no matter how many times an
 /// ancestor has moved, and the same check that rules out an unrelated
 /// page merely sharing this suffix.
-///
-/// An `id:`-anchored marker is excluded outright, not merely another
-/// candidate to filter: it already names its own parent's id inside the
-/// string, so a stale one is never legacy material — it is a
-/// *current-scheme* marker for some other parent entirely. `id:` never
-/// starts a real ancestor identity — a slug cannot contain `:` — so this
-/// is exact, not a guess.
 async fn recovered_legacy_owner(
     repos: &Repos,
-    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+    legacy_marker_index: &std::collections::HashMap<(String, String, String), Vec<i64>>,
     post_type: &str,
     slug: &str,
     parent_id: i64,
@@ -936,22 +966,18 @@ async fn recovered_legacy_owner(
     let Some(parent_row) = repos.posts.find_by_id(parent_id).await? else {
         return Ok(None);
     };
-    let suffix = format!("/{slug}");
-    for ((candidate_type, marker), ids) in imported_source_slugs {
-        if candidate_type != post_type || marker.starts_with("id:") || !marker.ends_with(&suffix) {
-            continue;
-        }
-        let without_suffix = &marker[..marker.len() - suffix.len()];
-        let parent_segment = without_suffix.rsplit('/').next().unwrap_or(without_suffix);
-        if parent_segment != parent_row.slug {
-            continue;
-        }
-        for &id in ids {
-            if let Some(candidate) = repos.posts.find_by_id(id).await?
-                && candidate.parent_id == Some(parent_id)
-            {
-                return Ok(Some(candidate));
-            }
+    let Some(ids) = legacy_marker_index.get(&(
+        post_type.to_owned(),
+        parent_row.slug.clone(),
+        slug.to_owned(),
+    )) else {
+        return Ok(None);
+    };
+    for &id in ids {
+        if let Some(candidate) = repos.posts.find_by_id(id).await?
+            && candidate.parent_id == Some(parent_id)
+        {
+            return Ok(Some(candidate));
         }
     }
     Ok(None)
@@ -970,14 +996,21 @@ async fn recovered_legacy_owner(
 /// matches (the parent moved), and the row's own current parent no longer
 /// agrees either (the row moved) — the same gap applies if the parent was
 /// also re-slugged, since the suffix scan's parent check reads its
-/// *current* slug. Telling such a row apart from a genuinely new,
-/// unrelated one sharing its slug would need every page to carry a
-/// permanent identity of its own, not only the ones this importer created
-/// — a materially bigger change than this fix, and the same one #2763
-/// itself named as the alternative to accepting this gap.
+/// *current* slug. The same gap opens even without a double move if the
+/// parent's *original* slug is later freed (by a rename) and claimed by
+/// an unrelated row, which the row then moves under: every check here
+/// reads current, sibling-unique slugs and current parent ids, neither of
+/// which can tell "the same parent, moved" apart from "a different parent
+/// that now happens to hold the same slug and the same child." Telling
+/// such a row apart from a genuinely new, unrelated one sharing its slug
+/// would need every page to carry a permanent identity of its own, not
+/// only the ones this importer created — a materially bigger change than
+/// this fix, and the same one #2763 itself named as the alternative to
+/// accepting this gap.
 async fn recover_legacy_row(
     repos: &Repos,
     imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+    legacy_marker_index: &std::collections::HashMap<(String, String, String), Vec<i64>>,
     post_type: &str,
     slug: &str,
     parent_id: i64,
@@ -989,7 +1022,7 @@ async fn recover_legacy_row(
     {
         return repos.posts.find_by_id(id).await;
     }
-    recovered_legacy_owner(repos, imported_source_slugs, post_type, slug, parent_id).await
+    recovered_legacy_owner(repos, legacy_marker_index, post_type, slug, parent_id).await
 }
 
 /// Turns a `stable_identity` position into a safe marker key.
@@ -1020,6 +1053,7 @@ struct ImportGraph<'a> {
     posts: &'a [ExportPost],
     graph: &'a FileGraph<'a>,
     imported_source_slugs: &'a std::collections::HashMap<(String, String), Vec<i64>>,
+    legacy_marker_index: &'a std::collections::HashMap<(String, String, String), Vec<i64>>,
     created_ids: &'a [(i64, String, String, Option<String>)],
     completed_imports: &'a std::collections::HashSet<i64>,
 }
@@ -1117,6 +1151,7 @@ fn resolved_post_id<'a>(
             && let Some(candidate) = recover_legacy_row(
                 import.repos,
                 import.imported_source_slugs,
+                import.legacy_marker_index,
                 &post.post_type,
                 &post.slug,
                 parent_id,
@@ -1407,6 +1442,10 @@ pub async fn import(
     let imported_source_slugs = repos
         .with_conn(async |conn| content::imported_source_slugs(conn).await)
         .await?;
+    // Built once from the same table, for the same reason: recovering
+    // every pathless post with an external parent otherwise rescanned it
+    // per post (#2763).
+    let legacy_marker_index = legacy_marker_index(&imported_source_slugs);
     // Which of those a previous run *finished*. The source marker is written
     // before the row's terms, status and ancestry are, so on its own it cannot
     // distinguish "ours, unfinished, repair it" from "ours, done, leave it".
@@ -1484,6 +1523,7 @@ pub async fn import(
                         posts: &payload.posts,
                         graph: &graph,
                         imported_source_slugs: &imported_source_slugs,
+                        legacy_marker_index: &legacy_marker_index,
                         created_ids: &created_ids,
                         completed_imports: &completed_imports,
                     };
@@ -1556,6 +1596,7 @@ pub async fn import(
             marker_owned = recover_legacy_row(
                 &repos,
                 &imported_source_slugs,
+                &legacy_marker_index,
                 &post.post_type,
                 &post.slug,
                 parent_id,
