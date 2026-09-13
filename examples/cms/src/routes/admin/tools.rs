@@ -907,10 +907,18 @@ async fn legacy_marker_at_current_position(
 /// here recomputes it. Instead this checks the row's real, current parent,
 /// which is accurate no matter how many times an ancestor has moved.
 /// Only a candidate whose actual `parent_id` still equals `parent_id` is
-/// accepted, among every marker for `post_type` ending in `/{slug}` — a
-/// shared suffix alone is not enough, since an unrelated page under a
-/// different parent can share it by coincidence; only the real parent
-/// tells them apart.
+/// accepted, among every *legacy-shaped* marker for `post_type` ending in
+/// `/{slug}` — a shared suffix alone is not enough, since an unrelated
+/// page under a different parent can share it by coincidence; only the
+/// real parent tells them apart.
+///
+/// An `id:`-anchored marker is excluded, not merely another candidate to
+/// filter by parent: it already names its own parent's id inside the
+/// string, so a stale one is never a legacy marker to recover — it is a
+/// *current-scheme* marker for some other parent entirely, and a row an
+/// editor has since dragged under this parent by coincidence must not be
+/// mistaken for this post's own row. `id:` never starts a real ancestor
+/// identity — a slug cannot contain `:` — so this is exact, not a guess.
 async fn recovered_legacy_owner(
     repos: &Repos,
     imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
@@ -920,7 +928,7 @@ async fn recovered_legacy_owner(
 ) -> AutumnResult<Option<crate::models::Post>> {
     let suffix = format!("/{slug}");
     for ((candidate_type, marker), ids) in imported_source_slugs {
-        if candidate_type != post_type || !marker.ends_with(&suffix) {
+        if candidate_type != post_type || marker.starts_with("id:") || !marker.ends_with(&suffix) {
             continue;
         }
         for &id in ids {

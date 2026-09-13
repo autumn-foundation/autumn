@@ -12337,6 +12337,148 @@ async fn importing_a_new_descendant_of_a_pre_upgrade_legacy_parent_nests_it_corr
     );
 }
 
+/// Importing a genuinely new page must not be confused with an unrelated,
+/// *current-scheme* marker whose row an editor has since dragged under the
+/// same external parent by coincidence (#2763).
+///
+/// `P`'s marker is `id:<B>/p` — the shape this fix itself now writes, not
+/// a legacy one. An editor moving `P` to `A` afterwards must not make the
+/// legacy-recovery suffix scan mistake it for a *different* `p` this file
+/// is naming under `A` for the first time: an `id:`-anchored marker is
+/// never a legacy candidate, no matter whose slug it ends in.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_a_relocated_current_scheme_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "B"),
+            ("slug", "b"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating B: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/b/p").send().await.assert_ok();
+
+    // A different external parent, then the editor drags `P` under it
+    // directly — not through any import.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+    let (p_id, a_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let p = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p");
+        let a = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a");
+        (p, a)
+    };
+    let a_id_str = a_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", a_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/a/p").send().await.assert_ok();
+
+    // A genuinely new file, naming a different `P2` under `A` — its slug
+    // collides with the relocated page above only by coincidence.
+    let cookie = sign_in(&client, "owner").await;
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P2", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // The new page exists under `A`, alongside the relocated one.
+    sign_out(&client);
+    let new_under_a: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::title.eq("P2"))
+            .filter(cms::schema::posts::parent_id.eq(a_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count")
+    };
+    assert_eq!(new_under_a, 1, "the new `P2` must exist under `A`");
+    client.get("/a/p").send().await.assert_ok();
+}
+
 /// Re-importing a whole multi-level, pathless backup must still recognize
 /// every page in the chain, not just the immediate parent of whichever page
 /// is being checked.
