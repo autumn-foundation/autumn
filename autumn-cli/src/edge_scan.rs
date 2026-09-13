@@ -3315,9 +3315,35 @@ fn skip_cfg_excluded_statement(
 /// "no `;` needed" property, is folded in recursively; the other four
 /// keywords have no such chain.
 fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
+    let start = i;
     loop {
         match trees.get(i) {
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
+                // A bare block expression (`if { true } { .. }`, real, valid
+                // Rust — verified directly via a real build, warned as
+                // "unnecessary braces" but not rejected) can stand as the
+                // WHOLE condition or scrutinee itself, with no other tokens
+                // before it: unlike a struct literal, a bare, un-parenthesized
+                // `{ ... }` with no preceding path is not what Rust's
+                // "no struct literal in condition" restriction forbids, so
+                // it's read as the condition/scrutinee expression, and the
+                // real body's own brace follows directly after it. This is
+                // only possible for `if`/`while`/`match`, which always need a
+                // condition/scrutinee before their body; `unsafe`/`loop` have
+                // no condition at all (their body brace comes immediately
+                // after the keyword, so `i == start` there IS the real
+                // body), and `for`'s pattern never starts with a bare `{`.
+                // Without this, the whole cfg'd-out `if { true } {
+                // edge_routes![show]; }` had its condition block mistaken for
+                // the real body, leaving the actual body an ordinary,
+                // unexcluded sibling group that credited `show` (Codex review
+                // on #2739, round 45, P2).
+                if i == start
+                    && matches!(trees.get(start.wrapping_sub(1)), Some(TokenTree::Ident(id)) if matches!(id.to_string().as_str(), "if" | "while" | "match"))
+                {
+                    i += 1;
+                    continue;
+                }
                 // A brace-delimited macro invocation in the condition or
                 // scrutinee (`match value!{} { .. }`) has its OWN brace
                 // group — the macro's argument list — directly preceded by
@@ -9032,6 +9058,42 @@ mod tests {
             async fn wire() {
                 #[cfg(feature = "premium")]
                 if async { predicate().await }.await {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// A bare block expression (`if { true } { .. }`) can stand as the
+    /// WHOLE `if` condition itself, with nothing else preceding it — real,
+    /// valid Rust verified directly via a real build (warned as
+    /// "unnecessary braces", not rejected), since Rust's "no struct literal
+    /// in condition" restriction forbids a `Path { .. }` literal, not a bare,
+    /// path-less block. `control_flow_block_end` previously treated the
+    /// FIRST Brace group reached as unambiguously the real body, so it
+    /// mistook this condition block for the body and left the actual body
+    /// an ordinary, unexcluded sibling group that credited `show` even
+    /// though the whole `if` sits behind an inactive `#[cfg(feature =
+    /// "premium")]` (Codex review on #2739, round 45, P2).
+    #[test]
+    fn cfg_false_if_with_bare_block_condition_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if { true } {
                     edge_routes![crate::show];
                 }
             }
