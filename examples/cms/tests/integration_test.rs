@@ -12239,6 +12239,104 @@ async fn importing_a_new_page_is_not_confused_with_an_unrelated_pre_upgrade_name
     client.get("/a/p").send().await.assert_ok();
 }
 
+/// A new descendant of a page whose own marker predates #2763 must nest
+/// under that page's real row, not land at the top level (#2763).
+///
+/// `P`'s marker (`a/p`) is the pre-#2763 shape. `C` names `P` as its
+/// parent, and `P` is also declared in this same file, so `C`'s parent
+/// resolves through `resolved_post_id` — which needs the same legacy
+/// recovery the main loop uses, or it can never find `P`'s real id.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_pre_upgrade_legacy_parent_nests_it_correctly() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A backup that names `P` again, and adds a new child `C` under it.
+    let second_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "p", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/a/p/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the import must not have created a second, top-level `c`"
+    );
+}
+
 /// Re-importing a whole multi-level, pathless backup must still recognize
 /// every page in the chain, not just the immediate parent of whichever page
 /// is being checked.

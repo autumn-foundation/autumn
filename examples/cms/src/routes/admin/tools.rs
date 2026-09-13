@@ -934,6 +934,39 @@ async fn recovered_legacy_owner(
     Ok(None)
 }
 
+/// Recovers a row a prior import already created for a post whose parent
+/// is external, when no other marker lookup found one (#2763).
+///
+/// Tries the exact recomputed marker first, and only falls back to the
+/// parent-verified suffix scan when that misses — see
+/// `legacy_marker_at_current_position` and `recovered_legacy_owner` for
+/// why each exists and what each one alone cannot do.
+///
+/// Neither tier recovers a row whose external parent *and* the row itself
+/// have both moved since the original import: the exact marker no longer
+/// matches (the parent moved), and the row's own current parent no longer
+/// agrees either (the row moved). Telling that row apart from a genuinely
+/// new, unrelated one sharing its slug would need every page to carry a
+/// permanent identity of its own, not only the ones this importer created
+/// — a materially bigger change than this fix, and the same one #2763
+/// itself named as the alternative to accepting this gap.
+async fn recover_legacy_row(
+    repos: &Repos,
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+    post_type: &str,
+    slug: &str,
+    parent_id: i64,
+) -> AutumnResult<Option<crate::models::Post>> {
+    if let Some(legacy_marker) = legacy_marker_at_current_position(repos, parent_id, slug).await?
+        && let Some(&id) = imported_source_slugs
+            .get(&(post_type.to_owned(), legacy_marker))
+            .and_then(|ids| ids.first())
+    {
+        return repos.posts.find_by_id(id).await;
+    }
+    recovered_legacy_owner(repos, imported_source_slugs, post_type, slug, parent_id).await
+}
+
 /// Turns a `stable_identity` position into a safe marker key.
 ///
 /// A position with no slash at all — a genuinely top-level post, qualified
@@ -1011,30 +1044,54 @@ fn resolved_post_id<'a>(
         {
             return Ok(Some(id));
         }
+        // This post's own parent, resolved the same way the main loop
+        // resolves any other: recursively, through this same function, for
+        // one already declared in this file, or against local content
+        // otherwise. Needed below regardless of which fallback applies, so
+        // resolved once rather than twice.
+        let parent = parent_identity(post);
+        let in_file_parent = parent
+            .as_ref()
+            .and_then(|parent| import.graph.find(post.post_type.as_str(), parent));
+        let parent_now = match (&parent, in_file_parent) {
+            (Some(_), Some(parent_index)) => {
+                resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
+            }
+            (Some(parent), None) => parent
+                .resolve_local(import.repos, &post.post_type)
+                .await?
+                .map(|found| found.id),
+            (None, _) => None,
+        };
         if depth <= content::MAX_PAGE_DEPTH + 2
             && stable != own_identity
             && let Some(ids) = import
                 .imported_source_slugs
                 .get(&(post.post_type.clone(), own_identity.clone()))
-        {
-            let expected_parent = match parent_identity(post) {
-                Some(parent) => match import.graph.find(post.post_type.as_str(), &parent) {
-                    Some(parent_index) => {
-                        resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
-                    }
-                    None => parent
-                        .resolve_local(import.repos, &post.post_type)
-                        .await?
-                        .map(|found| found.id),
-                },
-                None => None,
-            };
-            if let Some(candidate) =
-                pick_marker_candidate(import.repos, ids, import.completed_imports, expected_parent)
+            && let Some(candidate) =
+                pick_marker_candidate(import.repos, ids, import.completed_imports, parent_now)
                     .await?
-            {
-                return Ok(Some(candidate.id));
-            }
+        {
+            return Ok(Some(candidate.id));
+        }
+        // A pre-#2763 marker for a post whose own parent is external, the
+        // same recovery the main loop tries for any other post (#2763). A
+        // post declared as another's parent needs this too: without it, a
+        // legacy row like this one is never added to `created_ids`, and a
+        // new descendant naming it as parent could not find its real id.
+        if parent.is_some()
+            && in_file_parent.is_none()
+            && let Some(parent_id) = parent_now
+            && let Some(candidate) = recover_legacy_row(
+                import.repos,
+                import.imported_source_slugs,
+                &post.post_type,
+                &post.slug,
+                parent_id,
+            )
+            .await?
+        {
+            return Ok(Some(candidate.id));
         }
         Ok(find_local(import.repos, &post.post_type, &own_identity)
             .await?
@@ -1464,28 +1521,14 @@ pub async fn import(
             && graph.find(post.post_type.as_str(), &parent).is_none()
             && let Some(parent_id) = parent_now
         {
-            // The parent has not moved: this recomputes the exact old
-            // marker, so a match is exact and needs no further check.
-            if let Some(legacy_marker) =
-                legacy_marker_at_current_position(&repos, parent_id, &post.slug).await?
-                && let Some(&id) = imported_source_slugs
-                    .get(&(post.post_type.clone(), legacy_marker))
-                    .and_then(|ids| ids.first())
-            {
-                marker_owned = repos.posts.find_by_id(id).await?;
-            }
-            // The parent has moved: recover by the row's real parent
-            // instead, since its old position can no longer be recomputed.
-            if marker_owned.is_none() {
-                marker_owned = recovered_legacy_owner(
-                    &repos,
-                    &imported_source_slugs,
-                    &post.post_type,
-                    &post.slug,
-                    parent_id,
-                )
-                .await?;
-            }
+            marker_owned = recover_legacy_row(
+                &repos,
+                &imported_source_slugs,
+                &post.post_type,
+                &post.slug,
+                parent_id,
+            )
+            .await?;
         }
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating
