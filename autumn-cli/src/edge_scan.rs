@@ -703,11 +703,13 @@ enum TargetCfgPredicate {
     Any(Vec<Self>),
 }
 
-/// wasm32-wasip1's own value(s) for every `cfg(...)` key this scan resolves
-/// — every key/value pair `rustc --print cfg --target wasm32-wasip1` prints,
-/// `debug_assertions` (a bare flag, not a `key = "value"` pair, and not a
-/// realistic target-table predicate) aside — verified directly against that
-/// complete output (Codex review on #2739, rounds 14 through 17, each
+/// wasm32-wasip1's own value(s) for every `key = "value"` shaped `cfg(...)`
+/// key this scan resolves — every such pair `rustc --print cfg --target
+/// wasm32-wasip1` prints, `debug_assertions` (a bare flag with no value,
+/// handled as its own always-true special case in
+/// [`TargetCfgPredicate`]'s `Parse` impl instead — see round 25 there)
+/// aside — verified directly against that complete output (Codex review on
+/// #2739, rounds 14 through 17, each
 /// extending the previous round's grammar after a real predicate it did not
 /// recognize was found to evaluate as "does not match" when it actually
 /// does — the exact dangerous-direction mistake this evaluator exists to
@@ -853,20 +855,26 @@ impl syn::parse::Parse for TargetCfgPredicate {
         if ident == "windows" || ident == "unix" {
             return Ok(Self::Leaf(false));
         }
-        // `debug_assertions` deliberately falls through to "unresolvable"
-        // here too, and that is the CORRECT answer, not merely a
-        // conservative one: `rustc --print cfg --target wasm32-wasip1`
-        // reports it bare, but only because that command defaults to a
-        // dev-profile-shaped query. Verified directly with
-        // `-C debug-assertions=off` (what a `--release` build actually
-        // uses): the flag disappears entirely. The edge capsule is always
-        // compiled `--release` (see the module doc), so `debug_assertions`
-        // is genuinely false for it — treating it as true here would
-        // manufacture the exact phantom-route problem this evaluator
-        // exists to avoid, in the opposite direction (Codex review on
-        // #2739, round 20, P1 — investigated and not applied; see the
-        // adjacent test asserting today's exclusion is correct).
-        //
+        // Round 20 concluded `debug_assertions` should stay unresolvable
+        // (hence false) here, reasoning that the capsule always builds
+        // `--release` and `-C debug-assertions=off` makes the flag genuinely
+        // absent for it. That conflated two DIFFERENT Cargo pipelines:
+        // real, direct verification (`cargo build --release --target
+        // wasm32-wasip1 -v` on a manifest with `[target.'cfg(debug_assertions)'.dependencies]`)
+        // shows the dependency compiled into the release build regardless —
+        // Cargo resolves a target-table predicate's `debug_assertions`
+        // using its fixed per-target cfg database (always true, the same
+        // one `rustc --print cfg`'s default dev-profile-shaped query
+        // reports), not the profile's actual `-C debug-assertions=off`/`on`
+        // flag, which only affects how the CRATE'S OWN source-level
+        // `#[cfg(debug_assertions)]` compiles, a later and separate step.
+        // Treating it as unresolvable-so-false was therefore the wrong
+        // direction after all: it filtered out a dependency (and the
+        // `#[cfg(feature = "...")]` route behind it) that a real release
+        // build genuinely includes (Codex review on #2739, round 25, P1).
+        if ident == "debug_assertions" {
+            return Ok(Self::Leaf(true));
+        }
         // `target_env`, `target_pointer_width`, ... as a bare identifier
         // (not `key = "value"`) — not part of the resolvable grammar
         // either; the caller treats all of these as "does not match."
@@ -1064,12 +1072,15 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 let members = workspace_globs("members");
                 let member_patterns: Vec<&str> = members.iter().map(String::as_str).collect();
-                if any_glob_matches(&member_patterns, &rel) {
+                // `members` never covers a subtree beneath a matched entry —
+                // each entry must itself BE a package (see `any_glob_matches`).
+                if any_glob_matches(&member_patterns, &rel, false) {
                     return true;
                 }
                 let exclude = workspace_globs("exclude");
                 let exclude_patterns: Vec<&str> = exclude.iter().map(String::as_str).collect();
-                !any_glob_matches(&exclude_patterns, &rel)
+                // `exclude`, unlike `members`, DOES cover a whole subtree.
+                !any_glob_matches(&exclude_patterns, &rel, true)
             });
             if governed {
                 return Some(table);
@@ -1083,18 +1094,45 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
 /// Whether any of `patterns` (Cargo's `[workspace] members = [...]` or
 /// `exclude = [...]` globs) matches `rel` — the forward-slash path from a
 /// workspace root to a candidate member. Supports the shapes real manifests
-/// actually use for these fields: an exact path (`"mainpkg"`), a single `*`
-/// wildcard within one segment (`"crates/*"`), and covering an entire
-/// subtree by naming its own root (`"vendor"` also covers
-/// `"vendor/nested/pkg"`, matching Cargo's own documented semantics for
-/// both fields) — not the full glob grammar dedicated crates support
-/// (recursive `**`, character classes, brace expansion), which these
-/// fields essentially never need in practice.
-fn any_glob_matches(patterns: &[&str], rel: &str) -> bool {
+/// actually use for these fields: an exact path (`"mainpkg"`) and a single
+/// `*` wildcard within one segment (`"crates/*"`) always require the SAME
+/// number of segments as `rel` — not the full glob grammar dedicated crates
+/// support (recursive `**`, character classes, brace expansion), which these
+/// fields essentially never need in practice, and in particular `*` never
+/// crosses a `/` the way a recursive glob would: verified directly (`cargo
+/// metadata` on `members = ["crates/*"]` with only `crates/group/app`
+/// present, no `crates/group/Cargo.toml`, errors trying to load
+/// `crates/group` itself as the matched member — it never even considers
+/// the deeper `crates/group/app` a candidate).
+///
+/// `allow_subtree_match` covers the one shape that DOES extend past the
+/// pattern's own segment count, and it is real only for `exclude`, verified
+/// directly: a workspace with `members = ["crates/app"]` (a path dependency
+/// away from `vendor/nested/pkg`, which Cargo auto-includes as an implicit
+/// member) and `exclude = ["vendor"]` — a bare, one-segment, non-wildcard
+/// pattern — drops `vendor/nested/pkg` from `workspace_members` entirely.
+/// `members` never gets this treatment: verified directly the other way,
+/// `members = ["vendor"]` alone (no wildcard, same one-segment pattern)
+/// errors trying to load `vendor/Cargo.toml` as the matched package instead
+/// of reaching into `vendor/nested/pkg` — `members` entries must each name
+/// an actual package root, with no auto-recursion into subtrees at all.
+/// Previously this scan let `pattern_segments.len() <= rel_segments.len()`
+/// govern BOTH fields uniformly (truncating the comparison to the
+/// pattern's own length and ignoring rel's remaining segments), so a
+/// `members = ["crates/*"]` entry wrongly matched a package two levels
+/// deeper, like `crates/group/app` — treating an ancestor workspace as
+/// covering a package one glob-segment further than any real Cargo build
+/// would ever agree it does (Codex review on #2739, round 25, P1).
+fn any_glob_matches(patterns: &[&str], rel: &str, allow_subtree_match: bool) -> bool {
     let rel_segments: Vec<&str> = rel.split('/').collect();
     patterns.iter().any(|pattern| {
         let pattern_segments: Vec<&str> = pattern.split('/').collect();
-        pattern_segments.len() <= rel_segments.len()
+        let length_matches = if allow_subtree_match {
+            pattern_segments.len() <= rel_segments.len()
+        } else {
+            pattern_segments.len() == rel_segments.len()
+        };
+        length_matches
             && pattern_segments
                 .iter()
                 .zip(&rel_segments)
@@ -2282,21 +2320,71 @@ fn skip_cfg_excluded_statement(
     if !excluded || is_specially_handled_item(trees, attrs_end) {
         return None;
     }
-    Some(
-        if matches!(trees.get(attrs_end), Some(TokenTree::Group(_))) {
-            attrs_end + 1
-        } else {
-            let mut i = attrs_end;
-            while i < trees.len() {
-                let is_semicolon = matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';');
-                i += 1;
-                if is_semicolon {
-                    break;
-                }
-            }
-            i
-        },
-    )
+    if matches!(trees.get(attrs_end), Some(TokenTree::Group(_))) {
+        return Some(attrs_end + 1);
+    }
+    // `if`/`match`/`while`/`loop`/`for`/`unsafe` used as a whole statement
+    // never end in `;` — real Rust's grammar simply doesn't require or
+    // allow one there (a trailing `;` after `if cond { .. }` would be an
+    // EXTRA, separate empty statement, not part of it). The generic
+    // scan-to-`;` fallback below cannot see that: given `#[cfg(...)] if
+    // cond { edge_routes![premium] }` immediately followed by an ACTIVE
+    // `edge_routes![show];`, it would keep consuming tokens right through
+    // the excluded `if`'s own closing brace and into the next, unrelated,
+    // still-real statement, stopping only at ITS semicolon — dropping a
+    // genuine registration the real build still compiles in (Codex review
+    // on #2739, round 25, P2).
+    if let Some(TokenTree::Ident(ident)) = trees.get(attrs_end)
+        && matches!(
+            ident.to_string().as_str(),
+            "if" | "match" | "while" | "loop" | "for" | "unsafe"
+        )
+        && let Some(block_end) = control_flow_block_end(trees, attrs_end + 1)
+    {
+        return Some(block_end + 1);
+    }
+    let mut i = attrs_end;
+    while i < trees.len() {
+        let is_semicolon = matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';');
+        i += 1;
+        if is_semicolon {
+            break;
+        }
+    }
+    Some(i)
+}
+
+/// The end of a block-like control-flow statement (`if`/`match`/`while`/
+/// `loop`/`for`/`unsafe`) starting right after its own keyword at `i` —
+/// these never need, or allow, a trailing `;` to end the statement, unlike
+/// everything else [`skip_cfg_excluded_statement`] assumes does.
+///
+/// Scans forward treating any token — including a whole `Group` — as an
+/// opaque pass-through except the FIRST Brace-delimited one, which ends the
+/// primary block. That is safe because Rust's grammar forbids a bare,
+/// un-parenthesized struct-literal (or any other top-level `{`) in an
+/// `if`/`while`/`for` condition or a `match` scrutinee, precisely to avoid
+/// this exact ambiguity with the block that follows — so the first Brace
+/// group reached here is unambiguously the real body, never part of the
+/// condition. An `if`'s own `else`/`else if` chain, which shares the same
+/// "no `;` needed" property, is folded in recursively; the other four
+/// keywords have no such chain.
+fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
+    loop {
+        match trees.get(i) {
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => break,
+            Some(_) => i += 1,
+            None => return None,
+        }
+    }
+    if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if id == "else") {
+        return match trees.get(i + 2) {
+            Some(TokenTree::Ident(id)) if id == "if" => control_flow_block_end(trees, i + 3),
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => Some(i + 2),
+            _ => Some(i),
+        };
+    }
+    Some(i)
 }
 
 /// For `[<generics>] <Type>` or `[<generics>] <Trait> for <Type> [where
@@ -2318,6 +2406,16 @@ fn simple_impl_body_index(trees: &[TokenTree], impl_index: usize) -> Option<usiz
         match trees.get(i) {
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace && angle_depth == 0 => {
                 return Some(i);
+            }
+            // `->` (e.g. a `Fn() -> U` bound in a `where` clause or generic
+            // param) is two Punct tokens, `-` then `>` — see the identical
+            // fix and rationale in `simple_fn_body_index` (Codex review on
+            // #2739, round 25, P2).
+            Some(TokenTree::Punct(p))
+                if p.as_char() == '-'
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+            {
+                i += 2;
             }
             Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
                 angle_depth += 1;
@@ -2371,6 +2469,20 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         let mut depth: i32 = 0;
         loop {
             match trees.get(i) {
+                // `->` (e.g. a `Fn() -> U` bound inside `<T: Fn() -> U>`) is
+                // two Punct tokens, `-` then `>` — the `>` half is not a
+                // closing angle bracket and must not decrement `depth`, or a
+                // legitimate generic bound ends this loop early and leaves
+                // the real closing `>` as an unexpected token the rest of
+                // this function cannot parse, returning `None` for a
+                // perfectly ordinary generic function (Codex review on
+                // #2739, round 25, P2).
+                Some(TokenTree::Punct(p))
+                    if p.as_char() == '-'
+                        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+                {
+                    i += 2;
+                }
                 Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
                     depth += 1;
                     i += 1;
@@ -2446,6 +2558,21 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
                     if g.delimiter() == Delimiter::Brace && angle_depth == 0 =>
                 {
                     return Some(i);
+                }
+                // `->` (a plain function arrow, e.g. inside `impl Fn() ->
+                // T`) is two Punct tokens, `-` then `>` — the `>` half must
+                // not be mistaken for a closing angle bracket, or a
+                // legitimate return type nesting an arrow (any
+                // `Fn`/`FnMut`/`FnOnce` bound) trips the `angle_depth < 0`
+                // guard below and wrongly returns `None`, sending the
+                // caller's `#[cfg(...)]`-excluded function through the
+                // unprotected, cfg-blind fallback instead (Codex review on
+                // #2739, round 25, P2).
+                Some(TokenTree::Punct(p))
+                    if p.as_char() == '-'
+                        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+                {
+                    i += 2;
                 }
                 Some(TokenTree::Punct(p)) if p.as_char() == '<' => {
                     angle_depth += 1;
@@ -2999,6 +3126,36 @@ mod tests {
         assert_eq!(scan.registered_fns().len(), 1);
     }
 
+    /// The same arrow-inside-angle-brackets ambiguity `simple_fn_body_index`
+    /// guards against, but inside `simple_impl_body_index`'s own generic
+    /// parameter list this time (`impl<T: Fn() -> u8> Routes<T>`) — the
+    /// identical fix applies there too (Codex review on #2739, round 25,
+    /// P2).
+    #[test]
+    fn cfg_feature_gated_impl_block_with_an_arrow_bound_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            struct Routes<T>(T);
+
+            #[cfg(feature = "premium")]
+            impl<T: Fn() -> u8> Routes<T> {
+                fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
     /// Same as the cfg'd-out inline module case above, but the
     /// `edge_routes![]` call is inside a cfg'd-out FUNCTION body instead of
     /// a `mod { ... }` — the generic group recursion, not just the
@@ -3105,6 +3262,76 @@ mod tests {
         assert_eq!(scan.registered_fns().len(), 1);
     }
 
+    /// A cfg'd-out `if` block used as a whole statement never ends in `;` —
+    /// so `skip_cfg_excluded_statement`'s fallback of scanning to the next
+    /// top-level `;` must not run through it into the FOLLOWING, still-real
+    /// statement. Before the fix, `#[cfg(feature = "premium")] if true {
+    /// edge_routes![premium]; }` followed by an active
+    /// `edge_routes![show];` had the excluded `if`'s scan swallow the real
+    /// statement too, stopping only at ITS semicolon — dropping `show`'s
+    /// genuine registration (Codex review on #2739, round 25, P2).
+    #[test]
+    fn cfg_feature_gated_if_statement_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[edge]
+            pub fn premium() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if true {
+                    edge_routes![crate::premium];
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "premium");
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// Same setup, but with `premium` on: both registrations genuinely
+    /// exist in the compiled capsule.
+    #[test]
+    fn cfg_feature_gated_if_statement_registration_is_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[edge]
+            pub fn premium() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if true {
+                    edge_routes![crate::premium];
+                }
+                edge_routes![crate::show];
+            }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            2,
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
     /// A grouped return type (`-> ()`, `-> Result<(), E>`, `-> [T; N]`) has
     /// a non-brace `Group` token (a parenthesized or bracketed group) inside
     /// it — previously unrecognized by the return-type/`where`-clause
@@ -3155,6 +3382,39 @@ mod tests {
 
             #[cfg(feature = "premium")]
             fn wire<const N: usize>() -> R<{ 1 + 2 }> { edge_routes![crate::show]; R }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// A return type nesting its OWN arrow (`-> impl Fn() -> ()`) is legal,
+    /// ordinary Rust — no generics or const-generics involved at all. The
+    /// angle-bracket-depth tracking added to guard against braced
+    /// const-generics treated the inner arrow's `>` half as a closing angle
+    /// bracket, decrementing `angle_depth` below zero and wrongly returning
+    /// `None` for a function that has no angle brackets whatsoever, sending
+    /// it through the unprotected, cfg-blind fallback scan instead of being
+    /// correctly recognized and excluded (Codex review on #2739, round 25,
+    /// P2).
+    #[test]
+    fn cfg_feature_gated_fn_with_a_nested_arrow_return_type_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire() -> impl Fn() -> () {
+                edge_routes![crate::show];
+                || ()
+            }
             "#,
             &[],
         );
@@ -3300,6 +3560,36 @@ mod tests {
 
             #[cfg(feature = "premium")]
             fn wire<T>() where T: Default { edge_routes![crate::show]; }
+            "#,
+            &[],
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// A generic BOUND nesting an arrow (`fn wire<T: Fn() -> U>()`) hits the
+    /// same ambiguity as a return type nesting one, but inside the
+    /// generic-parameter-list tolerance loop instead: that loop's own
+    /// angle-bracket depth tracking mistook the bound's `-> U`'s `>` half
+    /// for the generic list's real closing bracket, ending the loop one
+    /// token early and leaving the true `>` (and the parameter list after
+    /// it) as unexpected tokens this function could not parse, wrongly
+    /// returning `None` for an ordinary generic function (Codex review on
+    /// #2739, round 25, P2).
+    #[test]
+    fn cfg_feature_gated_generic_fn_with_an_arrow_bound_registration_is_excluded_when_feature_is_off()
+     {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            fn wire<T: Fn() -> u8>() { edge_routes![crate::show]; }
             "#,
             &[],
         );
@@ -3809,17 +4099,19 @@ mod tests {
         assert!(enabled.contains("dep"));
     }
 
-    /// `cfg(debug_assertions)` must NOT enable a target-specific optional
-    /// dependency — verified directly with
-    /// `rustc --print cfg --target wasm32-wasip1 -C debug-assertions=off`
-    /// (what the capsule's always-`--release` build actually uses): the
-    /// flag is genuinely absent there, unlike the dev-profile-shaped
-    /// default `--print cfg` output. Treating it as true would manufacture
-    /// a phantom route in the opposite direction from every other fix in
-    /// this file (Codex review on #2739, round 20, P1 — investigated, not
-    /// applied).
+    /// `cfg(debug_assertions)` DOES enable a target-specific optional
+    /// dependency, even for the capsule's always-`--release` build —
+    /// verified directly (`cargo build --release --target wasm32-wasip1 -v`
+    /// on exactly this manifest shape): Cargo resolves a target-table
+    /// predicate's `debug_assertions` from its own fixed per-target cfg
+    /// database, always true, not from the profile's actual
+    /// `-C debug-assertions=off` flag — that flag only governs how the
+    /// crate's OWN source-level `#[cfg(debug_assertions)]` compiles, a
+    /// later and separate step. Round 20 treated this as unresolvable
+    /// (hence false) reasoning from the wrong pipeline; round 25 corrects
+    /// it (Codex review on #2739, round 25, P1).
     #[test]
-    fn a_debug_assertions_target_specific_dependency_is_not_enabled() {
+    fn a_debug_assertions_target_specific_dependency_is_enabled() {
         let manifest = r#"
             [target.'cfg(debug_assertions)'.dependencies]
             dep = { version = "1", optional = true }
@@ -3828,7 +4120,7 @@ mod tests {
             default = ["dep/extra"]
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
-        assert!(!enabled.contains("dep"));
+        assert!(enabled.contains("dep"), "{enabled:?}");
     }
 
     /// Same reasoning for `unix`.
@@ -4014,6 +4306,37 @@ mod tests {
         .unwrap();
         assert!(resolver_v1_is_in_effect(
             &dir.path().join("crates/mainpkg"),
+            Some(&member)
+        ));
+    }
+
+    /// A `members = ["crates/*"]` glob must NOT reach a package one segment
+    /// FURTHER than the pattern itself names — verified directly: `cargo
+    /// metadata` on this exact shape (only `crates/group/app` present, no
+    /// `crates/group` package) errors trying to load `crates/group` itself,
+    /// never even considering `crates/group/app` a candidate. Before this
+    /// fix, `any_glob_matches` treated `crates/*` as matching
+    /// `crates/group/app` by truncating the comparison to the pattern's own
+    /// two segments and ignoring the rel path's third — so the "explicit
+    /// membership overrides an overlapping exclude" check above (which must
+    /// run first) wrongly short-circuited on a member match that was never
+    /// real, and an `exclude = ["crates/group/app"]` entry sitting right
+    /// next to it was never even consulted (Codex review on #2739, round
+    /// 25, P1).
+    #[test]
+    fn resolver_v1_is_in_effect_does_not_extend_a_members_glob_across_an_extra_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/group/app\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/group/app")).unwrap();
+        let member: toml::Table =
+            toml::from_str("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2018\"\n")
+                .unwrap();
+        assert!(resolver_v1_is_in_effect(
+            &dir.path().join("crates/group/app"),
             Some(&member)
         ));
     }
