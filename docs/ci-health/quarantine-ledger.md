@@ -643,8 +643,9 @@ without also filling in the intake form above.
   same pagination risk this ledger already flagged in the 2026-09-11
   entry above. Every failure this sample surfaced was attributed to
   one of: the pre-existing MinIO/Docker-Hub outage (pre-#2740, before
-  17:03:52Z), the #2740/#2743 dead-code escape documented above
-  (17:46:17Z-02:09:18Z), or a WIP branch's own in-progress bug (a
+  17:03:52Z), the four-diagnosis MinIO-fix escape documented above (two
+  corrected intervals, 17:46:17Z-23:19:07Z and 23:22:06Z-02:09:18Z), or a
+  WIP branch's own in-progress bug (a
   `dependabot` toolchain bump breaking `semver_script_checks_...`, a
   `capture_min_length` feature branch, repeated `Clippy` churn on single
   branches iterating on lint fixes). None matched `live_upgrade`,
