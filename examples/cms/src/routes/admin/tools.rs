@@ -665,6 +665,51 @@ fn parent_identity(post: &ExportPost) -> Option<String> {
     post.parent.clone()
 }
 
+/// How deep a post nests, by this file's own parent references.
+///
+/// The old sort key counted slashes in `identity(post)`. A page nested only
+/// through `parent`, with no `path`, has a bare identity. A bare identity has
+/// no slash, so it looks top level. The old key ran such a page before its
+/// own parent was even created.
+///
+/// This walks `parent_identity` against the file's other posts instead. It
+/// finds the real depth, no matter which field names the parent.
+///
+/// The result is memoized by post index. The walk is bounded, like every
+/// other ancestry walk in this module — a hand-edited file could name a page
+/// as its own ancestor.
+fn file_depth(
+    posts: &[ExportPost],
+    index: usize,
+    memo: &mut [Option<usize>],
+    visiting: &mut [bool],
+) -> usize {
+    if let Some(depth) = memo[index] {
+        return depth;
+    }
+    if visiting[index] {
+        // A cycle in the file's parent references. Stop, and treat this post
+        // as top level.
+        return 0;
+    }
+    visiting[index] = true;
+    let depth = parent_identity(&posts[index])
+        .and_then(|parent| {
+            posts.iter().enumerate().find(|(other, candidate)| {
+                *other != index
+                    && candidate.post_type == posts[index].post_type
+                    && identity(candidate) == parent
+            })
+        })
+        .map(|(parent_index, _)| {
+            (file_depth(posts, parent_index, memo, visiting) + 1).min(content::MAX_PAGE_DEPTH + 2)
+        })
+        .unwrap_or(0);
+    visiting[index] = false;
+    memo[index] = Some(depth);
+    depth
+}
+
 /// The full path a stored post is addressed at, for comparing against a file's
 /// identity.
 async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResult<String> {
@@ -910,8 +955,14 @@ pub async fn import(
     // it stayed that way after re-parenting. Creating the parent first lets the
     // child be inserted where it belongs, where its slug only has to be unique
     // among its siblings.
-    let mut ordered: Vec<&ExportPost> = payload.posts.iter().collect();
-    ordered.sort_by_key(|post| identity(post).matches('/').count());
+    //
+    // Depth comes from `file_depth`, not from counting slashes in
+    // `identity()` — see its own comment for why.
+    let mut depth_memo: Vec<Option<usize>> = vec![None; payload.posts.len()];
+    let mut depth_visiting: Vec<bool> = vec![false; payload.posts.len()];
+    let mut order: Vec<usize> = (0..payload.posts.len()).collect();
+    order.sort_by_key(|&i| file_depth(&payload.posts, i, &mut depth_memo, &mut depth_visiting));
+    let ordered: Vec<&ExportPost> = order.into_iter().map(|i| &payload.posts[i]).collect();
 
     for post in ordered {
         // Idempotent on the slug *the file names*, not only on the slug the
@@ -944,17 +995,32 @@ pub async fn import(
             },
             None => None,
         };
+        // A marker records the *file* identity, not the row's real position.
+        // A pathless page's identity is only its slug. An unrelated page
+        // elsewhere in the tree can compute that same bare slug.
+        //
+        // An unfinished row is trusted anyway: the ancestry pass below still
+        // has to place it. A finished row is trusted only when its actual
+        // parent still matches what this file says the parent should be.
+        // Otherwise the marker match is a coincidence, not the same page
+        // resumed.
         let marker_owned =
             match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
-                Some(id) => repos.posts.find_by_id(*id).await?,
+                Some(id) => repos.posts.find_by_id(*id).await?.filter(|candidate| {
+                    !completed_imports.contains(&candidate.id) || candidate.parent_id == parent_now
+                }),
                 None => None,
             };
-        // Matched on the *path*, not the bare slug: a local `/about/team` does
-        // not make the file's `/company/team` already present, and treating it
-        // as such dropped a page out of the site's own backup.
+        // Matched on the *path*, not the bare slug: a local `/about/team`
+        // does not make the file's `/company/team` already present. Treating
+        // it as such dropped a page out of the site's own backup.
+        //
+        // The same bare slug is not enough either. A local top-level page
+        // must also match this post's own resolved parent before it counts
+        // as the same page.
         let slug_taken = find_local(&repos, &post.post_type, &file_identity)
             .await?
-            .is_some();
+            .is_some_and(|candidate| candidate.parent_id == parent_now);
 
         if let Some(ours) = marker_owned {
             skipped += 1;

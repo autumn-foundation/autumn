@@ -11178,6 +11178,125 @@ async fn a_backup_with_duplicate_page_slugs_restores_every_page() {
         .assert_body_contains("4 already present");
 }
 
+/// A single run must restore two pathless pages of the same name, each
+/// nested under a different parent. Neither must be dropped.
+///
+/// `identity()` falls back to a page's bare slug when the file has no `path`
+/// for it. This is the version-2/3 shape, and it also happens when a
+/// version-5 entry simply omits `path`. The old "shallowest first" sort
+/// counted that bare string's slashes. A page nested only through `parent`
+/// then sorted as if it were top level, the same as its own not-yet-created
+/// parent. Both same-named pages ran before either parent, found no parent
+/// yet, and one was read as a duplicate of the other and dropped — even
+/// though the file names nothing at the top level with that slug at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn same_run_import_restores_pathless_pages_nested_under_different_parents() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Both `Team` pages precede the parents they name, and neither carries a
+    // `path` — the version-2/3 shape this file's `version` also declares.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a").send().await.assert_ok();
+    client.get("/b").send().await.assert_ok();
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+}
+
+/// A later, unrelated import must not be dropped merely because an earlier
+/// import's pathless page happened to compute the same bare identity, while
+/// actually landing somewhere else.
+///
+/// `_import_source_slug` records a row's *file* identity, not its resolved
+/// position. A page imported without `path` leaves that marker keyed on its
+/// bare slug, even when it is correctly nested under a parent. A later,
+/// separate import can name an unrelated page with an explicit, accurate
+/// top-level `path` that computes the same bare string. That page must not
+/// match the earlier marker and get silently skipped — not "already
+/// present" in truth, just gone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cross_run_import_does_not_confuse_an_unrelated_page_with_a_pathless_one() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Import #1: a top-level `A`, then a *pathless* `Team` correctly nested
+    // under it. `Team`'s file entry has no `path`, so its marker is recorded
+    // as the bare slug `team`, not `a/team`.
+    let first = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Import #2: a separate, later run — a *different* `Team`, explicitly and
+    // accurately declaring its own top-level path.
+    let second = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "team"}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/team").send().await.assert_ok();
+
+    // Idempotent on its own, accurate identity: running the same file again
+    // changes nothing.
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+}
+
 /// A malformed email is refused at registration.
 ///
 /// `register_user` inserts through direct Diesel, so the model's
