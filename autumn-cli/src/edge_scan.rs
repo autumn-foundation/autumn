@@ -1884,6 +1884,85 @@ fn attr_name(attr: &syn::Attribute) -> Option<String> {
     attr.path().segments.last().map(|s| s.ident.to_string())
 }
 
+/// Every attribute name visible on an item: each ordinary attribute's own
+/// last path segment (what [`attr_name`] gives directly), plus — for each
+/// `#[cfg_attr(condition, meta1, meta2, ...)]` whose condition does not
+/// definitely resolve false — the last path segment of every meta in its
+/// payload too.
+///
+/// `#[cfg_attr(feature = "edge-routes", edge)]` expands to exactly
+/// `#[edge]` once `edge-routes` is on — real, valid Rust — but this scan's
+/// marker search previously only ever looked at each attribute's own
+/// top-level path, never `cfg_attr`'s payload, so a handler whose ONLY
+/// `#[edge]` marker arrived this way was invisible to the scan entirely:
+/// not merely excluded, but never even considered a candidate `EdgeFn` no
+/// matter how the build was configured (Codex review on #2739, round 27,
+/// P1). Conservative in the same direction as [`eval_cfg_attr`]: only a
+/// condition that DEFINITELY resolves false drops the payload's names — an
+/// unparseable condition (`target_os`, ...) still lets them through, since
+/// wrongly hiding a real `#[edge]` marker is the dangerous direction here.
+fn attr_names_including_cfg_attr(
+    attrs: &[syn::Attribute],
+    default_features: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for attr in attrs {
+        let Some(name) = attr_name(attr) else {
+            continue;
+        };
+        if name == "cfg_attr" {
+            names.extend(cfg_attr_active_marker_names(attr, default_features));
+        } else {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The attribute names inside `#[cfg_attr(condition, meta1, meta2, ...)]`'s
+/// payload, once `condition` is resolved against `default_features` —
+/// empty when it definitely resolves false. Splits the payload's raw tokens
+/// on the first top-level `,` by hand (rather than parsing `condition` and
+/// the rest through one `syn::parse::Parse` impl) specifically so an
+/// UNPARSEABLE condition still doesn't lose access to the meta list after
+/// it: `?`-propagating a parse failure from a combined parser would bail
+/// out before ever reaching the metas, defeating the conservative
+/// "unresolvable stays visible" rule this function exists to apply.
+fn cfg_attr_active_marker_names(
+    attr: &syn::Attribute,
+    default_features: &BTreeSet<String>,
+) -> Vec<String> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return Vec::new();
+    };
+    let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
+    let Some(comma_index) = tokens
+        .iter()
+        .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
+    else {
+        return Vec::new();
+    };
+    let condition_tokens: proc_macro2::TokenStream =
+        tokens[..comma_index].iter().cloned().collect();
+    let condition_excludes = syn::parse2::<CfgPredicate>(condition_tokens)
+        .is_ok_and(|pred| !pred.eval(default_features));
+    if condition_excludes {
+        return Vec::new();
+    }
+    let rest_tokens: proc_macro2::TokenStream = tokens[comma_index + 1..].iter().cloned().collect();
+    syn::parse::Parser::parse2(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        rest_tokens,
+    )
+    .map(|metas| {
+        metas
+            .iter()
+            .filter_map(|meta| meta.path().segments.last().map(|s| s.ident.to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Build an [`EdgeFn`] when `attrs` contains an `#[edge]` marker and no
 /// `#[cfg(...)]` on the same function definitely excludes it.
 fn edge_fn(
@@ -1894,7 +1973,7 @@ fn edge_fn(
     module_path: &[String],
     default_features: &BTreeSet<String>,
 ) -> Option<EdgeFn> {
-    let names: Vec<String> = attrs.iter().filter_map(attr_name).collect();
+    let names = attr_names_including_cfg_attr(attrs, default_features);
     if !names.iter().any(|n| n == "edge") {
         return None;
     }
@@ -2061,7 +2140,15 @@ fn collect_registrations(
             && let Some(TokenTree::Group(group)) = trees.get(index + 2)
             && group.delimiter() == Delimiter::Brace
         {
-            if !preceding_cfg_excludes(&trees, index, default_features) {
+            // `#[cfg(feature = "premium")] pub mod wiring { ... }` has
+            // `pub` (or `pub(crate)`/`pub(super)`/`pub(in path)`) between
+            // the attribute and `mod`, same as `fn`/`impl` tolerate via
+            // `skip_back_over_fn_modifiers` — checking immediately before
+            // `mod` alone would see the visibility modifier instead of the
+            // attribute and wrongly conclude nothing excludes it (Codex
+            // review on #2739, round 27, P2).
+            let attr_index = skip_back_over_fn_modifiers(&trees, index);
+            if !preceding_cfg_excludes(&trees, attr_index, default_features) {
                 module_path.push(name.to_string());
                 collect_registrations(
                     &group.stream(),
@@ -2812,6 +2899,71 @@ mod tests {
         assert!(scan.is_empty(), "{:?}", scan.functions);
     }
 
+    /// `#[cfg_attr(feature = "edge-routes", edge)]` expands to exactly
+    /// `#[edge]` once `edge-routes` is on — real, valid Rust — but this
+    /// scan's marker search previously only ever checked each attribute's
+    /// OWN top-level path, never looking inside `cfg_attr`'s payload, so a
+    /// handler whose ONLY `#[edge]` marker arrived this way was invisible
+    /// to the scan entirely (Codex review on #2739, round 27, P1).
+    #[test]
+    fn an_edge_marker_behind_an_active_cfg_attr_is_found() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "edge-routes", edge)]
+            pub fn hello() {}
+            "#,
+            &["edge-routes"],
+        );
+        assert_eq!(scan.names(), vec!["hello"]);
+    }
+
+    /// Same shape, but the condition is off — the marker genuinely does not
+    /// apply, so the function must NOT be treated as an edge handler at
+    /// all.
+    #[test]
+    fn an_edge_marker_behind_an_inactive_cfg_attr_is_not_found() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(feature = "edge-routes", edge)]
+            pub fn hello() {}
+            "#,
+            &[],
+        );
+        assert!(scan.is_empty(), "{:?}", scan.functions);
+    }
+
+    /// An unresolvable `cfg_attr` condition (a key this scan's `CfgPredicate`
+    /// grammar does not parse) stays conservative — the same "unresolvable
+    /// stays visible" direction `eval_cfg_attr` already uses for a plain
+    /// `#[cfg(...)]` — since wrongly hiding a real `#[edge]` marker is the
+    /// dangerous direction here, not wrongly keeping one.
+    #[test]
+    fn an_edge_marker_behind_an_unresolvable_cfg_attr_condition_is_still_found() {
+        let scan = scan_one_with_features(
+            r#"
+            #[cfg_attr(target_os = "wasi", edge)]
+            pub fn hello() {}
+            "#,
+            &[],
+        );
+        assert_eq!(scan.names(), vec!["hello"]);
+    }
+
+    /// A guard attribute conditionally applied the same way is recognized
+    /// too, since both go through the same attribute-name computation.
+    #[test]
+    fn a_guard_attribute_behind_an_active_cfg_attr_is_recorded() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            #[cfg_attr(feature = "strict-auth", secured)]
+            pub fn hello() {}
+            "#,
+            &["strict-auth"],
+        );
+        assert_eq!(scan.functions[0].guards, vec!["secured".to_owned()]);
+    }
+
     #[test]
     fn guard_attributes_on_the_same_fn_are_recorded() {
         let scan = scan_one(
@@ -3082,6 +3234,54 @@ mod tests {
             #[cfg(feature = "premium")]
             mod wiring {
                 fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &["premium"],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(scan.registered_fns().len(), 1);
+    }
+
+    /// Same idea, but the cfg'd-out module has a `pub` visibility modifier
+    /// between the attribute and `mod` — the `mod` special case looked
+    /// immediately before `mod` itself for the attribute, same as `fn`/
+    /// `impl` used to before they gained `skip_back_over_fn_modifiers`, so
+    /// `pub` hid the attribute and the registration was wrongly credited
+    /// (Codex review on #2739, round 27, P2).
+    #[test]
+    fn cfg_feature_gated_pub_inline_module_registration_is_excluded_when_feature_is_off() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            pub mod wiring {
+                pub fn wire() { edge_routes![crate::show]; }
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().len() == 1, "{:?}", scan.unregistered());
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+    }
+
+    /// Same setup, but with `premium` on: the registration genuinely exists
+    /// in the compiled capsule, so `show` must report as registered.
+    #[test]
+    fn cfg_feature_gated_pub_inline_module_registration_is_included_when_feature_is_default() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            #[cfg(feature = "premium")]
+            pub mod wiring {
+                pub fn wire() { edge_routes![crate::show]; }
             }
             "#,
             &["premium"],
