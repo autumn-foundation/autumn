@@ -636,6 +636,63 @@ def _string(match):
         return None
     return next((g for g in match.groups() if g is not None), None)
 
+
+def without_toml_comments(text):
+    """TOML comments blanked, preserving length so offsets still line up.
+
+    Only ever applied to text already known to be TOML — the inside of an
+    inline table, or a subtable's body — never to a whole markdown page, where
+    `#` opens a heading rather than a comment.
+
+    This exists because the fallback searches a table for `version = "…"` with
+    an unanchored pattern, and a COMMENTED version sits earlier in the text
+    than the live one:
+
+        autumn-web = {
+            # version = "0.7"
+            version = "0.5", features = ["db"]
+        }
+
+    `tomllib` rejects a newline directly inside the braces (TOML 1.0 forbids
+    it, Cargo accepts it), so this shape reaches the fallback — which then read
+    `0.7` off the comment and passed a page really pinning `0.5`. That is worse
+    than the misses found elsewhere in this path: not a pin overlooked, but the
+    WRONG TEXT read and a false pass reported.
+
+    A `#` inside a string is data, so quoting is tracked rather than stripped
+    line-wise.
+    """
+    out = []
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            out.append(char)
+            # Only a BASIC string honours backslash escapes; in a literal
+            # string a backslash is an ordinary character.
+            if char == '\\' and quote == '"' and index + 1 < len(text):
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in '"\'':
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char == '#':
+            while index < len(text) and text[index] != '\n':
+                out.append(' ')
+                index += 1
+            continue
+        out.append(char)
+        index += 1
+    return ''.join(out)
+
 # Cargo comparison operators that still name ONE release line, against the ones
 # that name a RANGE instead.
 #
@@ -819,7 +876,8 @@ def subtable_pins(body):
     for match in SUBTABLE.finditer(body):
         start = match.end()
         following = NEXT_SECTION.search(body, start)
-        section = body[start:following.start() if following else len(body)]
+        section = without_toml_comments(
+            body[start:following.start() if following else len(body)])
         version = SUBTABLE_VERSION.search(section)
         if not version:
             continue
@@ -850,7 +908,8 @@ def renamed_pins(body):
     reported twice.
     """
     for match in RENAMED_PIN.finditer(body):
-        package = _string(PACKAGE_KEY_INLINE.search(match.group(2)))
+        table = without_toml_comments(match.group(2))
+        package = _string(PACKAGE_KEY_INLINE.search(table))
         if not package or not package.startswith('autumn'):
             continue
         # Suppress only what `PIN` will report as the SAME crate. An earlier
@@ -861,7 +920,7 @@ def renamed_pins(body):
         # crate was dropped unless the alias itself happened to be published.
         if package == match.group(1):
             continue
-        spec = _string(VERSION_KEY.search(match.group(2)))
+        spec = _string(VERSION_KEY.search(table))
         if spec is None or requirement(spec) is None:
             continue
         yield body.count('\n', 0, match.start()) + 1, package, spec
@@ -887,7 +946,7 @@ def pattern_pins(body):
     for match in PIN.finditer(body):
         spec = match['basic'] if match['basic'] is not None else match['literal']
         if spec is None:
-            table = match['table'] or ''
+            table = without_toml_comments(match['table'] or '')
             # A `package = "…"` rename means the KEY is a local ALIAS and not
             # the crate, so reporting the key here is a FALSE POSITIVE — the
             # one failure this gate cannot afford. `autumn-edge = { package =
@@ -1623,6 +1682,33 @@ def self_test():
            list(pins('autumn-web = { package = "autumn-web", '
                      'version = "0.5" }')),
            [(1, 'autumn-web', '0.5')])
+
+    # ---- a COMMENTED version must not shadow the live one ----
+    # `tomllib` rejects a newline directly inside the braces, so this reaches
+    # the fallback; reading the comment reported a false PASS on a stale pin.
+    expect('comment does not shadow the live version',
+           list(pins(fenced('[dependencies]', 'autumn-web = {',
+                            '    # version = "0.7"',
+                            '    version = "0.5", features = ["db"]', '}'))),
+           [(3, 'autumn-web', '0.5')])
+    expect('commented-out package rename is ignored',
+           list(pins('web = {\n  # package = "autumn-web"\n'
+                     '  version = "0.5"\n}')),
+           [])
+    # A table whose ONLY version is commented out pins nothing.
+    expect('commented-out version leaves no pin',
+           list(pins(fenced('[dependencies]', 'autumn-web = {',
+                            '  # version = "0.5"',
+                            '  path = "../autumn"', '}'))),
+           [])
+    # A `#` INSIDE a string is data, not a comment.
+    expect('hash inside a string is not a comment',
+           list(pins('autumn-web = {\n  features = ["a#b"],\n'
+                     '  version = "0.5"\n}')),
+           [(1, 'autumn-web', '0.5')])
+    expect('comment stripper preserves length',
+           len(without_toml_comments('a = 1 # note\nb = 2\n')),
+           len('a = 1 # note\nb = 2\n'))
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
