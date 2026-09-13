@@ -2977,6 +2977,21 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
             }
             _ => {}
         }
+        // ANY OTHER macro invocation statement using brace delimiters
+        // (`configure! { ... }`, not `configure!(...)`/`configure![...]`)
+        // needs no trailing `;` either — verified directly via a real
+        // build. `macro_rules` above is the same rule with an extra
+        // "macro's own name" token between `!` and the group; an ordinary
+        // invocation has nothing between them, so this checks the group
+        // directly. None of the specific keywords above can themselves be
+        // followed by `!` (they're reserved words, never valid macro
+        // names), so there's no overlap with them (Codex review on #2739,
+        // round 36, P2).
+        if matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            && matches!(trees.get(i + 2), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
+        {
+            return Some(i + 2);
+        }
     }
     if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '\'')
         && matches!(trees.get(i + 1), Some(TokenTree::Ident(_)))
@@ -4571,6 +4586,41 @@ mod tests {
                 macro_rules! unused(
                     () => {};
                 );
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// An ordinary (non-`macro_rules!`) macro invocation using brace
+    /// delimiters (`configure! { ... }`) also has no trailing `;` — verified
+    /// directly via a real build — so a cfg'd-out one would let the generic
+    /// scan-to-`;` fallback run through it into the next, unrelated, still-
+    /// real `edge_routes![show]` invocation and consume that too (Codex
+    /// review on #2739, round 36, P2).
+    #[test]
+    fn cfg_false_brace_delimited_macro_invocation_does_not_swallow_the_following_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            macro_rules! configure {
+                ($($t:tt)*) => {};
+            }
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                configure! { a b c }
                 edge_routes![crate::show];
             }
             "#,
