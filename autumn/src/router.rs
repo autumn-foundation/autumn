@@ -2948,6 +2948,31 @@ fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegi
         || registered.type_id
             == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
         || is_i18n_bundle_extension_layer(registered.type_id)
+        || is_edge_fallthrough_sentinel_strip_layer(registered.type_id)
+}
+
+/// The origin-only layer that strips the edge lane's internal fallthrough
+/// sentinel header (issue #2244, `autumn::app::StripEdgeFallthroughSentinelLayer`).
+///
+/// It only ever removes one framework-owned response header — it never reads
+/// or branches on caller identity, session, or tenant — so it cannot change
+/// which cached response an idempotency replay serves. `app()` registers it
+/// through the ordinary `AppBuilder::layer` path (like any other custom
+/// layer), which is why it needs this same-shaped allowance as
+/// `SessionLayer` and the i18n bundle extension: otherwise every app built
+/// with the `edge` feature on would force fail-closed idempotency, whether
+/// or not it ever calls `with_edge_kv`.
+///
+/// Matched by `TypeId`, not a name: a bespoke crate-private type, unlike a
+/// name (even a function's), cannot collide with a user's own middleware.
+#[cfg(feature = "edge")]
+fn is_edge_fallthrough_sentinel_strip_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<crate::app::StripEdgeFallthroughSentinelLayer>()
+}
+
+#[cfg(not(feature = "edge"))]
+const fn is_edge_fallthrough_sentinel_strip_layer(_type_id: std::any::TypeId) -> bool {
+    false
 }
 
 #[cfg(feature = "i18n")]

@@ -11178,6 +11178,1426 @@ async fn a_backup_with_duplicate_page_slugs_restores_every_page() {
         .assert_body_contains("4 already present");
 }
 
+/// A single run must restore two pathless pages of the same name, each
+/// nested under a different parent. Neither must be dropped.
+///
+/// `identity()` falls back to a page's bare slug when the file has no `path`
+/// for it. This is the version-2/3 shape. It also happens when a version-5
+/// entry simply omits `path`. The old "shallowest first" sort counted that
+/// bare string's slashes. A page nested only through `parent` then sorted as
+/// if it were top level, the same as its own not-yet-created parent. Both
+/// same-named pages ran before either parent existed. Neither found its
+/// parent yet. The importer read one as a duplicate of the other and dropped
+/// it — even though the file names nothing at the top level with that slug
+/// at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn same_run_import_restores_pathless_pages_nested_under_different_parents() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Both `Team` pages precede the parents they name, and neither carries a
+    // `path` — the version-2/3 shape this file's `version` also declares.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a").send().await.assert_ok();
+    client.get("/b").send().await.assert_ok();
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+}
+
+/// A pathless page nested under a real parent must not be dropped merely
+/// because its bare slug matches a genuinely top-level page of the same
+/// name. Re-importing the same file afterward must not duplicate either one.
+///
+/// Both `Team` pages here are already in the right order — this test does
+/// not depend on `file_depth` at all. It isolates the other half of the fix:
+/// `find_local`'s plain slug match must also check that the matched row's
+/// parent agrees with this post's own parent before treating it as the same
+/// page. The re-import also checks that recording each row's *qualified*
+/// identity — not the bare slug both pages share — keeps their two markers
+/// distinct, so a later run recognizes each one on its own.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn same_run_import_does_not_confuse_a_top_level_page_with_a_nested_namesake() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `Team` at the top level is listed, and created, before `C` and its own,
+    // unrelated, nested `Team`.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "c", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/team").send().await.assert_ok();
+    client.get("/c").send().await.assert_ok();
+    client.get("/c/team").send().await.assert_ok();
+
+    // Both `Team` rows share a bare identity. Re-importing must still tell
+    // them apart and duplicate neither.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 3 already present");
+}
+
+/// A later, unrelated import must not be dropped merely because an earlier
+/// import's pathless page happened to compute the same bare identity, while
+/// actually landing somewhere else.
+///
+/// `_import_source_slug` records a row's *file* identity, not its resolved
+/// position. A page imported without `path` leaves that marker keyed on its
+/// bare slug, even when it is correctly nested under a parent. A later,
+/// separate import can name an unrelated page with an explicit, accurate
+/// top-level `path` that computes the same bare string. That page must not
+/// match the earlier marker. It must not be silently skipped — it is not
+/// already present, it would be lost.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cross_run_import_does_not_confuse_an_unrelated_page_with_a_pathless_one() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Import #1: a top-level `A`, then a *pathless* `Team` correctly nested
+    // under it. `Team`'s file entry has no `path`, so its marker is recorded
+    // as the bare slug `team`, not `a/team`.
+    let first = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Import #2: a separate, later run — a *different* `Team`, explicitly and
+    // accurately declaring its own top-level path.
+    let second = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "team"}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/team").send().await.assert_ok();
+
+    // Idempotent on its own, accurate identity: running the same file again
+    // changes nothing.
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+}
+
+/// Re-importing a backup must still recognize a page it created earlier, even
+/// after an editor moves that page to a different parent. It must not
+/// duplicate it, and it must not move it back.
+///
+/// The marker used to record a page's raw file identity — its bare slug when
+/// `path` was omitted. Matching a later import against the row's *current*
+/// parent, rather than trusting the marker outright, broke exactly this
+/// case: the file still names the old parent, so the row's real parent no
+/// longer agrees, the marker match is rejected, and the importer creates a
+/// second copy under the old parent instead of leaving the moved one alone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_leaves_an_editor_moved_page_alone() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // An editor moves `P` out from under `A` and files it under `B` instead.
+    let (p_id, b_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let p = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("p"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p");
+        let b = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("b"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("b");
+        (p, b)
+    };
+    let b_id_str = b_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", b_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A` as its parent.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 3 already present");
+
+    // The editor's move stands, and no duplicate appeared under `A`.
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under `A`"
+    );
+}
+
+/// Re-importing a backup must still recognize a nested page whose *parent*
+/// the allocator had to suffix, and must not duplicate it.
+///
+/// A completed marker match skips before adding to `created_ids`, and
+/// `find_local` cannot find a suffixed slug by the file's own, unsuffixed
+/// one. Resolving the parent through its own marker — recorded under the
+/// same bare identity, since a top-level post's qualified identity is just
+/// its slug — is what lets the child's own qualified marker come out the
+/// same way twice.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_finds_a_child_under_a_reslugged_parent() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `search` is a route the framework itself mounts (`RESERVED_PATHS`), so
+    // a top-level page named `search` is suffixed on the way in, no
+    // competing post required.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Search", "slug": "search", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "search", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    sign_out(&client);
+    client.get("/search-2/team").send().await.assert_ok();
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/search-2/team").send().await.assert_ok();
+    assert_eq!(
+        client.get("/team").send().await.status,
+        404,
+        "the import must not have created a second, top-level `team`"
+    );
+}
+
+/// Re-importing a backup must still recognize a page whose marker a
+/// pre-upgrade import recorded under the *old*, bare identity, and must not
+/// duplicate it.
+///
+/// A site that imported content before this fix shipped has exactly this
+/// data: a nested page's marker keyed on its bare slug, not the qualified
+/// identity `resolved_identity` now records. The lookup falls back to that
+/// bare key — guarded by the same parent check the original fix used
+/// everywhere, since a bare key is exactly the ambiguous one — so upgrading
+/// does not turn every such row into a duplicate on its next re-import.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_bare_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Rewrite `Team`'s marker to the *old*, pre-upgrade shape: its bare
+    // slug, as an import before this fix would have recorded it.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_id: i64 = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("team");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(team_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    assert_eq!(
+        client.get("/team").send().await.status,
+        404,
+        "the import must not have created a second, top-level `team`"
+    );
+}
+
+/// Re-importing a backup must still recognize a page even after an editor
+/// moves that page's *parent* — not the page itself — somewhere else.
+///
+/// A marker qualified by the parent's real, current `local_identity` changes
+/// the moment any ancestor moves, since that ancestor's own position is part
+/// of the chain. Qualifying by the file's own declared structure instead —
+/// what `stable_identity` does — keeps a descendant's marker fixed no matter
+/// what an editor does to any ancestor above it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_child_of_a_moved_ancestor() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // A separate top-level page, then the editor moves `A` — the *parent*,
+    // not `P` itself — underneath it.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("a"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A`, unqualified,
+    // as its parent.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    // `A`'s move stands, and no duplicate `p` appeared anywhere.
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+}
+
+/// Re-importing a whole multi-level, pathless backup must still recognize
+/// every page in the chain, not just the immediate parent of whichever page
+/// is being checked.
+///
+/// A legacy `parent` reference is always a bare slug, one level at a time.
+/// `find_local` cannot match it against a page nested two or more levels
+/// deep, and a completed ancestor is skipped before it can be offered
+/// through `created_ids`. `stable_identity` sidesteps both: it resolves a
+/// pathless post's whole chain through the file's own graph, the same one
+/// `file_depth` walks, so a page's marker does not depend on any ancestor
+/// having been freshly resolved this run.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_three_level_pathless_chain() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+    client.get("/a/b/c").send().await.assert_ok();
+
+    // The same backup again. `A` and `B` are both completed, so `C`'s own
+    // parent lookup can lean on neither `created_ids` nor an exact
+    // `find_local` match.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 3 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the import must not have created a second, top-level `c`"
+    );
+}
+
+/// Importing an updated backup that adds a new descendant to an otherwise
+/// unchanged, already-settled pathless tree must nest that descendant under
+/// its real parent, not leave it at the top level.
+///
+/// `A` and `B` are unchanged and already completed, so they are skipped
+/// before either reaches `created_ids`. Resolving `C`'s parent by the bare
+/// legacy identity `b` cannot find the settled `/a/b` row. Resolving it
+/// through `resolved_post_id` — which checks `B`'s own qualified marker,
+/// not the bare identity — can.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_settled_tree_nests_it_correctly() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/b").send().await.assert_ok();
+
+    // The same `A` and `B`, unchanged, plus a brand new `C` nested under `B`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the new page must nest under its real parent, not land at the top level"
+    );
+}
+
+/// A pathless child naming its parent by the legacy, bare `parent` field
+/// must still nest correctly even when that parent itself carries an
+/// explicit `path`.
+///
+/// `path: "a/b"` and a bare `parent: "b"` both mean the page slugged `b` —
+/// but the file's own identity for `B` is `"a/b"`, not `"b"`. A lookup keyed
+/// only on full identity misses it entirely.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_bare_parent_reference_resolves_a_path_carrying_entry() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": "",
+             "path": "a/b"},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "C must nest under B's real path, not land at the top level"
+    );
+}
+
+/// A pre-upgrade site can hold two completed pages that share the *same*
+/// old, bare marker. Re-importing both must recognize each one by its own
+/// real parent, not duplicate whichever one a query does not happen to
+/// return first.
+///
+/// `imported_source_slugs` keeps every id a bare key names, and the legacy
+/// marker fallback tries each of them in turn rather than only the first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_both_sides_of_a_pre_upgrade_bare_collision() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+
+    // Rewrite both `Team` markers to the *same* old, pre-upgrade bare shape
+    // — a collision the qualified scheme can no longer produce, but that a
+    // site upgrading from before this fix can still carry.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_ids: Vec<i64> = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+            .select({{crate_name}}::schema::posts::id)
+            .load(&mut conn)
+            .await
+            .expect("both team rows");
+        assert_eq!(team_ids.len(), 2, "two Team rows");
+        for id in team_ids {
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq("team"))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+        }
+    }
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 4 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+}
+
+/// Two *unfinished* pre-upgrade rows can share the same old, bare marker
+/// under different parents — an import interrupted right after creating
+/// both, before either got its completion marker. Retrying must pair each
+/// file post with the row under its own real parent, not whichever
+/// unfinished row a query happens to return first.
+///
+/// `pick_marker_candidate` used to accept the first unfinished candidate
+/// outright, without checking whether a later one actually matches the
+/// parent. That paired the wrong row, reapplying one file post's terms and
+/// ancestry to the other page's row and leaving the true match untouched.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_prefers_the_unfinished_candidate_with_the_matching_parent() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Notes", "slug": "notes", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Notes", "slug": "notes", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+    client.get("/a/notes").send().await.assert_ok();
+    client.get("/b/notes").send().await.assert_ok();
+
+    // Downgrade both `Notes` rows to the same old, pre-upgrade bare marker,
+    // and strip their completion marker — as if this importer had been
+    // interrupted right after creating both, before either was finished.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let notes_ids: Vec<i64> = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("notes"))
+            .select({{crate_name}}::schema::posts::id)
+            .load(&mut conn)
+            .await
+            .expect("both notes rows");
+        assert_eq!(notes_ids.len(), 2, "two Notes rows");
+        for id in &notes_ids {
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq("notes"))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+            diesel::delete(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_COMPLETED_KEY),
+                    ),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("strip the completion marker");
+        }
+    }
+
+    // The same backup again. Each Notes row must be recognized under its
+    // own real parent, not merged into one row under the other's parent.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 4 already present");
+
+    sign_out(&client);
+    client.get("/a/notes").send().await.assert_ok();
+    client.get("/b/notes").send().await.assert_ok();
+}
+
+/// A new, genuinely top-level page must not be paired with an *unfinished*,
+/// nested pre-upgrade row that happens to share its bare marker.
+///
+/// `pick_marker_candidate`'s "trust an unfinished candidate" fallback only
+/// makes sense for a post that is itself nested: an unfinished row is
+/// trusted because its own ancestry has not settled yet. A genuinely
+/// top-level post can never need that excuse, so it must not be paired with
+/// somebody else's unsettled nested row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_new_top_level_page_is_not_paired_with_an_unfinished_nested_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Downgrade the nested `Team` row to the old, pre-upgrade bare marker,
+    // and strip its completion marker — as if that import had been
+    // interrupted right after creating it.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter(
+                    {{crate_name}}::schema::post_meta::post_id.eq_any(
+                        {{crate_name}}::schema::posts::table
+                            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+                            .select({{crate_name}}::schema::posts::id),
+                    ),
+                )
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+        diesel::delete(
+            {{crate_name}}::schema::post_meta::table
+                .filter(
+                    {{crate_name}}::schema::post_meta::post_id.eq_any(
+                        {{crate_name}}::schema::posts::table
+                            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+                            .select({{crate_name}}::schema::posts::id),
+                    ),
+                )
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_COMPLETED_KEY)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("strip the completion marker");
+    }
+
+    // A distinct, genuinely top-level page that only happens to share the
+    // nested row's bare slug.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/team").send().await.assert_ok();
+    client.get("/a/team").send().await.assert_ok();
+}
+
+/// A single-segment parent reference derived from an explicit `path` prefix
+/// names one specific post — not any post that happens to share that slug.
+///
+/// `path: "b/c"` gives a one-segment parent identity `b`, indistinguishable
+/// by content alone from the legacy `parent: "b"` field. `FileGraph::find`
+/// used to route every single-segment reference through the ambiguous,
+/// slug-keyed index regardless of which field produced it, so a payload
+/// naming both a top-level `b` and a nested `a/b` could resolve `c`'s parent
+/// to whichever `b` was inserted first — not necessarily the one `path`
+/// actually named.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_path_derived_single_segment_parent_resolves_by_full_identity() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "a"},
+            // Nested `b`, listed before the top-level one, so a slug-keyed
+            // lookup that ignores which post actually declared `path: "b"`
+            // would find this row first.
+            {"post_type": "page", "title": "Nested B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": "",
+             "path": "a/b"},
+            // Already occupies slug `c` under the nested `b`, so a
+            // misresolved parent forces the real `C` below into a suffix.
+            {"post_type": "page", "title": "Decoy C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": "",
+             "path": "a/b/c"},
+            {"post_type": "page", "title": "Top B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "b"},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": "",
+             "path": "b/c"}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("5 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    client.get("/b/c").send().await.assert_ok();
+}
+
+/// A new, genuinely top-level page must not be dropped merely because a
+/// pre-upgrade site already has a completed, *nested* page whose old, bare
+/// marker happens to equal that same slug.
+///
+/// `stable_identity` gives a top-level post's marker a leading slash
+/// (`/team`), so it cannot be confused with an old, unprefixed marker
+/// (`team`) left by a pathless post that was actually nested elsewhere.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_new_top_level_page_is_not_confused_with_a_pre_upgrade_nested_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Rewrite `Team`'s marker to the old, pre-upgrade bare shape.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_id: i64 = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("team");
+        diesel::update(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::post_id.eq(team_id))
+                .filter({{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set({{crate_name}}::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A separate, later import: a *different*, genuinely top-level `Team`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/team").send().await.assert_ok();
+}
+
+/// Adding a new descendant to a pre-upgrade tree whose completed ancestors
+/// still carry the old, bare markers must still nest the new page under its
+/// real parent.
+///
+/// `resolved_post_id`'s own legacy fallback resolves the parent's expected
+/// position recursively — the same way the main loop resolves any other
+/// parent — so it is not limited to the qualified marker `stable_identity`
+/// now writes going forward.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_pre_upgrade_settled_tree_nests_it_correctly() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/b").send().await.assert_ok();
+
+    // Rewrite both markers to their old, pre-upgrade bare shape.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        for slug in ["a", "b"] {
+            let id: i64 = {{crate_name}}::schema::posts::table
+                .filter({{crate_name}}::schema::posts::slug.eq(slug))
+                .select({{crate_name}}::schema::posts::id)
+                .first(&mut conn)
+                .await
+                .expect("the row");
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq(slug))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+        }
+    }
+
+    // An updated backup: the same `A` and `B`, plus a brand new `C`.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the new page must nest under its real parent, not land at the top level"
+    );
+}
+
+/// A page imported once as a pathless legacy child, later moved by an
+/// editor, then re-imported (still naming its *original* position) as an
+/// explicit `path` — a newer, version-4/5 export of the same site — must
+/// still be recognized as the same page rather than duplicated at its old
+/// position.
+///
+/// `find_local`'s exact ancestry match cannot catch this on its own once
+/// the row has moved: it needs `stable_identity`'s recursive composition to
+/// never carry its own disambiguating prefix into a parent's contribution,
+/// so a chain nested under a pathless top-level post and the identical
+/// position spelled out as one explicit `path` compose to the same marker
+/// string regardless of where the row sits now.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_pathless_import_and_a_later_explicit_path_import_agree_on_position() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "X", "slug": "x", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // An editor moves `Team` out from under `A` and files it under `X`.
+    let (team_id, x_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("team");
+        let x = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("x"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("x");
+        (team, x)
+    };
+    let x_id_str = x_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{team_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &team_id,
+                &[
+                    ("title", "Team"),
+                    ("slug", "team"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/team").send().await.assert_ok();
+
+    // A newer, version-5 export of the same site, taken *before* the move —
+    // it still names `Team`'s original position under `A`.
+    let cookie = sign_in(&client, "owner").await;
+    let second = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-02-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "a"},
+            {"post_type": "page", "title": "X", "slug": "x", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "x"},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": "",
+             "path": "a/team"}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 3 already present");
+
+    // The editor's move stands, and no duplicate appeared at the old
+    // position.
+    sign_out(&client);
+    client.get("/x/team").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/team").send().await.status,
+        404,
+        "the explicit-path re-import must not have created a duplicate at Team's old position"
+    );
+}
+
+/// A file where two pages name each other as legacy parent, both already
+/// carrying pre-upgrade bare markers, must not hang the import.
+///
+/// `resolved_post_id`'s own legacy-fallback recursion — unlike
+/// `file_depth` and `stable_identity` — is new code with no other route to
+/// it, so nothing else exercises its depth bound.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_cyclic_legacy_parent_reference_with_pre_upgrade_markers_does_not_hang() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported");
+
+    // Rewrite both markers to their old, pre-upgrade bare shape.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        for slug in ["a", "b"] {
+            let id: i64 = {{crate_name}}::schema::posts::table
+                .filter({{crate_name}}::schema::posts::slug.eq(slug))
+                .select({{crate_name}}::schema::posts::id)
+                .first(&mut conn)
+                .await
+                .expect("the row");
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq(slug))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+        }
+    }
+
+    // The same cyclic backup again. It must complete rather than hang.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok();
+}
+
+/// A file where two pages name each other as parent must not hang or crash
+/// the import, and must not create an actual cycle in the database.
+///
+/// `file_depth`'s own seen-set is new code. Nothing else makes an import walk
+/// a chain of the file's own parent references, so nothing else exercises
+/// this guard.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_with_a_cyclic_parent_reference_does_not_hang() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported");
+
+    // Both rows exist, and the hierarchy lock's own cycle guard — not this
+    // test — decides where they land. What matters here is that neither
+    // parent link points back the other way: that would be a real cycle.
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let rows: std::collections::HashMap<String, (i64, Option<i64>)> = {{crate_name}}::schema::posts::table
+        .filter({{crate_name}}::schema::posts::slug.eq_any(["a", "b"]))
+        .select((
+            {{crate_name}}::schema::posts::slug,
+            {{crate_name}}::schema::posts::id,
+            {{crate_name}}::schema::posts::parent_id,
+        ))
+        .load::<(String, i64, Option<i64>)>(&mut conn)
+        .await
+        .expect("both rows")
+        .into_iter()
+        .map(|(slug, id, parent_id)| (slug, (id, parent_id)))
+        .collect();
+    assert_eq!(rows.len(), 2, "both pages were imported: {rows:?}");
+    let (a_id, a_parent) = rows["a"];
+    let (b_id, b_parent) = rows["b"];
+    assert!(
+        !(a_parent == Some(b_id) && b_parent == Some(a_id)),
+        "the two pages must not end up parents of each other"
+    );
+}
+
 /// A malformed email is refused at registration.
 ///
 /// `register_user` inserts through direct Diesel, so the model's

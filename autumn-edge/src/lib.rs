@@ -111,7 +111,7 @@ pub mod host;
 pub use autumn_macros::{edge, edge_routes, get};
 
 pub use extract::{EdgeCache, EdgeCacheUnavailable};
-pub use handler::{EdgeHandler, edge_get};
+pub use handler::{EdgeExtract, EdgeHandler, EdgeLeaf, edge_get};
 pub use kv::{EdgeKv, EmptyEdgeKv, InMemoryEdgeKv};
 pub use route::{EdgeCapability, EdgeRoute, EdgeState};
 pub use router::{CapabilityProbe, build_edge_router};
