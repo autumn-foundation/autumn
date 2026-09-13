@@ -216,6 +216,60 @@ pub struct CmtSoft {
 pub trait CmtSoftRepository {}
 
 diesel::table! {
+    cmt_denorm_tenants (id) {
+        id -> Int8,
+        title -> Text,
+        tenant_id -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// #2263: `tenant_id` here is denormalized, not a scope. The repository does
+/// **not** opt into `tenant_scoped`, so the column must not force a tenant
+/// context on every request the way [`CmtTenanted`]'s does.
+#[autumn_web::model(table = "cmt_denorm_tenants")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtDenormTenant {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+#[autumn_web::repository(CmtDenormTenant, table = "cmt_denorm_tenants")]
+pub trait CmtDenormTenantRepository {}
+
+diesel::table! {
+    cmt_audit_softs (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// #2263: `deleted_at` here is audit history, not a tombstone — the same
+/// convention `AuditedDoc` documents for search indexing
+/// (`search_index_definition.rs`). The repository does **not** opt into
+/// `soft_delete`, so a non-null value must not hide the row from the comment
+/// router the way [`CmtSoft`]'s does.
+#[autumn_web::model(table = "cmt_audit_softs")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtAuditSoft {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(CmtAuditSoft, table = "cmt_audit_softs")]
+pub trait CmtAuditSoftRepository {}
+
+diesel::table! {
     cmt_hards (id) {
         id -> Int8,
         title -> Text,
@@ -282,6 +336,12 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE cmt_softs \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
+    "CREATE TABLE cmt_denorm_tenants \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE cmt_audit_softs \
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
     "CREATE TABLE cmt_hards \
@@ -409,14 +469,21 @@ async fn seed_one_col(conn: &mut AsyncPgConnection, table: &str, column: &str, v
     .id
 }
 
-async fn seed_tenanted(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
-    diesel::sql_query("INSERT INTO cmt_tenanted (tenant_id, title) VALUES ($1, $2) RETURNING id")
-        .bind::<Text, _>(tenant)
-        .bind::<Text, _>(title)
-        .get_result::<IdRow>(conn)
-        .await
-        .expect("seed tenanted")
-        .id
+async fn seed_tenanted(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    tenant: &str,
+    title: &str,
+) -> i64 {
+    diesel::sql_query(format!(
+        "INSERT INTO {table} (tenant_id, title) VALUES ($1, $2) RETURNING id"
+    ))
+    .bind::<Text, _>(tenant)
+    .bind::<Text, _>(title)
+    .get_result::<IdRow>(conn)
+    .await
+    .unwrap_or_else(|e| panic!("seed {table}: {e}"))
+    .id
 }
 
 async fn counter(conn: &mut AsyncPgConnection, table: &str, id: i64) -> i64 {
@@ -502,6 +569,40 @@ fn every_commentable_model_registers_itself() {
     let spec = commentable_spec_for("CmtPhoto").expect("CmtPhoto is registered");
     assert_eq!(spec.parent_table, "cmt_photos");
     assert!(commentable_spec_for("NoSuchModel").is_none());
+}
+
+/// #2263: the repository's opt-in decides tenant/soft-delete scope, not the
+/// column. This is a static-registry fact: the `#[repository]` macro submits
+/// it at link time. So this test needs no database, unlike the router tests
+/// beside it that check the same thing end to end.
+#[test]
+fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() {
+    use autumn_web::commentable::{model_requires_tenant, model_soft_deletes};
+
+    // `CmtDenormTenant` carries `tenant_id`, but its repository is plain: the
+    // column must not force tenant scoping.
+    assert!(
+        !model_requires_tenant(core::any::type_name::<CmtDenormTenant>(), true),
+        "a plain repository must not scope on a denormalized tenant_id column"
+    );
+    // `CmtTenanted` is the correctly-configured case: still scoped.
+    assert!(model_requires_tenant(
+        core::any::type_name::<CmtTenanted>(),
+        true
+    ));
+
+    // `CmtAuditSoft` carries `deleted_at`, but its repository is plain: the
+    // column is audit history, not a tombstone.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtAuditSoft>()),
+        Some(false),
+        "a plain repository must not treat an audit deleted_at as a tombstone"
+    );
+    // `CmtSoft` is the correctly-configured case: still a tombstone.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtSoft>()),
+        Some(true)
+    );
 }
 
 /// AC3: the repository helpers exist on the generated repository.
@@ -1179,7 +1280,7 @@ async fn a_tenant_scoped_repository_cannot_comment_across_the_tenant_boundary() 
     let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
     let mut conn = pool.get().await.expect("conn");
     let author = seed_user(&mut conn, "ada").await;
-    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "theirs").await;
 
     // Inside `acme`, the record is reachable.
     let comment = CURRENT_TENANT
@@ -1219,7 +1320,7 @@ async fn across_tenants_sees_every_tenants_thread() {
     let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
     let mut conn = pool.get().await.expect("conn");
     let author = seed_user(&mut conn, "ada").await;
-    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "theirs").await;
 
     CURRENT_TENANT
         .scope(Some("acme".to_owned()), async {
@@ -1245,7 +1346,7 @@ async fn a_tenant_scoped_repository_with_no_context_refuses_to_comment() {
     let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
     let mut conn = pool.get().await.expect("conn");
     let author = seed_user(&mut conn, "ada").await;
-    let acme = seed_tenanted(&mut conn, "acme", "theirs").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "theirs").await;
 
     repo.add_comment(acme, author, "no context", None)
         .await
@@ -1363,6 +1464,97 @@ async fn router_rejects_an_unregistered_commentable_type() {
     let (pool, _container) = setup_pool().await;
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
     let (status, _) = call(app, get("/comments/NoSuchModel/1")).await;
+    assert_eq!(status, 404);
+}
+
+// ── #2263: the repository's opt-in decides, not the column ──────────────────
+//
+// The router dispatches by `commentable_type` alone — it never knows which
+// repository would have served the request. `request_tenant` and the parent
+// probe must ask the registered repository facts, not just "does the model
+// have a `tenant_id` / `deleted_at` column". These tests mount the router
+// with **no** tenancy middleware at all, so a wrongly-scoped model would 500
+// or 404 here.
+
+/// A denormalized `tenant_id` column must not force a tenant context. Only a
+/// `tenant_scoped` repository does that — [`CmtDenormTenant`]'s is plain, so
+/// this must succeed with no `CURRENT_TENANT` scope in sight.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_ignores_a_denormalized_tenant_column_with_no_tenant_context() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_tenanted(&mut conn, "cmt_denorm_tenants", "acme", "denorm").await;
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call(app, get(&format!("/comments/CmtDenormTenant/{target}"))).await;
+    assert_eq!(
+        status, 200,
+        "a denormalized tenant column must not 500: {body}"
+    );
+}
+
+/// The flip side of the test above: a genuinely `tenant_scoped` model must
+/// still fail closed with no tenant context. The fix must not disable
+/// scoping entirely.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_requires_tenant_context_for_a_tenant_scoped_model() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "scoped").await;
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, _) = call(app, get(&format!("/comments/CmtTenanted/{target}"))).await;
+    assert_eq!(
+        status, 500,
+        "a tenant_scoped model with no tenant context is a wiring mistake, not a query"
+    );
+}
+
+/// An audit `deleted_at` must not hide the row. Only a `soft_delete`
+/// repository does that — [`CmtAuditSoft`]'s does not, so the thread stays
+/// visible with the column set.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_serves_a_parent_whose_deleted_at_is_only_an_audit_trail() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_one_col(&mut conn, "cmt_audit_softs", "title", "audited").await;
+    diesel::sql_query("UPDATE cmt_audit_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the audit trail");
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call(app, get(&format!("/comments/CmtAuditSoft/{target}"))).await;
+    assert_eq!(
+        status, 200,
+        "an audit `deleted_at` must not hide the row: {body}"
+    );
+}
+
+/// The flip side: a genuinely soft-deleting model still reports no thread —
+/// the fix must not turn every `deleted_at` blind.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_reports_not_found_for_a_soft_deleted_parent() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_one_col(&mut conn, "cmt_softs", "title", "gone").await;
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, _) = call(app, get(&format!("/comments/CmtSoft/{target}"))).await;
     assert_eq!(status, 404);
 }
 
