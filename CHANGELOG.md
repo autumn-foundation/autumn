@@ -9,23 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`#[commentable]`'s comment router no longer infers tenant scoping or
-  soft-delete from column presence alone (#2263):** a `tenant_id` or
-  `deleted_at` column on the parent model does not, by itself, prove the
-  repository opted into `tenant_scoped` or `soft_delete` — a model can carry
-  either column for other reasons (denormalized reporting data, an audit
-  trail) without its repository scoping or hiding on it. `request_tenant` and
-  `probe_parent` in `autumn/src/commentable.rs` already resolve both flags
-  from the repository's own `#[repository(...)]` opt-ins via the
-  `RepositoryFacts` registry (`model_requires_tenant`, `model_soft_deletes`),
-  not from the column alone; a registration is still absent for a model with
-  no `#[repository]` at all, and the column is the conservative fallback only
-  then. This change adds the regression coverage that pins the two exact
-  shapes the issue reported — a `tenant_id` column with a non-`tenant_scoped`
-  repository (previously would have been a hard `500` on every comment-router
-  request with no tenancy middleware to opt out of), and a `deleted_at` column
-  with no `soft_delete` opt-in (previously would have `404`d a parent the
-  repository's own finders still return) — plus the matching documentation in
+- **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
+  `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
+  as audit-only data (#2263):** `#[commentable]` must hide a soft-deleted
+  parent only when that model's own `#[repository(..., soft_delete)]` opted
+  in — a `deleted_at` column with no such opt-in is ordinary audit history,
+  and `probe_parent` already resolves the real answer from the
+  `RepositoryFacts` registry (`commentable_model_for_spec` +
+  `model_soft_deletes`) rather than the column's presence. That registry
+  lookup matches the registered `#[commentable]` descriptor by **pointer
+  identity**, and all three write functions took an owned copy of the spec
+  (`let spec = *spec`) for their transaction closure — `CommentableSpec` is
+  `Copy`, so this compiled cleanly, but the copy lives at a new stack
+  address, so the identity check always missed and silently fell back to the
+  column-derived answer on every write. A parent with only an audit
+  `deleted_at` (no `soft_delete` repository) was wrongly `404`d by
+  `add_comment` and `delete_comment` the moment that column was ever
+  non-null, even though the repository's own finders kept returning the row.
+  `comment_thread`'s read path never copied the spec, so reads were already
+  unaffected. Fixed by widening these three functions to
+  `spec: &'static CommentableSpec` — every real caller already passes the
+  registered static — and moving the reference itself into the closure
+  instead of the value, which keeps the identity check intact.
+  Tenant scoping was not affected: it resolves through the separate
+  `request_tenant`/`__autumn_m2m_tenant_scope` path before any copy
+  happens, and already correctly ignores a `tenant_id` column on a
+  non-`tenant_scoped` repository. Added regression coverage for both the
+  audit-`deleted_at` shape and the denormalized-`tenant_id` shape (router
+  and generated-trait level), plus the corresponding rule in
   `docs/guide/commentable.md`.
 
 ### Added
