@@ -3058,11 +3058,22 @@ fn render_repository_file(
     // When `broadcasts = true` is set, `#[repository]` synthesizes internal
     // hooks whose generated `update` body expands an unqualified
     // `{Pascal}DraftExt::from_patch(...)`. Import that trait alongside the other
-    // model types so the generated repository compiles (issue #1853). Gated on
-    // the same `live` boolean that drives `broadcasts_attr` — the default
-    // (non-broadcast) scaffold emits no hooks and no `from_patch`, so it keeps
-    // the plain three-name import.
-    let draft_ext_import = if live {
+    // model types so the generated repository compiles (issue #1853).
+    //
+    // Warden 2026-09-13: the macro's `_api_update` handler does the same thing
+    // whenever `policy = Type` is present (`has_policy`, issue #1801's
+    // merged-model validation) — and `api = "/api/{plural}"` is unconditional
+    // in this function's template (the `api` bool param below only toggles
+    // the doc comment/fragment content, never whether the attribute carries
+    // `api = ...`), so `has_policy` is live whenever `owner_column.is_some()`
+    // (`owner_policy_wiring` above always wires a `policy = Type` alongside
+    // `owner = <col>`) — on EVERY owner-scoped scaffold, `--api` or not. So
+    // the import is needed whenever EITHER drives `has_policy`: `live`
+    // (broadcasts) or `owner_column.is_some()` (policy). Caught by CI's
+    // `owner-searchable`/`nullable-owner-searchable`/`attachment-owner`/
+    // `policy-scaffold` generator-conformance jobs (E0405: `PostDraftExt` not
+    // found) after an earlier cut of this fix wrongly gated on `api` too.
+    let draft_ext_import = if live || owner_column.is_some() {
         format!(", {pascal_name}DraftExt")
     } else {
         String::new()

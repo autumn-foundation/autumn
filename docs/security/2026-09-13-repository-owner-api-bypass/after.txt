@@ -64,6 +64,23 @@ before autumn-cli/src/generate/scaffold.rs's owner_policy_wiring fix; each scaff
 a fresh project and runs `cargo check --tests` against it, so all four independently
 prove the generated `#[repository(..., owner = <col>, policy = <Type>)]` compiles.)
 
+Second round: the first cut of `owner_policy_wiring` (commit 1be3040) fixed the
+macro-level gate but reintroduced all four failures with a DIFFERENT error —
+`error[E0405]: cannot find trait "PostDraftExt" in this scope` at the newly-wired
+`policy = PostPolicy` attribute. Root cause: `#[repository]`'s `_api_update`
+handler expands an unqualified `{Model}DraftExt::from_patch(...)` whenever
+`has_policy` (issue #1801's merged-model validation) — and this scaffold's
+template always emits `api = "/api/{plural}"` in the attribute (the `api: bool`
+parameter only toggles the doc comment/route-mounting, never the attribute
+string), so `has_policy` is live on EVERY owner-scoped scaffold once `policy =
+Type` is wired in, `--api` or not — not only the `--live` (broadcasts) case
+`draft_ext_import`'s gate already covered. Fixed by widening that gate from
+`live` to `live || owner_column.is_some()`. Verified directly: scaffolded
+`Post title:String body:Text author_id:i64 --searchable title,body` against a
+patched (`[patch.crates-io] autumn-web = { path = ... }`) fresh project and ran
+`cargo check --tests` — `Finished` with only pre-existing unused-import/variable
+warnings, no errors (previously: E0405 on `PostDraftExt`).
+
 === cargo fmt --all -- --check / cargo clippy -p autumn-macros --lib -- -D warnings /
     cargo clippy -p autumn-cli --bin autumn --tests -- -D warnings ===
 All clean except one pre-existing, unrelated finding confirmed present on bare trunk

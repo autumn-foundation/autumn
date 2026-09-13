@@ -220,6 +220,34 @@ plus two `trybuild` compile-fail fixtures for the two rejected shapes.
   `generated_policy_scaffold_cargo_checks`, which needed no test changes —
   they don't assert on the repository attribute's exact content, only that
   the generated project compiles and its routes authorize correctly.
+- The first cut of `owner_policy_wiring` fixed the macro-level gate but
+  reintroduced all four failures with a different error: `E0405: cannot find
+  trait "PostDraftExt"`. `#[repository]`'s `_api_update` handler expands an
+  unqualified `{Model}DraftExt::from_patch(...)` whenever `has_policy` (issue
+  #1801), and this scaffold's template always emits `api = "/api/{plural}"`
+  regardless of the CLI's own `--api` flag (that flag only controls the doc
+  comment and which routes `main.rs` mounts, never the attribute string) — so
+  `has_policy` goes live on every owner-scoped scaffold once `policy = Type`
+  is wired in, not only the `--live` (broadcasts) case the existing
+  `draft_ext_import` gate covered. Fixed by widening that gate from `live` to
+  `live || owner_column.is_some()`. See `after.txt` for the verification.
+- Codex also flagged (P1, `autumn-cli/src/generate/scaffold.rs:3030`) that a
+  default non-`--api` owner-scoped scaffold's HTML `show`/index routes stay
+  open because the generated policy's `can_show` returns `true`
+  unconditionally. Investigated and **not a regression from this PR**: for a
+  non-`--api` scaffold, `main_route_entries` mounts the hand-written
+  `routes::{plural}::show` (not the macro's `_api_get`), whose authorization
+  is driven entirely by `render_routes_file`'s own template — a function this
+  PR never touches and which receives its own independent `owner`/`authorize`
+  parameters, not a re-parse of the repository attribute string `policy_attr`
+  lands in. "Public reads by default" is `autumn-cli/src/generate/policy.rs`'s
+  documented, pre-existing design for the generated policy (module doc:
+  "public reads, authenticated create, owner-or-admin update/delete";
+  `can_show`'s own comment: "Reads are public by default. Tighten this if
+  shows should be gated.") — unchanged by, and unreachable from, this PR's
+  diff. The list endpoint (which IS privacy-sensitive — enumeration) already
+  uses the owner-filtered `list_scoped` on every owner-scoped scaffold,
+  `--api` or not (issue #1830/#1841), independent of this fix too.
 - Single fix point: every `#[repository(...)]` expansion goes through the
   same `parse_repo_args`, so there is no second code path that could declare
   this combination another way.
