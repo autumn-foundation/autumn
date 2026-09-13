@@ -1115,7 +1115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `owner = ...`, or drop `api = "..."` and call the generated
   `list_scoped`/`search_page_scoped` methods from your own hand-written,
   owner-checked routes instead. See the
-  [migration guide](docs/migrations/next.md#repository-owner--column-next-to-api-----now-requires-policy-or-scope)
+  [migration guide](docs/migrations/next.md#repository-owner--column-next-to-api---now-requires-policy-or-scope)
   and `docs/security/2026-09-13-repository-owner-api-bypass/`.
 
 ### Performance
