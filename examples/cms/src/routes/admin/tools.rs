@@ -1014,19 +1014,33 @@ pub async fn import(
         // a marker says "this row is ours, finish it", while a bare slug match
         // says only "something local is already called that".
         let file_identity = identity(post);
-        // The parent, if this run has already created it or the site already
-        // had it. `None` leaves the row at the top level for the pass below to
-        // re-link — which is still needed for a parent the file names but does
-        // not contain.
+        // The parent, if this run has already created it, the site already
+        // had it, or an earlier, now-completed run of this importer did.
+        // `None` leaves the row at the top level for the pass below to
+        // re-link — which is still needed for a parent the file names but
+        // does not contain.
+        //
+        // The third step matters whenever the parent's own slug was
+        // suffixed by the allocator: a completed marker match skips before
+        // adding to `created_ids`, and `find_local` cannot find a suffixed
+        // slug by the file's bare one. The parent's own marker — recorded
+        // under this same bare identity, since a top-level post's qualified
+        // identity is just its slug — still can.
         let parent_now = match parent_identity(post) {
             Some(parent) => match created_ids
                 .iter()
                 .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &parent)
             {
                 Some((id, _, _, _)) => Some(*id),
-                None => find_local(&repos, &post.post_type, &parent)
+                None => match find_local(&repos, &post.post_type, &parent)
                     .await?
-                    .map(|found| found.id),
+                    .map(|found| found.id)
+                {
+                    Some(id) => Some(id),
+                    None => imported_source_slugs
+                        .get(&(post.post_type.clone(), parent))
+                        .copied(),
+                },
             },
             None => None,
         };
@@ -1035,11 +1049,29 @@ pub async fn import(
         // marker key. Kept around: it is also what gets recorded below, if
         // this post turns out to be new.
         let marker_identity = resolved_identity(&repos, post, parent_now).await?;
-        let marker_owned =
-            match imported_source_slugs.get(&(post.post_type.clone(), marker_identity.clone())) {
-                Some(id) => repos.posts.find_by_id(*id).await?,
-                None => None,
-            };
+        let marker_owned = match imported_source_slugs
+            .get(&(post.post_type.clone(), marker_identity.clone()))
+        {
+            Some(id) => repos.posts.find_by_id(*id).await?,
+            // A site that imported this same page before this fix shipped
+            // still carries the *old*, bare marker for it. Falling back to
+            // that bare identity — only when it differs from the qualified
+            // one, i.e. only for a nested post — keeps such a row
+            // recognized instead of duplicated. The bare key is exactly the
+            // ambiguous one, so an unfinished row is trusted as before, but
+            // a finished one is trusted only if its real parent still
+            // agrees with this post's.
+            None if marker_identity != file_identity => {
+                match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
+                    Some(id) => repos.posts.find_by_id(*id).await?.filter(|candidate| {
+                        !completed_imports.contains(&candidate.id)
+                            || candidate.parent_id == parent_now
+                    }),
+                    None => None,
+                }
+            }
+            None => None,
+        };
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating
         // it as such dropped a page out of the site's own backup.

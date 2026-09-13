@@ -11452,6 +11452,138 @@ async fn re_importing_a_backup_leaves_an_editor_moved_page_alone() {
     );
 }
 
+/// Re-importing a backup must still recognize a nested page whose *parent*
+/// the allocator had to suffix, and must not duplicate it.
+///
+/// A completed marker match skips before adding to `created_ids`, and
+/// `find_local` cannot find a suffixed slug by the file's own, unsuffixed
+/// one. Resolving the parent through its own marker — recorded under the
+/// same bare identity, since a top-level post's qualified identity is just
+/// its slug — is what lets the child's own qualified marker come out the
+/// same way twice.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_finds_a_child_under_a_reslugged_parent() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `search` is a route the framework itself mounts (`RESERVED_PATHS`), so
+    // a top-level page named `search` is suffixed on the way in, no
+    // competing post required.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Search", "slug": "search", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "search", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    sign_out(&client);
+    client.get("/search-2/team").send().await.assert_ok();
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/search-2/team").send().await.assert_ok();
+    assert_eq!(
+        client.get("/team").send().await.status,
+        404,
+        "the import must not have created a second, top-level `team`"
+    );
+}
+
+/// Re-importing a backup must still recognize a page whose marker a
+/// pre-upgrade import recorded under the *old*, bare identity, and must not
+/// duplicate it.
+///
+/// A site that imported content before this fix shipped has exactly this
+/// data: a nested page's marker keyed on its bare slug, not the qualified
+/// identity `resolved_identity` now records. The lookup falls back to that
+/// bare key — guarded by the same parent check the original fix used
+/// everywhere, since a bare key is exactly the ambiguous one — so upgrading
+/// does not turn every such row into a duplicate on its next re-import.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_bare_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Rewrite `Team`'s marker to the *old*, pre-upgrade shape: its bare
+    // slug, as an import before this fix would have recorded it.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_id: i64 = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("team"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("team");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(team_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    assert_eq!(
+        client.get("/team").send().await.status,
+        404,
+        "the import must not have created a second, top-level `team`"
+    );
+}
+
 /// A file where two pages name each other as parent must not hang or crash
 /// the import, and must not create an actual cycle in the database.
 ///
