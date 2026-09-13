@@ -62,6 +62,29 @@ job, so calling the whole fix "CI-natively verified" overstated it. (3) The
 are four tracked *tests*, but `live_upgrade` alone carries three distinct
 signatures, for six signatures total — reworded below.
 
+**Fifth correction (post-review, via two further Codex review comments on
+PR #2768):** (1) a leftover typo from the third correction's own split
+still said "two independent-diagnosis fixes" in one summary sentence
+despite the enumerated chronology (and every other summary) saying four;
+fixed, along with the first correction note above, which still asserted
+the pre-split "at least six independent PRs" figure without pointing to
+the later four-plus-two accounting. (2) The workflow-run sample (two
+`perPage=100` pages fetched separately against a table under continuous
+concurrent writes, no anchor to a stable run ID between them) was
+presented as fully triaging every failure; this ledger's own 2026-09-11
+entry already documents that exact pagination risk. Qualified as a
+best-effort sample below, not a proven-exhaustive one.
+
+**Sixth correction (post-review, via a further Codex review comment on PR
+#2768): the harness idle duration was arithmetically wrong.** At this
+report's own 2026-09-13T09:02Z cutoff, the interval since
+`manual-macos-contention-check.yml` became dispatchable
+(2026-09-08T15:07:44Z) is ~114 hours, not the ~90 hours stated throughout
+(a stale figure apparently carried over without recomputing for this
+pass's actual elapsed time). Corrected everywhere it appeared: the verdict
+path, the treatment section, the measurement table, and the ledger's
+matching note.
+
 Follow-up to `docs/reports/2026-09-11-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. No fix PR from
 this pass — the one substantive finding (a merge-time collision among several
@@ -81,8 +104,8 @@ gate developers wait on is `Test suite` (`test-gate`), fed by
 `[test, trybuild, test-features, test-docker]`. `coverage` remains a separate,
 non-gating lane. `manual-macos-contention-check.yml` remains dispatch-only —
 **still zero `workflow_dispatch` runs**, the same number reported on
-2026-09-08 through 2026-09-11, now a 5th consecutive idle day (~90 hours since
-it became dispatchable at 2026-09-08T15:07:44Z).
+2026-09-08 through 2026-09-11, now a 5th consecutive idle day (~114 hours
+since it became dispatchable at 2026-09-08T15:07:44Z).
 
 ## 🌡️ Symptom
 
@@ -231,13 +254,13 @@ past.
     verification-scope overstatement (see the correction notes at the top
     of this report).
   - Added a 2026-09-13 dated update to the `live_upgrade` entry (5th
-    consecutive pass, harness still at 0 dispatches, ~90h idle, zero new
+    consecutive pass, harness still at 0 dispatches, ~114h idle, zero new
     hits on any tracked signature in this pass's window) and to the
     `job_tracking_stores_integration` entry (no repeat, still n=1).
 - **Recommendation for a human, unchanged from the last four passes**:
   dispatch `manual-macos-contention-check.yml` (`samples: "20"`) against a
-  `trunk-dev` commit at or after `8fae8af`. ~90 hours idle since it became
-  dispatchable is now most of a week of not even the partial evidence it
+  `trunk-dev` commit at or after `8fae8af`. ~114 hours idle since it became
+  dispatchable is most of a week of not even the partial evidence it
   could be producing for the `live_upgrade`/`cache_stampede`/
   `sim_fault_plan` investigation.
 - **No action needed on the WIP failures** (dependabot toolchain bump,
@@ -256,7 +279,7 @@ No rerun campaign this pass — organic sampling plus one escape write-up.
 | `cache_stampede` | 0 new hits | Unchanged, undiagnosed |
 | `sim_fault_plan` | 0 new hits | Unchanged, undiagnosed |
 | `job_tracking_stores_integration` | 0 new hits (still n=1 total) | Unchanged, undiagnosed |
-| `manual-macos-contention-check.yml` dispatches | 0 → 0 | 5th consecutive idle pass, ~90h |
+| `manual-macos-contention-check.yml` dispatches | 0 → 0 | 5th consecutive idle pass, ~114h |
 
 ## 🔬 Reproduce
 

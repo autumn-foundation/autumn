@@ -652,7 +652,7 @@ without also filling in the intake form above.
   `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
   still `total_count: 0` against `workflow_dispatch` runs, checked
   2026-09-13T~09:1xZ — unchanged for a 5th straight day since it became
-  dispatchable 2026-09-08T15:07:44Z (now ~90 hours idle).
+  dispatchable 2026-09-08T15:07:44Z (now ~114 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
