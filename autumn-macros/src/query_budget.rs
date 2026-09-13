@@ -163,7 +163,12 @@ const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", 
 /// Async methods that turn an *already-tracked* handle into a fresher one of
 /// a possibly different type, rather than issuing a query — currently only
 /// `LazyDb::checkout` (autumn/src/db.rs, #2264), which turns a prepared-but-
-/// not-taken checkout into a live `Db`.
+/// not-taken checkout into a live `Db`. Used two ways: `checkout` on a
+/// tracked receiver both hands its result the handle identity forward
+/// (`awaited_expr_is_fresh_handle`) and costs nothing itself
+/// (`method_chain`) — a connection checkout is plumbing, not a query the
+/// handler asked for, the same reason a plain `HANDLE_ACCESSORS` call never
+/// counts as one.
 ///
 /// Deliberately not added to `HANDLE_ACCESSORS`: that list matches a bare
 /// method name on *any* receiver, and "checkout" is also a real domain verb —
@@ -920,6 +925,15 @@ impl Analyzer {
             let Some(last) = on_handle.last().map(|m| m.method.to_string()) else {
                 return cost;
             };
+            // A `HANDLE_TRANSITIONS` method (`checkout`) never costs a query,
+            // awaited or not: unlike a builder name, it cannot double as a
+            // real finder someone happened to await, so there is no reason to
+            // charge it once the chain runs. Checked ahead of the builder
+            // rule below because it is unconditional, where that one only
+            // applies while `!awaited`.
+            if HANDLE_TRANSITIONS.contains(&last.as_str()) {
+                return cost;
+            }
             // A builder name refines the *next* query rather than issuing one —
             // unless the chain is awaited here, in which case the terminal call
             // really did run (a user finder may share a builder's name).

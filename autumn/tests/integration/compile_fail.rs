@@ -596,6 +596,10 @@ fn compile_pass_tests_a() {
     // the terminal query, not a handle-refining step (PR #2546 review,
     // round 4) — its result must not be promoted to a handle either.
     t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
+    // `LazyDb::checkout` (PR #2762 review, second round, #2264): the
+    // checkout call itself must not cost a query, or the documented idiom
+    // plus one real query would need `#[query_budget(2)]`.
+    t.pass("tests/compile-pass/query_budget_lazy_db_checkout_excluded_from_budget.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
