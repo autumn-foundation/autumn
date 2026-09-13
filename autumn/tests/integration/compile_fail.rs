@@ -92,11 +92,19 @@ fn compile_fail_tests() {
     // Warden security review, 2026-09-13: `owner = <column>` only emits
     // opt-in `list_scoped`/`search_page_scoped` methods for a hand-written
     // handler to call explicitly — the generated `api = "..."` CRUD routes
-    // never call them and only branch on `policy`/`scope`. Left on its own
-    // next to `api = "..."`, `owner` silently shipped a fully public REST API
-    // that looked, at the declaration site, like a per-owner-scoped one.
+    // never call them and only branch on `policy` (`scope` filters only the
+    // list endpoint's SQL). Left on its own next to `api = "..."`, `owner`
+    // silently shipped a fully public REST API that looked, at the
+    // declaration site, like a per-owner-scoped one.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_owner_api_without_policy_or_scope.rs");
+    // `scope = Type` alone (no `policy`) is equally insufficient: it only
+    // filters `GET <api>`'s SQL query, leaving `_api_get`/`_api_update`/
+    // `_api_delete` fully unguarded. Caught in review (Codex, PR #2770) on
+    // the first cut of this fix, which wrongly accepted `scope` as an
+    // alternative to `policy`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_owner_api_with_scope_but_no_policy.rs");
 
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]

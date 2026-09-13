@@ -10,8 +10,12 @@ auto-generated HTTP handlers
 `PUT <api>/{id}` and `DELETE <api>/{id}` routes, mounted through
 `AppBuilder`/`routes![]` exactly as `#[repository(api = "...")]` documents
 **Affected:** `autumn-web` 0.7.0 and every earlier release that shipped
-`owner = <column>` (issue #1841)
+`owner = <column>` (issue #1841) — including projects scaffolded by
+`autumn-cli generate scaffold`, which generated this exact declaration by
+default (see Blast radius)
 **Status:** fixed — `autumn-macros/src/repository.rs` (compile-time rejection)
+and `autumn-cli/src/generate/scaffold.rs` (generator now wires the policy it
+already creates into the same attribute)
 
 ## 🎯 Surface
 
@@ -125,16 +129,35 @@ registered in `autumn/tests/integration/compile_fail.rs`. See `after.txt`.
 ## 🩹 Fix
 
 `autumn-macros/src/repository.rs`'s `parse_repo_args` now rejects
-`api_path.is_some() && owner_column.is_some() && policy_type.is_none() &&
-scope_type.is_none()` with a `syn::Error` naming the exact gap (`owner =
-<column> has no effect on the generated api = "..." CRUD routes`) and the two
-ways out (add `policy`/`scope`, or drop `api` and call `list_scoped`/
-`search_page_scoped` from a hand-written route). Fixed at the layer that
-generates the routes — the parse-time config validation every
-`#[repository(...)]` expansion goes through — not by patching one app's
-handler, so every app on the next release is covered without a code change
-on their part (their build breaks, with a message telling them exactly what
-to add).
+`api_path.is_some() && owner_column.is_some() && policy_type.is_none()` with
+a `syn::Error` naming the exact gap (`owner = <column> has no effect on the
+generated api = "..." CRUD routes`) and the ways out (add `policy`, or drop
+`api` and call `list_scoped`/`search_page_scoped` from a hand-written
+route). `policy_type` is required unconditionally — `scope_type` may
+additionally be present (it still gives the list endpoint a cheaper
+SQL-level filter) but is never accepted as a substitute, since it only ever
+filters `GET <api>`'s SQL query and has no effect on
+`_api_get`/`_api_update`/`_api_delete` (only `has_policy` drives
+`policy_check_show`/`policy_check_update_pre`/`policy_check_delete_pre`;
+there is no `scope`-driven equivalent for the single-record handlers). Fixed
+at the layer that generates the routes — the parse-time config validation
+every `#[repository(...)]` expansion goes through — not by patching one
+app's handler, so every app on the next release is covered without a code
+change on their part (their build breaks, with a message telling them
+exactly what to add).
+
+**Review caught a gap before merge.** The first version of this fix accepted
+`policy_type.is_none() && scope_type.is_none()` (i.e. treated `scope` as an
+alternative to `policy`), which still left `owner = <column>` + `api =
+"..."` + `scope = Type` (no `policy`) compiling successfully with
+`_api_get`/`_api_update`/`_api_delete` completely unguarded — the same
+underlying vulnerability, just gated behind one extra declared attribute.
+Codex's automated review on PR #2770 flagged this
+(`autumn-macros/src/repository.rs:1253`) before the PR merged; the condition
+was tightened to require `policy_type` unconditionally, the error message
+and a test were corrected, and a second `trybuild` fixture
+(`repository_owner_api_with_scope_but_no_policy.rs`) was added to pin the
+narrower case shut too.
 
 Three pre-existing `autumn-macros` unit tests
 (`parse_repo_args_with_owner`, `repository_owner_scoped_list_filters_owner_in_count_and_page`,
@@ -144,29 +167,59 @@ none of them asserted anything about the auto-API surface, only about
 `list_scoped`/`search_page_scoped` generation, which is gated on
 `owner_column` alone and completely independent of `api_path`. Updated to
 drop the now-invalid `api = "/api/posts"` from their input so they keep
-testing exactly what they tested before. Four new unit tests added
+testing exactly what they tested before. Five new unit tests added
 (`repository_owner_api_without_policy_or_scope_is_rejected`,
 `repository_owner_api_with_policy_is_accepted`,
-`repository_owner_api_with_scope_is_accepted`,
-`repository_owner_without_api_is_accepted`) pinning the new gate in both
-directions.
+`repository_owner_api_with_scope_but_no_policy_is_rejected`,
+`repository_owner_api_with_policy_and_scope_is_accepted`,
+`repository_owner_without_api_is_accepted`) pin the gate in every direction,
+plus two `trybuild` compile-fail fixtures for the two rejected shapes.
 
 ## ✅ Verification
 
 - Reproduction: PASS on trunk (bad outcome reproduces — `trunk-failure.txt`),
-  and the compile-fail fixture is REJECTED after the fix (`after.txt`).
+  and both compile-fail fixtures are REJECTED after the fix (`after.txt`).
 - `cargo test -p autumn-macros --lib repository::` — see `after.txt`.
 - `cargo test -p autumn-web --test integration_tests --features "db,test-support" compile_fail` — see `after.txt`.
 - `cargo fmt --all` — clean.
 - `cargo clippy -p autumn-macros --lib -- -D warnings` — clean.
-- `./scripts/pre-push-check.sh` — see `after.txt`.
-- Re-attack: confirmed `owner = <column>` alongside `policy = Type` or
-  `scope = Type` (the documented way out) still compiles, and that
-  `owner = <column>` with **no** `api = "..."` at all (the pure
-  hand-written-handler usage) still compiles unchanged.
+- `./scripts/check-migration-guides.sh` and `./scripts/check-docs-links.sh` — clean.
+- Re-attack: confirmed `owner = <column>` alongside `policy = Type` (with or
+  without `scope = Type` too) still compiles, that `owner = <column>` +
+  `scope = Type` with **no** `policy` is rejected, and that `owner =
+  <column>` with **no** `api = "..."` at all (the pure hand-written-handler
+  usage) still compiles unchanged.
 
 ## 📡 Blast radius
 
+- **`autumn-cli`'s own `generate scaffold` command shipped this exact
+  pattern.** `render_repository_file` (`autumn-cli/src/generate/scaffold.rs`)
+  emits `owner = <col>` on the standard owner-scoped path (`authorize_wiring`)
+  but never wired the `{Pascal}Policy` it *also* generates and registers on
+  the app into the same `#[repository(...)]` attribute — so `autumn generate
+  scaffold Post title:String author_id:i64` (and the `--searchable` /
+  attachment variants) produced a project with exactly the vulnerable
+  declaration this ledger describes, before a single line was hand-written.
+  Discovered when the fix landed and CI's generator-conformance suite
+  (`owner-searchable`, `nullable-owner-searchable`, `attachment-owner`,
+  `policy-scaffold`) started failing to compile. Fixed alongside the macro:
+  `render_repository_file` now calls a new `owner_policy_wiring` helper that
+  wires `policy = {Pascal}Policy` (and its `use` import) into the generated
+  repository attribute whenever `owner_column` is set — completing wiring the
+  scaffold's own doc comment already told developers to do by hand, using the
+  policy the scaffold was already generating and registering. Three
+  `autumn-cli` tests updated to assert the new wiring
+  (`autumn-cli/src/generate/scaffold.rs`'s
+  `searchable_with_owner_scoped_model_emits_scoped_wiring`,
+  `autumn-cli/tests/generate.rs`'s
+  `generated_owner_searchable_scaffold_cargo_checks` and
+  `generated_nullable_owner_searchable_scaffold_cargo_checks`), and the four
+  previously-failing generator-conformance tests were re-run locally and
+  pass: the two `--searchable` ones above (assertions updated), plus
+  `generated_attachment_owner_scaffold_cargo_checks` and
+  `generated_policy_scaffold_cargo_checks`, which needed no test changes —
+  they don't assert on the repository attribute's exact content, only that
+  the generated project compiles and its routes authorize correctly.
 - Single fix point: every `#[repository(...)]` expansion goes through the
   same `parse_repo_args`, so there is no second code path that could declare
   this combination another way.
@@ -197,15 +250,17 @@ directions.
 ## 📜 Compatibility
 
 - **Breaking, at compile time only.** `#[repository(api = "...", owner =
-  column)]` with no `policy`/`scope` now fails to compile with a message
-  naming the fix. Any app that had this combination in production was
-  already fully exposed (this closes the hole, it does not narrow a working
+  column)]` with no `policy` now fails to compile with a message naming the
+  fix — this includes `owner` + `api` + `scope` alone, which is also
+  rejected. Any app that had either combination in production was already
+  fully exposed (this closes the hole, it does not narrow a working
   guarantee), so the break trades a silent vulnerability for a loud build
   failure. Recorded in `CHANGELOG.md` under `## [Unreleased]` → `### Security`,
   and in `docs/migrations/next.md` (`repository: owner = column next to api =
-  "..." now requires policy or scope`).
+  "..." now requires policy`).
 - No runtime behavior changes for any repository that already declares
-  `policy`/`scope`, or that declares `owner` with no `api` at all.
+  `policy` (with or without `scope`), or that declares `owner` with no `api`
+  at all.
 - No config default changed.
 
 ## 🗂 Ledger
