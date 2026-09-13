@@ -548,6 +548,37 @@ fn every_commentable_model_registers_itself() {
     assert!(commentable_spec_for("NoSuchModel").is_none());
 }
 
+/// #2263: the repository's opt-in decides tenant/soft-delete scope, not the
+/// column. This is a static-registry fact — the `#[repository]` macro submits
+/// it at link time — so it needs no database at all, unlike the router tests
+/// beside it that also check this end to end.
+#[test]
+fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() {
+    use autumn_web::commentable::{model_requires_tenant, model_soft_deletes};
+
+    // `CmtDenormTenant` carries `tenant_id`, but its repository is plain: the
+    // column must not force tenant scoping.
+    assert!(
+        !model_requires_tenant(core::any::type_name::<CmtDenormTenant>(), true),
+        "a plain repository must not scope on a denormalized tenant_id column"
+    );
+    // `CmtTenanted` is the correctly-configured case: still scoped.
+    assert!(model_requires_tenant(core::any::type_name::<CmtTenanted>(), true));
+
+    // `CmtAuditSoft` carries `deleted_at`, but its repository is plain: the
+    // column is audit history, not a tombstone.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtAuditSoft>()),
+        Some(false),
+        "a plain repository must not treat an audit deleted_at as a tombstone"
+    );
+    // `CmtSoft` is the correctly-configured case: still a tombstone.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtSoft>()),
+        Some(true)
+    );
+}
+
 /// AC3: the repository helpers exist on the generated repository.
 #[test]
 fn comment_helpers_are_generated() {
