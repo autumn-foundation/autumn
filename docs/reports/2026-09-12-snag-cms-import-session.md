@@ -22,12 +22,12 @@ literally rather than simulated.
 Time-boxed to one sitting (spread across ~2 hours of active work, with a
 gap in between). Same environment constraint as the prior session: no
 Docker daemon in this sandbox, so PostgreSQL 16 ran as a native
-`pg_ctlcluster` service; ten separate databases (`cms` through `cms10`,
-`cms7` unused — a naming slip, not a missing trial) were created over the
-course of the session to model independent site instances without
-touching each other's state, as later reproductions (round six onward,
-prompted by Codex review comments) needed fresh databases beyond the six
-the session started with.
+`pg_ctlcluster` service; thirteen separate databases (`cms` through
+`cms13`, `cms7` unused — a naming slip, not a missing trial) were created
+over the course of the session to model independent site instances
+without touching each other's state, as later reproductions (round six
+onward, prompted by Codex review comments) needed fresh databases beyond
+the six the session started with.
 
 ## 📌 Environment
 
@@ -118,10 +118,11 @@ independently.)
 ## 🐛 Bug filed
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
-silently drops a same-slug sibling page whenever *both* same-slug siblings
-fall back to the bare slug as their file identity, and the earlier one in
-file order was itself inserted before *its own* parent existed (data loss,
-repro 6/6).**
+silently drops a pathless nested page whenever a page with that bare slug
+is *already persisted* as a top-level (or otherwise depth-tied) row —
+whether that row is a pre-existing page on the site, one from an earlier,
+separate import, or one created moments earlier in the same run while its
+own parent was still unresolved (data loss, repro 8/8).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -183,21 +184,54 @@ each verified live rather than accepted from reasoning alone:
   pages ended up correctly nested with no loss at all. A Codex catch on
   this PR, verified live on a fresh database (`cms11`) rather than
   accepted from reasoning alone.
+- **Nor does the first page's parent need to have been unresolved at all
+  — a genuinely, permanently top-level page triggers it the same way.**
+  Every reproduction so far involved a first page whose parent was merely
+  *not yet created* at the moment it was processed. That framing is too
+  narrow: `find_local` does not care *why* a persisted row's
+  `local_identity` is the bare slug, only that it is. Verified with a file
+  containing a **real** top-level page (`"parent": null`, no unresolved
+  anything) named `Team`, a top-level page `B`, and a *third*, pathless
+  `Team` page nested under `b` — no page named `a` anywhere in the file:
+  the nested `Team` was still dropped (`"2 imported, 1 already present"`,
+  `/b/team` → 404), even though the first `Team` was never "waiting" on
+  anything; it was simply, correctly, a top-level page, and that alone was
+  enough to collide. A Codex catch on this PR, verified live (`cms12`).
+- **And it isn't limited to one import run.** The colliding row does not
+  need to come from the same file at all: an *existing* top-level page on
+  the site, created by an entirely separate, earlier import (or, by the
+  same logic, by ordinary page authoring through the admin UI), blocks a
+  later import's pathless nested page with the same slug just as
+  permanently. Verified across two sequential imports on a fresh database
+  (`cms13`): first, a file creating top-level `Team` and `B` pages only
+  (`"2 imported, 0 already present"`); then, a *second*, separate import
+  of a single pathless `Team` page nested under `b` — dropped
+  (`"1 already present"`, `/b/team` → 404) even though the first import
+  had already fully committed and the site was in a completely settled
+  state by the time the second import began. This means the bug is not
+  really about import *ordering* at all in the general case — the
+  "shallowest first" sort and the unresolved-parent mechanics in the
+  earlier reproductions are just one way among several to get a
+  bare-identity row on the books before the colliding pathless page is
+  checked.
 
-Either way, the import loop misidentifies the *second* colliding page as
-"somebody else's row that merely shares the slug" against the first one's
-already-persisted state — but only when the second page's own file
-identity happens to equal that persisted state, which in practice means
-the second page is *also* pathless (or otherwise carries an identity that
-collapses to the same bare slug). The loop then drops it permanently, with
-the summary screen reporting an unremarkable "N imported, M already
-present" and no orphan count. Reproduced 6/6 across independent fresh
-databases: two on version 2 (one a hand-reordered full export, one a
-minimized 4-post file), one on version 3, one a version-5-labeled file
-with `path` omitted on all four posts, one with `path` present on the
-parents only, and one reordered so the dropped page follows its own
-parent in the file. All six had *both* colliding pages pathless; all six
-are deterministic given the file's post ordering, not a race.
+Either way, the import loop misidentifies the pathless nested page as
+"somebody else's row that merely shares the slug" against whatever
+already-persisted row shares its bare-slug identity — and drops it
+permanently, with the summary screen reporting an unremarkable
+"N imported, M already present" and no orphan count. Reproduced 8/8
+across independent fresh databases: two on version 2 (one a
+hand-reordered full export, one a minimized 4-post file), one on version
+3, one a version-5-labeled file with `path` omitted on all four posts,
+one with `path` present on the parents only, one reordered so the dropped
+page follows its own parent in the file, one where the earlier same-slug
+page is a genuine, permanently top-level page rather than a
+temporarily-unresolved one, and one where the earlier same-slug page
+comes from a wholly separate, already-completed prior import rather than
+the same run. Every case that *does* involve file ordering within a
+single run is a pure function of that ordering, not a race — but, per the
+last two reproductions, ordering within one run is not actually a
+precondition of the bug at all.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
@@ -236,13 +270,14 @@ regression test the sweep will then pick up automatically.
 
 ## Findings summary
 
-- **Bugs filed:** 1 — #2737 (data loss on import, when an earlier
-  same-slug sibling page lands at the top level — pathless, or top-level
-  with `path` — before a later same-slug sibling is checked against it,
-  *and* that later sibling is itself pathless too, so both resolve to the
-  same bare-slug identity; see above — not a risk to ordinary pathless
-  *posts*, which never collide on slug in the first place, only to
-  same-slug *pages* under different parents).
+- **Bugs filed:** 1 — #2737 (data loss on import: a pathless nested page is
+  silently dropped whenever a page with that same bare slug is already
+  persisted as a top-level row — pre-existing on the site, from an
+  earlier separate import, or created moments earlier in the same run
+  before its own parent existed — and no error, orphan count, or other
+  signal is given; see above — not a risk to ordinary pathless *posts*,
+  which never collide on slug in the first place, only to same-slug
+  *pages* under different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
