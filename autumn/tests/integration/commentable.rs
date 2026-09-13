@@ -554,9 +554,9 @@ fn every_commentable_model_registers_itself() {
 }
 
 /// #2263: the repository's opt-in decides tenant/soft-delete scope, not the
-/// column. This is a static-registry fact — the `#[repository]` macro submits
-/// it at link time — so it needs no database at all, unlike the router tests
-/// beside it that also check this end to end.
+/// column. This is a static-registry fact: the `#[repository]` macro submits
+/// it at link time. So this test needs no database, unlike the router tests
+/// beside it that check the same thing end to end.
 #[test]
 fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() {
     use autumn_web::commentable::{model_requires_tenant, model_soft_deletes};
@@ -1414,9 +1414,9 @@ async fn router_ignores_a_denormalized_tenant_column_with_no_tenant_context() {
     );
 }
 
-/// The flip side of the test above, so the fix cannot be read as "the router
-/// never scopes any more": a genuinely `tenant_scoped` model still fails
-/// closed with no tenant context.
+/// The flip side of the test above: a genuinely `tenant_scoped` model must
+/// still fail closed with no tenant context. The fix must not disable
+/// scoping entirely.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn router_requires_tenant_context_for_a_tenant_scoped_model() {
