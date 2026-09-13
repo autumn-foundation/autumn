@@ -213,7 +213,9 @@ each verified live rather than accepted from reasoning alone:
   `/b/team` → 404), even though the first `Team` was never "waiting" on
   anything; it was simply, correctly, a top-level page, and that alone was
   enough to collide. A Codex catch on this PR, verified live (`cms12`).
-- **And it isn't limited to one import run.** The colliding row does not
+- **And it isn't limited to one import run — though a Codex catch on this
+  PR found that the cross-run case actually trips a *different* internal
+  check than every other reproduction here.** The colliding row does not
   need to come from the same file at all: an *existing* top-level page on
   the site, created by an entirely separate, earlier import (or, by the
   same logic, by ordinary page authoring through the admin UI), blocks a
@@ -224,17 +226,36 @@ each verified live rather than accepted from reasoning alone:
   of a single pathless `Team` page nested under `b` — dropped
   (`"1 already present"`, `/b/team` → 404) even though the first import
   had already fully committed and the site was in a completely settled
-  state by the time the second import began. This means the bug is not
-  really about import *ordering* at all in the general case — the
-  "shallowest first" sort and the unresolved-parent mechanics in the
-  earlier reproductions are just one way among several to get a
-  bare-identity row on the books before the colliding pathless page is
-  checked.
+  state by the time the second import began. But — confirmed by reading
+  `imported_source_slugs`/`record_import_source` in `tools.rs` and
+  `content.rs`, then querying `cms13`'s `post_meta` table directly, which
+  showed the first run's `Team` row carrying `_import_source_slug = "team"`
+  — this specific case is *not* actually caught by `find_local`. It never
+  gets that far: the second import's own `imported_source_slugs` lookup,
+  keyed on `(post_type, file_identity)` and loaded fresh at the start of
+  *that* run, matches the unrelated second `Team` post against the first
+  run's completed row purely because both happen to compute the same bare
+  `"team"` file identity — so the loop treats them as literally the same
+  post resuming an unfinished import, and skips at the `marker_owned`/
+  `completed_imports` check (`tools.rs`, before the `slug_taken` branch is
+  ever reached), not at `find_local`. Within a *single* run this can't
+  happen — `imported_source_slugs` is loaded once before the loop starts
+  and is never updated mid-loop, so a page created earlier in the *same*
+  run has no marker yet for a later post in that run to collide with — but
+  across two separate import requests, the marker collision fires first.
+  This means the bug is not really about import *ordering* at all in the
+  general case, and it is not even a single mechanism: the "shallowest
+  first" sort and the unresolved-parent mechanics only ever address the
+  `find_local` path, and a fix confined to that path — recursively
+  resolving ancestry or not — would leave this exact cross-run
+  reproduction unfixed, because the source-marker lookup short-circuits
+  before `find_local` is ever consulted.
 
-Either way, the import loop misidentifies the pathless nested page as
-"somebody else's row that merely shares the slug" against whatever
-already-persisted row shares its bare-slug identity — and drops it
-permanently, with the summary screen reporting an unremarkable
+Either way — via `find_local`'s bare-identity match for every same-run
+reproduction, or via the `_import_source_slug` marker coincidentally
+matching for the two cross-run ones — the import loop misidentifies the
+pathless nested page as content that is already accounted for, and drops
+it permanently, with the summary screen reporting an unremarkable
 "N imported, M already present" and no orphan count. Reproduced 9/9
 across independent fresh databases: two on version 2 (one a
 hand-reordered full export, one a minimized 4-post file), one on version
@@ -326,15 +347,21 @@ regression test the sweep will then pick up automatically.
    date to drive that branch over HTTP; none of this session's fixtures
    used `future` at all. Both the import-time analogue and the real timer
    sweep remain unverified end-to-end and belong together in a follow-up.
-3. **A fix for #2737** needs more than reordering. Recursively resolving
-   each post's `parent` chain (rather than counting `/`) would close the
-   *same-run* ordering cases, but the `cms13`/`cms14` reproductions show a
-   same-run ordering fix alone is insufficient: there, the colliding
-   top-level page already exists, fully settled, from an earlier import
-   with correct ancestry — no ordering problem exists to fix. The
-   deduplication check itself (`find_local`'s comparison of an incoming
-   page's *file* identity against a persisted row's *ancestry-derived*
-   identity) needs to account for where the incoming page's file `parent`
-   chain says it actually belongs, not just compare bare slugs when `path`
-   is absent — flagged in the issue as work for whoever picks it up, not
+3. **A fix for #2737** needs to close two distinct code paths, not one.
+   Recursively resolving each post's `parent` chain (rather than counting
+   `/`) would close the *same-run* ordering cases that go through
+   `find_local`, but the `cms13`/`cms14` reproductions show that alone is
+   insufficient: those are actually caught earlier, by the
+   `imported_source_slugs` marker lookup matching an unrelated post from a
+   *previous, separate* import purely because both compute the same bare
+   file identity — a Codex catch on this PR, confirmed by querying
+   `cms13`'s `post_meta` table directly. `find_local` is never even reached
+   in that case. A complete fix needs both: `find_local`'s comparison of an
+   incoming page's *file* identity against a persisted row's
+   *ancestry-derived* identity should account for where the incoming
+   page's file `parent` chain actually says it belongs, and the
+   `imported_source_slugs` lookup needs a key that can't coincidentally
+   collide between two unrelated posts across separate import runs (e.g.
+   incorporating the resolved parent chain rather than the bare identity
+   alone) — flagged in the issue as work for whoever picks it up, not
    attempted here.
