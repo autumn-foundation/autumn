@@ -3364,18 +3364,27 @@ fn skip_cfg_excluded_statement(
 /// partner anywhere ahead is never mistaken for one half of an open generic
 /// argument list. `->` is skipped as the atomic two-token unit it is, the
 /// same way every other generics-aware scan in this file treats it, so its
-/// own `>` half is never treated as a stray closer. A match arm's own `=>`
-/// is skipped the identical way: its `>` half sits at the exact position a
-/// later, real arm's fat arrow can otherwise "close" an earlier stray `<`
-/// from a still-active comparison in a PRECEDING excluded arm — verified
-/// directly against a real failure this introduced (a cfg'd-out `0 => 1 <
-/// 2,` arm's stray `<` spuriously paired with the very next arm's own `=>`,
-/// which then wrongly reads as this loop's OWN closing `>` and drops the
-/// following arm's real registration along with the excluded one). Scoped
-/// to `start` rather than the whole token stream so a `<`/`>` from an
-/// earlier, already-handled statement can never spuriously pair with one in
-/// the region the caller is currently scanning (Codex review on #2739,
-/// round 46, P2).
+/// own `>` half is never treated as a stray closer.
+///
+/// A bare `=>` (a match arm's own fat arrow — the ONLY way this token can
+/// appear here at all, since a NESTED match's own arms live inside its own
+/// opaque body `Group`, invisible at this flat level) can NEVER legitimately
+/// occur inside a real, still-open generic argument list — unlike `->`,
+/// which a trait-bound return type can nest (`Foo<dyn Fn() -> u32>`), so
+/// `->` is skipped as a unit without disturbing `stack`, but crossing a
+/// `=>` clears every still-open entry on it outright. Without this, a
+/// stray `<` opened in one excluded arm's own comparison could pair with
+/// ANY later `>` reachable by simply scanning far enough forward — not just
+/// a later arm's own fat arrow (round 46's first fix for that ONE specific
+/// case), but an entirely unrelated real comparison several arms further
+/// on (`#[cfg(false)] 0 => 1 < 2, _ => show().len() > 0,` — verified
+/// directly via a real build that this compiles, with the second arm
+/// remaining real, active code) — since nothing bounded the search to the
+/// excluded arm's own extent. A `=>` is the one token that provably can
+/// never appear inside a real generic here, so treating it as a hard reset
+/// bounds the match to at most one arm's own tokens, exactly the scope this
+/// function's own `start` parameter already bounds it to on the other side
+/// (Codex review on #2739, round 47, P2).
 fn matched_angle_bracket_positions(trees: &[TokenTree], start: usize) -> BTreeSet<usize> {
     let mut matched = BTreeSet::new();
     let mut stack: Vec<usize> = Vec::new();
@@ -3383,9 +3392,17 @@ fn matched_angle_bracket_positions(trees: &[TokenTree], start: usize) -> BTreeSe
     while i < trees.len() {
         match trees.get(i) {
             Some(TokenTree::Punct(p))
-                if (p.as_char() == '-' || p.as_char() == '=')
+                if p.as_char() == '-'
                     && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
             {
+                i += 2;
+                continue;
+            }
+            Some(TokenTree::Punct(p))
+                if p.as_char() == '='
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+            {
+                stack.clear();
                 i += 2;
                 continue;
             }
@@ -3505,6 +3522,29 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                 // on a real body either (Codex review on #2739, round 46,
                 // P2).
                 if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "const")
+                {
+                    i += 1;
+                    continue;
+                }
+                // An `unsafe { .. }` block used in the condition or
+                // scrutinee (`if unsafe { true } { .. }`, real, valid Rust —
+                // verified directly via a real build, warned as
+                // "unnecessary `unsafe` block" but not rejected) is the
+                // identical shape as `async`/`const` above, EXCEPT `unsafe`
+                // is also one of the SIX keywords this very function is
+                // itself dispatched for (`statement_without_semicolon_end`
+                // calls `control_flow_block_end(trees, i + 1)` right after
+                // an `unsafe` used as the WHOLE outer statement, which has
+                // no condition at all — its body brace comes immediately
+                // after the keyword). So `i == start` there IS the real
+                // body (the same reasoning the bare-block-condition check
+                // above already excludes `unsafe` for), and only `i >
+                // start` — meaning some condition tokens of an ENCLOSING
+                // if/while/match already came before this nested `unsafe`
+                // block — signals the condition-block shape (Codex review
+                // on #2739, round 47, P2).
+                if i > start
+                    && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "unsafe")
                 {
                     i += 1;
                     continue;
@@ -9290,6 +9330,45 @@ mod tests {
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
+    /// The round-46 fix scoped its bracket-matching to skip a match arm's
+    /// own `=>` as an atomic unit, which only ever fixed a stray `<`
+    /// spuriously pairing with the VERY NEXT arm's own fat arrow. Fresh
+    /// evidence beyond that is a stray `<` pairing with an entirely
+    /// unrelated real comparison several tokens further on, past the next
+    /// arm's own `=>` — `#[cfg(false)] 0 => 1 < 2, _ =>
+    /// edge_routes![show].len() > 0,` — verified directly via a real build
+    /// that this compiles with the second arm remaining real, active code.
+    /// A `=>` now clears every still-open stack entry outright (not just
+    /// skips past it), since a bare `=>` can never legitimately occur
+    /// inside a real generic argument list, bounding the match to at most
+    /// one arm's own tokens (Codex review on #2739, round 47, P2).
+    #[test]
+    fn cfg_false_match_arm_with_unmatched_comparison_operator_does_not_pair_across_the_next_arm() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() -> Vec<i32> { vec![] }
+
+            fn wire(x: i32) {
+                match x {
+                    #[cfg(feature = "premium")]
+                    0 => 1 < 2,
+                    _ => edge_routes![crate::show].len() > 0,
+                };
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
     /// An async block used in the condition or scrutinee (`if async {
     /// predicate().await }.await { .. }`) has its OWN brace group
     /// immediately preceded by the `async` keyword itself — verified
@@ -9415,6 +9494,43 @@ mod tests {
             fn wire() {
                 #[cfg(feature = "premium")]
                 if const { true } {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// An `unsafe { .. }` block used as the WHOLE `if` condition (`if
+    /// unsafe { true } { .. }`) is real, valid Rust verified directly via a
+    /// real build (warned as "unnecessary `unsafe` block", not rejected) —
+    /// the identical shape as the `async`/`const` cases, except `unsafe` is
+    /// ALSO one of the six keywords `control_flow_block_end` is itself
+    /// dispatched for (a top-level `unsafe { .. }` statement has no
+    /// condition at all — its body brace comes immediately after the
+    /// keyword). `control_flow_block_end` previously had no exception for a
+    /// NESTED `unsafe` block condition, so it mistook this condition block
+    /// for the real body, leaving the actual body an ordinary, unexcluded
+    /// sibling group that credited `show` (Codex review on #2739, round 47,
+    /// P2).
+    #[test]
+    fn cfg_false_if_with_unsafe_block_condition_does_not_leak_its_body_as_a_separate_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                if unsafe { true } {
                     edge_routes![crate::show];
                 }
             }
