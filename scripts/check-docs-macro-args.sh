@@ -289,8 +289,16 @@ OWNERS = {
     "api_doc": "api_doc.rs",
     "authorize": "authorize.rs",
     "cached": "cached.rs",
+    # Wire contracts (#1755). `#[contract_checked]` has one key, `client`, and
+    # reads nothing from the route grammar: it parses its own argument list and
+    # then walks the annotated function's body. `#[endpoint]` takes `service`
+    # and `name` of its own; the method and path it records come from the route
+    # attribute BELOW it, which it reads off the item rather than from its own
+    # arguments — so `route.rs` is not part of either grammar.
+    "contract_checked": "wire/checked.rs",
     "delete": ("route.rs", "parse.rs"),
     "edge": "edge.rs",
+    "endpoint": "wire/endpoint.rs",
     "event": "event.rs",
     "feature_flag": "feature_flag.rs",
     "get": ("route.rs", "parse.rs"),

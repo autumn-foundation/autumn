@@ -227,6 +227,14 @@ where
             }
         }
 
+        // A failed service-to-service call (#1755) is a dependency fault, not
+        // a client one, so `?` on one in a handler produces 502 rather than
+        // blaming the caller for an upstream 404.
+        #[cfg(feature = "http-client")]
+        if let Some(wire_err) = any_err.downcast_ref::<crate::wire::WireError>() {
+            status = wire_err.status();
+        }
+
         // Web Push (#1392) distinguishes client-fault failures (a malformed
         // browser subscription, an endpoint already claimed) from server-fault
         // ones, so an app calling `push.subscribe(…).await?` from its own

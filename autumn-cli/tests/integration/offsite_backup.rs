@@ -71,18 +71,12 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-/// Starts a `MinIO` testcontainer, pulling from `quay.io` instead of the
-/// crate default's `docker.io/minio/minio`. `MinIO` Inc. pulled that Docker
-/// Hub repo in 2025, so the tag `testcontainers-modules` 0.15.0 hardcodes
-/// 404s there; `quay.io/minio/minio` still mirrors the exact same
-/// tag/digest.
+/// Starts a `MinIO` testcontainer from [`minio_image`], so both tests and the
+/// registry guard below share one image definition.
 async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO> {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
 
-    MinIO::default()
-        .with_name("quay.io/minio/minio")
+    minio_image()
         .start()
         .await
         .expect("start MinIO — is Docker running?")
@@ -205,6 +199,35 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub.
+/// Docker Hub no longer serves that repository at all (`MinIO` Inc. dropped
+/// it), so every pull now fails with "pull access denied ... repository does
+/// not exist". Point at `MinIO`'s other public registry, `quay.io/minio/minio`,
+/// instead. This tag choice is independent of `testcontainers-modules`, so it
+/// stays pullable even if a future crate bump changes the crate's own default.
+fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
+    use testcontainers::ImageExt as _;
+    testcontainers_modules::minio::MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .with_tag("RELEASE.2025-09-07T16-13-09Z")
+}
+
+/// Guards the registry override without needing Docker.
+///
+/// Both tests below run only in the Docker sweep, so losing the override would
+/// surface as a red job naming a registry rather than the file that forgot.
+/// This runs in the ordinary lane instead.
+#[test]
+fn minio_image_pulls_from_the_public_registry() {
+    let descriptor = minio_image().descriptor();
+    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
+    assert_eq!(
+        name, "quay.io/minio/minio",
+        "Docker Hub no longer serves minio/minio",
+    );
+    assert!(!tag.is_empty(), "the tag must be pinned explicitly");
 }
 
 #[tokio::test]

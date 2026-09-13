@@ -660,6 +660,8 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
+ "serde",
+ "serde_json",
  "syn 2.0.119",
  "temp-env",
 ]
@@ -5224,6 +5226,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mesh-catalog"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "serde",
+]
+
+[[package]]
+name = "mesh-storefront"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "maud",
+ "mesh-catalog",
 ]
 
 [[package]]
