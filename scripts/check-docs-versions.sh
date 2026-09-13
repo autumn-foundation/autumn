@@ -158,6 +158,22 @@
 #     motivated parsing in the first place, and no tracked markdown in this
 #     repo contains a `[patch.…]` table at all, so the inconsistency is
 #     documented and left rather than built around.
+#   - Whether an EXACT pin names the newest patch. `autumn-web = "=0.7.0"` is
+#     accepted while `0.7.1` is published, and that is deliberate: this gate
+#     asks which release LINE a page names, and both are the 0.7 line. A
+#     `0.7.2` pin against a published `0.7.1` IS refused, because a page may
+#     not promise a patch nobody can install.
+#
+#     The case for tightening it was that an old exact pin could reproduce the
+#     duplicate-framework failure this gate exists to catch. Measured, it does
+#     not: `^1.0` beside `=1.0.200` resolves to ONE version (1.0.200) — cargo
+#     unifies them, so there is no second copy and no `links` conflict. The
+#     older patch also remains installable, since crates.io does not remove
+#     published versions; a test against a local PATH package at the newer
+#     patch fails only because no other version exists there, which is not the
+#     situation a reader is in.
+#     What is left is mild staleness at the patch level, and gating it would
+#     refuse `=0.7.0` on the day `0.7.1` lands — on pages that still work.
 #
 # MIGRATION PAGES, precisely: the rule is `pin <= page version`, not
 # `pin == page version`, because the "before" block is the whole point of the
@@ -871,7 +887,24 @@ def pattern_pins(body):
     for match in PIN.finditer(body):
         spec = match['basic'] if match['basic'] is not None else match['literal']
         if spec is None:
-            inner = _string(VERSION_KEY.search(match['table'] or ''))
+            table = match['table'] or ''
+            # A `package = "…"` rename means the KEY is a local ALIAS and not
+            # the crate, so reporting the key here is a FALSE POSITIVE — the
+            # one failure this gate cannot afford. `autumn-edge = { package =
+            # "axum", version = "0.5" }` is a dependency on axum, and a page
+            # writing it is correct; before this, the pattern path called it a
+            # stale `autumn-edge` pin. An alias renamed to a DIFFERENT autumn
+            # crate was worse: `renamed_pins` reported the real crate and this
+            # pass reported the alias, so one declaration produced two defects.
+            #
+            # The parsed path never had this, because `_declared` resolves the
+            # rename before yielding. This makes the two paths agree, and makes
+            # `PIN` and `renamed_pins` exactly complementary: a rename to
+            # another crate belongs to `renamed_pins`, everything else here.
+            renamed = _string(PACKAGE_KEY_INLINE.search(table))
+            if renamed is not None and renamed != match['crate']:
+                continue
+            inner = _string(VERSION_KEY.search(table))
             if inner is None:
                 # `{ path = "../autumn" }` or `{ workspace = true }` pins no
                 # version, so there is nothing here to be stale.
@@ -1572,6 +1605,24 @@ def self_test():
     expect('plain subtable still works',
            list(pins('[dependencies.autumn-web]\nversion = "0.5"\n')),
            [(2, 'autumn-web', '0.5')])
+
+    # ---- an alias renamed AWAY from the crate its key names ----
+    # The only FALSE-POSITIVE class found in review: the key is a local alias,
+    # not the crate, so reporting it calls a correct page wrong.
+    expect('alias renamed to a foreign crate is not a pin',
+           list(pins('autumn-edge = { package = "axum", version = "0.5" }')),
+           [])
+    # Renamed to a DIFFERENT autumn crate: reported ONCE, against the real
+    # crate. Reporting the alias too made one declaration into two defects.
+    expect('alias renamed to another autumn crate reports once',
+           list(pins('autumn-web = { package = "autumn-edge", '
+                     'version = "0.5" }')),
+           [(1, 'autumn-edge', '0.5')])
+    # A rename that agrees with its key is still an ordinary pin.
+    expect('rename agreeing with the key still reports',
+           list(pins('autumn-web = { package = "autumn-web", '
+                     'version = "0.5" }')),
+           [(1, 'autumn-web', '0.5')])
     # An `autumn*` key is PIN's; it must not be reported by both readers.
     expect('autumn key is not double-read',
            list(pins('autumn-web = { version = "0.5" }')),
