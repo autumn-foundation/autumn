@@ -77,6 +77,7 @@ the framework almost certainly already generates or ships it:
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.7.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
+| `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
@@ -2010,6 +2011,60 @@ line items in one submit — use `autumn_web::nested_form` (0.6.0, #1915) instea
 decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
+
+## Service-to-service wire contracts (unreleased, issue #1755)
+
+Don't hand-write an HTTP client to call another Autumn service in the same
+workspace, and don't keep a schema alongside it. The callee's handler
+signatures are the contract.
+
+Callee:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item { pub id: String, pub name: String }
+
+#[endpoint(service = "catalog")]   // MUST sit above the route attribute
+#[get("/items/{id}")]
+#[public]
+pub async fn get_item(id: Path<String>) -> AutumnResult<Json<Item>> { … }
+```
+
+Caller:
+
+```rust
+wire_client! {
+    name = CatalogClient,
+    endpoints = [catalog::get_item_endpoint(id)],   // (…) lists path params
+}
+
+#[contract_checked(client = CatalogClient)]
+#[get("/items/{id}")]
+#[public]
+async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
+    let catalog = CatalogClient::new(catalog_url(), http);
+    let item = catalog.get_item(&*id, NoBody).await?;   // NoBody = no request body
+    Ok(html! { h1 { (item.name) } })
+}
+```
+
+- `#[endpoint]` emits `get_item_endpoint` plus a JSON descriptor under
+  `target/autumn-contracts/`. It reads the request/response types off the
+  signature and the method/path off the route attribute below it.
+- `wire_client!` generates one method per endpoint, typed with the callee's own
+  types. A body-less endpoint takes `NoBody`.
+- `#[contract_checked]` fails the build at the call site when a response field
+  the function reads is no longer produced, a request field it sets is no longer
+  accepted, or a `..Default::default()` request omits a newly-required field.
+  It refuses a client it cannot find a value for, so it never passes vacuously.
+- `?` on a failed call produces 502, not 500: the dependency failed, not the
+  caller's client.
+- `#[derive(WireShape)]` refuses generics, enums, tuple structs,
+  `#[serde(flatten)]` and split renames rather than describing them wrongly.
+
+First slice: one workspace, sync request/response, JSON over HTTP. Guide:
+`docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +
+`examples/mesh-storefront`.
 
 ## Resumable SSE streams (0.6.0, issue #1356)
 

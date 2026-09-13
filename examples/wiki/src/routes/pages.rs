@@ -55,6 +55,15 @@ pub fn status_badge(status: &str) -> Markup {
     }
 }
 
+/// Look up the message [`PageForm::validate_fields`] recorded against
+/// `field`, if any.
+fn field_error<'a>(errors: &'a [(&str, &str)], field: &str) -> Option<&'a str> {
+    errors
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, msg)| *msg)
+}
+
 pub fn pages_list_snippet(pages: &[Page]) -> Markup {
     html! {
         ul id="search-results" class="space-y-3" {
@@ -216,53 +225,104 @@ pub async fn show(
     ))
 }
 
-#[get("/new")]
-pub async fn new_form() -> Markup {
-    layout(
-        "New Page",
-        html! {
-            (breadcrumb(&[
-                Crumb::link("Wiki", &paths::list()),
-                Crumb::current("New Page"),
-            ]))
-            h1 class="text-2xl font-bold mb-6" { "New Page" }
-            form action=(paths::create()) method="post"
-                 class="space-y-4 bg-white rounded shadow p-6" {
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          placeholder="My Awesome Page"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="body" class="block text-sm font-medium" { "Body" }
-                    textarea id="body" name="body" rows="10"
-                             placeholder="Write your content here..."
-                             class="w-full border rounded p-2 mt-1" {}
-                }
-                div {
-                    label for="status" class="block text-sm font-medium" { "Status" }
-                    select id="status" name="status" class="border rounded p-2 mt-1" {
-                        option value="draft" { "Draft" }
-                        option value="published" { "Published" }
+/// Render the "New Page" form. `data` holds the values to show — blank
+/// defaults on the initial GET, or the author's just-rejected submission on
+/// a failed POST — and `errors` is whatever [`PageForm::validate_fields`]
+/// found wrong with it (empty on the GET path). Sharing this between the GET
+/// route and the POST route's 422 branch is what makes a rejected submission
+/// redisplay with the author's title/body/status intact and a message next
+/// to the field that failed, instead of losing the draft to the generic
+/// error page `PageHooks::before_create`'s `?` used to produce.
+fn new_page_form(data: &PageForm, errors: &[(&str, &str)]) -> Markup {
+    let title_error = field_error(errors, "title");
+    let body_error = field_error(errors, "body");
+
+    html! {
+        (breadcrumb(&[
+            Crumb::link("Wiki", &paths::list()),
+            Crumb::current("New Page"),
+        ]))
+        h1 class="text-2xl font-bold mb-6" { "New Page" }
+        form action=(paths::create()) method="post"
+             class="space-y-4 bg-white rounded shadow p-6" {
+            div {
+                label for="title" class="block text-sm font-medium" { "Title" }
+                input type="text" id="title" name="title" required
+                      value=(data.title)
+                      placeholder="My Awesome Page"
+                      aria-invalid=(if title_error.is_some() { "true" } else { "false" })
+                      aria-describedby="title-error"
+                      class="w-full border rounded p-2 mt-1";
+                div id="title-error" {
+                    @if let Some(msg) = title_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
                     }
                 }
-                button type="submit"
-                       class="bg-emerald-600 text-white px-6 py-2 rounded hover:bg-emerald-700" {
-                    "Create Page"
+            }
+            div {
+                label for="body" class="block text-sm font-medium" { "Body" }
+                textarea id="body" name="body" rows="10"
+                         placeholder="Write your content here..."
+                         aria-invalid=(if body_error.is_some() { "true" } else { "false" })
+                         aria-describedby="body-error"
+                         class="w-full border rounded p-2 mt-1" { (data.body) }
+                div id="body-error" {
+                    @if let Some(msg) = body_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                    }
                 }
             }
-        },
-    )
+            div {
+                label for="status" class="block text-sm font-medium" { "Status" }
+                select id="status" name="status" class="border rounded p-2 mt-1" {
+                    option value="draft" selected[data.status != "published"] { "Draft" }
+                    option value="published" selected[data.status == "published"] { "Published" }
+                }
+            }
+            button type="submit"
+                   class="bg-emerald-600 text-white px-6 py-2 rounded hover:bg-emerald-700" {
+                "Create Page"
+            }
+        }
+    }
 }
 
+#[get("/new")]
+pub async fn new_form() -> Markup {
+    layout("New Page", new_page_form(&PageForm::default(), &[]))
+}
+
+/// Create a new page from a form submission.
+///
+/// On validation failure (publishing with an empty title or body) the
+/// new-page form is re-rendered with the author's draft intact and a message
+/// next to the field that failed (422), instead of the generic error page
+/// `PageHooks::before_create`'s `bad_request_msg` used to produce via the
+/// handler's `?` — which dropped the author off the form and discarded
+/// whatever title/body they had typed. A draft may still be saved empty;
+/// only publishing enforces [`Page::can_publish`], mirroring the hook.
 #[post("/pages")]
 pub async fn create(
     repo: PgPageRepository,
     mut db: Db,
     form: Form<PageForm>,
-) -> AutumnResult<Redirect> {
-    let new_page = form.0.into_new();
+) -> AutumnResult<impl IntoResponse> {
+    let submitted = form.0;
+    let effective_status = if submitted.status.trim().is_empty() {
+        "draft"
+    } else {
+        submitted.status.as_str()
+    };
+    let errors = submitted.validate_fields(effective_status);
+    if !errors.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout("New Page", new_page_form(&submitted, &errors)),
+        )
+            .into_response());
+    }
+
+    let new_page = submitted.into_new();
     let page = repo.save(&new_page).await?;
 
     diesel::insert_into(revisions::table)
@@ -278,47 +338,88 @@ pub async fn create(
         .execute(&mut *db)
         .await?;
 
-    Ok(Redirect::to(&paths::show(page.slug)))
+    Ok(Redirect::to(&paths::show(page.slug)).into_response())
+}
+
+/// Render the "Edit Page" form, shared by the GET route and the POST route's
+/// 422 branch (see [`new_page_form`] for the same pattern on create).
+/// `crumb_title` drives the breadcrumb/`<title>` text: the GET route passes
+/// the stored page's title, the POST route's failure branch passes back
+/// whatever the author just typed. `status` is always the page's *current*
+/// stored status — this form never changes it (status flows through the
+/// dedicated transition route) — used both for the read-only badge and to
+/// decide whether an empty title/body is a publish-guard violation.
+fn edit_page_form(
+    slug: &str,
+    crumb_title: &str,
+    status: &str,
+    data: &PageForm,
+    errors: &[(&str, &str)],
+) -> Markup {
+    let title_error = field_error(errors, "title");
+    let body_error = field_error(errors, "body");
+
+    html! {
+        (breadcrumb(&[
+            Crumb::link("Wiki", &paths::list()),
+            Crumb::link(crumb_title, &paths::show(slug.to_string())),
+            Crumb::current("Edit"),
+        ]))
+        h1 class="text-2xl font-bold mb-6" { "Edit: " (crumb_title) }
+        form action=(paths::update(slug.to_string())) method="post"
+             class="space-y-4 bg-white rounded shadow p-6" {
+            div {
+                label for="title" class="block text-sm font-medium" { "Title" }
+                input type="text" id="title" name="title" required value=(data.title)
+                      aria-invalid=(if title_error.is_some() { "true" } else { "false" })
+                      aria-describedby="title-error"
+                      class="w-full border rounded p-2 mt-1";
+                div id="title-error" {
+                    @if let Some(msg) = title_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                    }
+                }
+            }
+            div {
+                label for="body" class="block text-sm font-medium" { "Body" }
+                textarea id="body" name="body" rows="10"
+                         aria-invalid=(if body_error.is_some() { "true" } else { "false" })
+                         aria-describedby="body-error"
+                         class="w-full border rounded p-2 mt-1" { (data.body) }
+                div id="body-error" {
+                    @if let Some(msg) = body_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                    }
+                }
+            }
+            p class="text-sm text-gray-500" {
+                "Status: " (status_badge(status))
+                " — change it from the "
+                a href=(paths::show(slug.to_string())) class="text-emerald-600 hover:underline" { "page" }
+                " using the status controls."
+            }
+            input type="hidden" name="lock_version" value=(data.lock_version);
+            button type="submit"
+                   class="bg-emerald-600 text-white px-6 py-2 rounded hover:bg-emerald-700" {
+                "Save Changes"
+            }
+        }
+    }
 }
 
 #[get("/pages/{slug}/edit")]
 pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> AutumnResult<Markup> {
     let page = find_page_by_slug(&repo, &slug).await?;
+    let data = PageForm {
+        title: page.title.clone(),
+        body: page.body.clone(),
+        status: String::new(),
+        lock_version: page.lock_version,
+    };
 
     Ok(layout(
         &format!("Edit: {}", page.title),
-        html! {
-            (breadcrumb(&[
-                Crumb::link("Wiki", &paths::list()),
-                Crumb::link(&page.title, &paths::show(page.slug.clone())),
-                Crumb::current("Edit"),
-            ]))
-            h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
-            form action=(paths::update(page.slug.clone())) method="post"
-                 class="space-y-4 bg-white rounded shadow p-6" {
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required value=(page.title)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="body" class="block text-sm font-medium" { "Body" }
-                    textarea id="body" name="body" rows="10"
-                             class="w-full border rounded p-2 mt-1" { (page.body) }
-                }
-                p class="text-sm text-gray-500" {
-                    "Status: " (status_badge(&page.status))
-                    " — change it from the "
-                    a href=(paths::show(page.slug.clone())) class="text-emerald-600 hover:underline" { "page" }
-                    " using the status controls."
-                }
-                input type="hidden" name="lock_version" value=(page.lock_version);
-                button type="submit"
-                       class="bg-emerald-600 text-white px-6 py-2 rounded hover:bg-emerald-700" {
-                    "Save Changes"
-                }
-            }
-        },
+        edit_page_form(&page.slug, &page.title, &page.status, &data, &[]),
     ))
 }
 
@@ -326,7 +427,7 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
 /// because `UpdatePage` wraps every field in `Patch<T>` (for partial updates
 /// via JSON). HTML forms always submit all fields, so we deserialize into
 /// plain values here and convert to the `UpdatePage` type.
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub struct PageForm {
     pub title: String,
     pub body: String,
@@ -340,6 +441,28 @@ pub struct PageForm {
 }
 
 impl PageForm {
+    /// A draft page may be saved with an empty title or body —
+    /// [`PageHooks::before_create`]/[`PageHooks::before_update`] only enforce
+    /// [`Page::can_publish`] once a page is (or becomes) published — so this
+    /// mirrors that same rule for the HTML forms. `effective_status` is the
+    /// status the saved row would have: the submitted `status` on create, or
+    /// the page's current stored status on edit (this form never changes
+    /// it). A submission that fails here would otherwise reach the hook's
+    /// `bad_request_msg` and bounce to the generic error page instead of
+    /// back to the form with the author's draft intact.
+    fn validate_fields(&self, effective_status: &str) -> Vec<(&'static str, &'static str)> {
+        let mut errors = Vec::new();
+        if effective_status == "published" {
+            if self.title.trim().is_empty() {
+                errors.push(("title", "A published page needs a title"));
+            }
+            if self.body.trim().is_empty() {
+                errors.push(("body", "A published page needs body content"));
+            }
+        }
+        errors
+    }
+
     fn into_new(self) -> NewPage {
         NewPage {
             title: self.title,
@@ -384,15 +507,42 @@ pub(crate) fn generate_update_summary(
     }
 }
 
+/// Update a page from a form submission.
+///
+/// On validation failure the edit page is re-rendered the same way
+/// [`create`] does — see that handler's doc comment; the same anti-pattern
+/// applied here via `PageHooks::before_update`'s `?` on the update path too.
+/// An already-published page's title/body can't be edited down to empty
+/// (`PageHooks::before_update` enforces the same guard the create path
+/// does), so `effective_status` is the page's current stored status.
 #[post("/pages/{slug}")]
 pub async fn update(
     Path(slug): Path<String>,
     repo: PgPageRepository,
     mut db: Db,
     form: Form<PageForm>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<impl IntoResponse> {
     let page = find_page_by_slug(&repo, &slug).await?;
-    let update_page = form.0.into_update();
+    let submitted = form.0;
+    let errors = submitted.validate_fields(&page.status);
+    if !errors.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                &format!("Edit: {}", submitted.title),
+                edit_page_form(
+                    &page.slug,
+                    &submitted.title,
+                    &page.status,
+                    &submitted,
+                    &errors,
+                ),
+            ),
+        )
+            .into_response());
+    }
+
+    let update_page = submitted.into_update();
     let updated = repo.update(page.id, &update_page).await?;
 
     let summary =
@@ -411,7 +561,7 @@ pub async fn update(
         .execute(&mut *db)
         .await?;
 
-    Ok(Redirect::to(&paths::show(updated.slug)))
+    Ok(Redirect::to(&paths::show(updated.slug)).into_response())
 }
 
 /// `POST /pages/{slug}/transitions/status` — apply a state-machine transition
@@ -555,4 +705,116 @@ async fn find_page_by_slug(repo: &PgPageRepository, slug: &str) -> AutumnResult<
         .into_iter()
         .next()
         .ok_or_else(|| AutumnError::not_found_msg(format!("Page '{slug}' not found")))
+}
+
+/// Error-path coverage for `create`/`update`'s redisplay-on-failure fix
+/// (baseline: both handlers sent a publish-guard rejection through
+/// `PageHooks::before_create`/`before_update`'s `bad_request_msg` via `?`,
+/// landing on the generic error page and losing the author's title/body —
+/// 0 of 2 failure modes were adjacent to cause, persisted in place, said how
+/// to recover, or preserved the draft).
+#[cfg(test)]
+mod page_form_tests {
+    use super::*;
+
+    fn blank() -> PageForm {
+        PageForm::default()
+    }
+
+    #[test]
+    fn a_draft_may_have_an_empty_title_and_body() {
+        let form = blank();
+        assert!(form.validate_fields("draft").is_empty());
+    }
+
+    #[test]
+    fn publishing_with_a_blank_title_is_rejected_with_a_field_message() {
+        let form = PageForm {
+            title: "   ".into(),
+            body: "Some body text".into(),
+            ..blank()
+        };
+        let errors = form.validate_fields("published");
+        assert_eq!(
+            field_error(&errors, "title"),
+            Some("A published page needs a title")
+        );
+        assert_eq!(field_error(&errors, "body"), None);
+    }
+
+    #[test]
+    fn publishing_with_a_blank_body_is_rejected_with_a_field_message() {
+        let form = PageForm {
+            title: "A real title".into(),
+            body: "  \n ".into(),
+            ..blank()
+        };
+        let errors = form.validate_fields("published");
+        assert_eq!(field_error(&errors, "title"), None);
+        assert_eq!(
+            field_error(&errors, "body"),
+            Some("A published page needs body content")
+        );
+    }
+
+    #[test]
+    fn a_fully_populated_published_page_has_no_errors() {
+        let form = PageForm {
+            title: "A real title".into(),
+            body: "Some body text".into(),
+            status: "published".into(),
+            ..blank()
+        };
+        assert!(form.validate_fields("published").is_empty());
+    }
+
+    /// The rejected new-page submission keeps the author's draft and wires
+    /// each error to its field (adjacent to cause, `aria-invalid`, preserved
+    /// entered data) instead of dropping them onto a generic error page.
+    #[test]
+    fn a_rejected_new_page_submission_keeps_the_authors_input_and_wires_its_error() {
+        let submitted = PageForm {
+            title: String::new(),
+            body: String::new(),
+            status: "published".into(),
+            lock_version: 0,
+        };
+        let errors = submitted.validate_fields("published");
+        let html = new_page_form(&submitted, &errors).into_string();
+
+        assert!(
+            html.contains(r#"option value="published" selected"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains("A published page needs a title"), "{html}");
+        assert!(
+            html.contains("A published page needs body content"),
+            "{html}"
+        );
+    }
+
+    /// Same coverage as above for the edit form's 422 branch: the author's
+    /// just-typed title/body survive the round trip, adjacent to the field
+    /// that failed.
+    #[test]
+    fn a_rejected_edit_submission_keeps_the_authors_input_and_wires_its_error() {
+        let submitted = PageForm {
+            title: "Kept Title".into(),
+            body: String::new(),
+            status: String::new(),
+            lock_version: 3,
+        };
+        let errors = submitted.validate_fields("published");
+        let html =
+            edit_page_form("my-page", "Kept Title", "published", &submitted, &errors).into_string();
+
+        assert!(html.contains(r#"value="Kept Title""#), "{html}");
+        assert!(html.contains(r#"value="3""#), "{html}");
+        assert!(
+            html.contains("A published page needs body content"),
+            "{html}"
+        );
+        assert!(field_error(&errors, "title").is_none());
+    }
 }

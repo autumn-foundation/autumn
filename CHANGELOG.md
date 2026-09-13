@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Build-checked typed contracts between two Autumn services (#1755):** the day
+  a team carves the first service out of an Autumn monolith, the framework used
+  to go silent — `openapi.rs` and `mcp.rs` project a typed surface *outward*,
+  `http_client.rs` gives a raw outbound client, and nothing generated a
+  caller-side client from a callee's real handler signatures or checked that the
+  two still agreed. Four new pieces close that, with no IDL and no codegen step.
+  On the callee, `#[endpoint(service = "…")]` marks a typed handler: it reads
+  the request and response types straight off the signature (and the method and
+  path off the route attribute below it), emits a marker type implementing
+  `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire descriptor
+  under `target/autumn-contracts/`. `#[derive(WireShape)]` records a DTO's
+  serde-visible field shape in *both* directions. On the caller, `wire_client!`
+  generates the typed client from those markers — so every method's types are
+  the callee's own types — and `#[contract_checked]` reads each call site's
+  read-set (every response field the caller names, including inside a `html!` or
+  `format!` body) and write-set (every request field an inline literal sets) and
+  emits one `const _: () = assert!(…)` per field against the callee's own const
+  field table. A mismatch is a compile error at the call site naming the caller,
+  the endpoint and the field. Because the assertion is a cross-crate const fact,
+  rustc rebuilds the caller whenever the callee's table changes — nothing can go
+  stale. The check earns its keep on the breaks the type checker cannot see: a
+  `#[serde(skip_serializing)]` on a response field a caller reads, a
+  `#[serde(skip_deserializing)]` on a request field a caller sets, a required
+  request field the request type may keep off the wire
+  (`#[serde(skip_serializing_if)]`) that a call site does not set, and a route
+  path that stops taking the parameters a client declares — each of which
+  compiles today and fails in production. What it deliberately does NOT flag is
+  a plain `..Default::default()` request: both ends share the type, so
+  serialization emits every field and the body is complete. Against the seeded
+  mutation set in `scripts/wire-contract-sweep.py`, all 12 wire-breaking changes
+  turn `cargo build` red with a caller-named error and none of the 12 compatible
+  changes is rejected. Worked two-service example in `examples/mesh-catalog` and
+  `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. Entirely
+  new surface, so this is **non-breaking** — a glob-imported prelude name an app
+  already defines shadows the new one. First
+  slice: one workspace, synchronous request/response, JSON over HTTP — the
+  cross-version rolling-deploy proof is the next one.
+  <!-- migration-guide-gate: entirely new surface; "breaking" here describes the
+  wire-breaking changes the feature CATCHES, not a break in Autumn's own API -->
 - **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
   `rich_text_area` and its five siblings in `autumn::form` hardcoded English
   chrome: the toolbar's aria-label, its per-control names and syntax hints,
@@ -376,6 +415,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password protection across page/feed/API, permalink-structure changes not
   404ing existing URLs, revision restore, export/import idempotence, and a CSRF
   round trip.
+- **`LazyDb`, a lazy database connection extractor (#2264):** `Db` is a
+  `FromRequestParts` extractor. Axum runs it before the body extractor
+  (`Form`, `Json`, `Multipart`, ...) in the same handler. A handler that took
+  both held a pooled connection for as long as the client took to send its
+  body. A slow upload could pin `pool_size` connections and starve every
+  other request. `LazyDb` takes the same argument position but defers the
+  checkout. It records what the checkout will need at extraction time and
+  only takes a connection when the handler calls `LazyDb::checkout`, after
+  the body is already read. `#[commentable]`'s own `post_comment` handler now
+  uses it. Additive: existing `Db` handlers are unaffected.
+
+- **`scripts/check-docs-versions.sh` — release-line pin gate [no-plugin].**
+  Every `autumn-* = "<version>"` pin in the reader-facing corpus must name the
+  published release line. This is the eighth thing a reader copies off a page
+  and the one every other docs gate is implicitly relative to: a correct
+  `autumn_web::…` path against the wrong release line is still a build error.
+  It was gated in one place over eight pages —
+  `repo_hygiene::first_run_docs_match_current_release_line` holds a hand-listed
+  `FIRST_RUN_DOCS` array to the published pin — while the corpus is 212 pages
+  carrying 74 pins; that test is also existential rather than per-occurrence, so
+  a page carrying both a correct and a stale pin passed it. The CHANGELOG
+  records the class being swept by hand twice before (the `0.6.0` install-pin
+  alignment across five pages, and the getting-started rewrite that found a
+  guide "announcing the '0.4 release line' while pinning 0.6 commands"). Truth
+  set is README.md's quickstart pin — the same single source
+  `check-quickstart.sh` installs from — so a release bump moves the gate's
+  expectation by editing one line and cannot disagree with the first-run test
+  about what "current" means. Migration guides are held to their own version
+  instead, since a before-block is the page's whole purpose:
+  `docs/migrations/0.4.0.md` may pin 0.3 and 0.4, but not 0.5. A pin a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- version-pin-allow: … — reason -->` marker, so the waiver is deleted by
+  the commit that deletes the sentence; the corpus has one, the reproduced
+  plugin-contract panic text in `docs/plugins.md`. Baseline: 74 pins checked,
+  1 defect (the `skills/autumn-patterns/SKILL.md` pin under **Fixed**), 1
+  waived. Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit
+  rather than after its corpus had a chance to drift — #2709 exists because the
+  gates each spelled their own "reader-facing" and three of them diverged, and a
+  fifth unwatched spelling is how that recurs.
 
 ### Changed
 
@@ -530,6 +608,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text (e.g. `UNIQUE constraint failed: widgets.email`) to resolve the
   violated column when no constraint name is reported. Postgres behavior
   and the function's signature are unchanged.
+- **docs:** `skills/autumn-patterns/SKILL.md` pinned `autumn-web = { version =
+  "0.5", features = ["test-support"] }` in the `[dev-dependencies]` block of its
+  "Testing with TestApp and TestClient" section — the line a reader adds the
+  first time they write a test, two release lines behind the `autumn-web =
+  "0.7"` the same corpus pins in 47 other places. It entered the tree already
+  stale rather than rotting there, so no release-time sweep would have found it.
+  The pin does not fail as a version complaint: `autumn-web` pulls
+  `libsqlite3-sys`, which carries `links = "sqlite3"`, and Cargo permits one
+  package per `links` value in a graph, so `0.5` beside the app's `0.7` resolves
+  to `error: failed to select a version for libsqlite3-sys … links to the native
+  library sqlite3, but it conflicts with a previous package` — naming neither
+  `autumn-web` nor the page. Verified against crates.io in both directions: the
+  `0.5` pin exits 101 at resolve time, `0.7` resolves clean.
+
+- **🧭 Wayfinder: redisplay page create/edit forms on failure in
+  `examples/wiki` (error-path 0/2 → 2/2, draft preserved):** an error-path
+  inventory of `wiki`'s page create/edit forms — `/new` and
+  `/pages/{slug}/edit`, the only content-authoring flow in this
+  `supported`-tier example and the exact CRUD-with-a-state-machine pattern
+  the app exists to demonstrate — found both of `PageHooks`'s recoverable
+  publish-guard rejections sent the submission through
+  `AutumnError::bad_request_msg`'s generic `application/problem+json`
+  response via the handler's `?`, instead of redisplaying the form: 0 of 2
+  failure modes were adjacent to cause, persisted in place, said how to
+  recover, or preserved the author's draft. Both are reachable from the
+  real UI, not just the JSON API: the create form's `status` select offers
+  "Published" while its `body` textarea has no `required` attribute, so
+  selecting Published with an empty body trips
+  `PageHooks::before_create`'s `can_publish` guard; the edit form's `body`
+  has no `required` either, so clearing it on an already-published page
+  trips the identical guard in `PageHooks::before_update`. Either way the
+  author lost their typed title/body to a dead-end JSON response with no
+  way back into the form. This is the same anti-pattern already fixed in
+  `blog`'s post editor (#2687), `reddit-clone`'s create-community form
+  (#2665), and `saas`/`teams`'s auth forms (#2530).
+  Fix: `PageForm` gains `validate_fields(effective_status) ->
+  Vec<(&'static str, &'static str)>`, mirroring the exact rule the hooks
+  already enforce (a draft may be empty; publishing may not) so the
+  business rule isn't duplicated, just checked earlier. `create` passes the
+  submitted `status`; `update` passes the page's current stored status,
+  since the edit form never changes it. A non-empty result now renders the
+  same form template (`new_page_form/edit_page_form`, shared with the GET
+  routes so there is exactly one place each form's markup lives) with a 422,
+  `aria-invalid`/`aria-describedby` wired to the failing field, a
+  `role="alert"` message next to it, and the author's title/body intact —
+  the hooks' checks stay in place underneath as the last line of defense for
+  the JSON/repository path. 6 new unit tests
+  (`examples/wiki/src/routes/pages.rs`'s `page_form_tests`) cover: a draft
+  may be empty, publishing with a blank title/body is rejected with a
+  field-specific message, a fully populated publish has no errors, and a
+  rejected new-page/edit submission keeps the author's input and wires its
+  error to the right field.
+
+- **`cms` example — import no longer drops, nor later duplicates, a page that
+  shares a bare slug with an unrelated one (#2737):** a page's file identity
+  falls back to its bare slug when the file has no `path` for it — the
+  version-2/3 shape, and also a version-5 entry that simply omits `path`.
+  Two importer checks used that bare identity on its own and could match it
+  against the wrong page. The "shallowest first" sort counted only
+  `identity()`'s own slashes, so a page nested through `parent` alone (no
+  `path`) sorted as if it were top level and could run before its own parent
+  existed, landing at the top level by mistake. The `_import_source_slug`
+  marker recorded that same bare identity at creation time, not the row's
+  real position, so a later, unrelated import naming an accurate top-level
+  page with the same slug matched the marker and was silently skipped. Both
+  are fixed: the sort now walks the file's own parent references to find
+  each post's real depth, the plain slug match now also requires the
+  matched row's actual parent to agree with what the current file says the
+  parent should be, and the marker now records each row's identity
+  qualified by its parent's own *stable* identity — resolved through the
+  file's own declared structure, recursively, the same graph the sort
+  walks — rather than the bare slug alone or a parent's mutable, real-time
+  position. Two pages that only *look* alike keep separate markers; a later
+  re-import still recognizes a row regardless of an editor moving it, a
+  suffixed ancestor, an ancestor moved after import, or a multi-level
+  pathless chain where every ancestor is already settled from an earlier
+  run — so the fix does not trade the original data loss for a duplicate on
+  a later run. A pre-upgrade site's markers, recorded under the old, bare
+  scheme, are still recognized too. Resolving a completed ancestor's real id
+  now also goes through that same qualified marker, with a legacy fallback of
+  its own, rather than the bare identity alone, so importing an updated
+  backup that adds a new page to an otherwise unchanged, already-settled tree
+  — pre-upgrade or not — nests it under its real parent instead of leaving it
+  at the top level. A bare, legacy `parent` reference now also resolves
+  against a sibling that carries an explicit `path`, since both name a page
+  by its slug. A pre-upgrade site's old, bare markers are kept as a list
+  rather than collapsed to one, so two completed pages that happen to share
+  that same old marker are both still recognized on a later re-import, rather
+  than one of them getting duplicated. A genuinely top-level post's marker
+  key is now marked with a leading slash a legacy marker could never carry,
+  so a brand new top-level page can no longer be mistaken for a pre-upgrade
+  site's unrelated, already-completed nested one — the underlying *position*
+  a marker is built from stays undecorated and purely positional at every
+  recursive step, so a page imported once as a pathless legacy child and
+  later re-imported as one explicit `path` (what the CMS's own exporter
+  always writes) still resolve to the same position. Recursively resolving
+  an already-completed legacy parent's own expected parent is now bounded
+  the same way every other ancestry walk in this module is, so a
+  hand-edited file naming two pre-upgrade pages as each other's parent can
+  no longer hang the import. Picking among a pre-upgrade site's old, bare
+  marker candidates now checks every candidate's real parent before falling
+  back to an unfinished one, so two unfinished rows left by an interrupted
+  run under the same bare marker but different parents are no longer
+  conflated on retry. That fallback is now also restricted to a post that is
+  itself nested — a genuinely top-level post is never paired with somebody
+  else's unsettled nested row merely because it shares that row's old, bare
+  marker. A parent reference derived from an explicit `path` prefix — even a
+  single segment, when that parent is itself top-level — is now always
+  resolved by full identity rather than by the ambiguous, slug-keyed lookup
+  the legacy `parent` field alone needs, so it can no longer be confused
+  with an unrelated post sharing that same slug elsewhere in the file.
+- **edge:** a batch of P2/P3 follow-ups deferred from the edge capsule's
+  first slice (#1790/#2243), closing issue #2244:
+  - `EdgeHandler` now checks a sealed `EdgeExtract` whitelist (`Path`,
+    `Query`, `HeaderMap`, `EdgeCache`, and tuples of these) instead of the
+    open `Handler<_, EdgeState>` bound. The open bound let `Extension<T>`
+    (hidden behind a type alias) and the whole-`Request` extractor compile
+    as `#[edge]` handlers, passing locally against the origin and only
+    diverging at the edge — a silent gap the route macro's token-level
+    `Extension` scan could not see.
+  - `autumn-cli`'s edge-route scanner now evaluates `#[cfg(feature = "x")]`
+    (and `not`/`all`/`any` of it) against the crate's own default-feature
+    set, so a defaults-off route no longer forces a spurious WASI-target/
+    capsule-bin demand; and `edge_routes![]` registrations are matched by
+    full qualified path, so `users::show` no longer satisfies the
+    registered-check for an unrelated `admin::show`.
+  - `autumn doctor`'s edge checks now warn instead of silently passing from
+    a virtual workspace root, and resolve the edge-capsule binary from the
+    manifest (`[[bin]]`/`autobins`) instead of only the conventional path.
+  - `EdgeRoute.method` is now validated (wire version 1 is GET-only); a
+    header-multiplicity-only difference no longer produces an empty
+    conformance divergence detail; and the origin now strips the edge
+    lane's internal fallthrough-sentinel header from every response instead
+    of leaking it to a real client on a wiring bug.
+  - The `edge-conformance` CI job no longer compiles the wasm32-wasip1
+    capsule twice into two target-dir subtrees.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
@@ -538,6 +752,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project declaring `autumn-web` this way silently kept the `mail` feature
   unset after `autumn generate auth --mail`, with no error — the generated
   mail routes would then fail to compile.
+- **`autumn release init --target aws-app-runner`:** `main.tf`'s
+  `aws_apprunner_service` no longer ignores the whole `instance_configuration`
+  block (#2256). The cutover call in `docs/guide/deployment.md` sets only
+  `instance_role_arn` outside Terraform, but the old `ignore_changes` list
+  named the entire block, so a later change to `var.instance_cpu` or
+  `var.instance_memory` never reached AWS — `terraform apply` silently kept
+  the service at its old size. `ignore_changes` now targets
+  `instance_configuration[0].instance_role_arn` only, so cpu/memory resizing
+  works through Terraform again while the role stays cutover-managed.
 - **query strings:** an append (`tags[]=`) after an out-of-range explicit
   index no longer sorts wrong or collides with it (#2253). `Segment::Index`
   saturates an absurd index to `usize::MAX` for ordering only; an append
@@ -7161,6 +7384,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marginal allocation blocks/query and bytes/query (dhat) are unchanged
   (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
   allocation-bound, so only the instruction floor is claimed.
+- **`autumn deploy up` now has a direct test that it refuses the whole fleet
+  when any host fails preflight (#2269, #1621 AC-7 follow-up):** the behavior
+  was correct, but only proven by code reading and by an adjacent `deploy
+  check` test — `run_up_with` takes `checks` as already-graded input, so it
+  cannot exercise the refusal, and `run_up` itself needs disk/network I/O to
+  drive directly. The refusal is now its own function,
+  `refuse_if_preflight_failed`, called by `run_up` right after
+  `collect_fleet_preflight` and before any executor is built. One new test
+  drives that same gate against a three-host fleet with one failing host and
+  asserts zero executors are built and the fleet's call tape stays empty —
+  mirroring `execute_first_deploy`'s existing
+  `preflight_failure_aborts_before_any_executor_call` one level up, at the
+  fleet driver. A second new test asserts the call order inside `run_up`'s
+  own source (mirroring the existing
+  `media_provisioning_is_deferred_past_app_cutover_in_up` pattern), so a
+  refactor that moved the gate after the `run_up_with` hand-off — the exact
+  risk the issue named — fails a test even though the gate function itself
+  still works.
+- **`comments:commentable` (#2265): a hard-deleted parent no longer leaves
+  orphaned comment rows behind.** `commentable_id` has no foreign key.
+  Nothing cascaded a deleted parent's comments away. No generated route
+  could reach the orphaned rows afterward. `autumn generate scaffold …
+  comments:commentable` now writes an `AFTER DELETE` trigger into the
+  parent's own migration. The trigger removes that parent's comments on
+  any hard delete — through the repository, raw SQL, or an admin tool. A
+  soft-deleted parent is not affected: its row is never removed. New tests
+  cover this: a database-level test in
+  `autumn/tests/integration/commentable.rs`, and scaffold-output tests in
+  `autumn-cli`'s `scaffold_commentable.rs`.
 
 ## [0.7.0] - 2026-08-23
 

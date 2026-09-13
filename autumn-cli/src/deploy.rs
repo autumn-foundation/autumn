@@ -2818,6 +2818,20 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     failed
 }
 
+/// Refuse the rollout if any preflight check failed (issue #1621, AC-7).
+///
+/// `run_up` calls this right after `collect_fleet_preflight`, before it
+/// builds any executor. A failing host stops the rollout before it
+/// touches a server. Split into its own function so a test can drive
+/// this exact decision with no disk and no network (issue #2269).
+fn refuse_if_preflight_failed(checks: &[PreflightCheck]) -> Result<(), DeployError> {
+    let failed = report_preflight(checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+    Ok(())
+}
+
 /// Run the preflight over EVERY configured host and report it (issue #1621, AC-7).
 ///
 /// `hosts` is the ordered target list from [`deploy_host_list`]. With more than one
@@ -3646,10 +3660,7 @@ fn run_up(
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
     let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
-    let failed = report_preflight(&checks);
-    if failed > 0 {
-        return Err(DeployError::PreflightFailed(failed));
-    }
+    refuse_if_preflight_failed(&checks)?;
 
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
@@ -10515,6 +10526,85 @@ mod tests {
             recorder.mutating(&[]).is_empty(),
             "a refused fleet must run NO remote command at all, probes included: {:?}",
             recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn up_refuses_the_whole_fleet_when_one_host_fails_preflight() {
+        // #2269 (#1621 AC-7 follow-up). `run_up_with` assumes checks are
+        // already graded; it never re-checks them. The real gate is
+        // `refuse_if_preflight_failed`, called by `run_up` before any
+        // executor is built. This test drives that gate directly, then
+        // calls `run_up_with` only on success. Mirrors
+        // `preflight_failure_aborts_before_any_executor_call` (exec.rs) one
+        // level up.
+        //
+        // This alone cannot prove `run_up` still calls the gate before the
+        // hand-off — `and_then` short-circuits regardless. See
+        // `up_calls_the_preflight_gate_before_handing_off_to_run_up_with`
+        // right below, which asserts that ordering in `run_up`'s own source.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let checks = vec![
+            PreflightCheck::pass("signing_secret", "ok"),
+            PreflightCheck::fail("ssh_reachability", "unreachable", "check the network")
+                .scoped(Some("web-b".to_owned())),
+        ];
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let executor_builds = std::cell::Cell::new(0_usize);
+
+        let err = refuse_if_preflight_failed(&checks)
+            .and_then(|()| {
+                run_up_with(&fixture.input(&fleet), |cfg| {
+                    executor_builds.set(executor_builds.get() + 1);
+                    Ok(recorder.executor(cfg))
+                })
+            })
+            .expect_err("a failing host must refuse the whole rollout");
+
+        assert!(
+            matches!(err, DeployError::PreflightFailed(1)),
+            "expected PreflightFailed(1), got {err:?}"
+        );
+        assert_eq!(
+            executor_builds.get(),
+            0,
+            "no executor may be built for any host when preflight fails"
+        );
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn up_calls_the_preflight_gate_before_handing_off_to_run_up_with() {
+        // #2269. The test above proves the GATE refuses correctly, but it
+        // composes `refuse_if_preflight_failed` and `run_up_with` by hand — it
+        // cannot prove `run_up` itself still calls them in that order. This
+        // checks the SOURCE order inside `run_up`, mirroring
+        // `media_provisioning_is_deferred_past_app_cutover_in_up`: a refactor
+        // that moved the gate after the `run_up_with` hand-off, or dropped it,
+        // fails this test even though the gate function still works on its
+        // own.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let gate_at = up_body
+            .find("refuse_if_preflight_failed(&checks)")
+            .expect("the preflight gate call present on the up path");
+        let handoff_at = up_body
+            .find("run_up_with(")
+            .expect("the run_up_with hand-off present on the up path");
+
+        assert!(
+            gate_at < handoff_at,
+            "run_up must call the preflight gate BEFORE handing off to run_up_with",
         );
     }
 

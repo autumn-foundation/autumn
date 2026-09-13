@@ -74,7 +74,7 @@ use crate::state::AppState;
 /// ```
 #[must_use]
 pub fn app() -> AppBuilder {
-    AppBuilder {
+    let builder = AppBuilder {
         routes: Vec::new(),
         api_versions: Vec::new(),
         route_sources: Vec::new(),
@@ -162,6 +162,105 @@ pub fn app() -> AppBuilder {
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
         inbound_mail_router: None,
+    };
+    // Strip the edge lane's internal fallthrough-sentinel header from every
+    // outbound response, for every app — not only apps that call
+    // `with_edge_kv`. `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) sets
+    // this header on its 500 so the EDGE CAPSULE runtime knows to fall
+    // through to the origin; the same handler code also runs at the origin,
+    // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
+    // bug — hits that same 500 at the origin. Without this layer the internal
+    // header would leak straight to a real HTTP client. See
+    // `StripEdgeFallthroughSentinelLayer` below.
+    #[cfg(feature = "edge")]
+    let builder = builder.layer(StripEdgeFallthroughSentinelLayer);
+    builder
+}
+
+/// Removes [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
+///
+/// `autumn-edge` is substrate-agnostic on purpose: `extract.rs` cannot tell
+/// whether it is running at the edge or at the origin, so it always sets the
+/// sentinel on an `EdgeCacheUnavailable` response. Only the origin knows it is
+/// the origin, so only the origin strips the header before a real client ever
+/// sees it. The response body's actionable message is left untouched — only
+/// the internal signaling header is removed.
+///
+/// A bespoke `tower::Layer`, not `axum::middleware::from_fn`: this type's
+/// `TypeId` is what `router::is_idempotency_transparent_app_layer` matches
+/// on to recognize this one framework-owned registration without forcing
+/// fail-closed idempotency on every app built with the `edge` feature. A
+/// name (even a function's) is not unique enough for that — a user's own
+/// `from_fn` middleware could share it by coincidence; a crate-private type
+/// cannot.
+#[cfg(feature = "edge")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StripEdgeFallthroughSentinelLayer;
+
+#[cfg(feature = "edge")]
+impl<S> tower::Layer<S> for StripEdgeFallthroughSentinelLayer {
+    type Service = StripEdgeFallthroughSentinelService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StripEdgeFallthroughSentinelService { inner }
+    }
+}
+
+/// `true` for a `custom_layers` registration that [`app()`] installs itself
+/// rather than a user calling [`AppBuilder::layer`] — [`get_layer_types`](AppBuilder::get_layer_types)
+/// filters these out to keep its documented "user-installed only" contract,
+/// even though they share the same underlying `custom_layers` vector as a
+/// real user layer (needed so the router-build step applies them the same
+/// way, in the same registration-order pass).
+#[cfg(feature = "edge")]
+fn is_framework_owned_layer(type_id: TypeId) -> bool {
+    type_id == TypeId::of::<StripEdgeFallthroughSentinelLayer>()
+}
+
+#[cfg(not(feature = "edge"))]
+const fn is_framework_owned_layer(_type_id: TypeId) -> bool {
+    false
+}
+
+/// Tower [`Service`](tower::Service) produced by
+/// [`StripEdgeFallthroughSentinelLayer`].
+#[cfg(feature = "edge")]
+#[derive(Clone, Debug)]
+pub(crate) struct StripEdgeFallthroughSentinelService<S> {
+    inner: S,
+}
+
+#[cfg(feature = "edge")]
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>>
+    for StripEdgeFallthroughSentinelService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let response = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = response.await?;
+            response
+                .headers_mut()
+                .remove(autumn_edge::FALLTHROUGH_SENTINEL);
+            Ok(response)
+        })
     }
 }
 
@@ -1231,12 +1330,16 @@ impl AppBuilder {
     /// Returns the registered custom layer types in registration order.
     ///
     /// This includes only user-installed layers from
-    /// [`AppBuilder::layer`], not framework-managed middleware.
+    /// [`AppBuilder::layer`], not framework-managed middleware — even one
+    /// installed through this same `custom_layers` vector internally, such
+    /// as the `edge` feature's own sentinel-strip layer, which this filters
+    /// back out.
     #[must_use]
     pub fn get_layer_types(&self) -> Vec<TypeId> {
         self.custom_layers
             .iter()
             .map(|registered| registered.type_id)
+            .filter(|type_id| !is_framework_owned_layer(*type_id))
             .collect()
     }
 
@@ -16712,6 +16815,186 @@ mod tests {
                 "Accept-Language: {accept_language}"
             );
         }
+    }
+
+    // ── The origin never leaks the edge lane's internal sentinel (issue
+    //    #2244, item 4) ────────────────────────────────────────────────────
+    //
+    // `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) answers with the
+    // fallthrough sentinel header so the EDGE CAPSULE runtime knows to fall
+    // through to the origin. The same handler code also runs at the origin —
+    // `extract.rs` cannot special-case which substrate it is on — so an app
+    // that forgets to call `with_edge_kv` (a wiring bug) hits this same 500
+    // at the origin, and a real HTTP client must never see the internal
+    // header.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn an_uninjected_edge_seam_never_leaks_the_fallthrough_sentinel_to_a_real_client() {
+        async fn note(_cache: autumn_edge::EdgeCache) -> &'static str {
+            "never reached: extraction fails first"
+        }
+
+        // The real `app()` entry point, `with_edge_kv` NEVER called — the
+        // wiring bug this test is about.
+        let custom_layers = app().custom_layers;
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/edge/note",
+                handler: axum::routing::get(note),
+                name: "note",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/edge/note",
+                    operation_id: "note",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &AutumnConfig::default(),
+            AppState::for_test(),
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        let request = axum::http::Request::builder()
+            .uri("/edge/note")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.expect("response");
+
+        // Existing behavior, unchanged: still a 500 with an actionable body.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The fix: the internal sentinel never reaches a real client.
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL),
+            "the origin must strip the internal fallthrough sentinel: {:?}",
+            response.headers()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("with_edge_kv"),
+            "the actionable message must survive: {body}"
+        );
+    }
+
+    /// `app()` registers the sentinel-strip layer through the ordinary
+    /// `AppBuilder::layer` path, which the idempotency machinery otherwise
+    /// treats as "opaque" (forcing fail-closed replay) for any custom layer
+    /// it does not specifically recognize — see
+    /// `router::is_idempotency_transparent_app_layer`. Without that
+    /// recognition, every app built with the `edge` feature on would force
+    /// fail-closed idempotency, whether or not it ever calls `with_edge_kv`.
+    /// This pins the real registration's `type_name` against the substring
+    /// that recognizer matches on, so the two sides cannot drift apart.
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
+        let registration = &app().custom_layers[0];
+        assert_eq!(
+            registration.type_id,
+            std::any::TypeId::of::<StripEdgeFallthroughSentinelLayer>(),
+            "the real registration's type_id no longer matches what \
+             router::is_idempotency_transparent_app_layer looks for"
+        );
+    }
+
+    /// `get_layer_types()` documents "only user-installed layers", but the
+    /// sentinel-strip layer above shares its underlying storage
+    /// (`custom_layers`) with real `AppBuilder::layer` calls so the
+    /// router-build step applies both the same way. Without filtering it
+    /// back out, a plugin (or a test like
+    /// `middleware_introspection::get_layer_types_returns_registration_order`)
+    /// asserting an exact layer list sees this internal registration leak in
+    /// as an unexpected leading entry (Codex review on #2739, round 6, P1).
+    #[cfg(feature = "edge")]
+    #[test]
+    fn get_layer_types_excludes_the_framework_owned_sentinel_strip_layer() {
+        #[derive(Clone, Copy)]
+        struct UserLayer;
+        impl<S> tower::Layer<S> for UserLayer {
+            type Service = S;
+            fn layer(&self, inner: S) -> S {
+                inner
+            }
+        }
+
+        let builder = app().layer(UserLayer);
+        assert_eq!(
+            builder.get_layer_types(),
+            vec![std::any::TypeId::of::<UserLayer>()],
+            "the framework's own sentinel-strip registration must not appear \
+             in the user-facing layer list"
+        );
+    }
+
+    /// The header-stripping behavior itself, independent of the router-level
+    /// idempotency classification test above.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn the_sentinel_strip_service_removes_the_header_and_keeps_the_body() {
+        use axum::response::IntoResponse as _;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let inner = tower::service_fn(|_req: axum::extract::Request| async move {
+            Ok::<_, std::convert::Infallible>(
+                (
+                    [(autumn_edge::FALLTHROUGH_SENTINEL, "missing_capability")],
+                    "actionable message",
+                )
+                    .into_response(),
+            )
+        });
+        let mut service = StripEdgeFallthroughSentinelLayer.layer(inner);
+        let request = axum::extract::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response: axum::response::Response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("infallible");
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, b"actionable message".as_slice());
     }
 
     #[cfg(feature = "i18n")]
