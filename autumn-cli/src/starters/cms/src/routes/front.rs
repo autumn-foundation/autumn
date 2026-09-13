@@ -25,7 +25,7 @@ use crate::repositories::{
 use crate::settings::Settings;
 use crate::theme;
 
-use super::site::{Csrf, Repos, render};
+use super::site::{Csrf, Repos, permalink_from, render};
 
 /// Whether a post's registered type is reachable on the public front end.
 ///
@@ -296,10 +296,7 @@ pub async fn search(
         .await?
     };
 
-    let mut cards = Vec::with_capacity(results.len());
-    for post in &results {
-        cards.push((post.clone(), repos.permalink(post, &settings).await?));
-    }
+    let cards = permalinks_for(&repos, &results, &settings).await?;
 
     let theme = theme::active_theme(&settings);
     let body = html! {
@@ -865,6 +862,47 @@ pub async fn unlock(
 
 // ── Shared pieces ───────────────────────────────────────────────────────────
 
+/// Resolve every post's permalink in one pass.
+///
+/// `Repos::permalink` walks a page's ancestor chain one row at a time, so a
+/// listing that called it per post paid one query per hierarchy level per
+/// *page-typed* result — `search()` and `listing()` both did, up to
+/// `MAX_PAGE_DEPTH` round trips for each hierarchical hit on a page. This
+/// batches the same way `site::nav_for` already does for the nav menu: one
+/// `posts_with_ancestors` call loads every result's own row plus every
+/// ancestor across the whole batch, at most `MAX_PAGE_DEPTH` queries total
+/// regardless of how many results or how many of them are pages, and
+/// `permalink_from` (the pure, map-based twin of `Repos::permalink`) builds
+/// each URL from that map afterwards with no further database access.
+async fn permalinks_for(
+    repos: &Repos,
+    posts: &[Post],
+    settings: &Settings,
+) -> AutumnResult<Vec<(Post, String)>> {
+    let page_ids: Vec<i64> = posts
+        .iter()
+        .filter(|post| post.post_type == "page")
+        .map(|post| post.id)
+        .collect();
+    // `blog_index`/`term_archive`/`author_archive`/`date_archive` all list
+    // `post_type = "post"` results, so `page_ids` is empty on every one of
+    // them — skip the connection checkout entirely rather than pay for one
+    // just to run a query `posts_with_ancestors` would immediately no-op.
+    let ancestors = if page_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        repos
+            .with_conn(async move |conn| {
+                crate::content::posts_with_ancestors(conn, &page_ids).await
+            })
+            .await?
+    };
+    Ok(posts
+        .iter()
+        .map(|post| (post.clone(), permalink_from(post, &ancestors, settings)))
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn listing(
     repos: &Repos,
@@ -877,10 +915,7 @@ async fn listing(
     base_path: &str,
 ) -> AutumnResult<Markup> {
     let theme = theme::active_theme(settings);
-    let mut cards = Vec::with_capacity(posts.len());
-    for post in posts {
-        cards.push((post.clone(), repos.permalink(post, settings).await?));
-    }
+    let cards = permalinks_for(repos, posts, settings).await?;
 
     let page = params.page_number();
     let last_page = total.div_ceil(per_page.max(1)).max(1);

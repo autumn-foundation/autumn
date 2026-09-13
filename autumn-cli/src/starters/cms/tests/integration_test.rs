@@ -3636,6 +3636,117 @@ async fn search_results_render_pagination() {
     assert!(html.contains("Page 2 of 3"), "and say where it is:\n{html}");
 }
 
+/// A hierarchical page's permalink in a search result must still resolve its
+/// full nested path when it comes from a batched ancestor lookup rather than
+/// a per-row one.
+///
+/// `search()` used to call `Repos::permalink` once per result, which for a
+/// page walked its ancestor chain a row at a time. It now resolves every
+/// result's ancestors in one batched pass (`content::posts_with_ancestors`)
+/// and builds the URL from that map with `site::permalink_from` — the same
+/// pure function `site::nav_for` already uses for the nav menu. This is the
+/// equivalence proof for the new call sites: a three-level chain must still
+/// produce its full path, two sibling leaves sharing the same parent (the
+/// shape the batching actually has to get right — a single result works
+/// under any implementation) must each resolve independently and correctly,
+/// and a flat, non-hierarchical post must render exactly as before.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn search_resolves_hierarchical_page_permalinks_from_the_batched_lookup() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    async fn create_page(
+        client: &TestClient,
+        cookie: &str,
+        title: &str,
+        slug: &str,
+        parent_id: Option<&str>,
+    ) -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            (
+                "body",
+                "Zzflorb marks the search token this test looks for.",
+            ),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent_id {
+            fields.push(("parent_id", parent));
+        }
+        let resp = client
+            .post("/admin/content/page")
+            .header("cookie", cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(
+            resp.status,
+            303,
+            "create page should redirect: {}",
+            resp.text()
+        );
+        resp.header("location")
+            .expect("redirect to the editor")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    }
+
+    // docs > docs/install > docs/install/{setup-a,setup-b}: a three-level
+    // chain with two sibling leaves sharing the same immediate parent, so the
+    // batch has to resolve one shared ancestor path for two distinct results.
+    let docs = create_page(&client, &cookie, "Docs Zzflorb", "docs", None).await;
+    let install = create_page(&client, &cookie, "Install Zzflorb", "install", Some(&docs)).await;
+    create_page(
+        &client,
+        &cookie,
+        "Setup A Zzflorb",
+        "setup-a",
+        Some(&install),
+    )
+    .await;
+    create_page(
+        &client,
+        &cookie,
+        "Setup B Zzflorb",
+        "setup-b",
+        Some(&install),
+    )
+    .await;
+
+    // A flat post: `permalink()`/`permalink_from` never walk ancestry for a
+    // non-`page` type at all, batched or not.
+    create_post(&client, &cookie, "Flat Zzflorb", "A flat post.", "publish").await;
+
+    sign_out(&client);
+    let html = client
+        .get("/search?s=zzflorb")
+        .send()
+        .await
+        .assert_ok()
+        .text();
+
+    assert!(
+        html.contains(r#"href="/docs/install/setup-a""#),
+        "the first sibling must resolve its full three-level path:\n{html}"
+    );
+    assert!(
+        html.contains(r#"href="/docs/install/setup-b""#),
+        "the second sibling, sharing the same parent, must resolve its own \
+         full path too -- not be dropped or given the first sibling's URL by \
+         the batched lookup:\n{html}"
+    );
+    assert!(
+        html.contains("Flat Zzflorb"),
+        "a flat post must still appear, unaffected by ancestry batching:\n{html}"
+    );
+}
+
 /// An absurd page number is bounded, not an overflow.
 ///
 /// `page` is an unbounded `usize` from the query string and the offset is
