@@ -22,8 +22,8 @@ literally rather than simulated.
 Time-boxed to one sitting (spread across ~2 hours of active work, with a
 gap in between). Same environment constraint as the prior session: no
 Docker daemon in this sandbox, so PostgreSQL 16 ran as a native
-`pg_ctlcluster` service; fifteen separate databases (`cms` through
-`cms15`, `cms7` unused — a naming slip, not a missing trial) were created
+`pg_ctlcluster` service; sixteen separate databases (`cms` through
+`cms16`, `cms7` unused — a naming slip, not a missing trial) were created
 over the course of the session to model independent site instances
 without touching each other's state, as later reproductions (round six
 onward, prompted by Codex review comments) needed fresh databases beyond
@@ -118,12 +118,15 @@ independently.)
 ## 🐛 Bug filed
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
-silently drops a pathless nested page whenever that same bare slug is
+silently drops an incoming page whenever its file identity string is
 already spoken for — either by a persisted top-level (or otherwise
 depth-tied) row `find_local` matches, or, more broadly still, by *any*
-earlier pathless import's `_import_source_slug` marker, even one attached
-to a page that is correctly, deeply nested and has nothing to do with the
-top level at all (data loss, repro 10/10).**
+earlier import's `_import_source_slug` marker with that same bare slug,
+even one attached to a page that is correctly, deeply nested and has
+nothing to do with the top level at all. Neither the earlier claimant nor
+the later, dropped page needs to be pathless — either can reach the same
+bare identity string via an explicit `path` set to that literal slug
+(data loss, repro 11/11).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -277,14 +280,33 @@ each verified live rather than accepted from reasoning alone:
   narrow: any earlier pathless import of a page with that slug, correctly
   nested anywhere, poisons the bare-slug marker namespace for every
   subsequent import indefinitely.
+- **Nor does the *incoming* page need to be pathless — a Codex catch on
+  this PR pointed out this too, and it checks out live.** What actually
+  matters for Path B is only that the incoming page's own file
+  `identity()` string equals the poisoned marker key — and `identity()`
+  returns an explicit `path` verbatim when one is present, so a page whose
+  `path` is *explicitly set to the bare slug itself* (`"path": "team"`,
+  no slashes) computes the identical string a pathless page would have
+  fallen back to. Verified with an eleventh reproduction (`cms16`): same
+  `A` + pathless-nested-`Team` first import as above; the second, separate
+  import this time carries a *path-bearing* top-level `Team` page
+  (`"path": "team"` explicitly set, not omitted) — still dropped
+  (`"1 already present"`, `/team` → 404), and `find_local("page","team")`
+  finds nothing top-level to match either (the only `team` row is still
+  `/a/team`, correctly nested) — Path B alone, on an explicitly
+  path-carrying incoming page. "The incoming page must be pathless" was
+  therefore imprecise for Path B specifically: the true condition is that
+  its file identity *string* collides with an already-claimed one, by
+  either mechanism.
 
 Either way — via `find_local`'s bare-identity match against a persisted
 top-level row, and/or via the `_import_source_slug` marker matching *any*
 earlier pathless import regardless of where that import's page actually
-ended up — the import loop misidentifies the pathless nested page as
+ended up, or regardless of whether the *later* colliding page itself
+carries a path — the import loop misidentifies the incoming page as
 content that is already accounted for, and drops it permanently, with the
 summary screen reporting an unremarkable "N imported, M already present"
-and no orphan count. Reproduced 10/10
+and no orphan count. Reproduced 11/11
 across independent fresh databases: two on version 2 (one a
 hand-reordered full export, one a minimized 4-post file), one on version
 3, one a version-5-labeled file with `path` omitted on all four posts,
@@ -295,14 +317,16 @@ temporarily-unresolved one, one where the earlier same-slug page comes
 from a wholly separate, already-completed prior import rather than the
 same run, one where that earlier, separately-imported page carried an
 explicit `path` equal to its own bare slug rather than omitting `path`
-altogether, and one where the earlier same-slug page is not top-level at
-all but correctly, deeply nested — dropping the later page purely through
-the marker path, with no top-level row for `find_local` to match. Every
-case that *does* involve file ordering within a single run is a pure
-function of that ordering, not a race — but, per the last four
-reproductions, neither same-run ordering, the persisted row's own `path`
-history, nor even that row being top-level is actually a precondition of
-the bug at all; only the *incoming* page's own pathlessness is.
+altogether, one where the earlier same-slug page is not top-level at all
+but correctly, deeply nested — dropping the later page purely through the
+marker path, with no top-level row for `find_local` to match — and one
+where the *later*, dropped page itself carries an explicit path equal to
+the bare slug rather than omitting `path`. Every case that *does* involve
+file ordering within a single run is a pure function of that ordering,
+not a race — but, per these reproductions, neither same-run ordering, the
+persisted row's own `path` history, that row being top-level, nor even
+the incoming page's own pathlessness is actually a precondition of the
+bug at all; only the coincidence of the two file-identity *strings* is.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
@@ -341,16 +365,18 @@ regression test the sweep will then pick up automatically.
 
 ## Findings summary
 
-- **Bugs filed:** 1 — #2737 (data loss on import: a pathless nested page is
-  silently dropped whenever that same bare slug is already spoken for —
-  either by a page persisted as a top-level row (pre-existing on the
-  site, from an earlier separate import, or created moments earlier in
-  the same run before its own parent existed), or, more broadly, by *any*
-  earlier pathless import's leftover marker, even one attached to a page
-  that is correctly, deeply nested and was never top-level at all — and no
-  error, orphan count, or other signal is given; see above — not a risk to
-  ordinary pathless *posts*, which never collide on slug in the first
-  place, only to same-slug *pages* under different parents).
+- **Bugs filed:** 1 — #2737 (data loss on import: an incoming page is
+  silently dropped whenever its file identity string is already spoken
+  for — either by a page persisted as a top-level row (pre-existing on
+  the site, from an earlier separate import, or created moments earlier
+  in the same run before its own parent existed), or, more broadly, by
+  *any* earlier import's leftover marker sharing that bare slug, even one
+  attached to a page that is correctly, deeply nested and was never
+  top-level at all; neither page needs to be pathless, since an explicit
+  `path` set to the bare slug itself reaches the same identity string —
+  and no error, orphan count, or other signal is given; see above — not a
+  risk to ordinary pathless *posts*, which never collide on slug in the
+  first place, only to same-slug *pages* under different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
@@ -406,5 +432,8 @@ regression test the sweep will then pick up automatically.
    chain actually says it belongs, and the `imported_source_slugs` lookup
    needs a key derived from each page's *actual* resolved position (e.g.
    its resolved parent chain) rather than the bare file identity alone —
-   flagged in the issue as work for whoever picks it up, not
+   on *both* sides of the comparison, since a Codex catch on this PR
+   (`cms16`) showed the incoming page reaches the same collision via an
+   explicit `path` set to the bare slug just as easily as by omitting
+   `path` — flagged in the issue as work for whoever picks it up, not
    attempted here.
