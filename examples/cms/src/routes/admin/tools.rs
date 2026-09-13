@@ -651,18 +651,120 @@ fn identity(post: &ExportPost) -> String {
     post.path.clone().unwrap_or_else(|| post.slug.clone())
 }
 
+/// A post's declared parent reference, and which field named it.
+///
+/// `path`'s own prefix is the parent's full, exact identity, even when it is
+/// only one segment — a one-segment prefix still names one specific
+/// top-level post, not any post sharing that slug. The legacy `parent`
+/// field has no such precision: it only ever held a bare slug, ambiguous
+/// with any other post carrying it.
+enum ParentRef {
+    Path(String),
+    Bare(String),
+}
+
+impl ParentRef {
+    fn as_str(&self) -> &str {
+        match self {
+            ParentRef::Path(id) | ParentRef::Bare(id) => id,
+        }
+    }
+}
+
 /// The identity of a post's parent, as the file describes it.
 ///
 /// For a version-4 page this is the path's own prefix, which is unambiguous.
 /// For an older file it is the bare parent slug, which is the best that file
 /// can say — and was unambiguous under the schema that wrote it.
-fn parent_identity(post: &ExportPost) -> Option<String> {
+fn parent_identity(post: &ExportPost) -> Option<ParentRef> {
     if let Some(path) = &post.path {
         let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         segments.pop();
-        return (!segments.is_empty()).then(|| segments.join("/"));
+        return (!segments.is_empty()).then(|| ParentRef::Path(segments.join("/")));
     }
-    post.parent.clone()
+    post.parent.clone().map(ParentRef::Bare)
+}
+
+/// Indexes into a file's own posts, for resolving a `parent_identity()`
+/// reference to the post it names without scanning the whole file.
+///
+/// `ParentRef` says which of the two ways to look a reference up, not its
+/// segment count: a `path` prefix is always the parent's full, exact
+/// identity — even a lone segment, when that parent is itself top-level —
+/// so it can only match another post's own `identity()`; `by_identity` is
+/// keyed on that. A bare `parent` field names a post by its *slug* alone,
+/// whether or not that post itself carries a `path`: `path: "a/b"` and a
+/// bare `parent: "b"` both mean the page slugged `b` — `by_slug` is keyed on
+/// that instead. Routing a `Path` reference through `by_slug` risked
+/// matching the wrong post whenever two posts shared a slug; using
+/// `by_identity` for a `Bare` one misses a path-carrying post entirely,
+/// since its full identity is never just its slug.
+struct FileGraph<'a> {
+    by_identity: std::collections::HashMap<(&'a str, String), usize>,
+    by_slug: std::collections::HashMap<(&'a str, &'a str), usize>,
+}
+
+impl<'a> FileGraph<'a> {
+    fn build(posts: &'a [ExportPost]) -> Self {
+        let mut by_identity = std::collections::HashMap::new();
+        let mut by_slug = std::collections::HashMap::new();
+        for (i, post) in posts.iter().enumerate() {
+            by_identity
+                .entry((post.post_type.as_str(), identity(post)))
+                .or_insert(i);
+            by_slug
+                .entry((post.post_type.as_str(), post.slug.as_str()))
+                .or_insert(i);
+        }
+        Self {
+            by_identity,
+            by_slug,
+        }
+    }
+
+    fn find(&self, post_type: &str, parent: &ParentRef) -> Option<usize> {
+        match parent {
+            ParentRef::Path(id) => self.by_identity.get(&(post_type, id.clone())).copied(),
+            ParentRef::Bare(slug) => self.by_slug.get(&(post_type, slug.as_str())).copied(),
+        }
+    }
+}
+
+/// How deep a post nests, by this file's own parent references.
+///
+/// The old sort key counted slashes in `identity(post)`. A page nested only
+/// through `parent`, with no `path`, has a bare identity. A bare identity has
+/// no slash, so it looks top level. The old key ran such a page before its
+/// own parent was even created.
+///
+/// This walks `parent_identity` up the file's own posts instead, resolving
+/// each step through `graph` in one lookup rather than scanning the whole
+/// file.
+///
+/// Walks up rather than down, and bounded by `MAX_PAGE_DEPTH` with a
+/// seen-set, for the same reason `trashed_ancestor` (in `content.rs`) is: a
+/// hand-edited file could chain a post deeper than any real page tree goes,
+/// or even name a page as its own ancestor.
+fn file_depth(posts: &[ExportPost], graph: &FileGraph, index: usize) -> usize {
+    let mut seen = vec![index];
+    let mut cursor = index;
+    let mut depth = 0_usize;
+    while depth < content::MAX_PAGE_DEPTH + 2 {
+        let Some(parent) = parent_identity(&posts[cursor]) else {
+            break;
+        };
+        let Some(parent_index) = graph.find(posts[cursor].post_type.as_str(), &parent) else {
+            break;
+        };
+        if seen.contains(&parent_index) {
+            // A cycle in the file's parent references. Stop here.
+            break;
+        }
+        seen.push(parent_index);
+        cursor = parent_index;
+        depth += 1;
+    }
+    depth
 }
 
 /// The full path a stored post is addressed at, for comparing against a file's
@@ -677,6 +779,246 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
     } else {
         format!("{}/{}", ancestry.join("/"), post.slug)
     })
+}
+
+/// A post's stable *position*, built from the file's own declared
+/// structure, not from a parent's mutable current position.
+///
+/// An explicit `path` is used verbatim: it is already fully qualified, and
+/// already what a retry recomputes. A pathless post is qualified by its
+/// *parent's own* stable position instead — resolved through this same
+/// file, recursively, whenever the parent is also part of it, the same
+/// graph `file_depth` walks for sort order. Keying on the file's own
+/// structure, not on a parent's real, current `local_identity`, keeps a
+/// descendant unaffected by an editor moving an ancestor between runs, and
+/// unaffected by the allocator suffixing an ancestor's slug.
+///
+/// Only when the parent is not part of this file — content this import does
+/// not itself declare — does this fall back to that parent's real, current
+/// position: the one signal available for content this importer does not
+/// track. `parent_now` is that fallback's input, and only ever applies at
+/// the top of the recursion, where the caller has already resolved it; a
+/// parent found one or more levels up the file's own chain has no such
+/// value computed for it, so a *second* external parent further up a
+/// legacy chain falls back to its own bare slug instead. Bounded by
+/// `MAX_PAGE_DEPTH` like every other ancestry walk in this module.
+///
+/// This is the plain, undecorated position — not yet a marker key. Every
+/// recursive step composes on this exact value, deliberately, so a chain
+/// nested three levels under a pathless post and the same real page
+/// described by one explicit, fully-qualified `path` compose to the
+/// *identical* string. `disambiguated_identity` is what turns this into a
+/// safe marker key; calling it here instead would mean a later backup that
+/// switches from the pathless legacy shape to explicit paths — the CMS's
+/// own exporter always writes one — could no longer recognize its own,
+/// already-imported pages by position alone.
+fn stable_identity<'a>(
+    repos: &'a Repos,
+    posts: &'a [ExportPost],
+    graph: &'a FileGraph,
+    index: usize,
+    memo: &'a mut Vec<Option<String>>,
+    parent_now: Option<i64>,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<String>> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(cached) = &memo[index] {
+            return Ok(cached.clone());
+        }
+        let post = &posts[index];
+        let value = if let Some(path) = &post.path {
+            path.clone()
+        } else if depth > content::MAX_PAGE_DEPTH + 2 {
+            post.slug.clone()
+        } else if let Some(parent) = parent_identity(post) {
+            match graph.find(post.post_type.as_str(), &parent) {
+                Some(parent_index) => {
+                    let parent_stable =
+                        stable_identity(repos, posts, graph, parent_index, memo, None, depth + 1)
+                            .await?;
+                    format!("{parent_stable}/{}", post.slug)
+                }
+                None => match parent_now.map(|id| repos.posts.find_by_id(id)) {
+                    Some(query) => match query.await? {
+                        Some(parent_row) => {
+                            format!(
+                                "{}/{}",
+                                local_identity(repos, &parent_row).await?,
+                                post.slug
+                            )
+                        }
+                        None => post.slug.clone(),
+                    },
+                    None => post.slug.clone(),
+                },
+            }
+        } else {
+            post.slug.clone()
+        };
+        memo[index] = Some(value.clone());
+        Ok(value)
+    })
+}
+
+/// Turns a `stable_identity` position into a safe marker key.
+///
+/// A position with no slash at all — a genuinely top-level post, qualified
+/// by nothing — is given a leading one. Nothing else in this file ever
+/// writes a leading slash, old code included, so `/team` can only ever have
+/// come from here: unlike a bare `team`, which is also exactly what a
+/// pathless post's identity was under the pre-`stable_identity` scheme
+/// regardless of where it actually nested, `/team` cannot be confused with
+/// a leftover marker for some unrelated, actually-nested page. A position
+/// with a slash already is left untouched — it names an accurate, full
+/// position by construction, the same guarantee an explicit `path` always
+/// carried, so it is no more ambiguous than one.
+fn disambiguated_identity(position: String) -> String {
+    if position.contains('/') {
+        position
+    } else {
+        format!("/{position}")
+    }
+}
+
+/// Everything about this run that resolving a file-declared post's real
+/// database id needs, bundled so passing it around does not mean naming six
+/// arguments at every call site.
+struct ImportGraph<'a> {
+    repos: &'a Repos,
+    posts: &'a [ExportPost],
+    graph: &'a FileGraph<'a>,
+    imported_source_slugs: &'a std::collections::HashMap<(String, String), Vec<i64>>,
+    created_ids: &'a [(i64, String, String, Option<String>)],
+    completed_imports: &'a std::collections::HashSet<i64>,
+}
+
+/// The real database id of a post already declared in this file, resolved
+/// through everything this run can know about it: a row created earlier in
+/// this same run, a row a completed marker names — its new, stable one or,
+/// failing that, the old bare one a pre-upgrade import left — or a local row
+/// whose own raw identity matches exactly.
+///
+/// The marker check goes through `stable_identity`'s marker form
+/// (`disambiguated_identity`), not the bare `identity()`: a completed,
+/// nested ancestor's own marker is qualified, so looking it up by the bare
+/// identity alone always misses it. That miss is what let a newly added
+/// descendant of an otherwise unchanged, already settled tree land at the
+/// top level instead of under its real parent. The legacy fallback needs
+/// this post's own expected parent to disambiguate a bare key that names
+/// more than one row, so it resolves that parent the same way the main loop
+/// resolves any other — recursively, through this same function. Bounded
+/// by `MAX_PAGE_DEPTH` like every other ancestry walk in this module: a
+/// hand-edited file could name two posts as each other's legacy parent.
+fn resolved_post_id<'a>(
+    import: &'a ImportGraph<'a>,
+    stable_memo: &'a mut Vec<Option<String>>,
+    index: usize,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<Option<i64>>> + Send + 'a>> {
+    Box::pin(async move {
+        let post = &import.posts[index];
+        let own_identity = identity(post);
+        if let Some((id, _, _, _)) = import
+            .created_ids
+            .iter()
+            .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &own_identity)
+        {
+            return Ok(Some(*id));
+        }
+        let stable = disambiguated_identity(
+            stable_identity(
+                import.repos,
+                import.posts,
+                import.graph,
+                index,
+                stable_memo,
+                None,
+                0,
+            )
+            .await?,
+        );
+        // Its own marker: a qualified key like this one names exactly one
+        // row, so the first (and only) candidate is enough.
+        if let Some(&id) = import
+            .imported_source_slugs
+            .get(&(post.post_type.clone(), stable.clone()))
+            .and_then(|ids| ids.first())
+        {
+            return Ok(Some(id));
+        }
+        if depth <= content::MAX_PAGE_DEPTH + 2
+            && stable != own_identity
+            && let Some(ids) = import
+                .imported_source_slugs
+                .get(&(post.post_type.clone(), own_identity.clone()))
+        {
+            let expected_parent = match parent_identity(post) {
+                Some(parent) => match import.graph.find(post.post_type.as_str(), &parent) {
+                    Some(parent_index) => {
+                        resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
+                    }
+                    None => find_local(import.repos, &post.post_type, parent.as_str())
+                        .await?
+                        .map(|found| found.id),
+                },
+                None => None,
+            };
+            if let Some(candidate) =
+                pick_marker_candidate(import.repos, ids, import.completed_imports, expected_parent)
+                    .await?
+            {
+                return Ok(Some(candidate.id));
+            }
+        }
+        Ok(find_local(import.repos, &post.post_type, &own_identity)
+            .await?
+            .map(|found| found.id))
+    })
+}
+
+/// The marker candidate whose real parent agrees with `parent_now`, among
+/// rows sharing an ambiguous, pre-`stable_identity` bare marker. Falls back
+/// to an unfinished candidate only when none agrees.
+///
+/// A bare key predates qualified markers, so it can genuinely name more than
+/// one real page — every candidate it lists is tried, not just the first one
+/// loaded. A parent match is checked across *all* candidates first: two
+/// unfinished rows can share one bare marker under different parents (an
+/// import interrupted right after creating both), and picking whichever one
+/// is unfinished first — without checking whether a later candidate actually
+/// matches — pairs the file's post with the wrong row. Only once no
+/// candidate matches does "unfinished" serve as a fallback, since the
+/// ancestry pass below still has to place such a row anyway.
+///
+/// That fallback only makes sense when this file's own post is itself
+/// nested (`parent_now` is `Some`): an unfinished row is trusted precisely
+/// because its own ancestry has not settled yet, and could still land where
+/// this post needs it to. A genuinely top-level post (`parent_now` is
+/// `None`) can never need that excuse — nothing about "not yet nested" ever
+/// applies to it — so it must not be paired with somebody else's unsettled
+/// nested row merely because that row happens to share its bare marker.
+async fn pick_marker_candidate(
+    repos: &Repos,
+    candidates: &[i64],
+    completed_imports: &std::collections::HashSet<i64>,
+    parent_now: Option<i64>,
+) -> AutumnResult<Option<crate::models::Post>> {
+    let mut first_unfinished = None;
+    for &id in candidates {
+        let Some(candidate) = repos.posts.find_by_id(id).await? else {
+            continue;
+        };
+        if candidate.parent_id == parent_now {
+            return Ok(Some(candidate));
+        }
+        if parent_now.is_some()
+            && first_unfinished.is_none()
+            && !completed_imports.contains(&candidate.id)
+        {
+            first_unfinished = Some(candidate);
+        }
+    }
+    Ok(first_unfinished)
 }
 
 /// A stored post of `post_type` whose own identity matches, if there is one.
@@ -910,10 +1252,19 @@ pub async fn import(
     // it stayed that way after re-parenting. Creating the parent first lets the
     // child be inserted where it belongs, where its slug only has to be unique
     // among its siblings.
-    let mut ordered: Vec<&ExportPost> = payload.posts.iter().collect();
-    ordered.sort_by_key(|post| identity(post).matches('/').count());
+    //
+    // Depth comes from `file_depth`, not from counting slashes in
+    // `identity()`. See `file_depth`'s own comment for why.
+    let graph = FileGraph::build(&payload.posts);
+    let mut order: Vec<usize> = (0..payload.posts.len()).collect();
+    order.sort_by_key(|&i| file_depth(&payload.posts, &graph, i));
+    // `stable_identity`'s own memo, shared across every post this run
+    // resolves — including recursive lookups of an already-visited post as
+    // someone else's parent.
+    let mut stable_memo: Vec<Option<String>> = vec![None; payload.posts.len()];
 
-    for post in ordered {
+    for index in order {
+        let post = &payload.posts[index];
         // Idempotent on the slug *the file names*, not only on the slug the
         // row ended up with. Those differ whenever the allocator had to add a
         // suffix — an imported `about` landing as `about-2` because a post
@@ -928,33 +1279,97 @@ pub async fn import(
         // a marker says "this row is ours, finish it", while a bare slug match
         // says only "something local is already called that".
         let file_identity = identity(post);
-        // The parent, if this run has already created it or the site already
-        // had it. `None` leaves the row at the top level for the pass below to
-        // re-link — which is still needed for a parent the file names but does
-        // not contain.
+        // The parent, if this run has already created it, the site already
+        // had it, or an earlier, now-completed run of this importer did.
+        // `None` leaves the row at the top level for the pass below to
+        // re-link — which is still needed for a parent the file names but
+        // does not contain.
+        //
+        // A parent this same file also declares is resolved through
+        // `resolved_post_id`, which knows how to find it whether it was
+        // just created, or is a completed row — nested or not — that only
+        // its own marker still names. A parent this file does not declare
+        // is content this import does not track: the best this can do is
+        // match it by its current local identity, or by a marker some
+        // earlier, separate import left for that same bare slug.
         let parent_now = match parent_identity(post) {
-            Some(parent) => match created_ids
-                .iter()
-                .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &parent)
-            {
-                Some((id, _, _, _)) => Some(*id),
-                None => find_local(&repos, &post.post_type, &parent)
+            Some(parent) => match graph.find(post.post_type.as_str(), &parent) {
+                Some(parent_index) => {
+                    let import = ImportGraph {
+                        repos: &repos,
+                        posts: &payload.posts,
+                        graph: &graph,
+                        imported_source_slugs: &imported_source_slugs,
+                        created_ids: &created_ids,
+                        completed_imports: &completed_imports,
+                    };
+                    resolved_post_id(&import, &mut stable_memo, parent_index, 0).await?
+                }
+                None => match find_local(&repos, &post.post_type, parent.as_str())
                     .await?
-                    .map(|found| found.id),
+                    .map(|found| found.id)
+                {
+                    Some(id) => Some(id),
+                    None => imported_source_slugs
+                        .get(&(post.post_type.clone(), parent.as_str().to_owned()))
+                        .and_then(|ids| ids.first())
+                        .copied(),
+                },
             },
             None => None,
         };
-        let marker_owned =
-            match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
-                Some(id) => repos.posts.find_by_id(*id).await?,
+        // Looked up by `disambiguated_identity`, not the raw `file_identity`
+        // — see its own comment, and `stable_identity`'s, for why a bare
+        // identity cannot be trusted as a marker key. Kept around: it is
+        // also what gets recorded below, if this post turns out to be new.
+        let marker_identity = disambiguated_identity(
+            stable_identity(
+                &repos,
+                &payload.posts,
+                &graph,
+                index,
+                &mut stable_memo,
+                parent_now,
+                0,
+            )
+            .await?,
+        );
+        let marker_owned = match imported_source_slugs
+            .get(&(post.post_type.clone(), marker_identity.clone()))
+        {
+            // A qualified key like this one names exactly one row.
+            Some(ids) => match ids.first() {
+                Some(&id) => repos.posts.find_by_id(id).await?,
                 None => None,
-            };
-        // Matched on the *path*, not the bare slug: a local `/about/team` does
-        // not make the file's `/company/team` already present, and treating it
-        // as such dropped a page out of the site's own backup.
+            },
+            // A site that imported this same page before this fix shipped
+            // still carries the *old*, bare marker for it. Falling back to
+            // that bare identity — only when it differs from the qualified
+            // one, i.e. only for a nested post — keeps such a row
+            // recognized instead of duplicated. A bare key can genuinely
+            // name more than one real page, so every candidate it names is
+            // tried, not just whichever one a query happens to return
+            // first.
+            None if marker_identity != file_identity => {
+                match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
+                    Some(ids) => {
+                        pick_marker_candidate(&repos, ids, &completed_imports, parent_now).await?
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        // Matched on the *path*, not the bare slug: a local `/about/team`
+        // does not make the file's `/company/team` already present. Treating
+        // it as such dropped a page out of the site's own backup.
+        //
+        // The same bare slug is not enough either. A local top-level page
+        // must also match this post's own resolved parent before it counts
+        // as the same page.
         let slug_taken = find_local(&repos, &post.post_type, &file_identity)
             .await?
-            .is_some();
+            .is_some_and(|candidate| candidate.parent_id == parent_now);
 
         if let Some(ours) = marker_owned {
             skipped += 1;
@@ -1024,7 +1439,7 @@ pub async fn import(
                 ours.id,
                 post.post_type.clone(),
                 file_identity.clone(),
-                parent_identity(post),
+                parent_identity(post).map(|p| p.as_str().to_owned()),
             ));
             continue;
         }
@@ -1108,7 +1523,8 @@ pub async fn import(
         // Not the file's status verbatim: an elapsed schedule becomes a
         // publication. See `import_status`.
         let wanted_status = import_status(&post.status, post.published_at).to_owned();
-        let source_slug = file_identity.clone();
+        // The same qualified identity `marker_owned` looked up above.
+        let source_slug = marker_identity;
         // The insert, the marker, the terms and the status are one transaction.
         //
         // The insert used to sit outside it, because the `Repos` allocator
@@ -1201,7 +1617,7 @@ pub async fn import(
             created_id,
             post.post_type.clone(),
             file_identity.clone(),
-            parent_identity(post),
+            parent_identity(post).map(|p| p.as_str().to_owned()),
         ));
         restored += 1;
     }

@@ -567,6 +567,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cms` example — import no longer drops, nor later duplicates, a page that
+  shares a bare slug with an unrelated one (#2737):** a page's file identity
+  falls back to its bare slug when the file has no `path` for it — the
+  version-2/3 shape, and also a version-5 entry that simply omits `path`.
+  Two importer checks used that bare identity on its own and could match it
+  against the wrong page. The "shallowest first" sort counted only
+  `identity()`'s own slashes, so a page nested through `parent` alone (no
+  `path`) sorted as if it were top level and could run before its own parent
+  existed, landing at the top level by mistake. The `_import_source_slug`
+  marker recorded that same bare identity at creation time, not the row's
+  real position, so a later, unrelated import naming an accurate top-level
+  page with the same slug matched the marker and was silently skipped. Both
+  are fixed: the sort now walks the file's own parent references to find
+  each post's real depth, the plain slug match now also requires the
+  matched row's actual parent to agree with what the current file says the
+  parent should be, and the marker now records each row's identity
+  qualified by its parent's own *stable* identity — resolved through the
+  file's own declared structure, recursively, the same graph the sort
+  walks — rather than the bare slug alone or a parent's mutable, real-time
+  position. Two pages that only *look* alike keep separate markers; a later
+  re-import still recognizes a row regardless of an editor moving it, a
+  suffixed ancestor, an ancestor moved after import, or a multi-level
+  pathless chain where every ancestor is already settled from an earlier
+  run — so the fix does not trade the original data loss for a duplicate on
+  a later run. A pre-upgrade site's markers, recorded under the old, bare
+  scheme, are still recognized too. Resolving a completed ancestor's real id
+  now also goes through that same qualified marker, with a legacy fallback of
+  its own, rather than the bare identity alone, so importing an updated
+  backup that adds a new page to an otherwise unchanged, already-settled tree
+  — pre-upgrade or not — nests it under its real parent instead of leaving it
+  at the top level. A bare, legacy `parent` reference now also resolves
+  against a sibling that carries an explicit `path`, since both name a page
+  by its slug. A pre-upgrade site's old, bare markers are kept as a list
+  rather than collapsed to one, so two completed pages that happen to share
+  that same old marker are both still recognized on a later re-import, rather
+  than one of them getting duplicated. A genuinely top-level post's marker
+  key is now marked with a leading slash a legacy marker could never carry,
+  so a brand new top-level page can no longer be mistaken for a pre-upgrade
+  site's unrelated, already-completed nested one — the underlying *position*
+  a marker is built from stays undecorated and purely positional at every
+  recursive step, so a page imported once as a pathless legacy child and
+  later re-imported as one explicit `path` (what the CMS's own exporter
+  always writes) still resolve to the same position. Recursively resolving
+  an already-completed legacy parent's own expected parent is now bounded
+  the same way every other ancestry walk in this module is, so a
+  hand-edited file naming two pre-upgrade pages as each other's parent can
+  no longer hang the import. Picking among a pre-upgrade site's old, bare
+  marker candidates now checks every candidate's real parent before falling
+  back to an unfinished one, so two unfinished rows left by an interrupted
+  run under the same bare marker but different parents are no longer
+  conflated on retry. That fallback is now also restricted to a post that is
+  itself nested — a genuinely top-level post is never paired with somebody
+  else's unsettled nested row merely because it shares that row's old, bare
+  marker. A parent reference derived from an explicit `path` prefix — even a
+  single segment, when that parent is itself top-level — is now always
+  resolved by full identity rather than by the ambiguous, slug-keyed lookup
+  the legacy `parent` field alone needs, so it can no longer be confused
+  with an unrelated post sharing that same slug elsewhere in the file.
 - **edge:** a batch of P2/P3 follow-ups deferred from the edge capsule's
   first slice (#1790/#2243), closing issue #2244:
   - `EdgeHandler` now checks a sealed `EdgeExtract` whitelist (`Path`,

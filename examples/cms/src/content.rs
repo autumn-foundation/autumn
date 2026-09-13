@@ -3795,28 +3795,34 @@ pub async fn completed_import_ids(
         .collect())
 }
 
-/// Every `(post_type, source slug)` a previous import recorded, and the row it
-/// produced.
+/// Every `(post_type, source slug)` a previous import recorded, and the rows
+/// it produced.
 ///
 /// The id matters as well as the membership: a retry has to be able to reach
 /// the existing row to finish work an interrupted run left undone, not merely
-/// know that it should skip it.
+/// know that it should skip it. A key can name more than one row: a marker
+/// recorded under the pre-`stable_identity` scheme was a bare slug, and two
+/// different pages could compute the identical bare slug — so every id is
+/// kept rather than only the last one a query happens to return.
 ///
 /// Joined to `posts` so a row deleted since the import it came from does not
 /// keep its slug reserved — re-importing content the site no longer holds is a
 /// restore, and should work.
 pub async fn imported_source_slugs(
     conn: &mut AsyncPgConnection,
-) -> AutumnResult<std::collections::HashMap<(String, String), i64>> {
-    Ok(post_meta::table
+) -> AutumnResult<std::collections::HashMap<(String, String), Vec<i64>>> {
+    let mut by_key: std::collections::HashMap<(String, String), Vec<i64>> =
+        std::collections::HashMap::new();
+    for (post_type, slug, id) in post_meta::table
         .inner_join(posts::table.on(posts::id.eq(post_meta::post_id)))
         .filter(post_meta::meta_key.eq(IMPORT_SOURCE_SLUG_KEY))
         .select((posts::post_type, post_meta::meta_value, posts::id))
         .load::<(String, String, i64)>(conn)
         .await?
-        .into_iter()
-        .map(|(post_type, slug, id)| ((post_type, slug), id))
-        .collect())
+    {
+        by_key.entry((post_type, slug)).or_default().push(id);
+    }
+    Ok(by_key)
 }
 
 /// What the content-administration screen is asking for.
