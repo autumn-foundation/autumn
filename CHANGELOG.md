@@ -573,11 +573,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each post's real depth, the plain slug match now also requires the
   matched row's actual parent to agree with what the current file says the
   parent should be, and the marker now records each row's identity
-  qualified by its resolved parent rather than the bare slug alone — so two
-  pages that only *look* alike keep separate markers, a later re-import
-  still recognizes a row an editor has since moved without re-parenting or
-  duplicating it, and the fix does not trade the original data loss for a
-  duplicate on a later run.
+  qualified by its parent's own *stable* identity — resolved through the
+  file's own declared structure, recursively, the same graph the sort
+  walks — rather than the bare slug alone or a parent's mutable, real-time
+  position. Two pages that only *look* alike keep separate markers; a later
+  re-import still recognizes a row regardless of an editor moving it, a
+  suffixed ancestor, an ancestor moved after import, or a multi-level
+  pathless chain where every ancestor is already settled from an earlier
+  run — so the fix does not trade the original data loss for a duplicate on
+  a later run. A pre-upgrade site's markers, recorded under the old, bare
+  scheme, are still recognized too.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

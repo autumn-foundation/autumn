@@ -11584,6 +11584,175 @@ async fn re_importing_a_backup_recognizes_a_pre_upgrade_bare_marker() {
     );
 }
 
+/// Re-importing a backup must still recognize a page even after an editor
+/// moves that page's *parent* — not the page itself — somewhere else.
+///
+/// A marker qualified by the parent's real, current `local_identity` changes
+/// the moment any ancestor moves, since that ancestor's own position is part
+/// of the chain. Qualifying by the file's own declared structure instead —
+/// what `stable_identity` does — keeps a descendant's marker fixed no matter
+/// what an editor does to any ancestor above it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_child_of_a_moved_ancestor() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // A separate top-level page, then the editor moves `A` — the *parent*,
+    // not `P` itself — underneath it.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A`, unqualified,
+    // as its parent.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 2 already present");
+
+    // `A`'s move stands, and no duplicate `p` appeared anywhere.
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+}
+
+/// Re-importing a whole multi-level, pathless backup must still recognize
+/// every page in the chain, not just the immediate parent of whichever page
+/// is being checked.
+///
+/// A legacy `parent` reference is always a bare slug, one level at a time.
+/// `find_local` cannot match it against a page nested two or more levels
+/// deep, and a completed ancestor is skipped before it can be offered
+/// through `created_ids`. `stable_identity` sidesteps both: it resolves a
+/// pathless post's whole chain through the file's own graph, the same one
+/// `file_depth` walks, so a page's marker does not depend on any ancestor
+/// having been freshly resolved this run.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_three_level_pathless_chain() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+    client.get("/a/b/c").send().await.assert_ok();
+
+    // The same backup again. `A` and `B` are both completed, so `C`'s own
+    // parent lookup can lean on neither `created_ids` nor an exact
+    // `find_local` match.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 3 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the import must not have created a second, top-level `c`"
+    );
+}
+
 /// A file where two pages name each other as parent must not hang or crash
 /// the import, and must not create an actual cycle in the database.
 ///

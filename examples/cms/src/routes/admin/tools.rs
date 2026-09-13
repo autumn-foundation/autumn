@@ -721,37 +721,87 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
     })
 }
 
-/// The identity a marker should record for an imported row: the file's own
-/// slug, qualified by its resolved parent's real position.
+/// The identity a marker should record for an imported row: a stable
+/// identity built from the file's own declared structure, not from a
+/// parent's mutable current position.
 ///
-/// Not `identity(post)`. That string can be bare only because `path` was
-/// omitted — the same shape a genuinely top-level page's identity has. Two
-/// different pages can then compute the identical marker key. Only one keeps
-/// a place in the marker map; the other's own history is lost, so a retry
-/// can miss it, or an unrelated later import can match the wrong row.
+/// Not `identity(post)` alone. That string can be bare only because `path`
+/// was omitted — the same shape a genuinely top-level page's identity has.
+/// Two different pages can then compute the identical marker key. Only one
+/// keeps a place in the marker map; the other's own history is lost, so a
+/// retry can miss it, or an unrelated later import can match the wrong row.
 ///
-/// Qualifying by the parent's real `local_identity`, not by the file's own
-/// declared parent string, keeps the key correct even for a slug the
-/// allocator had to suffix: the file's own slug is what a retry recomputes
-/// too. It also keeps the key pointed at the same row even after an editor
-/// moves that row — the marker is about which *file entry* a row came from,
-/// not about where the row lives right now.
-async fn resolved_identity(
-    repos: &Repos,
-    post: &ExportPost,
+/// An explicit `path` is used verbatim: it is already fully qualified, and
+/// already what a retry recomputes. A pathless post is qualified by its
+/// *parent's own* stable identity instead — resolved through this same
+/// file, recursively, whenever the parent is also part of it, the same
+/// graph `file_depth` walks for sort order. Keying on the file's own
+/// structure, not on a parent's real, current `local_identity`, keeps a
+/// descendant's marker unaffected by an editor moving an ancestor between
+/// runs, and unaffected by the allocator suffixing an ancestor's slug.
+///
+/// Only when the parent is not part of this file — content this import does
+/// not itself declare — does this fall back to that parent's real, current
+/// position: the one signal available for content this importer does not
+/// track. `parent_now` is that fallback's input, and only ever applies at
+/// the top of the recursion, where the caller has already resolved it; a
+/// parent found one or more levels up the file's own chain has no such
+/// value computed for it, so a *second* external parent further up a
+/// legacy chain falls back to its own bare slug instead. Bounded by
+/// `MAX_PAGE_DEPTH` like every other ancestry walk in this module.
+fn stable_identity<'a>(
+    repos: &'a Repos,
+    posts: &'a [ExportPost],
+    by_identity: &'a std::collections::HashMap<(&str, String), usize>,
+    index: usize,
+    memo: &'a mut Vec<Option<String>>,
     parent_now: Option<i64>,
-) -> AutumnResult<String> {
-    let Some(parent_id) = parent_now else {
-        return Ok(post.slug.clone());
-    };
-    let Some(parent) = repos.posts.find_by_id(parent_id).await? else {
-        return Ok(post.slug.clone());
-    };
-    Ok(format!(
-        "{}/{}",
-        local_identity(repos, &parent).await?,
-        post.slug
-    ))
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<String>> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(cached) = &memo[index] {
+            return Ok(cached.clone());
+        }
+        let post = &posts[index];
+        let value = if let Some(path) = &post.path {
+            path.clone()
+        } else if depth > content::MAX_PAGE_DEPTH + 2 {
+            post.slug.clone()
+        } else if let Some(parent) = parent_identity(post) {
+            match by_identity.get(&(post.post_type.as_str(), parent)) {
+                Some(&parent_index) => {
+                    let parent_stable = stable_identity(
+                        repos,
+                        posts,
+                        by_identity,
+                        parent_index,
+                        memo,
+                        None,
+                        depth + 1,
+                    )
+                    .await?;
+                    format!("{parent_stable}/{}", post.slug)
+                }
+                None => match parent_now.map(|id| repos.posts.find_by_id(id)) {
+                    Some(query) => match query.await? {
+                        Some(parent_row) => {
+                            format!(
+                                "{}/{}",
+                                local_identity(repos, &parent_row).await?,
+                                post.slug
+                            )
+                        }
+                        None => post.slug.clone(),
+                    },
+                    None => post.slug.clone(),
+                },
+            }
+        } else {
+            post.slug.clone()
+        };
+        memo[index] = Some(value.clone());
+        Ok(value)
+    })
 }
 
 /// A stored post of `post_type` whose own identity matches, if there is one.
@@ -997,9 +1047,13 @@ pub async fn import(
     }
     let mut order: Vec<usize> = (0..payload.posts.len()).collect();
     order.sort_by_key(|&i| file_depth(&payload.posts, &by_identity, i));
-    let ordered: Vec<&ExportPost> = order.into_iter().map(|i| &payload.posts[i]).collect();
+    // `stable_identity`'s own memo, shared across every post this run
+    // resolves — including recursive lookups of an already-visited post as
+    // someone else's parent.
+    let mut stable_memo: Vec<Option<String>> = vec![None; payload.posts.len()];
 
-    for post in ordered {
+    for index in order {
+        let post = &payload.posts[index];
         // Idempotent on the slug *the file names*, not only on the slug the
         // row ended up with. Those differ whenever the allocator had to add a
         // suffix — an imported `about` landing as `about-2` because a post
@@ -1044,11 +1098,20 @@ pub async fn import(
             },
             None => None,
         };
-        // Looked up by `resolved_identity`, not the raw `file_identity` — see
+        // Looked up by `stable_identity`, not the raw `file_identity` — see
         // its own comment for why a bare identity cannot be trusted as a
         // marker key. Kept around: it is also what gets recorded below, if
         // this post turns out to be new.
-        let marker_identity = resolved_identity(&repos, post, parent_now).await?;
+        let marker_identity = stable_identity(
+            &repos,
+            &payload.posts,
+            &by_identity,
+            index,
+            &mut stable_memo,
+            parent_now,
+            0,
+        )
+        .await?;
         let marker_owned = match imported_source_slugs
             .get(&(post.post_type.clone(), marker_identity.clone()))
         {
