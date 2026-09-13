@@ -130,12 +130,21 @@ Time-boxed to one sitting (~1.5 hours wall clock, most of it a genuinely slow
 
 **Not reached this session** (candidates for a follow-up charter):
 
-- The `db` room-store backend (`DbRoomStore`) — needs Postgres, unavailable
-  in this sandbox. `docs/guide/media.md` claims parity with the in-memory
-  store ("both backends enforce the absolute 6-seat mesh ceiling and cap the
-  registry") and a "last-write-wins" cross-process reaper convergence claim
-  that is a strictly better differential-oracle target than anything
-  reachable against a single in-memory process.
+- The `db` room-store backend (`DbRoomStore`) — not attempted this session.
+  **Correction**: an earlier draft of this bullet said this needed Postgres
+  and was therefore unreachable without Docker; that's wrong.
+  `rooms_db.rs`'s own module doc and `docs/guide/media.md` both say the
+  backend is written portably against `RuntimeConnection`/`RuntimeBackend`
+  (Postgres by default, SQLite under `autumn-web/sqlite`) with no
+  Postgres-only SQL, so a SQLite file needs no Docker at all — a Codex
+  review on this PR correctly caught the misstatement. The real reason this
+  wasn't reached is simply that this session's time box went to the
+  in-memory store instead, not a missing dependency. `docs/guide/media.md`
+  claims parity with the in-memory store ("both backends enforce the
+  absolute 6-seat mesh ceiling and cap the registry") and a "last-write-wins"
+  cross-process reaper convergence claim that is a strictly better
+  differential-oracle target than anything reachable against a single
+  in-memory process.
 - `room_namespace` tenant isolation — the shipped example never sets one, so
   cross-namespace leakage (a namespace-A token used against a namespace-B
   room id) was read in code (fails closed by construction, keyed into the
@@ -175,10 +184,11 @@ Time-boxed to one sitting (~1.5 hours wall clock, most of it a genuinely slow
 
 ## Proposed next charters
 
-1. **`DbRoomStore` parity** — once Postgres is available in a session, repeat
-   this charter against the `db` room-store backend and specifically target
-   the documented cross-process "last-write-wins" reaper-convergence claim
-   with two app processes sharing one database.
+1. **`DbRoomStore` parity** — repeat this charter against the `db` room-store
+   backend, backed by SQLite (no Docker needed — see the correction above)
+   or Postgres, and specifically target the documented cross-process
+   "last-write-wins" reaper-convergence claim with two app processes sharing
+   one database file/instance.
 2. **Cross-namespace isolation, live** — configure two `room_namespace`
    values (or two plugin instances) and drive an explicit cross-namespace
    token-reuse attempt over HTTP, rather than relying on the code-level
