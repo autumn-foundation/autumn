@@ -68,9 +68,28 @@
 #      inline-code spelling prose uses (`autumn-storage-s3 = "0.7"`) — names the
 #      published release line, as `x.y` or the exact `x.y.z`.
 #
-#      Three spellings are easy to miss, and the first version of this gate
-#      missed all three — each a silent hole rather than a wrong answer, which
-#      is the one failure mode a drift gate cannot afford:
+#      HOW A PIN IS READ: a ```toml fence is a TOML document, so it is PARSED
+#      (`tomllib`) rather than matched; everything else — prose, a `text` fence
+#      reproducing a panic, an unlabelled block — has no document to parse and
+#      goes through the pattern. The two paths partition the page, so no pin is
+#      read twice, and a fence that does not parse is a fragment rather than a
+#      defect and falls back to the pattern rather than being skipped.
+#
+#      Parsing is not the obvious first choice for a docs gate, and it was not
+#      the first choice here. It is the answer to five review rounds in a row,
+#      three of which were the same finding wearing a different hat: the
+#      pattern did not know the `[dependencies.x]` subtable, then did not know
+#      TOML literal (single-quoted) strings, then did not know a
+#      `package = "…"` rename on a key not starting with `autumn`. Each was a
+#      silent hole, each had a fourth waiting behind it, and
+#      `check-docs-scope.sh` already records this repo shipping the identical
+#      mistake once — a manifest reader that took only double-quoted
+#      `readme = "…"`, so a single-quoted path resolved to nothing in all four
+#      gates that shared it. A TOML parser knows every spelling at once; a
+#      pattern learns them one review round at a time.
+#
+#      Two spellings still matter on the PATTERN path, since prose carries pins
+#      too, and the first version of this gate missed both:
 #
 #        - A Cargo COMPARISON OPERATOR. `autumn-web = "=0.6.0"` is the opening
 #          instruction of every migration guide ("Pin your current dependency …
@@ -85,13 +104,15 @@
 #          recovered from the match offset.
 #        - Cargo's SUBTABLE form, `[dependencies.autumn-web]` with a plain
 #          `version = "…"` some lines below. Neither half looks like a pin on
-#          its own. No `autumn*` subtable is in the corpus today, so this one
-#          closes a LATENT hole rather than a live defect — but the form is
-#          ordinary Cargo a page could adopt at any time, and `autumn-cli`'s
-#          `generate auth --mail` patcher exists because real projects write
-#          their dependency this way. A `package = "…"` rename inside the
-#          section names the real crate; without one, Cargo does not treat
-#          `autumn_web` as `autumn-web`, and neither does this.
+#          its own. The parser handles this inside a `toml` fence; the pattern
+#          keeps its own reader for the fragment fallback and for a subtable
+#          written outside one.
+#
+#      One rule spans both paths. Cargo does NOT treat `-` and `_` as
+#      interchangeable in a dependency table key, so `[dependencies.autumn_web]`
+#      names a crate called `autumn_web`, which does not exist, unless it
+#      carries an explicit `package = "autumn-web"`. Following Cargo rather
+#      than guessing is what keeps a correct page from being reported.
 #
 #   2. The published line is read from README.md's quickstart
 #      (`cargo install autumn-cli --version <x.y.z>`) — the same single source
@@ -622,21 +643,21 @@ def subtable_pins(body):
         yield lineno, crate, version.group(1)
 
 
-def pins(text):
-    """Yield (line_no, crate, version) for every pin a reader can see.
+def pattern_pins(body):
+    """Yield (line_no, crate, spec) for every pin a PATTERN can see.
 
-    Matched over the whole comment-blanked document rather than one line at a
-    time. An inline dependency table is routinely opened on one line and closed
+    Matched over the whole comment-blanked text rather than one line at a time.
+    An inline dependency table is routinely opened on one line and closed
     several later — `skills/autumn-web/SKILL.md` spells a nine-feature table
     that way — and a line-at-a-time reading skips those ENTIRELY: a silent hole
     in a gate whose whole purpose is not to have one. Line numbers are
     recovered from the match offset, so a defect still points at the line the
     pin opens on.
 
-    Cargo's subtable spelling is read by `subtable_pins`, since neither half of
-    it looks like a pin on its own.
+    This is the path for pins OUTSIDE a ```toml fence — prose, a `text` fence
+    reproducing a panic, an unlabelled block — where there is no TOML document
+    to parse. `toml` fences go through `fenced_toml_pins`.
     """
-    body = blank_comments(text)
     yield from subtable_pins(body)
     for match in PIN.finditer(body):
         spec = match.group(2)
@@ -655,6 +676,149 @@ def pins(text):
         # written by copying the pin off the page. `requirement()` is applied
         # again by the caller to compare it.
         yield body.count('\n', 0, match.start()) + 1, match.group(1), spec
+
+
+# A fence opener, with its language. Only ```toml blocks are handed to the TOML
+# parser; every other block stays on the pattern path.
+FENCE_MARK = re.compile(r'^[^\S\n]*(?P<mark>`{3,}|~{3,})[^\S\n]*'
+                        r'(?P<lang>[^\s`~]*)[^\S\n]*$')
+
+# The dependency tables Cargo reads a version out of.
+DEP_TABLES = ('dependencies', 'dev-dependencies', 'build-dependencies')
+
+
+def toml_fences(text):
+    """Yield (first_body_line, body) for every ```toml block, 1-based."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        opener = FENCE_MARK.match(lines[i])
+        if not opener:
+            i += 1
+            continue
+        mark = opener.group('mark')[0]
+        start = i + 1
+        end = start
+        while end < len(lines) and not lines[end].strip().startswith(mark * 3):
+            end += 1
+        if opener.group('lang').lower() == 'toml':
+            yield start + 1, '\n'.join(lines[start:end])
+        i = end + 1
+
+
+def _dependency_tables(doc):
+    """Every dependency table in a parsed manifest fragment."""
+    out = []
+    for name in DEP_TABLES:
+        table = doc.get(name)
+        if isinstance(table, dict):
+            out.append(table)
+    target = doc.get('target')
+    if isinstance(target, dict):
+        for cfg in target.values():
+            if isinstance(cfg, dict):
+                for name in DEP_TABLES:
+                    table = cfg.get(name)
+                    if isinstance(table, dict):
+                        out.append(table)
+    # A fence that IS a dependency table body with the `[dependencies]` header
+    # left off — which is how most snippets in this corpus are written.
+    out.append(doc)
+    return out
+
+
+def _declared(table):
+    """Yield (key, crate, spec) for each dependency that names a version."""
+    for key, value in table.items():
+        if isinstance(value, str):
+            yield key, key, value
+        elif isinstance(value, dict):
+            version = value.get('version')
+            if isinstance(version, str):
+                # `package = "…"` renames the dependency: the table KEY can be
+                # anything, and the crate it really pins is the rename. Cargo
+                # resolves it this way in an inline table and a subtable alike.
+                package = value.get('package')
+                yield key, package if isinstance(package, str) else key, version
+
+
+def _pin_line(body_lines, key, spec):
+    """Where inside a fence this pin is written, as a 0-based offset.
+
+    `tomllib` reports no positions, so the line is recovered by looking for the
+    dependency's key and then the version literal at or below it. That covers
+    the inline form (both on one line), the multiline table (key on the opening
+    line) and the subtable (key in the header, version below).
+    """
+    declared = next((i for i, line in enumerate(body_lines) if key in line), 0)
+    quoted = (f'"{spec}"', f"'{spec}'")
+    return next((i for i in range(declared, len(body_lines))
+                 if any(q in body_lines[i] for q in quoted)), declared)
+
+
+def fenced_toml_pins(body):
+    """Yield (line_no, crate, spec) from every ```toml block, parsed as TOML.
+
+    `tomllib` rather than a pattern, because the thing a pattern approximates
+    here IS a TOML parser, and three review rounds in a row each found another
+    spelling it did not know: the `[dependencies.x]` subtable, literal
+    (single-quoted) strings, and `package = "…"` renames on a key that does not
+    start with `autumn`. `check-docs-scope.sh` records this repo shipping the
+    same mistake once already — a manifest reader that took only double-quoted
+    `readme = "…"`, so a single-quoted path resolved to nothing in all four
+    gates that shared it. Parsing ends the class instead of adding a fourth
+    special case to a pattern that will have a fifth.
+
+    A fence that does not parse is a FRAGMENT, not a defect — an elided `…`, a
+    slice of a larger file, a deliberate syntax error being described — so it
+    falls back to the pattern rather than being skipped. Skipping would be a
+    silent hole of exactly the kind this gate exists to prevent.
+    """
+    for first_line, fence in toml_fences(body):
+        try:
+            doc = tomllib.loads(fence)
+        except (tomllib.TOMLDecodeError, ValueError, TypeError):
+            for lineno, crate, spec in pattern_pins(fence):
+                yield first_line + lineno - 1, crate, spec
+            continue
+        fence_lines = fence.splitlines()
+        seen = set()
+        for table in _dependency_tables(doc):
+            for key, crate, spec in _declared(table):
+                if requirement(spec) is None or (key, crate, spec) in seen:
+                    continue
+                seen.add((key, crate, spec))
+                yield (first_line + _pin_line(fence_lines, key, spec),
+                       crate, spec)
+
+
+def mask_toml_fences(text):
+    """Blank every ```toml body, preserving line numbers.
+
+    The parser owns those blocks. Leaving them visible to the pattern as well
+    would report every pin in them twice.
+    """
+    lines = text.splitlines(keepends=True)
+    for first_line, fence in toml_fences(text):
+        for offset in range(len(fence.splitlines())):
+            index = first_line - 1 + offset
+            if index < len(lines):
+                lines[index] = re.sub(r'[^\n]', ' ', lines[index])
+    return ''.join(lines)
+
+
+def pins(text):
+    """Yield (line_no, crate, spec) for every pin a reader can see.
+
+    Two paths over one page, partitioned so nothing is read twice: a ```toml
+    fence is a TOML document and is parsed as one; everything else — prose, a
+    `text` fence, an unlabelled block — has no document to parse and stays on
+    the pattern.
+    """
+    body = blank_comments(text)
+    found = list(fenced_toml_pins(body))
+    found.extend(pattern_pins(mask_toml_fences(body)))
+    return sorted(found)
 
 
 # A migration guide's own release line, from its filename: `0.4.0.md` -> 0.4.0.
@@ -925,6 +1089,41 @@ def self_test():
                      '\n[package]\nversion = "0.5"\n')), [])
     expect('subtable with no version pins nothing',
            list(pins('[dependencies.autumn-web]\npath = "../autumn"\n')), [])
+
+    # ---- the ```toml path, which is parsed rather than matched ----
+    def fenced(*body):
+        return '```toml\n' + '\n'.join(body) + '\n```\n'
+
+    # TOML literal (single-quoted) strings are as valid as basic ones. A
+    # double-quote-only reader shipped in this repo once already; see
+    # `check-docs-scope.sh` on `readme = 'README.md'`.
+    expect('literal string pin', list(pins(fenced("autumn-web = '0.5'"))),
+           [(2, 'autumn-web', '0.5')])
+    expect('literal string in an inline table',
+           list(pins(fenced("autumn-web = { version = '0.5' }"))),
+           [(2, 'autumn-web', '0.5')])
+    # A `package = "…"` rename on a key that does not start with `autumn`
+    # still pins autumn-web, in an inline table exactly as in a subtable.
+    expect('inline table rename resolves the crate',
+           list(pins(fenced('web = { package = "autumn-web", '
+                            'version = "0.5" }'))),
+           [(2, 'autumn-web', '0.5')])
+    expect('parsed dev-dependencies table',
+           list(pins(fenced('[dev-dependencies]', 'autumn-web = "0.5"'))),
+           [(3, 'autumn-web', '0.5')])
+    # A pin must be reported ONCE, not by both paths.
+    expect('toml fence is not double-read',
+           list(pins(fenced('autumn-web = "0.5"'))),
+           [(2, 'autumn-web', '0.5')])
+    # A fence that is a FRAGMENT does not parse. Falling back to the pattern is
+    # what keeps that from becoming a silent hole.
+    fragment = fenced('[dependencies]', 'autumn-web = "0.5"', '# …', 'oops =')
+    expect('unparseable fence falls back to the pattern',
+           list(pins(fragment)), [(3, 'autumn-web', '0.5')])
+    # A non-toml fence has no document to parse and stays on the pattern.
+    expect('text fence stays on the pattern',
+           list(pins('```text\nautumn-web = "0.6"\n```\n')),
+           [(2, 'autumn-web', '0.6')])
     # A longer crate name must not be read as a pin on a shorter one.
     expect('no prefix bleed', list(pins('bench-autumn-web = "0.1"')), [])
     # A comment renders as nothing, so it carries no pin a reader can paste.
