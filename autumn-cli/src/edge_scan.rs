@@ -615,8 +615,14 @@ fn resolve_edge_scan_impl(
     if let Some(lib_path) = &custom_lib_path {
         let lib_file = project_root.join(lib_path);
         if lib_file.is_file() {
-            let (touched, _aliased) =
-                scan_bin_crate_tree(&lib_file, project_root, "", &default_features, &mut scan);
+            let (touched, _aliased) = scan_bin_crate_tree(
+                &lib_file,
+                project_root,
+                "",
+                Vec::new(),
+                &default_features,
+                &mut scan,
+            );
             claimed.extend(touched);
         }
     }
@@ -642,6 +648,7 @@ fn resolve_edge_scan_impl(
             file,
             project_root,
             "bin:edge-capsule",
+            Vec::new(),
             &default_features,
             &mut scan,
         );
@@ -694,10 +701,14 @@ fn resolve_edge_scan_impl(
     // (`#[path = "../routes.rs"] mod handlers;` in `src/lib.rs` compiles a
     // file the ordinary, `src/`-only walk above never reaches) — verified
     // directly via a real build. `path_attribute_module_paths` already
-    // recorded its identity; read and scan it directly here, once per
-    // recorded identity the same way an in-`src/` override target already
-    // is above, since it was never in `files`/`sources` to begin with
-    // (Codex review on #2739, round 40, P1).
+    // recorded its identity; scan it, and any of ITS OWN further out-of-line
+    // children (`pub mod child;` inside that same outside file resolves
+    // beside it, never back under `src/`), by reusing `scan_bin_crate_tree`'s
+    // BFS with the already-recorded identity as its starting module path,
+    // once per recorded identity the same way an in-`src/` override target
+    // already is above, since it was never in `files`/`sources` to begin
+    // with (Codex review on #2739, round 40, P1; descendant traversal added
+    // round 45, P1).
     for (target_rel, identities) in &path_overrides {
         if sources_rel.contains(target_rel.as_str()) {
             continue;
@@ -706,20 +717,17 @@ fn resolve_edge_scan_impl(
         if claimed.contains(&target_path) {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&target_path) else {
-            continue;
-        };
         for (crate_root, module_path) in identities {
-            scan_source_with_context(
-                target_rel,
-                &src,
+            let (touched, _aliased) = scan_bin_crate_tree(
+                &target_path,
+                project_root,
                 crate_root,
                 module_path.clone(),
                 &default_features,
                 &mut scan,
             );
+            claimed.extend(touched);
         }
-        scan.files_scanned += 1;
     }
     scan
 }
@@ -2359,10 +2367,19 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
 /// out-of-line submodules, which that heuristic cannot tell apart from an
 /// unrelated second flat bin file in the same directory (Codex review on
 /// #2739, round 22, P2).
+///
+/// `initial_module_path` seeds `root_file`'s own logical module path —
+/// empty for a real crate root (a custom `[lib]`/`[[bin]] path`), but
+/// non-empty when this same BFS machinery is reused to recursively follow
+/// an EXTERNAL `#[path]` override target's own further out-of-line
+/// children from the ordinary `src/` walk: that target's already-recorded
+/// identity (from `path_attribute_module_paths`) becomes the starting
+/// point instead of an empty path (Codex review on #2739, round 45, P1).
 fn scan_bin_crate_tree(
     root_file: &Path,
     project_root: &Path,
     crate_root: &str,
+    initial_module_path: Vec<String>,
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
@@ -2422,7 +2439,7 @@ fn scan_bin_crate_tree(
         std::collections::VecDeque::new();
     queue.push_back((
         root_file.to_path_buf(),
-        Vec::new(),
+        initial_module_path,
         vec![root_file.to_path_buf()],
         root_dir.to_path_buf(),
     ));
@@ -3252,7 +3269,25 @@ fn skip_cfg_excluded_statement(
                 angle_depth = angle_depth.saturating_sub(1);
                 i += 1;
             }
-            TokenTree::Punct(p) if p.as_char() == ';' || p.as_char() == ',' => {
+            // A `;` always ends the statement regardless of `angle_depth`,
+            // unlike a comma: a genuine top-level `;` can never actually
+            // occur while a real generic argument list is still open at
+            // this flat scan depth (the only place a semicolon legitimately
+            // appears inside `<...>` is a const-generic block expression,
+            // e.g. `Foo<{ let x = 1; x }>`, and that block's own braces make
+            // it one opaque Group token here, never reached). Without this,
+            // a comparison/shift operator with no matching partner (`1 <
+            // 2`) left `angle_depth` permanently elevated, so the scan ran
+            // straight past the statement's real semicolon into a
+            // following, unrelated, still-active statement — verified
+            // directly via a real build that `#[cfg(false)] let disabled =
+            // 1 < 2;` compiles fine, dropping the whole statement (Codex
+            // review on #2739, round 45, P2).
+            TokenTree::Punct(p) if p.as_char() == ';' => {
+                i += 1;
+                break;
+            }
+            TokenTree::Punct(p) if p.as_char() == ',' => {
                 i += 1;
                 if angle_depth == 0 {
                     break;
@@ -8376,6 +8411,51 @@ mod tests {
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
+    /// An external `#[path]` target can itself declare further out-of-line
+    /// children (`pub mod child;` inside `outside/shared.rs`, resolving to
+    /// the sibling `outside/child.rs`) — verified directly via a real build,
+    /// where `handlers::child::show` compiles from exactly this layout. The
+    /// external-path loop previously read and scanned only the target file
+    /// itself with a flat `scan_source_with_context` call, never following
+    /// its own further declarations, so a handler defined one level deeper
+    /// than the `#[path]` target was invisible to the whole scan (Codex
+    /// review on #2739, round 45, P1).
+    #[test]
+    fn resolve_edge_scan_follows_a_path_attributes_targets_own_child_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            #[path = "../outside/shared.rs"]
+            mod handlers;
+            fn wire() { edge_routes![crate::handlers::child::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("outside/shared.rs"), "pub mod child;\n").unwrap();
+        std::fs::write(
+            dir.path().join("outside/child.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "outside/child.rs");
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["handlers".to_string(), "child".to_string()]
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
     /// The same file can be `#[path]`-included under two different module
     /// names — `#[path = "shared.rs"] mod a;` and `#[path = "shared.rs"]
     /// mod b;` both compile `shared.rs`, once per name — verified directly
@@ -8892,6 +8972,44 @@ mod tests {
         );
         assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
         assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// An ordinary comparison operator with no matching partner (`1 < 2`)
+    /// leaves the fallback's `angle_depth` counter elevated forever, since
+    /// nothing in an ordinary boolean expression ever supplies the closing
+    /// `>` half — verified directly via a real build: `#[cfg(false)] let
+    /// disabled = 1 < 2;` compiles fine, dropping the whole statement, and a
+    /// following ACTIVE statement compiles as its own, separate statement.
+    /// The round-44 angle-depth fix made the fallback's `;` case share the
+    /// same `angle_depth == 0` guard as its `,` case, so a `<` with no
+    /// matching `>` left the scan unable to ever recognize a genuine
+    /// terminating `;` again, running straight through the excluded
+    /// statement's own semicolon into a later, unrelated, still-active
+    /// `edge_routes![show];` and crediting it as part of the excluded
+    /// statement (Codex review on #2739, round 45, P2).
+    #[test]
+    fn cfg_false_let_with_unmatched_comparison_operator_does_not_swallow_the_next_statement() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire() {
+                #[cfg(feature = "premium")]
+                let disabled = 1 < 2;
+                edge_routes![crate::show];
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
     /// An async block used in the condition or scrutinee (`if async {
