@@ -1043,7 +1043,11 @@ FENCE_MARK = re.compile(r'^[^\S\n]*(?P<mark>`{3,}|~{3,})[^\S\n]*'
 
 
 def fence_opener(line):
-    """A fence opener as (fence character, info string), or None.
+    """A fence opener as (marker run, info string), or None.
+
+    The marker is returned WHOLE rather than as its character, because its
+    length is part of the fence: a closer must be at least as long as the
+    opener it closes. `fence_closes` needs both.
 
     CommonMark restricts the info string of a BACKTICK fence only, and only as
     to backticks: ```` ```lang`x` ```` would be ambiguous with inline code. A
@@ -1060,10 +1064,38 @@ def fence_opener(line):
     match = FENCE_MARK.match(line)
     if match is None:
         return None
-    mark, info = match['mark'][0], match['info']
-    if mark == '`' and '`' in info:
+    run, info = match['mark'], match['info']
+    if run[0] == '`' and '`' in info:
         return None
-    return mark, info
+    return run, info
+
+
+def fence_closes(line, run):
+    """Does LINE close a fence opened by RUN?
+
+    CommonMark: a closing fence is a run of the SAME character, AT LEAST AS
+    LONG as the opener, followed by nothing but whitespace. Both halves matter
+    here, and neither was enforced:
+
+      * A shorter run does not close a longer fence. Inside a ```` ````toml ````
+        block, a ```` ``` ```` line is content.
+      * A run carrying an info string closes nothing. Inside a ```` ```toml ````
+        block — a multiline string holding a snippet, say — a ```` ```rust ````
+        line is content too.
+
+    Treating either as a closer ends the fence early, and the rest of the TOML
+    then goes to the pattern path, where a `[patch.crates-io]` entry below the
+    split is reported against the exemption this gate documents: a false CI
+    failure on a page doing nothing wrong.
+
+    Indentation is NOT held to CommonMark's three-space limit, deliberately.
+    This scanner is flat rather than container-aware, and an opener is already
+    matched at any indentation, so a fence nested in a list item must be able
+    to close at the same depth its opener sat at.
+    """
+    stripped = line.strip()
+    length = len(stripped) - len(stripped.lstrip(run[0]))
+    return length >= len(run) and not stripped[length:].strip()
 
 
 def fence_language(info):
@@ -1096,10 +1128,10 @@ def toml_fences(text):
         if opener is None:
             i += 1
             continue
-        mark, info = opener
+        run, info = opener
         start = i + 1
         end = start
-        while end < len(lines) and not lines[end].strip().startswith(mark * 3):
+        while end < len(lines) and not fence_closes(lines[end], run):
             end += 1
         if fence_language(info) == 'toml':
             yield start + 1, '\n'.join(lines[start:end])
@@ -1689,7 +1721,7 @@ def self_test():
     # reopened the hole above, one character over.
     expect('tilde in a backtick info string is still an opener',
            fence_opener('```toml title="~/Cargo.toml"'),
-           ('`', 'toml title="~/Cargo.toml"'))
+           ('```', 'toml title="~/Cargo.toml"'))
     expect('tilde-annotated toml fence is parsed',
            list(pins('```toml title="~/Cargo.toml"\n[dependencies]\n'
                      'autumn-web = "0.5"\n```\n')),
@@ -1707,10 +1739,43 @@ def self_test():
     # A TILDE fence carries no such restriction, on either character.
     expect('tilde fence info string takes both characters',
            fence_opener('~~~toml title="`~/Cargo.toml`"'),
-           ('~', 'toml title="`~/Cargo.toml`"'))
+           ('~~~', 'toml title="`~/Cargo.toml`"'))
     expect('tilde-fenced toml is parsed',
            list(pins('~~~toml\n[dependencies]\nautumn-web = "0.5"\n~~~\n')),
            [(3, 'autumn-web', '0.5')])
+
+    # ---- fence CLOSERS: same character, no shorter, nothing but whitespace ----
+    expect('a plain closer closes', fence_closes('```', '```'), True)
+    expect('a longer closer closes', fence_closes('`````', '```'), True)
+    expect('a shorter run does not close a longer fence',
+           fence_closes('```', '````'), False)
+    expect('a closer may not carry an info string',
+           fence_closes('```rust', '```'), False)
+    expect('a closer may not carry anything else',
+           fence_closes('``` and then some prose', '```'), False)
+    expect('the other fence character does not close',
+           fence_closes('~~~', '```'), False)
+    expect('a closer may be indented', fence_closes('    ```', '```'), True)
+    # The consequence, and why this is a FALSE FAILURE rather than a miss: a
+    # line that is not a closer ended the block anyway, so the TOML below the
+    # split went to the pattern path — which does not know the patch exemption.
+    expect('a nested fence line does not split a toml block',
+           list(pins('```toml\n[deps]\nx = """\n```rust\n"""\n\n'
+                     '[patch.crates-io]\n'
+                     'autumn-web = { path = "../fork", version = "0.5" }\n'
+                     '```\n')),
+           [])
+    expect('a short run does not split a longer toml block',
+           list(pins('````toml\n[patch.crates-io]\n'
+                     'autumn-web = { path = "../fork", version = "0.5" }\n'
+                     'note = """\n```\n"""\n````\n')),
+           [])
+    # …and a block that legitimately ends still ends: the pin AFTER a real
+    # closer is prose, and must not be swallowed into the fence.
+    expect('a real closer still ends the block',
+           list(pins('```toml\n[dependencies]\nautumn-web = "0.5"\n```\n\n'
+                     'Then in prose, autumn-web = "0.6" is mentioned.\n')),
+           [(3, 'autumn-web', '0.5'), (6, 'autumn-web', '0.6')])
 
     # ---- the surface line survives a README pin that is not a version ----
     # `series()` raises without two numeric components, and this line printed
