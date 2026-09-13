@@ -451,7 +451,12 @@ async fn seed_one_col(conn: &mut AsyncPgConnection, table: &str, column: &str, v
     .id
 }
 
-async fn seed_tenanted(conn: &mut AsyncPgConnection, table: &str, tenant: &str, title: &str) -> i64 {
+async fn seed_tenanted(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    tenant: &str,
+    title: &str,
+) -> i64 {
     diesel::sql_query(format!(
         "INSERT INTO {table} (tenant_id, title) VALUES ($1, $2) RETURNING id"
     ))
@@ -563,7 +568,10 @@ fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() 
         "a plain repository must not scope on a denormalized tenant_id column"
     );
     // `CmtTenanted` is the correctly-configured case: still scoped.
-    assert!(model_requires_tenant(core::any::type_name::<CmtTenanted>(), true));
+    assert!(model_requires_tenant(
+        core::any::type_name::<CmtTenanted>(),
+        true
+    ));
 
     // `CmtAuditSoft` carries `deleted_at`, but its repository is plain: the
     // column is audit history, not a tombstone.
@@ -1400,7 +1408,10 @@ async fn router_ignores_a_denormalized_tenant_column_with_no_tenant_context() {
 
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
     let (status, body) = call(app, get(&format!("/comments/CmtDenormTenant/{target}"))).await;
-    assert_eq!(status, 200, "a denormalized tenant column must not 500: {body}");
+    assert_eq!(
+        status, 200,
+        "a denormalized tenant column must not 500: {body}"
+    );
 }
 
 /// The flip side of the test above, so the fix cannot be read as "the router
@@ -1440,7 +1451,10 @@ async fn router_serves_a_parent_whose_deleted_at_is_only_an_audit_trail() {
 
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
     let (status, body) = call(app, get(&format!("/comments/CmtAuditSoft/{target}"))).await;
-    assert_eq!(status, 200, "an audit `deleted_at` must not hide the row: {body}");
+    assert_eq!(
+        status, 200,
+        "an audit `deleted_at` must not hide the row: {body}"
+    );
 }
 
 /// The flip side: a genuinely soft-deleting model still reports no thread —
