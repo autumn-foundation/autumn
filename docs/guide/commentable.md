@@ -117,10 +117,12 @@ CREATE TRIGGER posts_delete_comments
     EXECUTE FUNCTION comments_delete_for_parent('Post');
 ```
 
-This runs for **every** delete of a `posts` row: through the repository, a
-raw `DELETE`, or an admin tool. It only fires on a **hard** delete. A model
-with `soft_delete` never removes the parent row. So the trigger never runs
-for it. `add_comment`'s own check already refuses a soft-deleted parent.
+This runs for **every** hard delete of a `posts` row: through the
+repository, a raw `DELETE`, or an admin tool. An ordinary soft delete does
+not fire it — the row is only marked deleted, not removed. `add_comment`'s
+own check already refuses a soft-deleted parent. A later `purge`, though,
+issues a real hard `DELETE`. It fires the trigger, and the parent's
+comments go with it.
 
 A hand-written `#[commentable]` model gets no trigger for free. Write your
 own trigger. Match it to the model's `type_name` and comments table.
