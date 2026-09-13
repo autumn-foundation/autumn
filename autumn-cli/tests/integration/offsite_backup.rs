@@ -193,6 +193,7 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
@@ -207,7 +208,13 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
+    // `testcontainers-modules` 0.15's `MinIO::default()` pulls from Docker
+    // Hub's `minio/minio`, which MinIO has retired — the repository itself
+    // now 404s. `quay.io/minio/minio` is MinIO's current registry and still
+    // serves this exact tag, so this repoints the pull without changing
+    // anything about the image itself.
     let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
         .start()
         .await
         .expect("start MinIO — is Docker running?");
@@ -316,6 +323,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
@@ -330,7 +338,10 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
+    // See the sibling test above: `minio/minio` on Docker Hub is retired,
+    // `quay.io/minio/minio` is the live mirror of the same tag.
     let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
         .start()
         .await
         .expect("start MinIO — is Docker running?");
