@@ -875,9 +875,27 @@ impl syn::parse::Parse for TargetCfgPredicate {
         if ident == "debug_assertions" {
             return Ok(Self::Leaf(true));
         }
-        // `target_env`, `target_pointer_width`, ... as a bare identifier
-        // (not `key = "value"`) — not part of the resolvable grammar
-        // either; the caller treats all of these as "does not match."
+        // Any OTHER bare identifier (no `= "value"` following) is a custom
+        // or unrecognized cfg flag this scan has no value table for — and
+        // verified directly (`cargo tree --target wasm32-wasip1` on
+        // `[target.'cfg(not(my_custom_flag))'.dependencies]` includes the
+        // dependency; the same manifest with the bare, un-negated
+        // `cfg(my_custom_flag)` does not) that Cargo treats an unknown bare
+        // flag as simply absent — false, not "unparseable." Previously this
+        // fell through to a parse `Err`, which fails the WHOLE enclosing
+        // predicate (not just this leaf): `not(my_custom_flag)`, really
+        // true since Cargo doesn't know an absent flag as anything but
+        // false, evaluated as unresolvable-so-false instead — the same
+        // class of mistake round 19 already fixed for
+        // `target_has_atomic`'s bare form specifically, now generalized to
+        // every OTHER unknown bare flag too (Codex review on #2739, round
+        // 26, P1).
+        if !input.peek(syn::Token![=]) {
+            return Ok(Self::Leaf(false));
+        }
+        // A `key = "value"` pair this scan does not recognize the key
+        // for — not part of the resolvable grammar either; the caller
+        // treats the whole predicate as "does not match."
         Err(input.error("target cfg predicate not resolvable by this scan"))
     }
 }
@@ -4135,6 +4153,46 @@ mod tests {
         "#;
         let enabled = enabled_features_from_manifest(manifest, &[]);
         assert!(enabled.contains("dep"));
+    }
+
+    /// A custom/unrecognized bare cfg flag this scan has no value table for
+    /// (not `windows`/`unix`/`debug_assertions`, not a known `key =
+    /// "value"` key in bare form) must still compose correctly under
+    /// `not(...)` — verified directly (`cargo tree --target wasm32-wasip1`
+    /// on this exact manifest includes the dependency; the bare,
+    /// un-negated form of the same predicate does not): Cargo treats an
+    /// unknown bare flag as simply absent for the target, not as
+    /// "unparseable." Previously this fell through to a parse `Err`, which
+    /// fails the WHOLE enclosing `not(...)` (not just the leaf), evaluating
+    /// as unresolvable-so-false instead of the real true (Codex review on
+    /// #2739, round 26, P1).
+    #[test]
+    fn a_not_unknown_bare_flag_target_specific_dependency_also_enables_the_dependency() {
+        let manifest = r#"
+            [target.'cfg(not(my_custom_flag))'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(enabled.contains("dep"), "{enabled:?}");
+    }
+
+    /// The un-negated mirror: a bare unknown flag alone is false, so the
+    /// dependency stays disabled — confirming this is genuine "absent, not
+    /// unparseable" semantics, not "any unknown bare flag matches."
+    #[test]
+    fn an_unknown_bare_flag_target_specific_dependency_is_not_enabled() {
+        let manifest = r#"
+            [target.'cfg(my_custom_flag)'.dependencies]
+            dep = { version = "1", optional = true }
+
+            [features]
+            default = ["dep/extra"]
+        "#;
+        let enabled = enabled_features_from_manifest(manifest, &[]);
+        assert!(!enabled.contains("dep"), "{enabled:?}");
     }
 
     // --- lexically_normalize_path ---
