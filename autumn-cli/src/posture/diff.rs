@@ -891,8 +891,37 @@ fn segments_overlap(a: &str, b: &str) -> bool {
     // and not `/other.json`.
     let (a_prefix, a_suffix) = literal_edges(a);
     let (b_prefix, b_suffix) = literal_edges(b);
-    (a_prefix.starts_with(b_prefix) || b_prefix.starts_with(a_prefix))
-        && (a_suffix.ends_with(b_suffix) || b_suffix.ends_with(a_suffix))
+    if !(a_prefix.starts_with(b_prefix) || b_prefix.starts_with(a_prefix)) {
+        return false;
+    }
+    if !(a_suffix.ends_with(b_suffix) || b_suffix.ends_with(a_suffix)) {
+        return false;
+    }
+    // A capture must consume at least one character — matchit 404s otherwise —
+    // so a segment with L literal characters and n captures only matches text
+    // of length >= L + n. A concrete segment shorter than the other's minimum
+    // can share nothing with it: `/file.{ext}` never serves `/file.`, so the
+    // old edge-only check invented a shadow there. The same comparison keeps
+    // the two required edges from overlapping inside a concrete segment, since
+    // L + n already covers both edge lengths. (#2499)
+    if !a.contains(CAPTURE) && min_match_len(b) > a.chars().count() {
+        return false;
+    }
+    if !b.contains(CAPTURE) && min_match_len(a) > b.chars().count() {
+        return false;
+    }
+    true
+}
+
+/// The fewest characters a normalized segment can match.
+///
+/// Normalization collapses each capture to a single `CAPTURE` character, and
+/// matchit requires every capture to consume at least one character — so the
+/// minimum is the segment's own length: L literal characters plus n captures
+/// match only text of length >= L + n. (Callers screen out catch-alls before
+/// this predicate runs, so every character here is a literal or a capture.)
+fn min_match_len(segment: &str) -> usize {
+    segment.chars().count()
 }
 
 /// The literal text before the first capture and after the last one. A segment
@@ -4133,6 +4162,49 @@ mod tests {
         let widening = widening(&findings);
         assert_eq!(widening.len(), 1, "{findings:#?}");
         assert_eq!(widening[0].kind, "route_shadow_exposed");
+    }
+
+    /// A capture must consume at least one character: `/file.{ext}` never
+    /// serves `/file.` — matchit 404s there — so the two segments do not
+    /// overlap, while `/file.json` still does. (#2499)
+    #[test]
+    fn a_capture_must_consume_a_character_so_a_bare_prefix_does_not_overlap() {
+        let ext = normalize_captures("file.{ext}");
+        assert!(!segments_overlap(&ext, "file."));
+        assert!(!segments_overlap("file.", &ext));
+        assert!(segments_overlap(&ext, "file.json"));
+        assert!(segments_overlap("file.json", &ext));
+    }
+
+    /// The same minimum-length rule flows through `intersect` and `covers`:
+    /// `/file.{ext}` and `/file.` share no URL, while `/file.json` is inside
+    /// the capture's range. (#2499)
+    #[test]
+    fn the_capture_minimum_length_reaches_intersect_and_covers() {
+        let ext = normalize_captures("/file.{ext}");
+        assert_eq!(intersect(&ext, "/file."), None);
+        assert_eq!(intersect("/file.", &ext), None);
+        assert!(intersect(&ext, "/file.json").is_some());
+        assert!(!covers(&ext, "/file."));
+        assert!(covers(&ext, "/file.json"));
+    }
+
+    /// Deleting a guarded `/file.` beside a public `/file.{ext}` is not a
+    /// shadow exposure: a request for `/file.` 404s against `/file.{ext}`
+    /// because the capture must consume a character, so the survivor inherits
+    /// no URL the deleted route served. (#2499)
+    #[test]
+    fn deleting_a_guarded_bare_prefix_beside_a_public_capture_is_not_a_shadow() {
+        let survivor = route("/file.{ext}", "GET", "public", &[], &[], false);
+        let removed = route("/file.", "GET", "gated", &["user"], &[], false);
+        let base = routes_only(&format!("{survivor},{removed}"));
+        let head = routes_only(&survivor);
+
+        let findings = diff(&base, &head);
+        assert!(
+            !findings.iter().any(|f| f.kind == "route_shadow_exposed"),
+            "a capture cannot serve the bare prefix: {findings:#?}"
+        );
     }
 
     /// A route's declared method is not the set of requests it answers: the
