@@ -1415,11 +1415,11 @@ async fn router_renders_the_thread_for_any_registered_model() {
     assert!(!body.contains("<form"), "{body}");
 }
 
-/// Issue #2263's sharpest reproduction: `CmtDenormTenant` carries a
+/// Issue #2263's router-level reproduction: `CmtDenormTenant` carries a
 /// `tenant_id` column, but its repository never declares `tenant_scoped`. The
-/// router is mounted with **no tenancy middleware at all** — before this
-/// fix, that combination 500'd on every request. Both a read and a write must
-/// succeed instead.
+/// router is mounted with **no tenancy middleware at all**. This end-to-end
+/// shape had no coverage before this change; both a read and a write must
+/// succeed with no tenant context anywhere in the request.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn router_serves_a_denormalized_tenant_column_with_no_tenancy_middleware() {

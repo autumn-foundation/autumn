@@ -335,9 +335,9 @@ tenant-scoped.
 (see "Why `commentable_id` has no foreign key" above) — but only when the
 parent's own repository opts into `#[repository(…, soft_delete)]`. A
 `deleted_at` column with no such repository is audit history, not a
-tombstone: the row stays fully commentable, exactly as the repository's own
-finders would still return it. As with tenancy, the repository's opt-in
-decides — never the column's presence alone.
+tombstone. The row stays commentable. The repository's own finders still
+return it. As with tenancy, the repository's opt-in decides — never the
+column's presence alone.
 
 ## What this deliberately does not do
 
