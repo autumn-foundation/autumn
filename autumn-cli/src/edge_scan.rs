@@ -126,7 +126,7 @@
 //! capsule step is skipped (the native build is unaffected), and a missed
 //! registration means at most a warning that names the function.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
@@ -549,6 +549,15 @@ fn resolve_edge_scan_impl(
     // across platforms and filesystem orderings.
     files.sort();
 
+    // A `#[path = "..."]` override on an out-of-line `mod name;` redirects
+    // which FILE backs the module without changing the module's own real
+    // name/path — real Rust still resolves `name::show` (never a name
+    // derived from the file), so this scan's ordinary directory-walk guess
+    // (`crate_context_from_file`, which assumes file path mirrors module
+    // path) needs to be corrected for exactly these files (Codex review on
+    // #2739, round 31, P2).
+    let path_overrides = path_attribute_module_paths(project_root, &default_features);
+
     // Read first, scan second, so the filesystem half and the pure half stay
     // separable: `scan_sources` is the same entry point the unit tests drive
     // with inline sources. An unreadable file is skipped, like the sibling
@@ -568,7 +577,18 @@ fn resolve_edge_scan_impl(
         .collect();
 
     for (rel, src) in &sources {
-        scan_source(rel, src, &default_features, &mut scan);
+        if let Some((crate_root, module_path)) = path_overrides.get(rel.as_str()) {
+            scan_source_with_context(
+                rel,
+                src,
+                crate_root,
+                module_path.clone(),
+                &default_features,
+                &mut scan,
+            );
+        } else {
+            scan_source(rel, src, &default_features, &mut scan);
+        }
     }
     scan.files_scanned += sources.len();
     scan
@@ -1512,11 +1532,20 @@ fn scan_source_with_context(
 /// function, not an unresolved one, so `is_registered` no longer treats it
 /// as a wildcard either (Codex review on #2739, round 3, P2).
 ///
-/// A non-standard layout (`#[path = "..."]`, e.g.) can make this wrong, like
-/// every other heuristic in this best-effort scanner — see the module doc's
-/// "Recognition limits". A wrong prefix can only ever produce an extra
-/// false-positive "unregistered" warning, never a missed one: this scanner's
-/// documented safe direction.
+/// A non-standard layout can still make this wrong for a shape this scan
+/// does not resolve — a directory-style out-of-line submodule this scan
+/// cannot find at all, e.g. — the same accepted "best-effort, not a build
+/// system" trade-off as every other heuristic here: a wrong prefix produces
+/// an extra false-positive "unregistered" warning, never a missed one. A
+/// `#[path = "..."]` override specifically is corrected BEFORE reaching
+/// this function at all: [`resolve_edge_scan_impl`] resolves
+/// [`path_attribute_module_paths`] first and calls
+/// [`scan_source_with_context`] directly for an overridden file, bypassing
+/// this directory-mirrors-modules guess entirely — the false-positive
+/// direction turned out not to be safe for it, since a sole registration
+/// reached only through a `#[path]`-redirected file being wrongly reported
+/// unregistered makes `run_edge_capsule_build` hard-fail the whole build,
+/// not merely warn (Codex review on #2739, round 31, P2).
 ///
 /// `src/bin/<name>.rs` (or the directory form, `src/bin/<name>/main.rs`) is
 /// none of the above: Cargo treats it as its OWN crate root, one `[[bin]]`
@@ -1735,6 +1764,129 @@ fn collect_out_of_line_mods(
             None => out.push((path.clone(), item_mod.ident.to_string())),
         }
     }
+}
+
+/// Every out-of-line `mod name;` in the project carrying a `#[path =
+/// "..."]` override, mapped from the FILE it redirects to (relative to
+/// `project_root`, forward-slash-separated — the same key format the main
+/// `src/` walk uses) to that module's real crate identity and module path.
+///
+/// `#[path]` redirects which file backs a module without renaming the
+/// module itself: real Rust still resolves `name::show` for `#[path =
+/// "actual.rs"] mod name;`, never a path derived from the file `actual.rs`
+/// happens to be named. The main `src/` walk assumes file path mirrors
+/// module path (`crate_context_from_file`) for every file it finds via
+/// plain directory listing, not by following `mod` declarations, so a
+/// `#[path]`-redirected file's module path came out wrong — not merely a
+/// cosmetic difference: when that file's registration is the project's
+/// ONLY one, `is_registered` never matches it, `scan.registered_fns()`
+/// comes back empty, and `run_edge_capsule_build` hard-fails the whole
+/// build ("found N `#[edge]` handler(s) but none are registered"), not just
+/// the extra false-positive warning a wrong module-path guess produces in
+/// every other case (Codex review on #2739, round 31, P2).
+///
+/// Scoped to the direct case only: a `mod name;` (top-level or nested
+/// inside an INLINE `mod { ... }`) whose own `#[path]` attribute names the
+/// file, resolved relative to the DECLARING file's own directory (Rust's
+/// real rule) and lexically normalized. A file reached this way that
+/// itself declares FURTHER out-of-line submodules of its own is a deeper,
+/// genuinely ambiguous corner of Rust's `#[path]` interaction with nested
+/// modules this scan does not attempt to resolve — the same accepted,
+/// best-effort trade-off as every other heuristic in this module.
+fn path_attribute_module_paths(
+    project_root: &Path,
+    default_features: &BTreeSet<String>,
+) -> BTreeMap<String, (String, Vec<String>)> {
+    let mut files = Vec::new();
+    collect_rs_files(&project_root.join("src"), &mut files);
+    files.sort();
+    let mut overrides = BTreeMap::new();
+    for declaring_file in &files {
+        let Ok(src) = std::fs::read_to_string(declaring_file) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&src) else {
+            continue;
+        };
+        let declaring_rel = declaring_file
+            .strip_prefix(project_root)
+            .unwrap_or(declaring_file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let (crate_root, base_module_path) = crate_context_from_file(&declaring_rel);
+        let mut inline_path = Vec::new();
+        let mut found = Vec::new();
+        collect_path_attribute_mods(&ast.items, default_features, &mut inline_path, &mut found);
+        let declaring_dir = declaring_file.parent().unwrap_or(declaring_file);
+        for (inline, name, path_value) in found {
+            let target_file = lexically_normalize_path(&declaring_dir.join(&path_value));
+            let target_rel = target_file
+                .strip_prefix(project_root)
+                .unwrap_or(&target_file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let mut module_path = base_module_path.clone();
+            module_path.extend(inline);
+            module_path.push(name);
+            overrides.insert(target_rel, (crate_root.clone(), module_path));
+        }
+    }
+    overrides
+}
+
+/// Every out-of-line `mod name;` carrying a `#[path = "..."]` override,
+/// found the same way [`collect_out_of_line_mods`] finds every out-of-line
+/// `mod`, returned as `(enclosing_inline_path, name, path_attribute_value)`.
+fn collect_path_attribute_mods(
+    items: &[syn::Item],
+    default_features: &BTreeSet<String>,
+    path: &mut Vec<String>,
+    out: &mut Vec<(Vec<String>, String, String)>,
+) {
+    for item in items {
+        let syn::Item::Mod(item_mod) = item else {
+            continue;
+        };
+        let cfg_excludes = item_mod
+            .attrs
+            .iter()
+            .any(|attr| eval_cfg_attr(attr, default_features) == Some(false));
+        if cfg_excludes {
+            continue;
+        }
+        match &item_mod.content {
+            Some((_, inner)) => {
+                path.push(item_mod.ident.to_string());
+                collect_path_attribute_mods(inner, default_features, path, out);
+                path.pop();
+            }
+            None => {
+                if let Some(path_value) = path_attribute_value(&item_mod.attrs) {
+                    out.push((path.clone(), item_mod.ident.to_string(), path_value));
+                }
+            }
+        }
+    }
+}
+
+/// The string value of a `#[path = "..."]` attribute, if `attrs` has one.
+fn path_attribute_value(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("path") {
+            return None;
+        }
+        let syn::Meta::NameValue(name_value) = &attr.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(lit_str),
+            ..
+        }) = &name_value.value
+        else {
+            return None;
+        };
+        Some(lit_str.value())
+    })
 }
 
 /// Resolve an out-of-line `mod name;` to its file, following Rust's own rule:
@@ -6301,6 +6453,77 @@ mod tests {
         let scan = resolve_edge_scan(dir.path());
         assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
         assert_eq!(scan.functions[0].module_path, vec!["routes".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A `#[path = "actual.rs"] mod handlers;` declaration redirects which
+    /// FILE backs the module without renaming it — real Rust still resolves
+    /// `handlers::show`, never `actual::show`. Before this scan resolved
+    /// `#[path]` overrides, the ordinary `src/` walk (plain directory
+    /// listing, not `mod`-declaration following) found `src/actual.rs` and
+    /// guessed its module path straight from that filename instead (Codex
+    /// review on #2739, round 31, P2).
+    #[test]
+    fn resolve_edge_scan_resolves_a_path_attribute_out_of_line_modules_real_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[path = \"actual.rs\"]\nmod handlers;\nfn wire() { edge_routes![crate::handlers::show]; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].module_path, vec!["handlers".to_owned()]);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// Same idea, but the `#[path]`-attributed `mod` is nested inside an
+    /// INLINE module — the override's real module path must include that
+    /// enclosing inline segment too, not just the mod's own name.
+    #[test]
+    fn resolve_edge_scan_resolves_a_path_attribute_mod_nested_inside_an_inline_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            r#"
+            mod api {
+                #[path = "actual.rs"]
+                mod handlers;
+            }
+            fn wire() { edge_routes![crate::api::handlers::show]; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/actual.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan(dir.path());
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["api".to_owned(), "handlers".to_owned()]
+        );
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
