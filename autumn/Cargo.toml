@@ -758,6 +758,21 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# `unique_violation_field` against a real SQLite unique-violation (issue
+# #2698): diesel boxes SQLite's DatabaseErrorInformation as a bare String,
+# whose constraint_name() is always None, so the Postgres-only
+# constraint-name match left every generated app's friendly-conflict
+# handling for a `--unique` column dead on SQLite. Boots an in-memory pool,
+# triggers a genuine duplicate-insert UniqueViolation, and proves the fix
+# resolves it to the mapped field/message the same way Postgres already does.
+# Only meaningful under `--features sqlite`; the file is `#![cfg(feature =
+# "sqlite")]` so a default `cargo test` compiles it to an empty (passing)
+# binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_unique_violation_field`.
+[[test]]
+name = "sqlite_unique_violation_field"
+path = "tests/sqlite_unique_violation_field.rs"
+
 # SQLite model-field type conversions (issue #1924): proves a `#[model]` carrying
 # a `DateTime<Utc>` (-> TimestamptzSqlite), a `NaiveDateTime` (-> Timestamp), and
 # an `Option<Blob>` attachment (-> Text/JSON) compiles AND round-trips on an
