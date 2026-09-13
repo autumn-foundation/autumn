@@ -19,11 +19,15 @@ jars) against several live `cms` instances, each on its own fresh
 PostgreSQL database, so a "restore into a fresh site" claim could be tested
 literally rather than simulated.
 
-Time-boxed to one sitting (~2 hours). Same environment constraint as the
-prior session: no Docker daemon in this sandbox, so PostgreSQL 16 ran as a
-native `pg_ctlcluster` service; six separate databases (`cms`, `cms2` … `cms6`)
-were created to model six independent site instances without touching each
-other's state.
+Time-boxed to one sitting (spread across ~2 hours of active work, with a
+gap in between). Same environment constraint as the prior session: no
+Docker daemon in this sandbox, so PostgreSQL 16 ran as a native
+`pg_ctlcluster` service; ten separate databases (`cms` through `cms10`,
+`cms7` unused — a naming slip, not a missing trial) were created over the
+course of the session to model independent site instances without
+touching each other's state, as later reproductions (round six onward,
+prompted by Codex review comments) needed fresh databases beyond the six
+the session started with.
 
 ## 📌 Environment
 
@@ -114,8 +118,9 @@ independently.)
 ## 🐛 Bug filed
 
 **[#2737](https://github.com/autumn-foundation/autumn/issues/2737) — import
-silently drops a same-slug sibling page whenever it lacks a `path` and is
-processed before its parent (data loss, repro 5/5).**
+silently drops a same-slug sibling page whenever an earlier same-slug
+sibling in the file was itself inserted before *its own* parent existed
+(data loss, repro 6/6).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -137,25 +142,40 @@ correctly and does not trigger the bug), and conversely a version-4 or
 version, hits the identical fallback and the identical bug — confirmed by
 a fourth reproduction below, a Codex catch on this PR.
 
-When two same-slug pages under different parents are listed in the file
-before their respective parents, and neither of the two colliding pages
-itself carries a `path`, the import loop misidentifies the *second* one as
-"somebody else's row that merely shares the slug" against the *first* one
-it just created — and drops it permanently, with the summary screen
-reporting an unremarkable "N imported, M already present" and no orphan
-count. The *parents'* own `path` is not part of the condition: a top-level
-parent's path (`"about"`, `"company"`) never contains `/` either way, so it
-sorts at the same depth-0 tier as a pathless child whether the parent
-carries `path` or not — a Codex catch on this PR, confirmed with a fifth
-live reproduction rather than by reasoning about the sort key alone: the
-identical 4-post file, `version: 5`, with the two parent posts given real
-`path` values (`"a"`, `"b"`) and only the two colliding children left
-pathless, still produced `"3 imported, 1 already present"` and a 404 on
-`/b/team`. Reproduced 5/5 across independent fresh databases: two on
-version 2 (one a hand-reordered full export, one a minimized 4-post file),
-one on version 3, one a version-5-labeled file with `path` omitted on all
-four posts, and this fifth with `path` present on the parents only. All
-five are deterministic given the file's post ordering, not a race.
+The precise mechanism, refined twice more by Codex catches on this PR,
+each verified live rather than accepted from reasoning alone:
+
+- **The parents' own `path` is not part of the condition.** A top-level
+  parent's path (`"a"`, `"b"`) never contains `/` either way, so it sorts
+  at the same depth-0 tier as a pathless child whether the parent carries
+  `path` or not. Verified with the 4-post `version: 5` file, giving the
+  two parent posts real `path` values and leaving only the two colliding
+  children pathless: still `"3 imported, 1 already present"`, still a 404
+  on `/b/team`.
+- **Nor is "each colliding page must precede its own parent."** What
+  actually matters is only the *first* colliding page in file order: if
+  it is inserted while its own parent is still unresolved, it lands as a
+  top-level row whose `local_identity` is the bare slug — and *that*
+  persisted row is what the *second* colliding page collides against,
+  via `find_local`, regardless of whether the second page's own parent
+  already exists by then. Verified with the file ordered
+  `a/team, b, b/team, a`: `b/team` comes *after* its own parent `b` in the
+  file (so `b/team`'s own parent is already resolved when it's processed),
+  yet `b/team` is still dropped — because `a/team`,
+  processed first while `a` didn't exist yet, was already sitting in the
+  database as a top-level page with bare identity `"team"`, and that's
+  what `b/team` collided against.
+
+Either way, the import loop misidentifies the *second* colliding page as
+"somebody else's row that merely shares the slug" against the first one's
+already-persisted state — and drops it permanently, with the summary
+screen reporting an unremarkable "N imported, M already present" and no
+orphan count. Reproduced 6/6 across independent fresh databases: two on
+version 2 (one a hand-reordered full export, one a minimized 4-post
+file), one on version 3, one a version-5-labeled file with `path` omitted
+on all four posts, one with `path` present on the parents only, and one
+reordered so the dropped page follows its own parent in the file. All six
+are deterministic given the file's post ordering, not a race.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
@@ -194,10 +214,12 @@ regression test the sweep will then pick up automatically.
 
 ## Findings summary
 
-- **Bugs filed:** 1 — #2737 (data loss on import, when a same-slug sibling
-  page is listed before its parent and neither carries `path`; see above —
-  not a risk to ordinary pathless *posts*, which never collide on slug in
-  the first place, only to same-slug *pages* under different parents).
+- **Bugs filed:** 1 — #2737 (data loss on import, when an earlier
+  same-slug sibling page lands at the top level — pathless, or top-level
+  with `path` — before a later same-slug sibling is checked against it;
+  see above — not a risk to ordinary pathless *posts*, which never
+  collide on slug in the first place, only to same-slug *pages* under
+  different parents).
 - **Digest:** none new. The one candidate rough edge investigated this
   session (the `500` on a blob-missing media request) turned out to be
   already-considered, documented behavior, not an oracle-less friction
