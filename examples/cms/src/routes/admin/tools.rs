@@ -872,33 +872,39 @@ fn stable_identity<'a>(
     })
 }
 
-/// The marker `stable_identity` recorded for this post before #2763
-/// shipped, if its parent is external: the parent's *position* then, not
-/// its row id now. `None` when the parent is in this file (that marker
-/// never embedded a position) or could not be resolved.
-async fn legacy_external_marker(
+/// Finds a row a prior import already created for this externally-parented
+/// post, when no marker lookup above found one (#2763).
+///
+/// A marker recorded before this fix shipped names the parent's *position*
+/// at that import, not its row id. Recomputing that position from the
+/// parent's *current* row does not recover it: the parent may have moved
+/// again since, and its old position is gone from anywhere this site can
+/// read it back. So this never recomputes a position. It checks the
+/// row's real, current parent instead, which is accurate regardless of
+/// how many times an ancestor has moved: any marker for `post_type` ending
+/// in `/{slug}` names a candidate, and only one whose actual `parent_id`
+/// equals `parent_id` is accepted.
+async fn recovered_legacy_owner(
     repos: &Repos,
-    graph: &FileGraph<'_>,
-    post: &ExportPost,
-    parent_now: Option<i64>,
-) -> AutumnResult<Option<String>> {
-    let Some(parent) = parent_identity(post) else {
-        return Ok(None);
-    };
-    if graph.find(post.post_type.as_str(), &parent).is_some() {
-        return Ok(None);
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+    post_type: &str,
+    slug: &str,
+    parent_id: i64,
+) -> AutumnResult<Option<crate::models::Post>> {
+    let suffix = format!("/{slug}");
+    for ((candidate_type, marker), ids) in imported_source_slugs {
+        if candidate_type != post_type || !marker.ends_with(&suffix) {
+            continue;
+        }
+        for &id in ids {
+            if let Some(candidate) = repos.posts.find_by_id(id).await?
+                && candidate.parent_id == Some(parent_id)
+            {
+                return Ok(Some(candidate));
+            }
+        }
     }
-    let Some(parent_id) = parent_now else {
-        return Ok(None);
-    };
-    let Some(parent_row) = repos.posts.find_by_id(parent_id).await? else {
-        return Ok(None);
-    };
-    Ok(Some(disambiguated_identity(format!(
-        "{}/{}",
-        local_identity(repos, &parent_row).await?,
-        post.slug
-    ))))
+    Ok(None)
 }
 
 /// Turns a `stable_identity` position into a safe marker key.
@@ -1423,18 +1429,22 @@ pub async fn import(
             None => None,
         };
         // A site that imported this page before #2763 shipped still
-        // carries a marker anchored to its external parent's old
-        // *position*, not the parent's row id. Tried last, and only when
-        // nothing above matched, so upgrading does not duplicate it.
+        // carries a marker for its external parent under an older scheme.
+        // Tried last, and only when nothing above matched, so upgrading
+        // does not duplicate it.
         if marker_owned.is_none()
-            && let Some(legacy_marker) =
-                legacy_external_marker(&repos, &graph, post, parent_now).await?
-            && legacy_marker != marker_identity
-            && let Some(&id) = imported_source_slugs
-                .get(&(post.post_type.clone(), legacy_marker))
-                .and_then(|ids| ids.first())
+            && let Some(parent) = parent_identity(post)
+            && graph.find(post.post_type.as_str(), &parent).is_none()
+            && let Some(parent_id) = parent_now
         {
-            marker_owned = repos.posts.find_by_id(id).await?;
+            marker_owned = recovered_legacy_owner(
+                &repos,
+                &imported_source_slugs,
+                &post.post_type,
+                &post.slug,
+                parent_id,
+            )
+            .await?;
         }
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating

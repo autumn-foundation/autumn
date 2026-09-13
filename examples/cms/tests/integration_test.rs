@@ -11829,6 +11829,160 @@ async fn re_importing_a_backup_recognizes_a_moved_external_parent() {
     );
 }
 
+/// A re-import must still recognize a page whose marker a pre-#2763 site
+/// recorded against its external parent's *old* position, when that
+/// parent then moved before the site upgraded to this fix (#2763).
+///
+/// The stored marker (`a/p`) reflects `A`'s position at the *original*
+/// import. Recomputing that marker from `A`'s *current* row cannot recover
+/// it once `A` has moved since — the old position is gone, not just
+/// unreachable by id. Recognizing `P` here must not depend on recomputing
+/// any position at all: it must find the old marker by its slug suffix and
+/// confirm it by `P`'s real, current parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_marker_after_the_parent_moved() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `A`'s position at
+    // this import (`a`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The editor moves `A` — before the site ever upgrades to this fix.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The site now upgrades to this fix and re-imports the same backup.
+    // `P`'s marker still reads `a/p`, and `A`'s position is now `x/a`.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
 /// Re-importing a whole multi-level, pathless backup must still recognize
 /// every page in the chain, not just the immediate parent of whichever page
 /// is being checked.
