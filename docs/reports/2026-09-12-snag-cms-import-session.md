@@ -136,8 +136,11 @@ The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
 always created before its children) is a no-op whenever a post's `path` is
 absent: `identity()` falls back to the bare slug, which never contains
-`/`. The condition is purely "this post's `path` is missing" — **not**
-"this file's version is old or new." `ExportPost::path` is
+`/`. A post's `path` being missing is *one* way to reach this bug — as
+later findings in this section establish, an explicit `path` set to the
+bare slug reaches the identical identity string, so pathlessness was
+never the exclusive trigger — but it is, either way, **not** about "this
+file's version is old or new." `ExportPost::path` is
 `#[serde(default)]` and the importer's version check
 (`READABLE_EXPORT_VERSIONS`) only validates the declared `version` number
 against an allowlist; it never inspects, requires, or strips `path` based
