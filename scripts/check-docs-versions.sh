@@ -68,8 +68,9 @@
 #      inline-code spelling prose uses (`autumn-storage-s3 = "0.7"`) — names the
 #      published release line, as `x.y` or the exact `x.y.z`.
 #
-#      Two spellings are easy to miss and were both missed by the first version
-#      of this gate, each a silent hole rather than a wrong answer:
+#      Three spellings are easy to miss, and the first version of this gate
+#      missed all three — each a silent hole rather than a wrong answer, which
+#      is the one failure mode a drift gate cannot afford:
 #
 #        - A Cargo COMPARISON OPERATOR. `autumn-web = "=0.6.0"` is the opening
 #          instruction of every migration guide ("Pin your current dependency …
@@ -82,6 +83,15 @@
 #          lines later; read one line at a time it does not exist. Pins are
 #          extracted from the whole comment-blanked page, with line numbers
 #          recovered from the match offset.
+#        - Cargo's SUBTABLE form, `[dependencies.autumn-web]` with a plain
+#          `version = "…"` some lines below. Neither half looks like a pin on
+#          its own. No `autumn*` subtable is in the corpus today, so this one
+#          closes a LATENT hole rather than a live defect — but the form is
+#          ordinary Cargo a page could adopt at any time, and `autumn-cli`'s
+#          `generate auth --mail` patcher exists because real projects write
+#          their dependency this way. A `package = "…"` rename inside the
+#          section names the real crate; without one, Cargo does not treat
+#          `autumn_web` as `autumn-web`, and neither does this.
 #
 #   2. The published line is read from README.md's quickstart
 #      (`cargo install autumn-cli --version <x.y.z>`) — the same single source
@@ -565,6 +575,53 @@ def waived(text):
     return out
 
 
+# `[dependencies.autumn-web]`, and its dev/build variants — Cargo's SUBTABLE
+# spelling, where the crate name is a section header and the version is a plain
+# `version = "…"` key some lines below it. Neither half looks like a pin on its
+# own, so the inline pattern above finds nothing and the page passes unchecked.
+#
+# The corpus has no `autumn*` subtable today (its one subtable is
+# `[dependencies.web-sys]`, third-party and not this gate's business), so this
+# closes a LATENT hole rather than a live defect. It is worth closing anyway:
+# the form is ordinary Cargo that a page could adopt at any time, and
+# `autumn-cli`'s `generate auth --mail` patcher already exists because real
+# projects write their dependency this way.
+SUBTABLE = re.compile(
+    r'^[^\S\n]*\[(?:dev-|build-)?dependencies\.([A-Za-z0-9_-]+)\][^\S\n]*$',
+    re.M)
+
+# The start of the next TOML section, which is where a subtable's body ends.
+NEXT_SECTION = re.compile(r'^[^\S\n]*\[', re.M)
+
+
+def subtable_pins(body):
+    """Yield (line_no, crate, spec) for each `[dependencies.<crate>]` section.
+
+    The line reported is the `version = "…"` key, not the header: that is the
+    line a fix edits.
+
+    The crate is the header key unless the section renames it with
+    `package = "…"`. Cargo does NOT treat `-` and `_` as interchangeable in a
+    dependency table key, so `[dependencies.autumn_web]` is a dependency on a
+    crate called `autumn_web` — which does not exist — UNLESS it carries that
+    explicit rename. Following Cargo here rather than guessing is what keeps a
+    correct page from being reported.
+    """
+    for match in SUBTABLE.finditer(body):
+        start = match.end()
+        following = NEXT_SECTION.search(body, start)
+        section = body[start:following.start() if following else len(body)]
+        version = re.search(r'(?m)^[^\S\n]*version\s*=\s*"([^"\n]*)"', section)
+        if not version:
+            continue
+        renamed = re.search(r'(?m)^[^\S\n]*package\s*=\s*"([^"\n]*)"', section)
+        crate = renamed.group(1) if renamed else match.group(1)
+        if requirement(version.group(1)) is None:
+            continue
+        lineno = body.count('\n', 0, start + version.start()) + 1
+        yield lineno, crate, version.group(1)
+
+
 def pins(text):
     """Yield (line_no, crate, version) for every pin a reader can see.
 
@@ -575,8 +632,12 @@ def pins(text):
     in a gate whose whole purpose is not to have one. Line numbers are
     recovered from the match offset, so a defect still points at the line the
     pin opens on.
+
+    Cargo's subtable spelling is read by `subtable_pins`, since neither half of
+    it looks like a pin on its own.
     """
     body = blank_comments(text)
+    yield from subtable_pins(body)
     for match in PIN.finditer(body):
         spec = match.group(2)
         if spec is None:
@@ -842,6 +903,28 @@ def self_test():
            'autumn-edge = { version = "0.7" }\n')
     expect('adjacent tables stay separate', list(pins(two)),
            [(1, 'autumn-web', '0.7'), (3, 'autumn-edge', '0.7')])
+
+    # Cargo's subtable spelling: neither half looks like a pin on its own, and
+    # the line reported is the `version` key, which is the line a fix edits.
+    sub = ('[dependencies.autumn-web]\n'
+           'version = "0.5"\n'
+           'features = ["db"]\n')
+    expect('subtable pin', list(pins(sub)), [(2, 'autumn-web', '0.5')])
+    expect('dev-dependencies subtable',
+           list(pins('[dev-dependencies.autumn-web]\nversion = "0.5"\n')),
+           [(2, 'autumn-web', '0.5')])
+    # `package = "…"` renames the dependency; the rename is the real crate.
+    expect('subtable rename resolves the crate',
+           list(pins('[dependencies.autumn_web]\n'
+                     'package = "autumn-web"\nversion = "0.5"\n')),
+           [(3, 'autumn-web', '0.5')])
+    # A version key in the NEXT section belongs to that section, not this one.
+    expect('subtable stops at the next section',
+           list(pins('[dependencies.autumn-web]\n'
+                     'features = ["db"]\n'
+                     '\n[package]\nversion = "0.5"\n')), [])
+    expect('subtable with no version pins nothing',
+           list(pins('[dependencies.autumn-web]\npath = "../autumn"\n')), [])
     # A longer crate name must not be read as a pin on a shorter one.
     expect('no prefix bleed', list(pins('bench-autumn-web = "0.1"')), [])
     # A comment renders as nothing, so it carries no pin a reader can paste.
