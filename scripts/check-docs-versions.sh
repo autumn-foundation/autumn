@@ -570,33 +570,32 @@ def published_crates(root):
     reached through the truth set rather than through the corpus, which is the
     quietest place for one to hide. `package_readmes()` in the shared corpus
     block above already parses for exactly this reason.
+
+    `publish` inheritance is resolved against the package's OWN workspace, via
+    the `_workspace_of` helper already in the block above. Reading
+    `[workspace.package]` off the repository root instead is right only by
+    coincidence, and only for packages in the root workspace: five standalone
+    workspaces sit inside this repository (`fuzz/`, `examples/island-flock/`,
+    `examples/reddit-clone/src-tauri/` and the two benchmark harnesses), and
+    two of them hold `autumn-*` crates — `autumn-fuzz` and
+    `autumn-island-flock`. `_workspace_of`'s own docstring warns against the
+    root-only read; the first version of this function did it anyway.
     """
-    listing = subprocess.run(
-        ['git', 'ls-files', '-z', 'Cargo.toml', '*/Cargo.toml'],
-        cwd=root, capture_output=True, text=True, check=True).stdout
-    # `publish` may be INHERITED: a member writing `publish.workspace = true`
-    # takes `[workspace.package] publish`. Read once, so a member that defers
-    # is resolved rather than read as a table — which matched neither the
-    # `false` nor the list test below, and so counted a deliberately
-    # unpublished crate as published. The damage from that is a FALSE
-    # POSITIVE: an old pin on a private `autumn-*` crate would be failed
-    # against a release line the crate does not have.
-    try:
-        root_manifest = tomllib.loads(
-            pathlib.Path(root, 'Cargo.toml').read_text(encoding='utf-8'))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        root_manifest = {}
-    workspace = root_manifest.get('workspace')
-    workspace_package = (workspace.get('package')
-                         if isinstance(workspace, dict) else None)
-    inherited = (workspace_package.get('publish')
-                 if isinstance(workspace_package, dict) else None)
+    tracked = tracked_files(root)
+    root_path = pathlib.Path(root)
+    cache = {}
+
+    def parsed(rel):
+        if rel not in cache:
+            cache[rel] = tomllib.loads(
+                (root_path / rel).read_text(encoding='utf-8'))
+        return cache[rel]
 
     out = set()
-    for rel in (f for f in listing.split('\0') if f):
+    for rel in sorted(f for f in tracked
+                      if f == 'Cargo.toml' or f.endswith('/Cargo.toml')):
         try:
-            manifest = tomllib.loads(
-                pathlib.Path(root, rel).read_text(encoding='utf-8'))
+            manifest = parsed(rel)
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             # A manifest that will not parse is Cargo's problem, not this
             # gate's; `check-crate-metadata.sh` owns manifest well-formedness.
@@ -607,6 +606,16 @@ def published_crates(root):
         name = package.get('name')
         if not isinstance(name, str) or not name.startswith('autumn'):
             continue
+        try:
+            ws_manifest = _workspace_of(rel, tracked, parsed)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            ws_manifest = None
+        inherited = None
+        if ws_manifest:
+            ws_package = parsed(ws_manifest).get('workspace', {}).get(
+                'package', {})
+            if isinstance(ws_package, dict):
+                inherited = ws_package.get('publish')
         # `publish = false` keeps a member off crates.io, and a LIST form
         # publishes only to the registries it names. Absent means published,
         # which is Cargo's own default. `_publish_state` holds that rule —
