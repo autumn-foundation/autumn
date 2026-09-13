@@ -2252,14 +2252,28 @@ fn scan_bin_crate_tree(
     let root_file = lexically_normalize_path(root_file);
     let root_file = root_file.as_path();
     let root_dir = root_file.parent().unwrap_or_else(|| Path::new(""));
-    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    // Two SEPARATE dedup sets, not one: a file's own out-of-line children
+    // are discovered (parsed and enqueued) only the FIRST time that file is
+    // reached, bounding the traversal against a module cycle the same way
+    // the old single `visited` set did — but each distinct (file,
+    // module_path) IDENTITY is still scanned and credited on its own. Real
+    // Rust allows the SAME file to be `#[path]`-included under multiple
+    // module names (`#[path = "shared.rs"] mod a;` and `#[path =
+    // "shared.rs"] mod b;` elsewhere both compile it, once per name —
+    // verified directly via a real build), and this BFS can enqueue both
+    // aliases once `path_attribute_module_paths`'s own round-40 fix stopped
+    // dropping the second one; deduping by file path ALONE here undid that
+    // fix specifically for a custom crate tree, silently skipping whichever
+    // alias was dequeued second (Codex review on #2739, round 42, P2).
+    let mut children_enqueued: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut scanned_identities: BTreeSet<(PathBuf, Vec<String>)> = BTreeSet::new();
     let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>)> =
         std::collections::VecDeque::new();
     queue.push_back((root_file.to_path_buf(), Vec::new()));
 
     while let Some((file, module_path)) = queue.pop_front() {
-        if !visited.insert(file.clone()) {
-            continue; // Already scanned — a module cycle can't loop forever.
+        if !scanned_identities.insert((file.clone(), module_path.clone())) {
+            continue; // This exact file/module-path identity is already scanned.
         }
         let Ok(src) = std::fs::read_to_string(&file) else {
             continue;
@@ -2279,6 +2293,9 @@ fn scan_bin_crate_tree(
         );
         scan.files_scanned += 1;
 
+        if !children_enqueued.insert(file.clone()) {
+            continue; // This file's own submodules were already discovered via a prior alias.
+        }
         let Ok(ast) = syn::parse_file(&src) else {
             continue;
         };
@@ -2327,7 +2344,13 @@ fn scan_bin_crate_tree(
         }
     }
 
-    visited
+    // Every physical file this BFS reached under any identity — the caller
+    // uses this to keep the ordinary `src/` walk from ALSO scanning (and
+    // double-crediting) the same file under its own conventional identity.
+    scanned_identities
+        .into_iter()
+        .map(|(file, _)| file)
+        .collect()
 }
 
 /// The last `::` segment of an attribute path, e.g. `edge` for
@@ -3003,11 +3026,26 @@ fn skip_cfg_excluded_statement(
     if let Some(block_end) = statement_without_semicolon_end(trees, attrs_end) {
         return Some(block_end + 1);
     }
+    // A cfg'd-out MATCH ARM (`#[cfg(feature = "premium")] true =>
+    // edge_routes![premium],`) is comma-delimited, not semicolon-delimited
+    // — this same function also bounds a match's arms, since
+    // `collect_registrations` recurses into a `match { ... }`'s body brace
+    // the same generic way it does any other block. A top-level (ungrouped)
+    // comma essentially never appears within one ordinary function-body
+    // STATEMENT's own tokens — every legitimate comma-bearing construct
+    // (tuples, call arguments, array/struct literals) is always inside its
+    // own Paren/Bracket/Brace group, invisible at this flat level — so it
+    // unambiguously marks a match arm's own boundary here. Without this,
+    // the scan found no `;` anywhere in the arms' flattened token stream
+    // and consumed every remaining arm, including a later, unrelated,
+    // still-active one's own `edge_routes![show]` (Codex review on #2739,
+    // round 42, P2).
     let mut i = attrs_end;
     while i < trees.len() {
-        let is_semicolon = matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';');
+        let is_terminator =
+            matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';' || p.as_char() == ',');
         i += 1;
-        if is_semicolon {
+        if is_terminator {
             break;
         }
     }
@@ -8220,5 +8258,99 @@ mod tests {
         assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
         assert_eq!(scan.functions[0].file, "src/actual.rs");
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
+    /// A cfg'd-out MATCH ARM (`#[cfg(feature = "premium")] true =>
+    /// edge_routes![premium],`) is comma-delimited, not semicolon-delimited
+    /// — verified directly via a real build. The generic scan-to-`;`
+    /// fallback found no semicolon anywhere in the match's flattened arm
+    /// tokens and consumed every remaining arm, including a later,
+    /// unrelated, still-active one's own `edge_routes![show]` (Codex review
+    /// on #2739, round 42, P2).
+    #[test]
+    fn cfg_false_match_arm_does_not_swallow_the_following_arms_registration() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire(x: bool) {
+                match x {
+                    #[cfg(feature = "premium")]
+                    true => edge_routes![crate::premium_thing],
+                    _ => edge_routes![crate::show],
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+    }
+
+    /// The same file can be `#[path]`-included under two different module
+    /// names inside a CUSTOM crate tree (a `[[bin]] path` capsule root, not
+    /// just the ordinary `src/` walk) — verified directly via a real build.
+    /// `scan_bin_crate_tree`'s own BFS `visited` set deduped purely by file
+    /// path, so once `path_attribute_module_paths`'s round-40 fix let both
+    /// aliases reach the queue, whichever was dequeued second was silently
+    /// dropped — the file was scanned under only one of its two real
+    /// identities (Codex review on #2739, round 42, P2).
+    #[test]
+    fn resolve_edge_scan_preserves_every_identity_for_a_shared_path_file_in_a_custom_crate_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            r#"
+            #[path = "shared.rs"]
+            mod a;
+            #[path = "shared.rs"]
+            mod b;
+            fn main() {
+                edge_routes![crate::a::show];
+                edge_routes![crate::b::show];
+            }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/shared.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+        assert_eq!(scan.functions.len(), 2, "{:?}", scan.functions);
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+        let module_paths: BTreeSet<Vec<String>> = scan
+            .functions
+            .iter()
+            .map(|f| f.module_path.clone())
+            .collect();
+        assert!(
+            module_paths.contains(&vec!["a".to_owned()]),
+            "{module_paths:?}"
+        );
+        assert!(
+            module_paths.contains(&vec!["b".to_owned()]),
+            "{module_paths:?}"
+        );
     }
 }
