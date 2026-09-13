@@ -115,14 +115,6 @@ const TRANSPARENT_BUILDERS: &[&str] = &[
     "returning",
     "values",
     "set",
-    // `LazyDb::checkout` (autumn/src/db.rs, #2264): turns a prepared-but-not-
-    // taken checkout into a live `Db`, the same handle under a new type. Safe
-    // here (unlike adding it to `HANDLE_ACCESSORS`, which matches on the bare
-    // name alone): this only fires when the receiver is *already* a tracked
-    // handle, so `autumn-billing`'s own unrelated `self.checkout(&snapshot)`
-    // (a Stripe checkout-completed reconciliation, not a connection) is never
-    // affected — its receiver is a plain `&Ctx`, never classified as one.
-    "checkout",
     // `Option`/`Result` unwrapping keeps whatever the handle accessor
     // returned: `state.webhook_outbound().unwrap().dispatch(...)`.
     "unwrap",
@@ -2532,6 +2524,22 @@ impl Analyzer {
                             insert,
                         });
                     }
+                    return Some(inner);
+                }
+                // `LazyDb::checkout` (autumn/src/db.rs, #2264) turns a
+                // prepared-but-not-taken checkout into a live `Db`, the same
+                // handle under a new type — but only when the receiver is a
+                // `Db`-kind handle (`LazyDb` collapses into `Handle::Db`, see
+                // `HANDLE_TYPES`). Gating on the variant, not just "the
+                // receiver is *some* tracked handle," matters: a
+                // `CartRepository` is `Handle::Repository`, and its own
+                // `checkout()` domain method (unrelated to a connection)
+                // must not inherit that repository's provenance just because
+                // the name matches (Codex review, PR #2762, round 3).
+                // `autumn-billing`'s `self.checkout(&snapshot)` (a Stripe
+                // reconciliation) is unaffected either way: its receiver is a
+                // plain `&Ctx`, never a tracked handle at all.
+                if name == "checkout" && matches!(inner, Handle::Db) {
                     return Some(inner);
                 }
                 (TRANSPARENT_BUILDERS.contains(&name.as_str())
@@ -5967,6 +5975,43 @@ mod tests {
         assert!(
             !expansion.contains("Compensable"),
             "a bounded write must stay compatible with `reversible`: {expansion}"
+        );
+    }
+
+    // ── `checkout` provenance is `Db`-only (#2264, Codex review round 3) ──
+
+    #[test]
+    fn a_repositorys_own_checkout_result_is_not_treated_as_a_handle() {
+        // `checkout` used to be a blanket-transparent builder name: any
+        // tracked handle's `checkout()` result inherited that handle's
+        // provenance, so a repository's own domain `checkout()` — unrelated
+        // to `LazyDb::checkout`'s connection handoff — made its ordinary
+        // return value (a receipt) look like an escaping effect handle.
+        // Handing that receipt to an opaque helper must compile clean.
+        assert_clean(
+            GRANT,
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let receipt = repo.checkout().await?;
+                crate::billing::render_receipt(&receipt);
+                Ok(())
+            }",
+        );
+    }
+
+    #[test]
+    fn lazy_dbs_checked_out_db_still_carries_handle_provenance() {
+        // The fix that scopes `checkout` transparency to `Handle::Db` must
+        // not lose the provenance tracking `LazyDb::checkout` needs in the
+        // first place: the `Db` it hands back is still an effect handle, so
+        // passing it to an opaque helper is still refused.
+        assert_error_contains(
+            GRANT,
+            r"async fn h(lazy_db: LazyDb) -> R {
+                let mut db = lazy_db.checkout().await?;
+                crate::billing::issue_refund(&mut db, 7).await?;
+                Ok(())
+            }",
+            &["issue_refund", "effect handle"],
         );
     }
 

@@ -3368,6 +3368,21 @@ impl RequestDbContext {
 /// statement timeout, route key, metrics, interceptors, clock. No connection
 /// is taken until the handler calls [`LazyDb::checkout`], after the body
 /// extractor has already run.
+///
+/// That guarantee assumes the body extractor actually reads the body during
+/// extraction — true for `Form` and `Json`, which buffer the whole body
+/// before the handler runs. It is **not** true for [`Multipart`]: extracting
+/// it does not read anything, and each field only streams in as the handler
+/// calls [`Multipart::next_field`] and reads from the returned field. Calling
+/// `checkout()` before that loop, the way the example above calls it right
+/// after a `Form` extractor, checks out a connection and then holds it for
+/// the loop's whole duration — exactly the pinning `LazyDb` exists to avoid.
+/// Call `checkout()` only after every field this handler needs has been
+/// fully read (buffered to memory or staged to disk), not before the loop
+/// that reads them.
+///
+/// [`Multipart`]: crate::extract::Multipart
+/// [`Multipart::next_field`]: crate::extract::Multipart::next_field
 pub struct LazyDb {
     pool: Pool<RuntimeConnection>,
     ctx: RequestDbContext,
