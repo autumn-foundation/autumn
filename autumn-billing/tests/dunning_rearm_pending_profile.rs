@@ -13,8 +13,19 @@
 //! fix: `rearm_row` (dunning.rs) calls `schedule()` → `JobClient::enqueue_due`
 //! once per row, sequentially awaited
 //! (`for row in rows { rearm_row(&state, &row).await }`), so re-arming N open
-//! rows costs N sequential `INSERT INTO autumn_jobs` round trips, run
-//! synchronously during startup, before the app can be considered fully up.
+//! rows costs N sequential `INSERT INTO autumn_jobs` round trips. Production
+//! `rearm_pending` spawns this loop (`tokio::runtime::Handle::spawn`) rather
+//! than awaiting it, and `run_startup_hooks` never sees that spawned task —
+//! it awaits only the `on_startup` closure's own future, which returns as
+//! soon as the spawn call does — so this does NOT delay
+//! `ProbeState::mark_startup_complete()` or readiness. What it does cost:
+//! every one of these N round trips runs against the same connection pool
+//! and Postgres instance a freshly-restarted process is about to start
+//! serving live traffic through, and no retry in the backlog is actually
+//! re-queued until its row's turn in the sequential loop comes up — so a
+//! large backlog extends how long the *payment-retry recovery itself* takes
+//! after a restart, even though the process reports itself ready well
+//! before that finishes.
 //!
 //! This is a **findings issue** harness, not a before/after fix. The
 //! mechanism is identical to the one already filed and deliberately left
@@ -40,7 +51,8 @@
 //! and specifically grows with an *upstream outage* — the one moment a
 //! payment provider incident is already degrading service, every redeploy or
 //! crash-restart during the incident pays for the full backlog again,
-//! sequentially, before the process is warmed up.
+//! sequentially, in the background — not blocking startup (see above), but
+//! extending how long that backlog stays un-re-armed.
 //!
 //! Exercises the real production path: `dunning::rearm_pending_now` is the
 //! exact body `dunning::rearm_pending` (the private startup-hook entry point
