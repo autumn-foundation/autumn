@@ -22,8 +22,8 @@ literally rather than simulated.
 Time-boxed to one sitting (spread across ~2 hours of active work, with a
 gap in between). Same environment constraint as the prior session: no
 Docker daemon in this sandbox, so PostgreSQL 16 ran as a native
-`pg_ctlcluster` service; thirteen separate databases (`cms` through
-`cms13`, `cms7` unused — a naming slip, not a missing trial) were created
+`pg_ctlcluster` service; fourteen separate databases (`cms` through
+`cms14`, `cms7` unused — a naming slip, not a missing trial) were created
 over the course of the session to model independent site instances
 without touching each other's state, as later reproductions (round six
 onward, prompted by Codex review comments) needed fresh databases beyond
@@ -122,7 +122,7 @@ silently drops a pathless nested page whenever a page with that bare slug
 is *already persisted* as a top-level (or otherwise depth-tied) row —
 whether that row is a pre-existing page on the site, one from an earlier,
 separate import, or one created moments earlier in the same run while its
-own parent was still unresolved (data loss, repro 8/8).**
+own parent was still unresolved (data loss, repro 9/9).**
 
 The "shallowest first" ordering that already fixes this exact class of bug
 (sorting posts by how many `/` their `path` contains, so a parent is
@@ -167,23 +167,39 @@ each verified live rather than accepted from reasoning alone:
   processed first while `a` didn't exist yet, was already sitting in the
   database as a top-level page with bare identity `"team"`, and that's
   what `b/team` collided against.
-- **But both colliding pages must resolve to that same bare identity —
-  one pathless sibling is not sufficient.** `find_local` compares the
-  *second* page's own file `identity()` against the first's already-
-  persisted `local_identity`; it is not a blanket "any row with this slug
-  blocks any other." Verified by giving the second `Team` page (under
-  `b`) its own correct `path: "b/team"` while leaving the first (under
-  `a`, still unresolved when processed) pathless: the file identity of
-  the second page is now `"b/team"`, which does not equal the first
-  page's persisted `local_identity` of `"team"`, so `find_local` finds no
-  match and the second page is created normally. The import reported
-  `"4 imported, 0 already present"`, `/b/team` resolved `200`, and —
-  because the deferred ancestry pass (see the "shallowest first" comment
-  in `tools.rs`) re-parents the first page once its own parent `a` is
-  later created in the same run — `/a/team` also resolved `200` and both
-  pages ended up correctly nested with no loss at all. A Codex catch on
-  this PR, verified live on a fresh database (`cms11`) rather than
-  accepted from reasoning alone.
+- **The *second* (incoming) page must be pathless — but "both pages
+  pathless" overstates the requirement on the first (persisted) page's
+  side.** `find_local` compares the *second* page's own file `identity()`
+  against the first row's already-persisted `local_identity`; it is not a
+  blanket "any row with this slug blocks any other." Verified by giving
+  the second `Team` page (under `b`) its own correct `path: "b/team"`
+  while leaving the first (under `a`, still unresolved when processed)
+  pathless: the file identity of the second page is now `"b/team"`, which
+  does not equal the first page's persisted `local_identity` of `"team"`,
+  so `find_local` finds no match and the second page is created normally.
+  The import reported `"4 imported, 0 already present"`, `/b/team`
+  resolved `200`, and — because the deferred ancestry pass (see the
+  "shallowest first" comment in `tools.rs`) re-parents the first page once
+  its own parent `a` is later created in the same run — `/a/team` also
+  resolved `200` and both pages ended up correctly nested with no loss at
+  all. A Codex catch on this PR, verified live on a fresh database
+  (`cms11`) rather than accepted from reasoning alone.
+
+  But the *first* (persisted) page's own `path` field, if it has one, is
+  irrelevant either way — `local_identity()` recomputes purely from actual
+  database ancestry (`page_ancestry`), never from whatever `path` the row's
+  originating file entry happened to carry. Verified with a fourteenth
+  reproduction (`cms14`): a top-level `Team` page imported with an
+  *explicit* `"path": "team"` (not omitted at all) still collides with a
+  later, separately-imported pathless `Team` page nested under `b` exactly
+  as when the first page had no `path` field — `"1 already present"`,
+  `/b/team` → 404. So the real asymmetry is: the *incoming* page being
+  checked must be pathless (or otherwise resolve to the bare slug) for the
+  collision to fire, but the *persisted* row it collides against can have
+  gotten its top-level `local_identity` from any combination of `path`
+  presence, absence, or content in whatever file originally created it —
+  that detail never survives into the database. A Codex catch on this PR,
+  verified live rather than accepted from reasoning alone.
 - **Nor does the first page's parent need to have been unresolved at all
   — a genuinely, permanently top-level page triggers it the same way.**
   Every reproduction so far involved a first page whose parent was merely
@@ -219,19 +235,22 @@ Either way, the import loop misidentifies the pathless nested page as
 "somebody else's row that merely shares the slug" against whatever
 already-persisted row shares its bare-slug identity — and drops it
 permanently, with the summary screen reporting an unremarkable
-"N imported, M already present" and no orphan count. Reproduced 8/8
+"N imported, M already present" and no orphan count. Reproduced 9/9
 across independent fresh databases: two on version 2 (one a
 hand-reordered full export, one a minimized 4-post file), one on version
 3, one a version-5-labeled file with `path` omitted on all four posts,
 one with `path` present on the parents only, one reordered so the dropped
 page follows its own parent in the file, one where the earlier same-slug
 page is a genuine, permanently top-level page rather than a
-temporarily-unresolved one, and one where the earlier same-slug page
-comes from a wholly separate, already-completed prior import rather than
-the same run. Every case that *does* involve file ordering within a
-single run is a pure function of that ordering, not a race — but, per the
-last two reproductions, ordering within one run is not actually a
-precondition of the bug at all.
+temporarily-unresolved one, one where the earlier same-slug page comes
+from a wholly separate, already-completed prior import rather than the
+same run, and one where that earlier, separately-imported page carried an
+explicit `path` equal to its own bare slug rather than omitting `path`
+altogether. Every case that *does* involve file ordering within a single
+run is a pure function of that ordering, not a race — but, per the last
+three reproductions, neither same-run ordering nor the persisted row's own
+`path` history is actually a precondition of the bug at all; only the
+*incoming* page's own pathlessness is.
 
 **Two corrections from earlier drafts of this report, both from Codex
 review comments on this PR.** First: the original framing called this a
@@ -307,7 +326,15 @@ regression test the sweep will then pick up automatically.
    date to drive that branch over HTTP; none of this session's fixtures
    used `future` at all. Both the import-time analogue and the real timer
    sweep remain unverified end-to-end and belong together in a follow-up.
-3. **A fix for #2737** would benefit from a design decision on how to order
-   posts by ancestry depth when the file carries no `path` (recursively
-   resolving each post's `parent` chain rather than counting `/`) — flagged
-   in the issue as work for whoever picks it up, not attempted here.
+3. **A fix for #2737** needs more than reordering. Recursively resolving
+   each post's `parent` chain (rather than counting `/`) would close the
+   *same-run* ordering cases, but the `cms13`/`cms14` reproductions show a
+   same-run ordering fix alone is insufficient: there, the colliding
+   top-level page already exists, fully settled, from an earlier import
+   with correct ancestry — no ordering problem exists to fix. The
+   deduplication check itself (`find_local`'s comparison of an incoming
+   page's *file* identity against a persisted row's *ancestry-derived*
+   identity) needs to account for where the incoming page's file `parent`
+   chain says it actually belongs, not just compare bare slugs when `path`
+   is absent — flagged in the issue as work for whoever picks it up, not
+   attempted here.
