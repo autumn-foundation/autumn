@@ -893,6 +893,44 @@ fn generator_conformance_ci_gate_is_configured() {
         "generator-conformance.yml must include a cron schedule so generator rot \
          is caught even when no template or prelude file was touched directly",
     );
+
+    // Issue #2538, gap 1: the `mod.rs` registry decides which test files
+    // compile into the `cli_tests` binary at all, so it must be in the
+    // trigger lists — matched in both `push.paths` and `pull_request.paths`.
+    let trigger_lists = workflow
+        .matches("\"autumn-cli/tests/integration/mod.rs\"")
+        .count();
+    assert!(
+        trigger_lists >= 2,
+        "generator-conformance.yml must list `autumn-cli/tests/integration/mod.rs` \
+         in both trigger path lists — a change that removes or renames a `mod` \
+         declaration would otherwise never fire this workflow (issue #2538)",
+    );
+
+    // Issue #2538, gap 2: every routed per-test invocation must be guarded by
+    // an assert-ran check. `cargo test` exits 0 when an `--exact` filter
+    // matches zero tests, so without the guard a renamed or removed test goes
+    // silently green. Matched per step block (not file-wide) so a guard added
+    // to the wrong step cannot satisfy it; comments are stripped first so a
+    // guard mentioned only in prose does not count.
+    let stripped = strip_yaml_comments(&workflow);
+    let mut guarded_steps = 0;
+    for block in stripped.split("\n      - name: ").skip(1) {
+        if block.contains("--ignored --exact") {
+            let step_name = block.lines().next().unwrap_or("?");
+            assert!(
+                block.contains("test result: ok"),
+                "generator-conformance.yml step `{step_name}` routes a per-test \
+                 `--ignored --exact` invocation with no assert-ran guard — a \
+                 filter matching zero tests would pass silently (issue #2538)",
+            );
+            guarded_steps += 1;
+        }
+    }
+    assert!(
+        guarded_steps > 0,
+        "expected to find guarded per-test steps in generator-conformance.yml",
+    );
 }
 
 // ── cli_tests per-test triage (issue #1945) ───────────────────────────────
