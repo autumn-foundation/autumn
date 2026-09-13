@@ -160,6 +160,25 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
+/// Async methods that turn an *already-tracked* handle into a fresher one of
+/// a possibly different type, rather than issuing a query — currently only
+/// `LazyDb::checkout` (autumn/src/db.rs, #2264), which turns a prepared-but-
+/// not-taken checkout into a live `Db`. Used two ways: `checkout` on a
+/// tracked receiver both hands its result the handle identity forward
+/// (`awaited_expr_is_fresh_handle`) and costs nothing itself
+/// (`method_chain`) — a connection checkout is plumbing, not a query the
+/// handler asked for, the same reason a plain `HANDLE_ACCESSORS` call never
+/// counts as one.
+///
+/// Deliberately not added to `HANDLE_ACCESSORS`: that list matches a bare
+/// method name on *any* receiver, and "checkout" is also a real domain verb —
+/// `autumn-billing`'s own `self.checkout(&snapshot)` is a Stripe
+/// checkout-completed reconciliation, not a connection checkout. Gating on
+/// `self.expr_is_handle(&mc.receiver)` (see `awaited_expr_is_fresh_handle`)
+/// keeps that call unaffected: its receiver is a plain `&Ctx`, never a
+/// tracked handle, so the `&&` never reaches this list.
+const HANDLE_TRANSITIONS: &[&str] = &["checkout"];
+
 /// `Result`/`Option`-unwrapping methods that stand in for the `?` operator
 /// (`ctx.conn().await.expect("connection")`, the documented shape in
 /// `autumn/src/seed.rs`) without themselves issuing a query. Deliberately
@@ -171,7 +190,7 @@ const RESULT_UNWRAP_METHODS: &[&str] = &["expect", "unwrap"];
 /// Exact type names that name a database handle.
 const HANDLE_TYPES: &[&str] = &[
     "Db",
-    "DeferredDb",
+    "LazyDb",
     "ShardedDb",
     "ShardedReadDb",
     "TestDb",
@@ -181,6 +200,17 @@ const HANDLE_TYPES: &[&str] = &[
     "SqliteConnection",
     "PooledConnection",
 ];
+
+/// Wrapper types safe to peer inside when looking for a specifically-`LazyDb`
+/// parameter (`Result<LazyDb, E>`, the shape a handler catching extraction
+/// failure uses; `Option`/`Arc`/`Rc`/`Box` and the common extractor wrappers,
+/// for the same reason `TRANSPARENT_WRAPPERS`/`EXTRACTOR_WRAPPERS` name them
+/// elsewhere in this codebase). Deliberately a *whitelist*, unlike
+/// `type_is_handle`'s own unrestricted generic-argument peering: an
+/// arbitrary, unrecognized wrapper (`Cart<LazyDb>`) must not qualify, since
+/// it may define its own domain `checkout()` (Codex review, PR #2762,
+/// round 7).
+const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
 
 /// Offered when the fix is to stop issuing a query per row.
 const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
@@ -357,6 +387,13 @@ impl Cost {
 struct Analyzer {
     /// Identifiers currently bound to a database handle.
     handles: HashSet<String>,
+    /// Identifiers currently bound to a handle known, specifically, to be a
+    /// `LazyDb` — a strict subset of `handles`. `HANDLE_TRANSITIONS`
+    /// (`checkout`) is gated on this, not on `handles`, because `handles`
+    /// also carries `*Repository`/`*Db`-suffixed types whose own `checkout`
+    /// method (a real, potentially query-issuing domain method) must not be
+    /// mistaken for `LazyDb::checkout`'s zero-cost connection handoff.
+    lazy_db_names: HashSet<String>,
     /// Counted call sites, in source order, for the diagnostic.
     ledger: Vec<String>,
     /// Errors raised by malformed `#[query_cost]` / `#[query_exempt]`.
@@ -364,9 +401,10 @@ struct Analyzer {
 }
 
 impl Analyzer {
-    const fn new(handles: HashSet<String>) -> Self {
+    const fn new(handles: HashSet<String>, lazy_db_names: HashSet<String>) -> Self {
         Self {
             handles,
+            lazy_db_names,
             ledger: Vec::new(),
             errors: Vec::new(),
         }
@@ -387,6 +425,7 @@ impl Analyzer {
         // initialises an outer binding, and restoring the whole set discarded
         // that (#1667 review, round five). Restore exactly the declared names.
         let outer = self.handles.clone();
+        let outer_lazy_db = self.lazy_db_names.clone();
         let mut declared = HashSet::new();
         let mut cost = Cost::ZERO;
         for stmt in &block.stmts {
@@ -397,9 +436,14 @@ impl Analyzer {
         }
         for name in declared {
             if outer.contains(&name) {
-                self.handles.insert(name);
+                self.handles.insert(name.clone());
             } else {
                 self.handles.remove(&name);
+            }
+            if outer_lazy_db.contains(&name) {
+                self.lazy_db_names.insert(name);
+            } else {
+                self.lazy_db_names.remove(&name);
             }
         }
         cost
@@ -466,6 +510,7 @@ impl Analyzer {
             // `let repo;` with no initialiser still shadows: the name holds
             // nothing yet, so it is not a handle.
             self.rebind(&local.pat, false);
+            self.rebind_lazy_db(&local.pat, false);
             return;
         };
         // A binding initialised from a handle — or from a chain rooted at one,
@@ -473,6 +518,7 @@ impl Analyzer {
         // itself a handle from here on.
         if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
             self.rebind(&local.pat, true);
+            self.rebind_lazy_db(&local.pat, self.expr_is_lazy_db(&init.expr));
         } else if matches!(&local.pat, Pat::Tuple(_)) && matches!(&*init.expr, Expr::Tuple(_)) {
             let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) else {
                 unreachable!("guarded by the matches! above")
@@ -482,6 +528,7 @@ impl Analyzer {
             for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
                 let is_handle = self.expr_is_handle(element) || self.chain_root_is_handle(element);
                 self.rebind(element_pat, is_handle);
+                self.rebind_lazy_db(element_pat, self.expr_is_lazy_db(element));
             }
         } else {
             // Shadowing. `let repo = repo.find_all().await?;` rebinds the name
@@ -491,6 +538,7 @@ impl Analyzer {
             // three). `block` restores the outer set, so this cannot leak past
             // the enclosing scope.
             self.rebind(&local.pat, false);
+            self.rebind_lazy_db(&local.pat, false);
         }
     }
 
@@ -499,24 +547,41 @@ impl Analyzer {
     /// Restoring *only* these names matters: a whole-set snapshot would also
     /// undo an assignment the scope made to an **outer** name, and assignments
     /// are not lexically scoped (#1667 review, round five).
-    fn enter_binding_scope(&mut self, pat: &Pat, is_handle: bool) -> Vec<(String, bool)> {
+    fn enter_binding_scope(&mut self, pat: &Pat, is_handle: bool) -> Vec<(String, bool, bool)> {
         let mut names = HashSet::new();
         collect_pat_idents(pat, &mut names);
-        let saved: Vec<(String, bool)> = names
+        let saved: Vec<(String, bool, bool)> = names
             .iter()
-            .map(|n| (n.clone(), self.handles.contains(n)))
+            .map(|n| {
+                (
+                    n.clone(),
+                    self.handles.contains(n),
+                    self.lazy_db_names.contains(n),
+                )
+            })
             .collect();
         self.rebind(pat, is_handle);
+        // A closure parameter is never known to be specifically `LazyDb`
+        // (deliberately narrow — see `lazy_db_names`'s own doc comment), so
+        // this always clears rather than sets: a name the closure shadows
+        // must not keep an outer scope's `LazyDb` identity for the scope's
+        // duration.
+        self.rebind_lazy_db(pat, false);
         saved
     }
 
     /// Undo an [`Self::enter_binding_scope`], name by name.
-    fn leave_binding_scope(&mut self, saved: Vec<(String, bool)>) {
-        for (name, was_handle) in saved {
+    fn leave_binding_scope(&mut self, saved: Vec<(String, bool, bool)>) {
+        for (name, was_handle, was_lazy_db) in saved {
             if was_handle {
-                self.handles.insert(name);
+                self.handles.insert(name.clone());
             } else {
                 self.handles.remove(&name);
+            }
+            if was_lazy_db {
+                self.lazy_db_names.insert(name);
+            } else {
+                self.lazy_db_names.remove(&name);
             }
         }
     }
@@ -532,6 +597,21 @@ impl Analyzer {
         } else {
             for name in names {
                 self.handles.remove(&name);
+            }
+        }
+    }
+
+    /// `rebind`'s counterpart for `lazy_db_names`: every binding this touches
+    /// is also passed through `rebind`, so a name here is always a subset of
+    /// `handles`.
+    fn rebind_lazy_db(&mut self, pat: &Pat, is_lazy_db: bool) {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        if is_lazy_db {
+            self.lazy_db_names.extend(names);
+        } else {
+            for name in names {
+                self.lazy_db_names.remove(&name);
             }
         }
     }
@@ -738,6 +818,21 @@ impl Analyzer {
                     } else {
                         self.handles.remove(&ident.to_string());
                     }
+                    // `lazy_db_names` must track an assignment the same way
+                    // `handles` does: `let selected; selected = lazy_db;` is
+                    // the deferred-initialisation idiom this same file's own
+                    // annotation-preserving code uses elsewhere, and without
+                    // this, `selected.checkout()` would fall back to the
+                    // ordinary "counted call" path — silently reintroducing
+                    // the exact `#[query_budget(1)]` false rejection this
+                    // whole `lazy_db_names` mechanism exists to avoid, just
+                    // reached through `=` instead of `let` (Codex review,
+                    // PR #2762, round 4).
+                    if self.expr_is_lazy_db(&a.right) {
+                        self.lazy_db_names.insert(ident.to_string());
+                    } else {
+                        self.lazy_db_names.remove(&ident.to_string());
+                    }
                 }
                 cost
             }
@@ -906,6 +1001,22 @@ impl Analyzer {
             let Some(last) = on_handle.last().map(|m| m.method.to_string()) else {
                 return cost;
             };
+            // A `HANDLE_TRANSITIONS` method (`checkout`) never costs a query,
+            // awaited or not: unlike a builder name, it cannot double as a
+            // real finder someone happened to await, so there is no reason to
+            // charge it once the chain runs. Checked ahead of the builder
+            // rule below because it is unconditional, where that one only
+            // applies while `!awaited`.
+            //
+            // Gated on `expr_is_lazy_db(root)`, not just "rooted at *some*
+            // handle": `handles` also covers `*Repository`/`*Db`-suffixed
+            // types via a name-suffix heuristic, and a domain `checkout()`
+            // method on one of those (a real, possibly query-issuing call)
+            // must not be zero-cost just because it shares `LazyDb::checkout`'s
+            // name (Codex review, PR #2762, round 3).
+            if HANDLE_TRANSITIONS.contains(&last.as_str()) && self.expr_is_lazy_db(root) {
+                return cost;
+            }
             // A builder name refines the *next* query rather than issuing one —
             // unless the chain is awaited here, in which case the terminal call
             // really did run (a user finder may share a builder's name).
@@ -1266,7 +1377,85 @@ impl Analyzer {
             // query" when both share this shape, so this stays a real,
             // acknowledged boundary of the analysis rather than a bug
             // fixable by another naming heuristic.
-            Expr::MethodCall(mc) => HANDLE_ACCESSORS.contains(&mc.method.to_string().as_str()),
+            //
+            // `HANDLE_TRANSITIONS` (`checkout`) is not the same kind of fix:
+            // it requires the receiver itself to already be a tracked
+            // `LazyDb` (`self.expr_is_lazy_db`, one hop, no recursion), so it
+            // does not reopen the `state.db().find_recipients(...)`
+            // regression above — that receiver (`state.db()`) is a call,
+            // never a bare tracked name. Gating on `expr_is_lazy_db` rather
+            // than the broader `expr_is_handle` matters here too: a
+            // `*Repository`'s own `checkout()` returning some unrelated
+            // value must not have that value inherit handle identity (Codex
+            // review, PR #2762, round 3).
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                HANDLE_ACCESSORS.contains(&method.as_str())
+                    || (HANDLE_TRANSITIONS.contains(&method.as_str())
+                        && self.expr_is_lazy_db(&mc.receiver))
+            }
+            _ => false,
+        }
+    }
+
+    /// Is this expression known, specifically, to be a `LazyDb` — as opposed
+    /// to `expr_is_handle`'s broader "some tracked handle, of any kind"?
+    /// Deliberately narrow (see `lazy_db_names`'s doc comment): only a bare,
+    /// possibly-referenced identifier already in `lazy_db_names`. No
+    /// `Expr::Field`/`Expr::MethodCall`/`Expr::If`/`Expr::Match` arms, unlike
+    /// `expr_is_handle` — those all reason from *name conventions*
+    /// (`HANDLE_ACCESSORS`, `member_is_handle_accessor`), which say "this is
+    /// some handle" but never "this is specifically `LazyDb`, not a
+    /// `Repository`." Missing a `LazyDb` reached that way just means its
+    /// `checkout()` is counted like an ordinary call — conservative, not a
+    /// hole — where guessing wrong the other way would let a real query
+    /// dodge the budget or a real handle escape an authority check.
+    fn expr_is_lazy_db(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .is_some_and(|i| self.lazy_db_names.contains(&i.to_string())),
+            Expr::Reference(r) => self.expr_is_lazy_db(&r.expr),
+            Expr::RawAddr(r) => self.expr_is_lazy_db(&r.expr),
+            Expr::Paren(p) => self.expr_is_lazy_db(&p.expr),
+            Expr::Group(g) => self.expr_is_lazy_db(&g.expr),
+            Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_lazy_db(&u.expr),
+            // `Result<LazyDb, E>` is a signature shape `type_is_lazy_db`
+            // already recognizes (mirroring how `type_is_handle` treats
+            // `Result<Db, E>`), so a handler catching extraction failure —
+            // `lazy_db: Result<LazyDb, AutumnError>` — must still see
+            // `lazy_db.expect(...).checkout()` as the same zero-cost
+            // transition `lazy_db.checkout()` is. Narrow on purpose, mirroring
+            // `expr_is_handle`'s own `RESULT_UNWRAP_METHODS` arm: only
+            // `.expect(...)`/`.unwrap()` on an already-`LazyDb`-tracked
+            // receiver, not `HANDLE_ACCESSORS`/`HANDLE_BUILDERS` in general —
+            // those recognize a handle from a name convention with no type
+            // behind it, which can say "some handle" but never "specifically
+            // `LazyDb`" (Codex review, PR #2762, round 6).
+            Expr::MethodCall(mc) => {
+                RESULT_UNWRAP_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_lazy_db(&mc.receiver)
+            }
+            // A `LazyDb` selected through a conditional is still a `LazyDb`:
+            // `let selected = if flag { first } else { second };`. Sound for
+            // the same reason `expr_is_handle`'s identical shape is — real
+            // Rust requires every arm of a value-producing `if`/`match` to
+            // share one type, so if any arm is `LazyDb`, every reachable arm
+            // is (Codex review, PR #2762, round 5). Deliberately still omits
+            // `Expr::Try` and `Expr::Field`: those recognize a handle from a
+            // *name convention* with no type behind it (`HANDLE_ACCESSORS`,
+            // `member_is_handle_accessor`), which can say "some handle" but
+            // never "specifically `LazyDb`."
+            Expr::If(i) => {
+                self.block_tail_is_lazy_db(&i.then_branch)
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_is_lazy_db(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_lazy_db(&arm.body)),
+            Expr::Block(b) => self.block_tail_is_lazy_db(&b.block),
+            Expr::Unsafe(u) => self.block_tail_is_lazy_db(&u.block),
             _ => false,
         }
     }
@@ -1275,6 +1464,14 @@ impl Analyzer {
     fn block_tail_is_handle(&self, block: &Block) -> bool {
         match block.stmts.last() {
             Some(Stmt::Expr(expr, None)) => self.expr_is_handle(expr),
+            _ => false,
+        }
+    }
+
+    /// [`Self::block_tail_is_handle`]'s `lazy_db_names` counterpart.
+    fn block_tail_is_lazy_db(&self, block: &Block) -> bool {
+        match block.stmts.last() {
+            Some(Stmt::Expr(expr, None)) => self.expr_is_lazy_db(expr),
             _ => false,
         }
     }
@@ -1653,6 +1850,61 @@ fn signature_handles(input_fn: &ItemFn) -> HashSet<String> {
     handles
 }
 
+/// Does this type name `LazyDb`, exactly — directly, behind a reference, or
+/// inside an extractor wrapper? Unlike [`type_is_handle`], deliberately has
+/// no suffix fallback: this backs the `HANDLE_TRANSITIONS` exemption, where
+/// mistaking a `*Repository`/`*Db`-suffixed type for `LazyDb` would let a
+/// same-named domain `checkout()` dodge the query budget (Codex review,
+/// PR #2762).
+fn type_is_lazy_db(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_lazy_db(&r.elem),
+        Type::Paren(p) => type_is_lazy_db(&p.elem),
+        Type::Group(g) => type_is_lazy_db(&g.elem),
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident == "LazyDb" {
+                return true;
+            }
+            // Unlike `type_is_handle`'s own generic-argument peering (which
+            // accepts *any* wrapper name — a pre-existing characteristic of
+            // that broader "is this some handle" check, left alone here),
+            // this only looks inside a wrapper the analysis knows is
+            // transparent. An arbitrary `Cart<LazyDb>` must not qualify: an
+            // arbitrary type may define its own domain `checkout()`, and
+            // `LazyDb`'s exemption is specifically for the framework
+            // extractor, not for "a `LazyDb` is mentioned somewhere in this
+            // type" (Codex review, PR #2762, round 7).
+            if LAZY_DB_WRAPPERS.contains(&segment.ident.to_string().as_str())
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            {
+                return args.args.iter().any(|arg| match arg {
+                    syn::GenericArgument::Type(inner) => type_is_lazy_db(inner),
+                    _ => false,
+                });
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// The `LazyDb` bindings a handler's signature introduces — a strict subset
+/// of [`signature_handles`].
+fn signature_lazy_db_names(input_fn: &ItemFn) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for arg in &input_fn.sig.inputs {
+        if let syn::FnArg::Typed(typed) = arg
+            && type_is_lazy_db(&typed.ty)
+        {
+            collect_pat_idents(&typed.pat, &mut names);
+        }
+    }
+    names
+}
+
 /// Removes `#[query_cost]` / `#[query_exempt]` from the emitted function: they
 /// are this macro's own vocabulary and mean nothing to rustc.
 struct StripAnnotations;
@@ -1827,7 +2079,10 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return quote! { #input_fn #err };
     }
 
-    let mut analyzer = Analyzer::new(signature_handles(&input_fn));
+    let mut analyzer = Analyzer::new(
+        signature_handles(&input_fn),
+        signature_lazy_db_names(&input_fn),
+    );
     let cost = analyzer.block(&input_fn.block);
 
     let mut errors: Vec<syn::Error> = std::mem::take(&mut analyzer.errors);
@@ -2284,6 +2539,161 @@ mod tests {
                 Ok(render(&rows))
             }
             ",
+        );
+    }
+
+    // ── `LazyDb::checkout` (#2264, Codex review round 3) ───────────────
+
+    #[test]
+    fn lazy_db_checkout_is_free_and_the_checked_out_db_is_tracked() {
+        // The documented idiom: `checkout()` itself costs nothing, and the
+        // `Db` it returns is still tracked, so the one real query after it
+        // is exactly the handler's whole cost.
+        assert_clean(
+            "1",
+            r#"
+            async fn post_comment(lazy_db: LazyDb, form: Form<CommentForm>) -> AutumnResult<&'static str> {
+                let mut db = lazy_db.checkout().await?;
+                posts::table.load(&mut *db).await?;
+                Ok("posted")
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn a_repositorys_own_checkout_method_is_still_counted() {
+        // A `*Repository` is a tracked handle by the same suffix rule as
+        // `PgPostRepository` elsewhere in this file, and "checkout" is a
+        // real domain verb some repository might expose (a Stripe
+        // checkout-completed reconciliation, a cart checkout, ...) —
+        // unrelated to `LazyDb::checkout`'s connection handoff. Zeroing its
+        // cost just because the method name matches would let a real query
+        // dodge the budget (Codex review, PR #2762, round 3).
+        assert_error_contains(
+            "0",
+            r"
+            async fn checkout(repo: CartRepository) -> AutumnResult<Receipt> {
+                let receipt = repo.checkout().await?;
+                Ok(receipt)
+            }
+            ",
+            &["1"],
+        );
+    }
+
+    #[test]
+    fn shadowing_a_lazy_db_with_a_repository_still_counts_its_checkout() {
+        // `lazy_db_names` must clear on shadowing exactly like `handles`
+        // does: rebinding the name to a different, non-`LazyDb` handle must
+        // not leave the old `LazyDb` identity attached to the new value.
+        assert_error_contains(
+            "0",
+            r"
+            async fn h(lazy_db: LazyDb, repo: CartRepository) -> AutumnResult<Receipt> {
+                let lazy_db = repo;
+                let receipt = lazy_db.checkout().await?;
+                Ok(receipt)
+            }
+            ",
+            &["1"],
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_assigned_through_deferred_initialisation_stays_tracked() {
+        // `Expr::Assign` (`selected = lazy_db;`) must update `lazy_db_names`
+        // exactly like a `let` does: the deferred-initialisation idiom
+        // (`let selected; selected = lazy_db;`) is ordinary Rust, and a gap
+        // here would silently reintroduce the same `#[query_budget(1)]`
+        // false rejection round 2 fixed for `let`, just reached through `=`
+        // instead (Codex review, PR #2762, round 4).
+        assert_clean(
+            "1",
+            r"
+            async fn h(lazy_db: LazyDb) -> AutumnResult<Markup> {
+                let selected;
+                selected = lazy_db;
+                let mut db = selected.checkout().await?;
+                let rows = posts::table.load(&mut *db).await?;
+                Ok(render(&rows))
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_selected_through_a_conditional_stays_tracked() {
+        // `expr_is_lazy_db` must mirror `expr_is_handle`'s `Expr::If`/
+        // `Expr::Match`/`Expr::Block` arms, not just `Expr::Path`/`Assign`:
+        // `let selected = if flag { first } else { second };` is sound to
+        // treat as `LazyDb` on *any* arm being one, the same way
+        // `expr_is_handle` already does for a generic handle — real Rust
+        // requires every arm of a value-producing `if` to share one type, so
+        // if either arm is `LazyDb`, both are (Codex review, PR #2762,
+        // round 5).
+        assert_clean(
+            "1",
+            r"
+            async fn h(first: LazyDb, second: LazyDb, flag: bool) -> AutumnResult<Markup> {
+                let selected = if flag { first } else { second };
+                let mut db = selected.checkout().await?;
+                let rows = posts::table.load(&mut *db).await?;
+                Ok(render(&rows))
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_unwrapped_from_a_result_still_tracks_its_checked_out_db() {
+        // A handler that catches extraction failure itself —
+        // `lazy_db: Result<LazyDb, AutumnError>` — is a signature shape
+        // `type_is_lazy_db` already recognizes (mirroring how `type_is_handle`
+        // treats `Result<Db, E>`), so `method_chain`'s root-based cost
+        // exemption already fired for `lazy_db.expect(...).checkout()`
+        // before this fix. But `expr_is_lazy_db` had no `Expr::MethodCall`
+        // arm at all, so `awaited_expr_is_fresh_handle`'s `HANDLE_TRANSITIONS`
+        // check — looking at `checkout`'s *immediate* receiver,
+        // `lazy_db.expect(...)`, not the outer chain's root — never
+        // recognized it as `LazyDb`, so `db` was never tracked as a handle
+        // and every query through it, including this N+1 loop, went
+        // uncounted (Codex review, PR #2762, round 6). Asserts the loop is
+        // now caught rather than that the whole handler is clean, so this
+        // fails loudly if the fix regresses instead of silently compiling.
+        assert_error_contains(
+            "1",
+            r#"
+            async fn h(lazy_db: Result<LazyDb, AutumnError>, ids: Vec<i64>) -> AutumnResult<Markup> {
+                let mut db = lazy_db.expect("lazy db").checkout().await?;
+                for id in &ids {
+                    posts::table.find(*id).first(&mut *db).await?;
+                }
+                Ok(render(&()))
+            }
+            "#,
+            &["loop", "first"],
+        );
+    }
+
+    #[test]
+    fn a_lazy_db_nested_in_an_arbitrary_wrapper_is_not_exempt() {
+        // `type_is_lazy_db`'s generic-argument peering is a *whitelist*
+        // (`LAZY_DB_WRAPPERS`), unlike `type_is_handle`'s own unrestricted
+        // version: `Cart<LazyDb>` still makes `cart` a generic handle (that
+        // broader, pre-existing behaviour is untouched), but must not make
+        // it specifically `LazyDb` — `Cart` may define its own domain
+        // `checkout()`, unrelated to a connection handoff (Codex review,
+        // PR #2762, round 7).
+        assert_error_contains(
+            "0",
+            r"
+            async fn h(cart: Cart<LazyDb>) -> AutumnResult<Receipt> {
+                let receipt = cart.checkout().await?;
+                Ok(receipt)
+            }
+            ",
+            &["1"],
         );
     }
 

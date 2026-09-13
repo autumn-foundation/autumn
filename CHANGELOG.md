@@ -415,6 +415,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password protection across page/feed/API, permalink-structure changes not
   404ing existing URLs, revision restore, export/import idempotence, and a CSRF
   round trip.
+- **`LazyDb`, a lazy database connection extractor (#2264):** `Db` is a
+  `FromRequestParts` extractor. Axum runs it before the body extractor
+  (`Form`, `Json`, `Multipart`, ...) in the same handler. A handler that took
+  both held a pooled connection for as long as the client took to send its
+  body. A slow upload could pin `pool_size` connections and starve every
+  other request. `LazyDb` takes the same argument position but defers the
+  checkout. It records what the checkout will need at extraction time and
+  only takes a connection when the handler calls `LazyDb::checkout`, after
+  the body is already read. `#[commentable]`'s own `post_comment` handler now
+  uses it. Additive: existing `Db` handlers are unaffected.
 
 ### Changed
 
@@ -615,6 +625,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved by full identity rather than by the ambiguous, slug-keyed lookup
   the legacy `parent` field alone needs, so it can no longer be confused
   with an unrelated post sharing that same slug elsewhere in the file.
+- **edge:** a batch of P2/P3 follow-ups deferred from the edge capsule's
+  first slice (#1790/#2243), closing issue #2244:
+  - `EdgeHandler` now checks a sealed `EdgeExtract` whitelist (`Path`,
+    `Query`, `HeaderMap`, `EdgeCache`, and tuples of these) instead of the
+    open `Handler<_, EdgeState>` bound. The open bound let `Extension<T>`
+    (hidden behind a type alias) and the whole-`Request` extractor compile
+    as `#[edge]` handlers, passing locally against the origin and only
+    diverging at the edge — a silent gap the route macro's token-level
+    `Extension` scan could not see.
+  - `autumn-cli`'s edge-route scanner now evaluates `#[cfg(feature = "x")]`
+    (and `not`/`all`/`any` of it) against the crate's own default-feature
+    set, so a defaults-off route no longer forces a spurious WASI-target/
+    capsule-bin demand; and `edge_routes![]` registrations are matched by
+    full qualified path, so `users::show` no longer satisfies the
+    registered-check for an unrelated `admin::show`.
+  - `autumn doctor`'s edge checks now warn instead of silently passing from
+    a virtual workspace root, and resolve the edge-capsule binary from the
+    manifest (`[[bin]]`/`autobins`) instead of only the conventional path.
+  - `EdgeRoute.method` is now validated (wire version 1 is GET-only); a
+    header-multiplicity-only difference no longer produces an empty
+    conformance divergence detail; and the origin now strips the edge
+    lane's internal fallthrough-sentinel header from every response instead
+    of leaking it to a real client on a wiring bug.
+  - The `edge-conformance` CI job no longer compiles the wasm32-wasip1
+    capsule twice into two target-dir subtrees.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

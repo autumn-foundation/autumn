@@ -436,11 +436,12 @@ fn has_extension_param(input_fn: &syn::ItemFn) -> bool {
 /// in the capacity contract (issue #1733).
 ///
 /// Deliberately narrow: only extractors that *are* a handle on the resource,
-/// for the length of the request, are listed. `DeferredDb` is excluded on both
-/// counts — it is `pub(crate)`, so no app author can write it, and its whole
-/// point is *not* holding a connection across the body read. An extractor that merely happens to consult the database on
-/// some paths (`Session`, `Tenant`, `Flags`) is not, because a contract that
-/// over-claims is worse than one that under-claims — see the "provable
+/// for the length of the request, are listed. `LazyDb` (#2264) is excluded:
+/// its whole point is *not* holding a connection across the body read, so
+/// listing it here would claim the very thing it exists to avoid. An
+/// extractor that merely happens to consult the database on some paths
+/// (`Session`, `Tenant`, `Flags`) is not listed either, because a contract
+/// that over-claims is worse than one that under-claims — see the "provable
 /// subset" caveat on `RouteInfo::pools`.
 const POOL_EXTRACTORS: &[(&str, &str)] = &[
     ("CrossShard", "db"),

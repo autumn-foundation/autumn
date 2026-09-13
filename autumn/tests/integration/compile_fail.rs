@@ -376,6 +376,9 @@ fn query_budget_compile_fail_tests() {
     // round 2): `self.conn().await?`, the real shape in
     // `autumn-search/src/postgres.rs`'s `write_documents`.
     t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
+    // `LazyDb::checkout` (PR #2762 review, #2264): `let mut db =
+    // lazy_db.checkout().await?;`, the documented public idiom.
+    t.compile_fail("tests/compile-fail/query_budget_lazy_db_checkout_n_plus_one.rs");
     // The `.expect(...)`/`.unwrap()` idiom `autumn/src/seed.rs` documents as
     // its own canonical usage (PR #2546 review, round 5) — the same
     // accessor-tracking gap as the `?` shape above, for a different
@@ -421,6 +424,8 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     ("agent_authority_job_not_listed", false),
     // A helper handed a tracked handle is opaque, never assumed effect-free.
     ("agent_authority_opaque_helper", false),
+    // Same, through a `Db` obtained via `LazyDb::checkout` (#2264, PR #2762).
+    ("agent_authority_lazy_db_checkout_opaque_helper", false),
     // Including an *associated* one: an uppercase path segment is a shape, not
     // evidence that the callee is framework surface.
     ("agent_authority_opaque_associated_helper", false),
@@ -591,6 +596,10 @@ fn compile_pass_tests_a() {
     // the terminal query, not a handle-refining step (PR #2546 review,
     // round 4) — its result must not be promoted to a handle either.
     t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
+    // `LazyDb::checkout` (PR #2762 review, second round, #2264): the
+    // checkout call itself must not cost a query, or the documented idiom
+    // plus one real query would need `#[query_budget(2)]`.
+    t.pass("tests/compile-pass/query_budget_lazy_db_checkout_excluded_from_budget.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
