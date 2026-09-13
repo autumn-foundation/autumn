@@ -44,6 +44,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`editor_validation_tests`) and 4 new Docker-gated integration tests cover
   the five failure modes, the stale-lock-version regression, and that a
   rejected transition never partially applies.
+- **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
+  `rich_text_area` and its five siblings in `autumn::form` hardcoded English
+  chrome: the toolbar's aria-label, its per-control names and syntax hints,
+  the hint under the editor, and the "Preview" heading. Callers had no way
+  to override this text. A new `RichTextLabels` builder carries all four
+  labels. A `_with_labels` sibling of each existing function
+  (`rich_text_area_with_labels`, `rich_text_area_htmx_with_labels`,
+  `rich_text_area_htmx_with_token_field_with_labels`, and the three
+  `required_*` counterparts) takes one. An app can now translate the
+  editor's chrome without touching the rest of the form. Additive and
+  backward-compatible: every existing function keeps rendering the default
+  English labels unchanged.
+- **`IntoChangeset::into_changeset_with` resolves a validation message by
+  field and code (#2227):** when a `#[validate(...)]` rule has no explicit
+  `message`, an unmessaged rule always produced the hardcoded English
+  `"validation failed: {code}"`. `into_changeset_with` takes a
+  `resolve: impl Fn(&str, &str) -> Option<String>` closure. `resolve` runs
+  first: return `Some(message)` to supply a translated message for a
+  `(field, code)` pair, or `None` to keep the default. An explicit `message`
+  on the validator attribute always wins; the resolver never sees it.
+  `into_changeset` is unchanged and keeps producing the same default
+  messages as before.
+- **Translatable state-transition controls via `TransitionLabels` (#2227):**
+  `autumn::widgets::transition_controls` built its group aria-label
+  (`"{field} transitions"`) and every button's `"Mark as {state}"` inside
+  itself, from positional arguments that carried no label seam. A new
+  `TransitionLabels` builder carries a group label plus `(target_state, label)`
+  overrides, and `transition_controls_with_labels` takes one. Additive and
+  backward-compatible: `transition_controls` renders exactly as before, and a
+  state with no override keeps its English default.
+- **`autumn generate scaffold --i18n` now translates the last three English
+  surfaces (#2227):** the flag used to warn about three gaps. A `richtext`
+  column's editor chrome, a `:states(…)` column's transition buttons, and
+  every inline `#[validate(...)]` message stayed English next to a
+  translated label. All three now go through the bundle. The rich-text
+  editor gets `common.richtext.toolbar` / `.hint` / `.preview` plus one key
+  per toolbar control (the Markdown syntax beside each name stays literal).
+  The transition controls get `<model>.field.<column>.transitions` and one
+  `<model>.field.<column>.transition.<state>` per distinct target state.
+  The `create`/`update` handlers build their changeset with
+  `into_changeset_with`, resolving each validator code through
+  `<model>.field.<column>.error.<code>`. Every English default is the exact
+  text the plain scaffold renders today, so an `en` app is unchanged, and
+  output without `--i18n` is byte-identical. One gap remains: the CSV
+  import report. `import_csv` runs its row handler per line, with no
+  request locale. `--import` with `--validate` under `--i18n` still shows
+  English messages there.
 - **Mutual TLS: client-certificate verification on the native listener (#1640):**
   a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
   not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
@@ -367,6 +414,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
+  CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
+  `csrf.rs` and `submit_token.rs` each carried a byte-identical private
+  `find_bytes`/`scan_multipart_field` pair — a hand-rolled scan for a named
+  field's value in a buffered `multipart/form-data` body, needed because
+  reading ahead for the CSRF/submit token must not disturb the handler's own
+  `Multipart` extraction downstream. History showed this pair needs to stay
+  in lockstep: a Content-Type case-sensitivity bug was fixed in
+  `submit_token.rs` and, a day later, the identical bug had to be
+  independently rediscovered and fixed in `csrf.rs` ("Mirrors the
+  submit-token replay-guard fix"). Both functions now live once in the new
+  `pub(crate) mod multipart_scan`, called identically from both guards with
+  no adaptation at either call site. Characterization tests (committed
+  first, passing unchanged against the pre-merge duplicated code) now live
+  with the merged function; behavior is unchanged — internal-only, no public
+  API surface.
+
 - **Docs gate: the drift gates must now agree on which pages are reader-facing
   [no-plugin].**
   `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
@@ -489,6 +553,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
+  recognizes a `[dependencies.autumn_web]` subtable that renames the package
+  back with `package = "autumn-web"` (Cargo's underscore-normalized table key
+  plus the explicit rename it requires — Cargo does not treat `-`/`_` as
+  interchangeable in a dependency table key on its own). Before this fix, a
+  project declaring `autumn-web` this way silently kept the `mail` feature
+  unset after `autumn generate auth --mail`, with no error — the generated
+  mail routes would then fail to compile.
+- **query strings:** an append (`tags[]=`) after an out-of-range explicit
+  index no longer sorts wrong or collides with it (#2253). `Segment::Index`
+  saturates an absurd index to `usize::MAX` for ordering only; an append
+  derived its position from `saturating_add(1)` on the current maximum, so
+  once that maximum was already `usize::MAX` the append could not advance
+  past it. Two symptoms followed: the append's canonical raw spelling then
+  lost a lexicographic tiebreak against the explicit spelling (wrong order),
+  and when the explicit index was spelled as literally `usize::MAX` the two
+  keys were byte-identical and merged into one node (a spurious duplicate-value
+  error for a scalar field, or a silent collapse of two elements into one for
+  a nested sequence). `SeqKey`'s tiebreak is now a `SeqKeyTie` enum —
+  `Explicit(raw)` or `Appended(insert_count)` — instead of a plain string, so
+  an append can never byte-match an explicit index, and two appends at a
+  saturated position stay distinct via their insert count. The same collision
+  also reached a `Node::Seq` promoted to a named object (mixing `k[N]=` with
+  `k[name]=`): an append there recomputed a decimal key that could byte-match
+  a saturated explicit key already in the map. That path now probes for a
+  free key instead of reusing one.
+- **testing:** every MinIO testcontainer (`autumn-cli`'s offsite-backup
+  suite, `autumn-web`'s `sqlite_replication_s3`, and the `reddit-clone`
+  example's avatar S3 test) now pulls from `quay.io/minio/minio` instead of
+  `testcontainers-modules` 0.15.0's hardcoded `docker.io/minio/minio`
+  default. MinIO Inc. pulled the `minio/minio` repository from Docker Hub in
+  2025 as part of a licensing change, so every one of these tests failed in
+  CI with a "pull access denied ... repository does not exist" error on the
+  pinned tag `RELEASE.2025-02-28T09-55-16Z` — not a flake, and not fixable
+  by retrying. `testcontainers-modules` 0.15.0 (the latest published
+  version) still hardcodes the dead Docker Hub image, so each call site now
+  overrides just the registry/owner via `ImageExt::with_name`; quay.io still
+  serves the exact same tag and digest, so no other behavior changes.
+- **auth:** confirmed, with new end-to-end tests, that stacking
+  `#[secured("admin")]` with `#[authorize(...)]` never emits two idempotency
+  replay guards in either attribute order (issue #2233). `#[secured]`'s
+  checks moved into a sibling `FromRequestParts` gate item well before this
+  investigation (issue #1668), so `should_own_replay`'s existing
+  `has_pending_authorize_attr`/`has_any_guard_gate_param` checks already
+  keep the two guards from double-claiming replay-serving — no scan or
+  runtime behavior needed to change. The new tests run real
+  `secured_macro`/`authorize_macro` output through both stacking orders and
+  assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
+  the final program, closing out the issue's suggested composition-test
+  coverage.
+- **repository:** `retention(...)` and `upsert_many` no longer bypass
+  `position(...)`'s single-row batching guard (#2240). A `#[repository(...,
+  position(...), retention(after = ...))]` sweep could batch several
+  same-scope rows into one DELETE/UPDATE statement — each row's compaction
+  trigger only sees its own pre-statement position, so a sweep could leave a
+  gap in the ordered sequence, the same root cause already fixed for
+  `delete_many`/`update_many` (#1358). `retention(...)` now rejects
+  `position(...)` at compile time (mirroring the existing `sharded`/
+  `dependent(...)` rejections) rather than risk corrupting the sequence.
+  Separately, `upsert_many`'s generated `INSERT ... ON CONFLICT DO UPDATE`
+  chunking could reassign several same-scope rows' `position` scope column
+  in one statement, hitting the identical race already fixed for
+  `update_many`'s scope reassignment. `upsert_many` now forces a chunk size
+  of 1 whenever the repository declares `position(...)`, matching
+  `delete_many`/`update_many`'s existing fix.
+- **ci:** confirmed the workspace and the SQLite-runtime lane pass
+  `cargo clippy -- -D warnings` clean on the runners' current stable
+  (rustc 1.98.1), on a cold cache (issue #2252). The four lint categories
+  the issue named were already fixed or grandfathered in earlier PRs, with
+  no link back to the issue — `unused_async_trait_impl` carries a scoped,
+  commented `[workspace.lints.clippy]` allow in the root `Cargo.toml`; the
+  other three carry local `#[allow(...)]` annotations with the same
+  rationale pattern. This closes the one open acceptance criterion: a
+  decision recorded on toolchain pinning. The lint lanes track `stable` on
+  purpose, to catch a new lint close to when it lands. The separate `msrv`
+  job keeps its own 1.88.0 pin for the compile floor.
+- **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
+  `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
+  one opaque `style: form, explode: true` parameter for the whole struct
+  (issue #2251). Each field gets the `style` that actually matches how the
+  `query_string` decoder reads it: `form`/`explode` for a scalar or
+  scalar-array field (unchanged from before), `deepObject` for a nested-object
+  field (`?filter[status]=open`). An array-of-objects field
+  (`?items[0][sku]=A-1`) has no OpenAPI `style` to carry — that parameter now
+  names the bracketed encoding in its `description` instead of silently
+  mis-describing it. Each parameter's `required` also now reflects the real
+  field — a non-`Option` field can be `required: true` — where the old
+  whole-struct parameter was always `required: false`. A `Query<T>` whose `T`
+  does not derive `OpenApiSchema` is unaffected: its fields cannot be read, so
+  it keeps the previous whole-struct parameter with no spec churn. MCP
+  `tools/call` dispatch is unaffected either way — it already renders the
+  bracketed form directly.
+  **Breaking:** `openapi::Parameter` (public, not `#[non_exhaustive]`) carries
+  a new `description` field. It now derives `Default`, so end a struct-literal
+  built outside this crate with `..Default::default()` rather than listing
+  every field. See the [migration guide](docs/migrations/next.md#openapi-parameter-gains-a-description-field).
+- **`cms` starter: the WordPress-style `[[tag]]` escape no longer leaves a
+  stray trailing `]` in rendered content.** `shortcodes::expand` collapsed the
+  opening `[[` to `[` but never consumed the matching second `]` at the close,
+  so `[[gallery]]` rendered as `[gallery]]` on the live page and in the Atom
+  feed — silently, with no error anywhere in the authoring flow. A paired
+  escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
+  the module's own "same syntax WordPress does" claim, and still suppresses
+  expansion of the inner shortcode (#2678).
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
@@ -498,6 +666,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "app" task definition when registering the real image, so a narrower
   migrate secret list silently stripped the signing secret from every real
   app deploy, and the app failed fast on startup.
+- **ci:** the `minio` testcontainer used by the offsite-backup, S3-replication,
+  and avatar-blob-store Docker-dependent tests now pulls from
+  `quay.io/minio/minio` instead of the default `minio/minio`. Docker Hub
+  started refusing anonymous pulls of `minio/minio` in 2025, so every
+  unauthenticated CI runner failed these tests with "pull access denied"
+  regardless of the change under test; `quay.io/minio/minio` mirrors the same
+  release tags and stays public.
+- **cli:** `autumn upgrade` bounds the two approximations behind its codemod
+  safety posture (issue #2234, follow-up to #2231). `0.6.0-repository-with-pool-untracked`
+  now ships as `review` rather than `auto`: it still rewrites every call site,
+  but flags each one, since receiver identification is textual and can be
+  fooled by a hand-written type or a `#[repository]` from another crate. A
+  hand-written type declared inside a function body no longer vouches
+  module-wide against a call elsewhere in the file — the same block-scope fix
+  already applied to generated repository types. `configured_target_dirs` now
+  asks `cargo metadata --no-deps` for the app's build-output directory
+  instead of hand-rolling Cargo's config resolution, falling back to the
+  hand-rolled walk when the subprocess is unavailable; vendor-directory and
+  nested-crate resolution are unchanged, since `cargo metadata` reports
+  neither.
 - **auth:** `api_token_error_response` now renders through the canonical
   problem classification — the rendered status/problem type (including the
   query-timeout reclassification) and the validation field map — instead of
@@ -718,6 +906,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Constela]: https://github.com/yuuichieguchi/constela
 
+- **Duplicate-name checker now enumerates auto-discovered bins and runs in an
+  enforced gate (#2690, #2691):** `scripts/check-example-bin-names.sh` — the
+  LNK1104 manifest gate from #2639 — returned early whenever a member declared
+  any explicit `[[bin]]`, on the false premise that an explicit `[[bin]]`
+  disables auto-discovery. It does not: unless `[package] autobins = false`,
+  cargo still builds `src/bin/*.rs` and `src/bin/*/main.rs` alongside the
+  explicit entries, so a member with one explicit bin could add a colliding
+  auto-discovered helper and the checker would report success (#2690). The
+  checker now enumerates both classes — honoring `autobins = false`, covering
+  the `src/bin/<name>/main.rs` form, and excluding only paths an explicit
+  `[[bin]]` actually claims (its `path`, or the default
+  `src/bin/<name>.rs`) — plus the package-named `src/main.rs` binary cargo
+  auto-discovers (a review finding: an explicit `[[bin]]` named like another
+  member's package would otherwise collide on the linker output undetected) —
+  and carries a synthetic `--self-test` (13 cases) that
+  the default invocation runs first, matching the other manifest gates. The
+  member enumeration also covers in-tree path dependencies cargo
+  auto-includes as workspace members even when `[workspace].members` does not
+  name them (honoring `[workspace].exclude`; a second review finding). The
+  checker was previously invoked by nothing — no workflow, no pre-push script,
+  no test — so a reintroduced duplicate would have passed every enforced check
+  (#2691): it now runs in the CI `lint` job and is mirrored in
+  `scripts/pre-push-check.sh` alongside the other manifest gates. No toolchain,
+  ~1 second.
 - **Removed dead `autumn/templates/build.rs.template` (#2694):** an
   unreferenced leftover from before the Tailwind build script moved to
   `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
