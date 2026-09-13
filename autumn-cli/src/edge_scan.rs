@@ -3275,6 +3275,24 @@ fn skip_cfg_excluded_statement(
     // `>`/`<` operators with no matching partner, and clamping keeps a
     // later, real top-level comma or semicolon recognized regardless (Codex
     // review on #2739, round 44, P2).
+    //
+    // A semicolon always terminates regardless of depth (round 45, P2), but
+    // a comma cannot: a genuine top-level comma DOES legitimately occur
+    // inside a real, still-open generic/turbofish argument list
+    // (`Result<(), ()>`, `foo::<A, B>()`), so comma-termination still needs
+    // real depth tracking. Simply counting every `<`/`>` (as semicolons can
+    // get away with) reintroduces the same eternal-lock bug in the other
+    // direction: an unmatched comparison `<` with no partner anywhere ahead
+    // (`#[cfg(false)] 0 => 1 < 2,`) would raise depth forever and swallow
+    // every following, still-active match arm's own comma — verified
+    // directly via a real build that this arm shape compiles fine and a
+    // following arm remains real Rust. So `<`/`>` only affect `angle_depth`
+    // here when `matched_angle_bracket_positions` confirms they belong to an
+    // actual matched pair somewhere in the remaining tokens; a stray,
+    // never-closed `<` (or a stray `>` with no opener, e.g. from `1 > 2`) is
+    // just an ordinary pass-through token instead (Codex review on #2739,
+    // round 46, P2).
+    let matched_angles = matched_angle_bracket_positions(trees, attrs_end);
     let mut i = attrs_end;
     let mut angle_depth: u32 = 0;
     while i < trees.len() {
@@ -3284,11 +3302,11 @@ fn skip_cfg_excluded_statement(
                     matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>');
                 i += usize::from(is_arrow) + 1;
             }
-            TokenTree::Punct(p) if p.as_char() == '<' => {
+            TokenTree::Punct(p) if p.as_char() == '<' && matched_angles.contains(&i) => {
                 angle_depth += 1;
                 i += 1;
             }
-            TokenTree::Punct(p) if p.as_char() == '>' => {
+            TokenTree::Punct(p) if p.as_char() == '>' && matched_angles.contains(&i) => {
                 angle_depth = angle_depth.saturating_sub(1);
                 i += 1;
             }
@@ -3320,6 +3338,53 @@ fn skip_cfg_excluded_statement(
         }
     }
     Some(i)
+}
+
+/// The set of token indices, within `trees[start..]`, that are one half of a
+/// genuinely matched `<`/`>` pair — computed with the standard stack-based
+/// bracket-matching algorithm (push each `<`, pop on `>`; a `>` with nothing
+/// to pop, and any `<` left on the stack at the end, are both stray and
+/// excluded), so an ordinary comparison/shift operator with no matching
+/// partner anywhere ahead is never mistaken for one half of an open generic
+/// argument list. `->` is skipped as the atomic two-token unit it is, the
+/// same way every other generics-aware scan in this file treats it, so its
+/// own `>` half is never treated as a stray closer. A match arm's own `=>`
+/// is skipped the identical way: its `>` half sits at the exact position a
+/// later, real arm's fat arrow can otherwise "close" an earlier stray `<`
+/// from a still-active comparison in a PRECEDING excluded arm — verified
+/// directly against a real failure this introduced (a cfg'd-out `0 => 1 <
+/// 2,` arm's stray `<` spuriously paired with the very next arm's own `=>`,
+/// which then wrongly reads as this loop's OWN closing `>` and drops the
+/// following arm's real registration along with the excluded one). Scoped
+/// to `start` rather than the whole token stream so a `<`/`>` from an
+/// earlier, already-handled statement can never spuriously pair with one in
+/// the region the caller is currently scanning (Codex review on #2739,
+/// round 46, P2).
+fn matched_angle_bracket_positions(trees: &[TokenTree], start: usize) -> BTreeSet<usize> {
+    let mut matched = BTreeSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut i = start;
+    while i < trees.len() {
+        match trees.get(i) {
+            Some(TokenTree::Punct(p))
+                if (p.as_char() == '-' || p.as_char() == '=')
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
+            {
+                i += 2;
+                continue;
+            }
+            Some(TokenTree::Punct(p)) if p.as_char() == '<' => stack.push(i),
+            Some(TokenTree::Punct(p)) if p.as_char() == '>' => {
+                if let Some(open) = stack.pop() {
+                    matched.insert(open);
+                    matched.insert(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    matched
 }
 
 /// The end of a block-like control-flow statement (`if`/`match`/`while`/
@@ -3396,8 +3461,19 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                 // preceded by the literal keyword `async` in valid Rust
                 // grammar (there is no "async if"), so this cannot misfire
                 // on a real body either (Codex review on #2739, round 45,
-                // P2).
+                // P2). An `async move { .. }` block (also real, valid Rust,
+                // verified directly) inserts `move` between the keyword and
+                // the brace, so the brace is preceded by `move`, not `async`
+                // directly, and needs the identical two-token lookback
+                // (Codex review on #2739, round 46, P2).
                 if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "async")
+                {
+                    i += 1;
+                    continue;
+                }
+                if i > 1
+                    && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "move")
+                    && matches!(trees.get(i - 2), Some(TokenTree::Ident(id)) if id == "async")
                 {
                     i += 1;
                     continue;
@@ -9097,6 +9173,45 @@ mod tests {
         assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 
+    /// A cfg'd-out match arm ending in a bare comparison (`0 => 1 < 2,`) —
+    /// real, valid Rust verified directly via a real build — has an
+    /// unmatched `<` with no closing `>` anywhere ahead, the same shape that
+    /// broke semicolon-termination in round 45. Unlike a semicolon, a comma
+    /// still needs real angle-bracket depth tracking (a comma legitimately
+    /// occurs inside an open turbofish/generic argument list), so simply
+    /// making commas ignore depth entirely — round 45's semicolon fix —
+    /// would silently break `Result<(), ()>`. `matched_angle_bracket_positions`
+    /// instead confirms `<`/`>` belong to a real matched pair before they
+    /// affect depth, so a stray, never-closed `<` no longer raises it
+    /// forever and swallows the following, still-active arm's own
+    /// registration (Codex review on #2739, round 46, P2).
+    #[test]
+    fn cfg_false_match_arm_with_unmatched_comparison_operator_does_not_swallow_the_next_arm() {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            fn wire(x: i32) {
+                match x {
+                    #[cfg(feature = "premium")]
+                    0 => 1 < 2,
+                    _ => edge_routes![crate::show],
+                };
+            }
+            "#,
+            &[],
+        );
+        assert_eq!(
+            scan.registered_fns().len(),
+            1,
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.registered_fns()[0].name, "show");
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
+    }
+
     /// An async block used in the condition or scrutinee (`if async {
     /// predicate().await }.await { .. }`) has its OWN brace group
     /// immediately preceded by the `async` keyword itself — verified
@@ -9117,6 +9232,41 @@ mod tests {
             async fn wire() {
                 #[cfg(feature = "premium")]
                 if async { predicate().await }.await {
+                    edge_routes![crate::show];
+                }
+            }
+            "#,
+            &[],
+        );
+        assert!(
+            scan.registered_fns().is_empty(),
+            "{:?}",
+            scan.registered_fns()
+        );
+        assert_eq!(scan.unregistered().len(), 1, "{:?}", scan.unregistered());
+        assert_eq!(scan.unregistered()[0].name, "show");
+    }
+
+    /// `async move { .. }` (a moving async block) used in the condition or
+    /// scrutinee (`if async move { true }.await { .. }`, real, valid Rust —
+    /// verified directly via a real build) inserts `move` between the
+    /// keyword and the brace, so the brace is preceded by `move`, not
+    /// `async` directly. The round-45 async-block fix only checked for
+    /// `async` immediately preceding the brace, so it missed this shape and
+    /// mistook the condition block for the real body, leaving the actual
+    /// body an ordinary, unexcluded sibling group that credited `show`
+    /// (Codex review on #2739, round 46, P2).
+    #[test]
+    fn cfg_false_if_with_async_move_block_condition_does_not_leak_its_body_as_a_separate_statement()
+    {
+        let scan = scan_one_with_features(
+            r#"
+            #[edge]
+            pub fn show() {}
+
+            async fn wire() {
+                #[cfg(feature = "premium")]
+                if async move { true }.await {
                     edge_routes![crate::show];
                 }
             }
