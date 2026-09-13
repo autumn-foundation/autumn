@@ -603,7 +603,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an already-completed legacy parent's own expected parent is now bounded
   the same way every other ancestry walk in this module is, so a
   hand-edited file naming two pre-upgrade pages as each other's parent can
-  no longer hang the import.
+  no longer hang the import. Picking among a pre-upgrade site's old, bare
+  marker candidates now checks every candidate's real parent before falling
+  back to an unfinished one, so two unfinished rows left by an interrupted
+  run under the same bare marker but different parents are no longer
+  conflated on retry.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

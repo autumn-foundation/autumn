@@ -958,31 +958,38 @@ fn resolved_post_id<'a>(
     })
 }
 
-/// The first marker candidate whose real parent still agrees with
-/// `parent_now`, among rows sharing an ambiguous, pre-`stable_identity` bare
-/// marker.
+/// The marker candidate whose real parent agrees with `parent_now`, among
+/// rows sharing an ambiguous, pre-`stable_identity` bare marker. Falls back
+/// to an unfinished candidate only when none agrees.
 ///
 /// A bare key predates qualified markers, so it can genuinely name more than
-/// one real page — every candidate it lists is tried, not just the first
-/// one loaded. An unfinished candidate is trusted regardless: the ancestry
-/// pass below still has to place it. Only a finished one needs its parent
-/// checked, since only then does "this row is settled" mean anything to
-/// compare.
+/// one real page — every candidate it lists is tried, not just the first one
+/// loaded. A parent match is checked across *all* candidates first: two
+/// unfinished rows can share one bare marker under different parents (an
+/// import interrupted right after creating both), and picking whichever one
+/// is unfinished first — without checking whether a later candidate actually
+/// matches — pairs the file's post with the wrong row. Only once no
+/// candidate matches does "unfinished" serve as a fallback, since the
+/// ancestry pass below still has to place such a row anyway.
 async fn pick_marker_candidate(
     repos: &Repos,
     candidates: &[i64],
     completed_imports: &std::collections::HashSet<i64>,
     parent_now: Option<i64>,
 ) -> AutumnResult<Option<crate::models::Post>> {
+    let mut first_unfinished = None;
     for &id in candidates {
         let Some(candidate) = repos.posts.find_by_id(id).await? else {
             continue;
         };
-        if !completed_imports.contains(&candidate.id) || candidate.parent_id == parent_now {
+        if candidate.parent_id == parent_now {
             return Ok(Some(candidate));
         }
+        if first_unfinished.is_none() && !completed_imports.contains(&candidate.id) {
+            first_unfinished = Some(candidate);
+        }
     }
-    Ok(None)
+    Ok(first_unfinished)
 }
 
 /// A stored post of `post_type` whose own identity matches, if there is one.

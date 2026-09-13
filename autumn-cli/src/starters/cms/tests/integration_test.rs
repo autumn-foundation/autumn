@@ -11941,6 +11941,99 @@ async fn re_importing_a_backup_recognizes_both_sides_of_a_pre_upgrade_bare_colli
     client.get("/b/team").send().await.assert_ok();
 }
 
+/// Two *unfinished* pre-upgrade rows can share the same old, bare marker
+/// under different parents — an import interrupted right after creating
+/// both, before either got its completion marker. Retrying must pair each
+/// file post with the row under its own real parent, not whichever
+/// unfinished row a query happens to return first.
+///
+/// `pick_marker_candidate` used to accept the first unfinished candidate
+/// outright, without checking whether a later one actually matches the
+/// parent. That paired the wrong row, reapplying one file post's terms and
+/// ancestry to the other page's row and leaving the true match untouched.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_prefers_the_unfinished_candidate_with_the_matching_parent() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Notes", "slug": "notes", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Notes", "slug": "notes", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+    client.get("/a/notes").send().await.assert_ok();
+    client.get("/b/notes").send().await.assert_ok();
+
+    // Downgrade both `Notes` rows to the same old, pre-upgrade bare marker,
+    // and strip their completion marker — as if this importer had been
+    // interrupted right after creating both, before either was finished.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let notes_ids: Vec<i64> = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("notes"))
+            .select({{crate_name}}::schema::posts::id)
+            .load(&mut conn)
+            .await
+            .expect("both notes rows");
+        assert_eq!(notes_ids.len(), 2, "two Notes rows");
+        for id in &notes_ids {
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq("notes"))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+            diesel::delete(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_COMPLETED_KEY),
+                    ),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("strip the completion marker");
+        }
+    }
+
+    // The same backup again. Each Notes row must be recognized under its
+    // own real parent, not merged into one row under the other's parent.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 4 already present");
+
+    sign_out(&client);
+    client.get("/a/notes").send().await.assert_ok();
+    client.get("/b/notes").send().await.assert_ok();
+}
+
 /// A new, genuinely top-level page must not be dropped merely because a
 /// pre-upgrade site already has a completed, *nested* page whose old, bare
 /// marker happens to equal that same slug.
