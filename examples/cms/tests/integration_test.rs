@@ -12034,6 +12034,159 @@ async fn re_importing_a_backup_prefers_the_unfinished_candidate_with_the_matchin
     client.get("/b/notes").send().await.assert_ok();
 }
 
+/// A new, genuinely top-level page must not be paired with an *unfinished*,
+/// nested pre-upgrade row that happens to share its bare marker.
+///
+/// `pick_marker_candidate`'s "trust an unfinished candidate" fallback only
+/// makes sense for a post that is itself nested: an unfinished row is
+/// trusted because its own ancestry has not settled yet. A genuinely
+/// top-level post can never need that excuse, so it must not be paired with
+/// somebody else's unsettled nested row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_new_top_level_page_is_not_paired_with_an_unfinished_nested_marker() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let first = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, first.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("2 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+
+    // Downgrade the nested `Team` row to the old, pre-upgrade bare marker,
+    // and strip its completion marker — as if that import had been
+    // interrupted right after creating it.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(
+                    cms::schema::post_meta::post_id.eq_any(
+                        cms::schema::posts::table
+                            .filter(cms::schema::posts::slug.eq("team"))
+                            .select(cms::schema::posts::id),
+                    ),
+                )
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("team"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+        diesel::delete(
+            cms::schema::post_meta::table
+                .filter(
+                    cms::schema::post_meta::post_id.eq_any(
+                        cms::schema::posts::table
+                            .filter(cms::schema::posts::slug.eq("team"))
+                            .select(cms::schema::posts::id),
+                    ),
+                )
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_COMPLETED_KEY)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("strip the completion marker");
+    }
+
+    // A distinct, genuinely top-level page that only happens to share the
+    // nested row's bare slug.
+    let second = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, second.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/team").send().await.assert_ok();
+    client.get("/a/team").send().await.assert_ok();
+}
+
+/// A single-segment parent reference derived from an explicit `path` prefix
+/// names one specific post — not any post that happens to share that slug.
+///
+/// `path: "b/c"` gives a one-segment parent identity `b`, indistinguishable
+/// by content alone from the legacy `parent: "b"` field. `FileGraph::find`
+/// used to route every single-segment reference through the ambiguous,
+/// slug-keyed index regardless of which field produced it, so a payload
+/// naming both a top-level `b` and a nested `a/b` could resolve `c`'s parent
+/// to whichever `b` was inserted first — not necessarily the one `path`
+/// actually named.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_path_derived_single_segment_parent_resolves_by_full_identity() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "a"},
+            // Nested `b`, listed before the top-level one, so a slug-keyed
+            // lookup that ignores which post actually declared `path: "b"`
+            // would find this row first.
+            {"post_type": "page", "title": "Nested B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": "",
+             "path": "a/b"},
+            // Already occupies slug `c` under the nested `b`, so a
+            // misresolved parent forces the real `C` below into a suffix.
+            {"post_type": "page", "title": "Decoy C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": "",
+             "path": "a/b/c"},
+            {"post_type": "page", "title": "Top B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": "",
+             "path": "b"},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": "",
+             "path": "b/c"}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("5 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    client.get("/b/c").send().await.assert_ok();
+}
+
 /// A new, genuinely top-level page must not be dropped merely because a
 /// pre-upgrade site already has a completed, *nested* page whose old, bare
 /// marker happens to equal that same slug.

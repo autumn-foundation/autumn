@@ -651,33 +651,54 @@ fn identity(post: &ExportPost) -> String {
     post.path.clone().unwrap_or_else(|| post.slug.clone())
 }
 
+/// A post's declared parent reference, and which field named it.
+///
+/// `path`'s own prefix is the parent's full, exact identity, even when it is
+/// only one segment — a one-segment prefix still names one specific
+/// top-level post, not any post sharing that slug. The legacy `parent`
+/// field has no such precision: it only ever held a bare slug, ambiguous
+/// with any other post carrying it.
+enum ParentRef {
+    Path(String),
+    Bare(String),
+}
+
+impl ParentRef {
+    fn as_str(&self) -> &str {
+        match self {
+            ParentRef::Path(id) | ParentRef::Bare(id) => id,
+        }
+    }
+}
+
 /// The identity of a post's parent, as the file describes it.
 ///
 /// For a version-4 page this is the path's own prefix, which is unambiguous.
 /// For an older file it is the bare parent slug, which is the best that file
 /// can say — and was unambiguous under the schema that wrote it.
-fn parent_identity(post: &ExportPost) -> Option<String> {
+fn parent_identity(post: &ExportPost) -> Option<ParentRef> {
     if let Some(path) = &post.path {
         let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         segments.pop();
-        return (!segments.is_empty()).then(|| segments.join("/"));
+        return (!segments.is_empty()).then(|| ParentRef::Path(segments.join("/")));
     }
-    post.parent.clone()
+    post.parent.clone().map(ParentRef::Bare)
 }
 
 /// Indexes into a file's own posts, for resolving a `parent_identity()`
 /// reference to the post it names without scanning the whole file.
 ///
-/// Two different fields can carry that reference, and they name a post two
-/// different ways. A multi-segment reference is only ever a child's own
-/// explicit `path` prefix, so it can only match another post's own full
-/// `identity()` — `by_identity` is keyed on that. A bare, single-segment
-/// reference is the legacy `parent` field's only shape, and names a post by
-/// its *slug* alone, whether or not that post itself carries a `path`:
-/// `path: "a/b"` and a bare `parent: "b"` both mean the page slugged `b` —
-/// `by_slug` is keyed on that instead. Using `by_identity` for a bare
-/// reference misses a path-carrying post entirely, since its full identity
-/// is never just its slug.
+/// `ParentRef` says which of the two ways to look a reference up, not its
+/// segment count: a `path` prefix is always the parent's full, exact
+/// identity — even a lone segment, when that parent is itself top-level —
+/// so it can only match another post's own `identity()`; `by_identity` is
+/// keyed on that. A bare `parent` field names a post by its *slug* alone,
+/// whether or not that post itself carries a `path`: `path: "a/b"` and a
+/// bare `parent: "b"` both mean the page slugged `b` — `by_slug` is keyed on
+/// that instead. Routing a `Path` reference through `by_slug` risked
+/// matching the wrong post whenever two posts shared a slug; using
+/// `by_identity` for a `Bare` one misses a path-carrying post entirely,
+/// since its full identity is never just its slug.
 struct FileGraph<'a> {
     by_identity: std::collections::HashMap<(&'a str, String), usize>,
     by_slug: std::collections::HashMap<(&'a str, &'a str), usize>,
@@ -701,13 +722,10 @@ impl<'a> FileGraph<'a> {
         }
     }
 
-    fn find(&self, post_type: &str, parent: &str) -> Option<usize> {
-        if parent.contains('/') {
-            self.by_identity
-                .get(&(post_type, parent.to_owned()))
-                .copied()
-        } else {
-            self.by_slug.get(&(post_type, parent)).copied()
+    fn find(&self, post_type: &str, parent: &ParentRef) -> Option<usize> {
+        match parent {
+            ParentRef::Path(id) => self.by_identity.get(&(post_type, id.clone())).copied(),
+            ParentRef::Bare(slug) => self.by_slug.get(&(post_type, slug.as_str())).copied(),
         }
     }
 }
@@ -939,7 +957,7 @@ fn resolved_post_id<'a>(
                     Some(parent_index) => {
                         resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
                     }
-                    None => find_local(import.repos, &post.post_type, &parent)
+                    None => find_local(import.repos, &post.post_type, parent.as_str())
                         .await?
                         .map(|found| found.id),
                 },
@@ -971,6 +989,14 @@ fn resolved_post_id<'a>(
 /// matches — pairs the file's post with the wrong row. Only once no
 /// candidate matches does "unfinished" serve as a fallback, since the
 /// ancestry pass below still has to place such a row anyway.
+///
+/// That fallback only makes sense when this file's own post is itself
+/// nested (`parent_now` is `Some`): an unfinished row is trusted precisely
+/// because its own ancestry has not settled yet, and could still land where
+/// this post needs it to. A genuinely top-level post (`parent_now` is
+/// `None`) can never need that excuse — nothing about "not yet nested" ever
+/// applies to it — so it must not be paired with somebody else's unsettled
+/// nested row merely because that row happens to share its bare marker.
 async fn pick_marker_candidate(
     repos: &Repos,
     candidates: &[i64],
@@ -985,7 +1011,10 @@ async fn pick_marker_candidate(
         if candidate.parent_id == parent_now {
             return Ok(Some(candidate));
         }
-        if first_unfinished.is_none() && !completed_imports.contains(&candidate.id) {
+        if parent_now.is_some()
+            && first_unfinished.is_none()
+            && !completed_imports.contains(&candidate.id)
+        {
             first_unfinished = Some(candidate);
         }
     }
@@ -1276,13 +1305,13 @@ pub async fn import(
                     };
                     resolved_post_id(&import, &mut stable_memo, parent_index, 0).await?
                 }
-                None => match find_local(&repos, &post.post_type, &parent)
+                None => match find_local(&repos, &post.post_type, parent.as_str())
                     .await?
                     .map(|found| found.id)
                 {
                     Some(id) => Some(id),
                     None => imported_source_slugs
-                        .get(&(post.post_type.clone(), parent))
+                        .get(&(post.post_type.clone(), parent.as_str().to_owned()))
                         .and_then(|ids| ids.first())
                         .copied(),
                 },
@@ -1410,7 +1439,7 @@ pub async fn import(
                 ours.id,
                 post.post_type.clone(),
                 file_identity.clone(),
-                parent_identity(post),
+                parent_identity(post).map(|p| p.as_str().to_owned()),
             ));
             continue;
         }
@@ -1588,7 +1617,7 @@ pub async fn import(
             created_id,
             post.post_type.clone(),
             file_identity.clone(),
-            parent_identity(post),
+            parent_identity(post).map(|p| p.as_str().to_owned()),
         ));
         restored += 1;
     }
