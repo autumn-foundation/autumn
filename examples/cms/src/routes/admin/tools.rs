@@ -1048,20 +1048,27 @@ fn resolved_post_id<'a>(
         // resolves any other: recursively, through this same function, for
         // one already declared in this file, or against local content
         // otherwise. Needed below regardless of which fallback applies, so
-        // resolved once rather than twice.
+        // resolved once rather than twice. Bounded the same way every other
+        // ancestry walk in this module is: a cyclic legacy chain must stop
+        // recursing here, before it ever reaches the recursive call, or it
+        // never terminates.
         let parent = parent_identity(post);
         let in_file_parent = parent
             .as_ref()
             .and_then(|parent| import.graph.find(post.post_type.as_str(), parent));
-        let parent_now = match (&parent, in_file_parent) {
-            (Some(_), Some(parent_index)) => {
-                resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
+        let parent_now = if depth <= content::MAX_PAGE_DEPTH + 2 {
+            match (&parent, in_file_parent) {
+                (Some(_), Some(parent_index)) => {
+                    resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
+                }
+                (Some(parent), None) => parent
+                    .resolve_local(import.repos, &post.post_type)
+                    .await?
+                    .map(|found| found.id),
+                (None, _) => None,
             }
-            (Some(parent), None) => parent
-                .resolve_local(import.repos, &post.post_type)
-                .await?
-                .map(|found| found.id),
-            (None, _) => None,
+        } else {
+            None
         };
         if depth <= content::MAX_PAGE_DEPTH + 2
             && stable != own_identity
