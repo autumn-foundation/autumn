@@ -2404,7 +2404,7 @@ async fn post_comment(
     // `Form` extractor below, so the connection would be held for as long as
     // the client takes to send its body — which the client chooses. Enough
     // slow-body requests would pin the whole pool.
-    deferred_db: crate::db::DeferredDb,
+    lazy_db: crate::db::LazyDb,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
 ) -> AutumnResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
@@ -2433,7 +2433,7 @@ async fn post_comment(
 
     // The body is read and validated, so take the connection now. A malformed
     // submission is rejected above without ever touching the pool.
-    let mut db = deferred_db.checkout().await?;
+    let mut db = lazy_db.checkout().await?;
 
     let outcome = add_comment(
         &mut db,
