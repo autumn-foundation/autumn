@@ -1098,6 +1098,48 @@ def fence_closes(line, run):
     return length >= len(run) and not stripped[length:].strip()
 
 
+# One blockquote marker: `>` with at most one space after it, at most three
+# spaces of indentation before. Nesting repeats it.
+QUOTE_MARKER = re.compile(r'^[^\S\n]{0,3}>[^\S\n]?')
+
+
+def quote_depth(line):
+    """How many blockquote markers LINE sits behind, and what follows them."""
+    depth, rest = 0, line
+    while True:
+        match = QUOTE_MARKER.match(rest)
+        if match is None:
+            return depth, rest
+        depth += 1
+        rest = rest[match.end():]
+
+
+def unquote(line, depth):
+    """LINE with DEPTH blockquote markers stripped, or None if it has fewer.
+
+    A fence inside a blockquote carries the marker on EVERY line, opener and
+    closer included, so a scanner reading raw lines never sees the opener at
+    all and hands the whole block to the pattern path. `docs/guide/tls.md` has
+    two such blocks, so this is a shape the corpus actually uses.
+
+    A line with fewer markers has left the quote, which ends the fence with it:
+    an unterminated fence inside a blockquote must not swallow the prose after
+    the blockquote. (Lazy continuation does not apply — CommonMark requires the
+    marker on a fenced block's lines inside a quote.)
+
+    Blockquotes are the ONLY container this needs: a fence indented inside a
+    list item is already read correctly, because an opener is matched at any
+    indentation, a closer likewise, and TOML tolerates leading whitespace.
+    """
+    rest = line
+    for _ in range(depth):
+        match = QUOTE_MARKER.match(rest)
+        if match is None:
+            return None
+        rest = rest[match.end():]
+    return rest
+
+
 def fence_language(info):
     """The language of a fence, from its CommonMark INFO STRING.
 
@@ -1124,17 +1166,25 @@ def toml_fences(text):
     lines = text.splitlines()
     i = 0
     while i < len(lines):
-        opener = fence_opener(lines[i])
+        depth, _ = quote_depth(lines[i])
+        opener = fence_opener(unquote(lines[i], depth))
         if opener is None:
             i += 1
             continue
         run, info = opener
         start = i + 1
         end = start
-        while end < len(lines) and not fence_closes(lines[end], run):
+        while end < len(lines):
+            inner = unquote(lines[end], depth)
+            if inner is None or fence_closes(inner, run):
+                break
             end += 1
         if fence_language(info) == 'toml':
-            yield start + 1, '\n'.join(lines[start:end])
+            # The body is yielded UNQUOTED — it has to parse as TOML — but one
+            # line in still means one line in, so the offsets `fenced_toml_pins`
+            # reports stay the page's own.
+            yield start + 1, '\n'.join(
+                unquote(lines[k], depth) or '' for k in range(start, end))
         i = end + 1
 
 
@@ -1776,6 +1826,43 @@ def self_test():
            list(pins('```toml\n[dependencies]\nautumn-web = "0.5"\n```\n\n'
                      'Then in prose, autumn-web = "0.6" is mentioned.\n')),
            [(3, 'autumn-web', '0.5'), (6, 'autumn-web', '0.6')])
+
+    # ---- fences inside a BLOCKQUOTE: `docs/guide/tls.md` has two ----
+    expect('one marker', quote_depth('> text'), (1, 'text'))
+    expect('nested markers', quote_depth('> > text'), (2, 'text'))
+    expect('a marker needs no space', quote_depth('>text'), (1, 'text'))
+    expect('unquoted text has no marker', quote_depth('text'), (0, 'text'))
+    expect('unquote strips exactly the depth asked for',
+           unquote('> > x', 1), '> x')
+    expect('unquote refuses a shallower line', unquote('plain', 1), None)
+    expect('a quoted toml fence is parsed',
+           list(pins('> ```toml\n> [dependencies]\n> autumn-web = "0.5"\n'
+                     '> ```\n')),
+           [(3, 'autumn-web', '0.5')])
+    # The consequence: unrecognised, the block went to the pattern path, which
+    # does not know the patch exemption — a false failure on a quoted snippet.
+    expect('a quoted patch fence stays exempt',
+           list(pins('> ```toml\n> [patch.crates-io]\n'
+                     '> autumn-web = { path = "../fork", version = "0.5" }\n'
+                     '> ```\n')),
+           [])
+    expect('a nested quoted toml fence is parsed',
+           list(pins('> > ```toml\n> > [dependencies]\n> > autumn-web = "0.5"\n'
+                     '> > ```\n')),
+           [(3, 'autumn-web', '0.5')])
+    # Leaving the quote ends the fence, so an unterminated quoted block cannot
+    # swallow the prose that follows it.
+    expect('leaving the blockquote ends the fence',
+           list(pins('> ```toml\n> [dependencies]\n> autumn-web = "0.5"\n\n'
+                     'Back in prose, autumn-web = "0.6".\n')),
+           [(3, 'autumn-web', '0.5'), (5, 'autumn-web', '0.6')])
+    # A fence indented inside a LIST ITEM needs no special handling, and this
+    # pins that: openers and closers already match at any indentation.
+    expect('a list-indented patch fence stays exempt',
+           list(pins('- item\n  ```toml\n  [patch.crates-io]\n'
+                     '  autumn-web = { path = "../fork", version = "0.5" }\n'
+                     '  ```\n')),
+           [])
 
     # ---- the surface line survives a README pin that is not a version ----
     # `series()` raises without two numeric components, and this line printed
