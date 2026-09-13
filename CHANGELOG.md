@@ -567,6 +567,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: redisplay page create/edit forms on failure in
+  `examples/wiki` (error-path 0/2 → 2/2, draft preserved):** an error-path
+  inventory of `wiki`'s page create/edit forms — `/new` and
+  `/pages/{slug}/edit`, the only content-authoring flow in this
+  `supported`-tier example and the exact CRUD-with-a-state-machine pattern
+  the app exists to demonstrate — found both of `PageHooks`'s recoverable
+  publish-guard rejections sent the submission through
+  `AutumnError::bad_request_msg`'s generic `application/problem+json`
+  response via the handler's `?`, instead of redisplaying the form: 0 of 2
+  failure modes were adjacent to cause, persisted in place, said how to
+  recover, or preserved the author's draft. Both are reachable from the
+  real UI, not just the JSON API: the create form's `status` select offers
+  "Published" while its `body` textarea has no `required` attribute, so
+  selecting Published with an empty body trips
+  `PageHooks::before_create`'s `can_publish` guard; the edit form's `body`
+  has no `required` either, so clearing it on an already-published page
+  trips the identical guard in `PageHooks::before_update`. Either way the
+  author lost their typed title/body to a dead-end JSON response with no
+  way back into the form. This is the same anti-pattern already fixed in
+  `blog`'s post editor (#2687), `reddit-clone`'s create-community form
+  (#2665), and `saas`/`teams`'s auth forms (#2530).
+  Fix: `PageForm` gains `validate_fields(effective_status) ->
+  Vec<(&'static str, &'static str)>`, mirroring the exact rule the hooks
+  already enforce (a draft may be empty; publishing may not) so the
+  business rule isn't duplicated, just checked earlier. `create` passes the
+  submitted `status`; `update` passes the page's current stored status,
+  since the edit form never changes it. A non-empty result now renders the
+  same form template (`new_page_form/edit_page_form`, shared with the GET
+  routes so there is exactly one place each form's markup lives) with a 422,
+  `aria-invalid`/`aria-describedby` wired to the failing field, a
+  `role="alert"` message next to it, and the author's title/body intact —
+  the hooks' checks stay in place underneath as the last line of defense for
+  the JSON/repository path. 6 new unit tests
+  (`examples/wiki/src/routes/pages.rs`'s `page_form_tests`) cover: a draft
+  may be empty, publishing with a blank title/body is rejected with a
+  field-specific message, a fully populated publish has no errors, and a
+  rejected new-page/edit submission keeps the author's input and wires its
+  error to the right field.
+
 - **`cms` example — import no longer drops, nor later duplicates, a page that
   shares a bare slug with an unrelated one (#2737):** a page's file identity
   falls back to its bare slug when the file has no `path` for it — the
@@ -7308,6 +7347,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refactor that moved the gate after the `run_up_with` hand-off — the exact
   risk the issue named — fails a test even though the gate function itself
   still works.
+- **`comments:commentable` (#2265): a hard-deleted parent no longer leaves
+  orphaned comment rows behind.** `commentable_id` has no foreign key.
+  Nothing cascaded a deleted parent's comments away. No generated route
+  could reach the orphaned rows afterward. `autumn generate scaffold …
+  comments:commentable` now writes an `AFTER DELETE` trigger into the
+  parent's own migration. The trigger removes that parent's comments on
+  any hard delete — through the repository, raw SQL, or an admin tool. A
+  soft-deleted parent is not affected: its row is never removed. New tests
+  cover this: a database-level test in
+  `autumn/tests/integration/commentable.rs`, and scaffold-output tests in
+  `autumn-cli`'s `scaffold_commentable.rs`.
 
 ## [0.7.0] - 2026-08-23
 

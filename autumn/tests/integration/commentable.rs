@@ -313,6 +313,24 @@ const DDL: &[&str] = &[
     "CREATE INDEX idx_cmt_comments_target \
      ON cmt_comments (commentable_type, commentable_id)",
     "CREATE INDEX idx_cmt_comments_parent ON cmt_comments (parent_id)",
+    // Issue #2265: `cmt_posts`' own cleanup trigger. `autumn generate
+    // scaffold … comments:commentable` writes this same shape into a real
+    // parent migration. A hard delete has no foreign key to cascade from.
+    // This trigger is the only thing that stops a deleted post's comments
+    // from outliving it.
+    "CREATE OR REPLACE FUNCTION cmt_comments_delete_for_parent() \
+     RETURNS TRIGGER AS $$ \
+     BEGIN \
+     \x20   DELETE FROM cmt_comments \
+     \x20    WHERE commentable_type = TG_ARGV[0] \
+     \x20      AND commentable_id = OLD.id; \
+     \x20   RETURN OLD; \
+     END; \
+     $$ LANGUAGE plpgsql",
+    "CREATE TRIGGER cmt_posts_delete_cmt_comments \
+     \x20   AFTER DELETE ON cmt_posts \
+     \x20   FOR EACH ROW \
+     \x20   EXECUTE FUNCTION cmt_comments_delete_for_parent('CmtPost')",
 ];
 
 async fn setup_pool() -> (
@@ -797,6 +815,69 @@ async fn delete_comment_cascades_to_descendants_and_decrements() {
         0
     );
     assert_eq!(counter(&mut conn, "cmt_posts", post).await, 1);
+}
+
+/// Issue #2265: a hard-deleted PARENT has no foreign key to cascade from.
+/// Its comments must go through the parent's own cleanup trigger instead.
+/// `autumn generate scaffold … comments:commentable` writes that same
+/// trigger. A bare `DELETE FROM cmt_posts` mimics a delete the framework
+/// never sees: raw SQL, an admin tool, or `psql`. That is how the bug
+/// reproduces.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn hard_deleting_the_parent_removes_its_comments() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    let other = seed_one_col(&mut conn, "cmt_posts", "title", "unrelated").await;
+
+    let root = repo
+        .add_comment(post, author, "root", None)
+        .await
+        .expect("root");
+    repo.add_comment(post, author, "reply", Some(root.id))
+        .await
+        .expect("reply");
+    repo.add_comment(other, author, "untouched", None)
+        .await
+        .expect("untouched");
+
+    assert_eq!(
+        row_count(
+            &mut conn,
+            &format!("commentable_type = 'CmtPost' AND commentable_id = {post}")
+        )
+        .await,
+        2,
+        "both comments exist before the hard delete"
+    );
+
+    diesel::sql_query("DELETE FROM cmt_posts WHERE id = $1")
+        .bind::<BigInt, _>(post)
+        .execute(&mut conn)
+        .await
+        .expect("hard delete the parent");
+
+    assert_eq!(
+        row_count(
+            &mut conn,
+            &format!("commentable_type = 'CmtPost' AND commentable_id = {post}")
+        )
+        .await,
+        0,
+        "the trigger must remove every comment the deleted parent owned"
+    );
+    assert_eq!(
+        row_count(
+            &mut conn,
+            &format!("commentable_type = 'CmtPost' AND commentable_id = {other}")
+        )
+        .await,
+        1,
+        "an unrelated parent's comments must survive"
+    );
 }
 
 /// A parent with no counter column runs the same write path minus the counter
