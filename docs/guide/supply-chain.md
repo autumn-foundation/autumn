@@ -704,6 +704,7 @@ them. Doctor reads that path and ages it the same way.
 | `autumn sbom --all-features` | …with every optional feature on (broader than any single build). |
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
+| `autumn sbom --no-default-features` | …with the `default` feature disabled (slimmed builds). |
 | `autumn sbom --filter-platform T` | …restricted to one target triple. |
 | `autumn doctor` | Does this app's lockfile pass its own dependency policy? |
 | `autumn doctor --json` | …as machine-readable output, ids and severities included. |
