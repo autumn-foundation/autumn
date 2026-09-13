@@ -665,6 +665,53 @@ fn parent_identity(post: &ExportPost) -> Option<String> {
     post.parent.clone()
 }
 
+/// Indexes into a file's own posts, for resolving a `parent_identity()`
+/// reference to the post it names without scanning the whole file.
+///
+/// Two different fields can carry that reference, and they name a post two
+/// different ways. A multi-segment reference is only ever a child's own
+/// explicit `path` prefix, so it can only match another post's own full
+/// `identity()` — `by_identity` is keyed on that. A bare, single-segment
+/// reference is the legacy `parent` field's only shape, and names a post by
+/// its *slug* alone, whether or not that post itself carries a `path`:
+/// `path: "a/b"` and a bare `parent: "b"` both mean the page slugged `b` —
+/// `by_slug` is keyed on that instead. Using `by_identity` for a bare
+/// reference misses a path-carrying post entirely, since its full identity
+/// is never just its slug.
+struct FileGraph<'a> {
+    by_identity: std::collections::HashMap<(&'a str, String), usize>,
+    by_slug: std::collections::HashMap<(&'a str, &'a str), usize>,
+}
+
+impl<'a> FileGraph<'a> {
+    fn build(posts: &'a [ExportPost]) -> Self {
+        let mut by_identity = std::collections::HashMap::new();
+        let mut by_slug = std::collections::HashMap::new();
+        for (i, post) in posts.iter().enumerate() {
+            by_identity
+                .entry((post.post_type.as_str(), identity(post)))
+                .or_insert(i);
+            by_slug
+                .entry((post.post_type.as_str(), post.slug.as_str()))
+                .or_insert(i);
+        }
+        Self {
+            by_identity,
+            by_slug,
+        }
+    }
+
+    fn find(&self, post_type: &str, parent: &str) -> Option<usize> {
+        if parent.contains('/') {
+            self.by_identity
+                .get(&(post_type, parent.to_owned()))
+                .copied()
+        } else {
+            self.by_slug.get(&(post_type, parent)).copied()
+        }
+    }
+}
+
 /// How deep a post nests, by this file's own parent references.
 ///
 /// The old sort key counted slashes in `identity(post)`. A page nested only
@@ -672,19 +719,15 @@ fn parent_identity(post: &ExportPost) -> Option<String> {
 /// no slash, so it looks top level. The old key ran such a page before its
 /// own parent was even created.
 ///
-/// This walks `parent_identity` up the file's own posts instead. `by_identity`
-/// maps each post's own `(post_type, identity)` to its index, so each step
-/// finds the parent in one lookup instead of scanning the whole file.
+/// This walks `parent_identity` up the file's own posts instead, resolving
+/// each step through `graph` in one lookup rather than scanning the whole
+/// file.
 ///
 /// Walks up rather than down, and bounded by `MAX_PAGE_DEPTH` with a
 /// seen-set, for the same reason `trashed_ancestor` (in `content.rs`) is: a
 /// hand-edited file could chain a post deeper than any real page tree goes,
 /// or even name a page as its own ancestor.
-fn file_depth(
-    posts: &[ExportPost],
-    by_identity: &std::collections::HashMap<(&str, String), usize>,
-    index: usize,
-) -> usize {
+fn file_depth(posts: &[ExportPost], graph: &FileGraph, index: usize) -> usize {
     let mut seen = vec![index];
     let mut cursor = index;
     let mut depth = 0_usize;
@@ -692,8 +735,7 @@ fn file_depth(
         let Some(parent) = parent_identity(&posts[cursor]) else {
             break;
         };
-        let key = (posts[cursor].post_type.as_str(), parent);
-        let Some(&parent_index) = by_identity.get(&key) else {
+        let Some(parent_index) = graph.find(posts[cursor].post_type.as_str(), &parent) else {
             break;
         };
         if seen.contains(&parent_index) {
@@ -752,7 +794,7 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 fn stable_identity<'a>(
     repos: &'a Repos,
     posts: &'a [ExportPost],
-    by_identity: &'a std::collections::HashMap<(&str, String), usize>,
+    graph: &'a FileGraph,
     index: usize,
     memo: &'a mut Vec<Option<String>>,
     parent_now: Option<i64>,
@@ -768,18 +810,11 @@ fn stable_identity<'a>(
         } else if depth > content::MAX_PAGE_DEPTH + 2 {
             post.slug.clone()
         } else if let Some(parent) = parent_identity(post) {
-            match by_identity.get(&(post.post_type.as_str(), parent)) {
-                Some(&parent_index) => {
-                    let parent_stable = stable_identity(
-                        repos,
-                        posts,
-                        by_identity,
-                        parent_index,
-                        memo,
-                        None,
-                        depth + 1,
-                    )
-                    .await?;
+            match graph.find(post.post_type.as_str(), &parent) {
+                Some(parent_index) => {
+                    let parent_stable =
+                        stable_identity(repos, posts, graph, parent_index, memo, None, depth + 1)
+                            .await?;
                     format!("{parent_stable}/{}", post.slug)
                 }
                 None => match parent_now.map(|id| repos.posts.find_by_id(id)) {
@@ -817,8 +852,8 @@ fn stable_identity<'a>(
 async fn resolved_post_id(
     repos: &Repos,
     posts: &[ExportPost],
-    by_identity: &std::collections::HashMap<(&str, String), usize>,
-    imported_source_slugs: &std::collections::HashMap<(String, String), i64>,
+    graph: &FileGraph<'_>,
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
     created_ids: &[(i64, String, String, Option<String>)],
     stable_memo: &mut Vec<Option<String>>,
     index: usize,
@@ -831,13 +866,45 @@ async fn resolved_post_id(
     {
         return Ok(Some(*id));
     }
-    let stable = stable_identity(repos, posts, by_identity, index, stable_memo, None, 0).await?;
-    if let Some(id) = imported_source_slugs.get(&(post.post_type.clone(), stable)) {
-        return Ok(Some(*id));
+    let stable = stable_identity(repos, posts, graph, index, stable_memo, None, 0).await?;
+    // Its own marker: a qualified key like this one names exactly one row,
+    // so the first (and only) candidate is enough.
+    if let Some(&id) = imported_source_slugs
+        .get(&(post.post_type.clone(), stable))
+        .and_then(|ids| ids.first())
+    {
+        return Ok(Some(id));
     }
     Ok(find_local(repos, &post.post_type, &own_identity)
         .await?
         .map(|found| found.id))
+}
+
+/// The first marker candidate whose real parent still agrees with
+/// `parent_now`, among rows sharing an ambiguous, pre-`stable_identity` bare
+/// marker.
+///
+/// A bare key predates qualified markers, so it can genuinely name more than
+/// one real page — every candidate it lists is tried, not just the first
+/// one loaded. An unfinished candidate is trusted regardless: the ancestry
+/// pass below still has to place it. Only a finished one needs its parent
+/// checked, since only then does "this row is settled" mean anything to
+/// compare.
+async fn pick_marker_candidate(
+    repos: &Repos,
+    candidates: &[i64],
+    completed_imports: &std::collections::HashSet<i64>,
+    parent_now: Option<i64>,
+) -> AutumnResult<Option<crate::models::Post>> {
+    for &id in candidates {
+        let Some(candidate) = repos.posts.find_by_id(id).await? else {
+            continue;
+        };
+        if !completed_imports.contains(&candidate.id) || candidate.parent_id == parent_now {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// A stored post of `post_type` whose own identity matches, if there is one.
@@ -1074,15 +1141,9 @@ pub async fn import(
     //
     // Depth comes from `file_depth`, not from counting slashes in
     // `identity()`. See `file_depth`'s own comment for why.
-    let mut by_identity: std::collections::HashMap<(&str, String), usize> =
-        std::collections::HashMap::new();
-    for (i, post) in payload.posts.iter().enumerate() {
-        by_identity
-            .entry((post.post_type.as_str(), identity(post)))
-            .or_insert(i);
-    }
+    let graph = FileGraph::build(&payload.posts);
     let mut order: Vec<usize> = (0..payload.posts.len()).collect();
-    order.sort_by_key(|&i| file_depth(&payload.posts, &by_identity, i));
+    order.sort_by_key(|&i| file_depth(&payload.posts, &graph, i));
     // `stable_identity`'s own memo, shared across every post this run
     // resolves — including recursive lookups of an already-visited post as
     // someone else's parent.
@@ -1118,12 +1179,12 @@ pub async fn import(
         // match it by its current local identity, or by a marker some
         // earlier, separate import left for that same bare slug.
         let parent_now = match parent_identity(post) {
-            Some(parent) => match by_identity.get(&(post.post_type.as_str(), parent.clone())) {
-                Some(&parent_index) => {
+            Some(parent) => match graph.find(post.post_type.as_str(), &parent) {
+                Some(parent_index) => {
                     resolved_post_id(
                         &repos,
                         &payload.posts,
-                        &by_identity,
+                        &graph,
                         &imported_source_slugs,
                         &created_ids,
                         &mut stable_memo,
@@ -1138,6 +1199,7 @@ pub async fn import(
                     Some(id) => Some(id),
                     None => imported_source_slugs
                         .get(&(post.post_type.clone(), parent))
+                        .and_then(|ids| ids.first())
                         .copied(),
                 },
             },
@@ -1150,7 +1212,7 @@ pub async fn import(
         let marker_identity = stable_identity(
             &repos,
             &payload.posts,
-            &by_identity,
+            &graph,
             index,
             &mut stable_memo,
             parent_now,
@@ -1160,21 +1222,24 @@ pub async fn import(
         let marker_owned = match imported_source_slugs
             .get(&(post.post_type.clone(), marker_identity.clone()))
         {
-            Some(id) => repos.posts.find_by_id(*id).await?,
+            // A qualified key like this one names exactly one row.
+            Some(ids) => match ids.first() {
+                Some(&id) => repos.posts.find_by_id(id).await?,
+                None => None,
+            },
             // A site that imported this same page before this fix shipped
             // still carries the *old*, bare marker for it. Falling back to
             // that bare identity — only when it differs from the qualified
             // one, i.e. only for a nested post — keeps such a row
-            // recognized instead of duplicated. The bare key is exactly the
-            // ambiguous one, so an unfinished row is trusted as before, but
-            // a finished one is trusted only if its real parent still
-            // agrees with this post's.
+            // recognized instead of duplicated. A bare key can genuinely
+            // name more than one real page, so every candidate it names is
+            // tried, not just whichever one a query happens to return
+            // first.
             None if marker_identity != file_identity => {
                 match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
-                    Some(id) => repos.posts.find_by_id(*id).await?.filter(|candidate| {
-                        !completed_imports.contains(&candidate.id)
-                            || candidate.parent_id == parent_now
-                    }),
+                    Some(ids) => {
+                        pick_marker_candidate(&repos, ids, &completed_imports, parent_now).await?
+                    }
                     None => None,
                 }
             }

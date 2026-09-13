@@ -586,7 +586,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now also goes through that same qualified marker rather than the bare
   identity, so importing an updated backup that adds a new page to an
   otherwise unchanged, already-settled tree nests it under its real parent
-  instead of leaving it at the top level.
+  instead of leaving it at the top level. A bare, legacy `parent` reference
+  now also resolves against a sibling that carries an explicit `path`, since
+  both name a page by its slug. A pre-upgrade site's old, bare markers are
+  kept as a list rather than collapsed to one, so two completed pages that
+  happen to share that same old marker are both still recognized on a later
+  re-import, rather than one of them getting duplicated.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

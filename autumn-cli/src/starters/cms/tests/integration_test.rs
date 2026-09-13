@@ -11817,6 +11817,130 @@ async fn importing_a_new_descendant_of_a_settled_tree_nests_it_correctly() {
     );
 }
 
+/// A pathless child naming its parent by the legacy, bare `parent` field
+/// must still nest correctly even when that parent itself carries an
+/// explicit `path`.
+///
+/// `path: "a/b"` and a bare `parent: "b"` both mean the page slugged `b` —
+/// but the file's own identity for `B` is `"a/b"`, not `"b"`. A lookup keyed
+/// only on full identity misses it entirely.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_bare_parent_reference_resolves_a_path_carrying_entry() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 5,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": "",
+             "path": "a/b"},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("3 imported, 0 already present");
+
+    sign_out(&client);
+    client.get("/a/b/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "C must nest under B's real path, not land at the top level"
+    );
+}
+
+/// A pre-upgrade site can hold two completed pages that share the *same*
+/// old, bare marker. Re-importing both must recognize each one by its own
+/// real parent, not duplicate whichever one a query does not happen to
+/// return first.
+///
+/// `imported_source_slugs` keeps every id a bare key names, and the legacy
+/// marker fallback tries each of them in turn rather than only the first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_both_sides_of_a_pre_upgrade_bare_collision() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "A", "slug": "a", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "B", "slug": "b", "status": "publish",
+             "author": "owner", "parent": null, "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "Team", "slug": "team", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported, 0 already present");
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+
+    // Rewrite both `Team` markers to the *same* old, pre-upgrade bare shape
+    // — a collision the qualified scheme can no longer produce, but that a
+    // site upgrading from before this fix can still carry.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let team_ids: Vec<i64> = {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("team"))
+            .select({{crate_name}}::schema::posts::id)
+            .load(&mut conn)
+            .await
+            .expect("both team rows");
+        assert_eq!(team_ids.len(), 2, "two Team rows");
+        for id in team_ids {
+            diesel::update(
+                {{crate_name}}::schema::post_meta::table
+                    .filter({{crate_name}}::schema::post_meta::post_id.eq(id))
+                    .filter(
+                        {{crate_name}}::schema::post_meta::meta_key.eq({{crate_name}}::content::IMPORT_SOURCE_SLUG_KEY),
+                    ),
+            )
+            .set({{crate_name}}::schema::post_meta::meta_value.eq("team"))
+            .execute(&mut conn)
+            .await
+            .expect("rewrite the marker");
+        }
+    }
+
+    // The same backup again. Both rows must be recognized, and neither
+    // duplicated.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 4 already present");
+
+    sign_out(&client);
+    client.get("/a/team").send().await.assert_ok();
+    client.get("/b/team").send().await.assert_ok();
+}
+
 /// A file where two pages name each other as parent must not hang or crash
 /// the import, and must not create an actual cycle in the database.
 ///
