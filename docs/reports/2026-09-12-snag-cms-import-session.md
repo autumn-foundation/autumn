@@ -450,20 +450,29 @@ regression test the sweep will then pick up automatically.
    reaches the same collision via an explicit `path` set to the bare slug
    just as easily as by omitting `path`.
 
-   The `imported_source_slugs` marker is trickier than "just key it by
-   resolved position" — a further Codex catch on this PR caught that
-   exact oversimplification. The marker is deliberately keyed on the
-   *file's own* identity, not the row's resolved slug, precisely so a
-   retried import can find its own unfinished work after the slug
-   allocator gave the row a suffixed name (`tools.rs:917-925`'s own
-   comment: an `about` that collided and landed as `about-2` must still
-   be found by a retry's `about` lookup, or the retry creates `about-3`
-   instead of finishing `about-2`). Replacing that key with the resolved
-   position would silently break this already-relied-on retry path. A
-   real fix has to keep the file-identity-keyed lookup for genuine
-   same-run retries while adding a *second* check — comparing the marker
-   row's actual current position against the incoming post's resolved
-   parent chain — before trusting a marker match from a *different*
-   import as "this is the same post, resume it." Both refinements are
-   flagged in the issue as work for whoever picks it up, not attempted
-   here.
+   The `imported_source_slugs` marker turns out to be genuinely hard to
+   fix, and two successive Codex catches on this PR each shot down an
+   oversimplified version of the same idea. First: simply re-keying the
+   marker by the row's *resolved* position, instead of its file identity,
+   breaks the documented allocator-retry case (`tools.rs:917-925`: an
+   `about` that collided and landed as `about-2` must still be found by a
+   retry's `about` lookup, or the retry creates `about-3` instead of
+   finishing `about-2`). Second: adding a secondary check that compares
+   the marker row's *current* position against the incoming post's
+   resolved position — proposed here as the fix for the first problem —
+   independently breaks a different, already-verified feature in this
+   very report: a page renamed *after* import (`team` → `the-team`) is
+   still correctly recognized by its marker on a re-import of the
+   *original* file, specifically because the match does *not* depend on
+   the row's current position matching the file's. A position-consistency
+   check would reject that legitimate case exactly as it rejects the
+   spurious cross-import collision, since both look identical from the
+   row's current state: "a marker match whose current position doesn't
+   match the incoming file." Distinguishing them likely needs information
+   neither check alone has — e.g. recording each import's *own* resolved
+   parent chain at creation time (not the row's live position, which
+   drifts under renames) and comparing that original chain against the
+   incoming file's, rather than comparing anyone's current, live state.
+   This wasn't designed or attempted here; it's flagged in the issue as a
+   harder problem than either of the two rejected shortcuts, for whoever
+   picks it up.
