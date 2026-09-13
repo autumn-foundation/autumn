@@ -2272,15 +2272,30 @@ fn scan_bin_crate_tree(
     // the file for children-discovery purposes entirely (Codex review on
     // #2739, round 43, P2).
     let mut scanned_identities: BTreeSet<(PathBuf, Vec<String>)> = BTreeSet::new();
-    let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>, Vec<PathBuf>)> =
+    // A queued file's `resolution_base` is the directory ITS OWN top-level
+    // (non-inline) out-of-line `mod name;` declarations resolve relative
+    // to — kept as its own PHYSICAL value, separate from `module_path`
+    // (the LOGICAL name accumulator used for registration matching),
+    // because the two diverge the moment any ancestor was `#[path]`d. A
+    // `#[path]`-loaded file resets this to its OWN directory for its own
+    // children (verified directly via a real build: `#[path =
+    // "shared.rs"] mod handlers;` where `shared.rs` has a plain `mod
+    // child;` resolves `child` at `child.rs` beside `shared.rs`, not
+    // `handlers/child.rs` — the logical name `handlers` plays no part).
+    // Reconstructing this from `root_dir` + the full accumulated
+    // `module_path` (this function's previous approach) stayed correct
+    // only up to the first `#[path]` in the chain (Codex review on #2739,
+    // round 43, P1).
+    let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>, Vec<PathBuf>, PathBuf)> =
         std::collections::VecDeque::new();
     queue.push_back((
         root_file.to_path_buf(),
         Vec::new(),
         vec![root_file.to_path_buf()],
+        root_dir.to_path_buf(),
     ));
 
-    while let Some((file, module_path, ancestors)) = queue.pop_front() {
+    while let Some((file, module_path, ancestors, resolution_base)) = queue.pop_front() {
         if !scanned_identities.insert((file.clone(), module_path.clone())) {
             continue; // This exact file/module-path identity is already scanned.
         }
@@ -2317,28 +2332,38 @@ fn scan_bin_crate_tree(
             // capsule root's `mod wiring;` reaching `cmd/wiring.rs`, which
             // itself has `#[path = "actual.rs"] mod handlers;`, resolves
             // that override to `cmd/actual.rs` (beside `wiring.rs`), never
-            // `cmd/wiring/actual.rs`. `dir_segments` includes `module_path`
-            // — segments accumulated from ALL ancestor OUT-OF-LINE files up
-            // to the tree root — which corresponds to a real subdirectory
-            // only for the conventional (non-`#[path]`) resolution above;
-            // an out-of-line file's OWN directory is wherever it actually
-            // sits on disk (`declaring_dir`, this iteration's own `file`),
-            // regardless of how many out-of-line `mod` levels led here. Only
-            // `nested` — segments from an INLINE `mod { ... }` block inside
-            // THIS SAME file — still folds in as a subdirectory relative to
-            // `declaring_dir`, the same rule the ordinary `src/` walk's own
+            // `cmd/wiring/actual.rs`. Only `nested` — segments from an
+            // INLINE `mod { ... }` block inside THIS SAME file — still
+            // folds in as a subdirectory relative to `declaring_dir`, the
+            // same rule the ordinary `src/` walk's own
             // `path_attribute_module_paths` already applies (Codex review on
             // #2739, round 35, P1, fixed incompletely; round 39, P2, this
-            // fold's own base was still wrong for a non-root declaring file).
-            let resolved = path_value.map_or_else(
-                || resolve_out_of_line_module_file(root_dir, &dir_segments, &name),
+            // fold's own base was still wrong for a non-root declaring
+            // file). The CONVENTIONAL branch resolves relative to
+            // `resolution_base` (this file's own physical anchor,
+            // threaded through the queue) folded with `nested`, never
+            // `root_dir` + the full logical `dir_segments` — those only
+            // coincide up to the first `#[path]` in the chain.
+            let (resolved, child_resolution_base) = path_value.map_or_else(
+                || {
+                    let base = nested
+                        .iter()
+                        .fold(resolution_base.clone(), |dir, segment| dir.join(segment));
+                    let resolved = resolve_out_of_line_module_file(&base, &[], &name);
+                    let child_base = base.join(&name);
+                    (resolved, child_base)
+                },
                 |path_value| {
                     let dir = nested
                         .iter()
                         .fold(declaring_dir.to_path_buf(), |dir, segment| {
                             dir.join(segment)
                         });
-                    Some(lexically_normalize_path(&dir.join(&path_value)))
+                    let resolved = lexically_normalize_path(&dir.join(&path_value));
+                    let child_base = resolved
+                        .parent()
+                        .map_or_else(|| dir.clone(), Path::to_path_buf);
+                    (Some(resolved), child_base)
                 },
             );
             let Some(resolved) = resolved else {
@@ -2351,7 +2376,12 @@ fn scan_bin_crate_tree(
             child_module_path.push(name);
             let mut child_ancestors = ancestors.clone();
             child_ancestors.push(resolved.clone());
-            queue.push_back((resolved, child_module_path, child_ancestors));
+            queue.push_back((
+                resolved,
+                child_module_path,
+                child_ancestors,
+                child_resolution_base,
+            ));
         }
     }
 
@@ -8464,5 +8494,57 @@ mod tests {
             Some(&dir.path().join("cmd/edge.rs")),
         );
         assert!(scan.functions.is_empty(), "{:?}", scan.functions);
+    }
+
+    /// A `#[path]`-overridden file's own CONVENTIONAL (non-`#[path]`) child
+    /// resolves relative to the overridden file's OWN physical directory,
+    /// never the logical module path used to reach it — verified directly
+    /// via a real build: `#[path = "shared.rs"] mod handlers;` where
+    /// `shared.rs` has a plain `mod child;` resolves `child` at
+    /// `child.rs`, sitting right beside `shared.rs`, not at
+    /// `handlers/child.rs`. Reconstructing the resolution base from
+    /// `root_dir` plus the full accumulated logical `module_path` (this
+    /// function's previous approach) only stayed correct up to the first
+    /// `#[path]` in the chain (Codex review on #2739, round 43, P1).
+    #[test]
+    fn resolve_edge_scan_resolves_a_conventional_child_of_a_path_overridden_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"edge-capsule\"\npath = \"cmd/edge.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/edge.rs"),
+            r#"
+            #[path = "shared.rs"]
+            mod handlers;
+            fn main() {
+                edge_routes![crate::handlers::child::show];
+            }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("cmd/shared.rs"), "mod child;\n").unwrap();
+        std::fs::write(
+            dir.path().join("cmd/child.rs"),
+            "#[edge]\npub fn show() {}\n",
+        )
+        .unwrap();
+
+        let scan = resolve_edge_scan_with_extra_file(
+            dir.path(),
+            &[],
+            Some(&dir.path().join("cmd/edge.rs")),
+        );
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        assert_eq!(scan.functions[0].file, "cmd/child.rs");
+        assert_eq!(
+            scan.functions[0].module_path,
+            vec!["handlers".to_owned(), "child".to_owned()]
+        );
+        assert!(scan.unregistered().is_empty(), "{:?}", scan.unregistered());
     }
 }
