@@ -183,9 +183,13 @@ each verified live rather than accepted from reasoning alone:
   processed first while `a` didn't exist yet, was already sitting in the
   database as a top-level page with bare identity `"team"`, and that's
   what `b/team` collided against.
-- **The *second* (incoming) page must be pathless — but "both pages
-  pathless" overstates the requirement on the first (persisted) page's
-  side.** `find_local` compares the *second* page's own file `identity()`
+- **The *second* (incoming) page's file identity must resolve to the same
+  bare slug as the first — but "both pages pathless" overstates the
+  requirement on the first (persisted) page's side, and, per the later
+  `cms16` finding below, pathlessness isn't required on the second page's
+  side either: an explicit `path` set to that same bare slug reaches the
+  identical identity string just as well.** `find_local` compares the
+  *second* page's own file `identity()`
   against the first row's already-persisted `local_identity`; it is not a
   blanket "any row with this slug blocks any other." Verified by giving
   the second `Team` page (under `b`) its own correct `path: "b/team"`
