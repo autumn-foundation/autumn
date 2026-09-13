@@ -188,8 +188,8 @@ each verified live rather than accepted from reasoning alone:
   But the *first* (persisted) page's own `path` field, if it has one, is
   irrelevant either way — `local_identity()` recomputes purely from actual
   database ancestry (`page_ancestry`), never from whatever `path` the row's
-  originating file entry happened to carry. Verified with a fourteenth
-  reproduction (`cms14`): a top-level `Team` page imported with an
+  originating file entry happened to carry. Verified with a ninth
+  reproduction (database `cms14`): a top-level `Team` page imported with an
   *explicit* `"path": "team"` (not omitted at all) still collides with a
   later, separately-imported pathless `Team` page nested under `b` exactly
   as when the first page had no `path` field — `"1 already present"`,
@@ -213,50 +213,55 @@ each verified live rather than accepted from reasoning alone:
   `/b/team` → 404), even though the first `Team` was never "waiting" on
   anything; it was simply, correctly, a top-level page, and that alone was
   enough to collide. A Codex catch on this PR, verified live (`cms12`).
-- **And it isn't limited to one import run — though a Codex catch on this
-  PR found that the cross-run case actually trips a *different* internal
-  check than every other reproduction here.** The colliding row does not
-  need to come from the same file at all: an *existing* top-level page on
-  the site, created by an entirely separate, earlier import (or, by the
-  same logic, by ordinary page authoring through the admin UI), blocks a
-  later import's pathless nested page with the same slug just as
-  permanently. Verified across two sequential imports on a fresh database
-  (`cms13`): first, a file creating top-level `Team` and `B` pages only
-  (`"2 imported, 0 already present"`); then, a *second*, separate import
-  of a single pathless `Team` page nested under `b` — dropped
-  (`"1 already present"`, `/b/team` → 404) even though the first import
-  had already fully committed and the site was in a completely settled
-  state by the time the second import began. But — confirmed by reading
-  `imported_source_slugs`/`record_import_source` in `tools.rs` and
-  `content.rs`, then querying `cms13`'s `post_meta` table directly, which
-  showed the first run's `Team` row carrying `_import_source_slug = "team"`
-  — this specific case is *not* actually caught by `find_local`. It never
-  gets that far: the second import's own `imported_source_slugs` lookup,
-  keyed on `(post_type, file_identity)` and loaded fresh at the start of
-  *that* run, matches the unrelated second `Team` post against the first
-  run's completed row purely because both happen to compute the same bare
-  `"team"` file identity — so the loop treats them as literally the same
-  post resuming an unfinished import, and skips at the `marker_owned`/
-  `completed_imports` check (`tools.rs`, before the `slug_taken` branch is
-  ever reached), not at `find_local`. Within a *single* run this can't
-  happen — `imported_source_slugs` is loaded once before the loop starts
-  and is never updated mid-loop, so a page created earlier in the *same*
-  run has no marker yet for a later post in that run to collide with — but
-  across two separate import requests, the marker collision fires first.
-  This means the bug is not really about import *ordering* at all in the
-  general case, and it is not even a single mechanism: the "shallowest
-  first" sort and the unresolved-parent mechanics only ever address the
-  `find_local` path, and a fix confined to that path — recursively
-  resolving ancestry or not — would leave this exact cross-run
-  reproduction unfixed, because the source-marker lookup short-circuits
-  before `find_local` is ever consulted.
+- **And it isn't limited to one import run — and a Codex catch on this PR
+  showed the cross-run case is actually caught by *both* internal checks
+  at once, not just one.** The colliding row does not need to come from
+  the same file at all: an *existing* top-level page on the site, created
+  by an entirely separate, earlier import (or, by the same logic, by
+  ordinary page authoring through the admin UI), blocks a later import's
+  pathless nested page with the same slug just as permanently. Verified
+  across two sequential imports on a fresh database (`cms13`): first, a
+  file creating top-level `Team` and `B` pages only (`"2 imported, 0
+  already present"`); then, a *second*, separate import of a single
+  pathless `Team` page nested under `b` — dropped (`"1 already present"`,
+  `/b/team` → 404) even though the first import had already fully
+  committed and the site was in a completely settled state by the time
+  the second import began. Reading `imported_source_slugs`/
+  `record_import_source` in `tools.rs` and `content.rs`, then querying
+  `cms13`'s `post_meta` table directly, showed the first run's `Team` row
+  carrying `_import_source_slug = "team"`. An earlier revision of this
+  report claimed this meant `find_local` was "never reached" here — that
+  was wrong, and a Codex catch caught it: `slug_taken` (which calls
+  `find_local`) is computed *unconditionally* on every iteration, before
+  the `marker_owned` branch is even inspected (`tools.rs:955-957`,
+  ahead of the `if let Some(ours) = marker_owned` at line 959) — so
+  `find_local` *is* called for this input, and it *also* returns a match,
+  since the persisted top-level page's `local_identity` ("team") equals
+  the incoming pathless page's file identity ("team") too. Both checks
+  agree the post should be skipped. What's true is narrower than "only
+  one check applies": the code *acts* on whichever check's branch runs
+  first, and `marker_owned`'s branch is checked before `slug_taken`'s
+  (line 959 precedes line 1032), so the marker match is what actually
+  produces the observed skip — but `slug_taken` would independently
+  produce the same skip immediately afterward if the marker check alone
+  were fixed and no longer matched. Within a *single* run, only
+  `find_local`/`slug_taken` can ever apply — `imported_source_slugs` is a
+  fixed snapshot loaded once before the loop starts, so a page created
+  earlier in the *same* run has no marker yet for a later post in that run
+  to match against — but across two separate import requests, both checks
+  independently return true. This means the bug is not really about
+  import *ordering* at all in the general case, and a fix confined to
+  `find_local` alone, or to the marker key alone, is insufficient for the
+  cross-run reproductions specifically: closing either one leaves this
+  exact input still dropped via the other.
 
-Either way — via `find_local`'s bare-identity match for every same-run
-reproduction, or via the `_import_source_slug` marker coincidentally
-matching for the two cross-run ones — the import loop misidentifies the
-pathless nested page as content that is already accounted for, and drops
-it permanently, with the summary screen reporting an unremarkable
-"N imported, M already present" and no orphan count. Reproduced 9/9
+Either way — via `find_local`'s bare-identity match (true for every
+reproduction here, including the cross-run ones), reinforced by the
+`_import_source_slug` marker coincidentally also matching for the two
+cross-run ones — the import loop misidentifies the pathless nested page as
+content that is already accounted for, and drops it permanently, with the
+summary screen reporting an unremarkable "N imported, M already present"
+and no orphan count. Reproduced 9/9
 across independent fresh databases: two on version 2 (one a
 hand-reordered full export, one a minimized 4-post file), one on version
 3, one a version-5-labeled file with `path` omitted on all four posts,
@@ -347,21 +352,26 @@ regression test the sweep will then pick up automatically.
    date to drive that branch over HTTP; none of this session's fixtures
    used `future` at all. Both the import-time analogue and the real timer
    sweep remain unverified end-to-end and belong together in a follow-up.
-3. **A fix for #2737** needs to close two distinct code paths, not one.
-   Recursively resolving each post's `parent` chain (rather than counting
-   `/`) would close the *same-run* ordering cases that go through
-   `find_local`, but the `cms13`/`cms14` reproductions show that alone is
-   insufficient: those are actually caught earlier, by the
-   `imported_source_slugs` marker lookup matching an unrelated post from a
-   *previous, separate* import purely because both compute the same bare
-   file identity — a Codex catch on this PR, confirmed by querying
-   `cms13`'s `post_meta` table directly. `find_local` is never even reached
-   in that case. A complete fix needs both: `find_local`'s comparison of an
-   incoming page's *file* identity against a persisted row's
-   *ancestry-derived* identity should account for where the incoming
-   page's file `parent` chain actually says it belongs, and the
-   `imported_source_slugs` lookup needs a key that can't coincidentally
-   collide between two unrelated posts across separate import runs (e.g.
-   incorporating the resolved parent chain rather than the bare identity
-   alone) — flagged in the issue as work for whoever picks it up, not
+3. **A fix for #2737** needs to close two distinct code paths, not one —
+   and, for the cross-run reproductions specifically, closing only one of
+   them is not enough on its own. Recursively resolving each post's
+   `parent` chain (rather than counting `/`) would close the *same-run*
+   ordering cases, which go through `find_local` alone. But in the
+   `cms13`/`cms14` cross-run reproductions, `find_local` *also* matches
+   (confirmed by querying `cms13`'s `post_meta` table directly: the
+   persisted top-level page and the incoming pathless page share the
+   identity `"team"`) — it is the `imported_source_slugs` marker lookup,
+   checked first, that happens to be what actually produces the observed
+   skip there, a Codex catch on this PR. So fixing the marker lookup's key
+   alone would still leave the cross-run cases dropped via `find_local`
+   immediately afterward, and fixing `find_local`'s ancestry-blindness
+   alone would still leave them dropped via the marker match. A complete
+   fix needs both: `find_local`'s comparison of an incoming page's *file*
+   identity against a persisted row's *ancestry-derived* identity should
+   account for where the incoming page's file `parent` chain actually says
+   it belongs, and the `imported_source_slugs` lookup needs a key that
+   can't coincidentally collide between two unrelated posts across
+   separate import runs (e.g. incorporating the resolved parent chain
+   rather than the bare identity alone) — flagged in the issue as work for
+   whoever picks it up, not
    attempted here.
