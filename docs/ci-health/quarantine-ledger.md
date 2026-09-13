@@ -137,7 +137,83 @@ _None as of 2026-09-05._
   restoring `MinIO::default()` without `.with_name(...)` would reproduce
   the identical 404 immediately.
 - **Closed**: 2026-09-12, pending this PR's own CI run for the CI-native
-  confirmation noted above (🚦 Semaphore).
+  confirmation noted above (🚦 Semaphore). **Confirmed 2026-09-13**: PR
+  #2740's own `Test (Docker)` check run (job 103543584136, part of workflow
+  run 34688787858) completed `success` at 2026-09-12T11:55:09Z — the real
+  pull against `quay.io/minio/minio` that could not be exercised in this
+  sandbox has now been exercised by CI itself. This entry's fix is
+  CI-natively verified, not just locally clippy-clean. See the new escape
+  entry immediately below for a coordination defect this fix's merge
+  timing collided with (independent, not a defect in the fix itself).
+
+### Escape: independent duplicate fix for the same MinIO/Docker-Hub outage collided at merge, ~8.4h of spurious Lint failures on unrelated branches
+
+- **Not a flake, not a product bug — a coordination gap between two
+  concurrently-authored fixes for the same external-dependency outage.**
+  PR #2740 (this ledger's own MinIO→Quay fix, above) merged
+  2026-09-12T17:03:52Z. An independent PR, **#2743** ("fix: pull MinIO
+  testcontainer images from quay.io, not Docker Hub"), merged
+  **2026-09-12T17:46:17Z — 43 minutes later** — fixing the identical
+  Docker-Hub-repository-gone outage, authored without visibility into
+  #2740 (different session, same underlying `ci.yml` failure independently
+  diagnosed). Both PRs touched
+  `examples/reddit-clone/tests/avatar_s3_integration.rs`: #2740 added
+  `.with_name("quay.io/minio/minio")` inline at the one call site; #2743,
+  based on a pre-#2740 checkout, added a separate `const MINIO_IMAGE: &str
+  = "quay.io/minio/minio"` at the top of the same file without wiring it
+  in (the inline literal from #2740 was already there by the time #2743's
+  merge commit landed). Neither PR's own CI run could have caught this —
+  each was green against its own base — so it surfaced only as `-D
+  dead-code` (`-D warnings`) once both were on `trunk-dev` together.
+- **Impact, measured**: sampling `ci.yml` `pull_request` runs from
+  2026-09-12T17:46:17Z (the #2743 merge) to 2026-09-13T02:09:18Z (the last
+  cleanup commit, below) — roughly 8.4 hours — found the same `-D
+  dead-code` `Lint` failure on at least 6 distinct, unrelated WIP branches
+  (confirmed by job log inspection, not inferred from branch name):
+  `claude/friendly-ritchie-uw76a2`, `claude/tender-galileo-6f3dr7`,
+  `claude/epic-clarke-8nbaes`, `claude/brave-goldberg-gyr60j` (hit twice,
+  both signatures below), `claude/busy-cerf-9zos9k`, plus the two
+  `fix/reddit-clone-minio-*` and `fix/minio-quay-registry` branches
+  visibly spun up by other sessions independently chasing the same error.
+  Two distinct signatures, both dead-code, both in MinIO-related test
+  files: `` error: function `minio_image` is never used ``
+  (`autumn-cli/tests/integration/offsite_backup.rs:216`) and `` error:
+  constant `MINIO_IMAGE` is never used ``
+  (`examples/reddit-clone/tests/avatar_s3_integration.rs:22`). Every hit
+  failed only `Lint`/`Clippy` (and the `Test suite` aggregator that
+  depends on it) — no runtime test behavior was affected, consistent with
+  this being purely a merge-time dead-code artifact, not a functional
+  regression.
+- **Resolution**: five follow-up commits, all authored independently of
+  this ledger's own tracking, untangled the collision on `trunk-dev`
+  piecemeal: #2750 and #2751 (both 2026-09-12T23:41-23:48Z) rewired
+  reddit-clone's test to actually reference the `MINIO_IMAGE` constant
+  instead of the duplicate inline literal; #2749 (23:55:48Z) did the same
+  for the constant's remaining unused-ness; #2752 (23:41:28Z) fixed an
+  unrelated `Cargo` subtable-form gate that had also gone stale in the
+  same window; #2756 (2026-09-13T02:09:18Z) removed the now-fully-orphaned
+  `minio_image()` helper in `offsite_backup.rs`. `trunk-dev`'s tip has
+  carried a clean, single-source-of-truth fix (one call site per test,
+  each using its own local constant, no orphaned helpers) since
+  2026-09-13T02:09:18Z — confirmed directly against
+  `autumn-cli/tests/integration/offsite_backup.rs` at `trunk-dev`'s
+  current tip (`6e71bfb`): `minio_image()` has two live call sites, no
+  dead code.
+- **Mechanism classification**: neither a test defect nor a product
+  defect — a **process/coordination gap**. Nothing in `ci.yml` or the
+  repo's tooling flags "another open PR already fixes this exact
+  failure" before merge; the same visible, identical, 100%-reproducible
+  Docker Hub outage was independently diagnosed and fixed by more than
+  one session within the same hour, and GitHub's normal one-PR-at-a-time
+  merge serialization is what turned two individually-correct fixes into
+  a combined dead-code break. No action taken here beyond recording it:
+  the fallout is already fully resolved on `trunk-dev`, and the affected
+  branches only need an ordinary rebase to pick up the clean state — this
+  is Tier 1 escape-analysis evidence per this role's own evidentiary
+  tiers, not a new quarantine candidate.
+- **Closed**: 2026-09-13 (🚦 Semaphore), recorded after the fact — the
+  fallout resolved itself via the five commits above before this pass
+  began.
 
 ## Under active investigation, not yet quarantined
 
@@ -419,6 +495,22 @@ without also filling in the intake form above.
   substitute for the rerun campaign below; the recommendation to dispatch
   it (macOS half only, `samples: "20"`) stands unchanged from the
   2026-09-10 pass.
+- **2026-09-13 update — 5th consecutive pass, harness still undispatched;
+  zero new organic hits on any of the three tracked signatures in the
+  sampled window.** Sampled `ci.yml` `pull_request` runs from roughly
+  2026-09-12T13:58Z to 2026-09-13T09:02Z (~19 hours, ~130+ runs spanning
+  both pages of the query). Every failure in that window attributed to
+  one of: the pre-existing MinIO/Docker-Hub outage (pre-#2740, before
+  17:03:52Z), the #2740/#2743 dead-code escape documented above
+  (17:46:17Z-02:09:18Z), or a WIP branch's own in-progress bug (a
+  `dependabot` toolchain bump breaking `semver_script_checks_...`, a
+  `capture_min_length` feature branch, repeated `Clippy` churn on single
+  branches iterating on lint fixes). None matched `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, or (see below)
+  `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
+  still `total_count: 0` against `workflow_dispatch` runs, checked
+  2026-09-13T~09:1xZ — unchanged for a 5th straight day since it became
+  dispatchable 2026-09-08T15:07:44Z (now ~90 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -647,3 +739,6 @@ without also filling in the intake form above.
   role's standard for a first hit; escalate to a rerun campaign only if a
   repeat signature appears. Not quarantined — the Docker sweep is
   unmodified and this test keeps running on every sweep.
+- **2026-09-13 update**: no repeat in the ~19h window sampled this pass
+  (see the `live_upgrade` entry's dated update above for the window and
+  method). Still n=1, still not campaigned.
