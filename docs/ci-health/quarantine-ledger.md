@@ -654,6 +654,91 @@ without also filling in the intake form above.
   still `total_count: 0` against `workflow_dispatch` runs, checked
   2026-09-13T~09:1xZ — unchanged for a 5th straight day since it became
   dispatchable 2026-09-08T15:07:44Z (now ~114 hours idle).
+- **2026-09-14 update — 6th consecutive pass, harness still undispatched;
+  zero new organic hits on any of the four tracked tests (`live_upgrade`'s
+  three signatures included, six signatures total) across everything
+  checked this pass.** Sampled `ci.yml` `pull_request` runs from the
+  2026-09-13 report's own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z
+  (~23 hours, one `perPage=100` page whose own span fully covers the window
+  with margin on both ends, so a second page was not needed this pass — 71
+  runs: 45 cancelled/24 success/2 failure). Both run-level failures triaged
+  by job/log inspection and attributed to their own branch's in-progress
+  work, neither a CI health issue: a `dependabot/cargo/validator-0.21.0`
+  bump broke its own `fuzz/Cargo.lock` (`--locked` refused the implicit
+  update) and, separately, `PostForm`'s `Validate` trait bound (`E0599` on
+  `into_changeset`) — both direct, deterministic consequences of that PR's
+  own dependency bump; and `claude/happy-edison-fstb1z` (previously flagged
+  for its own `Clippy` churn) failed a `Test (windows-latest)` repo-hygiene
+  self-check (`edge_conformance_ci_coverage`) because that branch's own
+  in-progress `ci.yml` edit hadn't finished restoring the
+  `edge-conformance:` job block.
+  **Correction (post-review, via a Codex review comment on PR #2786): the
+  original version of this pass called the whole window "zero hits" from
+  only the two run-level failures, but 45 of the 71 runs were `cancelled`
+  overall — and `ci.yml`'s `cancel-in-progress` means a job can fail before
+  its run gets superseded and marked `cancelled`, so those were not
+  established zero-hit observations.** Checked job-level conclusions for the
+  28 most-recently-created of the 45 cancelled runs (62%, best-effort
+  sample — a contiguous prefix by `created_at` descending, from 34773833346
+  through 34819892079; the remaining 17, from 34748838991 through
+  34771611140, weren't checked — full ID list in the matching report's
+  correction note). **Second correction (post-review, caught while
+  reproducing this claim for the "fixed" correction below, not a Codex
+  finding): the sample was originally miscounted as 26/45; it is 28/45.**
+  Found one hidden job-level failure: run 34774043482
+  (branch `claude/epic-meitner-vkej1i`, created 2026-09-13T18:15:04Z,
+  overall `cancelled` when superseded by that branch's next push 13 minutes
+  later) had `Test (ubuntu-latest)` and `Test (windows-latest)` both
+  complete with conclusion `failure` first, on the identical test on both
+  platforms: `starters::tests::embedded_cms_matches_example_cms`
+  (`autumn-cli/src/starters/mod.rs:664:13`), `` assertion `left == right`
+  failed: drift between embedded cms starter and examples/cms at
+  src/routes/front.rs `` — a repo-hygiene drift-check between the embedded
+  CMS starter template and `examples/cms`'s actual source, firing
+  identically on both OS runners because it's a pure file-diff assertion.
+  Branch-owned. **Third correction (post-review, via a further Codex review
+  comment on PR #2786): the same run had two other jobs — `Test (Docker)`
+  and `Test (macos-latest)` — that ran ~38 and ~40 minutes respectively
+  before being cancelled, long enough to have hidden a tracked-signature
+  panic from a conclusion-only check.** Fetched and grepped both full logs
+  for the four tracked signature names and any panic/`FAILED` marker: the
+  Docker job actually ran and passed
+  `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+  (`... ok`) before being cancelled — positive evidence, not absence — with
+  nothing matching any tracked signature anywhere in the log; the macOS job
+  was killed mid-`cargo build` (`Terminate orphan process: pid (37808)
+  (rustc)`) and never reached the test phase. Separately, for every one of
+  the other 27 sampled cancelled runs, every `Test`-shaped job shows the
+  *unexpanded* matrix template name with conclusion `cancelled` and
+  near-simultaneous created/started/completed timestamps — direct evidence
+  those jobs never started, so they carry no risk of hiding a signature
+  either.
+  **Fourth correction (post-review, via a further Codex review comment on
+  PR #2786, written chronologically before the third correction above):
+  whether the branch's next push fixed it is unverified, not
+  established.** An earlier version of this entry claimed the branch's very
+  next push (run 34777703864, ~13 minutes later) "evidently fixed it"
+  because the signature didn't recur in the other 25 sampled cancelled
+  runs — but that run's own `Test`/`Trybuild`/`Windows Tier 1 journey` jobs
+  all show the *unexpanded* matrix template name with conclusion
+  `cancelled` and near-simultaneous created/started/completed timestamps,
+  consistent with being cancelled before the matrix job even started, not
+  after running the test — so there is no completed test-job conclusion
+  from that run either way. Absence of a repeat signature in a sample of
+  cancelled runs whose own Test jobs were themselves cancelled before
+  completing is not evidence anything passed; it's absence of observation.
+  Corrected: not observed again in the runs sampled this pass, full stop —
+  whether or how it was fixed is unverified. Not a CI health issue, and no
+  match to any tracked signature, regardless — but a real correction to the
+  earlier "zero hits" framing (and then to the unverified "fixed" framing)
+  nonetheless.
+  Nothing found this pass — the two run-level failures plus the one
+  job-level failure inside a cancelled run — matched `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, or `job_tracking_stores_integration`.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-14T~08:0xZ — unchanged for a
+  6th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~137 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -718,6 +803,8 @@ without also filling in the intake form above.
   entry it was when it had n=1.
 - **Status**: under active investigation, same rerun campaign as
   `live_upgrade` above (still undispatched).
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -728,6 +815,9 @@ without also filling in the intake form above.
   not an exhausted wall-clock wait.
 - **Status**: one occurrence — suggestive, not yet a repeat signature.
   Covered by the same rerun campaign as `live_upgrade` above.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
+  Still n=1, still not campaigned.
 
 ### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
 
@@ -883,5 +973,8 @@ without also filling in the intake form above.
   repeat signature appears. Not quarantined — the Docker sweep is
   unmodified and this test keeps running on every sweep.
 - **2026-09-13 update**: no repeat in the ~19h window sampled this pass
+  (see the `live_upgrade` entry's dated update above for the window and
+  method). Still n=1, still not campaigned.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
