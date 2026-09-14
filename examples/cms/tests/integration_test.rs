@@ -9160,6 +9160,143 @@ async fn rescheduling_an_edit_with_no_publish_date_redisplays_the_editor() {
     );
 }
 
+/// A validation-rejected redisplay must carry the *submitted* `lock_version`
+/// forward, not the row's current one — otherwise a stale edit's retry
+/// silently stops being stale.
+///
+/// Concretely: editor A loads the form at version 1. Editor B saves first,
+/// advancing the row to version 2. A submits their (now-stale) version-1 form
+/// with a scheduling mistake (`status=future`, no date); `validate_fields`
+/// rejects it and redisplays the editor. If that redisplay's hidden
+/// `lock_version` field were stamped from the freshly-reloaded row (version 2)
+/// instead of from A's own stale submission (version 1), fixing the date and
+/// resubmitting would pass the stale-edit check it should fail, silently
+/// overwriting B's edit — exactly the loss `expected_lock_version` exists to
+/// prevent. This must still return 409, not 303.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn validation_redisplay_keeps_the_submitted_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's starting point"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "draft"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let stale_version: i32 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::lock_version)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+
+    // Editor B saves first, advancing the row past the version A's form was
+    // rendered from.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Editor B's save"),
+                    ("slug", "race"),
+                    ("excerpt", ""),
+                    ("body", "Editor B's body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+
+    // Editor A submits their stale version-1 form with a scheduling mistake.
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains(&format!(r#"name="lock_version" value="{stale_version}""#)),
+        "the redisplay must stamp back the version A actually submitted, not the row's current \
+         (already-advanced) version: {body}"
+    );
+
+    // A fixes the date and resubmits the same (still-stale) lock_version, as
+    // the redisplayed form's hidden field instructs them to.
+    let future = (chrono::Utc::now() + chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let retry = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+            ("publish_at", future.as_str()),
+        ]))
+        .send()
+        .await;
+    retry.assert_status(409);
+
+    let stored_title: String = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::title)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert_eq!(
+        stored_title, "Editor B's save",
+        "editor A's stale retry must not overwrite editor B's save"
+    );
+}
+
 /// A completed import is not reconciled again.
 ///
 /// The source marker says "an import created this row" and is written before

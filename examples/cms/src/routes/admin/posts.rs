@@ -829,7 +829,21 @@ fn editor(
                 // Stale-edit detection: the server compares this against the
                 // row it locks, so a save built on content someone else has
                 // since changed is refused rather than silently overwriting.
-                input type="hidden" name="lock_version" value=(post.lock_version);
+                //
+                // On a redisplay (`draft` present) this must carry the version
+                // the rejected submission itself named, not `post`'s current
+                // stored version: `post` here is re-fetched fresh on every
+                // request, so if it were used, a stale submission that also
+                // failed `PostForm::validate_fields` would come back stamped
+                // with whatever version is *now* current — silently curing its
+                // staleness — and a same-content retry would then pass
+                // optimistic locking and overwrite a concurrent edit instead of
+                // being refused.
+                input type="hidden" name="lock_version"
+                      value=(draft.map_or_else(
+                          || post.lock_version.to_string(),
+                          |f| f.lock_version.clone().unwrap_or_default(),
+                      ));
             }
             div class="lg:col-span-2 space-y-4" {
                 div class="bg-white rounded-lg shadow p-5 space-y-4" {
