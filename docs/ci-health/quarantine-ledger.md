@@ -656,26 +656,51 @@ without also filling in the intake form above.
   dispatchable 2026-09-08T15:07:44Z (now ~114 hours idle).
 - **2026-09-14 update — 6th consecutive pass, harness still undispatched;
   zero new organic hits on any of the four tracked tests (`live_upgrade`'s
-  three signatures included, six signatures total) in the sampled
-  window.** Sampled `ci.yml` `pull_request` runs from the 2026-09-13 report's
-  own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z (~23 hours, one
-  `perPage=100` page whose own span fully covers the window with margin on
-  both ends, so a second page was not needed this pass — 71 runs: 45
-  cancelled/24 success/2 failure). Both failures triaged by job/log
-  inspection and attributed to their own branch's in-progress work, neither
-  a CI health issue: a `dependabot/cargo/validator-0.21.0` bump broke its own
-  `fuzz/Cargo.lock` (`--locked` refused the implicit update) and, separately,
-  `PostForm`'s `Validate` trait bound (`E0599` on `into_changeset`) — both
-  direct, deterministic consequences of that PR's own dependency bump; and
-  `claude/happy-edison-fstb1z` (previously flagged for its own `Clippy`
-  churn) failed a `Test (windows-latest)` repo-hygiene self-check
-  (`edge_conformance_ci_coverage`) because that branch's own in-progress
-  `ci.yml` edit hadn't finished restoring the `edge-conformance:` job block.
-  Neither matched `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
-  `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
-  still `total_count: 0` against `workflow_dispatch` runs, checked
-  2026-09-14T~08:0xZ — unchanged for a 6th straight pass since it became
-  dispatchable 2026-09-08T15:07:44Z (now ~137 hours idle).
+  three signatures included, six signatures total) across everything
+  checked this pass.** Sampled `ci.yml` `pull_request` runs from the
+  2026-09-13 report's own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z
+  (~23 hours, one `perPage=100` page whose own span fully covers the window
+  with margin on both ends, so a second page was not needed this pass — 71
+  runs: 45 cancelled/24 success/2 failure). Both run-level failures triaged
+  by job/log inspection and attributed to their own branch's in-progress
+  work, neither a CI health issue: a `dependabot/cargo/validator-0.21.0`
+  bump broke its own `fuzz/Cargo.lock` (`--locked` refused the implicit
+  update) and, separately, `PostForm`'s `Validate` trait bound (`E0599` on
+  `into_changeset`) — both direct, deterministic consequences of that PR's
+  own dependency bump; and `claude/happy-edison-fstb1z` (previously flagged
+  for its own `Clippy` churn) failed a `Test (windows-latest)` repo-hygiene
+  self-check (`edge_conformance_ci_coverage`) because that branch's own
+  in-progress `ci.yml` edit hadn't finished restoring the
+  `edge-conformance:` job block.
+  **Correction (post-review, via a Codex review comment on PR #2786): the
+  original version of this pass called the whole window "zero hits" from
+  only the two run-level failures, but 45 of the 71 runs were `cancelled`
+  overall — and `ci.yml`'s `cancel-in-progress` means a job can fail before
+  its run gets superseded and marked `cancelled`, so those were not
+  established zero-hit observations.** Checked job-level conclusions for 26
+  of the 45 cancelled runs (58%, best-effort sample — the remaining 19
+  weren't checked). Found one hidden job-level failure: run 34774043482
+  (branch `claude/epic-meitner-vkej1i`, created 2026-09-13T18:15:04Z,
+  overall `cancelled` when superseded by that branch's next push 13 minutes
+  later) had `Test (ubuntu-latest)` and `Test (windows-latest)` both
+  complete with conclusion `failure` first, on the identical test on both
+  platforms: `starters::tests::embedded_cms_matches_example_cms`
+  (`autumn-cli/src/starters/mod.rs:664:13`), `` assertion `left == right`
+  failed: drift between embedded cms starter and examples/cms at
+  src/routes/front.rs `` — a repo-hygiene drift-check between the embedded
+  CMS starter template and `examples/cms`'s actual source, firing
+  identically on both OS runners because it's a pure file-diff assertion.
+  Branch-owned (that WIP branch's own next push evidently fixed it — none
+  of the other 26 sampled cancelled runs show the same signature), not a CI
+  health issue, and no match to any tracked signature — but a real
+  correction to the earlier "zero hits" framing nonetheless.
+  Nothing found this pass — the two run-level failures plus the one
+  job-level failure inside a cancelled run — matched `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, or `job_tracking_stores_integration`.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-14T~08:0xZ — unchanged for a
+  6th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~137 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -752,6 +777,9 @@ without also filling in the intake form above.
   not an exhausted wall-clock wait.
 - **Status**: one occurrence — suggestive, not yet a repeat signature.
   Covered by the same rerun campaign as `live_upgrade` above.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
+  Still n=1, still not campaigned.
 
 ### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
 
