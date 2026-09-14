@@ -7,25 +7,28 @@ SQLite backend, scaffold day-one, `fuzz/`, `examples/island-flock/`) and left
 four follow-ups. This pass reruns the harness end to end, re-verifies every
 follow-up, and reports what changed.
 
-**Corrections, made across two rounds of this PR's own review**: the first
+**Corrections, made across three rounds of this PR's own review**: the first
 draft claimed a "scheduled batch" opened today would carry an empty lockfile
 diff on all three graphs, and that no dependency-only commit exists anywhere
 in this repo's history. Both were wrong (a `cargo update` flag misuse, and
-never having checked for Dependabot activity). The second draft over-corrected
-by treating all three graphs as covered by Dependabot's existing cadence —
-also wrong: Dependabot only covers the root graph; the two satellite graphs'
-batch material is genuinely uncovered by any process. A third finding, also
-from review: a claim that this repo's `git log` showed no recent change to
-the S3-cache code path was itself wrong (the log wasn't empty), though
-inspecting the actual hit surfaced a git-history rewrite on `trunk-dev`
-unrelated to the dependency ledger, not a real second code change. See
-"Scheduled batch" and "Pain ledger" below for the fully corrected evidence,
-and follow-ups 5–8 for what's still open. The bottom line is unchanged for a
-different reason than either earlier draft gave: **no ledger change clears
-the impact floor this pass** — not because there's nothing to do, but
-because the root graph's batch material is already someone else's job in
-progress, and the two satellites' batch material needs its own rehearsal
-this pass didn't budget for.
+never having checked for Dependabot activity). The second draft
+over-corrected by treating all three graphs as covered by Dependabot's
+existing cadence — also wrong: Dependabot only covers the root graph; the
+two satellite graphs' batch material is genuinely uncovered by any process.
+The second draft also mis-investigated a `git log` check on the `lru`
+waiver and, working from a **shallow git clone**, concluded `trunk-dev` had
+been force-pushed/rewritten — a false alarm, fully retracted in this
+revision (see follow-up 8 and the waiver section below); the shallow clone
+made an ordinary boundary commit look rootless, nothing more. This revision
+also narrows an overclaim about the `island-flock` batch's MSRV
+compatibility (see "Scheduled batch" below). See "Scheduled batch" and
+"Pain ledger" below for the fully corrected evidence, and follow-ups 5–8 for
+what's still open. The bottom line is unchanged for a different reason than
+any earlier draft gave: **no ledger change clears the impact floor this
+pass** — not because there's nothing to do, but because the root graph's
+batch material is already someone else's job in progress, and the two
+satellites' batch material needs its own rehearsal this pass didn't budget
+for.
 
 ## 🎯 Class
 
@@ -55,35 +58,39 @@ current upstream state (not taken on faith from the pin comment):
 | RUSTSEC-2024-0384 | `instant` | max 0.1.13, unmaintained | max still 0.1.13, unmaintained | No |
 | RUSTSEC-2026-0253 | `lru` (via `aws-sdk-s3`) | pinned `aws-sdk-s3` 1.122.0; 1.123.0+ needs `rust-version` 1.91.0/1.94.1 > our 1.88.0 floor | confirmed via `cargo info aws-sdk-s3@1.123.0`/`@1.146.1`: still 1.91.0 / 1.94.1 respectively; 1.122.0 is still the newest MSRV-compatible release | No |
 
-**Correction**: the first draft claimed this `git log` came back empty; it
-does not — `git log --since=2026-09-08 -- autumn-storage-s3/
-autumn-media-plugin/` returns one commit, and it needed inspecting, not
-waving off. Inspected: the hit is a git-history artifact, not a real code
-change. This repo's `trunk-dev` was force-pushed/rewritten at some point
-during this PR's review (`git fetch origin trunk-dev` reported "+
-a4c8fb5...e87bbde trunk-dev -> origin/trunk-dev (forced update)"); the
-commit a real reviewer's checkout still had reachable in the old history
-(`a4c8fb5`, the media-room-heartbeat PR #2700) is no longer an ancestor of
-the current tip, and the commit that now shows up in its place
-(`63e8342`) diffs against a mismatched parent — its stat shows
-`autumn-storage-s3/src/lib.rs` as 951 freshly-added lines, which is not
-real: that file and crate have existed since before last week's report. Not
-a real second code change to reconcile — a rewritten-history artifact,
-flagged separately below as its own finding, unrelated to Ballast's charter
-to fix.
+**Correction, twice over**: the first draft claimed this `git log` came back
+empty; it does not — `git log --since=2026-09-08 -- autumn-storage-s3/
+autumn-media-plugin/` returns a real commit and needed inspecting, not
+waving off. The second draft inspected it, but from a **shallow clone**
+(this session's checkout was `git clone --depth`-limited), which made
+`a4c8fb5` (the actual commit, PR #2700) look unreachable and made an
+unrelated commit sitting at the shallow boundary (`63e8342`) look like it
+had a mismatched-parent diff touching these directories — an artifact of the
+shallow boundary treating that commit as rootless, not a real `trunk-dev`
+history rewrite. Retracted in full: `git fetch --unshallow` confirms
+`a4c8fb5` is and always was a normal ancestor of `origin/trunk-dev`, and
+`63e8342`'s real diff (against its real parent) touches only
+`CHANGELOG.md`, `README.md`, `compile_fail.rs`, and
+`docs/guide/getting-started.md` — nothing in either S3/media directory.
+Apologies for the false alarm this cost a review round to catch; the
+git-history-rewrite finding is removed (was follow-up 8 in an earlier
+revision) and any push notification claiming it stands corrected here.
 
-The reachability argument itself was verified directly against current file
-content rather than via `git log`, sidestepping the rewritten-history noise
-entirely: `grep -n "pop(\|LruCache\|CacheKey" autumn-storage-s3/src/lib.rs`
-returns nothing — Autumn's own code never touches `lru` directly. `lru` is
-pulled in purely as a transitive dependency of `aws-sdk-s3`'s own internal
-S3 Express session cache (both crates' `Cargo.toml`s pin `aws-sdk-s3 >=
-1.122` specifically to get `lru >= 0.16.3`, per their own comments), so the
-waiver's reachability question turns on `aws-sdk-s3`'s own vendored
-behavior, not on anything in this repo's diffs — unaffected by any commit
-here as long as the `aws-sdk-s3` pin itself doesn't move, which it hasn't
-(see the waiver table above). All three waivers' **review-by 2026-10-01**
-stands, 17 days out — not due this pass.
+With full history restored, `a4c8fb5` is the real, relevant commit: it
+touches `autumn-media-plugin/` (room-heartbeat feature, config validation,
+docs) but not `autumn-storage-s3/` at all, and its only change to
+`storage.rs` is a visibility fix (`fn is_tigris_endpoint` →
+`pub(crate) fn`), unrelated to caching. Confirmed directly against current
+file content too: `grep -n "pop(\|LruCache\|CacheKey"
+autumn-storage-s3/src/lib.rs` returns nothing — Autumn's own code never
+touches `lru` directly. `lru` is pulled in purely as a transitive dependency
+of `aws-sdk-s3`'s own internal S3 Express session cache (both crates'
+`Cargo.toml`s pin `aws-sdk-s3 >= 1.122` specifically to get `lru >=
+0.16.3`, per their own comments), so the waiver's reachability question
+turns on `aws-sdk-s3`'s own vendored behavior, unaffected by any commit in
+this repo as long as the `aws-sdk-s3` pin itself doesn't move, which it
+hasn't (see the waiver table above). All three waivers' **review-by
+2026-10-01** stands, 17 days out — not due this pass.
 
 **Graph facts, root workspace** (via `cargo deny list --format json`, same
 methodology as last week's baseline):
@@ -146,12 +153,22 @@ cargo update --dry-run --verbose                                (root)         �
 (cd examples/island-flock && cargo update --dry-run --verbose)                → Locking 29 packages
 ```
 
-All three are genuine, MSRV-compatible moves (`cargo update`'s own
-rust-version-aware resolver already filters out anything requiring a newer
-`rust-version` than the crate declares — confirmed with `-p async-compression`
-and `-p bitflags` spot checks in `fuzz/`, both real and both respecting the
-1.88.0 floor). So real batch material exists on **every** graph this pass —
-the opposite of the first draft's conclusion.
+All three counts are real. Root and `fuzz/` both declare `rust-version =
+"1.88.0"`, and `cargo update`'s own rust-version-aware resolver filters
+candidates against that floor — confirmed with `-p async-compression` and
+`-p bitflags` spot checks in `fuzz/`, both real and both respecting 1.88.0.
+**Correction**: `examples/island-flock/Cargo.toml` declares **no
+`rust-version` at all** (just `edition = "2024"`), so its "Locking 29
+packages to latest Rust 1.94.1 compatible versions" message reflects this
+sandbox's active toolchain (1.94.1), not a real declared floor — an earlier
+revision's "all three are MSRV-compatible" claim overstated confidence for
+this graph specifically. The 29-package count is real batch material, but
+whether all 29 selections would work against whatever toolchain
+`build-island.sh` / CI actually uses for the `wasm32-unknown-unknown` build
+is unverified; narrowing the claim to "real, uncertain-MSRV" rather than
+"real, MSRV-compatible" for this one graph. So real batch material exists on
+**every** graph this pass — the opposite of the first draft's conclusion,
+with island-flock's compatibility specifically unconfirmed.
 
 **Correction**: the second draft claimed all three graphs are "Dependabot's
 territory" and left all three unactioned on that basis — also wrong.
@@ -244,7 +261,7 @@ None to the dependency graph. This report is the only artifact.
 | Duplicate crate names (warn-level) | 73 | 76 |
 | Scheduled batch, root graph | 0 packages (wrong methodology — see correction) | 74 packages behind, real; not actioned, Dependabot's territory (root-only) |
 | Scheduled batch, `fuzz/` graph | not checked | 58 packages behind, real; **uncovered by any process** |
-| Scheduled batch, `island-flock/` graph | not checked | 29 packages behind, real; **uncovered by any process** |
+| Scheduled batch, `island-flock/` graph | not checked | 29 packages behind, real; **uncovered by any process**; MSRV-compatibility unconfirmed (no declared `rust-version`) |
 | Dependabot PRs found in repo history | not checked | 84 (`search_pull_requests author:app/dependabot`) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Existing waivers still valid on re-check | 3/3 | 3/3 |
@@ -282,14 +299,13 @@ cargo info aws-sdk-s3@1.123.0
    and all still hold; not yet due. Revisit properly at that date.
 2. `examples/island-flock/deny.toml`'s `RUSTSEC-2025-0141` (`bincode`,
    `yew`-internal, "undetermined" not "unreachable") is still unresolved.
-   **Correction**: `git log --since=2026-09-08 -- examples/island-flock
-   examples/flock/static/islands` is not literally empty either — it
-   returns the same rebase-artifact commit (`63e8342`) flagged in follow-up
-   8, not a real change to this directory (that commit's actual PR, #2707,
-   never touches `island-flock`; the hit is the same mismatched-parent diff
-   noise). `build-island.sh` genuinely has not rerun since last week, so
-   there has been no natural point to inspect the compiled `.wasm`'s
-   retained symbols. Still open.
+   With full (unshallowed) history, `git log --since=2026-09-08 --
+   examples/island-flock examples/flock/static/islands` is genuinely empty
+   — an earlier revision of this report misread a shallow-clone artifact
+   here too (see the waiver correction above); the real answer was "no
+   change" all along. `build-island.sh` genuinely has not rerun since last
+   week, so there has been no natural point to inspect the compiled
+   `.wasm`'s retained symbols. Still open.
 3. The NCSA-via-`libfuzzer-sys` license-class decision for `fuzz/deny.toml`
    is still an open human "ask before" question — no decision recorded
    anywhere in `CHANGELOG.md`, `deny.toml`, or `fuzz/deny.toml` since last
@@ -325,20 +341,20 @@ cargo info aws-sdk-s3@1.123.0
    satellite workspace. Needs a human decision: extend `dependabot.yml` with
    two more directory entries, or have Ballast own satellite-graph batches
    on its own cadence (each needs its own rehearsal command; see the
-   "Scheduled batch" section above).
-8. **New this pass, out of Ballast's own charter but worth flagging.** This
-   repo's `trunk-dev` branch was force-pushed/rewritten at some point during
-   this PR's review — `git fetch origin trunk-dev` reported "+
-   a4c8fb5...e87bbde trunk-dev -> origin/trunk-dev (forced update)". At
-   least one previously-merged commit (`a4c8fb5`, PR #2700) is no longer an
-   ancestor of the current tip, and at least one commit now in the linear
-   history (`63e8342`) diffs against a mismatched parent, showing
-   long-existing files (`autumn-storage-s3/src/lib.rs`, `
-   autumn-media-plugin/src/*.rs`) as freshly added. The affected file
-   *content* looks intact (confirmed for the S3 crate's cache logic
-   directly, see above), but a force-push to a shared integration branch
-   is disruptive — it can strand other open PRs' bases, break `git blame`,
-   and, as seen here, make a plain `git log -- <path>` an unreliable signal
-   for "did anything change." Not something to investigate or fix under
-   this charter; flagging so a human can decide whether it was intentional
-   (e.g. a merge-queue rebase) and whether anything needs reconciling.
+   "Scheduled batch" section above). Separately, `examples/island-flock/
+   Cargo.toml` declares no `rust-version` at all, unlike the root and
+   `fuzz/` graphs (both `1.88.0`) — worth deciding whether it should have
+   one, since without it there's no floor for `cargo update` to respect and
+   no easy way to state "this batch is MSRV-safe" the way the other two
+   graphs' reports can.
+8. **Retracted.** An earlier revision of this report claimed `trunk-dev` had
+   been force-pushed/rewritten, based on `a4c8fb5` appearing unreachable and
+   `63e8342` appearing to carry a mismatched-parent diff. Both symptoms came
+   from this session's own **shallow git clone** (`63e8342` sat at the
+   fetch-depth boundary, which makes a commit look rootless and its diff
+   look like it touches every long-lived file). `git fetch --unshallow`
+   confirms `trunk-dev`'s real history is intact and was never rewritten —
+   there was no incident. Left here, marked retracted, rather than deleted
+   outright, since a prior revision's PR comments and a push notification
+   referenced it and should point at a correction, not a silently vanished
+   line.
