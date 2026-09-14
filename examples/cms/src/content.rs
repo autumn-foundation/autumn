@@ -4637,15 +4637,55 @@ pub async fn import_terms(
             }
             to_insert.push(draft.clone());
         }
+        // `ON CONFLICT ... DO NOTHING`, not a plain INSERT: the keys in
+        // `to_insert` were decided from the batched load above, and a whole
+        // chunk now sits between that snapshot and this statement instead of
+        // the single row-by-row loop's back-to-back SELECT/INSERT. A
+        // concurrent create of the exact same (taxonomy, slug) — another
+        // import, or an editor adding the same tag — during that wider
+        // window must not abort the rest of this restore; it should be
+        // treated the same as "already existed", not a hard failure. Same
+        // pattern `save_tags` (reddit-clone) already uses for this race.
         for chunk in to_insert.chunks(CHUNK) {
             let rows: Vec<Term> = diesel::insert_into(terms::table)
                 .values(chunk.to_vec())
+                .on_conflict((terms::taxonomy, terms::slug))
+                .do_nothing()
                 .returning(Term::as_returning())
                 .get_results(conn)
                 .await?;
-            for row in rows {
+            for row in &rows {
                 created.insert(row.id);
+            }
+            let mut inserted_keys: HashSet<(String, String)> = HashSet::with_capacity(rows.len());
+            for row in rows {
+                inserted_keys.insert((row.taxonomy.clone(), row.slug.clone()));
                 by_key.insert((row.taxonomy.clone(), row.slug.clone()), row);
+            }
+            // Any key in this chunk that did not come back from `RETURNING`
+            // lost the race: the row now exists (created by whoever won),
+            // just not created by this call, so it is looked up rather than
+            // added to `created`.
+            let mut races: HashMap<String, Vec<String>> = HashMap::new();
+            for draft in chunk {
+                let key = (draft.taxonomy.clone(), draft.slug.clone());
+                if !inserted_keys.contains(&key) {
+                    races
+                        .entry(draft.taxonomy.clone())
+                        .or_default()
+                        .push(draft.slug.clone());
+                }
+            }
+            for (taxonomy, slugs) in &races {
+                let found: Vec<Term> = terms::table
+                    .filter(terms::taxonomy.eq(taxonomy))
+                    .filter(terms::slug.eq_any(slugs))
+                    .select(Term::as_select())
+                    .load(conn)
+                    .await?;
+                for row in found {
+                    by_key.insert((row.taxonomy.clone(), row.slug.clone()), row);
+                }
             }
         }
 
