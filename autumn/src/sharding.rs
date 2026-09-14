@@ -1326,30 +1326,37 @@ impl ShardHealthIndicator {
         // connections) and runs on every probe; the parity comparison
         // opens fresh connections to both roles and is throttled.
         match replica_pool.get().await {
-            Ok(mut conn) => match crate::db::probe_connection_alive(&mut conn).await {
-                Ok(()) => {
-                    self.shard.runtime().mark_replica_connection_ready();
-                    if self.shard.runtime().parity_check_due()
-                        && let Some((primary_url, replica_url)) =
-                            self.shard.runtime().migration_check()
-                    {
-                        let readiness = crate::migrate::check_replica_migration_readiness_blocking(
-                            primary_url,
-                            replica_url,
-                        )
-                        .await;
-                        if readiness.is_ready() {
-                            self.shard.runtime().mark_replica_migrations_ready();
-                        } else if let Some(detail) = readiness.detail() {
-                            self.shard.runtime().mark_replica_migrations_unready(detail);
+            Ok(mut conn) => {
+                let alive = crate::db::probe_connection_alive(&mut conn).await;
+                drop(conn);
+                match alive {
+                    Ok(()) => {
+                        self.shard.runtime().mark_replica_connection_ready();
+                        if self.shard.runtime().parity_check_due()
+                            && let Some((primary_url, replica_url)) =
+                                self.shard.runtime().migration_check()
+                        {
+                            let readiness =
+                                crate::migrate::check_replica_migration_readiness_blocking(
+                                    primary_url,
+                                    replica_url,
+                                )
+                                .await;
+                            if readiness.is_ready() {
+                                self.shard.runtime().mark_replica_migrations_ready();
+                            } else if let Some(detail) = readiness.detail() {
+                                self.shard.runtime().mark_replica_migrations_unready(detail);
+                            }
                         }
                     }
+                    Err(error) => self
+                        .shard
+                        .runtime()
+                        .mark_replica_connection_unready(format!(
+                            "replica connection failed: {error}"
+                        )),
                 }
-                Err(error) => self
-                    .shard
-                    .runtime()
-                    .mark_replica_connection_unready(format!("replica connection failed: {error}")),
-            },
+            }
             Err(error) => self
                 .shard
                 .runtime()
