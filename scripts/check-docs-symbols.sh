@@ -271,23 +271,32 @@ def workspace_crates(root):
         if not name or not _published(pkg, ws_package):
             continue
         out[name.replace('-', '_')] = (os.path.join(rel, 'src'),
-                                       _has_lib(root, rel, data))
+                                       _lib_file(root, rel, data))
     return out
 
 
-def _has_lib(root, rel, data):
-    """Whether Cargo builds a LIBRARY target for this package.
+def _lib_file(root, rel, data):
+    """The crate-root FILE of this package's library target, or None.
+
+    Returns a path rather than a boolean, because the file is the thing the
+    scanner needs and a boolean silently discards it. `[lib] path =
+    "src/api.rs"` is a valid published library; classifying it as "has a lib"
+    and then reading `src/lib.rs` anyway yields an EMPTY surface, and an empty
+    surface does not fail — it reports every documented path into that crate as
+    dead. Worse, `undeclared_crates` would have just instructed the author to
+    map the crate, so the gate's own advice produces the wrong answer. (The
+    empty-surface guard in `main` is the second half of that fix; a path is
+    only useful if a missing one is loud.)
 
     Three cases, in the order Cargo resolves them:
 
-      1. An explicit `[lib]` table declares one outright, wherever its `path`
-         points. It wins over everything below, which is why it is checked
-         first: `autolib` governs auto-DISCOVERY and says nothing about a
+      1. An explicit `[lib]` table declares one outright. Its `path` wins,
+         defaulting to `src/lib.rs` when the table omits it. Checked first
+         because `autolib` governs auto-DISCOVERY and says nothing about a
          target the manifest declares by hand.
       2. `package.autolib = false` turns auto-discovery off. A `src/lib.rs`
-         then sits in the tree and Cargo builds no library from it, so the
-         file's presence is not proof of a library target and cannot be the
-         last word.
+         then sits in the tree with no library built from it, so the file's
+         presence is not proof and cannot be the last word.
       3. Otherwise Cargo auto-discovers `src/lib.rs`.
 
     Getting (2) wrong is not a cosmetic miss. A published package with
@@ -298,10 +307,13 @@ def _has_lib(root, rel, data):
     look for a renamed item in a crate that exposes nothing at all.
     """
     if 'lib' in data:
-        return True
+        declared = (data.get('lib') or {}).get('path')
+        return declared if isinstance(declared, str) else 'src/lib.rs'
     if (data.get('package') or {}).get('autolib') is False:
-        return False
-    return os.path.exists(os.path.join(root, rel, 'src', 'lib.rs'))
+        return None
+    if os.path.exists(os.path.join(root, rel, 'src', 'lib.rs')):
+        return 'src/lib.rs'
+    return None
 
 
 # Workspace crates that ship NO library target, and so can never appear in a
@@ -323,8 +335,8 @@ def _has_lib(root, rel, data):
 # all. The answer is never a different path; it is the CLI, or an API the
 # library crates actually expose.
 def binary_only_crates(root):
-    return {ident: rel for ident, (rel, has_lib) in workspace_crates(root).items()
-            if not has_lib}
+    return {ident: rel for ident, (rel, lib) in workspace_crates(root).items()
+            if lib is None}
 
 
 def undeclared_crates(root):
@@ -337,8 +349,8 @@ def undeclared_crates(root):
     seven sibling crates. Failing here is how the next one gets modelled on the
     day it lands instead of the day a reader files a bug.
     """
-    return sorted(ident for ident, (_, has_lib) in workspace_crates(root).items()
-                  if has_lib and ident not in CRATES)
+    return sorted(ident for ident, (_, lib) in workspace_crates(root).items()
+                  if lib is not None and ident not in CRATES)
 
 # ------------------------------------------------------------------ parsing
 
@@ -531,13 +543,19 @@ def expand_braces(spec):
 class Crate:
     """The public surface of one crate, read statically from its sources."""
 
-    def __init__(self, ident, srcdir):
+    def __init__(self, ident, srcdir, rootfile='lib.rs'):
         self.ident = ident
         self.src = srcdir
+        # The crate-root FILE, not always `lib.rs`: `[lib] path = "src/api.rs"`
+        # is a valid published library, and reducing target discovery to a
+        # boolean lost which file to read. Submodules still resolve against
+        # `self.src`, which is where Rust looks for them — the directory of the
+        # crate root.
+        self.rootfile = rootfile
         self.mods = {}            # tuple(path) -> {name: 'item'|'mod'}
         self.uses = {}            # tuple(path) -> [(target, leaf, alias, glob)]
         self.exported_macros = set()
-        if os.path.isfile(os.path.join(self.src, 'lib.rs')):
+        if os.path.isfile(os.path.join(self.src, self.rootfile)):
             self._scan_file([])
         # `#[macro_export]` hoists a macro to the crate root regardless of the
         # module it is written in.
@@ -546,7 +564,7 @@ class Crate:
 
     def _modfile(self, mp):
         if not mp:
-            return os.path.join(self.src, 'lib.rs')
+            return os.path.join(self.src, self.rootfile)
         p = self.src
         for seg in mp[:-1]:
             p = os.path.join(p, seg)
@@ -657,11 +675,32 @@ class Crate:
 class Surface:
     """Every workspace crate, with path resolution across their re-exports."""
 
-    def __init__(self, root, crates=CRATES):
-        self.crates = {ident: Crate(ident, os.path.join(root, rel))
-                       for ident, rel in crates.items()}
+    def __init__(self, root, crates=CRATES, rootfiles=None):
+        # `rootfiles` maps a crate ident to its crate-root file NAME relative
+        # to the mapped `src` directory, for the `[lib] path = "src/api.rs"`
+        # case. Absent (and in the self-test's synthetic trees) it is
+        # `lib.rs`, which is what every crate in this workspace actually uses.
+        rootfiles = rootfiles or {}
+        self.crates = {
+            ident: Crate(ident, os.path.join(root, rel),
+                         rootfiles.get(ident, 'lib.rs'))
+            for ident, rel in crates.items()}
         self.external = set()
         self._memo = {}
+
+    def empty(self):
+        """Modelled crates whose crate root published no names at all.
+
+        A crate that resolves to nothing is the one failure this gate cannot
+        report as a defect, because it does not look like one: every path into
+        it comes back `dead:<first segment>`, which reads exactly like a batch
+        of renamed items. The cause is always the model, not the docs — a
+        mapped directory with no crate root in it, or a `[lib] path` pointing
+        somewhere the mapping does not reach — so it is raised as a gate error
+        before any page is judged.
+        """
+        return sorted(ident for ident, c in self.crates.items()
+                      if not self.names_of(c, ()))
 
     def names_of(self, crate, mp, depth=0):
         """Public names visible at `crate::mp`, following `pub use`."""
@@ -1190,7 +1229,16 @@ def occurrences(root, files, pattern):
 
 
 def audit(root):
-    surface = Surface(root)
+    # The crate root each modelled crate actually declares. `CRATES` maps to a
+    # `src` DIRECTORY, so without this a `[lib] path = "src/api.rs"` crate is
+    # scanned for a `lib.rs` it does not have.
+    rootfiles = {}
+    for ident, (rel, lib) in workspace_crates(root).items():
+        if lib is None or ident not in CRATES:
+            continue
+        name = os.path.relpath(lib, 'src') if lib.startswith('src/') else lib
+        rootfiles[ident] = name
+    surface = Surface(root, rootfiles=rootfiles)
     files = corpus(root)
     binary_only = binary_only_crates(root)
     occ = occurrences(root, files, prefix_re(root))
@@ -1229,6 +1277,17 @@ def main():
         return 1
 
     surface, files, occ, dead, unimportable, opaque, ok, waived = audit(ROOT)
+    blank = surface.empty()
+    if blank:
+        print('FAIL: modelled crates that published no names at all: '
+              + ', '.join(blank))
+        print('')
+        print('This is a MODEL error, not a docs defect: every path into such')
+        print('a crate comes back dead, which reads like a batch of renamed')
+        print('items. Check that the `CRATES` entry points at the directory')
+        print('holding the crate root, and that a `[lib] path` outside `src/`')
+        print('is reachable from it.')
+        return 1
     aw = surface.crates['autumn_web']
     by_crate = collections.Counter(c for c, *_ in occ)
     print(f'corpus: {len(files)} reader-facing markdown files')
@@ -1566,9 +1625,10 @@ macro_rules! declassify { () => {} }
                '"examples/demo"]\n')
         ws = workspace_crates(tmp)
         check('binary-only crate is detected as having no lib',
-              ws.get('bin_only'), (os.path.join('bin_only', 'src'), False))
-        check('library crate is detected as having one',
-              ws.get('lib_crate'), (os.path.join('lib_crate', 'src'), True))
+              ws.get('bin_only'), (os.path.join('bin_only', 'src'), None))
+        check('library crate reports its crate-root file',
+              ws.get('lib_crate'),
+              (os.path.join('lib_crate', 'src'), 'src/lib.rs'))
         check('binary-only set is exactly the crates with no lib target',
               sorted(binary_only_crates(tmp)), ['bin_only'])
         check('a missing member directory is skipped, not fatal',
@@ -1632,6 +1692,38 @@ macro_rules! declassify { () => {} }
               'registry_only' in ws2, True)
         check('an absent publish key is still published',
               'lib_crate' in ws2, True)
+
+        # -- `[lib] path` is preserved, not reduced to a boolean -------------
+        # A boolean said "library"; the scanner then read `src/lib.rs`, found
+        # nothing, and reported every path into the crate as dead — after the
+        # gate had just told the author to map it.
+        _write(tmp, 'odd_lib/Cargo.toml',
+               '[package]\nname = "odd-lib"\nversion = "0.1.0"\n'
+               '[lib]\npath = "src/api.rs"\n')
+        _write(tmp, 'odd_lib/src/api.rs', 'pub mod thing;\npub struct Real;\n')
+        _write(tmp, 'odd_lib/src/thing.rs', 'pub struct Inner;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "odd_lib"]\n')
+        check('[lib] path is reported, not just its existence',
+              workspace_crates(tmp).get('odd_lib'),
+              (os.path.join('odd_lib', 'src'), 'src/api.rs'))
+        check('a [lib] table with no path defaults to src/lib.rs',
+              _lib_file(tmp, 'lib_crate', {'lib': {}}), 'src/lib.rs')
+        # Scanned through the declared root, the surface is real.
+        s2 = Surface(tmp, {'odd_lib': 'odd_lib/src'},
+                     rootfiles={'odd_lib': 'api.rs'})
+        check('a crate scanned via its declared root resolves',
+              s2.resolve('Real', 'odd_lib'), 'ok')
+        check('…and its submodules resolve too',
+              s2.resolve('thing::Inner', 'odd_lib'), 'ok')
+        check('a declared-root crate is not empty', s2.empty(), [])
+        # The guard: the same crate mapped WITHOUT its root file is silent
+        # otherwise — every path into it reads as a rename.
+        s3 = Surface(tmp, {'odd_lib': 'odd_lib/src'})
+        check('a crate whose root file is missing is reported empty',
+              s3.empty(), ['odd_lib'])
+        check('…and its paths would otherwise look merely renamed',
+              s3.resolve('Real', 'odd_lib'), 'dead:Real')
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)

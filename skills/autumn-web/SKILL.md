@@ -56,10 +56,14 @@ when their details matter:
   setter surface. To check rendered HTML from a test, shell out to `autumn
   check --a11y --html "<markup>"` and assert on the exit code (0 = no
   Critical/Serious violation); there is no library import for the checker.
-  `--html` carries the markup in argv, which the OS caps (~128 KiB per
-  argument on Linux, ~32 KiB per command line on Windows), so use it for
-  FRAGMENTS and check a whole page with `--url` against a served app —
-  past the limit the checker never starts and no audit runs.
+  Pass a whole DOCUMENT: `html-has-lang`, `bypass` and `landmark-one-main`
+  run on every input, so a bare fragment fails on the missing page shell.
+  Wrapping it as `<html lang="en"><body><main>…</main></body></html>` settles
+  all three (a `<main>` first in `<body>` needs no skip link). `--html`
+  carries the markup in argv, which the OS caps (~128 KiB per argument on
+  Linux, ~32 KiB per command line on Windows), so check a large page with
+  `--url` against a served app instead — past the limit the checker never
+  starts and no audit runs.
 
 ## Never write `use autumn_cli::…`
 
