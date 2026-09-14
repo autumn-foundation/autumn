@@ -130,8 +130,15 @@ anywhere before this pass.
    into a SHA-256 digest input (`push_storage_key_component`,
    `autumn/src/idempotency.rs:180-200`); `#[cached]`'s `make_cache_key`
    folds the `Option<String>` tenant (discriminant and value both) into a
-   `DefaultHasher` hash of a Rust tuple — non-cryptographic, never
-   persisted (`autumn/src/cache/mod.rs:517-521`); `rate_limit.rs`'s
+   `DefaultHasher` hash of a Rust tuple (`autumn/src/cache/mod.rs:517-521`)
+   — non-cryptographic, but not merely in-process either: when a shared
+   Redis backend is registered, `autumn-cache-redis/src/lib.rs:307-318`'s
+   `insert_raw_bytes` is "the primary write path for `#[cached]`-annotated
+   functions," persisting this exact key string (with an optional,
+   `#[cached]`-declared TTL — no expiry at all when none is set) as a real
+   Redis key. Changing `make_cache_key`'s output format has the same
+   stranded-data risk as idempotency's and plugin KV's byte-compatibility
+   constraints below, not a weaker one; `rate_limit.rs`'s
    `tenant_qualify_bucket_key` emits a tagged plain string (`t<len>:`/`n:`
    prefixes); `plugin_sandbox`'s `namespaced_key` emits a colon-delimited
    string with each segment passed through `escape_segment`/
@@ -151,34 +158,54 @@ anywhere before this pass.
    could stay `pub(crate)` — zero public-API cost, a genuine two-way door.
    `#[cached]`, however, is a proc macro (`autumn-macros`) whose *generated
    code* is inserted into whatever downstream crate calls it — any helper
-   that generated code invokes must be `pub` in `autumn_web` (`tenancy` is
-   already `pub mod`, `autumn/src/lib.rs:639`), and removing a `pub` symbol
-   later is a breaking change gated by STABILITY.md's deprecation ramp
-   (a full minor cycle), not an instant revert. So the "neither item
-   touches a public API" claim in an earlier draft of this memo was wrong
-   for any version of item 1 that wires `#[cached]` to a shared helper;
-   corrected here rather than repeated.
-2. **Add a repo-hygiene test that pins the four *known* derived-key call
-   sites — all four of them — to tenant-folding, and name the gap it does
-   not close.** The same idiom ADR 0013 proposed for
-   `deny.toml`/`deny-sqlite.toml` — a test asserting each of
-   `build_storage_key`, `generate_cache_body`'s key expression,
-   `resolve_key_and_params` (the global tower layer, calling
-   `tenant_qualify_bucket_key` at its own call site), `__check_throttle`
-   (the per-route `#[throttle(key = "principal")]` guard, an *independent*
-   second call to `tenant_qualify_bucket_key` at
-   `autumn/src/security/rate_limit.rs:1692`, not reachable through
-   `resolve_key_and_params`), and `namespaced_key` still folds in tenant —
-   catches a *regression* in one of these five call sites (two of them in
-   rate limiting alone). It does **not** catch a new, sixth derived-key
-   builder that omits tenant-folding entirely: such a builder calls
-   nothing this test looks for, so it adds no call site for an allow-list
-   to flag — which is exactly the mechanism that let all of today's
-   builders ship unflagged in the first place. Closing that half of the
-   gap needs enumerating derived-key *construction* (a new function whose
-   return value backs a cache/dedup/rate-limit lookup), not
-   `CURRENT_TENANT` reads — a harder, semantic check this memo does not
-   design. This item, not item 1, is the one with real teeth.
+   that generated code invokes must be Rust-visible as `pub` from there.
+   That does *not* force it into the stable, SemVer-covered API, though:
+   `STABILITY.md:78-82` explicitly excludes anything marked
+   `#[doc(hidden)]` from stability guarantees, and `STABILITY.md:240` lists
+   "tightening `#[doc(hidden)]` items or removing them entirely" as a
+   non-breaking change outright — no deprecation ramp required.
+   `autumn/src/counter_cache.rs:715,840,863,899,1204` already uses exactly
+   this `#[doc(hidden)] pub fn`/`pub enum` pattern for macro-generated-code
+   seams, so a new helper for `#[cached]` to call could follow the same
+   precedent and stay a genuine two-way door. (An earlier draft of this
+   memo claimed the opposite — that any symbol `#[cached]`'s expansion
+   calls is necessarily gated by the deprecation ramp; that was wrong,
+   corrected here rather than repeated.) The reason item 1 is still
+   downgraded is the encoding-incompatibility point above, not this one.
+2. **Add a repo-hygiene test that pins both halves of each flow —
+   *acquiring* the tenant and *encoding* it — not just the encoders, and
+   name the gap it does not close.** Pinning only the encoder is not
+   enough: `rate_limit.rs`'s `tenant_qualify_bucket_key` reads
+   `CURRENT_TENANT` *and* encodes in one function, so pinning it at both
+   its call sites (`resolve_key_and_params`, the global tower layer; and
+   `__check_throttle`, the per-route `#[throttle(key = "principal")]`
+   guard's *independent* second call, `autumn/src/security/rate_limit.rs:1692`,
+   not reachable through `resolve_key_and_params`) covers that subsystem
+   fully. But idempotency and `plugin_sandbox` split acquisition from
+   encoding into two separate calls, and a test that pins only the
+   encoder would pass even after someone silently broke the *acquisition*
+   half — `build_storage_key` still correctly folds in whatever
+   `Option<&str>` it's handed, whether or not
+   `StorageKeyContext::from_parts`'s `tenant: current_tenant_scope()`
+   (`autumn/src/idempotency.rs:165`) is still actually calling it instead
+   of hardcoding `None`; the same is true of `namespaced_key` versus
+   `plugin.rs:579-583`'s `CURRENT_TENANT.try_with(...)` capture, and of
+   `generate_cache_body`'s `make_cache_key` call versus its own inline
+   `__autumn_tenant_key_component` read one block above it
+   (`autumn-macros/src/cached.rs:620-624`, immediately above the
+   `make_cache_key` call at 625-628). The same idiom ADR 0013
+   proposed for `deny.toml`/`deny-sqlite.toml` — a test asserting each of
+   these acquisition *and* encoding call sites is still present and wired
+   together — catches a *regression* in any of them. It does **not**
+   catch a new, sixth derived-key builder that omits tenant-folding
+   entirely from scratch: such a builder calls nothing this test looks
+   for, so it adds no call site for an allow-list to flag — which is
+   exactly the mechanism that let all of today's builders ship unflagged
+   in the first place. Closing that half of the gap needs enumerating
+   derived-key *construction* (a new function whose return value backs a
+   cache/dedup/rate-limit lookup), not `CURRENT_TENANT` reads — a harder,
+   semantic check this memo does not design. This item, not item 1, is
+   the one with real teeth.
 
 Neither item requires resolving whether other not-yet-audited subsystems
 have the same gap today — that would be a fresh audit, not an
@@ -220,9 +247,22 @@ grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 142 
 # The independent second rate-limit call site recommendation 2 must also pin
 sed -n '1684,1693p' autumn/src/security/rate_limit.rs   # __check_throttle
 
-# The byte-compatibility constraints recommendation 1 must preserve
+# The byte-compatibility constraints recommendation 1 must preserve,
+# including #[cached]'s own persisted-backend case
 grep -n "storage_key_without_a_resolved_tenant_is_unchanged" -A 20 autumn/src/idempotency.rs
 sed -n '95,111p' autumn/src/plugin_sandbox/capability/kv.rs   # namespaced_key is the physical stored key
+sed -n '306,318p' autumn-cache-redis/src/lib.rs   # insert_raw_bytes persists make_cache_key's exact output
+
+# #[doc(hidden)] avoids the deprecation ramp entirely — an existing pattern
+# for macro-generated-code seams, not a hypothetical
+sed -n '78,82p;238,241p' STABILITY.md
+grep -n "doc(hidden)" -A1 autumn/src/counter_cache.rs | grep -A1 "pub fn\|pub enum" | head -12
+
+# Acquisition (reading CURRENT_TENANT) is a separate call from encoding at
+# 3 of the 4 sites — pinning only the encoder misses a regression here
+sed -n '154,166p' autumn/src/idempotency.rs        # StorageKeyContext::from_parts
+sed -n '618,628p' autumn-macros/src/cached.rs       # read, then make_cache_key, two steps
+sed -n '573,583p' autumn/src/plugin_sandbox/plugin.rs   # capture, then namespaced_key elsewhere
 
 # `autumn cache audit` proves invalidation coverage, not key composition,
 # and has no equivalent for idempotency or rate-limiting
