@@ -47,9 +47,21 @@ All three are documented in their own write-ups
 (`docs/security/2026-09-02-idempotency-tenant-scope/README.md`,
 `.../2026-09-05-cached-tenant-key/README.md`,
 `.../2026-09-09-rate-limit-tenant-key/README.md`) as: *"Affected: `autumn-web`
-0.7.0 and every earlier release"* — this is not hypothetical exposure, it
-shipped in every release from each subsystem's introduction until its fix,
-3-4 months in the oldest case.
+0.7.0 and every earlier release [that shipped this subsystem]"* — that
+quote is each report's own words, describing when the vulnerable *source
+code* existed, not necessarily when it was an exploitable cross-tenant
+defect. Tenancy itself has no release before 0.5.0 (2026-06-16,
+`CHANGELOG.md:13404`), so `#[cached]`'s omission was latent, not
+exploitable, in 0.2.0-0.4.0 (2026-04-19 through 2026-05-12) — those
+releases could not compose `#[cached]` with a tenancy feature that did
+not yet exist. Idempotency and rate limiting's `AuthenticatedPrincipal`
+strategy both first shipped in 0.5.0 too (each landed after 0.4.0's
+2026-05-12 cut and before 0.5.0's 2026-06-16 release), so for all three,
+the actually-affected published range is uniform and starts at 0.5.0, not
+at each subsystem's own, earlier source-code introduction: roughly 2.5-3
+months of real exposure per subsystem, from 0.5.0 to its fix, not the
+"3-4 months" an earlier draft of this memo computed from `#[cached]`'s
+March introduction.
 
 **A fourth, independent data point — this time correct on the first try —
 confirms there is still no shared primitive to reach for.** `autumn/src/plugin_sandbox/capability/kv.rs:104`,
@@ -270,6 +282,10 @@ architecture decision, and this memo does not claim to have performed one.
 ## 🔬 Reproduce
 
 ```bash
+# The actually-affected published range starts at 0.5.0 (first release
+# with tenancy at all), not at each subsystem's own earlier introduction
+grep -n "^## \[0.2.0\]\|^## \[0.3.0\]\|^## \[0.4.0\]\|^## \[0.5.0\]" -A1 CHANGELOG.md
+
 # The three fixes and their bespoke shapes
 git show --stat 465229fa 96e7353f ebf4a837   # #2447, #2528, #2653
 sed -n '144,180p' autumn/src/idempotency.rs
