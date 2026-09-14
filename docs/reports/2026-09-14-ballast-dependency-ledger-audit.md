@@ -7,16 +7,25 @@ SQLite backend, scaffold day-one, `fuzz/`, `examples/island-flock/`) and left
 four follow-ups. This pass reruns the harness end to end, re-verifies every
 follow-up, and reports what changed.
 
-**Correction, made during this PR's own review**: the first version of this
-report claimed a "scheduled batch" opened today would carry an empty
-lockfile diff on all three graphs, and that no dependency-only commit exists
-anywhere in this repo's history. Both claims were wrong — the first from a
-`cargo update` flag misuse, the second from never having checked for
-Dependabot activity. See "Scheduled batch" and "Pain ledger" below for the
-corrected evidence. The bottom line is unchanged for a different reason:
-**no ledger change clears the impact floor this pass**, not because no batch
-material exists, but because Dependabot already runs this repo's scheduled
-batch, continuously — see below.
+**Corrections, made across two rounds of this PR's own review**: the first
+draft claimed a "scheduled batch" opened today would carry an empty lockfile
+diff on all three graphs, and that no dependency-only commit exists anywhere
+in this repo's history. Both were wrong (a `cargo update` flag misuse, and
+never having checked for Dependabot activity). The second draft over-corrected
+by treating all three graphs as covered by Dependabot's existing cadence —
+also wrong: Dependabot only covers the root graph; the two satellite graphs'
+batch material is genuinely uncovered by any process. A third finding, also
+from review: a claim that this repo's `git log` showed no recent change to
+the S3-cache code path was itself wrong (the log wasn't empty), though
+inspecting the actual hit surfaced a git-history rewrite on `trunk-dev`
+unrelated to the dependency ledger, not a real second code change. See
+"Scheduled batch" and "Pain ledger" below for the fully corrected evidence,
+and follow-ups 5–8 for what's still open. The bottom line is unchanged for a
+different reason than either earlier draft gave: **no ledger change clears
+the impact floor this pass** — not because there's nothing to do, but
+because the root graph's batch material is already someone else's job in
+progress, and the two satellites' batch material needs its own rehearsal
+this pass didn't budget for.
 
 ## 🎯 Class
 
@@ -46,12 +55,35 @@ current upstream state (not taken on faith from the pin comment):
 | RUSTSEC-2024-0384 | `instant` | max 0.1.13, unmaintained | max still 0.1.13, unmaintained | No |
 | RUSTSEC-2026-0253 | `lru` (via `aws-sdk-s3`) | pinned `aws-sdk-s3` 1.122.0; 1.123.0+ needs `rust-version` 1.91.0/1.94.1 > our 1.88.0 floor | confirmed via `cargo info aws-sdk-s3@1.123.0`/`@1.146.1`: still 1.91.0 / 1.94.1 respectively; 1.122.0 is still the newest MSRV-compatible release | No |
 
-No code touching `autumn-storage-s3`/`autumn-media-plugin`'s S3-cache path
-(the reachability argument for the `lru` waiver: "cache keys are `String`,
-`pop()` is never called") landed since last week
-(`git log --since=2026-09-08 -- autumn-storage-s3/ autumn-media-plugin/`:
-empty). All three waivers' **review-by 2026-10-01** stands, 17 days out — not
-due this pass.
+**Correction**: the first draft claimed this `git log` came back empty; it
+does not — `git log --since=2026-09-08 -- autumn-storage-s3/
+autumn-media-plugin/` returns one commit, and it needed inspecting, not
+waving off. Inspected: the hit is a git-history artifact, not a real code
+change. This repo's `trunk-dev` was force-pushed/rewritten at some point
+during this PR's review (`git fetch origin trunk-dev` reported "+
+a4c8fb5...e87bbde trunk-dev -> origin/trunk-dev (forced update)"); the
+commit a real reviewer's checkout still had reachable in the old history
+(`a4c8fb5`, the media-room-heartbeat PR #2700) is no longer an ancestor of
+the current tip, and the commit that now shows up in its place
+(`63e8342`) diffs against a mismatched parent — its stat shows
+`autumn-storage-s3/src/lib.rs` as 951 freshly-added lines, which is not
+real: that file and crate have existed since before last week's report. Not
+a real second code change to reconcile — a rewritten-history artifact,
+flagged separately below as its own finding, unrelated to Ballast's charter
+to fix.
+
+The reachability argument itself was verified directly against current file
+content rather than via `git log`, sidestepping the rewritten-history noise
+entirely: `grep -n "pop(\|LruCache\|CacheKey" autumn-storage-s3/src/lib.rs`
+returns nothing — Autumn's own code never touches `lru` directly. `lru` is
+pulled in purely as a transitive dependency of `aws-sdk-s3`'s own internal
+S3 Express session cache (both crates' `Cargo.toml`s pin `aws-sdk-s3 >=
+1.122` specifically to get `lru >= 0.16.3`, per their own comments), so the
+waiver's reachability question turns on `aws-sdk-s3`'s own vendored
+behavior, not on anything in this repo's diffs — unaffected by any commit
+here as long as the `aws-sdk-s3` pin itself doesn't move, which it hasn't
+(see the waiver table above). All three waivers' **review-by 2026-10-01**
+stands, 17 days out — not due this pass.
 
 **Graph facts, root workspace** (via `cargo deny list --format json`, same
 methodology as last week's baseline):
@@ -119,14 +151,29 @@ rust-version-aware resolver already filters out anything requiring a newer
 `rust-version` than the crate declares — confirmed with `-p async-compression`
 and `-p bitflags` spot checks in `fuzz/`, both real and both respecting the
 1.88.0 floor). So real batch material exists on **every** graph this pass —
-the opposite of the first draft's conclusion. **Not actioned this pass**, for
-a different reason than "nothing to do": this repo already runs a mechanical
-scheduled-batch process (Dependabot), continuously — see "Pain ledger" below
-— and hand-rolling a competing 74-package Ballast batch today would collide
-with that process rather than fill a gap in it. Recorded here mainly so the
-next pass doesn't re-derive the flag bug: always probe with a bare
-`cargo update --dry-run --verbose` (or explicit `-p` specs), never
-`--workspace`, on any of the five graphs.
+the opposite of the first draft's conclusion.
+
+**Correction**: the second draft claimed all three graphs are "Dependabot's
+territory" and left all three unactioned on that basis — also wrong.
+`.github/dependabot.yml`'s only `package-ecosystem: cargo` entry is
+`directory: /`; `fuzz/` and `examples/island-flock/` are each excluded from
+the root workspace specifically *because* they're independent workspaces
+with their own `Cargo.lock` (see `deny.toml`'s own header), and Dependabot
+has no config entry for either directory. Only the **root graph's 74
+packages** are genuinely Dependabot's territory. The **58-package `fuzz/`
+batch and the 29-package `island-flock/` batch are uncovered by any
+process** — not Dependabot's, and not actioned by Ballast this pass either,
+so they are a real, open gap rather than a covered one. Recorded as a new
+follow-up below (extend `dependabot.yml` with two more `cargo` entries, one
+per satellite directory, or have Ballast pick up satellite batches on its
+own cadence) rather than actioned in this PR, since evaluating which of
+those 58+29 packages needs its own rehearsal (`RUSTFLAGS="--cfg fuzzing"
+cargo +nightly check --workspace` for `fuzz/`, `cargo check --target
+wasm32-unknown-unknown` for `island-flock/`) is real, separate work this
+pass didn't budget for. Recorded here mainly so the next pass doesn't
+re-derive the flag bug: always probe with a bare `cargo update --dry-run
+--verbose` (or explicit `-p` specs), never `--workspace`, on any of the
+five graphs.
 
 **Supply-chain facts, re-verified**: zero wildcard version ranges and zero
 unpinned git refs anywhere in the tree (`grep -rn 'version = "\*"'` /
@@ -168,15 +215,18 @@ should merge or nudge.
 
 ## 💡 Mechanism / forcing fact
 
-None, for Ballast to act on directly. Every Tier-1 check reruns clean, every
-existing waiver's underlying fact is unchanged, and — corrected from the
-first draft — real batch material exists on all three graphs (74/58/29
-packages) but is already Dependabot's territory, actively worked (84 PRs of
-history, most recently the week between the two Ballast passes). Per the
-charter, "staying current" is not a forcing fact for Ballast to open a
-*second*, competing batch PR on top of a process that already owns this
-cadence. A report, not a bump, is the correct outcome — for a corrected
-reason from the first draft's.
+None, for Ballast to act on directly this pass. Every Tier-1 check reruns
+clean, every existing waiver's underlying fact is unchanged, and — corrected
+twice from the first draft — real batch material exists on all three graphs
+(74/58/29 packages): the root graph's 74 is genuinely Dependabot's territory
+(84 PRs of history, actively worked, most recently the week between the two
+Ballast passes), but the `fuzz/` and `island-flock/` batches (58 + 29
+packages) are uncovered by any process — Dependabot's `cargo` config only
+targets `directory: /`. Per the charter, "staying current" alone isn't a
+forcing fact, so this pass reports the gap rather than rehearsing two
+unplanned satellite batches on the spot — see follow-up 7. A report, not a
+bump, is the correct outcome, but "nothing to do" was never the accurate
+reason and this version doesn't claim it is.
 
 ## 🔧 Change
 
@@ -192,9 +242,9 @@ None to the dependency graph. This report is the only artifact.
 | Crate@version nodes / names / direct deps (root) | 743 / 665 / 131 | 791 / 704 / 134 |
 | Workspace members | 28 | 33 |
 | Duplicate crate names (warn-level) | 73 | 76 |
-| Scheduled batch, root graph | 0 packages (wrong methodology — see correction) | 74 packages behind, real (unscoped dry run); not actioned, Dependabot's territory |
-| Scheduled batch, `fuzz/` graph | not checked | 58 packages behind, real |
-| Scheduled batch, `island-flock/` graph | not checked | 29 packages behind, real |
+| Scheduled batch, root graph | 0 packages (wrong methodology — see correction) | 74 packages behind, real; not actioned, Dependabot's territory (root-only) |
+| Scheduled batch, `fuzz/` graph | not checked | 58 packages behind, real; **uncovered by any process** |
+| Scheduled batch, `island-flock/` graph | not checked | 29 packages behind, real; **uncovered by any process** |
 | Dependabot PRs found in repo history | not checked | 84 (`search_pull_requests author:app/dependabot`) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Existing waivers still valid on re-check | 3/3 | 3/3 |
@@ -231,10 +281,13 @@ cargo info aws-sdk-s3@1.123.0
    three, plus `fuzz/deny.toml`'s `RUSTSEC-2023-0071`): re-checked this pass
    and all still hold; not yet due. Revisit properly at that date.
 2. `examples/island-flock/deny.toml`'s `RUSTSEC-2025-0141` (`bincode`,
-   `yew`-internal, "undetermined" not "unreachable") is still unresolved —
-   `build-island.sh` has not rerun since last week
-   (`git log --since=2026-09-08 -- examples/island-flock examples/flock/
-   static/islands`: empty besides an unrelated `deny.toml` rewrite), so
+   `yew`-internal, "undetermined" not "unreachable") is still unresolved.
+   **Correction**: `git log --since=2026-09-08 -- examples/island-flock
+   examples/flock/static/islands` is not literally empty either — it
+   returns the same rebase-artifact commit (`63e8342`) flagged in follow-up
+   8, not a real change to this directory (that commit's actual PR, #2707,
+   never touches `island-flock`; the hit is the same mismatched-parent diff
+   noise). `build-island.sh` genuinely has not rerun since last week, so
    there has been no natural point to inspect the compiled `.wasm`'s
    retained symbols. Still open.
 3. The NCSA-via-`libfuzzer-sys` license-class decision for `fuzz/deny.toml`
@@ -247,17 +300,45 @@ cargo info aws-sdk-s3@1.123.0
    this pass's finding (nothing else moved), and is better spent once there
    is a specific candidate hire to attribute cost to rather than as a
    blanket sweep.
-5. **New this pass.** A human decision on how Ballast and Dependabot should
-   divide responsibility: Dependabot already delivers the mechanical
-   "scheduled batch" (grouped, weekly, human-merged), but its PRs get none
-   of this charter's reachability join, license-class diffing, or usage
-   analysis — a Dependabot PR could in principle bump past a fix that trades
-   one advisory for another, or introduce a new license class, with nothing
-   in its own pipeline to catch it. Worth deciding whether a future Ballast
-   pass should specifically review open/recently-merged Dependabot PRs
-   against this charter's evidence bar, rather than treating "batch" as
-   Ballast's own job to originate.
+5. **New this pass, corrected during review.** A human decision on how
+   Ballast and Dependabot should divide responsibility, narrowed from an
+   earlier overstatement: `ci.yml`'s `pull_request` trigger fires on every
+   PR including Dependabot's, so its `supply-chain` job (`
+   scripts/check-advisories.sh` + the blocking root/SQLite license
+   allow-list checks) already runs against every root-graph Dependabot PR —
+   a new unwaived advisory or a disallowed license class IS caught
+   mechanically today. What genuinely has no automated coverage is
+   **reachability** (an advisory that's newly *waivable* vs. genuinely fixed
+   needs the same human judgment call this charter's `[advisories] ignore`
+   entries required) and **usage/cost analysis** (whether a bump actually
+   exercises new surface, changes build time, or grows the transitive
+   tree). Worth deciding whether a future Ballast pass should specifically
+   apply that layer to open/recently-merged Dependabot PRs, rather than
+   treating "batch" as Ballast's own job to originate.
 6. **New this pass.** Two open Dependabot PRs are stale (#2302, 3+ weeks;
    #2179, 5+ weeks) — a queue-health signal, not something this pass acted
    on. #2615 (a toolchain bump) is correctly held open pending a human "ask
    before" decision.
+7. **New this pass.** The `fuzz/` (58 packages) and `island-flock/` (29
+   packages) scheduled batches are genuinely uncovered by any process —
+   Dependabot's only `cargo` entry targets `directory: /`, not either
+   satellite workspace. Needs a human decision: extend `dependabot.yml` with
+   two more directory entries, or have Ballast own satellite-graph batches
+   on its own cadence (each needs its own rehearsal command; see the
+   "Scheduled batch" section above).
+8. **New this pass, out of Ballast's own charter but worth flagging.** This
+   repo's `trunk-dev` branch was force-pushed/rewritten at some point during
+   this PR's review — `git fetch origin trunk-dev` reported "+
+   a4c8fb5...e87bbde trunk-dev -> origin/trunk-dev (forced update)". At
+   least one previously-merged commit (`a4c8fb5`, PR #2700) is no longer an
+   ancestor of the current tip, and at least one commit now in the linear
+   history (`63e8342`) diffs against a mismatched parent, showing
+   long-existing files (`autumn-storage-s3/src/lib.rs`, `
+   autumn-media-plugin/src/*.rs`) as freshly added. The affected file
+   *content* looks intact (confirmed for the S3 crate's cache logic
+   directly, see above), but a force-push to a shared integration branch
+   is disruptive — it can strand other open PRs' bases, break `git blame`,
+   and, as seen here, make a plain `git log -- <path>` an unreliable signal
+   for "did anything change." Not something to investigate or fix under
+   this charter; flagging so a human can decide whether it was intentional
+   (e.g. a merge-queue rebase) and whether anything needs reconciling.
