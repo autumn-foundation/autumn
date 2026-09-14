@@ -213,18 +213,26 @@ on this repo since well before either Ballast pass, grouped into `rust-deps`
 `axum-ecosystem`, and `diesel-ecosystem`, weekly on Mondays (today), with no
 `auto-merge` workflow wired to it — every one of these PRs goes through a
 human merge, not a bot merge. `search_pull_requests
-author:app/dependabot` returns **84 PRs** in this repo's history, most
-recently three merged in the four days right before last week's Ballast pass
-(#2616, #2617, #2629 — then #2640, a 7-update `rust-deps` batch, merged
-2026-09-09, one day *after* last week's report). That is exactly the
-"scheduled batch" class this charter describes, already running, already
-reviewed one PR at a time per group rather than per bump — the opposite of
-the "bot spam" failure mode the charter bans. It also explains part of why
-this week's unscoped dry run still finds 74 root-graph packages behind:
-Dependabot's `rust-deps` group explicitly excludes `axum*`/`diesel*`/`tokio`
-from its patterns, so anything in those families (or anything not yet
-swept into an open group PR) accumulates until a human opens/merges the next
-one.
+author:app/dependabot` returns **84 PRs** in this repo's history.
+
+**Correction**: the timeline for the most recent ones was wrong in an
+earlier revision. Checking each PR directly (`pull_request_read`, not
+inferred from search-result `created_at` or from commit messages read too
+quickly): **#2616** and **#2629** were each opened, then **closed without
+being merged** (`"merged": false`) as Dependabot recreated the same
+`rust-deps` group update with a fresher diff — ordinary Dependabot
+behavior, not two real landings. Only **#2617** (`tower-http`,
+axum-ecosystem) and **#2640** (7-update `rust-deps` batch) were actually
+merged, both by a human (`merged_by: madmax983`) at **2026-09-10
+18:57–18:59**, two days *after* last week's Ballast pass (2026-09-08) —
+not "before" it, and not on 09-09. That is exactly the "scheduled batch"
+class this charter describes, already running, already reviewed one PR at
+a time per group rather than per bump — the opposite of the "bot spam"
+failure mode the charter bans. It also explains part of why this week's
+unscoped dry run still finds 74 root-graph packages behind: Dependabot's
+`rust-deps` group explicitly excludes `axum*`/`diesel*`/`tokio` from its
+patterns, so anything in those families (or anything not yet swept into an
+open group PR) accumulates until a human opens/merges the next one.
 
 Two open Dependabot PRs are stale enough to flag as a queue-health
 observation (not something this pass merges or unblocks): **#2302**
