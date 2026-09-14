@@ -184,13 +184,19 @@ so they are a real, open gap rather than a covered one. Recorded as a new
 follow-up below (extend `dependabot.yml` with two more `cargo` entries, one
 per satellite directory, or have Ballast pick up satellite batches on its
 own cadence) rather than actioned in this PR, since evaluating which of
-those 58+29 packages needs its own rehearsal (`RUSTFLAGS="--cfg fuzzing"
-cargo +nightly check --workspace` for `fuzz/`, `cargo check --target
-wasm32-unknown-unknown` for `island-flock/`) is real, separate work this
-pass didn't budget for. Recorded here mainly so the next pass doesn't
-re-derive the flag bug: always probe with a bare `cargo update --dry-run
---verbose` (or explicit `-p` specs), never `--workspace`, on any of the
-five graphs.
+those 58+29 packages needs its own rehearsal is real, separate work this
+pass didn't budget for: `fuzz/`'s is `RUSTFLAGS="--cfg fuzzing" cargo
++nightly check --workspace`, but `island-flock/`'s is **not** a bare
+`cargo check` — `docs/guide/wasm-islands.md` requires `wasm-bindgen-cli`
+pinned to the *exact* `wasm-bindgen` library version the crate resolves to
+("a mismatch produces" broken output), and `build-island.sh` does a real
+`--release` build through the matching CLI, not a type-check. Since this
+batch includes a `wasm-bindgen` bump (`0.2.126` → `0.2.128` among the 29),
+a real rehearsal means running `build-island.sh` end to end with a
+correspondingly-bumped `wasm-bindgen-cli`, not `cargo check`. Recorded here
+mainly so the next pass doesn't re-derive the flag bug: always probe with a
+bare `cargo update --dry-run --verbose` (or explicit `-p` specs), never
+`--workspace`, on any of the five graphs.
 
 **Supply-chain facts, re-verified**: zero wildcard version ranges and zero
 unpinned git refs anywhere in the tree (`grep -rn 'version = "\*"'` /
