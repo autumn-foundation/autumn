@@ -113,61 +113,72 @@ a real property, no systematic enforcement, found piecemeal.
 
 ## 🔧 Recommendation — not a decision, and deliberately not an RFC
 
-**Reversibility: two-way door, low-single-digit days.** Both items below
-are additive to existing, already-shipped code; neither touches a public
-API, a data-ownership boundary, or an external contract. Per this
-framework's own rule — *"if reversal costs under ~2 engineer-weeks, the
-implementing team decides it in a PR description"* — this does not clear
-the bar for an RFC. Recorded as a findings memo because the connection
-across three separately-audited-and-fixed CVE-shaped defects, one shared
-root cause, and a live fourth reinvention had not been made anywhere before
-this pass.
+**Reversibility: two-way door, low-single-digit days for item 2; item 1 is
+downgraded below to a documentation nice-to-have, for reasons that also
+bear on its own reversibility.** Per this framework's own rule — *"if
+reversal costs under ~2 engineer-weeks, the implementing team decides it
+in a PR description"* — even the more expensive reading below does not
+clear the bar for an RFC. Recorded as a findings memo because the
+connection across three separately-audited-and-fixed CVE-shaped defects,
+one shared root cause, and a live fourth reinvention had not been made
+anywhere before this pass.
 
-Concrete, PR-sized items for whoever picks this up next (maintainer, or the
-Warden/Ledger personas):
-
-1. **Share only the pure encoding step — not how each site obtains the
-   tenant.** The four sites do not agree on *how* they get an `Option<&str>`
-   tenant: `idempotency.rs`, `cached.rs`, and `rate_limit.rs` each read the
-   `CURRENT_TENANT` task-local directly, because each runs inside the async
-   request-handling task where that task-local is valid. `plugin_sandbox`
-   deliberately does **not** — `plugin.rs:573-580`'s own comment explains
-   why: `namespaced_key`'s caller runs on a `spawn_blocking` worker thread,
-   where the task-local is absent, so the tenant is read once on the
-   request-handling task *before* `spawn_blocking` and threaded through
-   explicitly (`runtime.tenant() -> Option<&str>`, and embedders can also
-   supply one via `CapabilityServices::for_tenant`). A shared primitive must
-   not fold that read in — a version of `namespaced_key` that called
-   `CURRENT_TENANT` itself would resolve `None` on every call and collapse
-   every tenant into one namespace. What *is* shareable is narrower: a pure
-   function taking the `Option<&str>` each site already has in hand (e.g.
-   `autumn_web::tenancy::fold_tenant_component(tenant: Option<&str>) ->
-   Option<String>`) and returning the disjoint-namespace component. Nor can
-   the four physical encodings simply be canonicalized onto that shared
-   output: `idempotency.rs` carries its own regression test
-   (`storage_key_without_a_resolved_tenant_is_unchanged`,
-   `autumn/src/idempotency.rs:2154`) asserting its key stays byte-identical
-   pre/post-fix so a retry doesn't turn into a fresh miss that replays a
-   mutation, and `plugin_sandbox/capability/kv.rs:104`'s `namespaced_key` is
-   itself the physical key a persistent KV backend stores plugin data under
-   — changing its output format orphans existing stored data. Each site
-   keeps its own existing physical format and its own existing way of
-   obtaining the tenant; only the small pure encoding step is shared.
-2. **Add a repo-hygiene test that pins the four *known* derived-key
-   builders to the shared primitive, and name the gap it does not close.**
-   The same idiom ADR 0013 proposed for `deny.toml`/`deny-sqlite.toml` — a
-   test asserting `build_storage_key`, `generate_cache_body`'s key
-   expression, `extract_key`/`resolve_key_and_params`, and `namespaced_key`
-   each call the shared encoding primitive with whatever `Option<&str>`
-   tenant they already obtained — catches a *regression* in one of these
-   four. It does **not** catch a new, fifth derived-key builder that omits
-   tenant-folding entirely: such a builder calls nothing this test looks
-   for, so it adds no call site for an allow-list to flag — which is
-   exactly the mechanism that let all four of today's builders ship
-   unflagged in the first place. Closing that half of the gap needs
-   enumerating derived-key *construction* (a new function whose return
-   value backs a cache/dedup/rate-limit lookup), not `CURRENT_TENANT`
-   reads — a harder, semantic check this memo does not design.
+1. **No single shared *encoding* primitive is actually viable across all
+   four sites — downgraded to a documentation nice-to-have, not a fix.**
+   The four sites' physical key formats are incompatible in kind, not just
+   in tag scheme: `idempotency.rs`'s `build_storage_key` folds the tenant
+   into a SHA-256 digest input (`push_storage_key_component`,
+   `autumn/src/idempotency.rs:180-200`); `#[cached]`'s `make_cache_key`
+   folds the `Option<String>` tenant (discriminant and value both) into a
+   `DefaultHasher` hash of a Rust tuple — non-cryptographic, never
+   persisted (`autumn/src/cache/mod.rs:517-521`); `rate_limit.rs`'s
+   `tenant_qualify_bucket_key` emits a tagged plain string (`t<len>:`/`n:`
+   prefixes); `plugin_sandbox`'s `namespaced_key` emits a colon-delimited
+   string with each segment passed through `escape_segment`/
+   `tenant_segment`. A function returning one canonical `Option<String>`
+   for all four to fold in can't simultaneously produce four different
+   physical shapes — the disjointness guarantee is exactly the part that
+   has to stay bespoke per site. What's actually shareable shrinks to the
+   trivial step of *obtaining* the raw tenant value, which is already
+   close to a one-liner at three of the four sites
+   (`CURRENT_TENANT.try_with(Clone::clone).ok().flatten()`) and an
+   explicit parameter at the fourth (`plugin_sandbox`, which deliberately
+   does **not** read `CURRENT_TENANT` — see below). De-duplicating one
+   line has little value on its own. There is also a public-API asymmetry
+   worth naming for whoever revisits this: `idempotency.rs`,
+   `rate_limit.rs`, and `plugin_sandbox/capability/kv.rs` all live inside
+   the `autumn` crate itself, so anything shared only among those three
+   could stay `pub(crate)` — zero public-API cost, a genuine two-way door.
+   `#[cached]`, however, is a proc macro (`autumn-macros`) whose *generated
+   code* is inserted into whatever downstream crate calls it — any helper
+   that generated code invokes must be `pub` in `autumn_web` (`tenancy` is
+   already `pub mod`, `autumn/src/lib.rs:639`), and removing a `pub` symbol
+   later is a breaking change gated by STABILITY.md's deprecation ramp
+   (a full minor cycle), not an instant revert. So the "neither item
+   touches a public API" claim in an earlier draft of this memo was wrong
+   for any version of item 1 that wires `#[cached]` to a shared helper;
+   corrected here rather than repeated.
+2. **Add a repo-hygiene test that pins the four *known* derived-key call
+   sites — all four of them — to tenant-folding, and name the gap it does
+   not close.** The same idiom ADR 0013 proposed for
+   `deny.toml`/`deny-sqlite.toml` — a test asserting each of
+   `build_storage_key`, `generate_cache_body`'s key expression,
+   `resolve_key_and_params` (the global tower layer, calling
+   `tenant_qualify_bucket_key` at its own call site), `__check_throttle`
+   (the per-route `#[throttle(key = "principal")]` guard, an *independent*
+   second call to `tenant_qualify_bucket_key` at
+   `autumn/src/security/rate_limit.rs:1692`, not reachable through
+   `resolve_key_and_params`), and `namespaced_key` still folds in tenant —
+   catches a *regression* in one of these five call sites (two of them in
+   rate limiting alone). It does **not** catch a new, sixth derived-key
+   builder that omits tenant-folding entirely: such a builder calls
+   nothing this test looks for, so it adds no call site for an allow-list
+   to flag — which is exactly the mechanism that let all of today's
+   builders ship unflagged in the first place. Closing that half of the
+   gap needs enumerating derived-key *construction* (a new function whose
+   return value backs a cache/dedup/rate-limit lookup), not
+   `CURRENT_TENANT` reads — a harder, semantic check this memo does not
+   design. This item, not item 1, is the one with real teeth.
 
 Neither item requires resolving whether other not-yet-audited subsystems
 have the same gap today — that would be a fresh audit, not an
@@ -194,13 +205,20 @@ sed -n '565,585p' autumn/src/plugin_sandbox/plugin.rs   # capture before spawn_b
 # ruling out "predates tenancy" as the whole mechanism.
 git show -s --format='%h %ad %s' --date=short 15029e72 75bc830a 7e8d2763 68ccadab 77284d73
 
-# No shared primitive exists today; every call site reads the task-local directly.
-# (A pattern anchored on ".try_with"/".with" undercounts: idempotency.rs and
-# cached.rs both wrap the method call onto the next line, so a single-line
-# grep misses them. Use plain "CURRENT_TENANT" and read each hit.)
+# No shared primitive exists today. Three of the four sites read the
+# task-local directly; plugin_sandbox's namespaced_key does NOT (it takes
+# tenant as an explicit parameter — see plugin.rs:573-580 above), so its
+# absence from this grep is expected, not evidence of ambient capture.
+# (A pattern anchored on ".try_with"/".with" undercounts even the three
+# ambient-read sites: idempotency.rs and cached.rs both wrap the method
+# call onto the next line, so a single-line grep misses them. Use plain
+# "CURRENT_TENANT" and read each hit.)
 grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros
 grep -rln "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 25 files
 grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 142 lines
+
+# The independent second rate-limit call site recommendation 2 must also pin
+sed -n '1684,1693p' autumn/src/security/rate_limit.rs   # __check_throttle
 
 # The byte-compatibility constraints recommendation 1 must preserve
 grep -n "storage_key_without_a_resolved_tenant_is_unchanged" -A 20 autumn/src/idempotency.rs
