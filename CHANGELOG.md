@@ -1430,6 +1430,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes unchanged. See
   `docs/reports/2026-09-13-ledger-cms-search-listing-permalink-ancestry-batch/`.
 
+- **🗃️ Ledger: batch `examples/cms`'s `import_terms` taxonomy lookups
+  (statements 2064-4128→3-69, reimport buffers -94.2%):**
+  `content::import_terms` — the handler behind `POST /admin/tools/import`
+  that restores a site-export JSON file's whole taxonomy — walked the
+  file's terms in two sequential per-row loops: a single-row existence
+  check before each insert, then a single-row child/parent re-lookup for
+  every term naming a parent, plus one `INSERT ... RETURNING` per new row.
+  A heavily-tagged blog's backup can carry thousands of terms, so the
+  round trips this call paid scaled with the file's term count rather than
+  with the site's registered-taxonomy count (`category`, `post_tag`, ...).
+  Now every `(taxonomy, slug)` the call needs — each draft's own identity
+  plus any parent it names — is collected up front and loaded with one
+  batched `taxonomy = $1 AND slug = ANY($2)` query per distinct taxonomy
+  (chunked at 1,000 slugs), new rows are created with one chunked
+  multi-row `INSERT ... RETURNING`, and the child/parent linking pass
+  reuses that same lookup map instead of re-querying. Profiled through the
+  real import route against a 5,000-row pre-existing `terms` fixture and a
+  2,000-term import file (an 8-top-level/4-children category tree plus
+  1,960 flat tags): a fresh restore drops from 4,128 to 69 statements
+  (23,098→19,119 buffers), and reimporting the same file — isolating the
+  pure-read half of the defect — drops from 2,064 to 3 statements
+  (6,224→363 buffers, -94.2%). No behavior change: the harness asserts
+  every child category resolves to its expected parent after the rewrite
+  and that reimporting the same file creates zero additional rows. See
+  `docs/reports/2026-09-14-ledger-cms-import-terms-batch/`.
+
 - **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
   subscription (buffers -97.8%):** `close_dunning_for`
   (`autumn-billing/src/reconcile.rs`), the step a `subscription.deleted`/
