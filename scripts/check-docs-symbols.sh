@@ -270,9 +270,35 @@ def workspace_crates(root):
         name = pkg.get('name')
         if not name or not _published(pkg, ws_package):
             continue
-        out[name.replace('-', '_')] = (os.path.join(rel, 'src'),
-                                       _lib_file(root, rel, data))
+        lib = _lib_file(root, rel, data)
+        out[_import_ident(data, name)] = (
+            os.path.join(rel, 'src'),
+            # Anchored at the MANIFEST directory, which is where Cargo anchors
+            # it. A declared root need not live under `src/` (`[lib] path =
+            # "lib/api.rs"` is valid), and treating the path as `src`-relative
+            # scanned `<crate>/src/lib/api.rs` — a file that does not exist,
+            # so the crate came back empty, or worse, one that does and the
+            # wrong API got audited.
+            os.path.join(rel, lib) if lib is not None else None)
     return out
+
+
+def _import_ident(data, pkg_name):
+    """The identifier a reader writes at the head of a path into this crate.
+
+    `[lib] name = "sdk"` means downstream paths start `sdk::`, NOT with the
+    package name — so deriving the prefix from `[package].name` alone would ask
+    for a `CRATES` entry under a name nobody writes and, worse, leave the
+    crate's real prefix out of `prefix_re` entirely. That is a silent hole in
+    the every-published-crate guarantee this gate now makes, which is the one
+    kind of gap worth being fussy about: an unaudited prefix looks exactly like
+    a clean one.
+
+    Cargo normalizes `-` to `_` for the import name in both cases.
+    """
+    declared = (data.get('lib') or {}).get('name')
+    chosen = declared if isinstance(declared, str) and declared else pkg_name
+    return chosen.replace('-', '_')
 
 
 def _lib_file(root, rel, data):
@@ -543,15 +569,20 @@ def expand_braces(spec):
 class Crate:
     """The public surface of one crate, read statically from its sources."""
 
-    def __init__(self, ident, srcdir, rootfile='lib.rs'):
+    def __init__(self, ident, srcdir, rootpath=None):
         self.ident = ident
-        self.src = srcdir
-        # The crate-root FILE, not always `lib.rs`: `[lib] path = "src/api.rs"`
-        # is a valid published library, and reducing target discovery to a
-        # boolean lost which file to read. Submodules still resolve against
-        # `self.src`, which is where Rust looks for them — the directory of the
-        # crate root.
-        self.rootfile = rootfile
+        # `rootpath` is the crate-root FILE, and when given it decides BOTH
+        # halves: the file to read and the directory submodules resolve
+        # against, which Rust takes to be the crate root's own directory. They
+        # have to move together — a `[lib] path = "lib/api.rs"` crate whose
+        # root is read from `lib/` but whose `mod` lookups still ran against
+        # `src/` would resolve the root and then lose every submodule under it.
+        if rootpath is not None:
+            self.src = os.path.dirname(rootpath)
+            self.rootfile = os.path.basename(rootpath)
+        else:
+            self.src = srcdir
+            self.rootfile = 'lib.rs'
         self.mods = {}            # tuple(path) -> {name: 'item'|'mod'}
         self.uses = {}            # tuple(path) -> [(target, leaf, alias, glob)]
         self.exported_macros = set()
@@ -675,15 +706,16 @@ class Crate:
 class Surface:
     """Every workspace crate, with path resolution across their re-exports."""
 
-    def __init__(self, root, crates=CRATES, rootfiles=None):
-        # `rootfiles` maps a crate ident to its crate-root file NAME relative
-        # to the mapped `src` directory, for the `[lib] path = "src/api.rs"`
-        # case. Absent (and in the self-test's synthetic trees) it is
-        # `lib.rs`, which is what every crate in this workspace actually uses.
-        rootfiles = rootfiles or {}
+    def __init__(self, root, crates=CRATES, rootpaths=None):
+        # `rootpaths` maps a crate ident to its crate-root FILE, already
+        # absolute. Given, it overrides the `<mapped dir>/lib.rs` default
+        # entirely — path and submodule base together. Absent (and in the
+        # self-test's synthetic trees) the default holds, which is what all 11
+        # crates in this workspace actually use.
+        rootpaths = rootpaths or {}
         self.crates = {
             ident: Crate(ident, os.path.join(root, rel),
-                         rootfiles.get(ident, 'lib.rs'))
+                         rootpaths.get(ident))
             for ident, rel in crates.items()}
         self.external = set()
         self._memo = {}
@@ -1230,15 +1262,12 @@ def occurrences(root, files, pattern):
 
 def audit(root):
     # The crate root each modelled crate actually declares. `CRATES` maps to a
-    # `src` DIRECTORY, so without this a `[lib] path = "src/api.rs"` crate is
-    # scanned for a `lib.rs` it does not have.
-    rootfiles = {}
-    for ident, (rel, lib) in workspace_crates(root).items():
-        if lib is None or ident not in CRATES:
-            continue
-        name = os.path.relpath(lib, 'src') if lib.startswith('src/') else lib
-        rootfiles[ident] = name
-    surface = Surface(root, rootfiles=rootfiles)
+    # `src` DIRECTORY, so without this a crate whose manifest points its
+    # library somewhere else is scanned for a `lib.rs` it does not have.
+    rootpaths = {ident: os.path.join(root, lib)
+                 for ident, (_, lib) in workspace_crates(root).items()
+                 if lib is not None and ident in CRATES}
+    surface = Surface(root, rootpaths=rootpaths)
     files = corpus(root)
     binary_only = binary_only_crates(root)
     occ = occurrences(root, files, prefix_re(root))
@@ -1628,7 +1657,8 @@ macro_rules! declassify { () => {} }
               ws.get('bin_only'), (os.path.join('bin_only', 'src'), None))
         check('library crate reports its crate-root file',
               ws.get('lib_crate'),
-              (os.path.join('lib_crate', 'src'), 'src/lib.rs'))
+              (os.path.join('lib_crate', 'src'),
+               os.path.join('lib_crate', 'src', 'lib.rs')))
         check('binary-only set is exactly the crates with no lib target',
               sorted(binary_only_crates(tmp)), ['bin_only'])
         check('a missing member directory is skipped, not fatal',
@@ -1704,14 +1734,16 @@ macro_rules! declassify { () => {} }
         _write(tmp, 'odd_lib/src/thing.rs', 'pub struct Inner;\n')
         _write(tmp, 'Cargo.toml',
                '[workspace]\nmembers = ["lib_crate", "odd_lib"]\n')
-        check('[lib] path is reported, not just its existence',
+        check('[lib] path is reported, anchored at the manifest dir',
               workspace_crates(tmp).get('odd_lib'),
-              (os.path.join('odd_lib', 'src'), 'src/api.rs'))
+              (os.path.join('odd_lib', 'src'),
+               os.path.join('odd_lib', 'src', 'api.rs')))
         check('a [lib] table with no path defaults to src/lib.rs',
               _lib_file(tmp, 'lib_crate', {'lib': {}}), 'src/lib.rs')
         # Scanned through the declared root, the surface is real.
         s2 = Surface(tmp, {'odd_lib': 'odd_lib/src'},
-                     rootfiles={'odd_lib': 'api.rs'})
+                     rootpaths={'odd_lib': os.path.join(tmp, 'odd_lib',
+                                                        'src', 'api.rs')})
         check('a crate scanned via its declared root resolves',
               s2.resolve('Real', 'odd_lib'), 'ok')
         check('…and its submodules resolve too',
@@ -1724,6 +1756,58 @@ macro_rules! declassify { () => {} }
               s3.empty(), ['odd_lib'])
         check('…and its paths would otherwise look merely renamed',
               s3.resolve('Real', 'odd_lib'), 'dead:Real')
+
+        # -- a library root OUTSIDE `src/` ------------------------------------
+        # `[lib] path = "lib/api.rs"` is valid. Treating the declared path as
+        # `src`-relative looked for `<crate>/src/lib/api.rs`: a file that does
+        # not exist (so the crate came back empty) or, worse, one that does and
+        # the wrong API got audited. Both halves have to anchor at the manifest
+        # directory — the root file AND the submodule base under it.
+        _write(tmp, 'out_of_src/Cargo.toml',
+               '[package]\nname = "out-of-src"\nversion = "0.1.0"\n'
+               '[lib]\npath = "lib/api.rs"\n')
+        _write(tmp, 'out_of_src/lib/api.rs',
+               'pub mod deep;\npub struct Outside;\n')
+        _write(tmp, 'out_of_src/lib/deep.rs', 'pub struct Nested;\n')
+        # A decoy at the path the old `src`-relative join would have read.
+        _write(tmp, 'out_of_src/src/lib/api.rs', 'pub struct Decoy;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "odd_lib", '
+               '"out_of_src"]\n')
+        check('a root outside src/ is anchored at the manifest dir',
+              workspace_crates(tmp).get('out_of_src'),
+              (os.path.join('out_of_src', 'src'),
+               os.path.join('out_of_src', 'lib', 'api.rs')))
+        s4 = Surface(tmp, {'out_of_src': 'out_of_src/src'},
+                     rootpaths={'out_of_src': os.path.join(
+                         tmp, 'out_of_src', 'lib', 'api.rs')})
+        check('the real API resolves through a root outside src/',
+              s4.resolve('Outside', 'out_of_src'), 'ok')
+        check('submodules resolve beside that root, not under src/',
+              s4.resolve('deep::Nested', 'out_of_src'), 'ok')
+        check('the decoy under src/ is NOT what got audited',
+              s4.resolve('Decoy', 'out_of_src'), 'dead:Decoy')
+
+        # -- `[lib] name` is the prefix a reader writes -----------------------
+        # Downstream paths start with the LIBRARY name, not the package name.
+        # Deriving the ident from `[package].name` alone asks for a `CRATES`
+        # entry nobody writes and leaves the real prefix out of `prefix_re`,
+        # which is an unaudited prefix that looks exactly like a clean one.
+        _write(tmp, 'renamed/Cargo.toml',
+               '[package]\nname = "renamed-pkg"\nversion = "0.1.0"\n'
+               '[lib]\nname = "sdk"\n')
+        _write(tmp, 'renamed/src/lib.rs', 'pub struct Client;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "renamed"]\n')
+        ws3 = workspace_crates(tmp)
+        check('[lib] name becomes the import ident', 'sdk' in ws3, True)
+        check('…and the package name is not the ident',
+              'renamed_pkg' in ws3, False)
+        check('a dash in [lib] name normalizes to an underscore',
+              _import_ident({'lib': {'name': 'my-sdk'}}, 'pkg'), 'my_sdk')
+        check('an absent [lib] name falls back to the package name',
+              _import_ident({'lib': {'proc-macro': True}}, 'autumn-macros'),
+              'autumn_macros')
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
