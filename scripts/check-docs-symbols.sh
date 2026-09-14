@@ -224,8 +224,16 @@ CRATES = {
     'autumn_admin_plugin': 'autumn-admin-plugin/src',
     'autumn_media_plugin': 'autumn-media-plugin/src',
     'autumn_schema_core': 'autumn-schema-core/src',
-    'autumn_plugin_reference': 'autumn-plugin-reference/src',
 }
+# NOT modelled: `autumn_plugin_reference`. It was listed here at first, which
+# was inconsistent with this gate's own rule — the crate is `publish = false`,
+# so `workspace_crates` deliberately keeps it out of the reader-facing set,
+# while a `CRATES` entry put its prefix back into `prefix_re` and built a
+# resolvable surface for it. A page recommending
+# `autumn_plugin_reference::ReferencePlugin` would then have PASSED, for a
+# crate no reader can depend on at all. It is not re-exported by any published
+# crate (only named in one `plugin_contract.rs` doc comment) and the corpus
+# writes no path into it, so the entry bought nothing and cost that.
 
 
 def workspace_crates(root):
@@ -529,14 +537,32 @@ RUST_LINKABLE = frozenset({'lib', 'rlib', 'dylib', 'proc-macro'})
 def _rust_linkable(libtable):
     """Whether `[lib]`'s crate types include one rustc can link against.
 
-    An ABSENT `crate-type` defaults to `lib` (or to `proc-macro` when
-    `proc-macro = true`), so absence means linkable and must not be read as a
-    denial — that default is what all 11 crates here rely on.
+    ABSENT and EMPTY are different answers, and an earlier revision of this
+    function got that wrong in a committed test that asserted `crate-type = []`
+    was "the default, not a denial". It is a denial. Measured rather than
+    reasoned, which is what settled it:
+
+        [lib] crate-type = []          # in a path dependency
+        $ cargo metadata   -> kind=[] crate_types=[]
+        $ cargo check -p dependent
+        warning: the package `emptyct` provides no linkable target
+        error: could not compile `emptyct`
+
+    So only an absent key gets the default — `lib`, or `proc-macro` under
+    `proc-macro = true`, which is what all 10 modelled crates rely on. An
+    explicit list answers for itself, and an empty one names nothing linkable.
+
+    A non-list value is a manifest cargo itself rejects; it is read as the
+    default rather than as a denial, so a malformed manifest cannot manufacture
+    a docs defect out of this gate.
     """
-    kinds = libtable.get('crate-type')
-    if kinds is None:
-        kinds = libtable.get('crate_type')
-    if not isinstance(kinds, list) or not kinds:
+    if 'crate-type' in libtable:
+        kinds = libtable['crate-type']
+    elif 'crate_type' in libtable:
+        kinds = libtable['crate_type']
+    else:
+        return True
+    if not isinstance(kinds, list):
         return True
     return any(k in RUST_LINKABLE for k in kinds if isinstance(k, str))
 
@@ -2132,8 +2158,17 @@ macro_rules! declassify { () => {} }
               _rust_linkable({'proc-macro': True}), True)
         check('proc-macro stays linkable',
               _rust_linkable({'crate-type': ['proc-macro']}), True)
-        check('an empty crate-type list is the default, not a denial',
-              _rust_linkable({'crate-type': []}), True)
+        # An explicitly EMPTY list is a denial, not the default. Verified
+        # against cargo: `crate_types=[]` in metadata, and a dependent's
+        # `cargo check` prints "provides no linkable target" and fails.
+        check('an empty crate-type list is a denial',
+              _rust_linkable({'crate-type': []}), False)
+        check('an absent crate-type key is the default',
+              _rust_linkable({}), True)
+        check('the crate_type spelling is honoured too',
+              _rust_linkable({'crate_type': ['cdylib']}), False)
+        check('a malformed crate-type is read as the default, not a defect',
+              _rust_linkable({'crate-type': 'cdylib'}), True)
         _write(tmp, 'cdyl/Cargo.toml',
                '[package]\nname = "cdyl"\nversion = "0.1.0"\n'
                '[lib]\ncrate-type = ["cdylib"]\n')
