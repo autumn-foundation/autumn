@@ -101,7 +101,12 @@ invalidation gate already reaches further than `#[cached]` alone, via
 (`autumn/src/cache/coherence.rs:864-899`,
 `docs/guide/cache-coherence.md:259-267`). Idempotency and rate-limiting
 have no equivalent invalidation gate of any kind, but that is a distinct
-point from tenant-key coverage, which no gate here or elsewhere checks.
+point from tenant-key coverage: the behavioral tests named in 🔧
+Recommendation, item 2 *do* check tenant-key composition for the known
+flows they cover. What no gate here or elsewhere checks is tenant-key
+composition *systematically* — automatically, for a derived-key builder
+nobody has written a dedicated test for yet, which is exactly the state
+every one of today's four builders was in before 2026-09-02.
 `grep -rn "CURRENT_TENANT"` finds 142 lines across 25 files today — most
 are the correct, declarative `#[repository(..., tenant_scoped)]` path; the
 four discussed here are the ad hoc, imperative ones that middleware/macros
