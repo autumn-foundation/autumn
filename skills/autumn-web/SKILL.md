@@ -53,7 +53,35 @@ when their details matter:
   attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
   a guarantee — the typed primitives are the compile-time proof (0.6.0,
   #1706). See `skills/autumn-web/references/api-reference.md` for the full
-  setter surface.
+  setter surface. To check rendered HTML from a test, shell out to `autumn
+  check --a11y --html "<markup>"` and assert on the exit code (0 = no
+  Critical/Serious violation); there is no library import for the checker.
+  Pass a whole DOCUMENT: `html-has-lang`, `bypass` and `landmark-one-main`
+  run on every input, so a bare fragment fails on the missing page shell.
+  Wrapping it as `<html lang="en"><body><main>…</main></body></html>` settles
+  all three (a `<main>` first in `<body>` needs no skip link). `--html`
+  carries the markup in argv, which the OS caps (~128 KiB per argument on
+  Linux, ~32 KiB per command line on Windows), so check a large page with
+  `--url` against a served app instead — past the limit the checker never
+  starts and no audit runs.
+
+## Never write `use autumn_cli::…`
+
+`autumn-cli` ships a **binary target only** — no `src/lib.rs`, no `[lib]`, so
+`cargo metadata` reports `bin` plus tests and nothing else. `pub` inside it is
+visible only within that binary, and no path into it resolves from another
+crate however it is spelled. `cargo add autumn-cli` still succeeds, because the
+crate does publish a binary, which is what makes this worth stating: every
+other signal says the import is fine.
+
+So anything the CLI does is reached by RUNNING it (`std::process::Command`, or
+a shell step in CI), never by importing it. The library crates to import from
+are `autumn-web` and the plugin crates (`autumn-billing`, `autumn-storage-s3`,
+`autumn-cache-redis`, `autumn-search`, `autumn-admin-plugin`,
+`autumn-media-plugin`, `autumn-edge`, `autumn-schema-core`, `autumn-macros`).
+
+`scripts/check-docs-symbols.sh` fails any reader-facing page that writes such a
+path, so a generated snippet carrying one will not land.
 
 ## Prefer framework idioms over raw Diesel/Axum
 
