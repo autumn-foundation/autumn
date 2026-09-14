@@ -6,12 +6,28 @@
 
 ## 🎯 Scope
 
-System boundary examined: every framework subsystem that computes a
-**derived key** from ambient request context — an idempotency storage slot,
-a `#[cached]` memoization key, a rate-limit bucket — to decide "is this the
-same logical operation as last time," under Autumn's opt-in, retrofitted
-row-level multi-tenancy (`autumn/src/tenancy.rs`, ADR-less feature landed
-2026-05-22, #876).
+System boundary examined: framework subsystems that compute a **derived
+key** from ambient request context — an idempotency storage slot, a
+`#[cached]` memoization key, a rate-limit bucket, a plugin KV namespace —
+to decide "is this the same logical operation/entity as last time," under
+Autumn's opt-in, retrofitted row-level multi-tenancy
+(`autumn/src/tenancy.rs`, ADR-less feature landed 2026-05-22, #876).
+
+**Explicitly out of scope, and not an omission from this inventory:**
+`autumn/src/cache/layer.rs`'s `CacheResponseLayer` also derives a key from
+request context (URI path + query, `layer.rs:90-110,188-218`) — but by
+documented, load-bearing contract, not by accident: its own rustdoc says
+*"that last rule is the whole contract: the key is the URI and nothing
+else... [wrapping a handler whose body varies per-visitor] leaks one
+visitor's page to the next... So either keep per-visitor routes out of
+this layer entirely, or give the cache a key that includes what the
+response varies on."* It is the caller's job to never wrap a
+tenant-varying handler in it, not the layer's job to fold in tenant — the
+opposite design from the four sites below, which all promise tenant
+isolation *automatically*. The 2026-09-02 idempotency report already
+checked and excluded this exact surface for this exact reason
+(`docs/security/2026-09-02-idempotency-tenant-scope/README.md:111-114`,
+"Checked and **not** affected"); this memo does not re-litigate that call.
 
 Reproduce every claim below with the commands in 🔬 Reproduce.
 
@@ -294,6 +310,12 @@ grep -n "idempotency_tenant_scope\|rate_limit_tenant_scope\|cached_tenant_scope\
 # `autumn cache audit` proves invalidation coverage, not key composition,
 # and has no equivalent for idempotency or rate-limiting
 grep -n "idempotency\|rate_limit\|throttle" autumn-cli/src/cache_audit.rs   # zero hits
+
+# CacheResponseLayer is out of scope by documented, load-bearing contract
+# (visitor-invariant by design), already checked and excluded in the
+# original idempotency report
+sed -n '85,111p' autumn/src/cache/layer.rs
+sed -n '108,115p' docs/security/2026-09-02-idempotency-tenant-scope/README.md
 
 # The three write-ups this memo synthesizes
 cat docs/security/2026-09-02-idempotency-tenant-scope/README.md
