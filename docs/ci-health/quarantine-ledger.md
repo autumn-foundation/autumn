@@ -654,6 +654,28 @@ without also filling in the intake form above.
   still `total_count: 0` against `workflow_dispatch` runs, checked
   2026-09-13T~09:1xZ — unchanged for a 5th straight day since it became
   dispatchable 2026-09-08T15:07:44Z (now ~114 hours idle).
+- **2026-09-14 update — 6th consecutive pass, harness still undispatched;
+  zero new organic hits on any of the four tracked tests (`live_upgrade`'s
+  three signatures included, six signatures total) in the sampled
+  window.** Sampled `ci.yml` `pull_request` runs from the 2026-09-13 report's
+  own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z (~23 hours, one
+  `perPage=100` page whose own span fully covers the window with margin on
+  both ends, so a second page was not needed this pass — 71 runs: 45
+  cancelled/24 success/2 failure). Both failures triaged by job/log
+  inspection and attributed to their own branch's in-progress work, neither
+  a CI health issue: a `dependabot/cargo/validator-0.21.0` bump broke its own
+  `fuzz/Cargo.lock` (`--locked` refused the implicit update) and, separately,
+  `PostForm`'s `Validate` trait bound (`E0599` on `into_changeset`) — both
+  direct, deterministic consequences of that PR's own dependency bump; and
+  `claude/happy-edison-fstb1z` (previously flagged for its own `Clippy`
+  churn) failed a `Test (windows-latest)` repo-hygiene self-check
+  (`edge_conformance_ci_coverage`) because that branch's own in-progress
+  `ci.yml` edit hadn't finished restoring the `edge-conformance:` job block.
+  Neither matched `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
+  `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
+  still `total_count: 0` against `workflow_dispatch` runs, checked
+  2026-09-14T~08:0xZ — unchanged for a 6th straight pass since it became
+  dispatchable 2026-09-08T15:07:44Z (now ~137 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -718,6 +740,8 @@ without also filling in the intake form above.
   entry it was when it had n=1.
 - **Status**: under active investigation, same rerun campaign as
   `live_upgrade` above (still undispatched).
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -883,5 +907,8 @@ without also filling in the intake form above.
   repeat signature appears. Not quarantined — the Docker sweep is
   unmodified and this test keeps running on every sweep.
 - **2026-09-13 update**: no repeat in the ~19h window sampled this pass
+  (see the `live_upgrade` entry's dated update above for the window and
+  method). Still n=1, still not campaigned.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
