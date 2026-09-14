@@ -54,39 +54,56 @@ manual threads, no extra deps available in this sandbox) fired concurrent
 5. Idle period: 15s of **zero** traffic (> reap interval + idle TTL, so any
    room from steps 1-4 that was never joined ages out).
 6. Fresh burst of 10,500 → **exactly** `10,000×200` then `500×503`, first
-   `503` at request index 5,022 of *that* burst. Because this burst started
-   from a quiet registry (step 5), an exact 10,000-success-then-cap result is
-   only possible if the registry had actually drained back down to ~0 rooms
-   during the idle period — not merely "some rooms," the *whole* prior
-   population.
-7. Unambiguous drain check, run as a **separate, later rerun** after a Codex
-   review on this PR correctly flagged the first version of this check as
-   inconclusive (see Findings): created 3 fresh, never-joined rooms, waited
-   15s (idle period again), then `POST`ed `.../join` (not `GET .../{id}`) on
-   each. `join_room` (`rooms.rs:1099-1107`) fails with `RoomNotFound` purely
-   on registry membership — unlike the roster route, it needs no bearer
-   token, so a `404` here cannot be explained away as "room exists but I'm
-   not a member." All 3 came back `404`. A control room created and joined
-   immediately afterward, with no wait, succeeded (`200` + a session token),
-   confirming `join` behaves normally against a room that does exist and the
-   `404`s above are specifically about the room being gone.
+   `503` at request index 5,022 of *that* burst. This is consistent with the
+   registry having drained to ~0 during the idle period, but — a second
+   Codex catch on this PR, on the rerun below — is not, by itself, proof:
+   the reaper keeps ticking every 5s throughout a multi-second burst too, so
+   the *same* aggregate 10,000/500 split could in principle arise from a
+   registry that still held leftover rooms when the burst started, took some
+   early `503`s, and only opened back up once a mid-burst reaper tick
+   reaped them. The aggregate counts don't preserve enough ordering
+   information to rule that out on their own.
+7. Unambiguous drain check for individual rooms, run as a rerun after the
+   first Codex review on this PR flagged the original version of this check
+   (`GET .../{id}`) as inconclusive (see Findings): created 3 fresh,
+   never-joined rooms, waited 15s (idle period again), then `POST`ed
+   `.../join` (not `GET .../{id}`) on each. `join_room`
+   (`rooms.rs:1099-1107`) fails with `RoomNotFound` purely on registry
+   membership — unlike the roster route, it needs no bearer token, so a
+   `404` here cannot be explained away as "room exists but I'm not a
+   member." All 3 came back `404`. A control room created and joined
+   immediately afterward, with no wait, succeeded (`200` + a session
+   token), confirming `join` behaves normally against a room that does
+   exist and the `404`s above are specifically about the room being gone.
+8. Closing the gap the second Codex catch (step 6) identified — direct,
+   pre-burst confirmation that the registry is actually empty, not just
+   consistent with being empty: a **third** rerun, combining steps 6 and 7
+   into one ordered experiment. Created 1,000 rooms, saved every id, waited
+   15s, then `join`-probed 5 of them (first, 25th/50th/75th-percentile,
+   last of the batch) — all 5 came back `404`, confirmed **before** sending
+   a single new create. Only then was the 10,500-request burst fired, and
+   it reproduced the same split exactly: `10,000×200` then `500×503`. This
+   is the version of the result that actually rules out the leftover-rooms
+   explanation, since the registry's emptiness was checked, not inferred,
+   immediately before the burst began.
 
 ## Findings
 
 **No bug.** Both halves of the documented claim held under live HTTP drive:
 
-- The cap is enforced at **exactly** 10,000 rooms, twice independently
-  (step 3/4's manual boundary check, and step 6's clean burst) — no
-  off-by-one in either direction, and `RegistryFull` maps to `503` as
-  `RoomError::into_autumn` documents.
-- The reaper **fully** drains an idle registry, not just partially: step 6
-  needed the registry at ~0 to produce an unbroken run of 10,000 successes
-  before the next `503`, and it did. Step 7's rerun confirms individual
-  reaped rooms are actually gone (`join` → `404 RoomNotFound`), not just
-  excluded from some count.
+- The cap is enforced at **exactly** 10,000 rooms, three times independently
+  now (step 3/4's manual boundary check, step 6's burst, and step 8's
+  rerun) — no off-by-one in either direction, and `RegistryFull` maps to
+  `503` as `RoomError::into_autumn` documents.
+- The reaper **fully** drains an idle registry, not just partially — and, as
+  of step 8, this is now verified rather than inferred: 5 sampled rooms
+  spanning an entire 1,000-room batch all confirmed reaped (`join` →
+  `404 RoomNotFound`) *before* a single new create was sent, and the
+  following burst still produced exactly 10,000 successes. Step 7's smaller
+  rerun corroborates the same mechanism (`join` → `404`) on 3 rooms in
+  isolation.
 
-Two corrections, both from a Codex review on this PR, to the first version of
-this report:
+Three corrections, all from Codex reviews on this PR, across two rounds:
 
 - The first draft attributed step 2's interleaved `200`/`503` boundary to the
   reaper racing the creation burst. It doesn't hold up against step 3/4's own
@@ -103,6 +120,14 @@ this report:
   member," and the original conclusion was unsupported by that evidence.
   Reran it properly (current step 7) against `join`, which is not
   member-gated, giving an unambiguous result.
+- On a second review round, after the two fixes above were already pushed,
+  Codex correctly pointed out that step 6's aggregate
+  `10,000×200`/`500×503` count is also consistent with the burst starting on
+  a *non-empty* registry that got reaped mid-burst — the reaper's 5s tick
+  doesn't pause just because a burst is in flight, and the aggregate counts
+  don't carry timing information. Step 8 closes this by probing the
+  registry directly before the burst starts, rather than inferring its
+  state from the burst's own output.
 
 **Solid area** (toured, held up): `InMemoryRoomStore`'s 10,000-room registry
 cap and the idle-reaper's live drain-back-down, now confirmed at the real
@@ -168,6 +193,10 @@ AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS=5 \
 AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS=8 \
   ./target/debug/media-room &
 # burst-create rooms via POST /api/media/rooms (any concurrent HTTP client);
-# confirm the 10,001st create in a tight window returns 503, then confirm a
-# quiet period >= idle_ttl + reaper_interval lets a fresh 10,000 succeed again.
+# confirm the 10,001st create in a tight window returns 503. Then, to confirm
+# drain-back-down without relying on aggregate counts alone: after a quiet
+# period >= idle_ttl + reaper_interval, POST a saved room id's .../join first
+# (expect 404 RoomNotFound) to verify the registry is empty *before* sending
+# any new creates — only then fire a fresh burst and confirm it again reaches
+# exactly 10,000 successes.
 ```
