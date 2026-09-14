@@ -5,8 +5,18 @@ Second Ballast pass in this repo, one week after the first
 #2612). That pass built the harness — five audited graphs (root workspace,
 SQLite backend, scaffold day-one, `fuzz/`, `examples/island-flock/`) and left
 four follow-ups. This pass reruns the harness end to end, re-verifies every
-follow-up, and reports what changed. **No ledger change clears the impact
-floor this pass** — report only, per "Acceptable outcomes" #2.
+follow-up, and reports what changed.
+
+**Correction, made during this PR's own review**: the first version of this
+report claimed a "scheduled batch" opened today would carry an empty
+lockfile diff on all three graphs, and that no dependency-only commit exists
+anywhere in this repo's history. Both claims were wrong — the first from a
+`cargo update` flag misuse, the second from never having checked for
+Dependabot activity. See "Scheduled batch" and "Pain ledger" below for the
+corrected evidence. The bottom line is unchanged for a different reason:
+**no ledger change clears the impact floor this pass**, not because no batch
+material exists, but because Dependabot already runs this repo's scheduled
+batch, continuously — see below.
 
 ## 🎯 Class
 
@@ -82,48 +92,91 @@ own rationale) — recorded so a future pass doesn't have to re-derive the
 breakdown, and flagged as a candidate line to tighten in `deny.toml`'s own
 comment the next time that file is touched for an unrelated reason.
 
-**Scheduled batch — corrected finding, all three graphs, 0 packages move**:
+**Scheduled batch — methodology correction, real batch material on all three
+graphs**:
+
+`cargo update --dry-run --workspace` is the WRONG probe for "how much batch
+material exists." `-w`/`--workspace` is a **package-selection** flag —
+`cargo update --help`: "Only update the workspace packages" — it restricts
+the update targets to this repo's own first-party workspace-member crates,
+not their third-party dependencies. Those first-party crates are local path
+packages with no registry version to bump, so `--workspace` reliably reports
+"Locking 0 packages" on every graph in this repo regardless of how stale the
+lockfile actually is. Both this week's first draft and last week's report
+(`docs/reports/2026-09-07-...`, "A scheduled batch would carry an empty
+lockfile diff today") used this flag and both were wrong about that specific
+claim. The correct probe is the **unscoped** dry run (no `SPEC`, no
+`--workspace`) or `-p <crate>` against a package known to be behind:
 
 ```
-cargo update --dry-run --workspace                              (root)      → Locking 0 packages
-(cd fuzz && cargo update --dry-run --workspace)                             → Locking 0 packages
-(cd examples/island-flock && cargo update --dry-run --workspace)           → Locking 0 packages
+cargo update --dry-run --verbose                                (root)         → Locking 74 packages
+(cd fuzz && cargo update --dry-run --verbose)                                  → Locking 58 packages
+(cd examples/island-flock && cargo update --dry-run --verbose)                → Locking 29 packages
 ```
 
-Worth recording precisely because this pass initially got a **false positive**
-on the two satellite graphs: `cargo update --dry-run --verbose` (no
-`--workspace` flag) against `fuzz/` and `island-flock/` reported ~80 and ~29
-would-be package changes respectively, with no "requires Rust X" annotation —
-looking exactly like real batch material. Re-running with `--workspace`
-(matching the flag the root-graph check has always used, and matching what an
-actual `cargo update --workspace` does) collapsed both to **0 packages,
-"Locking 0 packages to latest Rust 1.88.0 [resp. 1.94.1] compatible
-versions."** The bare `--dry-run` invocation, without `--workspace`, does not
-apply the same rust-version-aware resolution the scoped/real command does, and
-so previews upgrades neither `cargo update --workspace` nor a real
-unattended run would ever select. Recorded here so the next pass runs the
-satellite dry-runs with `--workspace` from the start rather than re-deriving
-this. **Net result: a scheduled batch opened today would carry an empty
-lockfile diff on all three graphs** (root, `fuzz/`, `island-flock/`) — same
-conclusion as last week for the root graph, now confirmed for the two
-satellites too.
+All three are genuine, MSRV-compatible moves (`cargo update`'s own
+rust-version-aware resolver already filters out anything requiring a newer
+`rust-version` than the crate declares — confirmed with `-p async-compression`
+and `-p bitflags` spot checks in `fuzz/`, both real and both respecting the
+1.88.0 floor). So real batch material exists on **every** graph this pass —
+the opposite of the first draft's conclusion. **Not actioned this pass**, for
+a different reason than "nothing to do": this repo already runs a mechanical
+scheduled-batch process (Dependabot), continuously — see "Pain ledger" below
+— and hand-rolling a competing 74-package Ballast batch today would collide
+with that process rather than fill a gap in it. Recorded here mainly so the
+next pass doesn't re-derive the flag bug: always probe with a bare
+`cargo update --dry-run --verbose` (or explicit `-p` specs), never
+`--workspace`, on any of the five graphs.
 
 **Supply-chain facts, re-verified**: zero wildcard version ranges and zero
 unpinned git refs anywhere in the tree (`grep -rn 'version = "\*"'` /
 equivalent `git = "` scan, main workspace + both satellites — both empty,
 unchanged from last week).
 
-**Pain ledger**: still no dependency-only commit or reverted upgrade anywhere
-in this repo's history besides the two Ballast passes themselves
-(`git log --all --oneline | grep -i ballast` → 1 hit, this pass's predecessor).
+**Pain ledger — corrected**: the first draft's "no dependency-only commit
+anywhere in this repo's history" was checked only against `git log --all
+--oneline | grep -i ballast`, which can only find commits *this agent*
+authored — it says nothing about the repo's actual dependency-update
+history. `.github/dependabot.yml` has run `cargo` + `github-actions` updates
+on this repo since well before either Ballast pass, grouped into `rust-deps`
+(all crates except `axum*`/`diesel*`/`tokio`, minor+patch only),
+`axum-ecosystem`, and `diesel-ecosystem`, weekly on Mondays (today), with no
+`auto-merge` workflow wired to it — every one of these PRs goes through a
+human merge, not a bot merge. `search_pull_requests
+author:app/dependabot` returns **84 PRs** in this repo's history, most
+recently three merged in the four days right before last week's Ballast pass
+(#2616, #2617, #2629 — then #2640, a 7-update `rust-deps` batch, merged
+2026-09-09, one day *after* last week's report). That is exactly the
+"scheduled batch" class this charter describes, already running, already
+reviewed one PR at a time per group rather than per bump — the opposite of
+the "bot spam" failure mode the charter bans. It also explains part of why
+this week's unscoped dry run still finds 74 root-graph packages behind:
+Dependabot's `rust-deps` group explicitly excludes `axum*`/`diesel*`/`tokio`
+from its patterns, so anything in those families (or anything not yet
+swept into an open group PR) accumulates until a human opens/merges the next
+one.
+
+Two open Dependabot PRs are stale enough to flag as a queue-health
+observation (not something this pass merges or unblocks): **#2302**
+(`validator` 0.20.0 → 0.21.0, open since 2026-08-24, 3+ weeks) and **#2179**
+(a Python `django` bump in `benchmarks/runtime/django`, open since
+2026-08-10, 5+ weeks). **#2615** (`dtolnay/rust-toolchain` 1.88.0 → 1.120.0,
+open since 2026-09-07) is a toolchain-version bump — squarely this charter's
+own "ask before: any change to build toolchains, language versions" —
+correctly still sitting open for a human decision, not something Ballast
+should merge or nudge.
 
 ## 💡 Mechanism / forcing fact
 
-None. Every Tier-1 check reruns clean, every existing waiver's underlying
-fact is unchanged, and the corrected scheduled-batch dry-run confirms zero
-lockfile movement is available anywhere in the tree. Per the charter, "staying
-current" and "it's been a week" are not forcing facts — a report, not a bump,
-is the correct outcome when nothing crosses the floor.
+None, for Ballast to act on directly. Every Tier-1 check reruns clean, every
+existing waiver's underlying fact is unchanged, and — corrected from the
+first draft — real batch material exists on all three graphs (74/58/29
+packages) but is already Dependabot's territory, actively worked (84 PRs of
+history, most recently the week between the two Ballast passes). Per the
+charter, "staying current" is not a forcing fact for Ballast to open a
+*second*, competing batch PR on top of a process that already owns this
+cadence. A report, not a bump, is the correct outcome — for a corrected
+reason from the first draft's.
 
 ## 🔧 Change
 
@@ -139,9 +192,10 @@ None to the dependency graph. This report is the only artifact.
 | Crate@version nodes / names / direct deps (root) | 743 / 665 / 131 | 791 / 704 / 134 |
 | Workspace members | 28 | 33 |
 | Duplicate crate names (warn-level) | 73 | 76 |
-| Scheduled batch, root graph | 0 packages | 0 packages |
-| Scheduled batch, `fuzz/` graph | not checked | 0 packages (confirmed with `--workspace`) |
-| Scheduled batch, `island-flock/` graph | not checked | 0 packages (confirmed with `--workspace`) |
+| Scheduled batch, root graph | 0 packages (wrong methodology — see correction) | 74 packages behind, real (unscoped dry run); not actioned, Dependabot's territory |
+| Scheduled batch, `fuzz/` graph | not checked | 58 packages behind, real |
+| Scheduled batch, `island-flock/` graph | not checked | 29 packages behind, real |
+| Dependabot PRs found in repo history | not checked | 84 (`search_pull_requests author:app/dependabot`) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Existing waivers still valid on re-check | 3/3 | 3/3 |
 
@@ -159,10 +213,11 @@ cargo deny --config deny-sqlite.toml check licenses sources
 cargo deny check bans
 cargo deny list --format json
 
-# scheduled-batch check — use --workspace on every graph, satellites included
-cargo update --dry-run --workspace
-(cd fuzz && cargo update --dry-run --workspace)
-(cd examples/island-flock && cargo update --dry-run --workspace)
+# scheduled-batch check — NEVER --workspace (it only targets first-party
+# path packages and always reports 0); use a bare unscoped dry run instead
+cargo update --dry-run --verbose
+(cd fuzz && cargo update --dry-run --verbose)
+(cd examples/island-flock && cargo update --dry-run --verbose)
 
 # waiver spot-checks
 cargo info rsa
@@ -170,7 +225,7 @@ cargo info instant
 cargo info aws-sdk-s3@1.123.0
 ```
 
-## Follow-ups still open (unchanged from last week, not actioned this pass)
+## Follow-ups still open
 
 1. Waivers sharing the **2026-10-01** review-by date (root `deny.toml`'s
    three, plus `fuzz/deny.toml`'s `RUSTSEC-2023-0071`): re-checked this pass
@@ -192,3 +247,17 @@ cargo info aws-sdk-s3@1.123.0
    this pass's finding (nothing else moved), and is better spent once there
    is a specific candidate hire to attribute cost to rather than as a
    blanket sweep.
+5. **New this pass.** A human decision on how Ballast and Dependabot should
+   divide responsibility: Dependabot already delivers the mechanical
+   "scheduled batch" (grouped, weekly, human-merged), but its PRs get none
+   of this charter's reachability join, license-class diffing, or usage
+   analysis — a Dependabot PR could in principle bump past a fix that trades
+   one advisory for another, or introduce a new license class, with nothing
+   in its own pipeline to catch it. Worth deciding whether a future Ballast
+   pass should specifically review open/recently-merged Dependabot PRs
+   against this charter's evidence bar, rather than treating "batch" as
+   Ballast's own job to originate.
+6. **New this pass.** Two open Dependabot PRs are stale (#2302, 3+ weeks;
+   #2179, 5+ weeks) — a queue-health signal, not something this pass acted
+   on. #2615 (a toolchain bump) is correctly held open pending a human "ask
+   before" decision.
