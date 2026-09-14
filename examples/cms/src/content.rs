@@ -4722,10 +4722,32 @@ pub async fn import_terms(
                 continue;
             }
             if child.id != parent.id && child.parent_id != Some(parent.id) {
-                diesel::update(terms::table.find(child.id))
-                    .set(terms::parent_id.eq(parent.id))
-                    .execute(conn)
-                    .await?;
+                // `parent` came from the batched snapshot taken before the
+                // create pass, not from a lookup right before this write. For
+                // an early term that snapshot is only microseconds stale, same
+                // as the old row-by-row loop's own SELECT-then-UPDATE gap, but
+                // for a term near the end of a large file it can be however
+                // long the rest of the batch took to process. `parent_id` is
+                // `REFERENCES terms (id) ON DELETE SET NULL`: writing a since-
+                // deleted id straight from the stale snapshot would violate
+                // that constraint and abort the whole restore over an
+                // ordinary concurrent delete, instead of just skipping this
+                // one link the way the original per-row check would have.
+                // Bounded to actual re-parent operations, not to the file's
+                // term count, so re-checking here costs nothing this PR's
+                // measured counters care about.
+                let parent_still_exists: Option<Term> = terms::table
+                    .find(parent.id)
+                    .select(Term::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if parent_still_exists.is_some() {
+                    diesel::update(terms::table.find(child.id))
+                        .set(terms::parent_id.eq(parent.id))
+                        .execute(conn)
+                        .await?;
+                }
             }
         }
 
