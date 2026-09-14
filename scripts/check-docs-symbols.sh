@@ -354,6 +354,19 @@ def _member_dirs(root, ws):
         for rel in matches:
             note(rel)
 
+    # The ROOT package is a member too, when the root manifest carries both
+    # `[package]` and `[workspace]` — cargo adds it even though `members` does
+    # not say `"."`. Seeded last so an explicit `.` entry keeps its position.
+    # This repository's root manifest has no `[package]` (only `patch`,
+    # `profile` and `workspace`), so nothing is added here today; a published
+    # root library would otherwise never reach `undeclared_crates` at all.
+    try:
+        with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
+            if 'package' in tomllib.load(fh):
+                note('.')
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+
     while queue:
         rel = queue.pop(0)
         try:
@@ -466,7 +479,10 @@ def _lib_file(root, rel, data):
     look for a renamed item in a crate that exposes nothing at all.
     """
     if 'lib' in data:
-        declared = (data.get('lib') or {}).get('path')
+        libtable = data.get('lib') or {}
+        if not _rust_linkable(libtable):
+            return None
+        declared = libtable.get('path')
         return declared if isinstance(declared, str) else 'src/lib.rs'
     if (data.get('package') or {}).get('autolib') is False:
         return None
@@ -493,6 +509,38 @@ def _lib_file(root, rel, data):
 # would happily propose a near-miss inside a crate that cannot be imported at
 # all. The answer is never a different path; it is the CLI, or an API the
 # library crates actually expose.
+#: Crate types a dependent crate can actually `use`. `cdylib` and `staticlib`
+#: build an artifact for C, not an rlib for rustc, so a package whose only
+#: crate types are those "provides no linkable target" (cargo says so in as
+#: many words) and every `use pkg::Thing` against it is E0432 — even though
+#: `src/lib.rs` is right there and this gate could resolve the path out of it.
+#:
+#: That is the SAME shape as the `autumn-cli` defect this gate was widened to
+#: catch: a crate that reads as importable and is not. Different manifest key,
+#: identical consequence for the reader, so it belongs in the same class rather
+#: than in a check of its own.
+#:
+#: `proc-macro` is linkable and must stay so — `autumn-macros` is one, declared
+#: as `[lib] proc-macro = true`, and its derives are named through re-exports
+#: the resolver follows.
+RUST_LINKABLE = frozenset({'lib', 'rlib', 'dylib', 'proc-macro'})
+
+
+def _rust_linkable(libtable):
+    """Whether `[lib]`'s crate types include one rustc can link against.
+
+    An ABSENT `crate-type` defaults to `lib` (or to `proc-macro` when
+    `proc-macro = true`), so absence means linkable and must not be read as a
+    denial — that default is what all 11 crates here rely on.
+    """
+    kinds = libtable.get('crate-type')
+    if kinds is None:
+        kinds = libtable.get('crate_type')
+    if not isinstance(kinds, list) or not kinds:
+        return True
+    return any(k in RUST_LINKABLE for k in kinds if isinstance(k, str))
+
+
 def binary_only_crates(root):
     return {ident: rel for ident, (rel, lib) in workspace_crates(root).items()
             if lib is None}
@@ -1474,10 +1522,11 @@ def main():
     for (crate, path, rel, line, src) in sorted(unimportable,
                                                 key=lambda d: (d[2], d[3])):
         print(f'{rel}:{line}: `{crate}::{path}` cannot be imported '
-              f'-- `{crate}` ships no library target '
-              f'(`{src}` has no `lib.rs` and its manifest declares no `[lib]`), '
-              f'so nothing in it is nameable from another crate. Point the '
-              f'reader at the CLI or at a library crate instead of a path.')
+              f'-- `{crate}` ships no Rust-linkable library target '
+              f'(no `lib.rs` under `{src}` and no `[lib]` declaring one, or a '
+              f'`[lib] crate-type` with no `lib`/`rlib`/`dylib`/`proc-macro` '
+              f'in it), so nothing in it is nameable from another crate. Point '
+              f'the reader at the CLI or at a library crate instead of a path.')
     print(f'defects: {len(dead) + len(unimportable)} '
           f'({len(dead)} unresolved, {len(unimportable)} unimportable; '
           f'{waived} waived)')
@@ -2050,6 +2099,51 @@ macro_rules! declassify { () => {} }
               _member_dirs(tmp, {'members': ['crates/alpha'],
                                  'exclude': ['implicit']}),
               ['crates/alpha'])
+
+        # -- the root package is a member when the root manifest has one -----
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n')
+        check('no [package] at the root adds no root member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n'
+               '[package]\nname = "rootpkg"\nversion = "0.1.0"\n')
+        _write(tmp, 'src/lib.rs', 'pub struct Root;\n')
+        check('a root [package] is a member even without "." in members',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', '.'])
+        check('…and the root package reaches workspace_crates',
+              'rootpkg' in workspace_crates(tmp), True)
+
+        # -- crate types rustc cannot link against ---------------------------
+        # Same shape as the `autumn-cli` defect this gate exists to catch: a
+        # `src/lib.rs` sits right there and the path still does not resolve for
+        # a dependent, because cdylib/staticlib build for C, not for rustc.
+        check('cdylib alone is not importable',
+              _rust_linkable({'crate-type': ['cdylib']}), False)
+        check('staticlib alone is not importable',
+              _rust_linkable({'crate-type': ['staticlib']}), False)
+        check('cdylib + rlib IS importable',
+              _rust_linkable({'crate-type': ['cdylib', 'rlib']}), True)
+        check('an absent crate-type defaults to lib',
+              _rust_linkable({'proc-macro': True}), True)
+        check('proc-macro stays linkable',
+              _rust_linkable({'crate-type': ['proc-macro']}), True)
+        check('an empty crate-type list is the default, not a denial',
+              _rust_linkable({'crate-type': []}), True)
+        _write(tmp, 'cdyl/Cargo.toml',
+               '[package]\nname = "cdyl"\nversion = "0.1.0"\n'
+               '[lib]\ncrate-type = ["cdylib"]\n')
+        _write(tmp, 'cdyl/src/lib.rs', 'pub struct NotReachable;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha", "cdyl"]\n')
+        check('a cdylib-only crate lands in the unimportable class',
+              sorted(binary_only_crates(tmp)), ['cdyl'])
+        check('…so it is NOT demanded as an undeclared library crate',
+              'cdyl' in undeclared_crates(tmp), False)
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
