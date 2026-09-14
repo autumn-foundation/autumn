@@ -188,6 +188,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 run_py() {
   python3 - "$@" <<'PYEOF'
 import collections
+import glob as globlib
 import os
 import pathlib
 import re
@@ -255,12 +256,12 @@ def workspace_crates(root):
     """
     with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
         manifest = tomllib.load(fh)
-    members = manifest['workspace'].get('members', [])
+    ws = manifest.get('workspace') or {}
     # The members enumerated here are the ROOT workspace's, so the root
     # manifest is the one an inherited `publish` resolves against.
-    ws_package = (manifest.get('workspace') or {}).get('package') or {}
+    ws_package = ws.get('package') or {}
     out = {}
-    for rel in members:
+    for rel in _member_dirs(root, ws):
         path = os.path.join(root, rel, 'Cargo.toml')
         if not os.path.exists(path):
             continue
@@ -280,6 +281,55 @@ def workspace_crates(root):
             # so the crate came back empty, or worse, one that does and the
             # wrong API got audited.
             os.path.join(rel, lib) if lib is not None else None)
+    return out
+
+
+def _member_dirs(root, ws):
+    """Workspace member directories, repo-relative, globs expanded.
+
+    `members` accepts Cargo's globs (`crates/*`), and reading each entry as a
+    literal directory silently drops every package a glob matches. That is not
+    a missing check but a VOIDED one: `undeclared_crates` could no longer see
+    those crates, so the "every published crate is modelled" guarantee would
+    keep passing while covering none of them — the same
+    unaudited-looks-like-clean failure as an unmatched `[lib] name`.
+
+    `exclude` semantics are cargo's (`WorkspaceRootConfig::is_excluded`) and
+    are not symmetrical with `members`: entries are literal path PREFIXES, so
+    `exclude = ["crates/*"]` matches nothing, and an explicitly listed member
+    always wins over an exclude. Mirrored from
+    `scripts/check-example-bin-names.sh`, which worked these rules out first —
+    the shape, not a second guess at it.
+
+    Path dependencies are deliberately NOT walked, unlike that gate. It scans
+    for bin-name collisions, which an unlisted in-tree dependency can cause;
+    this one asks which crates a READER can name, and that is answered by what
+    the workspace publishes, not by what it happens to build.
+    """
+    raw = ws.get('members', []) or []
+    exclude = ws.get('exclude', []) or []
+
+    def under(rel, pat):
+        pat = pat.strip('/')
+        return bool(pat) and (rel == pat or rel.startswith(pat + '/'))
+
+    def excluded(rel):
+        return (any(under(rel, p) for p in exclude)
+                and not any(under(rel, p) for p in raw))
+
+    out, seen = [], set()
+    for pattern in raw:
+        if globlib.has_magic(pattern):
+            matches = sorted(
+                p.relative_to(root).as_posix()
+                for p in pathlib.Path(root).glob(pattern)
+                if p.is_dir() and (p / 'Cargo.toml').is_file())
+        else:
+            matches = [pattern.strip('/')]
+        for rel in matches:
+            if rel and rel not in seen and not excluded(rel):
+                seen.add(rel)
+                out.append(rel)
     return out
 
 
@@ -1808,6 +1858,41 @@ macro_rules! declassify { () => {} }
         check('an absent [lib] name falls back to the package name',
               _import_ident({'lib': {'proc-macro': True}}, 'autumn-macros'),
               'autumn_macros')
+
+        # -- globbed `members`, and cargo's asymmetric `exclude` -------------
+        # Reading a glob as a literal directory does not merely miss crates,
+        # it VOIDS the coverage guarantee: `undeclared_crates` stops seeing
+        # them, so the gate keeps passing while modelling none of them.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n')
+        _write(tmp, 'crates/alpha/src/lib.rs', 'pub struct A;\n')
+        _write(tmp, 'crates/beta/Cargo.toml',
+               '[package]\nname = "beta"\nversion = "0.1.0"\n')
+        _write(tmp, 'crates/beta/src/lib.rs', 'pub struct B;\n')
+        _write(tmp, 'crates/notacrate/README.md', 'no manifest here\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/*"]\n')
+        check('a glob expands to the manifests under it',
+              _member_dirs(tmp, {'members': ['crates/*']}),
+              ['crates/alpha', 'crates/beta'])
+        check('a globbed member is actually read',
+              sorted(workspace_crates(tmp)), ['alpha', 'beta'])
+        # `exclude` is literal-prefix, NOT a glob: cargo's own asymmetry.
+        check('exclude drops a globbed member by prefix',
+              _member_dirs(tmp, {'members': ['crates/*'],
+                                 'exclude': ['crates/beta']}),
+              ['crates/alpha'])
+        check('a glob in exclude matches nothing, as cargo has it',
+              _member_dirs(tmp, {'members': ['crates/*'],
+                                 'exclude': ['crates/*']}),
+              ['crates/alpha', 'crates/beta'])
+        check('an explicitly listed member wins over exclude',
+              _member_dirs(tmp, {'members': ['crates/alpha', 'crates/beta'],
+                                 'exclude': ['crates/beta']}),
+              ['crates/alpha', 'crates/beta'])
+        check('a literal member entry still works',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
