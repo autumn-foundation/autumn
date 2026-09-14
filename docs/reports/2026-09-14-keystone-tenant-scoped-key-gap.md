@@ -54,11 +54,15 @@ class of bug. No compile-time or CI check catches this shape today: `autumn
 cache audit` (`autumn-cli/src/cache_audit.rs`) proves cache
 *invalidation* coverage, not key composition, and covers only `#[cached]`;
 idempotency and rate-limiting have no equivalent gate at all.
-`grep -rn "CURRENT_TENANT.try_with\|CURRENT_TENANT.with"` finds 50 call
-sites across 24 files today — most are the correct, declarative
-`#[repository(..., tenant_scoped)]` path; the four discussed here are the
-ad hoc, imperative ones that middleware/macros hand-roll for a derived key,
-which is exactly the shape with no gate.
+`grep -rn "CURRENT_TENANT"` finds 142 lines across 25 files today — most
+are the correct, declarative `#[repository(..., tenant_scoped)]` path; the
+four discussed here are the ad hoc, imperative ones that middleware/macros
+hand-roll for a derived key, which is exactly the shape with no gate. (A
+narrower single-line pattern anchored on `.try_with`/`.with` undercounts
+this: `idempotency.rs` and `cached.rs` both wrap the method call onto its
+own line, so a single-line grep misses two of the four examples in this
+memo entirely — a real limitation of grep-as-enforcement mechanism, not
+just of this reproduce command; see Recommendation 2.)
 
 ## 🧭 Do nothing / decide later — 12-month baseline
 
@@ -106,22 +110,37 @@ this pass.
 Concrete, PR-sized items for whoever picks this up next (maintainer, or the
 Warden/Ledger personas):
 
-1. **Collapse the four independent encodings onto one shared, documented
-   primitive** in `autumn_web::tenancy` (e.g. a `fold_ambient_tenant(key:
-   &str) -> String` or a small `TenantScopedKey` newtype), and have
-   `idempotency.rs`, `cached.rs`, `rate_limit.rs`, and
-   `plugin_sandbox/capability/kv.rs` call it instead of each keeping its own
-   encoding. This does not change any of the three fixes' external
-   behavior — it only removes the duplication that let them diverge.
-2. **Add a repo-hygiene test** — the same idiom ADR 0013 already proposed
-   for `deny.toml`/`deny-sqlite.toml` — that enumerates known
-   `CURRENT_TENANT.try_with`/`.with` call sites (today: the ones named
-   above, plus the legitimate declarative ones in `repository.rs`,
-   `model.rs`, `tenant_cell.rs`, `sharding.rs`, `commentable.rs`) against an
-   explicit allow-list, and fails when a *new* call site appears outside
-   it. A new site isn't necessarily wrong, but it should force a conscious
-   "does this need the shared primitive?" decision at review time instead
-   of shipping silently, the way all four discussed here did.
+1. **Extract the shared *step*, not one canonical encoding.** All four
+   sites already agree on the underlying operation — "read the ambient
+   tenant, then fold it into this key so tenant-present and tenant-absent
+   namespaces stay disjoint" — but the four *physical* encodings cannot
+   simply be canonicalized onto one, because two of them are load-bearing
+   on-the-wire/on-disk formats today: `idempotency.rs` carries its own
+   regression test (`storage_key_without_a_resolved_tenant_is_unchanged`,
+   `autumn/src/idempotency.rs:2154`) asserting its key stays byte-identical
+   pre/post-fix so a retry doesn't turn into a fresh miss that replays a
+   mutation, and `plugin_sandbox/capability/kv.rs:104`'s `namespaced_key`
+   *is* the physical key a persistent KV backend stores plugin data under —
+   changing its format orphans existing stored data. A shared primitive
+   (e.g. `autumn_web::tenancy::fold_ambient_tenant(key: &str) ->
+   Option<String>`, returning the component each site already computes
+   inline) that every site's *existing* format wraps around removes the
+   duplicated "how do I read `CURRENT_TENANT` safely" logic without asking
+   any of the four to change what they already persist or compare.
+2. **Add a repo-hygiene test that pins the four *known* derived-key
+   builders to the shared primitive, and name the gap it does not close.**
+   The same idiom ADR 0013 proposed for `deny.toml`/`deny-sqlite.toml` — a
+   test asserting `build_storage_key`, `generate_cache_body`'s key
+   expression, `extract_key`/`resolve_key_and_params`, and `namespaced_key`
+   each call the shared primitive — catches a *regression* in one of these
+   four. It does **not** catch a new, fifth derived-key builder that omits
+   tenant-folding entirely: such a builder calls nothing this test looks
+   for, so it adds no call site for an allow-list to flag — which is
+   exactly the mechanism that let all four of today's builders ship
+   unflagged in the first place. Closing that half of the gap needs
+   enumerating derived-key *construction* (a new function whose return
+   value backs a cache/dedup/rate-limit lookup), not `CURRENT_TENANT`
+   reads — a harder, semantic check this memo does not design.
 
 Neither item requires resolving whether other not-yet-audited subsystems
 have the same gap today — that would be a fresh audit, not an
@@ -143,8 +162,17 @@ sed -n '95,115p' autumn/src/plugin_sandbox/capability/kv.rs
 # Each broken subsystem predates tenancy (2026-05-22, #876)
 git show -s --format='%h %ad %s' --date=short 15029e72 75bc830a 7e8d2763 68ccadab
 
-# No shared primitive exists today; every call site reads the task-local directly
-grep -rn "CURRENT_TENANT.try_with\|CURRENT_TENANT.with" --include="*.rs" autumn autumn-macros
+# No shared primitive exists today; every call site reads the task-local directly.
+# (A pattern anchored on ".try_with"/".with" undercounts: idempotency.rs and
+# cached.rs both wrap the method call onto the next line, so a single-line
+# grep misses them. Use plain "CURRENT_TENANT" and read each hit.)
+grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros
+grep -rln "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 25 files
+grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 142 lines
+
+# The byte-compatibility constraints recommendation 1 must preserve
+grep -n "storage_key_without_a_resolved_tenant_is_unchanged" -A 20 autumn/src/idempotency.rs
+sed -n '95,111p' autumn/src/plugin_sandbox/capability/kv.rs   # namespaced_key is the physical stored key
 
 # `autumn cache audit` proves invalidation coverage, not key composition,
 # and has no equivalent for idempotency or rate-limiting
