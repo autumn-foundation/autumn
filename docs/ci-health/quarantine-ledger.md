@@ -677,9 +677,15 @@ without also filling in the intake form above.
   only the two run-level failures, but 45 of the 71 runs were `cancelled`
   overall — and `ci.yml`'s `cancel-in-progress` means a job can fail before
   its run gets superseded and marked `cancelled`, so those were not
-  established zero-hit observations.** Checked job-level conclusions for 26
-  of the 45 cancelled runs (58%, best-effort sample — the remaining 19
-  weren't checked). Found one hidden job-level failure: run 34774043482
+  established zero-hit observations.** Checked job-level conclusions for the
+  28 most-recently-created of the 45 cancelled runs (62%, best-effort
+  sample — a contiguous prefix by `created_at` descending, from 34773833346
+  through 34819892079; the remaining 17, from 34748838991 through
+  34771611140, weren't checked — full ID list in the matching report's
+  correction note). **Second correction (post-review, caught while
+  reproducing this claim for the "fixed" correction below, not a Codex
+  finding): the sample was originally miscounted as 26/45; it is 28/45.**
+  Found one hidden job-level failure: run 34774043482
   (branch `claude/epic-meitner-vkej1i`, created 2026-09-13T18:15:04Z,
   overall `cancelled` when superseded by that branch's next push 13 minutes
   later) had `Test (ubuntu-latest)` and `Test (windows-latest)` both
@@ -690,9 +696,26 @@ without also filling in the intake form above.
   src/routes/front.rs `` — a repo-hygiene drift-check between the embedded
   CMS starter template and `examples/cms`'s actual source, firing
   identically on both OS runners because it's a pure file-diff assertion.
-  Branch-owned.
-  **Correction (post-review, via a further Codex review comment on PR
-  #2786): whether the branch's next push fixed it is unverified, not
+  Branch-owned. **Third correction (post-review, via a further Codex review
+  comment on PR #2786): the same run had two other jobs — `Test (Docker)`
+  and `Test (macos-latest)` — that ran ~38 and ~40 minutes respectively
+  before being cancelled, long enough to have hidden a tracked-signature
+  panic from a conclusion-only check.** Fetched and grepped both full logs
+  for the four tracked signature names and any panic/`FAILED` marker: the
+  Docker job actually ran and passed
+  `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+  (`... ok`) before being cancelled — positive evidence, not absence — with
+  nothing matching any tracked signature anywhere in the log; the macOS job
+  was killed mid-`cargo build` (`Terminate orphan process: pid (37808)
+  (rustc)`) and never reached the test phase. Separately, for every one of
+  the other 27 sampled cancelled runs, every `Test`-shaped job shows the
+  *unexpanded* matrix template name with conclusion `cancelled` and
+  near-simultaneous created/started/completed timestamps — direct evidence
+  those jobs never started, so they carry no risk of hiding a signature
+  either.
+  **Fourth correction (post-review, via a further Codex review comment on
+  PR #2786, written chronologically before the third correction above):
+  whether the branch's next push fixed it is unverified, not
   established.** An earlier version of this entry claimed the branch's very
   next push (run 34777703864, ~13 minutes later) "evidently fixed it"
   because the signature didn't recur in the other 25 sampled cancelled

@@ -1,22 +1,50 @@
 # 🚦 Semaphore: CI health follow-up — zero new hits, harness idle a 6th pass
 
-**Correction (post-review, via two Codex review comments on this report's own
-PR #2786):** the original version of this report (1) claimed all four tracked
-ledger entries got a 2026-09-14 dated note when only three did (`sim_fault_plan`
-was missed), and (2) called the whole 71-run window "zero hits" while only
-inspecting the two runs whose overall conclusion was `failure` — the other 45
-runs in the window were `cancelled`, and `ci.yml`'s `cancel-in-progress`
-(`.github/workflows/ci.yml:9-11`) means a job can fail before its run gets
-superseded and marked `cancelled` overall, so those runs were not established
-zero-hit observations. Checked job-level conclusions (not run-level) for 26 of
-the 45 cancelled runs (58%, a sample — the rest weren't checked, so this
-remains best-effort, not exhaustive, per this ledger's own precedent for that
-caveat): one of them, run 34774043482 (branch `claude/epic-meitner-vkej1i`),
-did have two job-level failures — `Test (ubuntu-latest)` and `Test
-(windows-latest)` both failed on the same test before the run was superseded
-and its other jobs cancelled. Detailed and folded in below; it doesn't change
-this pass's bottom line (branch-owned, not a CI health issue, no match to any
-tracked signature), but the earlier "zero hits" framing was wrong as stated.
+**Correction (post-review, via four Codex review comments on this report's
+own PR #2786), superseding all earlier counts in this report:** the original
+version had four distinct problems, fixed in order below:
+
+1. Claimed all four tracked ledger entries got a 2026-09-14 dated note when
+   only three did (`sim_fault_plan` was missed) — fixed.
+2. Called the whole 71-run window "zero hits" while only inspecting the two
+   runs whose overall conclusion was `failure`. The other 45 runs were
+   `cancelled`, and `ci.yml`'s `cancel-in-progress` (`.github/workflows/ci.yml:9-11`)
+   means a job can fail before its run gets superseded and marked `cancelled`
+   overall, so those runs were not established zero-hit observations —
+   fixed by checking job-level conclusions (below).
+3. **The job-level check's own sample size was miscounted (said 26/45,
+   actually 28/45)** — a plain counting error caught while reproducing the
+   claim for this correction, not a Codex finding. The 28 checked are the 28
+   most-recently-created cancelled runs in the window, a contiguous prefix
+   by `created_at` descending: every cancelled run from 34773833346
+   (2026-09-13T18:10:58Z) through 34819892079 (2026-09-14T07:52:34Z)
+   inclusive. The remaining 17 — from 34748838991 through 34771611140,
+   2026-09-13T09:02:19Z–17:26:42Z — were not checked at job level. Full ID
+   list for reproducibility: 34773833346, 34774043482, 34777703864,
+   34783448860, 34784140368, 34785395381, 34786240747, 34787566112,
+   34788314580, 34789201821, 34790105486, 34814835029, 34815233853,
+   34816097108, 34816911180, 34817165542, 34817593424, 34817649859,
+   34817766094, 34818037515, 34818239526, 34818372089, 34818471930,
+   34818972951, 34819023646, 34819591201, 34819796023, 34819892079.
+4. **The one hidden job-level failure this check found (run 34774043482) had
+   two other jobs — `Test (Docker)` and `Test (macos-latest)` — that ran for
+   ~38 and ~40 minutes respectively before being cancelled, long enough to
+   have hit a tracked flaky signature and gone unnoticed by a
+   conclusion-only check.** Fetched and grepped both jobs' full logs for the
+   four tracked signature names and for any panic/failure marker: the Docker
+   job actually ran and passed `job_tracking_stores_integration` (`test
+   integration::job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it
+   ... ok`) before being cancelled; the macOS job was killed mid-`cargo
+   build` (`Terminate orphan process: pid (37808) (rustc)` in its final
+   lines) and never reached the test phase at all. Positive evidence, not
+   absence of it, for these two — see Symptom below for the same check
+   applied structurally across the other 27 sampled runs.
+
+None of this changes the pass's bottom line (branch-owned, not a CI health
+issue, no match to any tracked signature), but the earlier "zero hits"
+framing, the sample-size count, and (in a prior commit on this same PR) an
+unverified "fixed by the next push" claim were all wrong as originally
+stated.
 
 Follow-up to `docs/reports/2026-09-13-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. No fix PR from
@@ -42,8 +70,22 @@ own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z (~23 hours, one
 2026-09-14T08:00:19Z, fully covers the window with margin on both ends, so no
 second page was needed this pass). 71 runs in window: 45 cancelled, 24
 success, 2 failure. Triaged both run-level failures by job/log inspection,
-then — per the correction above — also checked job-level conclusions for 26
-of the 45 cancelled runs (58%, best-effort sample):
+then — per the correction above — also checked job-level conclusions for the
+28 most-recently-created of the 45 cancelled runs (62%, best-effort sample;
+exact IDs in the correction above).
+
+**For every one of those 28 runs except 34774043482, every `Test`-shaped job
+(`Test (${{ matrix.os }})`, `Test ${{ matrix.lane }}`, `Test (Docker)`,
+`Trybuild ${{ matrix.shard }}`, `Windows Tier 1 journey`, `Loom`, `Test
+suite`, `Coverage (${{ matrix.lane }})`) shows the *unexpanded* matrix
+template name as its job name, conclusion `cancelled`, and
+created/started/completed timestamps within 1-2 seconds of each other** —
+GitHub Actions only substitutes a matrix job's real name once it's assigned
+a runner and starts; an unexpanded template name with near-simultaneous
+timestamps is direct evidence the job was cancelled before it ever started,
+not mid-run, so it cannot have hidden a tracked-signature panic. Only
+34774043482 broke this pattern (its Test jobs show real elapsed time and
+expanded names) — detailed next.
 
 - **`dependabot/cargo/validator-0.21.0`** (run 34789054745,
   2026-09-13T23:13:00Z): two job failures, both direct, deterministic
@@ -99,14 +141,25 @@ of the 45 cancelled runs (58%, best-effort sample):
   the runs sampled this pass, full stop — whether or how it was actually
   fixed is unverified. Not a CI health issue, and not a match to any tracked
   signature, regardless.
+- **The same run's two long-running cancelled jobs, checked directly (not
+  inferred from absence)**: `Test (Docker)` ran 2026-09-13T18:48:04Z–19:26:50Z
+  (~38 min) before being cancelled; its full log shows
+  `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+  actually ran and passed (`... ok`) — a positive pass, not just an absent
+  failure — with no panic or `FAILED` marker anywhere in the log for any of
+  the four tracked signatures. `Test (macos-latest)` ran 18:48:07Z–19:28:02Z
+  (~40 min) before being cancelled; its log ends mid-`cargo build` (`Terminate
+  orphan process: pid (37808) (rustc)`), meaning it never reached the test
+  phase at all — it was killed at the toolchain/build step, not during test
+  execution.
 - **Zero hits on any of the four actively-tracked flaky tests** —
   `live_upgrade` (three signatures), `cache_stampede`, `sim_fault_plan`,
   `job_tracking_stores_integration` (six signatures total) — across
-  everything checked this pass (both run-level failures, plus job-level
-  conclusions in the 26 sampled cancelled runs). The remaining 19 cancelled
-  runs in the window were not individually checked at job level, so this is
-  a best-effort sample, not a proven-exhaustive one, on the cancelled-run
-  half specifically.
+  everything checked this pass: both run-level failures, job-level
+  conclusions across the 28 sampled cancelled runs, and full-log inspection
+  of the two long-running cancelled jobs inside 34774043482. The remaining
+  17 cancelled runs in the window were not checked at all, so this stays a
+  best-effort sample, not a proven-exhaustive one, on the cancelled-run half.
 
 ## 🔍 Diagnosis
 
@@ -158,7 +211,8 @@ No rerun campaign this pass — organic sampling only.
 | `dependabot/cargo/validator-0.21.0` lockfile+compile break | Triaged, branch-owned | Not a CI health issue |
 | `claude/happy-edison-fstb1z` Windows edge-conformance self-check | Triaged, branch-owned | Not a CI health issue |
 | `claude/epic-meitner-vkej1i` hidden job failure inside cancelled run | Triaged, branch-owned; not observed again (fix unverified) | Not a CI health issue |
-| Cancelled-run job-level check | 26/45 sampled (58%), 1 hidden failure found (above) | Best-effort, not exhaustive |
+| Cancelled-run job-level check | 28/45 sampled (62%), 1 hidden failure found (above) | Best-effort, not exhaustive |
+| Cancelled-run long-running-job log check (the 2 jobs that ran >30 min) | 2/2 checked, 0 tracked-signature hits, 1 positive pass confirmed | Complete for this run |
 
 ## 🔬 Reproduce
 
@@ -170,6 +224,12 @@ actions_list(list_workflow_runs, ci.yml, event=pull_request, status=completed,
 # each failing job's log via get_job_logs(run_id, failed_only=true, return_content=true)
 # each cancelled run's job-level conclusions via list_workflow_jobs(run_id, filter=latest)
 #   → grep for "conclusion":"failure" (run 34774043482 is the one hit found)
+#   → the 28 run IDs checked are listed in the correction note at the top of this report
+# for any cancelled job with non-trivial (started_at vs completed_at) elapsed time,
+# fetch its full log and grep for the tracked signature names + panic/FAILED markers:
+get_job_logs(job_id=<Test (Docker) in 34774043482>, return_content=true)
+get_job_logs(job_id=<Test (macos-latest) in 34774043482>, return_content=true)
+# → grep -E "live_upgrade|cache_stampede|sim_fault_plan|job_tracking_stores_integration|panicked at|test result: FAILED"
 ```
 
 Confirm the harness is still undispatched:
