@@ -301,13 +301,32 @@ def _member_dirs(root, ws):
     `scripts/check-example-bin-names.sh`, which worked these rules out first —
     the shape, not a second guess at it.
 
-    Path dependencies are deliberately NOT walked, unlike that gate. It scans
-    for bin-name collisions, which an unlisted in-tree dependency can cause;
-    this one asks which crates a READER can name, and that is answered by what
-    the workspace publishes, not by what it happens to build.
+    IN-TREE PATH DEPENDENCIES ARE MEMBERS TOO, even when `members` does not
+    name them — cargo's documented behaviour, and the reason this function
+    walks them. An earlier revision of this gate deliberately did not, on the
+    reasoning that a path dependency reflects what the workspace BUILDS rather
+    than what it PUBLISHES. That reasoning was wrong: cargo makes such a
+    dependency a real member, so a published one is a crate a reader can name,
+    and omitting it left `undeclared_crates` green with that crate's whole
+    prefix unaudited. Adding a published sibling through `path = "../new"`
+    alone is enough to trigger it.
+
+    Membership is NOT taken from `cargo metadata`, which would be the
+    authoritative answer: this gate is a toolchain-free job that reports in
+    seconds (see its step in ci.yml), and shelling out to cargo would cost
+    that. The rules are mirrored from `scripts/check-example-bin-names.sh`
+    instead, which resolved them first on #2712 — including the two that are
+    easy to get wrong: a `[workspace.dependencies]` path is relative to the
+    ROOT while a direct `path` is relative to the dependent package, and a
+    dependency carrying its own `[workspace]` table is a separate workspace
+    and is not recursed into.
     """
     raw = ws.get('members', []) or []
     exclude = ws.get('exclude', []) or []
+    ws_deps = ws.get('dependencies') or {}
+    if not isinstance(ws_deps, dict):
+        ws_deps = {}
+    rootp = pathlib.Path(root).resolve()
 
     def under(rel, pat):
         pat = pat.strip('/')
@@ -317,19 +336,83 @@ def _member_dirs(root, ws):
         return (any(under(rel, p) for p in exclude)
                 and not any(under(rel, p) for p in raw))
 
-    out, seen = [], set()
+    out, seen, queue = [], set(), []
+
+    def note(rel):
+        if rel and rel not in seen and not excluded(rel):
+            seen.add(rel)
+            out.append(rel)
+            queue.append(rel)
+
     for pattern in raw:
         if globlib.has_magic(pattern):
-            matches = sorted(
-                p.relative_to(root).as_posix()
-                for p in pathlib.Path(root).glob(pattern)
-                if p.is_dir() and (p / 'Cargo.toml').is_file())
+            matches = sorted(p.relative_to(rootp).as_posix()
+                             for p in rootp.glob(pattern)
+                             if p.is_dir() and (p / 'Cargo.toml').is_file())
         else:
             matches = [pattern.strip('/')]
         for rel in matches:
-            if rel and rel not in seen and not excluded(rel):
-                seen.add(rel)
-                out.append(rel)
+            note(rel)
+
+    while queue:
+        rel = queue.pop(0)
+        try:
+            with open(os.path.join(root, rel, 'Cargo.toml'), 'rb') as fh:
+                data = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        for dep_path, from_root in _path_deps(data, ws_deps):
+            base = rootp if from_root else (rootp / rel)
+            try:
+                dep = (base / dep_path).resolve().relative_to(rootp).as_posix()
+            except ValueError:
+                continue            # outside the workspace: never a member
+            manifest = os.path.join(root, dep, 'Cargo.toml')
+            if dep in seen or not os.path.isfile(manifest):
+                continue
+            try:
+                with open(manifest, 'rb') as fh:
+                    dep_data = tomllib.load(fh)
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            if 'workspace' in dep_data:
+                continue            # its own workspace root, not this one
+            note(dep)
+    return out
+
+
+def _path_deps(manifest, ws_deps):
+    """`(path, is_relative_to_workspace_root)` for one manifest's path deps.
+
+    Covers `dependencies`, `dev-dependencies` and `build-dependencies`, and the
+    same three under every `[target.*]` table — a crate reachable only through
+    a target-gated dependency is still a member.
+
+    `dep.workspace = true` inherits from `[workspace.dependencies]`, whose key
+    is `package = "…"` when the dependency is renamed, and whose paths are
+    relative to the workspace root rather than to the dependent package.
+    """
+    out = []
+    tables = [manifest]
+    targets = manifest.get('target')
+    if isinstance(targets, dict):
+        tables += [t for t in targets.values() if isinstance(t, dict)]
+    for table in tables:
+        for section in ('dependencies', 'dev-dependencies',
+                        'build-dependencies'):
+            deps = table.get(section)
+            if not isinstance(deps, dict):
+                continue
+            for name, spec in deps.items():
+                if not isinstance(spec, dict):
+                    continue
+                if isinstance(spec.get('path'), str):
+                    out.append((spec['path'], False))
+                elif spec.get('workspace') is True:
+                    inherited = ws_deps.get(spec.get('package', name), {})
+                    if isinstance(inherited, dict) and isinstance(
+                            inherited.get('path'), str):
+                        out.append((inherited['path'], True))
     return out
 
 
@@ -1892,6 +1975,80 @@ macro_rules! declassify { () => {} }
               ['crates/alpha', 'crates/beta'])
         check('a literal member entry still works',
               _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+
+        # -- implicit members: in-tree path dependencies ---------------------
+        # Cargo treats an unexcluded in-tree path dependency as a member even
+        # when `members` omits it. An earlier revision of this gate did not
+        # walk them, on the reasoning that they are what the workspace BUILDS
+        # rather than what it PUBLISHES — which was wrong, and left a
+        # published sibling added through `path = "../new"` alone entirely
+        # unaudited while `undeclared_crates` stayed green.
+        _write(tmp, 'implicit/Cargo.toml',
+               '[package]\nname = "implicit"\nversion = "0.1.0"\n')
+        _write(tmp, 'implicit/src/lib.rs', 'pub struct I;\n')
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('an in-tree path dep is an implicit member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        # End to end, through the root manifest: the implicit member arrives
+        # in `workspace_crates`, which is what `undeclared_crates` reads.
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n')
+        check('…and it reaches workspace_crates, so coverage can see it',
+              sorted(workspace_crates(tmp)), ['alpha', 'implicit'])
+        # A dependency outside the workspace root is never a member.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nout = { path = "../../../elsewhere" }\n')
+        check('a path dep outside the root is not a member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        # A dependency with its own [workspace] table is a separate workspace.
+        _write(tmp, 'nested/Cargo.toml',
+               '[workspace]\nmembers = []\n'
+               '[package]\nname = "nested"\nversion = "0.1.0"\n')
+        _write(tmp, 'nested/src/lib.rs', 'pub struct N;\n')
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nnested = { path = "../../nested" }\n')
+        check('a nested workspace root is not absorbed as a member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        # dev- and build-dependencies count, and so do target-gated ones.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dev-dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('a dev-dependency path is a member too',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[target."cfg(unix)".dependencies]\n'
+               'implicit = { path = "../../implicit" }\n')
+        check('a target-gated path dep is a member too',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        # An inherited `workspace = true` path resolves against the ROOT, not
+        # the dependent package — and the lookup key is `package` when renamed.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nrenamed-dep = { workspace = true, '
+               'package = "implicit" }\n')
+        check('an inherited workspace path dep resolves against the root',
+              _member_dirs(tmp, {'members': ['crates/alpha'],
+                                 'dependencies': {
+                                     'implicit': {'path': 'implicit'}}}),
+              ['crates/alpha', 'implicit'])
+        # `exclude` still wins over an implicit member.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('exclude drops an implicit member',
+              _member_dirs(tmp, {'members': ['crates/alpha'],
+                                 'exclude': ['implicit']}),
               ['crates/alpha'])
 
         # -- the reader-facing scope matches the sibling gates ----------------
