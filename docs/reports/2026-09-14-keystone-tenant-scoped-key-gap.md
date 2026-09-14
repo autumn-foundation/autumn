@@ -260,6 +260,25 @@ below.
    test), but this specific gap is worth a targeted test in its own
    right, independent of anything this memo recommends.
 
+   A second qualification, this one *not* new: the existing
+   `rate_limit_tenant_scope.rs` coverage only exercises the normally
+   configured middleware stack. In a `dist`/static-serving build,
+   `try_build_router_with_static_inner` deliberately drains
+   `AppBuilder::layer`/`static_gate` custom layers — a custom
+   `RateLimitLayer` among them — and reapplies them *outside* both the
+   static-first middleware and `tenancy_middleware` (`router.rs:5760-5771`),
+   so `tenant_qualify_bucket_key` sees no ambient tenant there regardless
+   of whether its own logic is intact. This is not a hole this review
+   found: the rate-limit security report already named it as **P1**
+   (`docs/security/2026-09-09-rate-limit-tenant-key/README.md:214-230`),
+   explicitly "not a gap introduced by this fix, and not fixable at this
+   layer" — the ordering is deliberate (compression needs pre-rendered
+   responses, static serving must survive a down session backend, ISR
+   needs raw HTML) and affects *every* tenant-aware feature's custom
+   layers in that mode, not rate limiting specifically. Citing it here so
+   this memo's "behavioral coverage exists" claim doesn't read as broader
+   than the coverage actually is.
+
 What's left, once both items are corrected, is not a fix but an honest
 gap statement: nothing in this framework prompts a *new* derived-key
 builder to get the same behavioral-test treatment these four received
@@ -353,6 +372,10 @@ grep -n "idempotency_tenant_scope\|rate_limit_tenant_scope\|cached_tenant_scope\
 sed -n '280,297p' autumn/src/plugin_sandbox/plugin.rs   # render_slot's separate capture
 grep -n "with_tenant" autumn/tests/integration/plugin_sandbox_capabilities.rs   # exactly 1 hit, not near render_slot
 grep -n "render_slot" autumn/tests/integration/plugin_sandbox_capabilities.rs   # none inside that 1 hit's scope
+
+# The already-documented static-mode custom-layer limitation (P1, not new)
+sed -n '5760,5771p' autumn/src/router.rs
+sed -n '214,230p' docs/security/2026-09-09-rate-limit-tenant-key/README.md
 
 # `autumn cache audit` proves invalidation coverage, not key composition —
 # and reaches beyond #[cached] via declare_cached_read! for fragment/
