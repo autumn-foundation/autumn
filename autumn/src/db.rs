@@ -42,6 +42,9 @@ use diesel;
 // under the `sqlite` feature (diesel's `postgres` backend is still in the graph
 // via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+#[cfg(not(feature = "sqlite"))]
+use diesel_async::pooled_connection::RecyclingMethod;
 /// The deadpool connection pool Autumn's database seam produces.
 ///
 /// Re-exported so a plugin implementing
@@ -49,7 +52,6 @@ use diesel_async::AsyncPgConnection;
 /// the type its `create_pool` returns without taking its own `diesel-async`
 /// dependency at a matching major.
 pub use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::pooled_connection::{AsyncDieselConnectionManager, RecyclingMethod};
 use futures::FutureExt as _;
 use std::any::Any;
 use std::future::Future;
@@ -2535,6 +2537,20 @@ where
 
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
+
+/// Prove a pooled connection is actually alive, not merely checked out.
+///
+/// `pg_manager_config` sets `RecyclingMethod::Fast`, so `pool.get()` alone
+/// can return a stale connection without proving it is alive (issue #2485).
+/// A health/readiness probe that only checks out and drops a connection
+/// would then report a dead primary or replica as reachable. Run this on a
+/// fresh checkout so the probe itself proves liveness, not the pool.
+pub(crate) async fn probe_connection_alive(
+    conn: &mut PooledConnection,
+) -> Result<(), diesel::result::Error> {
+    use diesel_async::SimpleAsyncConnection as _;
+    conn.batch_execute("SELECT 1").await
+}
 
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,

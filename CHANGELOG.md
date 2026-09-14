@@ -7566,6 +7566,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -14.44%/-16.20% allocation blocks/bytes per round (`valgrind
   --tool=callgrind`/`--tool=dhat`, 5,020 rounds).
 
+  Two health/readiness checks relied on the pool's own ping instead of
+  running a query: `ShardHealthIndicator`'s primary/replica checks
+  (`sharding.rs`) and the replica readiness probe (`probe.rs`) checked out a
+  connection and dropped it, with no query in between. Under `Fast` that
+  checkout alone no longer proves the connection is alive, so a dead
+  primary or replica could report ready. Both now run a `SELECT 1` (the new
+  `db::probe_connection_alive`) on the checked-out connection before
+  deciding readiness, independent of the pool's recycling method.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the
