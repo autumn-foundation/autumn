@@ -201,12 +201,27 @@ forward unchanged.
 
 No rerun campaign this pass — organic sampling only.
 
+**Correction (post-review, via a fifth Codex review comment on PR #2786):
+the table below originally read "0 new hits in ~23h window" for each tracked
+signature, which overstates it as a window-wide result — the Symptom section
+above already says 17 of the 45 cancelled runs were never checked at job
+level. Rescoped to what was actually checked: of the 71 runs in the window,
+24 completed with overall conclusion `success` (which rules out a hidden
+tracked-signature failure — a real cargo-test panic fails the step, and this
+repo runs no ambient retries per this ledger's own banned-changes list, so a
+`success` conclusion is trustworthy on its own); the 2 `failure` runs were
+triaged by log; and 28 of the 45 `cancelled` runs were checked at job level
+(2 of those jobs deep enough to need full-log inspection, done above). That's
+54 of 71 runs with some level of verification — not "the window," and not
+"54 checked runs" either, since the 24 `success` ones weren't individually
+opened, just trusted by their own conclusion.**
+
 | Item | This pass | Status |
 |---|---|---|
-| `live_upgrade` (3 signatures) | 0 new hits in ~23h window | Unchanged; harness still undispatched, 6th pass |
-| `cache_stampede` | 0 new hits | Unchanged, undiagnosed |
-| `sim_fault_plan` | 0 new hits | Unchanged, undiagnosed |
-| `job_tracking_stores_integration` | 0 new hits (still n=1 total) | Unchanged, undiagnosed |
+| `live_upgrade` (3 signatures) | 0 hits among the 54 runs with some verification (24 trusted by `success` conclusion, 2 failure runs triaged by log, 28 cancelled runs checked at job level); 17 cancelled runs in the window not checked at all | Unchanged; harness still undispatched, 6th pass |
+| `cache_stampede` | 0 hits among the 54 runs with some verification; 17 cancelled runs not checked at all | Unchanged, undiagnosed |
+| `sim_fault_plan` | 0 hits among the 54 runs with some verification; 17 cancelled runs not checked at all | Unchanged, undiagnosed |
+| `job_tracking_stores_integration` | 0 hits among the 54 runs with some verification (still n=1 total); 17 cancelled runs not checked at all | Unchanged, undiagnosed |
 | `manual-macos-contention-check.yml` dispatches | 0 → 0 | 6th consecutive idle pass, ~137h |
 | `dependabot/cargo/validator-0.21.0` lockfile+compile break | Triaged, branch-owned | Not a CI health issue |
 | `claude/happy-edison-fstb1z` Windows edge-conformance self-check | Triaged, branch-owned | Not a CI health issue |
