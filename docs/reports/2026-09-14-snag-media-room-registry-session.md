@@ -79,31 +79,42 @@ manual threads, no extra deps available in this sandbox) fired concurrent
    pre-burst confirmation that the registry is actually empty, not just
    consistent with being empty: a **third** rerun, combining steps 6 and 7
    into one ordered experiment. Created 1,000 rooms, saved every id, waited
-   15s, then `join`-probed 5 of them (first, 25th/50th/75th-percentile,
+   15s, then `join`-probed **5** of them (first, 25th/50th/75th-percentile,
    last of the batch) — all 5 came back `404`, confirmed **before** sending
    a single new create. Only then was the 10,500-request burst fired, and
-   it reproduced the same split exactly: `10,000×200` then `500×503`. This
-   is the version of the result that actually rules out the leftover-rooms
-   explanation, since the registry's emptiness was checked, not inferred,
-   immediately before the burst began.
+   it reproduced the same split exactly: `10,000×200` then `500×503`.
+9. A third Codex catch on this PR, on step 8: probing only 5 of the 1,000
+   saved ids doesn't establish the other 995 were gone too, so step 8's
+   "registry's emptiness was checked" conclusion was still broader than the
+   evidence — a handful of surviving rooms among the unprobed 995 could in
+   principle still be reaped mid-burst and produce the identical
+   10,000/500 split (the same class of gap as step 6, just narrowed from
+   "all rooms" to "995 of them"). A **fourth** rerun closes it exhaustively:
+   created 1,000 rooms, waited 15s, then `join`-probed **all 1,000** saved
+   ids (not a sample) — **all 1,000** came back `404`, zero survivors,
+   confirmed before a single new create was sent. The following burst
+   again produced exactly `10,000×200` then `500×503`. This is the version
+   of the result with no remaining sampling gap: every room that existed
+   before the burst was individually confirmed gone, not inferred, not
+   estimated from a subset.
 
 ## Findings
 
 **No bug.** Both halves of the documented claim held under live HTTP drive:
 
-- The cap is enforced at **exactly** 10,000 rooms, three times independently
-  now (step 3/4's manual boundary check, step 6's burst, and step 8's
-  rerun) — no off-by-one in either direction, and `RegistryFull` maps to
-  `503` as `RoomError::into_autumn` documents.
+- The cap is enforced at **exactly** 10,000 rooms, four times independently
+  now (step 3/4's manual boundary check, and steps 6, 8, and 9's bursts) —
+  no off-by-one in either direction, and `RegistryFull` maps to `503` as
+  `RoomError::into_autumn` documents.
 - The reaper **fully** drains an idle registry, not just partially — and, as
-  of step 8, this is now verified rather than inferred: 5 sampled rooms
-  spanning an entire 1,000-room batch all confirmed reaped (`join` →
-  `404 RoomNotFound`) *before* a single new create was sent, and the
-  following burst still produced exactly 10,000 successes. Step 7's smaller
-  rerun corroborates the same mechanism (`join` → `404`) on 3 rooms in
-  isolation.
+  of step 9, this is exhaustively verified rather than sampled or inferred:
+  **all 1,000** rooms in a batch confirmed reaped (`join` →
+  `404 RoomNotFound`, zero survivors) *before* a single new create was
+  sent, and the following burst still produced exactly 10,000 successes.
+  Steps 7 and 8 corroborate the same mechanism at smaller (3-room) and
+  sampled (5-of-1,000) scale.
 
-Three corrections, all from Codex reviews on this PR, across two rounds:
+Four corrections, all from Codex reviews on this PR, across three rounds:
 
 - The first draft attributed step 2's interleaved `200`/`503` boundary to the
   reaper racing the creation burst. It doesn't hold up against step 3/4's own
@@ -128,6 +139,12 @@ Three corrections, all from Codex reviews on this PR, across two rounds:
   don't carry timing information. Step 8 closes this by probing the
   registry directly before the burst starts, rather than inferring its
   state from the burst's own output.
+- On a third review round, Codex pointed out that step 8's own fix was
+  incomplete: probing only 5 of the 1,000 saved ids leaves the other 995
+  unverified, so a handful of survivors among them could in principle still
+  be reaped mid-burst and produce the same aggregate split — a narrower
+  version of the exact gap step 8 was meant to close. Step 9 probes all
+  1,000, not a sample, removing the gap entirely rather than shrinking it.
 
 **Solid area** (toured, held up): `InMemoryRoomStore`'s 10,000-room registry
 cap and the idle-reaper's live drain-back-down, now confirmed at the real
