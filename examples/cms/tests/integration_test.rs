@@ -8988,6 +8988,178 @@ async fn a_scheduled_date_is_read_in_the_sites_timezone() {
     );
 }
 
+/// Creating a post with `status=future` and no publish date redisplays the
+/// editor with the author's draft intact, instead of bouncing to the generic
+/// error page `require_future_publish_date`'s `?` used to produce.
+///
+/// See [`cms::routes::admin::posts`]'s `PostForm::validate_fields`: the same
+/// anti-pattern already fixed for `examples/wiki`'s page forms (#2773),
+/// `examples/blog`'s post editor (#2687) and `reddit-clone`'s
+/// create-community form (#2665).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A future post"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body worth keeping."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", ""),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("A future post") && body.contains("A body worth keeping."),
+        "the author's title and body must round-trip rather than be lost: {body}"
+    );
+    assert!(
+        body.contains(r#"aria-describedby="publish_at-error""#),
+        "the publish-date field must be wired to its error for assistive tech: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let count: i64 = cms::schema::posts::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "a rejected submission must not create a row");
+}
+
+/// Same rejection, for a publish date that has already passed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_a_past_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Already due"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Still a draft."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", past.as_str()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("A scheduled post needs a publish date in the future"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains(&past),
+        "the exact wall clock the author typed must round-trip, not a reformatted or blanked \
+         value: {body}"
+    );
+}
+
+/// The same rejection on the *update* path: editing an already-published
+/// post's title/body while switching its status to "Scheduled" without
+/// picking a publish date must redisplay the editor with the edit intact
+/// rather than discard it. `require_future_publish_date`'s own doc comment
+/// names this general shape as an easy, ordinary editing mistake — not a
+/// crafted request — since the field is not required and nothing prompts an
+/// editor to fill it in before switching to "Scheduled".
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn rescheduling_an_edit_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Once live"),
+            ("slug", "once-live"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Once live, edited"),
+                    ("slug", "once-live"),
+                    ("excerpt", ""),
+                    ("body", "Edited body worth keeping."),
+                    ("status", "future"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("Once live, edited") && body.contains("Edited body worth keeping."),
+        "the just-typed edit must round-trip, not the previously-saved content: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let stored_title: String = cms::schema::posts::table
+        .find(id.parse::<i64>().expect("id"))
+        .select(cms::schema::posts::title)
+        .first(&mut conn)
+        .await
+        .expect("the post");
+    assert_eq!(
+        stored_title, "Once live",
+        "a rejected submission must not write the edit"
+    );
+}
+
 /// A completed import is not reconciled again.
 ///
 /// The source marker says "an import created this row" and is written before
