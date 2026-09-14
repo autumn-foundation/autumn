@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Symbol drift gate: every `autumn_web::…` path the reader-facing docs put in
-# front of someone must name an item that exists.
+# Symbol drift gate: every workspace-crate path the reader-facing docs put in
+# front of someone must name an item that exists — and live in a crate a reader
+# can actually import.
 #
 # WHY THIS EXISTS: the corpus already gates the four things a reader copies off
 # a page and the one thing they cannot copy at all.
@@ -17,6 +18,37 @@
 # layer (172 fences) combined. A renamed or never-shipped item leaves behind a
 # line that looks exactly like a working one, and nothing in the tree could tell
 # the difference.
+#
+# WIDENED FROM `autumn_web::` TO EVERY PUBLISHED CRATE. For its first several
+# revisions this gate scanned one prefix, `autumn_web::`, even though it already
+# MODELLED `autumn_macros`, `autumn_edge` and `autumn_search` — it had to, to
+# follow an `autumn_web` re-export into them. The gap that left is the whole
+# reason for the widening: the sibling crates are how a reader adopts a plugin
+# (`use autumn_billing::BillingPlugin;`, `use autumn_storage_s3::S3BlobStore;`),
+# the corpus writes 67 such paths, and not one of them was a passing check. They
+# were not checked at all. A path into a sibling fails exactly the way an
+# `autumn_web::` one does — E0432 against the reader's own file — so there was
+# never a reason for the two to be gated differently, only an accident of which
+# prefix got written first.
+#
+# Widening it meant seeding resolution with the crate the path NAMES instead of
+# `autumn_web` unconditionally. That single hardcoded root was wrong in both
+# directions, and the self-test now pins both: a real item in a sibling crate
+# resolved against `autumn_web` is a false FAILURE, and — worse — a sibling path
+# that happens to collide with an `autumn_web` module would have passed while
+# naming something that does not exist where the reader is looking.
+#
+# AND THE CLASS THAT NO RENAME FIXES: a crate with no library target. See
+# `binary_only_crates` — `autumn-cli` is `src/main.rs` and nothing else, so
+# `pub` inside it is visible only within the binary. The baseline run of the
+# widened gate found the corpus's one instance, and it is the nastiest shape
+# here: `docs/guide/accessibility.md` offered a "Programmatic use" section whose
+# `use autumn_cli::check::{A11yCheckOptions, run_a11y_check, print_report};`
+# names a module that is real, items that are real and really `pub`, in a crate
+# `cargo add` installs without complaint. Every signal a reader has says the
+# line is fine. What does not exist is a library to import it from, and no
+# spelling of the path fixes that — which is why it is reported as its own
+# defect class rather than as a dead segment with a `did you mean` hint.
 #
 # WHERE IT SITS ON THE VISIBILITY SCALE: both ends of it, which is the reason
 # to gate the whole surface rather than the import lines alone.
@@ -167,15 +199,104 @@ import tempfile
 MODE = sys.argv[1]
 ROOT = sys.argv[2]
 
-# The workspace crates a documented path can reach into. `autumn_web` is the
-# one readers name; the others are named only because `autumn_web` re-exports
+# The workspace crates a documented path can reach into.
+#
+# `autumn_web` is the one readers name most; `autumn_macros`, `autumn_edge` and
+# `autumn_search` were originally modelled only because `autumn_web` re-exports
 # out of them, and a path that lands in one has to keep resolving there.
+#
+# The rest are here because readers name them DIRECTLY. Adopting a plugin crate
+# is a `use autumn_billing::…`/`use autumn_storage_s3::…` line in the reader's
+# own file — the corpus writes 44 such sibling-crate paths across 26 distinct
+# spellings — and until this gate scanned for them only the `autumn_web::`
+# prefix was audited. A path into a sibling fails exactly the way an
+# `autumn_web::` one does (E0432 against the reader's own file), so there is no
+# reason for the two to be gated differently.
 CRATES = {
     'autumn_web': 'autumn/src',
     'autumn_macros': 'autumn-macros/src',
     'autumn_edge': 'autumn-edge/src',
     'autumn_search': 'autumn-search/src',
+    'autumn_billing': 'autumn-billing/src',
+    'autumn_storage_s3': 'autumn-storage-s3/src',
+    'autumn_cache_redis': 'autumn-cache-redis/src',
+    'autumn_admin_plugin': 'autumn-admin-plugin/src',
+    'autumn_media_plugin': 'autumn-media-plugin/src',
+    'autumn_schema_core': 'autumn-schema-core/src',
+    'autumn_plugin_reference': 'autumn-plugin-reference/src',
 }
+
+
+def workspace_crates(root):
+    """ident -> (src dir, has a library target), read from the workspace.
+
+    DERIVED rather than listed, for the reason the plugin-root scan in
+    `check-docs-toml.sh` is derived: a list of crates outlives the tree it
+    describes. A new publishable crate has to be MODELLED (see
+    `undeclared_crates`) or a reader can be handed a path into it that nothing
+    resolves, and a crate that stops shipping a library has to stop being
+    resolvable the same day.
+
+    Only PUBLISHED members count, and `publish = false` is the test rather than
+    the directory name. A reader reaches a crate by depending on it, so a crate
+    nobody can depend on is not a prefix anybody can write: that rules out the
+    `examples/` and `benchmarks/` members, and also `example-e2e` and
+    `autumn-plugin-reference`, which sit at the top level beside the real
+    crates and would otherwise be demanded here as reader-facing surface.
+    """
+    with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
+        members = tomllib.load(fh)['workspace'].get('members', [])
+    out = {}
+    for rel in members:
+        manifest = os.path.join(root, rel, 'Cargo.toml')
+        if not os.path.exists(manifest):
+            continue
+        with open(manifest, 'rb') as fh:
+            pkg = tomllib.load(fh)
+        name = pkg.get('package', {}).get('name')
+        if not name or pkg.get('package', {}).get('publish') is False:
+            continue
+        has_lib = ('lib' in pkg
+                   or os.path.exists(os.path.join(root, rel, 'src', 'lib.rs')))
+        out[name.replace('-', '_')] = (os.path.join(rel, 'src'), has_lib)
+    return out
+
+
+# Workspace crates that ship NO library target, and so can never appear in a
+# path a reader writes.
+#
+# `autumn-cli` is the whole class today: it is `src/main.rs` and nothing else,
+# with no `src/lib.rs` and no `[lib]` section, so `pub` inside it is visible
+# only within the binary. That is the nastiest shape this gate meets, because
+# every OTHER signal a reader has says the path is fine — the module is real,
+# the items are real and really `pub`, and `cargo add autumn-cli` succeeds,
+# since the crate does publish a binary. What does not exist is a library to
+# import, and no spelling of the path fixes that: the reader cannot route
+# around it the way they can route around a renamed item.
+#
+# So a path into one is reported as its own defect rather than as a dead
+# segment. "No `check` in `autumn_cli`" would be actively misleading advice —
+# `autumn-cli/src/check.rs` is right there, `pub`, and the suggestion machinery
+# would happily propose a near-miss inside a crate that cannot be imported at
+# all. The answer is never a different path; it is the CLI, or an API the
+# library crates actually expose.
+def binary_only_crates(root):
+    return {ident: rel for ident, (rel, has_lib) in workspace_crates(root).items()
+            if not has_lib}
+
+
+def undeclared_crates(root):
+    """Publishable library crates that `CRATES` does not model.
+
+    The declaration has to keep being true rather than merely keep matching
+    something: a crate added to the workspace with a library target is a
+    prefix readers can write, and leaving it out of `CRATES` would make every
+    path into it silently unaudited — the exact gap this gate closed for the
+    seven sibling crates. Failing here is how the next one gets modelled on the
+    day it lands instead of the day a reader files a bug.
+    """
+    return sorted(ident for ident, (_, has_lib) in workspace_crates(root).items()
+                  if has_lib and ident not in CRATES)
 
 # ------------------------------------------------------------------ parsing
 
@@ -628,10 +749,10 @@ class Surface:
             return None
         return ('mod', c, cur)
 
-    def resolve(self, path):
+    def resolve(self, path, root='autumn_web'):
         """'ok' | 'opaque' | 'dead:<the prefix that broke>'."""
         segs = path.split('::')
-        c, cur = self.crates['autumn_web'], ()
+        c, cur = self.crates[root], ()
         for i, s in enumerate(segs):
             # Deliberately NOT the structural `(cur + (s,)) in c.mods` shortcut
             # used for re-export targets below: that tree contains private and
@@ -658,11 +779,11 @@ class Surface:
             return 'ok'
         return 'ok'
 
-    def suggest(self, path):
+    def suggest(self, path, root='autumn_web'):
         """Closest existing sibling for the segment that broke, or None."""
         import difflib
         segs = path.split('::')
-        c, cur = self.crates['autumn_web'], ()
+        c, cur = self.crates[root], ()
         for s in segs:
             names = self.names_of(c, cur)
             if s in names:
@@ -890,7 +1011,14 @@ def corpus(root):
                           if p in tracked and p not in seen)
 
 
-PREFIX_RE = re.compile(r'\bautumn_web::')
+# Every crate prefix a reader can write, longest first so `autumn_web::` can
+# never shadow a longer ident that starts with it. Built from the modelled
+# crates plus the binary-only ones: a path into a crate with no library target
+# is a defect this gate must SEE in order to report, so its prefix has to scan.
+def prefix_re(root):
+    idents = sorted(set(CRATES) | set(binary_only_crates(root)),
+                    key=len, reverse=True)
+    return re.compile(r'\b(' + '|'.join(idents) + ')::')
 IDENT_RE = re.compile(r'[a-zA-Z_]\w*')
 # A path claim, once braces are expanded: identifiers separated by `::` and
 # nothing else. The guide also writes brace groups that are PROSE rather than
@@ -935,8 +1063,8 @@ def is_shown_as_output(line, col):
     return col < (cell_end if cell_end != -1 else len(line))
 
 
-def scan_paths(text):
-    """Yield (raw path spelling, offset) for every `autumn_web::…` in `text`.
+def scan_paths(text, pattern):
+    """Yield (crate ident, raw path spelling, offset) for every crate path.
 
     Scans the whole document rather than line by line, and matches braces by
     counting them, because the guide writes grouped imports BOTH nested
@@ -946,7 +1074,8 @@ def scan_paths(text):
     all 14 of those in this corpus: the symbols a reader copies off them were
     never audited at all, which is the failure this gate exists to prevent.
     """
-    for m in PREFIX_RE.finditer(text):
+    for m in pattern.finditer(text):
+        crate = m.group(1)
         i, parts = m.end(), []
         while True:
             if i < len(text) and text[i] == '{':
@@ -985,11 +1114,11 @@ def scan_paths(text):
                 continue
             break
         if parts:
-            yield '::'.join(parts), m.start()
+            yield crate, '::'.join(parts), m.start()
 
 
-def occurrences(root, files):
-    """[(path, file, line, waived)] for every documented `autumn_web::` path."""
+def occurrences(root, files, pattern):
+    """[(crate, path, file, line, waived)] for every documented crate path."""
     found = []
     for rel in files:
         full = os.path.join(root, rel)
@@ -998,7 +1127,7 @@ def occurrences(root, files):
                 text = fh.read()
         except OSError:
             continue
-        for raw, offset in scan_paths(text):
+        for crate, raw, offset in scan_paths(text, pattern):
             line_no = text.count('\n', 0, offset) + 1
             line_end = text.find('\n', offset)
             line = text[text.rfind('\n', 0, offset) + 1:
@@ -1014,64 +1143,99 @@ def occurrences(root, files):
                 if m:
                     path = m.group(1)
                 if path and PATH_SHAPE.match(path):
-                    found.append((path, rel, line_no, waived))
+                    found.append((crate, path, rel, line_no, waived))
     return found
 
 
 def audit(root):
     surface = Surface(root)
     files = corpus(root)
-    occ = occurrences(root, files)
-    dead, opaque, ok, waived = [], collections.Counter(), 0, 0
-    for (path, rel, line, is_waived) in occ:
+    binary_only = binary_only_crates(root)
+    occ = occurrences(root, files, prefix_re(root))
+    dead, unimportable = [], []
+    opaque, ok, waived = collections.Counter(), 0, 0
+    for (crate, path, rel, line, is_waived) in occ:
         if is_waived:
             waived += 1
             continue
-        r = surface.resolve(path)
+        # A crate with no library target is not a resolution question. Reported
+        # before `resolve` is consulted, because there is nothing to consult:
+        # the crate is not in `CRATES` and never can be.
+        if crate in binary_only:
+            unimportable.append((crate, path, rel, line, binary_only[crate]))
+            continue
+        r = surface.resolve(path, crate)
         if r.startswith('dead:'):
-            dead.append((path, rel, line, r[5:], surface.suggest(path)))
+            dead.append((crate, path, rel, line, r[5:],
+                         surface.suggest(path, crate)))
         elif r == 'opaque':
-            opaque[path] += 1
+            opaque[f'{crate}::{path}'] += 1
         else:
             ok += 1
-    return surface, files, occ, dead, opaque, ok, waived
+    return (surface, files, occ, dead, unimportable, opaque, ok, waived)
 
 
 def main():
-    surface, files, occ, dead, opaque, ok, waived = audit(ROOT)
+    unmodelled = undeclared_crates(ROOT)
+    if unmodelled:
+        print('FAIL: publishable library crates that `CRATES` does not model: '
+              + ', '.join(unmodelled))
+        print('')
+        print('Each is a prefix a reader can write in a `use` line, so every')
+        print('path into it would go unaudited. Add it to `CRATES` with its')
+        print('`src` directory rather than letting the gate skip the crate.')
+        return 1
+
+    surface, files, occ, dead, unimportable, opaque, ok, waived = audit(ROOT)
     aw = surface.crates['autumn_web']
+    by_crate = collections.Counter(c for c, *_ in occ)
     print(f'corpus: {len(files)} reader-facing markdown files')
     print(f'surface: {len(aw.mods)} modules, '
           f'{len(surface.names_of(aw, ()))} names at the crate root, '
-          f'{len(surface.crates)} workspace crates')
-    print(f'checked: {len(occ)} `autumn_web::` occurrences')
+          f'{len(surface.crates)} workspace crates modelled')
+    print(f'checked: {len(occ)} crate-path occurrences '
+          f'({by_crate.get("autumn_web", 0)} `autumn_web::`, '
+          f'{len(occ) - by_crate.get("autumn_web", 0)} sibling-crate)')
     print(f'  resolved: {ok}')
     print(f'  opaque (re-export of a crate outside this workspace): '
           f'{sum(opaque.values())}')
     print(f'  waived (shown as output: compiler error or log line): {waived}')
     print('')
-    if dead:
-        for (path, rel, line, broke, near) in sorted(dead,
-                                                     key=lambda d: (d[1], d[2])):
-            hint = f'  (did you mean `{near}`?)' if near else ''
-            print(f'{rel}:{line}: `autumn_web::{path}` does not resolve '
-                  f'-- no `{broke.split("::")[-1]}` in '
-                  f'`autumn_web{"::" + "::".join(broke.split("::")[:-1]) if "::" in broke else ""}`'
-                  f'{hint}')
-    print(f'defects: {len(dead)} ({waived} waived)')
-    return 1 if dead else 0
+    for (crate, path, rel, line, broke, near) in sorted(
+            dead, key=lambda d: (d[2], d[3])):
+        hint = f'  (did you mean `{near}`?)' if near else ''
+        parent = ('::' + '::'.join(broke.split('::')[:-1])
+                  if '::' in broke else '')
+        print(f'{rel}:{line}: `{crate}::{path}` does not resolve '
+              f'-- no `{broke.split("::")[-1]}` in `{crate}{parent}`{hint}')
+    for (crate, path, rel, line, src) in sorted(unimportable,
+                                                key=lambda d: (d[2], d[3])):
+        print(f'{rel}:{line}: `{crate}::{path}` cannot be imported '
+              f'-- `{crate}` ships no library target '
+              f'(`{src}` has no `lib.rs` and its manifest declares no `[lib]`), '
+              f'so nothing in it is nameable from another crate. Point the '
+              f'reader at the CLI or at a library crate instead of a path.')
+    print(f'defects: {len(dead) + len(unimportable)} '
+          f'({len(dead)} unresolved, {len(unimportable)} unimportable; '
+          f'{waived} waived)')
+    return 1 if (dead or unimportable) else 0
 
 
 def do_list():
-    surface, files, occ, dead, opaque, ok, waived = audit(ROOT)
+    surface, files, occ, dead, unimportable, opaque, ok, waived = audit(ROOT)
     print(f'corpus: {len(files)} reader-facing markdown files')
     print(f'occurrences: {len(occ)}')
+    print('')
+    print('BY CRATE -- the prefixes the corpus actually writes.')
+    for crate, n in sorted(collections.Counter(c for c, *_ in occ).items(),
+                           key=lambda kv: (-kv[1], kv[0])):
+        print(f'  {n:4d}  {crate}::')
     print('')
     print('OPAQUE -- re-exports of crates whose source is not in this tree.')
     print('A path here is NOT checked; the count is printed so it cannot grow')
     print('quietly.')
     for path, n in sorted(opaque.items(), key=lambda kv: (-kv[1], kv[0])):
-        print(f'  {n:4d}  autumn_web::{path}')
+        print(f'  {n:4d}  {path}')
     print(f'  total: {sum(opaque.values())}')
     print('')
     print(f'external crates reached: {", ".join(sorted(surface.external))}')
@@ -1196,8 +1360,16 @@ macro_rules! declassify { () => {} }
                '#[proc_macro_derive(OpenApiSchema, attributes(schema))]\n'
                'pub fn derive_open_api_schema(a: TokenStream) -> TokenStream { a }\n')
 
+        # A sibling a reader names DIRECTLY, rather than one reached through an
+        # `autumn_web` re-export: the shape of every plugin crate in the real
+        # workspace, and the surface this gate was blind to.
+        _write(tmp, 'fake_sibling/src/lib.rs', 'pub mod plugin;\n')
+        _write(tmp, 'fake_sibling/src/plugin.rs',
+               'pub struct Thing;\npub(crate) struct Hidden;\n')
+
         s = Surface(tmp, {'autumn_web': 'fake/src', 'fake_macros': 'fake_macros/src',
-                          'fake_edge': 'fake_edge/src'})
+                          'fake_edge': 'fake_edge/src',
+                          'fake_sibling': 'fake_sibling/src'})
 
         check('plain module item', s.resolve('app::AppBuilder'), 'ok')
         check('module itself', s.resolve('app'), 'ok')
@@ -1288,28 +1460,84 @@ macro_rules! declassify { () => {} }
               ['a', 'a::b'])
 
         # -- corpus extraction ------------------------------------------------
+        pat = re.compile(r'\b(autumn_web|fake_sibling|autumn_cli)::')
         _write(tmp, 'docs/guide/x.md',
                'use autumn_web::{app::AppBuilder, Error};\n'
                '| `error[E0432]: unresolved import `autumn_web::foo`` | x | y |\n')
-        found = occurrences(tmp, ['docs/guide/x.md'])
-        paths = sorted(p for (p, _, _, w) in found if not w)
+        found = occurrences(tmp, ['docs/guide/x.md'], pat)
+        paths = sorted(p for (_, p, _, _, w) in found if not w)
         check('brace-grouped doc import is expanded', paths,
               ['Error', 'app::AppBuilder'])
         check('compiler-error line is waived',
-              [p for (p, _, _, w) in found if w], ['foo'])
+              [p for (_, p, _, _, w) in found if w], ['foo'])
         # The waiver covers the error's own table cell, not the row: the FIX
         # column is a live recommendation and must stay audited.
         _write(tmp, 'docs/guide/mig.md',
                '| `error[E0063]: missing field` | a literal | '
                'add `autumn_web::app::AppBuilder` |\n'
                'INFO  autumn_web::route::Route: started\n')
-        rows = occurrences(tmp, ['docs/guide/mig.md'])
+        rows = occurrences(tmp, ['docs/guide/mig.md'], pat)
         check('path inside the error cell is waived',
-              sorted(p for (p, _, _, w) in rows if w),
+              sorted(p for (_, p, _, _, w) in rows if w),
               ['route::Route'])
         check('path in the fix column is still audited',
-              sorted(p for (p, _, _, w) in rows if not w),
+              sorted(p for (_, p, _, _, w) in rows if not w),
               ['app::AppBuilder'])
+
+        # -- sibling crates are scanned, and attributed to their own crate ----
+        # Before this, `PREFIX_RE` was `autumn_web::` alone: a path into a
+        # sibling was not a passing check, it was not a check at all.
+        _write(tmp, 'docs/guide/sib.md',
+               'use fake_sibling::plugin::Thing;\n'
+               'use autumn_web::app::AppBuilder;\n')
+        sib = occurrences(tmp, ['docs/guide/sib.md'], pat)
+        check('sibling-crate path is scanned',
+              sorted((c, p) for (c, p, _, _, w) in sib if not w),
+              [('autumn_web', 'app::AppBuilder'),
+               ('fake_sibling', 'plugin::Thing')])
+        # The crate a path is resolved AGAINST has to be the one it names.
+        # Resolving a sibling path against `autumn_web` is how a real item in
+        # the wrong crate passes, and a real item in the right crate fails.
+        check('sibling path resolves against its own crate',
+              s.resolve('plugin::Thing', 'fake_sibling'), 'ok')
+        check('…and a sibling miss is dead, not silently ok',
+              s.resolve('plugin::Nope', 'fake_sibling'), 'dead:plugin::Nope')
+        check('pub(crate) in a sibling is not reader-nameable',
+              s.resolve('plugin::Hidden', 'fake_sibling'),
+              'dead:plugin::Hidden')
+        # The same spelling must NOT resolve against `autumn_web`: that is the
+        # bug a single hardcoded root produces in both directions.
+        check('a sibling path is not resolved against autumn_web',
+              s.resolve('plugin::Thing'), 'dead:plugin')
+
+        # -- crates with no library target ------------------------------------
+        # The defect this class exists for: every other signal says the path is
+        # fine, and none of them is the one that matters.
+        _write(tmp, 'bin_only/Cargo.toml',
+               '[package]\nname = "bin-only"\nversion = "0.1.0"\n')
+        _write(tmp, 'bin_only/src/main.rs', 'pub mod check;\nfn main() {}\n')
+        _write(tmp, 'lib_crate/Cargo.toml',
+               '[package]\nname = "lib-crate"\nversion = "0.1.0"\n')
+        _write(tmp, 'lib_crate/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["bin_only", "lib_crate", '
+               '"examples/demo"]\n')
+        ws = workspace_crates(tmp)
+        check('binary-only crate is detected as having no lib',
+              ws.get('bin_only'), (os.path.join('bin_only', 'src'), False))
+        check('library crate is detected as having one',
+              ws.get('lib_crate'), (os.path.join('lib_crate', 'src'), True))
+        check('binary-only set is exactly the crates with no lib target',
+              sorted(binary_only_crates(tmp)), ['bin_only'])
+        check('a missing member directory is skipped, not fatal',
+              'demo' in ws, False)
+        # `[lib]` with no `src/lib.rs` still ships a library (the manifest can
+        # point `path` anywhere), so the manifest has to be consulted too.
+        _write(tmp, 'bin_only/Cargo.toml',
+               '[package]\nname = "bin-only"\nversion = "0.1.0"\n'
+               '[lib]\npath = "src/other.rs"\n')
+        check('an explicit [lib] counts even without src/lib.rs',
+              sorted(binary_only_crates(tmp)), [])
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
@@ -1361,14 +1589,14 @@ case "${1:-}" in
     run_py --corpus "$root"
     ;;
   "")
-    echo "Checking autumn_web:: symbol paths across the reader-facing docs..."
+    echo "Checking workspace-crate symbol paths across the reader-facing docs..."
     if run_py --check "$root"; then
       echo "Symbol drift gate OK."
     else
       cat >&2 <<'EOF'
 
-FAIL: the docs put an `autumn_web::…` path in front of a reader that does not
-resolve (above).
+FAIL: the docs put a workspace-crate path in front of a reader that they cannot
+write (above).
 
 Where the path reaches name resolution, `rustc` reports it against the READER's
 file, not against the page, so they are told their code is wrong when the
@@ -1378,6 +1606,9 @@ discards), nothing reports it at all and the reader simply carries away a name
 that does not exist.
 
 Fix each one where it lives:
+  - no library     -> the crate ships only a binary (`autumn-cli`), so NO path
+                      into it resolves and no rename helps. Document the
+                      command, or an API a library crate exports.
   - renamed item   -> use the current name (the `did you mean` hint is the
                       closest name in the same module)
   - moved item     -> use the path a reader can actually write; it is usually a
