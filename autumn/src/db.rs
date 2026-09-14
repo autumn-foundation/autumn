@@ -42,7 +42,6 @@ use diesel;
 // under the `sqlite` feature (diesel's `postgres` backend is still in the graph
 // via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 /// The deadpool connection pool Autumn's database seam produces.
 ///
 /// Re-exported so a plugin implementing
@@ -50,6 +49,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 /// the type its `create_pool` returns without taking its own `diesel-async`
 /// dependency at a matching major.
 pub use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::pooled_connection::{AsyncDieselConnectionManager, RecyclingMethod};
 use futures::FutureExt as _;
 use std::any::Any;
 use std::future::Future;
@@ -1350,6 +1350,35 @@ pub(crate) fn sqlite_replication_active() -> bool {
     SQLITE_REPLICATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Build the manager config for a Postgres pool.
+///
+/// Uses [`RecyclingMethod::Fast`]. Every checkout already runs `SET
+/// statement_timeout`: see [`Db::checkout`] and the `#[repository]`-generated
+/// acquire path. That statement is a round trip to Postgres. It already
+/// proves the connection is alive. Deadpool's default `Verified` method
+/// sends a second, redundant `SELECT 1` to prove the same thing. `Fast`
+/// removes that extra round trip. A dead connection still fails fast — at
+/// the `SET statement_timeout` call, not at the pool's own ping. (issue
+/// #2485)
+///
+/// Also plugs in a TLS setup callback when the URL asks for TLS: diesel-async's
+/// default establish path hardcodes `NoTls`, which cannot satisfy
+/// `sslmode=require`. `sslmode` absent/`disable`/`prefer` keeps the default
+/// (`NoTls`) path, so existing configurations behave exactly as before. See
+/// [`tls`] for the full posture table.
+#[cfg(not(feature = "sqlite"))]
+fn pg_manager_config(
+    url: &str,
+) -> diesel_async::pooled_connection::ManagerConfig<AsyncPgConnection> {
+    let mut config = diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+    config.recycling_method = RecyclingMethod::Fast;
+    let posture = tls::TlsPosture::from_database_url(url);
+    if posture != tls::TlsPosture::Off {
+        config.custom_setup = tls::setup_callback(posture);
+    }
+    config
+}
+
 fn build_pool(
     url: &str,
     pool_size: usize,
@@ -1385,21 +1414,9 @@ fn build_pool(
     #[cfg(not(feature = "sqlite"))]
     {
         let timeout = Duration::from_secs(connect_timeout_secs);
-        // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
-        // into the pool via a custom setup callback — diesel-async's default
-        // establish path hardcodes `NoTls`, which cannot satisfy
-        // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
-        // default (NoTls) path, so existing configurations behave exactly as
-        // before. See [`tls`] for the full posture table.
-        let manager = match tls::TlsPosture::from_database_url(url) {
-            tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
-            posture => {
-                let mut config =
-                    diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
-                config.custom_setup = tls::setup_callback(posture);
-                AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
-            }
-        };
+        let config = pg_manager_config(url);
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
         Ok(Pool::builder(manager)
             .max_size(pool_size.max(1))
             .wait_timeout(Some(timeout))
@@ -4399,6 +4416,25 @@ mod tests {
     }
 
     // ── Pool creation tests ──────────────────────────────────────
+
+    // `#[repository]`-generated code and `Db::checkout` already run `SET
+    // statement_timeout` on every acquire (a round trip to Postgres). That
+    // round trip already proves the connection is alive, so the pool must
+    // not pay for a second one via deadpool's default `Verified` recycling
+    // (issue #2485).
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_without_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_with_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app?sslmode=require");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
 
     #[tokio::test]
     async fn default_pool_provider_respects_url_config() {
