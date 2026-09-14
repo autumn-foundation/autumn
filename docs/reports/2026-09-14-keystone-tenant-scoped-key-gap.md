@@ -113,15 +113,18 @@ a real property, no systematic enforcement, found piecemeal.
 
 ## 🔧 Recommendation — not a decision, and deliberately not an RFC
 
-**Reversibility: two-way door, low-single-digit days for item 2; item 1 is
-downgraded below to a documentation nice-to-have, for reasons that also
-bear on its own reversibility.** Per this framework's own rule — *"if
-reversal costs under ~2 engineer-weeks, the implementing team decides it
-in a PR description"* — even the more expensive reading below does not
-clear the bar for an RFC. Recorded as a findings memo because the
-connection across three separately-audited-and-fixed CVE-shaped defects,
-one shared root cause, and a live fourth reinvention had not been made
-anywhere before this pass.
+**Reversibility: both items below turn out to need less doing than earlier
+drafts of this memo claimed, not more — item 1 is a documentation
+nice-to-have and item 2 is withdrawn outright, once existing test coverage
+is accounted for.** Per this framework's own rule — *"if reversal costs
+under ~2 engineer-weeks, the implementing team decides it in a PR
+description"* — neither clears the bar for an RFC, and neither is even a
+PR-sized ask by the time the corrections below are applied. Recorded as a
+findings memo anyway because the connection across three
+separately-audited-and-fixed CVE-shaped defects and one shared root cause
+had not been made anywhere before this pass — the value here is in the
+pattern-naming (📈 Evidence, 💡 Hypothesis), not in either recommendation
+below.
 
 1. **No single shared *encoding* primitive is actually viable across all
    four sites — downgraded to a documentation nice-to-have, not a fix.**
@@ -172,42 +175,54 @@ anywhere before this pass.
    calls is necessarily gated by the deprecation ramp; that was wrong,
    corrected here rather than repeated.) The reason item 1 is still
    downgraded is the encoding-incompatibility point above, not this one.
-2. **Add a repo-hygiene test that pins both halves of each flow —
-   *acquiring* the tenant and *encoding* it — not just the encoders, and
-   name the gap it does not close.** Pinning only the encoder is not
-   enough: `rate_limit.rs`'s `tenant_qualify_bucket_key` reads
-   `CURRENT_TENANT` *and* encodes in one function, so pinning it at both
-   its call sites (`resolve_key_and_params`, the global tower layer; and
-   `__check_throttle`, the per-route `#[throttle(key = "principal")]`
-   guard's *independent* second call, `autumn/src/security/rate_limit.rs:1692`,
-   not reachable through `resolve_key_and_params`) covers that subsystem
-   fully. But idempotency and `plugin_sandbox` split acquisition from
-   encoding into two separate calls, and a test that pins only the
-   encoder would pass even after someone silently broke the *acquisition*
-   half — `build_storage_key` still correctly folds in whatever
-   `Option<&str>` it's handed, whether or not
-   `StorageKeyContext::from_parts`'s `tenant: current_tenant_scope()`
-   (`autumn/src/idempotency.rs:165`) is still actually calling it instead
-   of hardcoding `None`; the same is true of `namespaced_key` versus
-   `plugin.rs:579-583`'s `CURRENT_TENANT.try_with(...)` capture, and of
-   `generate_cache_body`'s `make_cache_key` call versus its own inline
-   `__autumn_tenant_key_component` read one block above it
-   (`autumn-macros/src/cached.rs:620-624`, immediately above the
-   `make_cache_key` call at 625-628). The same idiom ADR 0013
-   proposed for `deny.toml`/`deny-sqlite.toml` — a test asserting each of
-   these acquisition *and* encoding call sites is still present and wired
-   together — catches a *regression* in any of them. It does **not**
-   catch a new, sixth derived-key builder that omits tenant-folding
-   entirely from scratch: such a builder calls nothing this test looks
-   for, so it adds no call site for an allow-list to flag — which is
-   exactly the mechanism that let all of today's builders ship unflagged
-   in the first place. Closing that half of the gap needs enumerating
-   derived-key *construction* (a new function whose return value backs a
-   cache/dedup/rate-limit lookup), not `CURRENT_TENANT` reads — a harder,
-   semantic check this memo does not design. This item, not item 1, is
-   the one with real teeth.
+2. **Withdrawn: the regression coverage this item proposed to add already
+   exists, is stronger than what was proposed, and already runs in CI.**
+   Each of the three fixes shipped its own dedicated behavioral test file
+   alongside the code change — the same house practice, not something
+   this memo needs to ask for: `idempotency_tenant_scope.rs`'s
+   `header_tenancy_does_not_replay_across_tenants`
+   (`autumn/tests/integration/idempotency_tenant_scope.rs:60-100`, opening
+   comment: *"Warden 2026-09-02"*) drives two real requests as two tenants
+   through the actual router and asserts tenant B never receives tenant
+   A's cached body; `rate_limit_tenant_scope.rs` covers *both* call sites
+   named above — `global_limiter_principal_bucket_isolated_by_tenant`
+   (line 105) for `resolve_key_and_params` and
+   `per_route_throttle_principal_bucket_isolated_by_tenant` (line 159) for
+   `__check_throttle` — each asserting tenant B is never denied service by
+   tenant A's exhausted bucket; `cached_tenant_scope.rs:133-187` does the
+   same for `#[cached]`, gated `#[ignore = "requires Docker
+   (testcontainers)"]` and swept by ci.yml's documented bare `--ignored`
+   Docker sweep (see CLAUDE.md), not skipped; and
+   `plugin_sandbox_capabilities.rs`'s
+   `the_tenant_a_mounted_plugin_binds_to_is_the_requests_own` (line
+   735-787) is, in its own words, *"the wiring nothing else in this suite
+   reaches... delete that line and every other test here still passes
+   while every tenant silently shares one namespace"* — asserting exactly
+   one KV key per tenant, not one shared. All four are real, behavioral,
+   end-to-end tests that would fail today if either the acquisition or
+   the encoding half of any of these flows regressed — strictly stronger
+   proof than a structural "does this function still get called" hygiene
+   test would have given, and it was already there before this memo was
+   written. Item 2, as originally proposed, would have added no coverage
+   that doesn't already exist; withdrawn rather than kept as a weaker
+   restatement of what these four files already do.
 
-Neither item requires resolving whether other not-yet-audited subsystems
+What's left, once both items are corrected, is not a fix but an honest
+gap statement: nothing in this framework prompts a *new* derived-key
+builder to get the same behavioral-test treatment these four received
+*after* being found vulnerable — that treatment is applied per-incident,
+by the audit that found each bug, not by any standing requirement. A
+fifth builder, written from scratch tomorrow, starts with zero coverage
+of this shape until someone thinks to add it, the same way these four
+did before 2026-09-02. Closing that requires recognizing *new* derived-key
+*construction* — a function whose return value backs a cache, dedup, or
+rate-limit lookup — as a class needing this treatment by default, which
+is a semantic property no grep or call-site allow-list can detect. This
+memo does not design that check; naming it as the actual unsolved half of
+the gap, rather than proposing a hygiene test that duplicates existing
+coverage, is the corrected conclusion.
+
+This does not require resolving whether other not-yet-audited subsystems
 have the same gap today — that would be a fresh audit, not an
 architecture decision, and this memo does not claim to have performed one.
 
@@ -244,8 +259,10 @@ grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros
 grep -rln "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 25 files
 grep -rn "CURRENT_TENANT" --include="*.rs" autumn autumn-macros | wc -l   # 142 lines
 
-# The independent second rate-limit call site recommendation 2 must also pin
-sed -n '1684,1693p' autumn/src/security/rate_limit.rs   # __check_throttle
+# The independent second rate-limit call site (__check_throttle), and its
+# own dedicated behavioral test (per_route_throttle_principal_bucket_isolated_by_tenant)
+sed -n '1684,1693p' autumn/src/security/rate_limit.rs
+grep -n "per_route_throttle_principal_bucket_isolated_by_tenant" -A2 autumn/tests/integration/rate_limit_tenant_scope.rs
 
 # The byte-compatibility constraints recommendation 1 must preserve,
 # including #[cached]'s own persisted-backend case
@@ -263,6 +280,16 @@ grep -n "doc(hidden)" -A1 autumn/src/counter_cache.rs | grep -A1 "pub fn\|pub en
 sed -n '154,166p' autumn/src/idempotency.rs        # StorageKeyContext::from_parts
 sed -n '618,628p' autumn-macros/src/cached.rs       # read, then make_cache_key, two steps
 sed -n '573,583p' autumn/src/plugin_sandbox/plugin.rs   # capture, then namespaced_key elsewhere
+
+# But that regression is already caught: each fix shipped its own
+# behavioral cross-tenant test, registered in tests/integration/mod.rs,
+# stronger proof than a structural hygiene test would have given
+sed -n '58,100p' autumn/tests/integration/idempotency_tenant_scope.rs
+sed -n '104,155p;157,215p' autumn/tests/integration/rate_limit_tenant_scope.rs   # both call sites
+sed -n '130,190p' autumn/tests/integration/cached_tenant_scope.rs   # #[ignore], swept by the Docker step
+sed -n '735,787p' autumn/tests/integration/plugin_sandbox_capabilities.rs
+grep -n "idempotency_tenant_scope\|rate_limit_tenant_scope\|cached_tenant_scope\|plugin_sandbox_capabilities" \
+  autumn/tests/integration/mod.rs
 
 # `autumn cache audit` proves invalidation coverage, not key composition,
 # and has no equivalent for idempotency or rate-limiting
