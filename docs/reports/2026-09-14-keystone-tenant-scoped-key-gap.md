@@ -78,8 +78,15 @@ persona) happened to point at it — one every ~5 weeks on average since
 tenancy landed, three in the last 7 days once that audit cycle reached this
 class of bug. No compile-time or CI check catches this shape today: `autumn
 cache audit` (`autumn-cli/src/cache_audit.rs`) proves cache
-*invalidation* coverage, not key composition, and covers only `#[cached]`;
-idempotency and rate-limiting have no equivalent gate at all.
+*invalidation* coverage, not key composition — and that invalidation gate
+already reaches further than `#[cached]` alone, via
+`declare_cached_read!` for the fragment and read-through caches
+(`autumn/src/cache/coherence.rs:864-899`,
+`docs/guide/cache-coherence.md:259-267`), so the real limitation is
+narrower than an earlier draft of this memo stated: not "covers only
+`#[cached]`," but "verifies that a cached read has an invalidation edge,
+never that its key includes tenant." Idempotency and rate-limiting have
+no equivalent gate of any kind.
 `grep -rn "CURRENT_TENANT"` finds 142 lines across 25 files today — most
 are the correct, declarative `#[repository(..., tenant_scoped)]` path; the
 four discussed here are the ad hoc, imperative ones that middleware/macros
@@ -307,8 +314,10 @@ sed -n '735,787p' autumn/tests/integration/plugin_sandbox_capabilities.rs
 grep -n "idempotency_tenant_scope\|rate_limit_tenant_scope\|cached_tenant_scope\|plugin_sandbox_capabilities" \
   autumn/tests/integration/mod.rs
 
-# `autumn cache audit` proves invalidation coverage, not key composition,
-# and has no equivalent for idempotency or rate-limiting
+# `autumn cache audit` proves invalidation coverage, not key composition —
+# and reaches beyond #[cached] via declare_cached_read! for fragment/
+# read-through caches; still has no equivalent for idempotency or rate-limiting
+sed -n '864,899p' autumn/src/cache/coherence.rs
 grep -n "idempotency\|rate_limit\|throttle" autumn-cli/src/cache_audit.rs   # zero hits
 
 # CacheResponseLayer is out of scope by documented, load-bearing contract
