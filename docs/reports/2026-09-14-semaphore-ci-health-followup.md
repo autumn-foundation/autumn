@@ -81,10 +81,24 @@ of the 45 cancelled runs (58%, best-effort sample):
   fires identically on both OS runners because it's a pure file-diff
   assertion, not a platform-dependent one. Branch-owned: this WIP branch's
   in-progress edit to `examples/cms` (or the starter template) hadn't yet
-  synced the other side when this commit ran; the branch's very next push
-  (13 minutes later) evidently fixed it, since none of the 26 sampled
-  cancelled runs after that point show the same signature. Not a CI health
-  issue, and not a match to any tracked signature.
+  synced the other side when this commit ran.
+  **Correction (post-review, via a further Codex review comment on PR
+  #2786): whether the branch's next push actually fixed it is unverified,
+  not established.** An earlier version of this entry claimed the very next
+  push (run 34777703864, ~13 minutes later) "evidently fixed it" because the
+  signature didn't recur in the 26 sampled cancelled runs afterward — but
+  that run's own `Test (${{ matrix.os }})` / `Test (${{ matrix.lane }})`
+  jobs all show the *unexpanded* matrix template name with conclusion
+  `cancelled` (near-simultaneous created/started/completed timestamps,
+  consistent with being cancelled before the matrix job even started, not
+  after running the test) — so there is no completed test-job conclusion
+  from that run to point to either way. The absence of a repeat signature in
+  a sample of cancelled runs whose own Test jobs were themselves cancelled
+  before completing is not evidence the test passed anywhere; it's just
+  absence of observation. Corrected: this failure is not observed again in
+  the runs sampled this pass, full stop — whether or how it was actually
+  fixed is unverified. Not a CI health issue, and not a match to any tracked
+  signature, regardless.
 - **Zero hits on any of the four actively-tracked flaky tests** —
   `live_upgrade` (three signatures), `cache_stampede`, `sim_fault_plan`,
   `job_tracking_stores_integration` (six signatures total) — across
@@ -105,8 +119,7 @@ pipeline. The `happy-edison-fstb1z` Windows failure and the
 category: a WIP branch's own repo-hygiene self-check firing because that
 branch's own diff (still in progress) hadn't finished syncing two things that
 must agree (`ci.yml`'s job list in one case, the embedded CMS starter vs.
-`examples/cms` in the other) — also working as intended, and in the second
-case self-corrected by the branch's own next push. No test-vs-product
+`examples/cms` in the other) — also working as intended. No test-vs-product
 verdict is needed for any of the three: all are attributable to a branch's
 own uncommitted-or-incomplete change, not to test or product code on
 `trunk-dev`.
@@ -127,8 +140,9 @@ forward unchanged.
 - **No action needed** on the dependabot lockfile/compile break, the
   `happy-edison-fstb1z` Windows failure, or the `epic-meitner-vkej1i`
   cross-platform drift-check failure — each belongs to its own branch's
-  author, and the third had already self-resolved by that branch's next
-  push.
+  author. Whether or how the third was actually fixed is unverified (see the
+  correction in Symptom above); it just isn't observed again in this pass's
+  sample.
 
 ## 📊 Measurement
 
@@ -143,7 +157,7 @@ No rerun campaign this pass — organic sampling only.
 | `manual-macos-contention-check.yml` dispatches | 0 → 0 | 6th consecutive idle pass, ~137h |
 | `dependabot/cargo/validator-0.21.0` lockfile+compile break | Triaged, branch-owned | Not a CI health issue |
 | `claude/happy-edison-fstb1z` Windows edge-conformance self-check | Triaged, branch-owned | Not a CI health issue |
-| `claude/epic-meitner-vkej1i` hidden job failure inside cancelled run | Triaged, branch-owned, self-resolved | Not a CI health issue |
+| `claude/epic-meitner-vkej1i` hidden job failure inside cancelled run | Triaged, branch-owned; not observed again (fix unverified) | Not a CI health issue |
 | Cancelled-run job-level check | 26/45 sampled (58%), 1 hidden failure found (above) | Best-effort, not exhaustive |
 
 ## 🔬 Reproduce

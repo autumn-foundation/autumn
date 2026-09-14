@@ -690,10 +690,25 @@ without also filling in the intake form above.
   src/routes/front.rs `` — a repo-hygiene drift-check between the embedded
   CMS starter template and `examples/cms`'s actual source, firing
   identically on both OS runners because it's a pure file-diff assertion.
-  Branch-owned (that WIP branch's own next push evidently fixed it — none
-  of the other 26 sampled cancelled runs show the same signature), not a CI
-  health issue, and no match to any tracked signature — but a real
-  correction to the earlier "zero hits" framing nonetheless.
+  Branch-owned.
+  **Correction (post-review, via a further Codex review comment on PR
+  #2786): whether the branch's next push fixed it is unverified, not
+  established.** An earlier version of this entry claimed the branch's very
+  next push (run 34777703864, ~13 minutes later) "evidently fixed it"
+  because the signature didn't recur in the other 25 sampled cancelled
+  runs — but that run's own `Test`/`Trybuild`/`Windows Tier 1 journey` jobs
+  all show the *unexpanded* matrix template name with conclusion
+  `cancelled` and near-simultaneous created/started/completed timestamps,
+  consistent with being cancelled before the matrix job even started, not
+  after running the test — so there is no completed test-job conclusion
+  from that run either way. Absence of a repeat signature in a sample of
+  cancelled runs whose own Test jobs were themselves cancelled before
+  completing is not evidence anything passed; it's absence of observation.
+  Corrected: not observed again in the runs sampled this pass, full stop —
+  whether or how it was fixed is unverified. Not a CI health issue, and no
+  match to any tracked signature, regardless — but a real correction to the
+  earlier "zero hits" framing (and then to the unverified "fixed" framing)
+  nonetheless.
   Nothing found this pass — the two run-level failures plus the one
   job-level failure inside a cancelled run — matched `live_upgrade`,
   `cache_stampede`, `sim_fault_plan`, or `job_tracking_stores_integration`.
