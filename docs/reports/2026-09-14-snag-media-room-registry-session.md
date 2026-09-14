@@ -37,13 +37,20 @@ manual threads, no extra deps available in this sandbox) fired concurrent
 
 1. Burst of 500 → all `200`.
 2. Burst of 9,700 more → `9,499×200`, `201×503`, first `503` at request index
-   7,505 of that burst (expected: earlier creates from step 1 were already
-   aging past the 8s idle TTL and being reaped mid-burst, so the cap boundary
-   moved during the run — see Findings).
+   7,505 of that burst — but interspersed with later `200`s, not a clean
+   cutoff. **Not** reaper interleaving (see Findings for why the first draft
+   of this report was wrong about that): under concurrent dispatch, a
+   request's index in the submission list is not its arrival order at the
+   store's lock, so a nominally-later request can claim one of the last free
+   slots before a nominally-earlier one arrives — that alone produces an
+   interleaved boundary near the cap with no reaping involved.
 3. Single manual request → `200` (room #10,000 confirmed by exact count, see
    below).
-4. Next manual request → `503`, HTML body confirms `room registry is at
-   capacity (10,000 rooms); try again later`.
+4. Next manual request, fired immediately after step 3 → `503`, HTML body
+   confirms `room registry is at capacity (10,000 rooms); try again later`.
+   This is the control that rules out reaping during steps 1-4: if even one
+   of the 10,000 rooms already created had been reaped by this point, this
+   request would have succeeded instead.
 5. Idle period: 15s of **zero** traffic (> reap interval + idle TTL, so any
    room from steps 1-4 that was never joined ages out).
 6. Fresh burst of 10,500 → **exactly** `10,000×200` then `500×503`, first
@@ -52,12 +59,17 @@ manual threads, no extra deps available in this sandbox) fired concurrent
    only possible if the registry had actually drained back down to ~0 rooms
    during the idle period — not merely "some rooms," the *whole* prior
    population.
-7. Spot-check: the very first room id created in step 1
-   (`191f177a-3c5a-445f-ac9d-ab9a6fbd87d3`, created 07:14:44Z) queried via
-   `GET /api/media/rooms/{id}` after the idle period → `404 room not found`
-   (`autumn_media_plugin::rooms::RoomError::RoomNotFound` per the dev error
-   overlay's stack trace), confirming it was reaped rather than merely
-   uncounted.
+7. Unambiguous drain check, run as a **separate, later rerun** after a Codex
+   review on this PR correctly flagged the first version of this check as
+   inconclusive (see Findings): created 3 fresh, never-joined rooms, waited
+   15s (idle period again), then `POST`ed `.../join` (not `GET .../{id}`) on
+   each. `join_room` (`rooms.rs:1099-1107`) fails with `RoomNotFound` purely
+   on registry membership — unlike the roster route, it needs no bearer
+   token, so a `404` here cannot be explained away as "room exists but I'm
+   not a member." All 3 came back `404`. A control room created and joined
+   immediately afterward, with no wait, succeeded (`200` + a session token),
+   confirming `join` behaves normally against a room that does exist and the
+   `404`s above are specifically about the room being gone.
 
 ## Findings
 
@@ -69,15 +81,28 @@ manual threads, no extra deps available in this sandbox) fired concurrent
   `RoomError::into_autumn` documents.
 - The reaper **fully** drains an idle registry, not just partially: step 6
   needed the registry at ~0 to produce an unbroken run of 10,000 successes
-  before the next `503`, and it did. Step 7 confirms individual reaped rooms
-  are actually gone (`404`), not just excluded from some count.
-- A useful side-observation from step 2's "moving boundary": the reaper isn't
-  merely a startup/shutdown affordance — it was visibly interleaving with
-  live creation traffic within the same ~3-second burst once the idle TTL
-  (deliberately set low for this test) had elapsed for the earliest rooms.
-  That's the reaper behaving exactly as `docs/guide/media.md` describes
-  ("a background reaper reclaims idle rooms"), just faster than a first-read
-  of the doc might suggest for an operator who hasn't set the TTL down.
+  before the next `503`, and it did. Step 7's rerun confirms individual
+  reaped rooms are actually gone (`join` → `404 RoomNotFound`), not just
+  excluded from some count.
+
+Two corrections, both from a Codex review on this PR, to the first version of
+this report:
+
+- The first draft attributed step 2's interleaved `200`/`503` boundary to the
+  reaper racing the creation burst. It doesn't hold up against step 3/4's own
+  result: if any of the first 10,000 rooms had already been reaped by the
+  time step 4 fired, that request would have succeeded instead of `503`ing
+  immediately. The real explanation is request-concurrency ordering (see
+  step 2's note above) — no reaping happened during steps 1-4 at all, only
+  starting once real idle time (step 5) elapsed.
+- The first draft's step 7 spot-check used `GET /api/media/rooms/{id}` (the
+  member-gated roster) against a room this session never joined. That route
+  fails closed with the *same* `404` whether the room is gone **or** it
+  exists but the caller holds no valid membership token — so that check
+  could not actually distinguish "reaped" from "exists, but I'm not a
+  member," and the original conclusion was unsupported by that evidence.
+  Reran it properly (current step 7) against `join`, which is not
+  member-gated, giving an unambiguous result.
 
 **Solid area** (toured, held up): `InMemoryRoomStore`'s 10,000-room registry
 cap and the idle-reaper's live drain-back-down, now confirmed at the real
@@ -106,11 +131,15 @@ namespaces from one `RoomService`/store (it currently doesn't), or testing
 `InMemoryRoomStore` directly below the HTTP layer (already covered by
 `reap_never_crosses_namespaces` and friends in `rooms.rs`'s own unit tests).
 Narrowing rather than dropping: this charter is better scoped as "add a
-second `RoomService`/store instance in one process, from two different
-`room_namespace` values, and prove no HTTP-reachable path lets a namespace-A
-room id collide with namespace-B's" — worth doing only if `media-room` (or
-another example) is extended to host multiple tenants in one process; as
-shipped, there's no such surface to drive.
+second `RoomService`, from a different `room_namespace`, **sharing the same
+underlying `Arc<InMemoryRoomStore>`** as the first — two separate store
+instances would reproduce this session's own mistake, since two isolated
+stores prove nothing about `(namespace, room_id)` keying regardless of how
+many `RoomService`s wrap them — and prove no HTTP-reachable path lets a
+namespace-A room id collide with namespace-B's" (also a Codex correction on
+this PR). Worth doing only if `media-room` (or another example) is extended
+to host multiple tenants in one process; as shipped, there's no such surface
+to drive.
 
 ## Proposed next charters
 
