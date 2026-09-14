@@ -39,6 +39,15 @@ const STATUS_CHOICES: &[(&str, &str)] = &[
     ("future", "Scheduled"),
 ];
 
+/// Look up the message [`PostForm::validate_fields`] recorded against
+/// `field`, if any.
+fn field_error<'a>(errors: &'a [(&str, &str)], field: &str) -> Option<&'a str> {
+    errors
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, msg)| *msg)
+}
+
 /// Whether the editor should offer `target` for a post currently at `current`.
 ///
 /// Read from the state machine's own generated transition table rather than
@@ -101,7 +110,7 @@ fn query_escape(value: &str) -> String {
 /// What the editor submits.
 ///
 /// Decoded by [`PostForm::from_body`] rather than the `Form` extractor.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct PostForm {
     pub title: String,
     #[serde(default)]
@@ -172,6 +181,37 @@ impl PostForm {
             AutumnError::unprocessable_msg(format!("Failed to deserialize form body: {err}"))
         })
     }
+
+    /// Mirrors [`crate::content::require_future_publish_date`] so a
+    /// "Scheduled" submission with no publish date, or one already due,
+    /// redisplays the editor with the author's draft intact and a message
+    /// next to the field that failed (422) instead of reaching that
+    /// function's `unprocessable_msg` via the handler's `?` — which bounced
+    /// to the generic error page and discarded the whole submission,
+    /// including the title and body. `status` is the *effective* status
+    /// (after `requested_status`'s capability clamp); `scheduled_for` is
+    /// [`scheduled_at`]'s parsed result, so a date the editor typed but this
+    /// form cannot parse is treated the same as no date at all — both need
+    /// to be picked again, and either way the raw text the editor typed
+    /// still round-trips into the redisplayed field (see `editor`'s
+    /// `publish_at` binding).
+    fn validate_fields(
+        status: &str,
+        scheduled_for: Option<chrono::NaiveDateTime>,
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut errors = Vec::new();
+        if status == "future" {
+            match scheduled_for {
+                Some(when) if when > chrono::Utc::now().naive_utc() => {}
+                Some(_) => errors.push((
+                    "publish_at",
+                    "A scheduled post needs a publish date in the future",
+                )),
+                None => errors.push(("publish_at", "Pick a publish date for a scheduled post")),
+            }
+        }
+        errors
+    }
 }
 
 /// Parse an optional numeric form field. An empty string means "not set",
@@ -233,10 +273,16 @@ async fn resolve_featured_media(
     Ok(Some(id))
 }
 
+/// `Err` only for a local time that does not exist — the hour a
+/// daylight-saving change skips. A plain `&'static str` rather than
+/// `AutumnResult`: both call sites fold this into the same
+/// `PostForm::validate_fields`-style field-error redisplay, not into a
+/// generic `AutumnError` response, so there is nothing here for `?` to
+/// short-circuit through.
 fn scheduled_at(
     form: &PostForm,
     settings: &crate::settings::Settings,
-) -> AutumnResult<Option<chrono::NaiveDateTime>> {
+) -> Result<Option<chrono::NaiveDateTime>, &'static str> {
     let Some(local) = form
         .publish_at
         .as_deref()
@@ -246,14 +292,10 @@ fn scheduled_at(
     else {
         return Ok(None);
     };
-    // `None` only for a local time that does not exist — the hour a
-    // daylight-saving change skips. Saying so is better than silently
-    // scheduling an hour the editor did not choose.
-    settings.from_local(local).map(Some).ok_or_else(|| {
-        AutumnError::unprocessable_msg(
-            "That time does not exist in this site's timezone — daylight saving skips it",
-        )
-    })
+    settings
+        .from_local(local)
+        .map(Some)
+        .ok_or("That time does not exist in this site's timezone — daylight saving skips it")
 }
 
 fn resolve_type(slug: &str) -> AutumnResult<PostType> {
@@ -480,7 +522,7 @@ pub async fn new_form(
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
     let registered = resolve_type(&post_type)?;
     let context = EditorContext::load(&repos, &registered, None).await?;
-    let body = editor(&registered, None, &context, &user, &csrf);
+    let body = editor(&registered, None, &context, &user, &csrf, None, &[]);
     Ok(layout(
         &user,
         &csrf,
@@ -514,7 +556,7 @@ pub async fn edit_form(
     }
 
     let context = EditorContext::load(&repos, &registered, Some(&post)).await?;
-    let body = editor(&registered, Some(&post), &context, &user, &csrf);
+    let body = editor(&registered, Some(&post), &context, &user, &csrf, None, &[]);
     Ok(layout(
         &user,
         &csrf,
@@ -754,18 +796,32 @@ impl EditorContext {
     }
 }
 
+/// `draft` carries the just-rejected submission when `editor` is redisplaying
+/// a 422 (see [`PostForm::validate_fields`]); `None` on every GET route,
+/// where `post`'s own stored values are what a blank or existing form shows.
+/// Only the scalar content fields it covers (title, slug, excerpt, body,
+/// status, publish date, password, sticky, comments, order) round-trip from
+/// the submission — the taxonomy, parent and featured-image pickers still
+/// redisplay from `post`'s stored state (empty on a rejected create), since
+/// their "selected" state is resolved against the database in
+/// [`EditorContext::load`] rather than carried on the form struct.
 fn editor(
     registered: &PostType,
     post: Option<&Post>,
     context: &EditorContext,
     user: &User,
     csrf: &Csrf,
+    draft: Option<&PostForm>,
+    errors: &[(&str, &str)],
 ) -> Markup {
     let action = post.map_or_else(
         || format!("/admin/content/{}", registered.slug),
         |p| format!("/admin/content/{}/{}", registered.slug, p.id),
     );
-    let value = |get: fn(&Post) -> &str| post.map_or("", get);
+    let value = |get_draft: fn(&PostForm) -> &str, get_post: fn(&Post) -> &str| -> &str {
+        draft.map_or_else(|| post.map_or("", get_post), get_draft)
+    };
+    let publish_at_error = field_error(errors, "publish_at");
     let can_publish = user.role().can(Capability::PublishPosts);
 
     html! {
@@ -775,14 +831,28 @@ fn editor(
                 // Stale-edit detection: the server compares this against the
                 // row it locks, so a save built on content someone else has
                 // since changed is refused rather than silently overwriting.
-                input type="hidden" name="lock_version" value=(post.lock_version);
+                //
+                // On a redisplay (`draft` present) this must carry the version
+                // the rejected submission itself named, not `post`'s current
+                // stored version: `post` here is re-fetched fresh on every
+                // request, so if it were used, a stale submission that also
+                // failed `PostForm::validate_fields` would come back stamped
+                // with whatever version is *now* current — silently curing its
+                // staleness — and a same-content retry would then pass
+                // optimistic locking and overwrite a concurrent edit instead of
+                // being refused.
+                input type="hidden" name="lock_version"
+                      value=(draft.map_or_else(
+                          || post.lock_version.to_string(),
+                          |f| f.lock_version.clone().unwrap_or_default(),
+                      ));
             }
             div class="lg:col-span-2 space-y-4" {
                 div class="bg-white rounded-lg shadow p-5 space-y-4" {
                     div {
                         label for="title" class="block text-sm font-medium mb-1" { "Title" }
                         input #title type="text" name="title" required maxlength="300"
-                              value=(value(|p| &p.title))
+                              value=(value(|f| &f.title, |p| &p.title))
                               class="w-full border rounded px-3 py-2 text-lg";
                     }
                     div {
@@ -792,7 +862,7 @@ fn editor(
                                 "(leave blank to derive from the title)"
                             }
                         }
-                        input #slug type="text" name="slug" value=(value(|p| &p.slug))
+                        input #slug type="text" name="slug" value=(value(|f| &f.slug, |p| &p.slug))
                               class="w-full border rounded px-3 py-2 font-mono text-sm";
                     }
                     div {
@@ -802,7 +872,7 @@ fn editor(
                         }
                         textarea #body name="body" rows="18"
                                  class="w-full border rounded px-3 py-2 font-mono text-sm" {
-                            (value(|p| &p.body))
+                            (value(|f| &f.body, |p| &p.body))
                         }
                     }
                     @if registered.supports_excerpt {
@@ -815,7 +885,7 @@ fn editor(
                             }
                             textarea #excerpt name="excerpt" rows="3"
                                      class="w-full border rounded px-3 py-2 text-sm" {
-                                (value(|p| &p.excerpt))
+                                (value(|f| &f.excerpt, |p| &p.excerpt))
                             }
                         }
                     }
@@ -838,8 +908,16 @@ fn editor(
                                 @if (can_publish || matches!(*value, "draft" | "pending"))
                                     && status_is_offerable(post.map(|p| p.status.as_str()), value) {
                                     option value=(value)
-                                           selected[post.is_some_and(|p| p.status == *value)
-                                                    || (post.is_none() && *value == "draft")] {
+                                           selected[draft.map_or_else(
+                                                   || post.map(|p| p.status.as_str()),
+                                                   |f| Some(if f.status.trim().is_empty() {
+                                                       "draft"
+                                                   } else {
+                                                       f.status.trim()
+                                                   }),
+                                               ) == Some(*value)
+                                                    || (draft.is_none() && post.is_none()
+                                                        && *value == "draft")] {
                                         (label)
                                     }
                                 }
@@ -858,11 +936,27 @@ fn editor(
                         // beside it is part of the fix rather than decoration:
                         // whichever zone the browser is in, this field means the
                         // site's.
+                        //
+                        // On a redisplay (`draft` present) the raw submitted text
+                        // round-trips as-is rather than being reformatted from a
+                        // parsed value, so an unparseable or past entry is shown
+                        // back exactly as typed instead of silently reverting to
+                        // whatever was last stored.
                         input #publish_at type="datetime-local" name="publish_at"
-                              value=(post.and_then(|p| p.published_at)
-                                  .map(|d| context.settings.format_datetime_local(d))
-                                  .unwrap_or_default())
+                              value=(draft.map_or_else(
+                                  || post.and_then(|p| p.published_at)
+                                      .map(|d| context.settings.format_datetime_local(d))
+                                      .unwrap_or_default(),
+                                  |f| f.publish_at.clone().unwrap_or_default(),
+                              ))
+                              aria-invalid=(if publish_at_error.is_some() { "true" } else { "false" })
+                              aria-describedby="publish_at-error"
                               class="w-full border rounded px-3 py-2 text-sm";
+                        div id="publish_at-error" {
+                            @if let Some(msg) = publish_at_error {
+                                p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                            }
+                        }
                     }
                     button type="submit"
                            class="w-full px-4 py-2 bg-indigo-600 text-white rounded \
@@ -984,7 +1078,10 @@ fn editor(
                     @if registered.supports_comments {
                         label class="flex items-center gap-2 text-sm" {
                             input type="checkbox" name="comment_status" value="open"
-                                  checked[post.is_none_or(|p| p.comment_status == "open")]
+                                  checked[draft.map_or_else(
+                                      || post.is_none_or(|p| p.comment_status == "open"),
+                                      |f| f.comment_status.is_some(),
+                                  )]
                                   class="rounded border-gray-300";
                             "Allow comments"
                         }
@@ -992,7 +1089,10 @@ fn editor(
                     @if registered.slug == "post" {
                         label class="flex items-center gap-2 text-sm" {
                             input type="checkbox" name="sticky" value="on"
-                                  checked[post.is_some_and(|p| p.sticky)]
+                                  checked[draft.map_or_else(
+                                      || post.is_some_and(|p| p.sticky),
+                                      |f| f.sticky.is_some(),
+                                  )]
                                   class="rounded border-gray-300";
                             "Pin to the top of the blog"
                         }
@@ -1002,7 +1102,7 @@ fn editor(
                             "Password"
                         }
                         input #password type="text" name="password"
-                              value=(value(|p| &p.password))
+                              value=(value(|f| &f.password, |p| &p.password))
                               placeholder="Leave blank for public"
                               class="w-full border rounded px-3 py-2 text-sm";
                     }
@@ -1034,7 +1134,10 @@ fn editor(
                                 "Order"
                             }
                             input #menu_order type="number" name="menu_order"
-                                  value=(post.map_or(0, |p| p.menu_order))
+                                  value=(draft.map_or_else(
+                                      || post.map_or(0, |p| p.menu_order).to_string(),
+                                      |f| f.menu_order.clone().unwrap_or_default(),
+                                  ))
                                   class="w-full border rounded px-3 py-2 text-sm";
                         }
                     }
@@ -1066,7 +1169,41 @@ pub async fn create(
     // would carry `published_at = NULL`, and the publish sweep — which selects
     // `status = 'future' AND published_at <= now()` — would never see it
     // again: the post would sit in `future` forever.
-    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
+    //
+    // Checked before `require_future_publish_date`'s own `?`: that call
+    // still runs below as the last line of defense, but reaching it first
+    // bounced a "Scheduled" submission with no date (or a date that fell in
+    // a daylight-saving gap `scheduled_at` couldn't resolve) straight to the
+    // generic error page, discarding the title and body the author had just
+    // typed. See `PostForm::validate_fields`.
+    let settings = repos.settings().await?;
+    let (scheduled_for, errors) = match scheduled_at(&form, &settings) {
+        Ok(value) => (value, PostForm::validate_fields(&status, value)),
+        Err(message) => (None, vec![("publish_at", message)]),
+    };
+    if !errors.is_empty() {
+        let context = EditorContext::load(&repos, &registered, None).await?;
+        let body = editor(
+            &registered,
+            None,
+            &context,
+            &user,
+            &csrf,
+            Some(&form),
+            &errors,
+        );
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                &user,
+                &csrf,
+                &format!("/admin/content/{post_type}"),
+                &format!("Add {}", registered.singular),
+                body,
+            ),
+        )
+            .into_response());
+    }
     require_future_publish_date(&status, scheduled_for)?;
 
     // Asked before anything is written. `private` and `future` are reached by
@@ -1224,7 +1361,40 @@ pub async fn update(
     }
 
     let status = requested_status(&form, &user);
-    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
+
+    // See `create`'s identical check: caught here, a "Scheduled" submission
+    // with no future date (or an unparseable/DST-gap one `scheduled_at`
+    // rejects) redisplays the editor with the author's edits intact instead
+    // of reaching `require_future_publish_date`'s `?` and bouncing to the
+    // generic error page.
+    let settings = repos.settings().await?;
+    let (scheduled_for, errors) = match scheduled_at(&form, &settings) {
+        Ok(value) => (value, PostForm::validate_fields(&status, value)),
+        Err(message) => (None, vec![("publish_at", message)]),
+    };
+    if !errors.is_empty() {
+        let context = EditorContext::load(&repos, &registered, Some(&existing)).await?;
+        let body = editor(
+            &registered,
+            Some(&existing),
+            &context,
+            &user,
+            &csrf,
+            Some(&form),
+            &errors,
+        );
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                &user,
+                &csrf,
+                &format!("/admin/content/{post_type}"),
+                &format!("Edit {}", registered.singular),
+                body,
+            ),
+        )
+            .into_response());
+    }
     // The submitted date, not the stored one. Falling back to
     // `existing.published_at` is what let a past timestamp through.
     require_future_publish_date(&status, scheduled_for)?;
@@ -1892,4 +2062,118 @@ pub async fn restore(
         .await?;
     do_action(Action::PostSaved, id);
     Ok(Redirect::to(&format!("/admin/content/{post_type}/{id}")).into_response())
+}
+
+#[cfg(test)]
+mod post_form_tests {
+    use super::PostForm;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn draft_needs_no_publish_date() {
+        assert!(PostForm::validate_fields("draft", None).is_empty());
+    }
+
+    #[test]
+    fn publish_needs_no_publish_date() {
+        // Only "future" schedules; an immediate "publish" never carries a
+        // publish date the editor picked.
+        assert!(PostForm::validate_fields("publish", None).is_empty());
+    }
+
+    #[test]
+    fn scheduled_with_no_date_is_rejected() {
+        let errors = PostForm::validate_fields("future", None);
+        assert_eq!(
+            errors,
+            vec![("publish_at", "Pick a publish date for a scheduled post")]
+        );
+    }
+
+    #[test]
+    fn scheduled_with_a_past_date_is_rejected() {
+        let past = (Utc::now() - Duration::hours(1)).naive_utc();
+        let errors = PostForm::validate_fields("future", Some(past));
+        assert_eq!(
+            errors,
+            vec![(
+                "publish_at",
+                "A scheduled post needs a publish date in the future"
+            )]
+        );
+    }
+
+    #[test]
+    fn scheduled_with_a_future_date_is_accepted() {
+        let soon = (Utc::now() + Duration::hours(1)).naive_utc();
+        assert!(PostForm::validate_fields("future", Some(soon)).is_empty());
+    }
+
+    #[test]
+    fn scheduled_at_with_no_publish_at_field_is_unscheduled() {
+        let form = PostForm::default();
+        let settings = crate::settings::Settings::default();
+        assert_eq!(super::scheduled_at(&form, &settings), Ok(None));
+    }
+
+    #[test]
+    fn scheduled_at_resolves_an_ordinary_local_time() {
+        let form = PostForm {
+            publish_at: Some("2026-06-15T09:00".to_owned()),
+            ..PostForm::default()
+        };
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        assert!(super::scheduled_at(&form, &settings).unwrap().is_some());
+    }
+
+    #[test]
+    fn scheduled_at_rejects_a_daylight_saving_gap_time() {
+        // 2026-03-08 is the day America/Los_Angeles springs forward: the
+        // wall clock jumps from 02:00 directly to 03:00, so 02:30 never
+        // happens that day. This is a calendar fact fixed by the IANA tz
+        // database, not by whenever this test happens to run.
+        let form = PostForm {
+            publish_at: Some("2026-03-08T02:30".to_owned()),
+            ..PostForm::default()
+        };
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        assert_eq!(
+            super::scheduled_at(&form, &settings),
+            Err("That time does not exist in this site's timezone — daylight saving skips it")
+        );
+    }
+
+    #[test]
+    fn a_daylight_saving_gap_time_redisplays_as_a_publish_at_field_error() {
+        // The handlers fold `scheduled_at`'s `Err` into the same
+        // `("publish_at", message)` shape `validate_fields` uses, so this
+        // failure redisplays the editor exactly like a missing or past date
+        // does, rather than reaching `AutumnError` via `?`.
+        let form = PostForm {
+            publish_at: Some("2026-03-08T02:30".to_owned()),
+            ..PostForm::default()
+        };
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        let errors: Vec<(&'static str, &'static str)> = match super::scheduled_at(&form, &settings)
+        {
+            Ok(value) => PostForm::validate_fields("future", value),
+            Err(message) => vec![("publish_at", message)],
+        };
+        assert_eq!(
+            errors,
+            vec![(
+                "publish_at",
+                "That time does not exist in this site's timezone — daylight saving skips it"
+            )]
+        );
+    }
 }
