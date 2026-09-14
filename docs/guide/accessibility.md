@@ -369,22 +369,40 @@ Exit code 0 means no Critical or Serious violations. Exit code 1 means at
 least one violation was found (or `--critical-only` was set and a Critical
 violation exists).
 
-### Programmatic use
+### From a test
 
-`autumn-cli` exposes the checker as a library function for use in integration
-tests:
+To assert on markup you render yourself, pass it to `--html` instead of serving
+it. This is what that flag is for, and it takes the HTML on the command line, so
+nothing has to be listening:
 
 ```rust
-use autumn_cli::check::{A11yCheckOptions, run_a11y_check, print_report};
+use std::process::Command;
 
 #[test]
 fn homepage_is_accessible() {
-    let html = /* render your Markup to String */;
-    let opts = A11yCheckOptions { html: Some(html), url: None, critical_only: false };
-    let violations = run_a11y_check(&opts).expect("checker failed");
-    assert!(violations.is_empty(), "a11y violations: {violations:?}");
+    // Render your `Markup` to a String however your app does it.
+    let html = render_homepage().into_string();
+
+    let out = Command::new("autumn")
+        .args(["check", "--a11y", "--html", &html])
+        .output()
+        .expect("`autumn` not on PATH — install it with `cargo install autumn-cli --locked`");
+
+    assert!(
+        out.status.success(),
+        "a11y violations:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
 }
 ```
+
+The exit code is the assertion: 0 when no Critical or Serious violation was
+found, 1 otherwise, exactly as in CI above. Add `--critical-only` to let Serious
+violations pass as warnings.
+
+There is no library import for the checker. `autumn-cli` ships a binary and no
+`lib` target, so `use autumn_cli::…` does not resolve from another crate no
+matter how the path is spelled — run the command, as above.
 
 ---
 

@@ -398,6 +398,24 @@ jobs:
         # item inside it is. Paths that leave the workspace are reported as
         # OPAQUE and counted rather than guessed at.
         #
+        # Covers EVERY published crate, not just `autumn_web`. Adopting a plugin
+        # is a `use autumn_billing::…`/`use autumn_storage_s3::…` line in the
+        # reader's own file, and the corpus writes 67 such sibling-crate paths;
+        # until the gate scanned for them they were not passing checks, they
+        # were no checks at all. Resolution seeds with the crate the path NAMES,
+        # so a sibling path is never resolved against `autumn_web` — that would
+        # fail real items and pass names the reader cannot reach.
+        #
+        # It also rejects a path into a crate with NO library target, which no
+        # rename can fix: `autumn-cli` is `src/main.rs` alone, so `pub` inside
+        # it is visible only within the binary. That is the shape where every
+        # other signal lies — accessibility.md offered
+        # `use autumn_cli::check::{A11yCheckOptions, run_a11y_check, …}` naming
+        # a real module and real `pub` items, in a crate `cargo add` installs
+        # happily, with no library to import them from. The crate list is
+        # derived from the workspace, so a new published library crate that the
+        # gate does not model fails it rather than going unaudited.
+        #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-symbols.sh --self-test && ./scripts/check-docs-symbols.sh

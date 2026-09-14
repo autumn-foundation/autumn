@@ -42,6 +42,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The docs symbol gate now covers every published crate, and rejects a path
+  into a crate with no library target:** `scripts/check-docs-symbols.sh`
+  scanned one prefix, `autumn_web::`, though it already modelled
+  `autumn_macros`, `autumn_edge` and `autumn_search` in order to follow
+  re-exports into them. Adopting a plugin is a `use autumn_billing::…` /
+  `use autumn_storage_s3::…` line in the reader's own file, and the
+  reader-facing corpus writes 67 such sibling-crate paths across 26 distinct
+  spellings — none of which was a passing check, because none was checked at
+  all. Resolution now seeds with the crate the path *names* rather than with
+  `autumn_web` unconditionally; that hardcoded root was wrong in both
+  directions, failing real sibling items and passing any sibling path that
+  collided with an `autumn_web` module. The gate also reports its own defect
+  class for a path into a crate that ships no `lib` target, which no rename
+  can fix: `autumn-cli` is `src/main.rs` and nothing else, so `pub` inside it
+  is visible only within the binary. That caught `docs/guide/accessibility.md`
+  offering `use autumn_cli::check::{A11yCheckOptions, run_a11y_check,
+  print_report};` — a real module and real `pub` items, in a crate `cargo add`
+  installs without complaint, with no library to import them from (the struct
+  literal beside it also named a `critical_only` field that
+  `A11yCheckOptions` does not have; it is a `print_report` parameter). That
+  section now documents `autumn check --a11y --html`, which is what the flag
+  exists for. The crate list is derived from the workspace and `publish =
+  false` is the test for reader-facing, so a new published library crate the
+  gate does not model fails it instead of going silently unaudited.
+  Paths audited 1,606 → 1,673; defects 3 → 0; corpus unchanged at 212 pages.
+
 - **Build-checked typed contracts between two Autumn services (#1755):** the day
   a team carves the first service out of an Autumn monolith, the framework used
   to go silent — `openapi.rs` and `mcp.rs` project a typed surface *outward*,
