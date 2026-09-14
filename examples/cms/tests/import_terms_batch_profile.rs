@@ -134,7 +134,8 @@ async fn register(client: &TestClient, username: &str) -> String {
         .send()
         .await;
     assert_eq!(
-        resp.status, 303,
+        resp.status,
+        303,
         "registration should redirect; body was: {}",
         resp.text()
     );
@@ -401,7 +402,8 @@ async fn import_terms_batch_profile() {
     let after_fresh = count_terms(&mut conn);
     assert_eq!(
         after_fresh,
-        background_count + (NUM_TOP_CATEGORIES * (CHILDREN_PER_CATEGORY + 1)) as i64
+        background_count
+            + (NUM_TOP_CATEGORIES * (CHILDREN_PER_CATEGORY + 1)) as i64
             + NUM_TAGS as i64,
         "the fresh import must create exactly the file's 2,000 new terms"
     );
@@ -433,7 +435,11 @@ async fn import_terms_batch_profile() {
         "every child category must be found under its expected parent row"
     );
     for link in &links {
-        assert!(link.linked, "{} must be linked to its parent", link.child_slug);
+        assert!(
+            link.linked,
+            "{} must be linked to its parent",
+            link.child_slug
+        );
     }
 
     // === Idempotent reimport: the same file, now entirely already present ===
@@ -462,7 +468,10 @@ async fn import_terms_batch_profile() {
         "ins calls",
         "ins buffers"
     );
-    for (label, p) in [("fresh restore", fresh_profile), ("reimport", reimport_profile)] {
+    for (label, p) in [
+        ("fresh restore", fresh_profile),
+        ("reimport", reimport_profile),
+    ] {
         println!(
             "{label:<20} {:>12} {:>14} {:>12} {:>14} {:>10} {:>12}",
             p.0, p.1, p.2, p.3, p.4, p.5
@@ -481,6 +490,8 @@ async fn import_terms_batch_profile() {
     explain(
         &mut conn,
         "batched taxonomy+slug ANY() lookup shape (the fix, one call for the whole post_tag chunk)",
-        &format!("SELECT * FROM terms WHERE taxonomy = 'post_tag' AND slug = ANY(ARRAY[{any_list}])"),
+        &format!(
+            "SELECT * FROM terms WHERE taxonomy = 'post_tag' AND slug = ANY(ARRAY[{any_list}])"
+        ),
     );
 }
