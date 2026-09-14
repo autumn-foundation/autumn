@@ -371,22 +371,22 @@ violation exists).
 
 ### From a test
 
-To assert on markup you render yourself, pass it to `--html` instead of serving
-it. This is what that flag is for, and it takes the HTML on the command line, so
-nothing has to be listening:
+To assert on a **fragment** you render yourself — a component, a partial, one
+`html!` block — pass it to `--html`, which takes the markup on the command line
+so nothing has to be listening:
 
 ```rust
 use std::process::Command;
 
 #[test]
-fn homepage_is_accessible() {
+fn comment_form_is_accessible() {
     // Render your `Markup` to a String however your app does it.
-    let html = render_homepage().into_string();
+    let html = comment_form().into_string();
 
     let out = Command::new("autumn")
         .args(["check", "--a11y", "--html", &html])
         .output()
-        .expect("`autumn` not on PATH — install it with `cargo install autumn-cli --locked`");
+        .expect("could not run `autumn` (on PATH? markup under the argv limit?)");
 
     assert!(
         out.status.success(),
@@ -399,6 +399,15 @@ fn homepage_is_accessible() {
 The exit code is the assertion: 0 when no Critical or Serious violation was
 found, 1 otherwise, exactly as in CI above. Add `--critical-only` to let Serious
 violations pass as warnings.
+
+**`--html` has a size ceiling, so use `--url` for whole pages.** The markup
+travels as one command-line argument, and the OS caps that: Linux rejects a
+single argument over ~128 KiB with `E2BIG`, and Windows caps the entire command
+line near 32 KiB. A full rendered page can cross either. Past the limit the
+checker never starts — `Command::output()` returns an `Err` before any audit
+runs, which is why the `expect` above does not claim a missing binary as the
+cause. For a whole page, serve it and point `--url` at it, as in the CI example
+above; keep `--html` for fragments, where the limit is not in reach.
 
 There is no library import for the checker. `autumn-cli` ships a binary and no
 `lib` target, so `use autumn_cli::…` does not resolve from another crate no

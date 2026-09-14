@@ -207,7 +207,7 @@ ROOT = sys.argv[2]
 #
 # The rest are here because readers name them DIRECTLY. Adopting a plugin crate
 # is a `use autumn_billing::…`/`use autumn_storage_s3::…` line in the reader's
-# own file — the corpus writes 44 such sibling-crate paths across 26 distinct
+# own file — the corpus writes 67 such sibling-crate paths across 26 distinct
 # spellings — and until this gate scanned for them only the `autumn_web::`
 # prefix was audited. A path into a sibling fails exactly the way an
 # `autumn_web::` one does (E0432 against the reader's own file), so there is no
@@ -237,29 +237,71 @@ def workspace_crates(root):
     resolves, and a crate that stops shipping a library has to stop being
     resolvable the same day.
 
-    Only PUBLISHED members count, and `publish = false` is the test rather than
-    the directory name. A reader reaches a crate by depending on it, so a crate
-    nobody can depend on is not a prefix anybody can write: that rules out the
-    `examples/` and `benchmarks/` members, and also `example-e2e` and
-    `autumn-plugin-reference`, which sit at the top level beside the real
-    crates and would otherwise be demanded here as reader-facing surface.
+    Only PUBLISHED members count, because a reader reaches a crate by depending
+    on it, so a crate nobody can depend on is not a prefix anybody can write:
+    that rules out the `examples/` and `benchmarks/` members, and also
+    `example-e2e` and `autumn-plugin-reference`, which sit at the top level
+    beside the real crates and would otherwise be demanded here as
+    reader-facing surface.
+
+    Publishability is `_published`, NOT a literal `publish is False` test of my
+    own. Cargo spells "do not publish" three ways — `publish = false`,
+    `publish = []`, and `publish.workspace = true` inheriting a `false` from
+    `[workspace.package]` — and this file already had all three right in
+    `_published`, for the corpus scan. A second, weaker copy here would read a
+    private library as published and fail the gate as an undeclared crate,
+    which is the self-maintaining check firing on the one shape it exists to
+    tolerate.
     """
     with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
-        members = tomllib.load(fh)['workspace'].get('members', [])
+        manifest = tomllib.load(fh)
+    members = manifest['workspace'].get('members', [])
+    # The members enumerated here are the ROOT workspace's, so the root
+    # manifest is the one an inherited `publish` resolves against.
+    ws_package = (manifest.get('workspace') or {}).get('package') or {}
     out = {}
     for rel in members:
-        manifest = os.path.join(root, rel, 'Cargo.toml')
-        if not os.path.exists(manifest):
+        path = os.path.join(root, rel, 'Cargo.toml')
+        if not os.path.exists(path):
             continue
-        with open(manifest, 'rb') as fh:
-            pkg = tomllib.load(fh)
-        name = pkg.get('package', {}).get('name')
-        if not name or pkg.get('package', {}).get('publish') is False:
+        with open(path, 'rb') as fh:
+            data = tomllib.load(fh)
+        pkg = data.get('package') or {}
+        name = pkg.get('name')
+        if not name or not _published(pkg, ws_package):
             continue
-        has_lib = ('lib' in pkg
-                   or os.path.exists(os.path.join(root, rel, 'src', 'lib.rs')))
-        out[name.replace('-', '_')] = (os.path.join(rel, 'src'), has_lib)
+        out[name.replace('-', '_')] = (os.path.join(rel, 'src'),
+                                       _has_lib(root, rel, data))
     return out
+
+
+def _has_lib(root, rel, data):
+    """Whether Cargo builds a LIBRARY target for this package.
+
+    Three cases, in the order Cargo resolves them:
+
+      1. An explicit `[lib]` table declares one outright, wherever its `path`
+         points. It wins over everything below, which is why it is checked
+         first: `autolib` governs auto-DISCOVERY and says nothing about a
+         target the manifest declares by hand.
+      2. `package.autolib = false` turns auto-discovery off. A `src/lib.rs`
+         then sits in the tree and Cargo builds no library from it, so the
+         file's presence is not proof of a library target and cannot be the
+         last word.
+      3. Otherwise Cargo auto-discovers `src/lib.rs`.
+
+    Getting (2) wrong is not a cosmetic miss. A published package with
+    `autolib = false` and a leftover `src/lib.rs` would be read as a library,
+    so it would skip the binary-only class entirely: instead of the accurate
+    "ships no library target", a path into it would be demanded as a modelled
+    crate and then reported as an unresolved SYMBOL — sending the reader to
+    look for a renamed item in a crate that exposes nothing at all.
+    """
+    if 'lib' in data:
+        return True
+    if (data.get('package') or {}).get('autolib') is False:
+        return False
+    return os.path.exists(os.path.join(root, rel, 'src', 'lib.rs'))
 
 
 # Workspace crates that ship NO library target, and so can never appear in a
@@ -1538,6 +1580,58 @@ macro_rules! declassify { () => {} }
                '[lib]\npath = "src/other.rs"\n')
         check('an explicit [lib] counts even without src/lib.rs',
               sorted(binary_only_crates(tmp)), [])
+
+        # -- `autolib = false` disables auto-discovery of src/lib.rs ----------
+        # The file is present and Cargo builds NO library from it. Reading the
+        # file as proof would skip the binary-only class and report a path into
+        # such a crate as an unresolved symbol instead.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n'
+               'autolib = false\n')
+        _write(tmp, 'no_autolib/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["bin_only", "lib_crate", '
+               '"no_autolib", "examples/demo"]\n')
+        check('autolib = false means no library target despite src/lib.rs',
+              sorted(binary_only_crates(tmp)), ['no_autolib'])
+        # An explicit [lib] still wins: `autolib` governs DISCOVERY only.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n'
+               'autolib = false\n[lib]\npath = "src/lib.rs"\n')
+        check('an explicit [lib] beats autolib = false',
+              sorted(binary_only_crates(tmp)), [])
+
+        # -- every Cargo spelling of "not published" is honoured --------------
+        # Reusing `_published` rather than testing `publish is False` here:
+        # a private LIBRARY read as published fails the gate as an undeclared
+        # crate, which is the self-maintaining check firing on the one shape it
+        # exists to tolerate.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n')
+        _write(tmp, 'priv_empty/Cargo.toml',
+               '[package]\nname = "priv-empty"\nversion = "0.1.0"\n'
+               'publish = []\n')
+        _write(tmp, 'priv_empty/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'priv_inherit/Cargo.toml',
+               '[package]\nname = "priv-inherit"\nversion = "0.1.0"\n'
+               'publish.workspace = true\n')
+        _write(tmp, 'priv_inherit/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'registry_only/Cargo.toml',
+               '[package]\nname = "registry-only"\nversion = "0.1.0"\n'
+               'publish = ["some-registry"]\n')
+        _write(tmp, 'registry_only/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "priv_empty", '
+               '"priv_inherit", "registry_only"]\n'
+               '[workspace.package]\npublish = false\n')
+        ws2 = workspace_crates(tmp)
+        check('publish = [] is not published', 'priv_empty' in ws2, False)
+        check('publish.workspace = true inherits false',
+              'priv_inherit' in ws2, False)
+        check('publish = ["registry"] IS published',
+              'registry_only' in ws2, True)
+        check('an absent publish key is still published',
+              'lib_crate' in ws2, True)
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
