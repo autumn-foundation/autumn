@@ -209,11 +209,13 @@ AUTUMN_SERVER__PORT=3100 \
 AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS=5 \
 AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS=8 \
   ./target/debug/media-room &
-# burst-create rooms via POST /api/media/rooms (any concurrent HTTP client);
-# confirm the 10,001st create in a tight window returns 503. Then, to confirm
-# drain-back-down without relying on aggregate counts alone: after a quiet
-# period >= idle_ttl + reaper_interval, POST a saved room id's .../join first
-# (expect 404 RoomNotFound) to verify the registry is empty *before* sending
-# any new creates — only then fire a fresh burst and confirm it again reaches
+# burst-create rooms via POST /api/media/rooms (any concurrent HTTP client),
+# saving every returned room id; confirm the 10,001st create in a tight
+# window returns 503. Then, to confirm drain-back-down without relying on
+# aggregate counts alone: after a quiet period >= idle_ttl + reaper_interval,
+# POST .../join for EVERY saved room id (not a sample — a partial sweep
+# proves only that the probed ids are gone, not the whole registry) and
+# confirm every single one returns 404 RoomNotFound *before* sending any new
+# creates — only then fire a fresh burst and confirm it again reaches
 # exactly 10,000 successes.
 ```
