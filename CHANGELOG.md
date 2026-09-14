@@ -32,6 +32,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the full timeline. Issue #2795 tracks lowering `autumn-web`'s own
   compile time and tightening this budget
   back toward the original target.
+- **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
+  "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
+  error-path inventory of `cms`'s content editor — `/admin/content/{type}`
+  create and `/admin/content/{type}/{id}` update, the single
+  content-authoring flow this `supported`-tier example exists to
+  demonstrate — found the "Scheduled" status option (offered in the same
+  dropdown as "Draft"/"Published"/"Private" to any account with
+  `publish_posts`) had no client-side `required` on its paired publish-date
+  field, and no server-side redisplay either:
+  `content::require_future_publish_date`'s rejection (no date picked, or a
+  date already in the past) reached the handler's `?` and bounced straight
+  to a generic `application/problem+json` response, discarding the title,
+  body, excerpt and every other field the author had just typed. This is
+  not a crafted-request edge case — `require_future_publish_date`'s own doc
+  comment names the ordinary way an editor hits it: a published post moved
+  back to draft keeps its stored `published_at`, so re-selecting
+  "Scheduled" later without touching the (now past) date field produces
+  exactly this rejection on an otherwise unremarkable edit. Same anti-pattern
+  already fixed in `wiki`'s page forms (#2773), `blog`'s post editor (#2687)
+  and `reddit-clone`'s create-community form (#2665).
+  Fix: `PostForm::validate_fields(status, scheduled_for)` mirrors
+  `require_future_publish_date`'s exact rule — checked before that
+  function's own `?`, which stays in place underneath as the last line of
+  defense for the REST/importer paths — and returns a
+  `("publish_at", message)` pair on failure. Both `create` and `update` now
+  redisplay the editor (422, `aria-invalid`/`aria-describedby` wired to the
+  publish-date field, `role="alert"` message beside it) instead of
+  discarding the submission. `editor()` gained a `draft: Option<&PostForm>`
+  parameter so the redisplay carries the author's just-typed title, slug,
+  body, excerpt, status selection, publish-date text (round-tripped
+  verbatim, not reformatted — an unparseable or past entry is shown back
+  exactly as typed), password, sticky flag, comment toggle and menu order;
+  the taxonomy, parent and featured-image pickers still redisplay from the
+  stored row (empty on a rejected create) rather than from this submission,
+  since their "selected" state is resolved from the database in
+  `EditorContext::load` — a smaller, deliberately out-of-scope follow-up.
+  5 new unit tests (`examples/cms/src/routes/admin/posts.rs`'s
+  `post_form_tests`) cover `validate_fields` directly; 3 new Docker
+  integration tests (`examples/cms/tests/integration_test.rs`) cover the
+  create and update paths end-to-end: a missing date, a past date, and — on
+  update — that a rejected submission neither writes the edit nor loses it.
 
 - **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
   `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
@@ -1453,6 +1494,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full nested paths, and the full existing 196-test Docker-gated suite
   passes unchanged. See
   `docs/reports/2026-09-13-ledger-cms-search-listing-permalink-ancestry-batch/`.
+
+- **🗃️ Ledger: batch `examples/cms`'s `import_terms` taxonomy lookups
+  (statements 2064-4128→3-69, reimport buffers -94.2%):**
+  `content::import_terms` — the handler behind `POST /admin/tools/import`
+  that restores a site-export JSON file's whole taxonomy — walked the
+  file's terms in two sequential per-row loops: a single-row existence
+  check before each insert, then a single-row child/parent re-lookup for
+  every term naming a parent, plus one `INSERT ... RETURNING` per new row.
+  A heavily-tagged blog's backup can carry thousands of terms, so the
+  round trips this call paid scaled with the file's term count rather than
+  with the site's registered-taxonomy count (`category`, `post_tag`, ...).
+  Now every `(taxonomy, slug)` the call needs — each draft's own identity
+  plus any parent it names — is collected up front and loaded with one
+  batched `taxonomy = $1 AND slug = ANY($2)` query per distinct taxonomy
+  (chunked at 1,000 slugs), new rows are created with one chunked
+  multi-row `INSERT ... RETURNING`, and the child/parent linking pass
+  reuses that same lookup map instead of re-querying. Profiled through the
+  real import route against a 5,000-row pre-existing `terms` fixture and a
+  2,000-term import file (an 8-top-level/4-children category tree plus
+  1,960 flat tags): a fresh restore drops from 4,128 to 69 statements
+  (23,098→19,119 buffers), and reimporting the same file — isolating the
+  pure-read half of the defect — drops from 2,064 to 3 statements
+  (6,224→363 buffers, -94.2%). No behavior change: the harness asserts
+  every child category resolves to its expected parent after the rewrite
+  and that reimporting the same file creates zero additional rows. See
+  `docs/reports/2026-09-14-ledger-cms-import-terms-batch/`.
 
 - **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
   subscription (buffers -97.8%):** `close_dunning_for`
