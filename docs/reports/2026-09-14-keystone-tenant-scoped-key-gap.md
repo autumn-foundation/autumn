@@ -224,14 +224,29 @@ below.
    735-787) is, in its own words, *"the wiring nothing else in this suite
    reaches... delete that line and every other test here still passes
    while every tenant silently shares one namespace"* — asserting exactly
-   one KV key per tenant, not one shared. All four are real, behavioral,
-   end-to-end tests that would fail today if either the acquisition or
-   the encoding half of any of these flows regressed — strictly stronger
-   proof than a structural "does this function still get called" hygiene
-   test would have given, and it was already there before this memo was
-   written. Item 2, as originally proposed, would have added no coverage
-   that doesn't already exist; withdrawn rather than kept as a weaker
-   restatement of what these four files already do.
+   one KV key per tenant, not one shared. That claim about "every other
+   test" was correct only for the acquisition site it names
+   (`plugin.rs:579-583`, reached through `serve`/`mounted_router`): it
+   does **not** extend to `SandboxedPlugin::render_slot`
+   (`plugin.rs:291-297`), which reads `CURRENT_TENANT` through its own,
+   independent capture rather than the one `serve` uses. Every
+   `render_slot` call in this test file (lines 859, 872, 875, 887, 933,
+   943) runs outside a `with_tenant` scope — `with_tenant` appears exactly
+   once in the whole file, in the `mounted_router` test — so no existing
+   test would notice if `render_slot`'s capture were deleted, even though
+   its output feeds the same `namespaced_key` encoder the mounted-router
+   path does. Corrected claim: three of the four subsystems (idempotency,
+   rate limiting at both call sites, `#[cached]`) and *one of
+   `plugin_sandbox`'s two acquisition sites* have real, behavioral,
+   end-to-end regression coverage running in CI today — strictly stronger
+   proof than a structural hygiene test would have given, for the paths
+   it actually covers. `render_slot`'s capture is a real, currently
+   uncovered gap this memo did not know about until this review caught
+   it; item 2 is still withdrawn as originally scoped (a source-shape
+   hygiene test would not have caught this gap either — it isn't a
+   missing call site, it's an existing call site with no behavioral
+   test), but this specific gap is worth a targeted test in its own
+   right, independent of anything this memo recommends.
 
 What's left, once both items are corrected, is not a fix but an honest
 gap statement: nothing in this framework prompts a *new* derived-key
@@ -316,6 +331,12 @@ sed -n '130,190p' autumn/tests/integration/cached_tenant_scope.rs   # #[ignore],
 sed -n '735,787p' autumn/tests/integration/plugin_sandbox_capabilities.rs
 grep -n "idempotency_tenant_scope\|rate_limit_tenant_scope\|cached_tenant_scope\|plugin_sandbox_capabilities" \
   autumn/tests/integration/mod.rs
+
+# But that mounted_router test does not cover render_slot's own,
+# independent ambient-tenant capture — a real, currently uncovered gap
+sed -n '280,297p' autumn/src/plugin_sandbox/plugin.rs   # render_slot's separate capture
+grep -n "with_tenant" autumn/tests/integration/plugin_sandbox_capabilities.rs   # exactly 1 hit, not near render_slot
+grep -n "render_slot" autumn/tests/integration/plugin_sandbox_capabilities.rs   # none inside that 1 hit's scope
 
 # `autumn cache audit` proves invalidation coverage, not key composition —
 # and reaches beyond #[cached] via declare_cached_read! for fragment/
