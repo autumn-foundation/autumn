@@ -76,17 +76,20 @@ a *new* derived-key feature, afterward, to ask whether tenancy applies to
 it. Each of the three was found only when a dedicated audit pass (the "Warden"
 persona) happened to point at it — one every ~5 weeks on average since
 tenancy landed, three in the last 7 days once that audit cycle reached this
-class of bug. No compile-time or CI check catches this shape today: `autumn
-cache audit` (`autumn-cli/src/cache_audit.rs`) proves cache
-*invalidation* coverage, not key composition — and that invalidation gate
-already reaches further than `#[cached]` alone, via
+class of bug — no check caught any of them *before* that audit found
+them and its fix shipped a dedicated regression test (see 🔧
+Recommendation, item 2: all four now have one, running in CI). The gap is
+narrower than "no CI check catches this shape" — it is "nothing catches
+this shape in a derived-key builder that has not yet been through that
+cycle." Separately, `autumn cache audit`
+(`autumn-cli/src/cache_audit.rs`) proves cache *invalidation* coverage,
+never key composition, for any cached read either way — and that
+invalidation gate already reaches further than `#[cached]` alone, via
 `declare_cached_read!` for the fragment and read-through caches
 (`autumn/src/cache/coherence.rs:864-899`,
-`docs/guide/cache-coherence.md:259-267`), so the real limitation is
-narrower than an earlier draft of this memo stated: not "covers only
-`#[cached]`," but "verifies that a cached read has an invalidation edge,
-never that its key includes tenant." Idempotency and rate-limiting have
-no equivalent gate of any kind.
+`docs/guide/cache-coherence.md:259-267`). Idempotency and rate-limiting
+have no equivalent invalidation gate of any kind, but that is a distinct
+point from tenant-key coverage, which no gate here or elsewhere checks.
 `grep -rn "CURRENT_TENANT"` finds 142 lines across 25 files today — most
 are the correct, declarative `#[repository(..., tenant_scoped)]` path; the
 four discussed here are the ad hoc, imperative ones that middleware/macros
