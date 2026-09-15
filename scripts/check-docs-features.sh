@@ -569,6 +569,10 @@ MOD_DECL = re.compile(r'^(pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
 # Strictly `pub`, for the nested pass: a `pub(crate)` or private `mod tests`
 # gated by a feature is not a path a reader can write.
 PUB_MOD_DECL = re.compile(r'^pub mod ([a-z_0-9]+)\s*[;{]')
+# How many `::`-separated segments below `autumn_web` the module walk descends.
+# 2 means `a::b` and `a::b::c` are both resolvable; a fourth segment would be an
+# item inside `c`, which needs type resolution rather than another file read.
+MAX_MODULE_DEPTH = 2
 
 
 def _is_public(visibility):
@@ -1078,22 +1082,42 @@ def nested_modules(root, parents):
     though the manifest's `variants = ["storage", …]` means naming the second
     already brings the first (see `enablers()`).
 
-    ONE level, not arbitrary depth. `check-docs-symbols.sh` stops at the first
-    item segment because resolving further needs type resolution; a module path
-    is the part that does not, and one level is where the corpus's gated
-    modules actually live. A third segment is an item inside a module, and
-    guessing at those is how a gate starts reporting confident nonsense.
+    TWO levels below the crate root, not one and not arbitrary depth. One level
+    was the original boundary, argued from `check-docs-symbols.sh` stopping at
+    the first item segment because resolving further needs type resolution. A
+    module path is the part that does not, and the argument stopped a level too
+    early: `autumn_web::capsule::capture::with_capture_scope` is a public
+    function gated by `any(test, feature = "test-support")` under an
+    unconditional `pub mod capture;`, reachable by reading one more FILE rather
+    than by resolving any type. The corpus writes **36** three-segment paths in
+    reader-facing rust fences — `auth::impersonation::*`,
+    `cache::coherence::*`, `capsule::regression::*` among them — so this was
+    not a hypothetical rung. Found by Codex review on #2800.
+
+    The limit is where a path stops being module segments: `a::b::c` is the
+    deepest a reader writes in this corpus, and a FOURTH segment would be an
+    item inside `c`, which is the type-resolution problem the symbol gate
+    declines. `MAX_MODULE_DEPTH` names it so the boundary is one number rather
+    than a shape buried in a loop.
     """
     out = {}
-    for name, parent_features in parents.items():
+    queue = [(name, set(features)) for name, features in parents.items()]
+    seen = set()
+    while queue:
+        name, parent_features = queue.pop()
+        if name in seen:
+            continue
+        seen.add(name)
         unconditional = set()
-        for candidate in (f'autumn/src/{name}.rs', f'autumn/src/{name}/mod.rs'):
+        stem = name.replace('::', '/')
+        for candidate in (f'autumn/src/{stem}.rs', f'autumn/src/{stem}/mod.rs'):
             path = pathlib.Path(root) / candidate
             if path.exists():
                 break
         else:
             # An inline `pub mod x { … }` in lib.rs has no file of its own.
             continue
+        deeper = name.count('::') + 1 < MAX_MODULE_DEPTH
         lines = path.read_text(encoding='utf-8').splitlines()
         pending = None
         index = 0
@@ -1112,12 +1136,17 @@ def nested_modules(root, parents):
                 continue
             match = PUB_MOD_DECL.match(line)
             if match:
+                child = f'{name}::{match.group(1)}'
+                child_features = set(parent_features) | (pending or set())
                 if pending:
-                    out[f'{name}::{match.group(1)}'] = (
-                        set(parent_features) | pending, {'module'})
+                    out[child] = (child_features, {'module'})
                 else:
-                    unconditional.add(
-                        (f'{name}::{match.group(1)}', 'type'))
+                    unconditional.add((child, 'type'))
+                # Descend whether or not the child carries a gate of its own:
+                # an UNCONDITIONAL child is exactly where the invisible gate
+                # lives, which is the lesson round 4 learned one rung up.
+                if deeper:
+                    queue.append((child, child_features))
                 pending = None
                 continue
             # A gated public ITEM inside an ungated module is the same hole one
@@ -1268,6 +1297,7 @@ FENCE = re.compile(r'^\s*```([A-Za-z0-9_+-]*)')
 RUST_LANGS = ('rust', 'rs')
 PATH_USE = re.compile(
     r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)'
+    r'(?:::([A-Za-z_][A-Za-z_0-9]*))?'
     r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
 ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
 # `use autumn_web::{Mail, Mailer};` — ordinary use-tree syntax, and the corpus
@@ -1458,14 +1488,24 @@ def uses(blanked, gated):
     `ws` — the difference between a line they can find on the page and a name
     they have to go looking for.
     """
-    def resolve(head, child):
-        """The surface entry for `head::child`, else for `head`, else None."""
-        if child:
-            entry = gated.get(f'{head}::{child}')
+    def resolve(*segments):
+        """The surface entry for the LONGEST prefix of `segments` that is one.
+
+        Longest-first, because a gate one level down can be invisible from the
+        level above: `db` is a default feature and `db::sqlite_types` is not,
+        and `capsule::capture` is unconditional while
+        `capsule::capture::with_capture_scope` needs `test-support`. Reading
+        the shortest prefix that happens to exist would vouch for a path that
+        does not build.
+        """
+        parts = [s for s in segments if s]
+        while parts:
+            key = '::'.join(parts)
+            entry = gated.get(key)
             if entry:
-                return entry, f'autumn_web::{head}::{child}'
-        entry = gated.get(head)
-        return (entry, f'autumn_web::{head}') if entry else (None, None)
+                return entry, f'autumn_web::{key}'
+            parts.pop()
+        return None, None
 
     # Type names a prelude glob brings into scope unqualified. Scoped to a
     # fence that actually writes the glob, and to names that START UPPERCASE,
@@ -1496,7 +1536,34 @@ def uses(blanked, gated):
     # re-parses the whole page, so a second loop for the module glob cost a
     # second parse of all 212 pages — 0.9s, a fifth of the gate — for a scan
     # that reads the same lines.
-    bare = {n for n in gated if n[:1].isupper()}
+    # What the prelude glob actually brings into scope, read off the surface's
+    # own `prelude::…` entries rather than inferred from capitalization.
+    #
+    # Capitalization was the original filter, and it was the wrong axis twice
+    # over. It admitted four gated names the prelude does NOT re-export
+    # (`BroadcastPayload`, `CacheEdgeKv`, `ChannelBackendConfigError`,
+    # `ChannelPublishError`) — bare uses of those do not compile after a
+    # prelude glob, so demanding a feature for them was answering about a line
+    # the reader cannot have written. And it excluded the lowercase FUNCTIONS
+    # the prelude does export: `presence_badge` and `presence_stream`
+    # (`prelude.rs:140` and `:148`), so `use autumn_web::prelude::*;` beside a
+    # bare `presence_badge(…)` reported nothing. Found by Codex review on #2800.
+    #
+    # A macro is excluded because a macro cannot be CALLED by its bare name:
+    # `t`, `ws`, `mailer`, `mailer_preview` and `mail_previews` are all prelude
+    # exports, and all of them are reached through `t!(…)` or `#[ws]`, which
+    # `BANG_USE` and `ATTR_USE` already read. Admitting them here would match a
+    # bare `t` or `ws` — an ordinary variable name — on every page that globs
+    # the prelude. The macro test is the parsed kind set, not a list.
+    bare = {}
+    for full, entry in gated.items():
+        head, sep, name = full.partition('::')
+        if head != 'prelude' or not sep:
+            continue
+        root = gated.get(name)
+        if root and root[1] & {'bang', 'attribute'}:
+            continue
+        bare[name] = entry
     children = {}
     for full, entry in gated.items():
         head, _, child = full.partition('::')
@@ -1518,10 +1585,15 @@ def uses(blanked, gated):
         if not prelude and not scoped:
             continue
         for offset, line in enumerate(body):
-            for match in re.finditer(r'\b([A-Z][A-Za-z_0-9]*)\b', line):
+            # Identifiers, not just Capitalized ones — the prelude exports
+            # lowercase functions too. The `(?<![:\w])` keeps a qualified path's
+            # last segment out: `autumn_web::presence_badge` is `PATH_USE`'s to
+            # report, and reading it here as well would double-count it.
+            for match in re.finditer(r'(?<![:\w])([A-Za-z_][A-Za-z_0-9]*)\b',
+                                     line):
                 name = match.group(1)
                 if prelude and name in bare:
-                    for feature in sorted(gated[name][0]):
+                    for feature in sorted(bare[name][0]):
                         yield start + offset, feature, name
                 found = scoped.get(name)
                 if found:
@@ -1556,11 +1628,11 @@ def uses(blanked, gated):
                 parts = [q.strip() for q in piece.split('::') if q.strip()]
                 if not parts:
                     continue
-                entry, shown = resolve(head, parts[0])
+                entry, shown = resolve(head, *parts[:MAX_MODULE_DEPTH])
                 if entry:
                     for feature in sorted(entry[0]):
                         yield lineno, feature, shown
-            entry, shown = resolve(head, None)
+            entry, shown = resolve(head)
             if entry:
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
@@ -1586,11 +1658,12 @@ def uses(blanked, gated):
                         first = child.split('::')[0].strip()
                         if not first:
                             continue
-                        entry, shown = resolve(head, first)
+                        deep = child.split('::')[:MAX_MODULE_DEPTH]
+                        entry, shown = resolve(head, *deep)
                         if entry:
                             for feature in sorted(entry[0]):
                                 yield lineno, feature, shown
-                    entry, shown = resolve(head, None)
+                    entry, shown = resolve(head)
                     if entry:
                         for feature in sorted(entry[0]):
                             yield lineno, feature, shown
@@ -1610,16 +1683,13 @@ def uses(blanked, gated):
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
         for match in PATH_USE.finditer(line):
-            head, child = match.group(1), match.group(2)
-            # A SECOND segment is resolved first, because a gate one level down
-            # can be invisible from the first: `autumn_web::db::sqlite_types`
-            # needs `sqlite`, and `db` is a DEFAULT feature, so reading only the
-            # head drops the path out of the surface entirely.
-            entry = gated.get(f'{head}::{child}') if child else None
-            shown = f'autumn_web::{head}::{child}' if entry else None
-            if entry is None:
-                entry = gated.get(head)
-                shown = f'autumn_web::{head}'
+            # The LONGEST prefix that is surface wins — see `resolve`. A gate
+            # one level down can be invisible from the level above
+            # (`autumn_web::db::sqlite_types` under the default `db`), and so
+            # can one two levels down
+            # (`autumn_web::capsule::capture::with_capture_scope` under an
+            # unconditional `capture`).
+            entry, shown = resolve(*match.groups())
             if entry:
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
@@ -2031,8 +2101,22 @@ def self_test():
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
         'embed_static': ({'embed-assets'}, {'bang'}),
-        # A prelude-glob type, and one that must stay unread.
+        # A prelude-glob type, and one that must stay unread. The bare-name
+        # scan reads the surface's `prelude::…` entries — what the glob
+        # actually brings into scope — so the fixture carries both spellings,
+        # the way the real crate does.
         'Presence': ({'presence'}, {'item'}),
+        'prelude::Presence': ({'presence'}, {'item'}),
+        # A lowercase FUNCTION the prelude exports: reachable bare.
+        'presence_badge': ({'presence'}, {'item'}),
+        'prelude::presence_badge': ({'presence'}, {'item'}),
+        # A gated type the prelude does NOT re-export: a bare use of it does
+        # not compile after a glob, so it must not be reported.
+        'BroadcastPayload': ({'ws'}, {'item'}),
+        # Prelude exports that are MACROS. Neither can be called by its bare
+        # name, and both are names a fence uses for ordinary variables.
+        'prelude::t': ({'i18n'}, {'item'}),
+        'prelude::ws': ({'ws'}, {'item'}),
         # The one-letter bang macro. Reachable because `\b` excludes
         # `assert!`/`insert!`/`vec!` on its own — no length floor needed.
         't': ({'i18n'}, {'bang'}),
@@ -2136,18 +2220,35 @@ def self_test():
             (2, 'storage', 'autumn_web::storage::variant'),
             (2, 'variants', 'autumn_web::storage::variant')])
 
-    # A bare type name a prelude glob brought into scope. Scoped to a fence
-    # that writes the glob, and to names starting uppercase.
+    # A bare name a prelude glob brought into scope. Scoped to a fence that
+    # writes the glob, and to what the glob actually EXPORTS — the surface's
+    # `prelude::…` entries — rather than to capitalization.
     glob = '```rust\nuse autumn_web::prelude::*;\n'
     expect('bare gated type read after a prelude glob',
            found(glob + 'async fn v(p: Presence) {}\n```\n'),
            [(3, 'presence', 'Presence')])
     expect('no glob, no bare-name scan',
            found('```rust\nasync fn v(p: Presence) {}\n```\n'), [])
-    expect('a lowercase name is never read bare',
+    # A lowercase FUNCTION the prelude exports is reachable bare; capitalization
+    # was the wrong axis for this.
+    expect('a bare prelude function is read',
+           found(glob + 'let b = presence_badge(1);\n```\n'),
+           [(3, 'presence', 'presence_badge')])
+    # ...but a MACRO the prelude exports is not, because a macro cannot be
+    # called by its bare name — and `t` and `ws` are ordinary variable names.
+    expect('a bare prelude macro name is not a use of the macro',
+           found(glob + 'for t in items { let ws = 1; }\n```\n'), []),
+    # A gated type the prelude does NOT export cannot be in scope from a glob.
+    expect('a gated name the prelude does not export is not read bare',
+           found(glob + 'let p: BroadcastPayload = x;\n```\n'), [])
+    expect('a module name is never read bare',
            found(glob + 'let x = storage;\n```\n'), [])
     expect('an ungated type is not read bare',
            found(glob + 'let x: Widget = w;\n```\n'), [])
+    # A qualified path's last segment belongs to `PATH_USE`, not to this scan.
+    expect('a qualified path is not double-counted by the bare scan',
+           found(glob + 'let b = autumn_web::presence_badge(1);\n```\n'),
+           [(3, 'presence', 'autumn_web::presence_badge')])
     # The direction that matters: `presence = ["ws"]`, so naming `ws` does NOT
     # supply `presence`. This is the live defect on `docs/guide/presence.md`.
     expect('naming the implied feature does not satisfy the implying one',
@@ -2827,8 +2928,19 @@ sys.exit(self_test() if MODE == '--self-test'
          else main())
 PYEOF
 
+# The program goes to the interpreter through a FILE rather than `-c`, which
+# takes it out of the argument vector. At ~2600 lines it outgrew `ARG_MAX` on
+# this workspace and every mode started failing with "Argument list too long" —
+# a failure of the harness, not of anything it checks, and one that would have
+# read as a broken gate in CI.
 run_py() {
-  python3 -c "$PYSRC" "$@"
+  local program
+  program="$(mktemp -t check-docs-features.XXXXXX.py)"
+  printf '%s\n' "$PYSRC" > "$program"
+  python3 "$program" "$@"
+  local status=$?
+  rm -f "$program"
+  return $status
 }
 
 mode="${1:-}"
