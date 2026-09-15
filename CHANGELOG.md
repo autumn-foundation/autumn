@@ -120,7 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leave an item ungated — naming one alternative already satisfies the first,
   and the second marks an item that exists when the feature is *off*, so
   demanding it would tell a reader to enable the one flag that removes what
-  they came for. Naming an *implying* feature counts, walking the manifest's
+  they came for. One level BELOW the crate root is resolved too, because a gate
+  under an unconditional module is invisible from the head segment and worst
+  when the head is default — `autumn_web::db::sqlite_types` needs `sqlite`
+  while `db` is on by default — and a fence inside a `>` callout is read like
+  any other. Naming an *implying* feature counts, walking the manifest's
   implication graph rather than subtracting the default closure alone:
   `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
   `presence_stream` snippet is complete, and demanding `ws` by name there would

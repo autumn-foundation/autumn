@@ -177,9 +177,18 @@
 #     `vec!(` all end in it, and requiring a word boundary still leaves a
 #     one-letter token this gate would have to be right about on 160 pages.
 #     Names first, and a one-letter name is not one.
-#   - Anything past the first path segment. `autumn_web::db::replica` is judged
-#     on `db` (default, so not judged at all); a feature gating a nested module
-#     is invisible here. Same boundary as the symbol gate's.
+#   - Anything past the SECOND path segment. One level down IS resolved, and has
+#     to be: a gate below an unconditional module is invisible from the head,
+#     and worst when the head is a DEFAULT feature —
+#     `autumn_web::db::sqlite_types` needs `sqlite` while `db` is on by default,
+#     so reading only the head dropped the whole path out of the surface and the
+#     gate vouched for a line that does not build. `storage::variant`
+#     (`variants`) is the same shape with a non-default parent. Found by Codex
+#     review on #2800; surface 61 -> 65, checked uses 78 -> 83, no live defect.
+#     Only `pub mod` counts — 11 of the 40 gated child modules are a private
+#     `mod tests`, which is not a path any reader can write. A THIRD segment is
+#     an item inside a module; resolving it needs type resolution, which is
+#     where `check-docs-symbols.sh` stops and where this stops too.
 #   - Non-`rust` fences and prose. A feature gate is a COMPILE failure, so the
 #     only place it can bite is a block a reader compiles. `autumn_web::pdf::Pdf`
 #     in a README's capability table is a description of the example, not a
@@ -457,6 +466,9 @@ SOURCES = ('autumn/src/lib.rs', 'autumn/src/prelude.rs')
 CFG_OPEN = re.compile(r'^#\[cfg\(')
 CFG_FEATURE_NAME = re.compile(r'feature\s*=\s*"([a-z0-9_.+-]+)"')
 MOD_DECL = re.compile(r'^(?:pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
+# Strictly `pub`, for the nested pass: a `pub(crate)` or private `mod tests`
+# gated by a feature is not a path a reader can write.
+PUB_MOD_DECL = re.compile(r'^pub mod ([a-z_0-9]+)\s*[;{]')
 USE_ONE_LINE = re.compile(r'^pub use ([a-z_0-9:]+)::\{?([^;{}]+?)\}?;')
 USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
 # A whole CRATE re-exported under a new name, with no `::` anywhere:
@@ -678,6 +690,68 @@ def _names(blob):
     return out
 
 
+def nested_modules(root, top_level):
+    """`{"parent::child": features}` for one level below the crate root.
+
+    A feature gate below an UNCONDITIONAL module is invisible from the first
+    path segment, and the worst case is the one where the parent is a DEFAULT
+    feature: `autumn_web::db::sqlite_types` needs `sqlite`, `db` is on by
+    default, so reading only the head drops the whole path out of the surface
+    and the gate vouches for a line that does not build. `storage::variant`
+    (`variants`) is the same shape with a non-default parent. Found by Codex
+    review on #2800.
+
+    Only `pub mod` counts: a private `mod tests` gated by a feature is not a
+    path any reader can write, and 11 of the 40 gated child modules are that.
+    Requirements are the UNION of the parent's and the child's, because a
+    reader needs both — `storage::variant` wants `storage` and `variants`,
+    though the manifest's `variants = ["storage", …]` means naming the second
+    already brings the first (see `enablers()`).
+
+    ONE level, not arbitrary depth. `check-docs-symbols.sh` stops at the first
+    item segment because resolving further needs type resolution; a module path
+    is the part that does not, and one level is where the corpus's gated
+    modules actually live. A third segment is an item inside a module, and
+    guessing at those is how a gate starts reporting confident nonsense.
+    """
+    out = {}
+    for name, (parent_features, kinds) in top_level.items():
+        if 'module' not in kinds:
+            continue
+        for candidate in (f'autumn/src/{name}.rs', f'autumn/src/{name}/mod.rs'):
+            path = pathlib.Path(root) / candidate
+            if path.exists():
+                break
+        else:
+            # An inline `pub mod x { … }` in lib.rs has no file of its own.
+            continue
+        lines = path.read_text(encoding='utf-8').splitlines()
+        pending = None
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if not line or line[:1].isspace():
+                index += 1
+                continue
+            if CFG_OPEN.match(line):
+                required, index = _cfg_requirement(lines, index)
+                if required:
+                    pending = required
+                continue
+            index += 1
+            if line.startswith(('///', '//!', '//', '#[')):
+                continue
+            match = PUB_MOD_DECL.match(line)
+            if match:
+                if pending:
+                    out[f'{name}::{match.group(1)}'] = (
+                        set(parent_features) | pending, {'module'})
+                pending = None
+                continue
+            pending = None
+    return out
+
+
 def surface(root):
     """`{name: (features, kinds)}` for what a DEFAULT build does not have.
 
@@ -699,6 +773,13 @@ def surface(root):
             f'--surface.')
     out = {}
     for name, (features, kinds) in gated.items():
+        needed = features - closure
+        if needed:
+            out[name] = (needed, kinds)
+    # One level down, keyed `parent::child`, resolved BEFORE the head in
+    # `uses()`. Seeded from every top-level module whatever its own gate, since
+    # the interesting case is a gated child under an ungated parent.
+    for name, (features, kinds) in nested_modules(root, gated).items():
         needed = features - closure
         if needed:
             out[name] = (needed, kinds)
@@ -760,8 +841,12 @@ FENCE = re.compile(r'^\s*```([A-Za-z0-9_+-]*)')
 # The languages a reader compiles. `rs` and `rust,no_run` are both live in the
 # corpus; an info string carries the language up to the first comma or space.
 RUST_LANGS = ('rust', 'rs')
-PATH_USE = re.compile(r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)')
+PATH_USE = re.compile(
+    r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
 ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
+# One or more `>` markers and the space after each: a nested quote writes
+# `> > `, and a fence inside one is still a fence.
+BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
 HTML_COMMENT = re.compile(r'<!--.*?-->', re.S)
 WAIVER = re.compile(
     r'<!--\s*feature-gate-allow:\s*([a-z0-9_-]+)\s*(?:—|:)\s*(\S[^>]*?)-->',
@@ -787,9 +872,21 @@ def rust_fences(text):
     `check-docs-macro-args.sh` reads the same corpus: a closing ``` carries no
     language, so the language is remembered from the opener. An unbalanced
     fence therefore ends at the next fence rather than swallowing the page.
+
+    The BLOCKQUOTE prefix is stripped first. A fence inside a `>` callout has
+    every line — the opener, the code, the closer — prefixed with `> `, so a
+    pattern anchored on optional whitespace never opens it and the snippet is
+    skipped in silence. The corpus writes two of them today
+    (`docs/guide/mcp.md:647` and `docs/guide/openapi.md:364`, the latter a
+    `use autumn_web::openapi::…` under the non-default `openapi` feature), and
+    a callout is exactly where an author puts the snippet that needs a warning
+    beside it. Neither is a live defect — `openapi.md` names its feature 340
+    lines earlier — but a shape the extractor cannot see is a shape the gate
+    does not cover. Found by Codex review on #2800.
     """
     lang = None
     for lineno, line in enumerate(text.splitlines(), 1):
+        line = BLOCKQUOTE.sub('', line)
         match = FENCE.match(line)
         if match:
             if lang is None:
@@ -819,9 +916,17 @@ def uses(blanked, gated):
     """
     for lineno, line in rust_fences(blanked):
         for match in PATH_USE.finditer(line):
-            entry = gated.get(match.group(1))
+            head, child = match.group(1), match.group(2)
+            # A SECOND segment is resolved first, because a gate one level down
+            # can be invisible from the first: `autumn_web::db::sqlite_types`
+            # needs `sqlite`, and `db` is a DEFAULT feature, so reading only the
+            # head drops the path out of the surface entirely.
+            entry = gated.get(f'{head}::{child}') if child else None
+            shown = f'autumn_web::{head}::{child}' if entry else None
+            if entry is None:
+                entry = gated.get(head)
+                shown = f'autumn_web::{head}'
             if entry:
-                shown = f'autumn_web::{match.group(1)}'
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
         for match in ATTR_USE.finditer(line):
@@ -1037,6 +1142,9 @@ def self_test():
         'mailer': ({'mail'}, {'macro'}),
         # The conjunction shape: two non-default requirements on one item.
         'presence_stream': ({'presence', 'ws'}, {'item'}),
+        # One level down, under a DEFAULT parent — the case that is invisible
+        # from the head segment alone.
+        'db::sqlite_types': ({'sqlite'}, {'module'}),
     }
 
     def found(text):
@@ -1067,6 +1175,30 @@ def self_test():
            found('```rust\n#[storage]\nstruct S;\n```\n'), [])
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
+
+    # A fence inside a `>` callout is still a fence. Every line carries the
+    # prefix — opener, code and closer — so a pattern anchored on whitespace
+    # alone never opens it and the snippet is skipped in silence.
+    expect('blockquoted fence read',
+           found('> ```rust\n> use autumn_web::pdf::Pdf;\n> ```\n'),
+           [(2, 'pdf', 'autumn_web::pdf')])
+    expect('nested blockquote read',
+           found('> > ```rust\n> > use autumn_web::pdf::Pdf;\n> > ```\n'),
+           [(2, 'pdf', 'autumn_web::pdf')])
+    expect('a blockquoted fence still closes',
+           found('> ```rust\n> let x = 1;\n> ```\n\n`autumn_web::pdf`\n'), [])
+
+    # A second path segment is resolved BEFORE the head, because a gate one
+    # level down can be invisible from the first — and worst when the parent is
+    # a DEFAULT feature, as `db` is.
+    expect('a nested gated module is reported under its own feature',
+           found('```rust\nuse autumn_web::db::sqlite_types::SqliteUuid;\n```\n'),
+           [(2, 'sqlite', 'autumn_web::db::sqlite_types')])
+    expect('an ungated second segment falls back to the head',
+           found('```rust\nuse autumn_web::pdf::Pdf;\n```\n'),
+           [(2, 'pdf', 'autumn_web::pdf')])
+    expect('a path with no gated segment is not reported',
+           found('```rust\nuse autumn_web::db::Db;\n```\n'), [])
 
     # A comment renders as nothing, so it can neither show a construct NOR
     # name a feature. The second half is the regression: `uses()` blanked and
@@ -1195,6 +1327,22 @@ def self_test():
     expect('naming `ws` alone does not satisfy `presence`',
            activation_lines('features = ["ws"]\n', {'presence'},
                             enabled_by).get('presence'), None)
+
+    # The nested pass, against the real crate. `db` is a DEFAULT feature, so
+    # `db::sqlite_types` exists only because the second segment is resolved.
+    for name, features in (('db::sqlite_types', {'sqlite'}),
+                           ('storage::variant', {'storage', 'variants'})):
+        got = real.get(name)
+        if got is None or got[0] != features:
+            failures.append(
+                f'truth set: {name} -> {got!r}, want features {features!r}')
+    # Only `pub mod` is a path a reader can write. 11 of the 40 gated child
+    # modules are private `mod tests`, and none of them may appear.
+    for name in ('openapi::tests', 'widgets::tests', 'lock::tests'):
+        if name in real:
+            failures.append(
+                f'truth set: {name} is a private module and must not be '
+                f'reported as a path')
 
     # An item whose every requirement is default is not gated surface at all:
     # `live` is behind `all(feature = "htmx", feature = "maud")`.
