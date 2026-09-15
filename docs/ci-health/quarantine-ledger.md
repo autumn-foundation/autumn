@@ -365,9 +365,15 @@ _None as of 2026-09-05._
   `tokio-rustls`, `tonic`, `reqwest`, `redis`, `lettre`, and
   `tokio-postgres-rustls` — most of the workspace's own network stack, not
   one narrow edge — so `cargo-deny`'s advisory check failed the required
-  `Supply chain (cargo-deny)` job (and therefore the `Test suite` aggregator)
-  on any open PR whose `Cargo.lock` carried that pin, independent of that
-  PR's own diff.
+  `Supply chain (cargo-deny)` job on any open PR whose `Cargo.lock` carried
+  that pin, independent of that PR's own diff. **Correction: not via the
+  `test-gate`/`Test suite` aggregator** — `.github/workflows/ci.yml`'s
+  `test-gate.needs` is exactly `[test, trybuild, test-features,
+  test-docker]` and does not include `supply-chain`, so a cargo-deny failure
+  fails its own separate check, not that aggregator. It is still blocking in
+  its own right: CONTRIBUTING.md's "Supply chain (cargo-deny)" section
+  states plainly that the job is fully blocking ("a PR that introduces a new
+  advisory... fails CI").
 - **Mechanism classification**: unpinned/newly-disclosed external
   vulnerability data, the same structural shape as the MinIO/Docker-Hub
   outage above (a lockfile- or registry-level fact outside this repo's own
@@ -410,11 +416,16 @@ _None as of 2026-09-05._
   records it after the fact, the same posture as the MinIO escape above —
   consistent with this repo's "red CI is work now" convention: whoever hit
   the failure on their own PR fixed it in place.
-- **Verification**: CI-native, not just local. Every `Supply chain
-  (cargo-deny)` run sampled after 23:07:59Z in the same window passed:
-  `dependabot/cargo/diesel-ecosystem` re-run at 23:11:34Z,
+- **Verification**: CI-native, not just local — with one caveat. Every
+  `Supply chain (cargo-deny)` run sampled that actually carried the updated
+  lockfile passed: `dependabot/cargo/diesel-ecosystem` re-run at 23:11:34Z,
   `claude/compassionate-euler-hfl9hp` re-run at 23:19:49Z,
-  `dependabot/cargo/rust-deps` re-run at 23:23:44Z. Revert check: not
+  `dependabot/cargo/rust-deps` re-run at 23:23:44Z. **Time alone is not the
+  boundary**: `dependabot/cargo/validator-0.21.0`'s own `Supply chain
+  (cargo-deny)` job failed again at 23:11:06Z, after 23:07:59Z — but that
+  failure is the separate, pre-existing `fuzz/Cargo.lock` `--locked`
+  mismatch on a stale branch whose lockfile never picked up the rustls
+  bump, not a recurrence of this advisory. Revert check: not
   applicable in the usual sense (nothing in this repo's own logic changed —
   the defect was an external vulnerability disclosure against a pinned
   version, not a bug in this repo's code), but the failure this fix removes

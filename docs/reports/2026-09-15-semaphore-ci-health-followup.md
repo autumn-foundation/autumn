@@ -90,13 +90,21 @@ rustls --precise 0.23.45` (patch-level, no API break) against both the root
 workspace `Cargo.lock` and, in a follow-up commit, `fuzz/`'s separate
 excluded-workspace lockfile. This is exactly the "red CI is work now" posture
 this repo's own conventions already call for — whoever hit the failure fixed
-it in place — and CI-natively confirmed: every `Supply chain (cargo-deny)`
-run sampled after 23:07:59Z in this window (`dependabot/cargo/diesel-ecosystem`
-re-run at 23:11:34Z, `claude/compassionate-euler-hfl9hp` re-run at
-23:19:49Z, `dependabot/cargo/rust-deps` re-run at 23:23:44Z) passed. No
-action needed from this pass beyond recording it accurately in the ledger
-(below) as Tier-1 escape-analysis evidence, matching the MinIO/Docker-Hub
-entry's own precedent.
+it in place — and CI-natively confirmed, with one caveat: every
+`Supply chain (cargo-deny)` run sampled that actually carried the updated
+lockfile passed — `dependabot/cargo/diesel-ecosystem` re-run at 23:11:34Z,
+`claude/compassionate-euler-hfl9hp` re-run at 23:19:49Z, and
+`dependabot/cargo/rust-deps` re-run at 23:23:44Z. **Not every run after
+23:07:59Z passed**: `dependabot/cargo/validator-0.21.0`'s own `Supply chain
+(cargo-deny)` job failed again at 23:11:06Z, after the fix landed — but that
+failure is the separate, pre-existing `fuzz/Cargo.lock` `--locked` mismatch
+(Finding 1's report text and the ledger's own prior entry both attribute it
+there), on a stale branch whose own lockfile never picked up the rustls
+bump, not a recurrence of RUSTSEC-2026-0285. Time alone isn't the right
+boundary for "fixed"; whether a given PR's own `Cargo.lock` carried the
+bump is. No action needed from this pass beyond recording it accurately in
+the ledger (below) as Tier-1 escape-analysis evidence, matching the
+MinIO/Docker-Hub entry's own precedent.
 
 **Finding 2 — `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
 hit again, on the exact same assertion as its one prior occurrence.** Run
