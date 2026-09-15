@@ -1277,7 +1277,15 @@ ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
 # is matched against, which is why `rust_fences` joins a multi-line `use` back
 # onto one line first — the claim that stood here, that the corpus writes no
 # multi-line group, was never measured and is false six times over.
-GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*)\}')
+#
+# The body is brace-BALANCED rather than brace-free, because `[^{}]*` did not
+# merely miss a nested entry — it failed the whole group, so
+# `use autumn_web::{pdf::Pdf, openapi::{Parameter}};` reported NEITHER name,
+# losing the `pdf::Pdf` that resolves perfectly well on its own. One nested
+# entry blinded the entire line. `PATH_USE` could not pick up the slack either,
+# since it wants an identifier straight after `::` and sees `{`. Found by Codex
+# review on #2800.
+GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
 # `use autumn_web::storage::{blob::Blob, variant::{Transform, VariantBudget}};`
 # — a group hanging off a MODULE segment, which `GROUP_USE` (anchored straight
 # after `autumn_web::`) cannot see. `storage-variants.md:71` writes exactly
@@ -1292,6 +1300,12 @@ MODULE_GROUP_ENTRY = re.compile(r'([a-z_][a-z_0-9]*)\s*::\s*\{|'
 # lowercase resolved the entry to `openapi` alone — which is ungated, so the
 # line reported nothing. Round 8 widened `PATH_USE` for exactly this and left
 # the group form behind. Found by Codex review on #2800.
+#
+# One entry of a root group that is itself a group — `openapi::{Parameter}`.
+# `MODULE_GROUP_USE` is anchored on `autumn_web::<mod>::{` and so cannot see a
+# group nested one level further in. Found by Codex review on #2800.
+NESTED_GROUP_ENTRY = re.compile(
+    r'^\s*([a-z_][a-z_0-9]*)\s*::\s*\{([^{}]*)\}\s*$')
 GROUP_ENTRY = re.compile(
     r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)'
     r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
@@ -1309,6 +1323,10 @@ GROUP_ENTRY = re.compile(
 # bang set does the rest.
 BANG_USE = re.compile(r'\b([a-z_][a-z_0-9]*)!')
 PRELUDE_GLOB = re.compile(r'\bautumn_web::prelude::\*')
+# `use autumn_web::openapi::*;` — a glob over a ROOT module, which brings that
+# module's gated items into scope under their bare names. `prelude` is excluded
+# because `PRELUDE_GLOB` already covers it against a wider candidate set.
+MODULE_GLOB = re.compile(r'\bautumn_web::(?!prelude\b)([a-z_][a-z_0-9]*)::\*')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
 BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
@@ -1462,18 +1480,55 @@ def uses(blanked, gated):
     # measuring the corpus found 27 occurrences across 14 page/name pairs — not
     # "most of the guide". One of those 14 was a live defect
     # (`docs/guide/presence.md`). Found by Codex review on #2800.
+    # A MODULE glob does the same thing one level down: `use
+    # autumn_web::openapi::*;` puts the gated `openapi::Parameter` in scope
+    # under its bare name, and only the prelude glob was being followed. That
+    # scan is narrower than the prelude one rather than wider — its candidate
+    # set is the gated children of the module the fence actually globbed, not
+    # every gated name in the crate — so it cannot report a name the glob did
+    # not import. Found by Codex review on #2800.
+    #
+    # No live occurrence: the corpus writes two non-prelude module globs, both
+    # `autumn_web::hooks::*` and both under `docs/plans/`, which is outside the
+    # reader-facing corpus, and `hooks` has no gated children either way.
+    #
+    # Both globs are followed in ONE pass over the fences. `rust_fence_blocks`
+    # re-parses the whole page, so a second loop for the module glob cost a
+    # second parse of all 212 pages — 0.9s, a fifth of the gate — for a scan
+    # that reads the same lines.
     bare = {n for n in gated if n[:1].isupper()}
+    children = {}
+    for full, entry in gated.items():
+        head, _, child = full.partition('::')
+        if child and child[:1].isupper():
+            children.setdefault(head, {})[child] = entry
     for start, body in rust_fence_blocks(blanked):
-        if not any(PRELUDE_GLOB.search(line) for line in body):
+        # Every glob this looks for — prelude or module — contains the literal
+        # `::*`, so a fence without it cannot match either pattern. A necessary
+        # condition read off the patterns themselves, not a guess about the
+        # corpus: unlike the `check()` prefilter round 11 removed, this one
+        # cannot drift away from what it is filtering for.
+        fence = '\n'.join(body)
+        if '::*' not in fence:
+            continue
+        prelude = PRELUDE_GLOB.search(fence) is not None
+        globbed = {m.group(1) for m in MODULE_GLOB.finditer(fence)}
+        scoped = {n: (e, head) for head in globbed
+                  for n, e in children.get(head, {}).items()}
+        if not prelude and not scoped:
             continue
         for offset, line in enumerate(body):
             for match in re.finditer(r'\b([A-Z][A-Za-z_0-9]*)\b', line):
                 name = match.group(1)
-                if name not in bare:
-                    continue
-                entry = gated[name]
-                for feature in sorted(entry[0]):
-                    yield start + offset, feature, name
+                if prelude and name in bare:
+                    for feature in sorted(gated[name][0]):
+                        yield start + offset, feature, name
+                found = scoped.get(name)
+                if found:
+                    entry, head = found
+                    shown = f'{name} (from autumn_web::{head}::*)'
+                    for feature in sorted(entry[0]):
+                        yield start + offset, feature, shown
 
     for lineno, line in rust_fences(blanked):
         for match in MODULE_GROUP_USE.finditer(line):
@@ -1510,7 +1565,36 @@ def uses(blanked, gated):
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
         for match in GROUP_USE.finditer(line):
-            for piece in match.group(1).split(','):
+            # The split guards against commas INSIDE a nested entry, the same
+            # way the module-group loop above does: `{pdf::Pdf, openapi::{A, B}}`
+            # is two entries, not three.
+            for piece in re.split(r',(?![^{]*\})', match.group(1)):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                # A nested entry is a module segment with its own group:
+                # `openapi::{Parameter}` resolves as `openapi::Parameter`, the
+                # same pair `openapi::Parameter` written flat would give. Read
+                # here rather than left to `MODULE_GROUP_USE`, which is anchored
+                # on `autumn_web::<mod>::{` and so cannot see a group nested
+                # one level further in.
+                nested = NESTED_GROUP_ENTRY.match(piece)
+                if nested:
+                    head = nested.group(1)
+                    for child in re.split(r',', nested.group(2)):
+                        child = child.strip().split(' as ')[0].strip()
+                        first = child.split('::')[0].strip()
+                        if not first:
+                            continue
+                        entry, shown = resolve(head, first)
+                        if entry:
+                            for feature in sorted(entry[0]):
+                                yield lineno, feature, shown
+                    entry, shown = resolve(head, None)
+                    if entry:
+                        for feature in sorted(entry[0]):
+                            yield lineno, feature, shown
+                    continue
                 entry_match = GROUP_ENTRY.match(piece)
                 if not entry_match:
                     continue
@@ -1672,6 +1756,30 @@ def naming_patterns(feature):
         rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn_web\]'
         rf'(?=[^\[]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^\[]*?features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
+        # A dependency-QUALIFIED value names autumn-web itself, so the package
+        # the command selects is beside the point: `cargo check -p app
+        # --features autumn-web/ws` turns `ws` on for autumn-web as a
+        # dependency of `app`, and rejecting it because `-p` selects something
+        # other than autumn-web failed a complete enabling command. This row
+        # therefore carries no `_FOREIGN_PKG` guard — the qualifier IS the
+        # guard, and `--features diesel/postgres` still names nothing of
+        # autumn-web's. Found by Codex review on #2800, one round after the
+        # qualified spelling was accepted for unselected commands only.
+        # Written as the bare qualified value rather than as another
+        # `--features …` line scan: `autumn-web/ws` names the crate AND the
+        # feature, so wherever it appears it is a complete instruction — in a
+        # command, in a forwarding array, or in prose ("enable
+        # `autumn-web/ws`"). Requiring the flag as well cost 0.047s per pass
+        # for a row that a literal leads, which is 1.5s across the corpus.
+        # The lookbehind is round 17's whole-key rule again, with `.` standing
+        # for the `-`/`_` so the width stays fixed: `not-autumn-web/ws` is a
+        # different crate. Its class is LOWERCASE, unlike the TOML-key rule's,
+        # because what it has to exclude is the tail of a longer CRATE name and
+        # a crate name has no uppercase in it. Spelling it `[A-Za-z0-9_-]`
+        # rejected `cargo check -p app -Fautumn-web/ws`, where the character
+        # before the crate is the flag letter `F` — caught by running the case.
+        rf'autumn[-_]web/{name}(?<![a-z0-9_-]autumn.web/{name})'
+        rf'(?:[",\s`\]]|$)',
         # A `--features` flag belongs to the package the COMMAND selects, and
         # the corpus runs `cargo install diesel_cli --no-default-features
         # --features postgres` three times. Round 9 tied dependency ARRAYS to
@@ -2103,6 +2211,41 @@ def self_test():
            found('```rust\nuse autumn_web::{\n    Mail,\n```\n\nprose\n\n'
                  '```rust\nuse autumn_web::pdf::Pdf;\n```\n'),
            [(9, 'pdf', 'autumn_web::pdf')])
+    # A nested group under the crate root. `[^{}]*` did not merely miss the
+    # nested entry — it failed the whole group, so the `pdf::Pdf` sibling went
+    # unread too: one nested entry blinded the entire line.
+    expect('a nested group under the root resolves its child',
+           found('```rust\nuse autumn_web::{openapi::{Parameter}};\n```\n'),
+           found('```rust\nuse autumn_web::{openapi::Parameter};\n```\n'))
+    expect('...and does not blind its siblings',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{pdf::Pdf, openapi::{Parameter}};'
+               '\n```\n')}),
+           ['openapi', 'pdf'])
+    expect('...for every name in the nested group',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{storage::{variant::Transform}};'
+               '\n```\n')}),
+           ['storage', 'variants'])
+
+    # A MODULE glob puts that module's gated items in scope bare. The candidate
+    # set is scoped to the module actually globbed, which is what keeps this
+    # narrower than the prelude scan rather than wider.
+    expect('a module glob brings its gated children into scope',
+           found('```rust\nuse autumn_web::openapi::*;\nlet p = Parameter {};'
+                 '\n```\n'),
+           [(3, 'openapi', 'Parameter (from autumn_web::openapi::*)')])
+    expect('...only from the module it globbed',
+           found('```rust\nuse autumn_web::openapi::*;\n'
+                 'async fn h(m: Multipart) {}\n```\n'),
+           [])
+    expect('...and only inside the fence that wrote it',
+           found('```rust\nuse autumn_web::openapi::*;\n```\n\nprose\n\n'
+                 '```rust\nlet p = Parameter {};\n```\n'),
+           [])
+    expect('a bare gated name with no glob at all is not read',
+           found('```rust\nlet p = Parameter {};\n```\n'), [])
+
     # A `use` with no group is not joined, so the line after it keeps its own
     # number.
     expect('consecutive single-line uses keep their own lines',
@@ -2308,7 +2451,24 @@ def self_test():
             # cheaper and would have re-broken them.
             ('Behind the non-default `ws` Cargo feature — '
              '`autumn-web = { version = "0.7", features = ["ws"] }`',
-             'ws', True)):
+             'ws', True),
+            # A dependency-QUALIFIED value names autumn-web itself, so the
+            # package the command selects is beside the point — the selector
+            # rejection above must not swallow it.
+            ('cargo check -p app --features autumn-web/ws', 'ws', True),
+            ('cargo build -p my-app --features autumn-web/tls', 'tls', True),
+            ('cargo check -p app -Fautumn-web/ws', 'ws', True),
+            ('enable `autumn-web/ws` in your manifest', 'ws', True),
+            # ...and the qualifier is still a whole crate name, with a
+            # LOWERCASE boundary so the `F` of an attached `-F` does not read
+            # as part of one.
+            ('see not-autumn-web/ws for the fork', 'ws', False),
+            ('my_autumn-web/ws', 'ws', False),
+            ('cargo run --features autumn-web/ws-extra', 'ws', False),
+            ('cargo check -p app --features diesel/postgres',
+             'postgres', False),
+            # A BARE value still belongs to the selected package.
+            ('cargo check -p app --features ws', 'ws', False)):
         if names_feature(spelling, feature) != want:
             failures.append(
                 f'naming: {spelling!r} / {feature} -> '
