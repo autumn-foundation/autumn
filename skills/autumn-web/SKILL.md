@@ -1489,7 +1489,15 @@ this is *provider-reported* failure.
   store. `with_mail_suppression_store` takes a store *by value* and wraps it in
   a fresh handle internally, so build **one** `InMemorySuppressionStore` and
   hand out `.clone()`s of it — the clone shares the same `Arc<Mutex<…>>` state
-  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`):
+  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`).
+
+  The receiving half needs the non-default `inbound-mail` feature on top of
+  `mail` — `record_inbound` and `InboundMailRouter` are both behind it, while
+  the store and `with_mail_suppression_store` above are not:
+
+  ```toml
+  autumn-web = { version = "0.7", features = ["mail", "inbound-mail"] }
+  ```
 
   ```rust
   use std::sync::OnceLock;

@@ -1064,6 +1064,26 @@ def root_modules(root):
     return out
 
 
+def _inline_module_body(lines, index, decl):
+    """`(body, index)` for `pub mod x {` — dedented lines, and where to resume.
+
+    `(None, index)` for the `pub mod x;` spelling, which has a file instead.
+
+    The block ends at the first column-zero `}`, which the workspace's
+    `cargo fmt --all` guarantees, and the body is dedented by one level so the
+    same column-zero reader can scan it unchanged. That is the whole trick: an
+    inline module is a file that never left home.
+    """
+    if not decl.rstrip().endswith('{'):
+        return None, index
+    body = []
+    while index < len(lines) and lines[index].rstrip() != '}':
+        body.append(lines[index][4:] if lines[index].startswith('    ')
+                    else lines[index])
+        index += 1
+    return body, index + 1
+
+
 def nested_modules(root, parents):
     """`{"parent::child": features}` for one level below the crate root.
 
@@ -1101,24 +1121,29 @@ def nested_modules(root, parents):
     than a shape buried in a loop.
     """
     out = {}
-    queue = [(name, set(features)) for name, features in parents.items()]
+    queue = [(name, set(features), None) for name, features in parents.items()]
     seen = set()
     while queue:
-        name, parent_features = queue.pop()
+        name, parent_features, lines = queue.pop()
         if name in seen:
             continue
         seen.add(name)
         unconditional = set()
-        stem = name.replace('::', '/')
-        for candidate in (f'autumn/src/{stem}.rs', f'autumn/src/{stem}/mod.rs'):
-            path = pathlib.Path(root) / candidate
-            if path.exists():
-                break
-        else:
-            # An inline `pub mod x { … }` in lib.rs has no file of its own.
-            continue
+        if lines is None:
+            stem = name.replace('::', '/')
+            for candidate in (f'autumn/src/{stem}.rs',
+                              f'autumn/src/{stem}/mod.rs'):
+                path = pathlib.Path(root) / candidate
+                if path.exists():
+                    break
+            else:
+                # A module with no file of its own is declared INLINE, and its
+                # body is pushed onto this queue by the scan of the file that
+                # declares it — see `_inline_module_body`. Reaching here with
+                # no lines means neither: nothing to read.
+                continue
+            lines = path.read_text(encoding='utf-8').splitlines()
         deeper = name.count('::') + 1 < MAX_MODULE_DEPTH
-        lines = path.read_text(encoding='utf-8').splitlines()
         pending = None
         index = 0
         while index < len(lines):
@@ -1145,8 +1170,18 @@ def nested_modules(root, parents):
                 # Descend whether or not the child carries a gate of its own:
                 # an UNCONDITIONAL child is exactly where the invisible gate
                 # lives, which is the lesson round 4 learned one rung up.
+                #
+                # An INLINE `pub mod x { … }` has no file, and skipping it hid
+                # a live defect: `mail.rs:4158` declares `pub mod suppression`
+                # inline, `record_inbound` inside it is `#[cfg(feature =
+                # "inbound-mail")]` (`:4386`), and
+                # `skills/autumn-web/SKILL.md:1494` imports that function on a
+                # page naming `inbound-mail` nowhere. Its body is queued
+                # directly instead of being looked up by path. Found by Codex
+                # review on #2800.
+                body, index = _inline_module_body(lines, index, line)
                 if deeper:
-                    queue.append((child, child_features))
+                    queue.append((child, child_features, body))
                 pending = None
                 continue
             # A gated public ITEM inside an ungated module is the same hole one
@@ -1276,6 +1311,47 @@ def enablers(graph):
     return out
 
 
+CONTINUATION = re.compile(r'\\\s*$')
+
+
+def join_continuations(text):
+    """`(joined, line_of)` — a `\\`-continued shell command read as one line.
+
+    A command split across lines with a trailing `\\` is ONE command, and the
+    corpus writes it that way with the package selector on the first line and
+    `--features` on the second: `CONTRIBUTING.md:355` is `cargo clippy -p
+    autumn-web \\` followed by `  --features "ws,mail,…"`, and four report
+    pages do the same. The package-scoping rule asks whether the command that
+    carries the flag also selects autumn-web, and a line-at-a-time reader sees
+    a flag with no selector in front of it and a selector with no flag after
+    it — rejecting both halves of one complete instruction.
+
+    `line_of` maps each joined line back to the line its command STARTS on, so
+    a reported naming line still points into the file and the ordering report's
+    arithmetic stays honest. Both halves of the naming check read the joined
+    text, so the gate and its own diagnostic cannot disagree — the failure mode
+    round 11 removed a prefilter for.
+    """
+    joined = []
+    line_of = []
+    current = None
+    start = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = CONTINUATION.sub(' ', line)
+        if current is None:
+            current, start = stripped, number
+        else:
+            current += ' ' + stripped.lstrip()
+        if not CONTINUATION.search(line):
+            joined.append(current)
+            line_of.append(start)
+            current = None
+    if current is not None:
+        joined.append(current)
+        line_of.append(start)
+    return '\n'.join(joined), line_of
+
+
 def activation_lines(text, needed, enabled_by):
     """feature -> the first line naming ANYTHING that turns that feature on.
 
@@ -1283,11 +1359,17 @@ def activation_lines(text, needed, enabled_by):
     corpus writes `features = [` arrays across several lines with comments
     inside them, and a line-at-a-time reader sees neither end of one.
     """
+    joined, line_of = join_continuations(text)
     out = {}
     for feature in needed:
         for candidate in sorted(enabled_by.get(feature, {feature})):
-            line = first_naming_line(text, candidate)
-            if line is not None and (feature not in out or line < out[feature]):
+            line = first_naming_line(joined, candidate)
+            if line is None:
+                continue
+            # Back to the line the command starts on, so the number points into
+            # the file the reader has open rather than into the joined copy.
+            line = line_of[line - 1] if line - 1 < len(line_of) else line
+            if feature not in out or line < out[feature]:
                 out[feature] = line
     return out
 
@@ -1321,8 +1403,16 @@ GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
 # after `autumn_web::`) cannot see. `storage-variants.md:71` writes exactly
 # that, and the inner `variant::` is where the `variants` requirement lives, so
 # the line resolved to `storage` alone. Found by Codex review on #2800.
+#
+# The module path before the brace may be SEVERAL segments. `use
+# autumn_web::mail::suppression::{record_inbound, …}` is how
+# `skills/autumn-web/SKILL.md:1494` writes it, and a single-segment head
+# resolved the line to `mail` alone — which is a default-adjacent feature the
+# page already names, so the gated `record_inbound` inside vanished. Found by
+# Codex review on #2800, in the same round as the inline module it lives in.
 MODULE_GROUP_USE = re.compile(
-    r'\bautumn_web::([a-z_][a-z_0-9]*)::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
+    r'\bautumn_web::([a-z_][a-z_0-9]*(?:::[a-z_][a-z_0-9]*)*)'
+    r'::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
 MODULE_GROUP_ENTRY = re.compile(r'([a-z_][a-z_0-9]*)\s*::\s*\{|'
                                 r'^\s*([A-Za-z_][A-Za-z_0-9]*)')
 # The child segment takes UPPERCASE too. `use autumn_web::{openapi::Parameter};`
@@ -1604,11 +1694,16 @@ def uses(blanked, gated):
 
     for lineno, line in rust_fences(blanked):
         for match in MODULE_GROUP_USE.finditer(line):
-            head, inner = match.group(1), match.group(2)
-            # Each `child::{…}` inside the group is a second segment under the
+            # The head may be several module segments, so it is split before
+            # `resolve` sees it — `resolve` walks segment by segment, and a
+            # head handed over whole would never fall back past its own first
+            # segment.
+            head = match.group(1).split('::')
+            inner = match.group(2)
+            # Each `child::{…}` inside the group is a further segment under the
             # same head.
             for child in re.findall(r'([a-z_][a-z_0-9]*)\s*::\s*\{', inner):
-                entry, shown = resolve(head, child)
+                entry, shown = resolve(*head, child)
                 if entry:
                     for feature in sorted(entry[0]):
                         yield lineno, feature, shown
@@ -1628,11 +1723,11 @@ def uses(blanked, gated):
                 parts = [q.strip() for q in piece.split('::') if q.strip()]
                 if not parts:
                     continue
-                entry, shown = resolve(head, *parts[:MAX_MODULE_DEPTH])
+                entry, shown = resolve(*head, *parts[:MAX_MODULE_DEPTH])
                 if entry:
                     for feature in sorted(entry[0]):
                         yield lineno, feature, shown
-            entry, shown = resolve(head)
+            entry, shown = resolve(*head)
             if entry:
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
@@ -1738,10 +1833,24 @@ _SKIP_OPTS = rf'(?:(?:{_OPT_WITH_VALUE})(?:=\S+|\s+\S+)\s+|--?[a-z][-a-z0-9]*\s+
 # The lookbehinds must be separate because Python requires a FIXED width and
 # `(?:-p|--package)` has two.
 _PKG_SELECTOR = (r'(?:-p(?<![-\w]-p)|--package(?<![-\w]--package))\s*=?\s*')
-_FOREIGN_PKG = (
-    rf'[^\n]*(?:cargo\s+(?:install|add)\s+{_SKIP_OPTS}'
-    rf'(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*'
-    rf'|{_PKG_SELECTOR}(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*)')
+# The command must select autumn-web, not merely fail to select someone else.
+#
+# Rounds 10 and 17 tightened this from the other side — rejecting a command
+# that names a DIFFERENT package — which left `cargo build --features ws`,
+# selecting nothing, counting as an enabling line. It is not one: in an
+# application that activates the APPLICATION's `ws` feature, and a page can
+# show `ws = ["dep:tokio-stream"]`, that command and a `#[ws]` snippet while
+# the build it documents fails. Cargo's own help says as much — `--features`
+# is "features to activate" for the selected package. The absence of a
+# selector is not autumn-web; it is the local crate. Found by Codex review on
+# #2800.
+#
+# Written as a lookahead from the line start so the selector may sit on either
+# side of the flag: `cargo add autumn-web --features constela` and
+# `cargo test --features test-support -p autumn-web` are the same instruction.
+_AUTUMN_PKG = (
+    rf'[^\n]*(?:cargo\s+(?:install|add)\s+{_SKIP_OPTS}autumn[-_]web\b'
+    rf'|{_PKG_SELECTOR}autumn[-_]web\b)')
 # A TOML key is the WHOLE key. `autumn-web = { … }` unanchored also matched the
 # tail of `not-autumn-web = { … }`, so an unrelated dependency whose name merely
 # ends in `autumn-web` satisfied the rule that exists to tie the array to
@@ -1891,10 +2000,10 @@ def naming_patterns(feature):
         # expensive row in the tuple by an order of magnitude — 0.06s per pass
         # against 0.002s for a dependency table — and it runs once per (page,
         # feature) pair. A second copy of it cost the whole gate 20%.
-        rf'(?m)^(?:[^\n]*?\$\s*)?(?!{_FOREIGN_PKG})'
+        rf'(?m)^(?={_AUTUMN_PKG})(?:[^\n]*?\$\s*)?'
         rf'[^\n]*(?:--features[^\n]*(?:[",\s=]|^)'
         rf'|(?<![-\w])-F(?:[^\n]*(?:[",\s=]|^))?)'
-        rf'(?:autumn[-_]web/)?{name}(?:[",\s]|$)',
+        rf'{name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
         rf'\bfeatures?\b(?:\s+flag)?\s+`{name}`',
         # A `[features]` table row in the reader's OWN manifest counts only
@@ -1907,7 +2016,15 @@ def naming_patterns(feature):
 
 
 def names_feature(text, feature):
-    return any(re.search(pattern, text, re.M)
+    """Whether `text` tells a reader how to turn `feature` on.
+
+    Continuations are joined first, so the rule itself is stated over whole
+    commands. `activation_lines` joins once per page and searches the same
+    form, so the gate and its line report cannot disagree about what counts —
+    the drift that made round 11's prefilter worse than no prefilter.
+    """
+    joined, _ = join_continuations(text)
+    return any(re.search(pattern, joined, re.M)
                for pattern in naming_patterns(feature))
 
 
@@ -2425,7 +2542,7 @@ def self_test():
             '    "mail",  # email\n    "ws",\n] }',
             '[dependencies.autumn-web]\nversion = "0.7"\n'
             'features = ["ws"]\n',
-            'cargo build --features ws',
+            'cargo add autumn-web --features ws',
             'the `ws` feature',
             'the `ws` Cargo feature',
             'gated behind the feature `ws`',
@@ -2491,15 +2608,17 @@ def self_test():
             ('[dev-dependencies.autumn_web]\npackage = "autumn-web"\n'
              'features = ["ws"]\n', 'ws', True),
             ('[dev-dependencies.axum]\nfeatures = ["ws"]\n', 'ws', False),
-            ('cargo build -F ws', 'ws', True),
+            # An UNSELECTED command activates the local crate's feature, not
+            # autumn-web's — see `_AUTUMN_PKG`.
+            ('cargo build -F ws', 'ws', False),
+            ('cargo build -Fautumn-web/ws', 'ws', True),
             ('cargo test -p autumn-web -F test-support', 'test-support', True),
             ('cargo install diesel_cli -F postgres', 'postgres', False),
             ('cargo add axum -F ws', 'ws', False),
             ('some--Fws thing', 'ws', False),
             # `-F` takes its value attached as well as separated, and no
             # delimiter precedes the name in that spelling.
-            ('cargo build -Fws', 'ws', True),
-            ('cargo build -Fautumn-web/ws', 'ws', True),
+            ('cargo build -Fws', 'ws', False),
             ('cargo install diesel_cli -Fpostgres', 'postgres', False),
             # The dependency-qualified spelling, which the corpus itself
             # publishes at `docs/guide/tls.md:71` and `:334` as the fallback
@@ -2535,7 +2654,9 @@ def self_test():
             # The lookbehind that makes the attached form safe: the `-p` inside
             # `--profile` is not a package selector, and reading it as one would
             # reject a correct line.
-            ('cargo build --profile release --features ws', 'ws', True),
+            ('cargo build --profile release --features ws', 'ws', False),
+            ('cargo test -p autumn-web --profile release --features ws',
+             'ws', True),
             # A TOML key is the WHOLE key, not a suffix of one.
             ('not-autumn-web = { features = ["ws"] }', 'ws', False),
             ('xautumn-web = { version = "0.7", features = ["ws"] }',
@@ -2599,12 +2720,20 @@ def self_test():
             ('cargo test -p autumn-web --features test-support',
              'test-support', True),
             ('cargo add autumn-web --features constela', 'constela', True),
+            # `autumn build` forwards `--features` to cargo for the READER's
+            # app, so an unselected one activates the app's feature too.
             ('$ AUTUMN_ENV=production autumn build --embed --features acme',
-             'acme', True),
+             'acme', False),
             ('cargo run -p autumn-web --release --features sim-testing',
              'sim-testing', True),
-            ('cargo build --features ws', 'ws', True),
-            ('  --features "ws,mail,offline-sync" \\', 'ws', True),
+            ('cargo build --features ws', 'ws', False),
+            # A `\\`-continued command is ONE command: the selector on the
+            # first line covers the flag on the second. `CONTRIBUTING.md:355`
+            # and four report pages write exactly this.
+            ('cargo clippy -p autumn-web \\\n  --features "ws,mail" \\\n  -- -D warnings',
+             'ws', True),
+            ('cargo clippy -p other-crate \\\n  --features "ws,mail"',
+             'ws', False),
             ('cargo install diesel_cli --no-default-features '
              '--features postgres', 'postgres', False),
             ('cargo install diesel_cli --features ws', 'ws', False),
