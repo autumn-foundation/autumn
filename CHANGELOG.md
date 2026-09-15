@@ -133,7 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implication graph rather than subtracting the default closure alone:
   `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
   `presence_stream` snippet is complete, and demanding `ws` by name there would
-  be the gate telling an author to break a page that works. Judged
+  be the gate telling an author to break a page that works. A gated
+  `#[macro_export] macro_rules!` in the crate root is recorded too — reachable
+  as neither a module nor a `pub use`, so `embed_static!()` and
+  `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
+  group is read entry by entry, which ordinary use-tree syntax had slipped past.
+  Judged
   only inside ```` ```rust ```` fences, since a feature gate is a *compile*
   failure: a capability table naming `autumn_web::pdf::Pdf` describes an
   example, it does not hand anyone a line. Presence is gated, placement is not

@@ -175,12 +175,22 @@
 #     wide with names like `Format`, `Column`, `Link`, `Client`, `Patch`,
 #     `Lock`, `Story` and `Transport`. Matching those as words would report
 #     most of the guide. `check-docs-symbols.sh` draws the line in the same
-#     place and for the same reason.
-#   - Bang macros. `t!("key")` is the `i18n` feature's whole call surface, and
-#     `\bt!\(` is one character long: `assert!(`, `insert!(`, `expect!(` and
-#     `vec!(` all end in it, and requiring a word boundary still leaves a
-#     one-letter token this gate would have to be right about on 160 pages.
-#     Names first, and a one-letter name is not one.
+#     place and for the same reason. A name inside a `use autumn_web::{…}`
+#     GROUP is not a bare identifier and IS read — the group names the path, so
+#     nothing has to be inferred — including a nested `{pdf::Pdf}`. Single-line
+#     groups only: the corpus writes no multi-line one, and this reads a line at
+#     a time. Found by Codex review on #2800, over 16 grouped imports in the
+#     corpus's rust fences.
+#   - A ONE- OR TWO-LETTER bang macro. `t!("key")` is the `i18n` feature's whole
+#     call surface, and `\bt!\(` is one character long: `assert!(`, `insert!(`,
+#     `expect!(` and `vec!(` all end in it, and requiring a word boundary still
+#     leaves a one-letter token this gate would have to be right about on 160
+#     pages. Longer bang macros ARE read — `embed_static!()` and
+#     `embed_locales!()` are `#[macro_export] macro_rules!` declarations gated
+#     in the crate root, reachable no other way, and a fence calling only one of
+#     them passed until they were recorded (Codex review, #2800). The filter is
+#     membership in the set this gate read off a `macro_rules!` line, with a
+#     three-character floor so the `t!` case cannot come back by accident.
 #   - Anything past the SECOND path segment. One level down IS resolved, and has
 #     to be: a gate below an unconditional module is invisible from the head,
 #     and worst when the head is a DEFAULT feature —
@@ -484,6 +494,14 @@ USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
 # Found by Codex review on #2800. It is a module to a reader, so it is recorded
 # as one.
 USE_CRATE_AS = re.compile(r'^pub use ([a-z_0-9]+) as ([a-z_0-9]+);')
+# `#[cfg(all(feature = "embed-assets", feature = "i18n"))] #[macro_export]
+# macro_rules! embed_locales { … }` — a BANG macro, exported from the crate
+# root, and the only way to reach it is `autumn_web::embed_locales!()` or a
+# bare `embed_locales!()`. Neither the module nor the `pub use` patterns match a
+# `macro_rules!` line, so the pending gate was discarded and the macro was
+# absent from the surface: a fence calling only `embed_static!()` passed.
+# Found by Codex review on #2800.
+MACRO_RULES_DECL = re.compile(r'^macro_rules!\s+([a-z_][a-z_0-9]*)')
 # `pub use autumn_macros::foo;` is the only source of an ATTRIBUTE a reader
 # writes. Anything re-exported from a `crate::…` path is a type or a function,
 # reachable only as a path or (after a prelude glob) as a bare name.
@@ -621,6 +639,15 @@ def gated_items(root):
             if match:
                 if pending:
                     _record(found, match.group(1), pending, 'module')
+                pending = None
+                continue
+            match = MACRO_RULES_DECL.match(line)
+            if match:
+                name = match.group(1)
+                # `__autumn_register_fake_seeder` is plumbing the seed macro
+                # expands into, not a call any reader writes.
+                if pending and not name.startswith('__'):
+                    _record(found, name, pending, 'bang')
                 pending = None
                 continue
             match = USE_CRATE_AS.match(line)
@@ -895,6 +922,22 @@ RUST_LANGS = ('rust', 'rs')
 PATH_USE = re.compile(
     r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
 ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
+# `use autumn_web::{Mail, Mailer};` — ordinary use-tree syntax, and the corpus
+# writes 16 of them in rust fences. `PATH_USE` wants an identifier straight
+# after `::` and sees `{`, so every name in the group went unread. Found by
+# Codex review on #2800. Single-line groups only: the corpus writes no
+# multi-line one, and a line-at-a-time reader cannot see both ends of one.
+GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*)\}')
+GROUP_ENTRY = re.compile(
+    r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
+# A bang-macro call, `autumn_web::embed_static!()` or a bare `embed_static!()`.
+# The real filter is membership in the gated `bang` set — a name this gate read
+# off a `macro_rules!` declaration in the crate root — so the pattern only has
+# to be loose enough to reach it. The THREE-character floor is what keeps the
+# `t!` problem out by construction as well as by membership: `assert!(`,
+# `insert!(` and `vec!(` all end in `t!`/`c!`, and a one-letter macro name is
+# not one this gate can be right about across 212 pages.
+BANG_USE = re.compile(r'\b([a-z_][a-z_0-9]{2,})!')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
 BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
@@ -965,7 +1008,32 @@ def uses(blanked, gated):
     `ws` — the difference between a line they can find on the page and a name
     they have to go looking for.
     """
+    def resolve(head, child):
+        """The surface entry for `head::child`, else for `head`, else None."""
+        if child:
+            entry = gated.get(f'{head}::{child}')
+            if entry:
+                return entry, f'autumn_web::{head}::{child}'
+        entry = gated.get(head)
+        return (entry, f'autumn_web::{head}') if entry else (None, None)
+
     for lineno, line in rust_fences(blanked):
+        for match in GROUP_USE.finditer(line):
+            for piece in match.group(1).split(','):
+                entry_match = GROUP_ENTRY.match(piece)
+                if not entry_match:
+                    continue
+                entry, shown = resolve(entry_match.group(1),
+                                       entry_match.group(2))
+                if entry:
+                    for feature in sorted(entry[0]):
+                        yield lineno, feature, shown
+        for match in BANG_USE.finditer(line):
+            entry = gated.get(match.group(1))
+            if entry and 'bang' in entry[1]:
+                shown = f'{match.group(1)}!'
+                for feature in sorted(entry[0]):
+                    yield lineno, feature, shown
         for match in PATH_USE.finditer(line):
             head, child = match.group(1), match.group(2)
             # A SECOND segment is resolved first, because a gate one level down
@@ -1196,6 +1264,10 @@ def self_test():
         # One level down, under a DEFAULT parent — the case that is invisible
         # from the head segment alone.
         'db::sqlite_types': ({'sqlite'}, {'module'}),
+        # Items reachable only through a brace group, and a bang macro.
+        'Mail': ({'mail'}, {'item'}),
+        'Mailer': ({'mail'}, {'item'}),
+        'embed_static': ({'embed-assets'}, {'bang'}),
     }
 
     def found(text):
@@ -1226,6 +1298,36 @@ def self_test():
            found('```rust\n#[storage]\nstruct S;\n```\n'), [])
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
+
+    # Ordinary use-tree syntax. `PATH_USE` wants an identifier straight after
+    # `::` and sees `{`, so every name in a group went unread.
+    expect('grouped import read',
+           found('```rust\nuse autumn_web::{Mail, Mailer};\n```\n'),
+           [(2, 'mail', 'autumn_web::Mail'),
+            (2, 'mail', 'autumn_web::Mailer')])
+    expect('a nested entry inside a group resolves its own segment',
+           found('```rust\nuse autumn_web::{pdf::Pdf};\n```\n'),
+           [(2, 'pdf', 'autumn_web::pdf')])
+    expect('an ungated group reports nothing',
+           found('```rust\nuse autumn_web::{get, post};\n```\n'), [])
+    expect('a group outside a rust fence is not read',
+           found('`use autumn_web::{Mail, Mailer};`\n'), [])
+
+    # A bang macro exported from the crate root under a `#[cfg]`. The three-
+    # character floor keeps `t!` out by construction; membership in the `bang`
+    # set keeps everything else out.
+    expect('bang macro read, qualified',
+           found('```rust\nlet d = autumn_web::embed_static!();\n```\n'),
+           [(2, 'embed-assets', 'autumn_web::embed_static'),
+            (2, 'embed-assets', 'embed_static!')])
+    expect('bang macro read, bare',
+           found('```rust\nlet d = embed_static!();\n```\n'),
+           [(2, 'embed-assets', 'embed_static!')])
+    expect('a module name is not a bang macro',
+           found('```rust\nlet x = storage!();\n```\n'), [])
+    expect('an ordinary macro call is not reported',
+           found('```rust\nassert!(x);\nvec![1];\nprintln!("hi");\n```\n'),
+           [])
 
     # A fence inside a `>` callout is still a fence. Every line carries the
     # prefix — opener, code and closer — so a pattern anchored on whitespace
@@ -1378,6 +1480,22 @@ def self_test():
     expect('naming `ws` alone does not satisfy `presence`',
            activation_lines('features = ["ws"]\n', {'presence'},
                             enabled_by).get('presence'), None)
+
+    # Gated `macro_rules!` exports, against the real crate. Neither is reachable
+    # as a module or a `pub use`, so both were discarded before this.
+    for name, features in (('embed_static', {'embed-assets'}),
+                           ('embed_locales', {'embed-assets', 'i18n'})):
+        got = real.get(name)
+        if got is None or got[0] != features or 'bang' not in got[1]:
+            failures.append(
+                f'truth set: {name} -> {got!r}, want features {features!r} '
+                f'and kind bang')
+    # Crate-internal plumbing a seed macro expands into is not a call a reader
+    # writes.
+    if '__autumn_register_fake_seeder' in real:
+        failures.append(
+            'truth set: __autumn_register_fake_seeder is internal plumbing '
+            'and must not be reported as a macro a reader calls')
 
     # The nested pass descends into UNCONDITIONAL parents too. `pub mod data;`
     # carries no `#[cfg]`, so seeding from the gated set alone skipped it — and
