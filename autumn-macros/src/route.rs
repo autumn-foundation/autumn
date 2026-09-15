@@ -350,14 +350,29 @@ pub fn route_macro(
 /// echo-audit-run.md). Mirrors the same guard already in
 /// `agent_operable_macro` and `query_budget_macro` (see their "Keep the
 /// original tokens so a parse failure still emits the item" comments).
+///
+/// Two things this re-emission must not do (Codex review, PR #2798):
+///
+/// - Assume `item` parses as a bare function. A guard macro stacked *above*
+///   the malformed route attribute (`#[secured]`/`#[step_up]`/`#[throttle]`)
+///   already expanded by the time this runs, so `item` is really its gate
+///   struct/impl followed by the handler — `split_leading_items_and_fn`
+///   (the same helper the successful path uses) is what actually finds the
+///   function in that shape.
+/// - Re-emit `#[intercept(...)]` verbatim. It is a route-macro-only marker
+///   (`parse::extract_interceptors`), never registered as its own attribute
+///   macro, so left on the handler it would fail to resolve and add
+///   "cannot find attribute `intercept`" on top of the real diagnostic.
 fn emit_with_attr_parse_error(item: &TokenStream, err: &TokenStream) -> TokenStream {
-    let Ok(input_fn) = syn::parse2::<syn::ItemFn>(item.clone()) else {
+    let Ok((leading_items, mut input_fn)) = parse::split_leading_items_and_fn(item) else {
         return quote! { #item #err };
     };
+    parse::extract_interceptors(&mut input_fn.attrs);
     let vis = &input_fn.vis;
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{fn_name}");
     quote! {
+        #leading_items
         #input_fn
 
         #[doc(hidden)]
@@ -997,6 +1012,70 @@ mod tests {
             generated.contains("fn __autumn_route_info_index"),
             "the companion must survive the attribute error, or routes![index] \
              adds a second, confusing \"cannot find function\" error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_intercept_marker() {
+        // Codex review, PR #2798: `#[intercept(...)]` is a route-macro-only
+        // marker (`parse::extract_interceptors`), never its own registered
+        // attribute macro. Left on the re-emitted handler it fails to
+        // resolve, adding "cannot find attribute `intercept`" on top of the
+        // real diagnostic -- defeating the one-error promise this whole
+        // helper exists for.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[intercept(MyLayer)]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("intercept"),
+            "`#[intercept(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_survives_a_guard_expanded_above_it() {
+        // Codex review, PR #2798: `#[secured]` written above a malformed
+        // route attribute has already expanded into its gate struct/impl
+        // followed by the handler by the time route_macro runs -- `item`
+        // is that whole sequence, not a bare function. Regression test that
+        // `emit_with_attr_parse_error` uses `split_leading_items_and_fn`
+        // (the same helper the successful path relies on) rather than
+        // assuming a bare `ItemFn` and silently dropping to the "not a
+        // function" fallback, which would re-emit the gate item but never
+        // build the `__autumn_route_info_*` stub.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn create() -> &'static str { "ok" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! {}, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute above an expanded guard must still be a compile error: \
+             {generated}"
+        );
+        assert!(
+            generated.contains("fn create"),
+            "the handler must survive alongside the guard's gate item: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_create"),
+            "the companion must still be built even though `item` carries leading items: \
+             {generated}"
         );
     }
 
