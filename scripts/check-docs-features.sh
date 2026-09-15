@@ -182,13 +182,21 @@
 #     Requirements that are default (`maud`, `htmx`) are dropped rather than
 #     demanded, so an item behind default features alone — `live`, behind
 #     `all(htmx, maud)` — is not gated surface at all.
-#   - `#[cfg(any(…))]` and `#[cfg(not(…))]` leave the item UNGATED, which
-#     under-reports rather than over-reports: a page is never failed for a
-#     feature the gate guessed at. `any(…)` is satisfied by naming ONE
-#     alternative and this gate cannot tell which a page meant; `not(…)` marks
-#     an item that exists when the feature is OFF, so reading the name out of
-#     it would tell a reader to enable the one feature that removes the item.
-#     `lib.rs` has one, `#[cfg(not(feature = "seed"))]`.
+#   - `#[cfg(not(…))]` leaves the item UNGATED: it marks an item that exists
+#     when the feature is OFF, so reading the name out of it would tell a
+#     reader to enable the one feature that removes the item. `lib.rs` has one,
+#     `#[cfg(not(feature = "seed"))]`.
+#   - `#[cfg(any(…))]` is dropped too — naming ONE alternative satisfies it and
+#     this gate cannot tell which a page meant — with ONE resolved exception:
+#     `any(test, feature = "X")`, where every non-feature predicate is one that
+#     cannot hold in a reader's build. `cfg(test)` is set for the crate being
+#     compiled as a test and NEVER for its dependencies, so a reader writing a
+#     test against autumn-web does not get that branch and genuinely needs `X`.
+#     `autumn/src/metrics.rs:1991` gates `metrics::testing` exactly so, and
+#     `docs/guide/metrics.md:465` hands the reader
+#     `autumn_web::metrics::testing::unique_name`. Dropping the whole item hid
+#     a real requirement rather than avoiding a guess. Found by Codex review on
+#     #2800. A genuine `any(feature = "a", feature = "b")` is still dropped.
 #   - NAMING AN IMPLYING FEATURE COUNTS, because Cargo activates what a feature
 #     implies. `presence = ["ws"]`, so a page that writes
 #     `features = ["presence"]` beside a `presence_stream` snippet is correct
@@ -701,9 +709,32 @@ def _cfg_requirement(lines, index):
         if depth <= 0:
             break
     text = ' '.join(parts)
-    if 'not(' in text or 'any(' in text:
+    if 'not(' in text:
         return None, index
     names = CFG_FEATURE_NAME.findall(text)
+    if 'any(' in text:
+        # `#[cfg(any(test, feature = "test-support"))]` — the shape
+        # `autumn/src/metrics.rs:1991` uses for `metrics::testing`, which
+        # `docs/guide/metrics.md:465` hands the reader as
+        # `autumn_web::metrics::testing::unique_name`.
+        #
+        # `cfg(test)` is set for the crate being compiled as a test, NEVER for
+        # its dependencies — so a reader writing a test against autumn-web does
+        # not get that branch and genuinely needs `test-support`. Dropping the
+        # whole item (the old behaviour for every `any(`) therefore hid a real
+        # requirement rather than avoiding a guess. Found by Codex review on
+        # #2800.
+        #
+        # Only this shape is resolved: every non-feature predicate must be one
+        # that cannot hold in a reader's build, and exactly one feature may
+        # remain. A genuine `any(feature = "a", feature = "b")` is still
+        # dropped — naming either satisfies it and this gate cannot tell which
+        # the page meant, which is the original `any(` argument and still
+        # right.
+        others = re.findall(r'\b(test|doc|doctest|miri)\b', text)
+        if len(names) == 1 and others:
+            return {names[0]}, index
+        return None, index
     return (set(names) if names else None), index
 
 
@@ -1296,6 +1327,15 @@ def uses(blanked, gated):
                     yield lineno, feature, shown
 
 
+# A command line that selects some OTHER package: `cargo install <crate>`,
+# `-p <pkg>` or `--package <pkg>` naming anything but autumn-web. Used as a
+# negative lookahead so the `--features` flag on such a line is not read as
+# autumn-web's. `autumn-web` and `autumn_web` both spell the crate.
+_FOREIGN_PKG = (
+    r'[^\n]*(?:cargo\s+install\s+(?!autumn[-_]web\b)[a-z0-9_-]+'
+    r'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_-]+)')
+
+
 def naming_patterns(feature):
     """The spellings that tell a reader how to turn `feature` on.
 
@@ -1327,7 +1367,22 @@ def naming_patterns(feature):
         rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*"{name}"',
         rf'\[(?:[a-z-]+\.)*dependencies\.autumn-web\][^\[]*?'
         rf'features\s*=\s*\[[^\]]*"{name}"',
-        rf'--features[^\n]*(?:[",\s=]|^){name}(?:[",\s]|$)',
+        # A `--features` flag belongs to the package the COMMAND selects, and
+        # the corpus runs `cargo install diesel_cli --no-default-features
+        # --features postgres` three times. Round 9 tied dependency ARRAYS to
+        # autumn-web and left this alone, on the stated grounds that the flag
+        # "names the feature without claiming a crate" — which is wrong: that
+        # is exactly what `cargo install <crate>` and `-p <pkg>` do. Found by
+        # Codex review on #2800, one round after the array fix it belonged
+        # with.
+        #
+        # The command counts unless it explicitly selects a package that is not
+        # autumn-web. `cargo test -p autumn-web --features test-support`,
+        # `cargo add autumn-web --features constela` and `autumn build
+        # --features acme` (the framework's own CLI, building the reader's app)
+        # all count; `cargo install diesel_cli --features postgres` does not.
+        rf'(?m)^(?:[^\n]*?\$\s*)?(?!{_FOREIGN_PKG})'
+        rf'[^\n]*--features[^\n]*(?:[",\s=]|^){name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
         rf'\bfeatures?\b(?:\s+flag)?\s+`{name}`',
         rf'^\s*{name}\s*=\s*\[',
@@ -1565,6 +1620,17 @@ def self_test():
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
 
+    # `cfg(any(test, feature = "X"))`: `cfg(test)` is set for the crate being
+    # tested, never for its dependencies, so a reader genuinely needs `X`.
+    expect('any(test, feature) yields the feature',
+           _cfg_requirement(
+               ['#[cfg(any(test, feature = "test-support"))]'], 0)[0],
+           {'test-support'})
+    expect('a genuine feature disjunction is still dropped',
+           _cfg_requirement(
+               ['#[cfg(any(feature = "a", feature = "b"))]'], 0)[0], None)
+    expect('any() with no feature at all yields nothing',
+           _cfg_requirement(['#[cfg(any(test, doc))]'], 0)[0], None)
     # `\bt!` matches none of these, which is why the length floor came off.
     expect('a one-letter bang macro does not match other macros',
            found('```rust\nassert!(x);\ninsert!(y);\nvec![1];\n```\n'), [])
@@ -1736,6 +1802,32 @@ def self_test():
            False)
     expect('a bare features array with no crate does not satisfy it either',
            names_feature('features = ["ws"]', 'ws'), False)
+
+    # A `--features` flag belongs to the package the command SELECTS. Every
+    # accepting row here is a real corpus line; every rejecting one is a shape
+    # the corpus writes (`cargo install diesel_cli …` appears three times) or
+    # the obvious way to fake it.
+    for command, feature, want in (
+            ('cargo test -p autumn-web --features test-support',
+             'test-support', True),
+            ('cargo add autumn-web --features constela', 'constela', True),
+            ('$ AUTUMN_ENV=production autumn build --embed --features acme',
+             'acme', True),
+            ('cargo run -p autumn-web --release --features sim-testing',
+             'sim-testing', True),
+            ('cargo build --features ws', 'ws', True),
+            ('  --features "ws,mail,offline-sync" \\', 'ws', True),
+            ('cargo install diesel_cli --no-default-features '
+             '--features postgres', 'postgres', False),
+            ('cargo install diesel_cli --features ws', 'ws', False),
+            ('cargo test -p some-other-crate --features ws', 'ws', False),
+            ('cargo build --package other --features mail', 'mail', False),
+            # autumn-cli is a different package from autumn-web.
+            ('cargo install autumn-cli --features ws', 'ws', False)):
+        if names_feature(command, feature) != want:
+            failures.append(
+                f'--features scope: {command!r} / {feature} -> '
+                f'{names_feature(command, feature)}, want {want}')
     expect('a comment naming the feature does not count',
            names_feature(blank_comments('<!-- features = ["ws"] -->'), 'ws'),
            False)
@@ -1852,6 +1944,14 @@ def self_test():
         failures.append(
             'truth set: __autumn_register_fake_seeder is internal plumbing '
             'and must not be reported as a macro a reader calls')
+
+    # `metrics::testing` is `#[cfg(any(test, feature = "test-support"))]`, and
+    # `docs/guide/metrics.md:465` hands it to the reader.
+    got = real.get('metrics::testing')
+    if got is None or got[0] != {'test-support'}:
+        failures.append(
+            f'truth set: metrics::testing -> {got!r}, want features '
+            f'{{\'test-support\'}} — `any(test, feature = …)`')
 
     # Gated public ITEMS one level down, not just gated `pub mod` children.
     # `openapi` the module is unconditional; `openapi::Parameter` is gated, and

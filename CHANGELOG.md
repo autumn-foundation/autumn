@@ -139,7 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
   group is read entry by entry, which ordinary use-tree syntax had slipped past.
   Judged
-  A `features = […]` array only counts when it is tied to an `autumn-web`
+  `#[cfg(any(test, feature = "X"))]` resolves to `X`, since `cfg(test)` never
+  holds for a dependency — a reader testing against autumn-web needs the
+  feature. A `--features` flag counts only when the command does not select
+  another package (`cargo install diesel_cli --features postgres` does not),
+  and a `features = […]` array only counts when it is tied to an `autumn-web`
   dependency: unqualified, any crate's array satisfied the gate, and the corpus
   carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
   enables axum's websockets and nothing of autumn-web's.
