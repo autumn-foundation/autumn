@@ -119,6 +119,14 @@ before — but each also widens a Rust type that user code can name.
 Three types moved. You are affected only if your code constructs or matches one
 of them exhaustively; none of them changes meaning.
 
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
 **Before (`{X.Y}`):**
 
 ```rust
@@ -243,7 +251,10 @@ the generated spec names that encoding instead of staying silent about it
 
 Only code that constructs a `Parameter` *by struct literal*, outside this
 crate, has to change. Every route macro and the OpenAPI generator itself
-already build one field at a time and are unaffected.
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
 
 **Before (`{X.Y}`):**
 

@@ -127,6 +127,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scripts/check-docs-features.sh` — feature-gate documentation gate
+  [no-plugin].** Every reader-facing page that shows Rust reaching for an
+  `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature
+  on the page. Every docs gate before it read the corpus against a crate built
+  with every feature on, and `check-docs-symbols.sh` says
+  so deliberately: resolving against the default set "would report an item a
+  reader can absolutely use as missing". That reasoning is right, and it leaves
+  a hole the shape of its own premise — proving `autumn_web::pdf::Pdf` EXISTS
+  is not the reader's question. Theirs is whether it exists in *their* build,
+  and `autumn-web`'s default set is eight features (`maud`, `htmx`, `tailwind`,
+  `db`, `cache-moka`, `http-client`, `reporting`, `flash`) out of fifty. So a
+  page could open on `use autumn_web::pdf::Pdf;` with every path resolving,
+  every macro argument valid, every link live — and the reader who pastes it
+  into the project the quickstart just scaffolded gets `error[E0433]: failed to
+  resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
+  whose fix is a line in a file the page never showed them. Baseline: 78 gated
+  uses checked, **17 defects across 13 pages**. Three sat under a literal
+  "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
+  `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
+  read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
+  the missing line — "requires the `maud` feature; enabled together with `pdf`
+  in the quick start above", where the quick start above carried no
+  `Cargo.toml` at all. The tenth — `docs/guide/jobs.md:824`, a
+  `use autumn_web::data::csv::export_csv;` in the async-CSV-export walkthrough,
+  on a page that never names `csv` — is reachable only once a second path
+  segment is resolved: `pub mod data;` is unconditional, so the gate that reads
+  only the head segment drops the path entirely. All ten are fixed in the same
+  commit. Truth set is
+  parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs` and
+  `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
+  snapshot — so moving an item behind a new feature moves the gate in the same
+  commit; only column-zero declarations count, which keeps `lib.rs`'s five
+  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. A
+  `#[cfg(all(…))]` conjunction requires every conjunct, so each non-default one
+  is reported separately and `autumn_web::presence_stream` asks for `presence`
+  *and* `ws`; the attribute is read by parenthesis balance, since that item's
+  gate wraps across four lines, and `pub use autumn_edge as edge;` is read as
+  the module it is to a reader despite carrying no `::`. `any(…)` and `not(…)`
+  leave an item ungated — naming one alternative already satisfies the first,
+  and the second marks an item that exists when the feature is *off*, so
+  demanding it would tell a reader to enable the one flag that removes what
+  they came for. One level BELOW the crate root is resolved too, because a gate
+  under an unconditional module is invisible from the head segment and worst
+  when the head is default — `autumn_web::db::sqlite_types` needs `sqlite`
+  while `db` is on by default — and a fence inside a `>` callout is read like
+  any other. Naming an *implying* feature counts, walking the manifest's
+  implication graph rather than subtracting the default closure alone:
+  `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
+  `presence_stream` snippet is complete, and demanding `ws` by name there would
+  be the gate telling an author to break a page that works. A gated
+  `#[macro_export] macro_rules!` in the crate root is recorded too — reachable
+  as neither a module nor a `pub use`, so `embed_static!()` and
+  `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
+  group is read entry by entry, which ordinary use-tree syntax had slipped past.
+  Judged
+  A declaration also made with no feature requirement — a complementary
+  `not(…)` arm — removes its gated siblings in the same namespace, so
+  `db::RuntimeConnection` is not reported as needing `sqlite` when it exists in
+  a default build; per namespace, since `edge` is an ungated attribute macro
+  *and* a gated module re-export.
+  `#[cfg(any(test, feature = "X"))]` resolves to `X`, since `cfg(test)` never
+  holds for a dependency — a reader testing against autumn-web needs the
+  feature. A `--features` flag counts only when the command does not select
+  another package (`cargo install diesel_cli --features postgres` does not),
+  a local `[features]` row counts only when it forwards
+  (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
+  is tied to an `autumn-web` dependency — in either TOML string form, and
+  including the `autumn_web = { package = "autumn-web", … }` rename Cargo
+  requires when the table key uses an underscore, and in a `dev-`/`build-`
+  dependency table as readily as a plain one; `-F` counts as `--features`: unqualified, any crate's array satisfied the gate, and the corpus
+  carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
+  enables axum's websockets and nothing of autumn-web's.
+  One level below the root resolves both gated MODULES and gated ITEMS, since
+  `pub mod openapi;` carries no `#[cfg]` while `openapi::Parameter` does.
+  Which macros are attributes and which are bang calls is read from
+  `autumn-macros`'s own `#[proc_macro]`/`#[proc_macro_attribute]` lines rather
+  than listed by hand, so `t!`, `mail_previews![…]` and `wire_client!` are
+  judged as the bang macros they are; a group hanging off a module segment
+  (`storage::{variant::{Transform}}`) resolves its inner child.
+  A bare type name is read inside a fence that writes
+  `use autumn_web::prelude::*;` — scoped to that glob and to names starting
+  uppercase — which is how four further defects surfaced, among them
+  `docs/guide/presence.md` telling readers to enable `ws` when the feature is
+  `presence` (`presence = ["ws"]` runs one way only, so an app on `ws` alone has
+  no `Presence` extractor at all). Judged
+  only inside ```` ```rust ```` fences, since a feature gate is a *compile*
+  failure: a capability table naming `autumn_web::pdf::Pdf` describes an
+  example, it does not hand anyone a line. Presence is gated, placement is not
+  — three pages name the feature only after the code that needs it (worst:
+  `tauri-mobile-offline-sync.md`, +221 lines) and that count is printed on
+  every run rather than enforced, because a page whose enabling line sits in a
+  later "Prerequisites" section is a legitimate shape. A construct a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- feature-gate-allow: … — reason -->` marker; the baseline needed none.
+  Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit rather
+  than after its corpus had a chance to drift, for the reason #2709 exists.
+
 - **The docs symbol gate now covers every published crate, and rejects a path
   into a crate with no library target:** `scripts/check-docs-symbols.sh`
   scanned one prefix, `autumn_web::`, though it already modelled
