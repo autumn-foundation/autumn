@@ -4230,16 +4230,20 @@ pub async fn logout(
     let _ = untrack_current_session(&mut db, &session).await;
     // Revoke this device's remember chain (issue #1397) so a stolen remember
     // cookie cannot re-establish a login after logout. No-op when absent.
-    // Propagate a delete failure instead of reporting a successful logout:
-    // the chain is a long-lived bearer credential and would still work.
-    revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await?;
+    // Hold the result rather than propagating it here: the session below is
+    // the primary credential and must be invalidated even if this failed.
+    let revoke_result = revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
     // Invalidate the session: clear all data (drops the auth keys) and rotate
     // the id so the pre-logout cookie can no longer be replayed — the old id is
     // destroyed in the session store on save. This is equivalent to `destroy()`
     // for replay safety while letting a one-shot logout notice ride the freshly
-    // rotated session through to the login page.
+    // rotated session through to the login page. Unconditional: it must not
+    // be skipped by a remember-chain delete failure propagated below.
     session.clear().await;
     session.rotate_id().await;
+    // Now fail the logout if the remember chain survived: it is a long-lived
+    // bearer credential and reporting success would be false.
+    revoke_result?;
     flash.info("You have been logged out.").await;
     let mut response = redirect_to("/login");
     append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
@@ -13378,10 +13382,62 @@ mod tests {
         let logout_body = &after[..next_fn];
         assert!(
             logout_body
-                .contains("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await?"),
-            "logout must propagate a remember-chain revocation failure with `?`, \
-             not discard it: {logout_body}"
+                .contains("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await"),
+            "logout must call revoke_remember_from_cookie and keep its result \
+             to propagate later, not discard it: {logout_body}"
         );
+    }
+
+    /// #2152 follow-up: the session is the primary credential, so logout must
+    /// invalidate it (`clear` + `rotate_id`) even when the remember-chain
+    /// delete fails. Propagating that failure with `?` BEFORE invalidating
+    /// the session would let a transient DB error on the remember-chain
+    /// delete leave the pre-logout session cookie live — worse than the bug
+    /// this was meant to fix, since the session is more sensitive than the
+    /// remember cookie.
+    #[test]
+    fn logout_invalidates_session_before_propagating_remember_chain_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        let revoke_call_at = logout_body
+            .find("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await")
+            .expect("logout must call revoke_remember_from_cookie");
+        assert!(
+            !logout_body[revoke_call_at..]
+                .starts_with("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await?"),
+            "the revoke call must not short-circuit the handler with `?` \
+             directly — that skips session invalidation on failure: {logout_body}"
+        );
+
+        let clear_at = logout_body
+            .find("session.clear()")
+            .expect("logout must clear the session");
+        let rotate_at = logout_body
+            .find("session.rotate_id()")
+            .expect("logout must rotate the session id");
+        assert!(
+            clear_at > revoke_call_at && rotate_at > revoke_call_at,
+            "logout must invalidate the session after calling \
+             revoke_remember_from_cookie: {logout_body}"
+        );
+
+        let propagate_at = logout_body.rfind('?').filter(|&p| p > rotate_at).expect(
+            "logout must propagate the remember-chain revocation result \
+                 with `?` AFTER the session is invalidated",
+        );
+        assert!(propagate_at > clear_at && propagate_at > rotate_at);
     }
 
     #[test]
