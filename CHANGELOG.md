@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the project the quickstart just scaffolded gets `error[E0433]: failed to
   resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
   whose fix is a line in a file the page never showed them. Baseline: 78 gated
-  uses checked, **15 defects across 12 pages**. Three sat under a literal
+  uses checked, **17 defects across 13 pages**. Three sat under a literal
   "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
   `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
   read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
@@ -139,6 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
   group is read entry by entry, which ordinary use-tree syntax had slipped past.
   Judged
+  One level below the root resolves both gated MODULES and gated ITEMS, since
+  `pub mod openapi;` carries no `#[cfg]` while `openapi::Parameter` does.
   Which macros are attributes and which are bang calls is read from
   `autumn-macros`'s own `#[proc_macro]`/`#[proc_macro_attribute]` lines rather
   than listed by hand, so `t!`, `mail_previews![…]` and `wire_client!` are

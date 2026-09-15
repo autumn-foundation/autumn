@@ -56,9 +56,9 @@
 # "requires the `maud` feature; enabled together with `pdf` in the quick start
 # above" — where the quick start above contains no `Cargo.toml` at all.
 #
-# THE BASELINE RUN found fifteen such page/feature pairs across twelve pages,
-# out of 137 gated uses in the corpus. Nine were visible from the first version
-# of the extractor:
+# THE BASELINE RUN found seventeen such page/feature pairs across thirteen
+# pages, out of 149 gated uses in the corpus. Nine were visible from the first
+# version of the extractor:
 #
 #   docs/guide/cloud-native.md:929        `#[ws]`                  -> ws
 #   docs/guide/daemon.md:194              `autumn_web::managed_pg` -> managed-pg
@@ -84,6 +84,11 @@
 # and a fifteenth once `t!` was read:
 #
 #   docs/guide/macro-transparency.md:1727 `t!`                     -> i18n
+#
+# and two more once a gated ITEM under an ungated module was read:
+#
+#   docs/guide/generators.md:871          `sse::stream`            -> ws
+#   docs/migrations/next.md:259           `openapi::Parameter`     -> openapi
 #
 # `presence.md` is the one to read twice. It was not missing the feature name —
 # it gave the WRONG one, pinning `features = ["ws"]` and saying the extractor
@@ -228,18 +233,20 @@
 #     `docs/guide/macro-transparency.md:1727` offers `t!(locale, …)` under a
 #     "**You write:**" heading on a page that names `i18n` nowhere. Found by
 #     Codex review on #2800.)
-#   - Anything past the SECOND path segment. One level down IS resolved, and has
-#     to be: a gate below an unconditional module is invisible from the head,
-#     and worst when the head is a DEFAULT feature —
-#     `autumn_web::db::sqlite_types` needs `sqlite` while `db` is on by default,
-#     so reading only the head dropped the whole path out of the surface and the
-#     gate vouched for a line that does not build. `storage::variant`
-#     (`variants`) is the same shape with a non-default parent. Found by Codex
-#     review on #2800; surface 61 -> 65, checked uses 78 -> 83, no live defect.
-#     Only `pub mod` counts — 11 of the 40 gated child modules are a private
-#     `mod tests`, which is not a path any reader can write. A THIRD segment is
-#     an item inside a module; resolving it needs type resolution, which is
-#     where `check-docs-symbols.sh` stops and where this stops too.
+#   - Anything past the SECOND path segment. One level down IS resolved, for
+#     both MODULES and ITEMS, and has to be: a gate below an unconditional
+#     module is invisible from the head, and worst when the head is a DEFAULT
+#     feature or no feature at all. `autumn_web::db::sqlite_types` needs
+#     `sqlite` while `db` is on by default; `autumn_web::openapi::Parameter`
+#     needs `openapi` while `pub mod openapi;` carries no `#[cfg]` at all, so
+#     the path resolved to nothing and the gate vouched for it
+#     (`docs/migrations/next.md:259`, a live defect; `sse::stream` under `ws`
+#     was a second). Both found by Codex review on #2800; surface 71 -> 197,
+#     checked uses 137 -> 149. For modules only `pub mod` counts — 11 of the 40
+#     gated child modules are a private `mod tests`, which is not a path any
+#     reader can write. A THIRD segment is an item inside a module inside a
+#     module; resolving it needs type resolution, which is where
+#     `check-docs-symbols.sh` stops and where this stops too.
 #   - Non-`rust` fences and prose. A feature gate is a COMPILE failure, so the
 #     only place it can bite is a block a reader compiles. `autumn_web::pdf::Pdf`
 #     in a README's capability table is a description of the example, not a
@@ -520,6 +527,13 @@ MOD_DECL = re.compile(r'^(?:pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
 # Strictly `pub`, for the nested pass: a `pub(crate)` or private `mod tests`
 # gated by a feature is not a path a reader can write.
 PUB_MOD_DECL = re.compile(r'^pub mod ([a-z_0-9]+)\s*[;{]')
+# A public item declared or re-exported at column zero INSIDE a root module.
+# `pub mod openapi;` is unconditional; `openapi::Parameter` is not.
+PUB_ITEM_DECL = re.compile(
+    r'^pub (?:struct|enum|trait|fn|async fn|type|const|static) '
+    r'([A-Za-z_][A-Za-z_0-9]*)')
+PUB_USE_ONE_LINE = re.compile(r'^pub use [A-Za-z_0-9:]+::\{?([^;{}]+?)\}?;')
+PUB_USE_BRACE_OPEN = re.compile(r'^pub use [A-Za-z_0-9:]+::\{$')
 USE_ONE_LINE = re.compile(r'^pub use ([a-z_0-9:]+)::\{?([^;{}]+?)\}?;')
 USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
 # A whole CRATE re-exported under a new name, with no `::` anywhere:
@@ -910,6 +924,40 @@ def nested_modules(root, parents):
                         set(parent_features) | pending, {'module'})
                 pending = None
                 continue
+            # A gated public ITEM inside an ungated module is the same hole one
+            # rung down: `pub mod openapi;` is unconditional while
+            # `openapi::Parameter` is `#[cfg(feature = "openapi")]`, so a page
+            # writing `use autumn_web::openapi::Parameter;` resolved to nothing
+            # and the gate vouched for it. `docs/migrations/next.md:259` did
+            # exactly that. Found by Codex review on #2800.
+            match = PUB_ITEM_DECL.match(line)
+            if match:
+                if pending:
+                    out[f'{name}::{match.group(1)}'] = (
+                        set(parent_features) | pending, {'item'})
+                pending = None
+                continue
+            match = PUB_USE_ONE_LINE.match(line)
+            if match:
+                if pending:
+                    for item in _names(match.group(1)):
+                        out[f'{name}::{item}'] = (
+                            set(parent_features) | pending, {'item'})
+                pending = None
+                continue
+            match = PUB_USE_BRACE_OPEN.match(line)
+            if match:
+                inner = []
+                while index < len(lines) and not lines[index].startswith('};'):
+                    inner.append(lines[index])
+                    index += 1
+                index += 1
+                if pending:
+                    for item in _names('\n'.join(inner)):
+                        out[f'{name}::{item}'] = (
+                            set(parent_features) | pending, {'item'})
+                pending = None
+                continue
             pending = None
     return out
 
@@ -1007,7 +1055,8 @@ FENCE = re.compile(r'^\s*```([A-Za-z0-9_+-]*)')
 # corpus; an info string carries the language up to the first comma or space.
 RUST_LANGS = ('rust', 'rs')
 PATH_USE = re.compile(
-    r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
+    r'\bautumn_web::([A-Za-z_][A-Za-z_0-9]*)'
+    r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
 ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
 # `use autumn_web::{Mail, Mailer};` — ordinary use-tree syntax, and the corpus
 # writes 16 of them in rust fences. `PATH_USE` wants an identifier straight
@@ -1431,6 +1480,8 @@ def self_test():
         'db::sqlite_types': ({'sqlite'}, {'module'}),
         # A nested module whose requirements include the parent's.
         'storage::variant': ({'storage', 'variants'}, {'module'}),
+        # A gated ITEM inside an UNCONDITIONAL module — the openapi case.
+        'openapi::Parameter': ({'openapi'}, {'item'}),
         # Items reachable only through a brace group, and a bang macro.
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
@@ -1477,6 +1528,14 @@ def self_test():
     expect('...but does match its own call',
            found('```rust\nlet s = t!(locale, "welcome.title");\n```\n'),
            [(2, 'i18n', 't!')])
+
+    # An uppercase second segment names an item, not a module, and resolves the
+    # same way. `pub mod openapi;` is unconditional; `Parameter` is not.
+    expect('a gated item under an ungated module is read',
+           found('```rust\nuse autumn_web::openapi::Parameter;\n```\n'),
+           [(2, 'openapi', 'autumn_web::openapi::Parameter')])
+    expect('an ungated item under the same module reports nothing',
+           found('```rust\nuse autumn_web::openapi::ApiDoc;\n```\n'), [])
 
     # A group hanging off a MODULE segment, not off `autumn_web::` itself.
     expect('a group after a module segment resolves the inner child',
@@ -1716,6 +1775,16 @@ def self_test():
         failures.append(
             'truth set: __autumn_register_fake_seeder is internal plumbing '
             'and must not be reported as a macro a reader calls')
+
+    # Gated public ITEMS one level down, not just gated `pub mod` children.
+    # `openapi` the module is unconditional; `openapi::Parameter` is gated, and
+    # `docs/migrations/next.md:259` imported it on a page naming no feature.
+    for name, features in (('openapi::Parameter', {'openapi'}),
+                           ('sse::stream', {'ws'})):
+        got = real.get(name)
+        if got is None or got[0] != features:
+            failures.append(
+                f'truth set: {name} -> {got!r}, want features {features!r}')
 
     # The nested pass descends into UNCONDITIONAL parents too. `pub mod data;`
     # carries no `#[cfg]`, so seeding from the gated set alone skipped it — and

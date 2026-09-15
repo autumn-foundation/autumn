@@ -251,7 +251,10 @@ the generated spec names that encoding instead of staying silent about it
 
 Only code that constructs a `Parameter` *by struct literal*, outside this
 crate, has to change. Every route macro and the OpenAPI generator itself
-already build one field at a time and are unaffected.
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
 
 **Before (`{X.Y}`):**
 
