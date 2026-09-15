@@ -33,7 +33,7 @@ pub fn route_macro(
 ) -> TokenStream {
     let route_args = match parse::parse_route_attr(attr) {
         Ok(a) => a,
-        Err(err) => return err,
+        Err(err) => return emit_with_attr_parse_error(&item, &err),
     };
     let path = route_args.path.clone();
 
@@ -332,6 +332,40 @@ pub fn route_macro(
         #fn_name_alias
 
         #edge_companion
+    }
+}
+
+/// When the `#[get("/path")]`-style attribute itself fails to parse (an empty
+/// literal, a missing leading slash, a dropped string literal entirely —
+/// `#[get()]`), still emit the handler and a stub `__autumn_route_info_*`
+/// companion alongside the `compile_error!`, instead of only the
+/// `compile_error!`.
+///
+/// Without this, the handler silently disappears from the module (the early
+/// `return err` this replaces never re-emits `item`), so `routes![handler]` —
+/// the README's documented way to register every handler — can't find
+/// `handler`, and can't find its `__autumn_route_info_handler` companion
+/// either: two more "cannot find" errors on top of the real one, the second
+/// naming an internal macro symbol no user ever typed (docs/reports/
+/// echo-audit-run.md). Mirrors the same guard already in
+/// `agent_operable_macro` and `query_budget_macro` (see their "Keep the
+/// original tokens so a parse failure still emits the item" comments).
+fn emit_with_attr_parse_error(item: &TokenStream, err: &TokenStream) -> TokenStream {
+    let Ok(input_fn) = syn::parse2::<syn::ItemFn>(item.clone()) else {
+        return quote! { #item #err };
+    };
+    let vis = &input_fn.vis;
+    let fn_name = &input_fn.sig.ident;
+    let route_info_name = format_ident!("__autumn_route_info_{fn_name}");
+    quote! {
+        #input_fn
+
+        #[doc(hidden)]
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            unreachable!()
+        }
+
+        #err
     }
 }
 
@@ -929,6 +963,40 @@ mod tests {
         assert_eq!(
             positional_format_string("/{{literal}}/{id}"),
             "/{{literal}}/{}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_still_emits_handler_and_companion() {
+        // `#[get()]` -- a dropped path literal. Regression test for the
+        // cascade in `route_attr_error_cascades_through_routes.rs`: without
+        // re-emitting `index` and a stub `__autumn_route_info_index`, this
+        // handler vanishes from the module and `routes![index]` piles on two
+        // more "cannot find" errors, the second naming an internal macro
+        // symbol (docs/reports/echo-audit-run.md).
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute must still be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("fn index"),
+            "the handler must survive the attribute error, or routes![index] \
+             cannot find `index`: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_index"),
+            "the companion must survive the attribute error, or routes![index] \
+             adds a second, confusing \"cannot find function\" error: {generated}"
         );
     }
 

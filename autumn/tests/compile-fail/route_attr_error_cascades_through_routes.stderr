@@ -5,15 +5,3 @@ error: unexpected end of input, expected string literal
   | ^^^^^^^^
   |
   = note: this error originates in the attribute macro `get` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error[E0425]: cannot find value `index` in this scope
- --> tests/compile-fail/route_attr_error_cascades_through_routes.rs:9:21
-  |
-9 |     let _ = routes![index];
-  |                     ^^^^^ not found in this scope
-
-error[E0425]: cannot find function `__autumn_route_info_index` in this scope
- --> tests/compile-fail/route_attr_error_cascades_through_routes.rs:9:21
-  |
-9 |     let _ = routes![index];
-  |                     ^^^^^ not found in this scope
