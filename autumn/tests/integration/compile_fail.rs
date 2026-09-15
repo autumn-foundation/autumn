@@ -16,6 +16,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_async_main.rs");
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
+    t.compile_fail("tests/compile-fail/route_attr_error_cascades_through_routes.rs");
 
     // An attribute matching #[authorize]'s argument grammar under a
     // different name is refused rather than guessed at, whether it's really
