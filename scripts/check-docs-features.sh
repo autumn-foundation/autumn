@@ -182,10 +182,14 @@
 #     Requirements that are default (`maud`, `htmx`) are dropped rather than
 #     demanded, so an item behind default features alone — `live`, behind
 #     `all(htmx, maud)` — is not gated surface at all.
-#   - `#[cfg(not(…))]` leaves the item UNGATED: it marks an item that exists
-#     when the feature is OFF, so reading the name out of it would tell a
-#     reader to enable the one feature that removes the item. `lib.rs` has one,
-#     `#[cfg(not(feature = "seed"))]`.
+#   - A `#[cfg(not(…))]` predicate is a build CONSTRAINT, not a requirement, so
+#     it contributes no feature name — reading one out would tell a reader to
+#     enable the very feature that removes the item (`lib.rs` has
+#     `#[cfg(not(feature = "seed"))]`). It does NOT cancel the positive
+#     conjuncts beside it, though: `capsule::build_recording_pool` is
+#     `all(feature = "test-support", feature = "db", not(feature = "sqlite"))`
+#     and still needs `test-support` in an ordinary default build. Dropping the
+#     whole gate on sight of a `not(` hid that. Found by Codex review on #2800.
 #   - A declaration made at least once with NO feature requirement removes its
 #     gated siblings in the same namespace. `autumn/src/db.rs` defines
 #     `RuntimeConnection` under both `not(feature = "sqlite")` and
@@ -678,6 +682,30 @@ def proc_macro_kinds(root):
     return out
 
 
+def _strip_not(text):
+    """Remove every balanced `not( … )` subexpression from a cfg predicate."""
+    out = []
+    index = 0
+    while True:
+        found = text.find('not(', index)
+        if found < 0:
+            out.append(text[index:])
+            return ''.join(out)
+        out.append(text[index:found])
+        depth = 0
+        cursor = found + 3
+        while cursor < len(text):
+            if text[cursor] == '(':
+                depth += 1
+            elif text[cursor] == ')':
+                depth -= 1
+                if depth == 0:
+                    cursor += 1
+                    break
+            cursor += 1
+        index = cursor
+
+
 def _cfg_requirement(lines, index):
     """Read one column-zero `#[cfg(…)]` and return (required_features, next_i).
 
@@ -721,7 +749,24 @@ def _cfg_requirement(lines, index):
             break
     text = ' '.join(parts)
     if 'not(' in text:
-        return None, index
+        # A `not(…)` predicate is a build CONSTRAINT, not a requirement — but
+        # it does not cancel the positive conjuncts beside it.
+        # `autumn/src/capsule/mod.rs:71` gates `build_recording_pool` on
+        # `all(feature = "test-support", feature = "db", not(feature =
+        # "sqlite"))`, and in an ordinary default (non-SQLite) build that item
+        # still needs `test-support`. Dropping the whole gate the moment a
+        # `not(` appeared hid that. Found by Codex review on #2800.
+        #
+        # The negative subexpressions are removed and whatever positive
+        # features remain are required. A gate that is ONLY `not(…)` —
+        # `#[cfg(not(feature = "seed"))]` in `lib.rs` — leaves nothing, which
+        # is the right answer: it marks an item that exists when the feature is
+        # off, so there is no feature to name.
+        stripped = _strip_not(text)
+        if 'any(' in stripped:
+            return None, index
+        names = CFG_FEATURE_NAME.findall(stripped)
+        return (set(names) if names else None), index
     names = CFG_FEATURE_NAME.findall(text)
     if 'any(' in text:
         # `#[cfg(any(test, feature = "test-support"))]` — the shape
@@ -1213,8 +1258,14 @@ MODULE_GROUP_USE = re.compile(
     r'\bautumn_web::([a-z_][a-z_0-9]*)::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
 MODULE_GROUP_ENTRY = re.compile(r'([a-z_][a-z_0-9]*)\s*::\s*\{|'
                                 r'^\s*([A-Za-z_][A-Za-z_0-9]*)')
+# The child segment takes UPPERCASE too. `use autumn_web::{openapi::Parameter};`
+# names a gated ITEM under an unconditional module, and restricting the child to
+# lowercase resolved the entry to `openapi` alone — which is ungated, so the
+# line reported nothing. Round 8 widened `PATH_USE` for exactly this and left
+# the group form behind. Found by Codex review on #2800.
 GROUP_ENTRY = re.compile(
-    r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
+    r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)'
+    r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
 # A bang-macro call, `autumn_web::embed_static!()` or a bare `embed_static!()`.
 # The real filter is membership in the gated `bang` set — a name this gate read
 # off a `macro_rules!` declaration in the crate root — so the pattern only has
@@ -1486,9 +1537,21 @@ def naming_patterns(feature):
         # `features = ['ws']` carries a complete enabling instruction. Matching
         # only the double-quoted form rejected it. Found by Codex review on
         # #2800.
+        # Cargo does not treat `-` and `_` as interchangeable in a dependency
+        # table KEY, so `autumn_web = { … }` is autumn-web only when it also
+        # carries `package = "autumn-web"`. That spelling is real — this
+        # repository's own CHANGELOG documents `autumn generate auth` learning
+        # to patch it — and requiring the literal `autumn-web` key rejected a
+        # page carrying a complete enabling instruction. Found by Codex review
+        # on #2800.
         rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
+        rf'autumn_web\s*=\s*\{{(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
+        rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         rf'\[(?:[a-z-]+\.)*dependencies\.autumn-web\][^\[]*?'
         rf'features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
+        rf'\[(?:[a-z-]+\.)*dependencies\.autumn_web\]'
+        rf'(?=[^\[]*package\s*=\s*[\'"]autumn-web[\'"])'
+        rf'[^\[]*?features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         # A `--features` flag belongs to the package the COMMAND selects, and
         # the corpus runs `cargo install diesel_cli --no-default-features
         # --features postgres` three times. Round 9 tied dependency ARRAYS to
@@ -1753,6 +1816,19 @@ def self_test():
            _cfg_requirement(
                ['#[cfg(any(test, feature = "test-support"))]'], 0)[0],
            {'test-support'})
+    # A `not(…)` is a build constraint; the positive conjuncts beside it are
+    # still required. `capsule::build_recording_pool` is the live case.
+    expect('positive conjuncts survive a not() sibling',
+           _cfg_requirement(['#[cfg(all(feature = "test-support", '
+                             'feature = "db", not(feature = "sqlite")))]'],
+                            0)[0],
+           {'test-support', 'db'})
+    expect('a gate that is only not() still yields nothing',
+           _cfg_requirement(['#[cfg(not(feature = "seed"))]'], 0)[0], None)
+    expect('...even with several not() predicates',
+           _cfg_requirement(
+               ['#[cfg(all(not(feature = "a"), not(feature = "b")))]'],
+               0)[0], None)
     expect('a genuine feature disjunction is still dropped',
            _cfg_requirement(
                ['#[cfg(any(feature = "a", feature = "b"))]'], 0)[0], None)
@@ -1826,6 +1902,11 @@ def self_test():
            found('```rust\nuse autumn_web::{Mail, Mailer};\n```\n'),
            [(2, 'mail', 'autumn_web::Mail'),
             (2, 'mail', 'autumn_web::Mailer')])
+    # An UPPERCASE child in a root group names a gated item under an
+    # unconditional module — the group form of round 8's `PATH_USE` widening.
+    expect('an uppercase child in a root group resolves',
+           found('```rust\nuse autumn_web::{openapi::Parameter};\n```\n'),
+           [(2, 'openapi', 'autumn_web::openapi::Parameter')])
     expect('a nested entry inside a group resolves its own segment',
            found('```rust\nuse autumn_web::{pdf::Pdf};\n```\n'),
            [(2, 'pdf', 'autumn_web::pdf')])
@@ -1959,6 +2040,20 @@ def self_test():
                          'ws'), True)
     expect('...and in a forwarding row',
            names_feature("realtime = ['autumn-web/ws']", 'ws'), True)
+    # Cargo does not normalise `-`/`_` in a dependency KEY, so the underscore
+    # spelling is autumn-web only alongside `package = "autumn-web"`.
+    expect('a renamed dependency key counts',
+           names_feature(
+               'autumn_web = { package = "autumn-web", features = ["ws"] }',
+               'ws'), True)
+    expect('...in the section spelling too',
+           names_feature('[dependencies.autumn_web]\n'
+                         'package = "autumn-web"\nfeatures = ["ws"]\n',
+                         'ws'), True)
+    expect('an underscore key WITHOUT the rename is a different crate',
+           names_feature(
+               'autumn_web = { version = "0.7", features = ["ws"] }', 'ws'),
+           False)
     expect('another crate\'s literal-string array still does not',
            names_feature("axum = { version = '0.8', features = ['ws'] }",
                          'ws'), False)
