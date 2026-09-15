@@ -352,7 +352,7 @@ _None as of 2026-09-05._
   then the wrong window end-point and the conflation of independent
   diagnoses with reactive cleanup commits.
 
-### Escape: RUSTSEC-2026-0285 (rustls) failed the required `Supply chain (cargo-deny)` gate on every PR carrying the pinned dependency, for ~7 hours, until fixed in passing by an unrelated PR
+### Escape: RUSTSEC-2026-0285 (rustls) failed the required `Supply chain (cargo-deny)` gate on any PR whose run reached the advisory audit with the pinned dependency, for ~7 hours, until fixed in passing by an unrelated PR
 
 - **Not a flake, not a product bug — a real, externally-disclosed
   vulnerability, caught by the exact mechanism built to catch it.** RUSTSEC-2026-0285
