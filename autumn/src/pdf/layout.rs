@@ -22,12 +22,34 @@ use super::metrics::{char_width_1000em, text_width_pt};
 const MAX_DEPTH: u32 = 512;
 
 thread_local! {
-    /// Set when a walker drops a non-empty `nodes` slice because it passed
-    /// [`MAX_DEPTH`] — an empty slice past the cap drops nothing, so that
-    /// case leaves this unset. [`render_pages`] clears the flag at the
+    /// Set when a walker drops a subtree with real text in it because it
+    /// passed [`MAX_DEPTH`] — a capped subtree of empty wrapper tags drops
+    /// nothing, so that case leaves this unset (see
+    /// [`subtree_has_text`]). [`render_pages`] clears the flag at the
     /// start of every call and reads it at the end, so one deep document
     /// logs one warning, not one per node.
     static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True if `nodes`, or anything nested inside them, holds non-empty text.
+///
+/// Walks with an explicit stack, not recursion: a capped subtree can be
+/// arbitrarily deep (that is the whole reason it got capped), so this must
+/// stay stack-safe the same way [`super::html`]'s parser and `Node`'s own
+/// `Drop` do.
+fn subtree_has_text(nodes: &[Node]) -> bool {
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(text) => {
+                if !text.is_empty() {
+                    return true;
+                }
+            }
+            Node::Element { children, .. } => stack.extend(children),
+        }
+    }
+    false
 }
 
 /// A4 portrait, matching the default most other frameworks in this space
@@ -203,7 +225,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -273,7 +295,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -317,7 +339,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -375,7 +397,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -407,7 +429,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -532,7 +554,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if !nodes.is_empty() {
+        if subtree_has_text(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -2672,16 +2694,21 @@ mod tests {
 
     #[test]
     fn empty_span_past_the_depth_cap_does_not_warn() {
-        // 513 empty <span> wrappers around nothing: the cap is hit, but the
-        // capped subtree has no content to drop, so this must not warn.
-        // (Codex review on PR #2810: a bare depth check fires even when
-        // `nodes` is empty, since the guard runs before the no-op loop.)
-        let html = format!("{}{}", "<span>".repeat(513), "</span>".repeat(513));
-        assert_eq!(
-            count_pdf_depth_warnings(&html),
-            0,
-            "an empty capped subtree drops no content, so it must not warn"
-        );
+        // N empty <span> wrappers around nothing, for several N past the
+        // cap: every level is checked, not just the first one past it,
+        // because a shallow "is this one slice empty" check only catches
+        // the exact depth where the wrapper chain runs out — one level
+        // deeper, that slice holds one more (still empty) wrapper element
+        // and looks non-empty by slice length alone. (Codex review on PR
+        // #2810, first at 513 levels, then again at 514.)
+        for n in 513..=520 {
+            let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
+            assert_eq!(
+                count_pdf_depth_warnings(&html),
+                0,
+                "{n} empty nested wrappers drop no content, so this must not warn"
+            );
+        }
     }
 
     #[test]
