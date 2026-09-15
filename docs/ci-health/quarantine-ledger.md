@@ -366,7 +366,12 @@ _None as of 2026-09-05._
   `tokio-postgres-rustls` — most of the workspace's own network stack, not
   one narrow edge — so `cargo-deny`'s advisory check failed the required
   `Supply chain (cargo-deny)` job on any open PR whose `Cargo.lock` carried
-  that pin, independent of that PR's own diff. **Correction: not via the
+  that pin and whose `check-advisories.sh` run actually reached the audit
+  step (carrying the pin was necessary but not sufficient — see the
+  `validator-0.21.0` counterexample below, whose run carried the same pin
+  but exited earlier on its own unrelated `fuzz/Cargo.lock` mismatch,
+  never reaching the audit), independent of that PR's own diff otherwise.
+  **Correction: not via the
   `test-gate`/`Test suite` aggregator** — `.github/workflows/ci.yml`'s
   `test-gate.needs` is exactly `[test, trybuild, test-features,
   test-docker]` and does not include `supply-chain`, so a cargo-deny failure
@@ -826,8 +831,10 @@ without also filling in the intake form above.
   ~137 hours idle).
 - **2026-09-15 update — 7th consecutive pass, harness still undispatched;
   zero new organic hits on any of `live_upgrade`'s three signatures across
-  the ~25.6h window sampled this pass (2026-09-14T08:00:19Z–2026-09-15T09:39:00Z,
-  68 runs: 50 cancelled/11 success/7 failure).** All 7 run-level failures
+  the ~25.6h window sampled this pass (2026-09-14T08:00:19Z, exclusive, to
+  2026-09-15T09:39:00Z — exclusive so as not to double-count run 34820504735,
+  already in the 2026-09-14 report's own success list at that exact boundary
+  timestamp — 67 runs: 50 cancelled/10 success/7 failure).** All 7 run-level failures
   triaged (see `docs/reports/2026-09-15-semaphore-ci-health-followup.md`):
   5 were the new RUSTSEC-2026-0285 `Supply chain (cargo-deny)` escape (its
   own new closed entry above), 1 was a pre-existing, unrelated
@@ -837,7 +844,7 @@ without also filling in the intake form above.
   the 2026-09-14 pass's cancelled-run job-level sampling (checking whether a
   `cancelled`-overall run hid a job-level `failure`), so — per that same
   caveat — this is not a proven-exhaustive zero-hit finding across the full
-  68-run window, only across the 18 runs that resolved to `success`/`failure`
+  67-run window, only across the 17 runs that resolved to `success`/`failure`
   and were actually inspected. `manual-macos-contention-check.yml`: still
   `total_count: 0` against `workflow_dispatch` runs, checked
   2026-09-15T~09:5xZ — unchanged for a 7th straight pass since it became

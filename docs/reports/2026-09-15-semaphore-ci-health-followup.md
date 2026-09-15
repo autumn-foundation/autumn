@@ -18,15 +18,18 @@ consecutive idle pass (~162.5 hours since it became dispatchable at
 
 ## 🌡️ Symptom
 
-Sampled `ci.yml` `pull_request`-triggered runs from the 2026-09-14 report's
-own cutoff (2026-09-14T08:00:19Z) to 2026-09-15T09:39:00Z (~25.6 hours, one
+Sampled `ci.yml` `pull_request`-triggered runs created strictly after the
+2026-09-14 report's own cutoff (2026-09-14T08:00:19Z, exclusive — that
+report's own success list already includes run 34820504735, the run created
+at exactly that boundary timestamp; an inclusive `>=` here would double-count
+it across both reports) up to 2026-09-15T09:39:00Z (~25.6 hours, one
 `perPage=100` page whose own span, 2026-09-13T20:09:37Z–2026-09-15T09:39:00Z,
 fully covers the window with margin on both ends, so no second page was
-needed). 68 runs in window: 50 cancelled, 11 success, 7 failure. Full ID
+needed). 67 runs in window: 50 cancelled, 10 success, 7 failure. Full ID
 list, anchored per the 2026-09-14 report's own correction against this same
 moving-page problem: **failures (7)** — 34867438081, 34877258106,
 34881729206, 34882678393, 34882747248, 34907660727, 34934228774.
-**Success (11)** — 34820504735, 34834847027, 34871417092, 34889464887,
+**Success (10)** — 34834847027, 34871417092, 34889464887,
 34890530960, 34907694152, 34908356868, 34908659972, 34909746568,
 34932405295, 34941314264. **Cancelled (50)** — 34832109780, 34832912451,
 34833276393, 34833954431, 34834252637, 34834645232, 34860640476,
@@ -44,9 +47,14 @@ sampling, per the 2026-09-14 report's methodology, was not repeated this
 pass — see Measurement for the scope this leaves uncovered).
 
 **Finding 1 — a real, newly-published RUSTSEC advisory failed the required
-`Supply chain (cargo-deny)` gate on every PR whose `Cargo.lock` carried the
-affected pin, for about 7 hours, until an unrelated PR's author fixed it in
-passing.** Of the 7 run-level failures, 5 failed `Supply chain (cargo-deny)`:
+`Supply chain (cargo-deny)` gate on any PR whose `Cargo.lock` carried the
+affected pin and whose `check-advisories.sh` run reached the advisory audit
+step, for about 7 hours, until an unrelated PR's author fixed it in
+passing.** (Carrying the pin was necessary but not sufficient to observe
+this specific failure — see the `validator-0.21.0` counterexample below,
+which carried the same pin but never reached the audit at all, exiting
+earlier on its own unrelated `fuzz/Cargo.lock` mismatch.) Of the 7
+run-level failures, 5 failed `Supply chain (cargo-deny)`:
 `claude/compassionate-euler-hfl9hp` (run 34867438081, 2026-09-14T16:15:15Z),
 `claude/epic-meitner-ftohjq` (run 34877258106, 17:51:24Z),
 `dependabot/github_actions/taiki-e/install-action-2.87.11` (run 34881729206,
@@ -207,7 +215,7 @@ job-level sampling (checking whether a `cancelled`-overall run hid a
 job-level `failure`, as run 34774043482 did in that pass) — of the 50
 cancelled runs in this window, none were checked at the job level, so a
 hidden failure inside one of them (on any tracked signature, or on
-`Supply chain`) cannot be ruled out for this pass, only for the 18 runs that
+`Supply chain`) cannot be ruled out for this pass, only for the 17 runs that
 resolved to `success`/`failure` and were actually inspected. Flagged here so
 this gap doesn't silently read as "checked and clean" the way the 2026-09-14
 report's own first draft mistakenly did before its correction.
@@ -227,7 +235,9 @@ report's own first draft mistakenly did before its correction.
 ```
 actions_list(list_workflow_runs, ci.yml, event=pull_request, status=completed,
              perPage=100, page=1)
-# → filtered to created_at in [2026-09-14T08:00:19Z, 2026-09-15T09:39:00Z]
+# → filtered to created_at in (2026-09-14T08:00:19Z, 2026-09-15T09:39:00Z]
+#   (lower bound exclusive — that timestamp's own run, 34820504735, is
+#   already counted in the 2026-09-14 report's success list)
 # each failure's jobs via list_workflow_jobs(run_id, filter=latest)
 # each failing job's log via get_job_logs(job_id, return_content=true, tail_lines>=60)
 #   (a 15-20 line tail truncates before the actual failure — the cargo-deny
