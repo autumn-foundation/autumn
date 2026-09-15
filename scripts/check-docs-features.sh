@@ -123,10 +123,27 @@
 #     `extract_path_params` (openapi) and four `plugin-sandbox` fuzz seams in
 #     the truth set under names nothing documents. The workspace runs
 #     `cargo fmt --all`, so top-level is column zero.
-#   - Only the exact `#[cfg(feature = "…")]` form is read. `#[cfg(all(…))]` and
-#     `#[cfg(any(…))]` leave the item UNGATED here, which under-reports rather
-#     than over-reports: a page is never failed for a feature the gate guessed
-#     at. `autumn-web` has no such form on a top-level item today.
+#   - A CONJUNCTION requires all of its conjuncts, and every non-default one is
+#     reported. Eleven column-zero attributes here are `#[cfg(all(…))]`:
+#     `presence_badge` is `all(presence, maud)` and `presence_stream` is a
+#     line-wrapped `all(presence, ws, maud, htmx)`. The first version of this
+#     gate read only the single-feature form — and said so in this paragraph,
+#     claiming "autumn-web has no such form on a top-level item today", which
+#     was simply false. Both items were missing from the truth set entirely, so
+#     a fence naming either would have passed while the reader's build failed
+#     for want of `presence` or `ws`. Found by Codex review on #2800; the
+#     attribute is now read by PARENTHESIS BALANCE, since `presence_stream`'s
+#     wraps across four lines and a line-anchored regex cannot see it.
+#     Requirements that are default (`maud`, `htmx`) are dropped rather than
+#     demanded, so an item behind default features alone — `live`, behind
+#     `all(htmx, maud)` — is not gated surface at all.
+#   - `#[cfg(any(…))]` and `#[cfg(not(…))]` leave the item UNGATED, which
+#     under-reports rather than over-reports: a page is never failed for a
+#     feature the gate guessed at. `any(…)` is satisfied by naming ONE
+#     alternative and this gate cannot tell which a page meant; `not(…)` marks
+#     an item that exists when the feature is OFF, so reading the name out of
+#     it would tell a reader to enable the one feature that removes the item.
+#     `lib.rs` has one, `#[cfg(not(feature = "seed"))]`.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - Bare identifiers. A fence that writes `use autumn_web::prelude::*;` and
@@ -417,7 +434,8 @@ MANIFEST = 'autumn/Cargo.toml'
 # `maud` widget surface appear only there. Both files declare at column zero.
 SOURCES = ('autumn/src/lib.rs', 'autumn/src/prelude.rs')
 
-CFG_FEATURE = re.compile(r'^#\[cfg\(feature = "([a-z0-9_-]+)"\)\]$')
+CFG_OPEN = re.compile(r'^#\[cfg\(')
+CFG_FEATURE_NAME = re.compile(r'feature\s*=\s*"([a-z0-9_.+-]+)"')
 MOD_DECL = re.compile(r'^(?:pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
 USE_ONE_LINE = re.compile(r'^pub use ([a-z_0-9:]+)::\{?([^;{}]+?)\}?;')
 USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
@@ -464,18 +482,65 @@ def default_features(root):
     return closure, set(table) - {'default'}
 
 
-def gated_items(root):
-    """Map every column-zero item behind a `#[cfg(feature = …)]` to its feature.
+def _cfg_requirement(lines, index):
+    """Read one column-zero `#[cfg(…)]` and return (required_features, next_i).
 
-    Returns `{name: (feature, kinds)}` where `kinds` is a set drawn from
-    `module`, `macro` (an attribute a reader writes) and `item` (a type or
-    function). A name can be SEVERAL of those at once and `ws` is: `lib.rs`
-    declares `pub mod ws;` and re-exports `autumn_macros::ws` under the same
-    gate, so `autumn_web::ws::WebSocket` and `#[ws("/echo")]` are both real.
-    Keeping only the first reading made `#[ws]` — the single most-copied gated
-    construct in the guide — invisible to this gate, which its self-test now
-    holds it to. A name's FEATURE is taken from its first declaration; `lib.rs`
-    and `prelude.rs` never disagree about one.
+    `required_features` is None when the attribute is not a plain conjunction of
+    `feature = "…"` predicates — which is the whole reason this is a function
+    rather than a regex. Three shapes are live at column zero in this crate and
+    each needs its own answer:
+
+      - `#[cfg(feature = "ws")]` — one required feature.
+      - `#[cfg(all(feature = "presence", feature = "maud"))]` and its
+        line-wrapped four-predicate sibling on `presence_stream` — EVERY
+        conjunct is required, so every non-default one has to be named. An
+        earlier version read only the single-feature form and declared in its
+        header that "autumn-web has no such form on a top-level item today".
+        That was simply false: eleven column-zero attributes are `all(…)`, and
+        `autumn_web::presence_badge` (presence + maud) and
+        `autumn_web::presence_stream` (presence + ws + maud + htmx) were
+        therefore missing from the truth set entirely, so a fence could use
+        either without naming `presence` or `ws` and this gate would pass it.
+        Caught by Codex review on #2800.
+      - `#[cfg(not(feature = "seed"))]` — the item exists when the feature is
+        OFF. Reading the name out of it would demand the reader enable the one
+        feature that REMOVES the item, so `not(` yields None, as does `any(`
+        (naming one alternative is already enough, and this gate cannot tell
+        which one a page meant). Both under-report rather than over-report: a
+        page is never failed for a feature the gate guessed at.
+
+    The attribute may wrap across lines — `presence_stream`'s does — so the
+    text is gathered by PARENTHESIS BALANCE rather than by line. A single-line
+    regex silently skipped it, which is the same "invisible because it spans a
+    line" failure `check-docs-cli.sh` records for its own span reader.
+    """
+    depth = 0
+    parts = []
+    while index < len(lines):
+        line = lines[index]
+        parts.append(line)
+        depth += line.count('(') - line.count(')')
+        index += 1
+        if depth <= 0:
+            break
+    text = ' '.join(parts)
+    if 'not(' in text or 'any(' in text:
+        return None, index
+    names = CFG_FEATURE_NAME.findall(text)
+    return (set(names) if names else None), index
+
+
+def gated_items(root):
+    """Map every column-zero item behind a `#[cfg(…)]` to the features it needs.
+
+    Returns `{name: (features, kinds)}`. `features` is the set the item
+    REQUIRES — several, for an `all(…)` conjunction. `kinds` is a set drawn
+    from `module`, `macro` (an attribute a reader writes) and `item` (a type or
+    function): a name can be several of those at once, and `ws` is, since
+    `lib.rs` declares `pub mod ws;` and re-exports `autumn_macros::ws` under
+    the same gate, so `autumn_web::ws::WebSocket` and `#[ws("/echo")]` are both
+    real. Keeping only the first reading made `#[ws]` — the most-copied gated
+    construct in the guide — invisible, which the self-test now holds it to.
 
     Column zero is the whole nesting model, and it is enough because the
     workspace runs `cargo fmt --all`. See the header for the five inline
@@ -489,17 +554,19 @@ def gated_items(root):
         index = 0
         while index < len(lines):
             line = lines[index]
-            index += 1
             # Indented or blank: inside something, or between things. Neither
             # can carry a top-level declaration, and neither cancels a pending
             # `#[cfg]` — rustfmt puts no blank line between an attribute and
             # the item it is on, but a doc comment may sit between them.
             if not line or line[:1].isspace():
+                index += 1
                 continue
-            match = CFG_FEATURE.match(line)
-            if match:
-                pending = match.group(1)
+            if CFG_OPEN.match(line):
+                required, index = _cfg_requirement(lines, index)
+                if required:
+                    pending = required
                 continue
+            index += 1
             # Doc comments and further attributes sit between the `#[cfg]` and
             # the item; they carry the gate forward rather than clearing it.
             if line.startswith(('///', '//!', '//', '#[')):
@@ -542,12 +609,19 @@ def gated_items(root):
     return found
 
 
-def _record(found, name, feature, kind):
-    """Add one declaration, keeping every kind a name is declared under."""
+def _record(found, name, features, kind):
+    """Add one declaration, unioning both the features and the kinds.
+
+    A name declared twice — `ws` as a module in `lib.rs` and as a macro in
+    `prelude.rs` — keeps every kind. Its requirements are unioned rather than
+    replaced: the reader needs whatever ANY of its declarations needs, and
+    taking only the first would let the narrower gate vouch for the wider one.
+    """
     if name in found:
+        found[name][0].update(features)
         found[name][1].add(kind)
     else:
-        found[name] = (feature, {kind})
+        found[name] = (set(features), {kind})
 
 
 def _names(blob):
@@ -569,10 +643,17 @@ def _names(blob):
 
 
 def surface(root):
-    """`{name: (feature, kind)}` for the items a DEFAULT build does not have."""
+    """`{name: (features, kinds)}` for what a DEFAULT build does not have.
+
+    `features` is narrowed to the NON-DEFAULT requirements. An item behind
+    `all(feature = "presence", feature = "maud")` keeps `presence` alone:
+    `maud` is on by default, so telling a reader to enable it is noise on a
+    page that is otherwise correct. An item whose every requirement is default
+    — `live`, behind `htmx` + `maud` — drops out entirely.
+    """
     closure, declared = default_features(root)
     gated = gated_items(root)
-    unknown = sorted({f for f, _ in gated.values()} - declared)
+    unknown = sorted(set().union(*(f for f, _ in gated.values())) - declared)
     if unknown:
         sys.exit(
             f'FAIL: {", ".join(unknown)} is `#[cfg(feature = …)]`-gated in the '
@@ -580,8 +661,12 @@ def surface(root):
             f'manifest lost it (the cfg is then dead and the item ships to '
             f'nobody) or this gate mis-parsed one of them. Inspect with '
             f'--surface.')
-    return {name: (feature, kinds) for name, (feature, kinds) in gated.items()
-            if feature not in closure}
+    out = {}
+    for name, (features, kinds) in gated.items():
+        needed = features - closure
+        if needed:
+            out[name] = (needed, kinds)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -634,26 +719,37 @@ def rust_fences(text):
             yield lineno, line
 
 
-def uses(text, gated):
+def uses(blanked, gated):
     """Yield (line_no, feature, shown) for each gated construct in a rust fence.
+
+    `blanked` is already comment-blanked — see `check()`, which does it once
+    and hands the same text to the naming check, so a `<!-- … -->` can neither
+    show a construct nor satisfy the rule about naming its feature.
+
+    One yield PER REQUIRED non-default feature: `autumn_web::presence_stream`
+    needs `presence` and `ws`, and a page naming only one of them has still
+    left the reader a line that does not build.
 
     `shown` is what the reader sees, so the report can say `#[ws]` rather than
     `ws` — the difference between a line they can find on the page and a name
     they have to go looking for.
     """
-    for lineno, line in rust_fences(blank_comments(text)):
+    for lineno, line in rust_fences(blanked):
         for match in PATH_USE.finditer(line):
-            name = match.group(1)
-            if name in gated:
-                yield lineno, gated[name][0], f'autumn_web::{name}'
+            entry = gated.get(match.group(1))
+            if entry:
+                shown = f'autumn_web::{match.group(1)}'
+                for feature in sorted(entry[0]):
+                    yield lineno, feature, shown
         for match in ATTR_USE.finditer(line):
-            name = match.group(1)
-            entry = gated.get(name)
+            entry = gated.get(match.group(1))
             # An attribute is only judged against an attribute MACRO. A module
             # named `storage` is not `#[storage]`, and reading it as one would
             # have this gate guessing at a construct that does not exist.
             if entry and 'macro' in entry[1]:
-                yield lineno, entry[0], f'#[{name}]'
+                shown = f'#[{match.group(1)}]'
+                for feature in sorted(entry[0]):
+                    yield lineno, feature, shown
 
 
 def naming_patterns(feature):
@@ -738,16 +834,25 @@ def check(root):
             encoding='utf-8', errors='ignore')
         if 'autumn_web' not in text and '#[' not in text:
             continue
+        # Blanked ONCE, and used for both halves. The first version blanked
+        # inside `uses()` and passed the raw text to the naming check, so a page
+        # carrying a live `autumn_web::pdf` fence and a hidden
+        # `<!-- features = ["pdf"] -->` reported zero defects: the gate accepted
+        # as the reader's enabling line a string the reader cannot see. A
+        # comment renders as nothing, so it must satisfy nothing. The waiver
+        # scan reads the RAW text, since a waiver is a comment by construction.
+        # Caught by Codex review on #2800.
+        blanked = blank_comments(text)
         covered = waived_lines(text)
         first = {}
-        for lineno, feature, shown in uses(text, gated):
+        for lineno, feature, shown in uses(blanked, gated):
             checked += 1
             if lineno in covered.get(feature, ()):
                 waived += 1
                 continue
             first.setdefault(feature, (lineno, shown))
         for feature, (lineno, shown) in sorted(first.items()):
-            named = first_naming_line(text, feature)
+            named = first_naming_line(blanked, feature)
             if named is None:
                 problems.append(
                     f'{rel}:{lineno}: {shown} needs the non-default '
@@ -775,9 +880,15 @@ def print_surface():
           f'{", ".join(sorted(closure))}')
     print(f'items behind a non-default feature: {len(gated)}')
     by_feature = {}
-    for name, (feature, kinds) in gated.items():
-        by_feature.setdefault(feature, []).append(
-            ('+'.join(sorted(kinds)), name))
+    for name, (features, kinds) in gated.items():
+        # An item needing two non-default features is listed under each, with
+        # the other named beside it, so `--surface` shows the conjunction
+        # rather than hiding half of it under one heading.
+        for feature in sorted(features):
+            also = sorted(features - {feature})
+            suffix = f'  (also needs {", ".join(also)})' if also else ''
+            by_feature.setdefault(feature, []).append(
+                ('+'.join(sorted(kinds)), f'{name}{suffix}'))
     for feature in sorted(by_feature):
         print(f'  {feature}')
         for kinds, name in sorted(by_feature[feature]):
@@ -791,10 +902,11 @@ def list_uses():
     for rel in corpus(ROOT):
         text = (pathlib.Path(ROOT) / rel).read_text(
             encoding='utf-8', errors='ignore')
+        blanked = blank_comments(text)
         covered = waived_lines(text)
         rows = []
-        for lineno, feature, shown in uses(text, gated):
-            named = first_naming_line(text, feature)
+        for lineno, feature, shown in uses(blanked, gated):
+            named = first_naming_line(blanked, feature)
             if named is None:
                 verdict = 'NOT NAMED'
             elif named > lineno:
@@ -824,15 +936,18 @@ def self_test():
             failures.append(f'{label}: got {got!r}, want {want!r}')
 
     gated = {
-        'ws': ('ws', {'module', 'macro'}),
-        'channels': ('ws', {'module'}),
-        'pdf': ('pdf', {'module'}),
-        'storage': ('storage', {'module'}),
-        'mailer': ('mail', {'macro'}),
+        'ws': ({'ws'}, {'module', 'macro'}),
+        'channels': ({'ws'}, {'module'}),
+        'pdf': ({'pdf'}, {'module'}),
+        'storage': ({'storage'}, {'module'}),
+        'mailer': ({'mail'}, {'macro'}),
+        # The conjunction shape: two non-default requirements on one item.
+        'presence_stream': ({'presence', 'ws'}, {'item'}),
     }
 
     def found(text):
-        return sorted(uses(text, gated))
+        # `uses()` takes ALREADY-BLANKED text, the way `check()` hands it over.
+        return sorted(uses(blank_comments(text), gated))
 
     # Only rust fences are read.
     expect('rust fence read',
@@ -859,9 +974,26 @@ def self_test():
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
 
-    # A comment renders as nothing, so it can neither show nor name.
+    # A comment renders as nothing, so it can neither show a construct NOR
+    # name a feature. The second half is the regression: `uses()` blanked and
+    # the naming check did not, so a page with a live `autumn_web::pdf` fence
+    # and a hidden `<!-- features = ["pdf"] -->` passed the gate while showing
+    # the reader nothing. Asserted through `check()`-shaped inputs, not on the
+    # helper alone — the helper was already right; the call path was not.
     expect('comment blanked',
            found('```rust\n<!-- autumn_web::pdf -->\n```\n'), [])
+    hidden = ('```rust\nuse autumn_web::pdf::Pdf;\n```\n'
+              '\n<!-- features = ["pdf"] -->\n')
+    expect('a hidden enabling line does not satisfy the naming rule',
+           names_feature(blank_comments(hidden), 'pdf'), False)
+    expect('...while the same line in view does',
+           names_feature(
+               blank_comments('```toml\nfeatures = ["pdf"]\n```\n'), 'pdf'),
+           True)
+    expect('a conjunction is reported once per non-default feature',
+           found('```rust\nuse autumn_web::presence_stream;\n```\n'),
+           [(2, 'presence', 'autumn_web::presence_stream'),
+            (2, 'ws', 'autumn_web::presence_stream')])
 
     # The naming rule.
     for spelling in (
@@ -921,15 +1053,46 @@ def self_test():
         failures.append('closure did not walk `oauth2 -> http-client`')
     expect('a default feature is not gated surface',
            any(f == 'db' for f, _ in real.values()), False)
-    for name, feature, kinds in (('ws', 'ws', {'module', 'macro'}),
-                                 ('pdf', 'pdf', {'module'}),
-                                 ('mailer', 'mail', {'macro'}),
-                                 ('storage', 'storage', {'module'}),
-                                 ('managed_pg', 'managed-pg', {'module'})):
-        if real.get(name) != (feature, kinds):
+    for name, features, kinds in (
+            ('ws', {'ws'}, {'module', 'macro'}),
+            ('pdf', {'pdf'}, {'module'}),
+            ('mailer', {'mail'}, {'macro'}),
+            ('storage', {'storage'}, {'module'}),
+            ('managed_pg', {'managed-pg'}, {'module'}),
+            # `all(feature = "presence", feature = "maud")` — `maud` is
+            # default, so only `presence` survives into the requirement.
+            ('presence_badge', {'presence'}, {'item'}),
+            # The line-wrapped four-predicate conjunction, of which two are
+            # non-default. Missing this shape entirely is the defect Codex
+            # review found on #2800: a fence could name `presence_stream` and
+            # this gate would vouch for it.
+            ('presence_stream', {'presence', 'ws'}, {'item'})):
+        if real.get(name) != (features, kinds):
             failures.append(
                 f'truth set: {name} -> {real.get(name)!r}, want '
-                f'{(feature, kinds)!r}')
+                f'{(features, kinds)!r}')
+    # An item whose every requirement is default is not gated surface at all:
+    # `live` is behind `all(feature = "htmx", feature = "maud")`.
+    if 'live' in real:
+        failures.append(
+            'truth set: `live` needs only default features and must not be '
+            'reported as gated surface')
+    # `#[cfg(not(feature = "seed"))]` marks an item that exists when the
+    # feature is OFF. Reading the name out of it would tell a reader to enable
+    # the one feature that REMOVES the item.
+    expect('a `not(…)` gate yields no requirement',
+           _cfg_requirement(['#[cfg(not(feature = "seed"))]'], 0)[0], None)
+    expect('an `any(…)` gate yields no requirement',
+           _cfg_requirement(['#[cfg(any(feature = "a", feature = "b"))]'],
+                            0)[0], None)
+    expect('a conjunction yields every conjunct',
+           _cfg_requirement(['#[cfg(all(feature = "presence", '
+                             'feature = "maud"))]'], 0)[0],
+           {'presence', 'maud'})
+    expect('a line-wrapped conjunction is read whole',
+           _cfg_requirement(['#[cfg(all(', '    feature = "presence",',
+                             '    feature = "ws",', '))]'], 0)[0],
+           {'presence', 'ws'})
     # Items inside `lib.rs`'s inline `pub mod … {` blocks are NOT top-level.
     for name in ('extract_path_params', 'parse_sandbox_manifest'):
         if name in real:
@@ -946,7 +1109,7 @@ def self_test():
 def main():
     problems, checked, waived, late = check(ROOT)
     gated = surface(ROOT)
-    features = sorted({feature for feature, _ in gated.values()})
+    features = sorted(set().union(*(f for f, _ in gated.values())))
     print(f'corpus: {len(corpus(ROOT))} reader-facing markdown files')
     print(f'surface: {len(gated)} crate-root items behind '
           f'{len(features)} non-default features')

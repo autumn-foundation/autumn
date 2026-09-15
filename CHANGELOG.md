@@ -111,7 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
   snapshot — so moving an item behind a new feature moves the gate in the same
   commit; only column-zero declarations count, which keeps `lib.rs`'s five
-  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. Judged
+  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. A
+  `#[cfg(all(…))]` conjunction requires every conjunct, so each non-default one
+  is reported separately and `autumn_web::presence_stream` asks for `presence`
+  *and* `ws`; the attribute is read by parenthesis balance, since that item's
+  gate wraps across four lines. `any(…)` and `not(…)` leave an item ungated —
+  naming one alternative already satisfies the first, and the second marks an
+  item that exists when the feature is *off*, so demanding it would tell a
+  reader to enable the one flag that removes what they came for. Judged
   only inside ```` ```rust ```` fences, since a feature gate is a *compile*
   failure: a capability table naming `autumn_web::pdf::Pdf` describes an
   example, it does not hand anyone a line. Presence is gated, placement is not

@@ -117,8 +117,15 @@ require it. Each is additive at the *config* and *document* level — an absent
 before — but each also widens a Rust type that user code can name.
 
 Three types moved. You are affected only if your code constructs or matches one
-of them exhaustively; none of them changes meaning. All of them are behind the
-non-default `tls` feature, so an app that does not enable it is unaffected.
+of them exhaustively; none of them changes meaning.
+
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
 
 **Before (`{X.Y}`):**
 
