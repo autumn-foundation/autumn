@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
+  `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
+  rollout halts, and `autumn deploy status --strict` sends one when it finds
+  drift. Both reuse the same `[alerts]` config and channels `autumn alert
+  test` uses (PagerDuty, Slack, Discord, or a signed webhook — not email,
+  which needs a running mailer). Delivery is best-effort: a failed send never
+  changes the command's exit code, and a plain `deploy status` (no
+  `--strict`) never sends one. Neither the drift model nor the `--json`
+  contract changed. See `docs/guide/fleet-deploys.md`.
+
 ### Fixed
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a

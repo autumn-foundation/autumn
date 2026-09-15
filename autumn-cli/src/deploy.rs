@@ -32,8 +32,10 @@ pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 use autumn_web::config::{AutumnConfig, DeployConfig, Env};
 use proxy::ProxyController;
 
@@ -4399,13 +4401,13 @@ where
         for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
             eprintln!("{line}");
         }
-        return Err(fleet_halted(
-            &plan,
-            &outcomes,
-            &degraded,
-            failed_host,
-            failed_step,
-        ));
+        let error = fleet_halted(&plan, &outcomes, &degraded, failed_host, failed_step);
+        // #2267: send a #1610 alert for the halt. This is best-effort. It
+        // does not change `error` below.
+        if let DeployError::FleetHalted(ref halt) = error {
+            emit_fleet_halted_alert(halt);
+        }
+        return Err(error);
     }
 
     // App deploy is committed on every host here: the cutovers succeeded and there
@@ -4631,6 +4633,167 @@ fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::Ho
         eprintln!("{line}");
     }
     fleet::HostOutcome::Manual { reason }
+}
+
+// ── #2267: send a #1610 alert on a halted rollout or on drift ───────────────
+//
+// AC-6 of #1621 asks for this. Do not make the operator poll a non-zero exit
+// code for it. Follow the `db::backup` pattern from issue #1743: load the
+// config, build the same channels `autumn alert test` uses, and deliver
+// directly. This is best-effort. It never changes the command's exit code.
+
+/// Load the config. Build the alert channels for a CLI-fired alert.
+///
+/// Return an empty list if the config fails to load. An empty list is a
+/// no-op downstream, so a broken config can not block the real exit code.
+fn deploy_alert_channels() -> Vec<Arc<dyn AlertChannel>> {
+    let config = match AutumnConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  \u{26A0} alert skipped: could not load configuration: {e}");
+            return Vec::new();
+        }
+    };
+    let client = autumn_web::http::Client::from_config(&config.http.client);
+    crate::alert::configured_http_channels(&config.alerts, &client)
+}
+
+/// Send `alert` to every channel in `channels`.
+///
+/// Use a short-lived runtime, like `autumn alert test` does. Log a failed
+/// delivery. Do not stop for it. This must never change the command's exit
+/// code. Do nothing when `channels` is empty — the case with no `[alerts]`
+/// destination set.
+fn deliver_alert(channels: &[Arc<dyn AlertChannel>], alert: &Alert) {
+    if channels.is_empty() {
+        return;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("  \u{26A0} alert not sent: could not start async runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(alert).await {
+                eprintln!(
+                    "  \u{26A0} alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
+}
+
+/// Join host names into one alert-detail value. Return an empty string for
+/// an empty list — for example, when no host was torn down.
+fn join_hosts(hosts: &[String]) -> String {
+    hosts.join(", ")
+}
+
+/// Join `(host, reason)` pairs into one alert-detail value.
+fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
+    pairs
+        .iter()
+        .map(|(host, reason)| format!("{host}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Build the alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O, so a test can call it directly.
+/// It reuses the `ScheduledTaskFailure` condition. It does not add a new
+/// `AlertCondition` variant. Issue #1743 made the same choice for a failed
+/// backup upload: a halted rollout is a framework-driven task that did not
+/// finish.
+///
+/// Every field on `halt` is a host name or a fixed op label (see
+/// [`FleetHalt`]). So this alert can never carry a shell line or a raw
+/// driver error.
+fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        "scheduled_task_failure:deploy-fleet-halted",
+    )
+    .title("Fleet rollout halted")
+    .summary(halt.to_string())
+    .detail("failed_host", halt.failed_host.clone())
+    .detail("failed_step", halt.failed_step)
+    .detail("rolled_back", join_hosts(&halt.rolled_back))
+    .detail("torn_down", join_hosts(&halt.torn_down))
+    .detail("still_on_new", join_hosts(&halt.still_on_new))
+    .detail("degraded", join_host_reasons(&halt.degraded))
+    .detail("manual", join_host_reasons(&halt.manual))
+    .build()
+}
+
+/// Send an alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// This runs on any halt, if `[alerts]` names a channel. If no channel is
+/// set, this builds an empty list and does nothing. So an operator with no
+/// alert destination sees the same behavior as before: a message and a
+/// non-zero exit.
+fn emit_fleet_halted_alert(halt: &FleetHalt) {
+    deliver_alert(&deploy_alert_channels(), &build_fleet_halted_alert(halt));
+}
+
+/// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
+fn drift_alert_summary(report: &fleet::DriftReport) -> String {
+    let mut parts = Vec::new();
+    if report.version_drift {
+        parts.push(format!(
+            "{} known release(s) are live at once",
+            report.known_releases().len()
+        ));
+    }
+    if !report.state_drift.is_empty() {
+        parts.push(format!(
+            "{} host(s) have state drift",
+            report.state_drift.len()
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Build the alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. Its dedup key includes `profile`,
+/// so drift on staging and drift on production never merge into one alert.
+///
+/// It carries the same reason strings `fleet::fleet_drift` already prints —
+/// never a raw driver error. So it needs no secrets check beyond what
+/// `DriftReport` already gives.
+fn build_drift_alert(report: &fleet::DriftReport, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-drift:{profile}"),
+    )
+    .title("Fleet drift detected")
+    .summary(drift_alert_summary(report))
+    .detail("profile", profile)
+    .detail("version_drift", report.version_drift.to_string())
+    .detail("state_drift", join_host_reasons(&report.state_drift))
+    .build()
+}
+
+/// Send an alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621) — the cron path in `docs/guide/fleet-deploys.md`.
+///
+/// This does nothing if `[alerts]` has no destination set. The caller must
+/// call this only in `--strict` mode: a plain `deploy status` check must
+/// never page anyone.
+fn emit_drift_alert(report: &fleet::DriftReport, profile: &str) {
+    deliver_alert(
+        &deploy_alert_channels(),
+        &build_drift_alert(report, profile),
+    );
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -5233,6 +5396,10 @@ fn run_status(
         }
     }
     if options.strict && report.drifted() {
+        // #2267: send a #1610 alert for the drift. This runs only in
+        // `--strict` mode: an interactive `deploy status` must not page
+        // anyone.
+        emit_drift_alert(&report, profile);
         return Err(DeployError::DriftDetected);
     }
     Ok(())
@@ -9472,6 +9639,160 @@ mod tests {
                 "FleetHalted must never carry `{secret}`: {rendered}"
             );
         }
+    }
+
+    // ── #2267: a halted rollout or drift sends a #1610 operator alert ───────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    fn sample_halt() -> FleetHalt {
+        FleetHalt {
+            failed_host: "web-b".to_owned(),
+            failed_step: "migrate",
+            rolled_back: vec!["web-a".to_owned()],
+            torn_down: vec![],
+            still_on_new: vec![],
+            degraded: vec![("web-a".to_owned(), "prune")],
+            manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+        }
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scheduled_task_failure() {
+        let alert = build_fleet_halted_alert(&sample_halt());
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet rollout halted");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-fleet-halted"
+        );
+        assert!(
+            alert.summary.contains("web-b") && alert.summary.contains("migrate"),
+            "the alert must name the failing host and step: {}",
+            alert.summary
+        );
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_carries_only_host_names_and_static_labels() {
+        // This check matches `FleetHalted`'s own secrets check. This
+        // alert comes only from its fields, so it can carry no more.
+        let alert = build_fleet_halted_alert(&sample_halt());
+        let rendered = format!("{alert:?}");
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "systemd-run",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a fleet-halted alert must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_fleet_halted_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_alert(&channels, &build_fleet_halted_alert(&sample_halt()));
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        assert_eq!(delivered[0].condition, AlertCondition::ScheduledTaskFailure);
+    }
+
+    #[test]
+    fn deliver_alert_is_noop_without_channels() {
+        // No `[alerts]` set means no channels. This must not panic. It
+        // must deliver nothing and change no behavior.
+        deliver_alert(&[], &build_fleet_halted_alert(&sample_halt()));
+    }
+
+    #[test]
+    fn build_drift_alert_is_scheduled_task_failure_scoped_to_profile() {
+        let report = fleet::DriftReport {
+            releases: vec![
+                ("web-a".to_owned(), fleet::ReleaseId::Known("r1".to_owned())),
+                ("web-b".to_owned(), fleet::ReleaseId::Known("r2".to_owned())),
+            ],
+            version_drift: true,
+            state_drift: vec![("web-b".to_owned(), fleet::DRIFT_HOST_NOT_DEPLOYED)],
+        };
+
+        let alert = build_drift_alert(&report, "production");
+
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet drift detected");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-drift:production"
+        );
+        assert!(
+            alert.summary.contains("release"),
+            "version drift must be named in the summary: {}",
+            alert.summary
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_profile_for_dedup() {
+        // Drift on staging and drift on production must stay two alerts.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let staging = build_drift_alert(&report, "staging");
+        let production = build_drift_alert(&report, "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn deliver_drift_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        deliver_alert(&channels, &build_drift_alert(&report, "staging"));
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].dedup_key,
+            "scheduled_task_failure:deploy-drift:staging"
+        );
     }
 
     #[test]
