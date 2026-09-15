@@ -545,6 +545,39 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-versions.sh --self-test && ./scripts/check-docs-versions.sh
+      - name: Feature-gate documentation gate
+        # Every gate above reads the corpus against a crate built with EVERY
+        # feature on, and `check-docs-symbols.sh` says so deliberately: gating
+        # symbol resolution on the default feature set "would report an item a
+        # reader can absolutely use as missing". That reasoning is right, and it
+        # leaves a hole the shape of its own premise. Proving
+        # `autumn_web::pdf::Pdf` EXISTS is not the reader's question — theirs is
+        # whether it exists in THEIR build, and autumn-web's default set is
+        # eight features out of fifty.
+        #
+        # So a page could open on `use autumn_web::pdf::Pdf;` with every path
+        # resolving, every macro argument valid and every link live, and the
+        # reader who pastes it into the project the quickstart just scaffolded
+        # gets `error[E0433]: could not find 'pdf' in 'autumn_web'` — a message
+        # about THEIR file, whose fix is a line the page never showed them.
+        #
+        # The baseline found nine such page/feature pairs across eight pages, of
+        # 78 gated uses. Three sat under a literal "**You write:**" heading, and
+        # `docs/guide/pdf-downloads.md` pointed AT the missing line: "requires
+        # the `maud` feature; enabled together with `pdf` in the quick start
+        # above", where the quick start above carried no Cargo.toml at all.
+        # `cloud-native.md`'s was the WebSocket drain contract — read by someone
+        # wiring a rolling deploy, the worst moment to find a feature missing.
+        #
+        # Truth set is parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs`
+        # and `autumn/Cargo.toml`'s transitively-closed default set, so moving
+        # an item behind a new feature moves the gate in the same commit.
+        # Registered in `check-docs-scope.sh`'s SIBLINGS, so its corpus cannot
+        # drift from the gates it sits beside.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-features.sh --self-test && ./scripts/check-docs-features.sh
       - name: Corpus scope agreement gate
         # The gates above each read "the reader-facing corpus", and each spells
         # that set itself. Three of them carry a comment promising the spellings

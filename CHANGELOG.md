@@ -84,6 +84,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scripts/check-docs-features.sh` — feature-gate documentation gate
+  [no-plugin].** Every reader-facing page that shows Rust reaching for an
+  `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature
+  on the page. Every docs gate before it read the corpus against a crate built
+  with every feature on, and `check-docs-symbols.sh` says
+  so deliberately: resolving against the default set "would report an item a
+  reader can absolutely use as missing". That reasoning is right, and it leaves
+  a hole the shape of its own premise — proving `autumn_web::pdf::Pdf` EXISTS
+  is not the reader's question. Theirs is whether it exists in *their* build,
+  and `autumn-web`'s default set is eight features (`maud`, `htmx`, `tailwind`,
+  `db`, `cache-moka`, `http-client`, `reporting`, `flash`) out of fifty. So a
+  page could open on `use autumn_web::pdf::Pdf;` with every path resolving,
+  every macro argument valid, every link live — and the reader who pastes it
+  into the project the quickstart just scaffolded gets `error[E0433]: failed to
+  resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
+  whose fix is a line in a file the page never showed them. Baseline: 78 gated
+  uses checked, **9 defects across 8 pages**. Three sat under a literal
+  "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
+  `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
+  read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
+  the missing line — "requires the `maud` feature; enabled together with `pdf`
+  in the quick start above", where the quick start above carried no
+  `Cargo.toml` at all. All nine are fixed in the same commit. Truth set is
+  parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs` and
+  `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
+  snapshot — so moving an item behind a new feature moves the gate in the same
+  commit; only column-zero declarations count, which keeps `lib.rs`'s five
+  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. Judged
+  only inside ```` ```rust ```` fences, since a feature gate is a *compile*
+  failure: a capability table naming `autumn_web::pdf::Pdf` describes an
+  example, it does not hand anyone a line. Presence is gated, placement is not
+  — three pages name the feature only after the code that needs it (worst:
+  `tauri-mobile-offline-sync.md`, +221 lines) and that count is printed on
+  every run rather than enforced, because a page whose enabling line sits in a
+  later "Prerequisites" section is a legitimate shape. A construct a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- feature-gate-allow: … — reason -->` marker; the baseline needed none.
+  Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit rather
+  than after its corpus had a chance to drift, for the reason #2709 exists.
+
 - **The docs symbol gate now covers every published crate, and rejects a path
   into a crate with no library target:** `scripts/check-docs-symbols.sh`
   scanned one prefix, `autumn_web::`, though it already modelled
