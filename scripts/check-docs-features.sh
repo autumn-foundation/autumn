@@ -1537,6 +1537,11 @@ def naming_patterns(feature):
         # `features = ['ws']` carries a complete enabling instruction. Matching
         # only the double-quoted form rejected it. Found by Codex review on
         # #2800.
+        # `[dev-dependencies.autumn-web]` and `[build-dependencies.…]` are
+        # dependency tables too — the first is where test documentation
+        # naturally puts `test-support` — and requiring the bare segment
+        # `dependencies` rejected both. Found by Codex review on #2800.
+        #
         # Cargo does not treat `-` and `_` as interchangeable in a dependency
         # table KEY, so `autumn_web = { … }` is autumn-web only when it also
         # carries `package = "autumn-web"`. That spelling is real — this
@@ -1547,9 +1552,10 @@ def naming_patterns(feature):
         rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         rf'autumn_web\s*=\s*\{{(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[(?:[a-z-]+\.)*dependencies\.autumn-web\][^\[]*?'
+        rf'\[(?:[a-z-]+\.)*(?:dev-|build-)?dependencies\.autumn-web\]'
+        rf'[^\[]*?'
         rf'features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[(?:[a-z-]+\.)*dependencies\.autumn_web\]'
+        rf'\[(?:[a-z-]+\.)*(?:dev-|build-)?dependencies\.autumn_web\]'
         rf'(?=[^\[]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^\[]*?features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         # A `--features` flag belongs to the package the COMMAND selects, and
@@ -1561,13 +1567,19 @@ def naming_patterns(feature):
         # Codex review on #2800, one round after the array fix it belonged
         # with.
         #
+        # `-F` is Cargo's documented short form of `--features`
+        # (`-F, --features <FEATURES>`), so `cargo build -F ws` is a complete
+        # instruction and rejecting it was a false positive. Found by Codex
+        # review on #2800.
+        #
         # The command counts unless it explicitly selects a package that is not
         # autumn-web. `cargo test -p autumn-web --features test-support`,
         # `cargo add autumn-web --features constela` and `autumn build
         # --features acme` (the framework's own CLI, building the reader's app)
         # all count; `cargo install diesel_cli --features postgres` does not.
         rf'(?m)^(?:[^\n]*?\$\s*)?(?!{_FOREIGN_PKG})'
-        rf'[^\n]*--features[^\n]*(?:[",\s=]|^){name}(?:[",\s]|$)',
+        rf'[^\n]*(?:--features|(?<![-\w])-F)[^\n]*'
+        rf'(?:[",\s=]|^){name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
         rf'\bfeatures?\b(?:\s+flag)?\s+`{name}`',
         # A `[features]` table row in the reader's OWN manifest counts only
@@ -2042,6 +2054,26 @@ def self_test():
            names_feature("realtime = ['autumn-web/ws']", 'ws'), True)
     # Cargo does not normalise `-`/`_` in a dependency KEY, so the underscore
     # spelling is autumn-web only alongside `package = "autumn-web"`.
+    # `dev-`/`build-dependencies` are dependency tables too, and `-F` is
+    # Cargo's short form of `--features`.
+    for spelling, feature, want in (
+            ('[dev-dependencies.autumn-web]\nfeatures = ["ws"]\n',
+             'ws', True),
+            ('[build-dependencies.autumn-web]\nfeatures = ["ws"]\n',
+             'ws', True),
+            ('[dev-dependencies.autumn_web]\npackage = "autumn-web"\n'
+             'features = ["ws"]\n', 'ws', True),
+            ('[dev-dependencies.axum]\nfeatures = ["ws"]\n', 'ws', False),
+            ('cargo build -F ws', 'ws', True),
+            ('cargo test -p autumn-web -F test-support', 'test-support', True),
+            ('cargo install diesel_cli -F postgres', 'postgres', False),
+            ('cargo add axum -F ws', 'ws', False),
+            ('some--Fws thing', 'ws', False)):
+        if names_feature(spelling, feature) != want:
+            failures.append(
+                f'naming: {spelling!r} / {feature} -> '
+                f'{names_feature(spelling, feature)}, want {want}')
+
     expect('a renamed dependency key counts',
            names_feature(
                'autumn_web = { package = "autumn-web", features = ["ws"] }',

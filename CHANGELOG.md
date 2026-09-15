@@ -152,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
   is tied to an `autumn-web` dependency — in either TOML string form, and
   including the `autumn_web = { package = "autumn-web", … }` rename Cargo
-  requires when the table key uses an underscore: unqualified, any crate's array satisfied the gate, and the corpus
+  requires when the table key uses an underscore, and in a `dev-`/`build-`
+  dependency table as readily as a plain one; `-F` counts as `--features`: unqualified, any crate's array satisfied the gate, and the corpus
   carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
   enables axum's websockets and nothing of autumn-web's.
   One level below the root resolves both gated MODULES and gated ITEMS, since
