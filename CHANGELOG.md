@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn_web::pdf`: content nested deeper than the 512-level layout cap
+  is no longer dropped silently (#2801):** the layout walker's
+  defense-in-depth depth cap previously omitted over-deep content with no
+  error, no log line, and no mention anywhere in the public module docs —
+  in direct conflict with the module's "degrades gracefully instead of
+  dropping content" promise. Every render that truncates anything now emits
+  one `tracing::warn!` naming the cap, and the cap (plus the warning) is
+  documented in the `autumn_web::pdf` module docs' new "Nesting depth
+  limit" section. The cap itself is unchanged — the parser stays iterative
+  and stack-safe, and the existing `deeply_nested_wrapper_tags_do_not_overflow_the_stack`
+  test still pins the no-panic behavior.
+
 - **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
   "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
   error-path inventory of `cms`'s content editor — `/admin/content/{type}`

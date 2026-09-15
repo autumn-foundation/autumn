@@ -49,6 +49,24 @@
 //! rather than spilling onto a second page — realistic scaffold tables
 //! (invoice line items, a handful of columns) never approach this.
 //!
+//! # Nesting depth limit
+//!
+//! Layout walks the parsed HTML tree recursively, so element nesting is
+//! capped at **512 levels**. The parser itself is iterative and stack-safe —
+//! adversarially deep markup can't blow the stack — but the layout walker's
+//! per-level recursion is deliberately bounded as defense in depth against
+//! pathological (adversarial or accidental) nesting, e.g. a runaway
+//! wrapper-per-iteration template bug or a recursively-rendered comment
+//! thread piped through [`Pdf::from_html`].
+//!
+//! Content nested deeper than the cap is **omitted** from the PDF — never
+//! silently: every render that truncates anything emits one `tracing::warn!`
+//! naming the cap, so a runaway template shows up in your logs instead of
+//! vanishing without a trace. 512 levels of literal nesting is far beyond
+//! anything a hand-written or generated invoice-style document reaches; if
+//! you ever see the warning, the HTML source almost certainly has a nesting
+//! bug worth fixing at the source.
+//!
 //! # Determinism
 //!
 //! Rendering the same HTML input always produces the same visible content:
