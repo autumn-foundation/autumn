@@ -2934,13 +2934,15 @@ PYEOF
 # a failure of the harness, not of anything it checks, and one that would have
 # read as a broken gate in CI.
 run_py() {
-  local program
-  program="$(mktemp -t check-docs-features.XXXXXX.py)"
+  local program status=0
+  program="$(mktemp)"
   printf '%s\n' "$PYSRC" > "$program"
-  python3 "$program" "$@"
-  local status=$?
+  # `|| status=$?` rather than a bare call: `set -e` is on, so a non-zero exit
+  # — which is exactly what a defect report is — would abort the function
+  # before the temp file could be removed.
+  python3 "$program" "$@" || status=$?
   rm -f "$program"
-  return $status
+  return "$status"
 }
 
 mode="${1:-}"
