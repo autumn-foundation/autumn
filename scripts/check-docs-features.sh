@@ -1246,8 +1246,10 @@ ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
 # `use autumn_web::{Mail, Mailer};` — ordinary use-tree syntax, and the corpus
 # writes 16 of them in rust fences. `PATH_USE` wants an identifier straight
 # after `::` and sees `{`, so every name in the group went unread. Found by
-# Codex review on #2800. Single-line groups only: the corpus writes no
-# multi-line one, and a line-at-a-time reader cannot see both ends of one.
+# Codex review on #2800. Both ends of the group have to be in the string this
+# is matched against, which is why `rust_fences` joins a multi-line `use` back
+# onto one line first — the claim that stood here, that the corpus writes no
+# multi-line group, was never measured and is false six times over.
 GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*)\}')
 # `use autumn_web::storage::{blob::Blob, variant::{Transform, VariantBudget}};`
 # — a group hanging off a MODULE segment, which `GROUP_USE` (anchored straight
@@ -1319,10 +1321,52 @@ def rust_fences(text):
     beside it. Neither is a live defect — `openapi.md` names its feature 340
     lines earlier — but a shape the extractor cannot see is a shape the gate
     does not cover. Found by Codex review on #2800.
+
+    A `use` whose group runs over several lines is joined back into one before
+    it is yielded — see `join_use_statements`.
     """
     for start, body in rust_fence_blocks(text):
-        for offset, line in enumerate(body):
+        for offset, line in join_use_statements(body):
             yield start + offset, line
+
+
+USE_START = re.compile(r'^\s*(?:pub\s+)?use\b')
+
+
+def join_use_statements(body):
+    """Yield (offset, text) with each multi-line `use` collapsed onto one.
+
+    rustfmt breaks a grouped import across lines as soon as it is long enough,
+    and every group pattern here needs BOTH braces in the string handed to it.
+    A line-at-a-time reader sees `use autumn_web::{`, then a bare `Mail,`, then
+    `};` — so the group went entirely unread and the path resolved to its head
+    alone, exactly the failure `MODULE_GROUP_USE` was added to fix for the
+    single-line spelling. The corpus writes six of these today
+    (`accessibility.md:29`, `experiments.md:253`, `feature-flags.md:284`,
+    `idempotency.md:301`, `runtime-config.md:23`, `web-push.md:354`); none is a
+    live defect, because every child in them is ungated surface, but
+    `idempotency::{…}` is one `RedisIdempotencyStore` away from being one.
+    Found by Codex review on #2800.
+
+    The run is ended by brace DEPTH, not by a `;`, and it cannot leave the
+    fence: an unclosed group swallows the rest of that snippet and no more. The
+    reported line is the one the `use` STARTS on, which is where a reader looks
+    for it.
+    """
+    offset = 0
+    while offset < len(body):
+        line = body[offset]
+        depth = line.count('{') - line.count('}')
+        if USE_START.match(line) and depth > 0:
+            start, parts = offset, [line.strip()]
+            while depth > 0 and offset + 1 < len(body):
+                offset += 1
+                parts.append(body[offset].strip())
+                depth += body[offset].count('{') - body[offset].count('}')
+            yield start, ' '.join(parts)
+        else:
+            yield offset, line
+        offset += 1
 
 
 def rust_fence_blocks(text):
@@ -1504,6 +1548,17 @@ _FOREIGN_PKG = (
     rf'(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*'
     rf'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*)')
 
+# What may sit between the `[` and `dependencies` of a dependency table. Cargo
+# puts platform-specific dependencies under `[target.<what>.dependencies.<dep>]`
+# where `<what>` is either a quoted cfg expression or a bare target triple, and
+# the corpus writes both forms (`docs/guide/edge.md:114`,
+# `docs/guide/platform-support.md:70`). A prefix of `[a-z-]+\.` components can
+# consume neither the quotes and parentheses of `'cfg(unix)'` nor the digits and
+# underscores of `x86_64-pc-windows-msvc`, so a page declaring a platform-gated
+# autumn-web with its features was rejected while carrying a complete enabling
+# instruction. Found by Codex review on #2800.
+_TABLE_PREFIX = r'''(?:(?:[a-z][a-z0-9_-]*|'[^'\n]*'|"[^"\n]*")\.)*'''
+
 
 def naming_patterns(feature):
     """The spellings that tell a reader how to turn `feature` on.
@@ -1552,10 +1607,10 @@ def naming_patterns(feature):
         rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         rf'autumn_web\s*=\s*\{{(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[(?:[a-z-]+\.)*(?:dev-|build-)?dependencies\.autumn-web\]'
+        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn-web\]'
         rf'[^\[]*?'
         rf'features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[(?:[a-z-]+\.)*(?:dev-|build-)?dependencies\.autumn_web\]'
+        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn_web\]'
         rf'(?=[^\[]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^\[]*?features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         # A `--features` flag belongs to the package the COMMAND selects, and
@@ -1577,9 +1632,32 @@ def naming_patterns(feature):
         # `cargo add autumn-web --features constela` and `autumn build
         # --features acme` (the framework's own CLI, building the reader's app)
         # all count; `cargo install diesel_cli --features postgres` does not.
+        #
+        # `--features autumn-web/tls` is the dependency-qualified spelling, and
+        # it is not hypothetical: `docs/guide/tls.md:71` and `:334` are the
+        # corpus's own fallback instruction for a reader who has not declared
+        # the forwarding `[features]` row. Requiring a delimiter immediately
+        # before the bare name rejected a complete instruction this repository
+        # publishes. The qualifier has to be autumn-web's own — `--features
+        # diesel/postgres` still names nothing of autumn-web's. Found by Codex
+        # review on #2800.
+        #
+        # `-Fws` attaches the value straight to the short flag, which Cargo
+        # accepts (`-F, --features <FEATURES>`) and before which there is no
+        # delimiter at all — so the separator is optional after `-F` and
+        # required after `--features`. Found by Codex review on #2800, one
+        # round after `-F` itself was added: the flag reached the command
+        # parser and not the naming rule, the fourth time in this review that a
+        # fix landed on one of two code paths.
+        #
+        # One alternation rather than two patterns because this is the most
+        # expensive row in the tuple by an order of magnitude — 0.06s per pass
+        # against 0.002s for a dependency table — and it runs once per (page,
+        # feature) pair. A second copy of it cost the whole gate 20%.
         rf'(?m)^(?:[^\n]*?\$\s*)?(?!{_FOREIGN_PKG})'
-        rf'[^\n]*(?:--features|(?<![-\w])-F)[^\n]*'
-        rf'(?:[",\s=]|^){name}(?:[",\s]|$)',
+        rf'[^\n]*(?:--features[^\n]*(?:[",\s=]|^)'
+        rf'|(?<![-\w])-F(?:[^\n]*(?:[",\s=]|^))?)'
+        rf'(?:autumn[-_]web/)?{name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
         rf'\bfeatures?\b(?:\s+flag)?\s+`{name}`',
         # A `[features]` table row in the reader's OWN manifest counts only
@@ -1927,6 +2005,52 @@ def self_test():
     expect('a group outside a rust fence is not read',
            found('`use autumn_web::{Mail, Mailer};`\n'), [])
 
+    # rustfmt breaks a group across lines as soon as it is long enough, and a
+    # line-at-a-time reader sees neither end of one. The corpus writes six.
+    # Reported against the line the `use` STARTS on.
+    expect('a multi-line root group is read',
+           found('```rust\nuse autumn_web::{\n    Mail,\n    Mailer,\n};\n```\n'),
+           [(2, 'mail', 'autumn_web::Mail'),
+            (2, 'mail', 'autumn_web::Mailer')])
+    # The invariant that matters for the module-segment forms is that breaking
+    # a group over lines changes NOTHING: same features, same shown paths, same
+    # line, same duplicates. Asserted against the single-line twin rather than
+    # a hand-written list, so it cannot drift away from the shape it mirrors.
+    expect('a multi-line module group reads as its single-line twin',
+           found('```rust\nuse autumn_web::storage::{\n'
+                 '    variant::Transform,\n};\n```\n'),
+           found('```rust\nuse autumn_web::storage::{variant::Transform};\n'
+                 '```\n'))
+    expect('a multi-line nested group reads as its single-line twin',
+           found('```rust\nuse autumn_web::storage::{\n    blob::Blob,\n'
+                 '    variant::{\n        Transform,\n    },\n};\n```\n'),
+           found('```rust\nuse autumn_web::storage::'
+                 '{blob::Blob, variant::{Transform}};\n```\n'))
+    # ...and that the twin it mirrors reaches the inner segment at all.
+    expect('...and that twin reaches `variants`',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::storage::{\n'
+               '    variant::Transform,\n};\n```\n')}),
+           ['storage', 'variants'])
+    expect('a multi-line uppercase child resolves',
+           found('```rust\nuse autumn_web::{\n    openapi::Parameter,\n};\n```\n'),
+           [(2, 'openapi', 'autumn_web::openapi::Parameter')])
+    expect('an ungated multi-line group reports nothing',
+           found('```rust\nuse autumn_web::{\n    get,\n    post,\n};\n```\n'),
+           [])
+    # The join is ended by brace depth AND by the fence, so an unclosed group
+    # cannot swallow the snippet after it.
+    expect('an unclosed multi-line group stops at the fence',
+           found('```rust\nuse autumn_web::{\n    Mail,\n```\n\nprose\n\n'
+                 '```rust\nuse autumn_web::pdf::Pdf;\n```\n'),
+           [(9, 'pdf', 'autumn_web::pdf')])
+    # A `use` with no group is not joined, so the line after it keeps its own
+    # number.
+    expect('consecutive single-line uses keep their own lines',
+           found('```rust\nuse autumn_web::pdf::Pdf;\n'
+                 'use autumn_web::channels::Channels;\n```\n'),
+           [(2, 'pdf', 'autumn_web::pdf'), (3, 'ws', 'autumn_web::channels')])
+
     # A bang macro exported from the crate root under a `#[cfg]`. The three-
     # character floor keeps `t!` out by construction; membership in the `bang`
     # set keeps everything else out.
@@ -2068,7 +2192,36 @@ def self_test():
             ('cargo test -p autumn-web -F test-support', 'test-support', True),
             ('cargo install diesel_cli -F postgres', 'postgres', False),
             ('cargo add axum -F ws', 'ws', False),
-            ('some--Fws thing', 'ws', False)):
+            ('some--Fws thing', 'ws', False),
+            # `-F` takes its value attached as well as separated, and no
+            # delimiter precedes the name in that spelling.
+            ('cargo build -Fws', 'ws', True),
+            ('cargo build -Fautumn-web/ws', 'ws', True),
+            ('cargo install diesel_cli -Fpostgres', 'postgres', False),
+            # The dependency-qualified spelling, which the corpus itself
+            # publishes at `docs/guide/tls.md:71` and `:334` as the fallback
+            # for a reader with no forwarding `[features]` row.
+            ('cargo run --features autumn-web/tls', 'tls', True),
+            ('cargo run --features autumn_web/tls', 'tls', True),
+            ('cargo build --release --features autumn-web/acme', 'acme', True),
+            # The qualifier has to be autumn-web's own.
+            ('cargo run --features diesel/postgres', 'postgres', False),
+            ('cargo run --features tokio/ws', 'ws', False),
+            # Platform-specific dependency tables are dependency tables.
+            ("[target.'cfg(unix)'.dependencies.autumn-web]\n"
+             'features = ["ws"]\n', 'ws', True),
+            ("[target.'cfg(unix)'.dev-dependencies.autumn-web]\n"
+             'features = ["ws"]\n', 'ws', True),
+            ('[target."cfg(windows)".dependencies.autumn-web]\n'
+             'features = ["ws"]\n', 'ws', True),
+            ('[target.x86_64-pc-windows-msvc.dependencies.autumn-web]\n'
+             'features = ["ws"]\n', 'ws', True),
+            ("[target.'cfg(unix)'.dependencies.autumn_web]\n"
+             'package = "autumn-web"\nfeatures = ["ws"]\n', 'ws', True),
+            # ...and a platform-specific table for a DIFFERENT crate is still
+            # a different crate.
+            ("[target.'cfg(unix)'.dependencies.axum]\nfeatures = [\"ws\"]\n",
+             'ws', False)):
         if names_feature(spelling, feature) != want:
             failures.append(
                 f'naming: {spelling!r} / {feature} -> '
