@@ -22,8 +22,24 @@ Sampled `ci.yml` `pull_request`-triggered runs from the 2026-09-14 report's
 own cutoff (2026-09-14T08:00:19Z) to 2026-09-15T09:39:00Z (~25.6 hours, one
 `perPage=100` page whose own span, 2026-09-13T20:09:37Z–2026-09-15T09:39:00Z,
 fully covers the window with margin on both ends, so no second page was
-needed). 68 runs in window: 50 cancelled, 11 success, 7 failure. All 7
-run-level failures triaged by job/log inspection (cancelled-run job-level
+needed). 68 runs in window: 50 cancelled, 11 success, 7 failure. Full ID
+list, anchored per the 2026-09-14 report's own correction against this same
+moving-page problem: **failures (7)** — 34867438081, 34877258106,
+34881729206, 34882678393, 34882747248, 34907660727, 34934228774.
+**Success (11)** — 34820504735, 34834847027, 34871417092, 34889464887,
+34890530960, 34907694152, 34908356868, 34908659972, 34909746568,
+34932405295, 34941314264. **Cancelled (50)** — 34832109780, 34832912451,
+34833276393, 34833954431, 34834252637, 34834645232, 34860640476,
+34861241168, 34861963614, 34862658187, 34863353990, 34864149372,
+34864632052, 34865101856, 34865541615, 34866030108, 34866558554,
+34867112043, 34868794407, 34869762877, 34870497392, 34870748755,
+34875860847, 34876412517, 34876529090, 34878196522, 34884872834,
+34888975210, 34889309749, 34906480829, 34925919203, 34927845483,
+34930410553, 34937618932, 34938484676, 34939235093, 34940156190,
+34940893460, 34941771047, 34942695642, 34943645230, 34944322469,
+34945041145, 34946033960, 34947362200, 34948366587, 34949380282,
+34950538560, 34952452212, 34953664685. All 7 run-level failures triaged by
+job/log inspection (cancelled-run job-level
 sampling, per the 2026-09-14 report's methodology, was not repeated this
 pass — see Measurement for the scope this leaves uncovered).
 
@@ -194,7 +210,7 @@ report's own first draft mistakenly did before its correction.
 | `cache_stampede` | No occurrence in any log actually inspected this pass | Unchanged, undiagnosed |
 | `sim_fault_plan` | No occurrence; `sim_fault_plan_pg` sibling passed | Unchanged, undiagnosed |
 | `job_tracking_stores_integration` | **Second organic hit, same exact signature** (run 34934228774) | **Escalated**: repeat signature per the entry's own stated trigger; still not campaigned |
-| RUSTSEC-2026-0285 / `Supply chain (cargo-deny)` | 5 run-level failures observed across ~7h (16:15–23:11Z), fixed by PR #2790 at 23:07:59Z, 3 post-fix runs confirmed green | Closed as Tier-1 escape analysis (below); no action needed |
+| RUSTSEC-2026-0285 / `Supply chain (cargo-deny)` | 5 run-level failures observed within a ~2.5h failure span (16:15:15Z–18:45:27Z); fixed by PR #2790 at 23:07:59Z (~6h53m after the earliest failure, making the full incident-to-fix window ~7h); 3 post-fix runs confirmed green | Closed as Tier-1 escape analysis (below); no action needed |
 | `manual-macos-contention-check.yml` dispatches | 0 → 0 | 7th consecutive idle pass, ~162.5h |
 | Cancelled-run job-level check | Not performed this pass | Gap, not a zero-hit finding — see note above |
 

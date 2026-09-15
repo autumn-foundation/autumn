@@ -1072,10 +1072,12 @@ without also filling in the intake form above.
   isolating experiment (e.g. asserting on `updated_at` to see which write,
   if either, actually fired), so treat the verdict as provisional per this
   role's own bar.
-- **Status**: n=1, not campaigned. Logged here for recognition per this
-  role's standard for a first hit; escalate to a rerun campaign only if a
-  repeat signature appears. Not quarantined — the Docker sweep is
-  unmodified and this test keeps running on every sweep.
+- **Status**: n=2 as of 2026-09-15 (see that dated update below) — escalated
+  out of "n=1, not campaigned" per this entry's own stated trigger, a repeat
+  signature. Not yet campaigned: a same-commit rerun-rate harness is
+  recommended (see the 2026-09-15 update) but not yet built. Not
+  quarantined — the Docker sweep is unmodified and this test keeps running
+  on every sweep.
 - **2026-09-13 update**: no repeat in the ~19h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
