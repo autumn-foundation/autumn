@@ -392,45 +392,116 @@ pub async fn show_invitation(
                 "Accept invitation",
                 false,
                 csrf_value(&csrf),
-                html! {
-                    div class="bg-white rounded-lg shadow p-6 max-w-md" {
-                        h1 class="text-xl font-bold mb-2" { "Join " (organization.name) }
-                        p class="text-gray-600 mb-4" {
-                            "You've been invited as " (invitation.role)
-                            ". Create an account to accept."
-                        }
-                        form action={"/invite/" (raw_token) "/accept"} method="post" class="space-y-4" {
-                            input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                            div {
-                                label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                                input #email type="email" value=(invitation.email) readonly disabled
-                                      class="w-full border rounded px-3 py-2 bg-gray-100";
-                            }
-                            div {
-                                label for="password" class="block text-sm font-medium mb-1" { "Password" }
-                                input #password type="password" name="password" required
-                                      autocomplete="new-password" class="w-full border rounded px-3 py-2";
-                            }
-                            button type="submit"
-                                   class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700" {
-                                "Create account and join"
-                            }
-                        }
-                    }
-                },
+                accept_signup_form(
+                    &organization.name,
+                    &invitation.role,
+                    &invitation.email,
+                    &raw_token,
+                    csrf_value(&csrf),
+                    None,
+                ),
             )
         }
     };
     Ok(page.into_response())
 }
 
+/// The "create an account to accept" card: rendered by [`show_invitation`]
+/// for a not-yet-registered invitee, and re-rendered by [`accept_invitation`]
+/// (via [`redisplay_accept_signup`]) at 422 when the submitted password is
+/// rejected. The email is fixed to the invited address (`readonly`/
+/// `disabled`, never resubmitted), so only the error message and the
+/// password field's `aria-invalid` state need to reflect a rejected
+/// submission.
+fn accept_signup_form(
+    organization_name: &str,
+    role: &str,
+    email: &str,
+    raw_token: &str,
+    csrf_token: &str,
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        div class="bg-white rounded-lg shadow p-6 max-w-md" {
+            h1 class="text-xl font-bold mb-2" { "Join " (organization_name) }
+            p class="text-gray-600 mb-4" {
+                "You've been invited as " (role) ". Create an account to accept."
+            }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
+            form action={"/invite/" (raw_token) "/accept"} method="post" class="space-y-4" {
+                input type="hidden" name="_csrf" value=(csrf_token);
+                div {
+                    label for="email" class="block text-sm font-medium mb-1" { "Email" }
+                    input #email type="email" value=(email) readonly disabled
+                          class="w-full border rounded px-3 py-2 bg-gray-100";
+                }
+                div {
+                    label for="password" class="block text-sm font-medium mb-1" { "Password" }
+                    input #password type="password" name="password" required
+                          aria-invalid=(if error.is_some() { "true" } else { "false" })
+                          autocomplete="new-password" class="w-full border rounded px-3 py-2";
+                }
+                button type="submit"
+                       class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700" {
+                    "Create account and join"
+                }
+            }
+        }
+    }
+}
+
+/// Redisplay [`accept_signup_form`] at 422 with `message` shown next to the
+/// password field, instead of the generic JSON/error-page response a bare
+/// `?`/`Err(...)` would produce — see the call sites in [`accept_invitation`]
+/// (Wayfinder: error-path inventory).
+async fn redisplay_accept_signup(
+    org_repo: &PgOrganizationRepository,
+    invitation: &Invitation,
+    raw_token: &str,
+    csrf: &Option<CsrfToken>,
+    email: &str,
+    message: &str,
+) -> AutumnResult<Response> {
+    let Some(organization) = org_repo
+        .find_by_id(parse_tenant_id(&invitation.tenant_id)?)
+        .await?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            invitation_error_page(
+                csrf_value(csrf),
+                "This invitation's organization no longer exists.",
+            ),
+        )
+            .into_response());
+    };
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        accept_signup_form(
+            &organization.name,
+            &invitation.role,
+            email,
+            raw_token,
+            csrf_value(csrf),
+            Some(message),
+        ),
+    )
+        .into_response())
+}
+
 // ── Accept (confirm) ─────────────────────────────────────────────────────────
 
 #[post("/invite/{token}/accept")]
+// Every argument is a distinct axum extractor; org_repo is needed only to
+// redisplay the accept form on a rejected password.
+#[allow(clippy::too_many_arguments)]
 pub async fn accept_invitation(
     session: Session,
     mut db: Db,
     invitation_repo: PgInvitationRepository,
+    org_repo: PgOrganizationRepository,
     State(state): State<AppState>,
     csrf: Option<CsrfToken>,
     Path(raw_token): Path<String>,
@@ -492,15 +563,36 @@ pub async fn accept_invitation(
                 ));
             }
             None => {
+                // Each of these three rejections used to `Err(...)` out to
+                // the generic JSON/error-page response, dropping the invitee
+                // off the accept page entirely — the same anti-pattern
+                // already fixed on `routes::auth::signup` (Wayfinder:
+                // error-path inventory). They now redisplay the same
+                // "create an account to accept" card the GET page renders,
+                // with the rejection message shown next to the password
+                // field; the email is `readonly` in that form, so it's the
+                // only field that ever needs to survive the round trip.
                 let Some(password) = form.password.as_deref().filter(|p| !p.is_empty()) else {
-                    return Err(AutumnError::unprocessable_msg(
+                    return redisplay_accept_signup(
+                        &org_repo,
+                        &invitation,
+                        &raw_token,
+                        &csrf,
+                        &email,
                         "A password is required to create your account",
-                    ));
+                    )
+                    .await;
                 };
                 if password.len() > 128 {
-                    return Err(AutumnError::unprocessable_msg(
+                    return redisplay_accept_signup(
+                        &org_repo,
+                        &invitation,
+                        &raw_token,
+                        &csrf,
+                        &email,
                         "Password must be at most 128 characters",
-                    ));
+                    )
+                    .await;
                 }
                 // Read through the shared `Arc`: `config()` would deep-clone
                 // every config section to reach `[auth.password]`.
@@ -515,7 +607,15 @@ pub async fn accept_invitation(
                     } else {
                         messages.join("\n")
                     };
-                    return Err(AutumnError::unprocessable_msg(message));
+                    return redisplay_accept_signup(
+                        &org_repo,
+                        &invitation,
+                        &raw_token,
+                        &csrf,
+                        &email,
+                        &message,
+                    )
+                    .await;
                 }
                 let password_hash = hash_password(password).await?;
                 Joiner::New {
@@ -911,4 +1011,78 @@ pub async fn resend_invitation(
         .await?;
 
     Ok(Redirect::to("/members").into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Baseline (no error): renders the invited email read-only, the form
+    /// posting to this exact token's accept endpoint, and no alert.
+    #[test]
+    fn accept_signup_form_clean_when_no_error() {
+        let html = accept_signup_form(
+            "Acme Inc",
+            "admin",
+            "invitee@example.com",
+            "tok123",
+            "csrf-abc",
+            None,
+        )
+        .into_string();
+        assert!(html.contains("Join Acme Inc"), "{html}");
+        assert!(html.contains("invited as admin"), "{html}");
+        assert!(html.contains(r#"value="invitee@example.com""#), "{html}");
+        assert!(html.contains("readonly"), "{html}");
+        assert!(html.contains(r#"action="/invite/tok123/accept""#), "{html}");
+        assert!(html.contains(r#"value="csrf-abc""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+    }
+
+    /// A rejected submission (Wayfinder: error-path inventory) shows the
+    /// message next to the password field, flags it `aria-invalid`, and
+    /// still preserves the invited email and the form's target token — the
+    /// only thing that changed is the password was wrong, so nothing else
+    /// should reset.
+    #[test]
+    fn accept_signup_form_shows_error_and_preserves_context() {
+        let html = accept_signup_form(
+            "Acme Inc",
+            "member",
+            "invitee@example.com",
+            "tok123",
+            "csrf-abc",
+            Some("Password must be at most 128 characters"),
+        )
+        .into_string();
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(
+            html.contains("Password must be at most 128 characters"),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"value="invitee@example.com""#), "{html}");
+        assert!(html.contains(r#"action="/invite/tok123/accept""#), "{html}");
+    }
+
+    #[test]
+    fn accept_signup_form_never_echoes_a_password_value() {
+        let html = accept_signup_form(
+            "Acme Inc",
+            "member",
+            "invitee@example.com",
+            "tok123",
+            "csrf-abc",
+            Some("A password is required to create your account"),
+        )
+        .into_string();
+        // The password field must always come back empty — only the
+        // (read-only) email is ever repopulated from the invitation.
+        assert!(
+            html.contains(r#"type="password" name="password" required"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="password" value"#), "{html}");
+    }
 }
