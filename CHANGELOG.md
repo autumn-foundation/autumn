@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Clear `AUTUMN_DUMP_CACHE_COHERENCE` before spawning later one-shot
+  children (#2370):** `AUTUMN_DUMP_CACHE_COHERENCE` is dispatched earlier
+  than the jobs, task, retention and replay one-shots in `AppBuilder::run`,
+  and `std::process::Command` inherits the parent environment — but
+  `autumn jobs manifest`, `autumn task --list` and `autumn task <name>`
+  cleared only the data-flow/agent-authority/graph dump vars, so an ambient
+  `AUTUMN_DUMP_CACHE_COHERENCE=1` silently answered the child with the
+  cache-coherence manifest instead of the jobs TOML, the task listing
+  JSON, or the task run itself. The var now has the same named
+  `cache_audit::DUMP_ENV` const the other dump modes carry, and both
+  commands strip it via a testable `clear_competing_dump_modes` helper
+  (regression tests pin all four removed vars). Note: `autumn cache audit`
+  still only clears `AUTUMN_BUILD_STATIC`/`AUTUMN_DUMP_ROUTES` before its
+  own child — an ambient `AUTUMN_DUMP_OPENAPI=1` (dispatched just ahead of
+  the coherence dump) is the same bug class on a newer var, left as a
+  separate follow-up.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the

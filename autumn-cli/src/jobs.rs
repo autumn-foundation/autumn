@@ -27,29 +27,37 @@ pub struct ManifestOptions<'a> {
     pub output: &'a str,
 }
 
+/// Strip the one-shot dump modes that `AppBuilder::run` dispatches before
+/// `AUTUMN_DUMP_JOBS` from a child command's inherited environment.
+///
+/// `Command` inherits this process's environment by default, and any of these
+/// left over in the CLI's own environment would answer this command with that
+/// manifest instead of the jobs one (AUTUMN_DUMP_CACHE_COHERENCE in
+/// particular — issue #2370).
+fn clear_competing_dump_modes(command: &mut Command) {
+    command
+        .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
+        .env_remove(crate::cache_audit::DUMP_ENV);
+}
+
 /// Run `autumn jobs manifest`.
 pub fn run(opts: &ManifestOptions<'_>) {
     eprintln!("\u{1F342} autumn jobs manifest\n");
     compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .env("AUTUMN_DUMP_JOBS", "1")
-        // `Command` inherits this process's environment, and both
-        // `AUTUMN_DUMP_DATA_FLOW` and `AUTUMN_DUMP_AGENT_AUTHORITY` are
-        // dispatched *earlier* than `AUTUMN_DUMP_JOBS` in `AppBuilder::run`:
-        // one left over in the CLI's own environment would answer this command
-        // with that manifest instead of the jobs one.
-        .env_remove(crate::data_flow::DUMP_ENV)
-        .env_remove(crate::agents::DUMP_ENV)
-        .env_remove(crate::graph::DUMP_ENV)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
+        .stderr(std::process::Stdio::inherit());
+    clear_competing_dump_modes(&mut command);
+    let output = command.output().unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+        std::process::exit(1);
+    });
 
     let stdout = match manifest_from_child(
         output.status.success(),
@@ -160,6 +168,58 @@ fn write_manifest(path: &Path, contents: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── clear_competing_dump_modes ──────────────────────────────────────────
+
+    #[test]
+    fn clear_competing_dump_modes_removes_every_earlier_mode_var() {
+        // Each of these is dispatched before AUTUMN_DUMP_JOBS in
+        // AppBuilder::run's dispatch chain, so any one left in the CLI's own
+        // environment would hijack `autumn jobs manifest` into a different
+        // dump (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
+        let competing = [
+            crate::data_flow::DUMP_ENV,
+            crate::agents::DUMP_ENV,
+            crate::graph::DUMP_ENV,
+            crate::cache_audit::DUMP_ENV,
+        ];
+        let mut command = Command::new("true");
+        for var in competing {
+            command.env(var, "1");
+        }
+
+        clear_competing_dump_modes(&mut command);
+
+        for var in competing {
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(var));
+            assert_eq!(
+                value,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly removed: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_cache_coherence_dump_cannot_hijack_the_jobs_manifest() {
+        // The issue's exact scenario: AUTUMN_DUMP_CACHE_COHERENCE is checked
+        // before AUTUMN_DUMP_JOBS in AppBuilder::run, so an ambient `=1` would
+        // have answered `autumn jobs manifest` with the coherence manifest
+        // instead of the TOML queues document (issue #2370).
+        let mut command = Command::new("true");
+        command.env(crate::cache_audit::DUMP_ENV, "1");
+        clear_competing_dump_modes(&mut command);
+        let survived = command
+            .get_envs()
+            .any(|(key, value)| key == crate::cache_audit::DUMP_ENV && value.is_some());
+        assert!(
+            !survived,
+            "an inherited {}=1 must never survive into the jobs-manifest child",
+            crate::cache_audit::DUMP_ENV
+        );
+    }
 
     // ── manifest_from_child ─────────────────────────────────────────────────
 
