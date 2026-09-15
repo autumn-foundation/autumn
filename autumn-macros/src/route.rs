@@ -363,11 +363,19 @@ pub fn route_macro(
 ///   (`parse::extract_interceptors`), never registered as its own attribute
 ///   macro, so left on the handler it would fail to resolve and add
 ///   "cannot find attribute `intercept`" on top of the real diagnostic.
+/// - Re-emit `#[api_doc(...)]` verbatim either. It *is* a real, independently
+///   registered attribute macro (`#[proc_macro_attribute] pub fn api_doc`),
+///   but only under its full path or when the caller's module has it in
+///   scope; a caller that wrote `use autumn_web::{get, routes};` (not the
+///   prelude) never imported the bare name, so re-emitting it unqualified
+///   fails to resolve too. The successful path always consumes it via
+///   `api_doc::extract` before emitting `input_fn` — this path must match.
 fn emit_with_attr_parse_error(item: &TokenStream, err: &TokenStream) -> TokenStream {
     let Ok((leading_items, mut input_fn)) = parse::split_leading_items_and_fn(item) else {
         return quote! { #item #err };
     };
     parse::extract_interceptors(&mut input_fn.attrs);
+    let _ = api_doc::extract(&mut input_fn.attrs);
     let vis = &input_fn.vis;
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{fn_name}");
@@ -1037,6 +1045,36 @@ mod tests {
         assert!(
             !generated.contains("intercept"),
             "`#[intercept(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_api_doc_marker() {
+        // Codex review, PR #2798, second round: `#[api_doc(...)]` *is* a real
+        // registered attribute macro, but a caller who wrote
+        // `use autumn_web::{get, routes};` (not the prelude) never imported
+        // the bare `api_doc` name into scope, so re-emitting it unqualified
+        // fails to resolve too -- a different "cannot find attribute" on top
+        // of the real diagnostic. The successful path always consumes it via
+        // `api_doc::extract` before emitting `input_fn`; this path must too.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[api_doc(summary = "Fetch a user by id")]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("api_doc"),
+            "`#[api_doc(...)]` must not survive onto the re-emitted handler: {generated}"
         );
         assert!(
             generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
