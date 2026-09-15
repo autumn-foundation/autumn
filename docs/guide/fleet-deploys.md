@@ -443,20 +443,20 @@ send an [operator alert](operator-alerts.md) through your `[alerts]` config:
 - `autumn deploy up` sends one the moment a rollout halts.
 - `autumn deploy status --strict` sends one when it finds drift.
 
-Both alerts use the `scheduled_task_failure` condition and carry only host
-names and the drift/halt reason strings — the same values the command
-already prints. Both are best-effort: a failed send never changes the
-command's exit code, and a plain `deploy status` (no `--strict`) never
-sends one.
+Both alerts use the `scheduled_task_failure` condition. They carry only host
+names and the drift or halt reason strings. These are the same values the
+command already prints. Delivery is best-effort. A failed send never
+changes the command's exit code. A plain `deploy status` (no `--strict`)
+never sends an alert.
 
-Set a destination once under `[alerts]` and both paths use it:
+Set a channel once under `[alerts]` and both paths use it:
 
 ```toml
 [alerts]
 pagerduty_routing_key = "…"   # or slack_webhook_url / discord_webhook_url / webhook_url
 ```
 
-> **Email is not a destination for these two alerts.** `[alerts] email`
+> **Email is not a channel for these two alerts.** `[alerts] email`
 > needs a running mailer. A one-shot CLI command has none. Use PagerDuty,
 > Slack, Discord, or a signed webhook instead. Run `autumn alert test` to
 > check your channels are wired up.

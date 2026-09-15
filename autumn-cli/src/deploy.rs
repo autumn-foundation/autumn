@@ -4662,8 +4662,8 @@ fn deploy_alert_channels() -> Vec<Arc<dyn AlertChannel>> {
 ///
 /// Use a short-lived runtime, like `autumn alert test` does. Log a failed
 /// delivery. Do not stop for it. This must never change the command's exit
-/// code. Do nothing when `channels` is empty — the case with no `[alerts]`
-/// destination set.
+/// code. Do nothing when `channels` is empty. This happens when `[alerts]`
+/// has no channel set.
 fn deliver_alert(channels: &[Arc<dyn AlertChannel>], alert: &Alert) {
     if channels.is_empty() {
         return;
@@ -4707,13 +4707,13 @@ fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
 
 /// Build the alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
 ///
-/// This is a pure function. It does no I/O, so a test can call it directly.
+/// This is a pure function. It does no I/O. So a test can call it directly.
 /// It reuses the `ScheduledTaskFailure` condition. It does not add a new
 /// `AlertCondition` variant. Issue #1743 made the same choice for a failed
-/// backup upload: a halted rollout is a framework-driven task that did not
-/// finish.
+/// backup upload. A halted rollout is also a task the framework runs, and
+/// it did not finish.
 ///
-/// Every field on `halt` is a host name or a fixed op label (see
+/// Every field on `halt` is a host name or a fixed operation label (see
 /// [`FleetHalt`]). So this alert can never carry a shell line or a raw
 /// driver error.
 fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
@@ -4737,8 +4737,8 @@ fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
 ///
 /// This runs on any halt, if `[alerts]` names a channel. If no channel is
 /// set, this builds an empty list and does nothing. So an operator with no
-/// alert destination sees the same behavior as before: a message and a
-/// non-zero exit.
+/// alert channel sees the same behavior as before. They see a message and
+/// a non-zero exit.
 fn emit_fleet_halted_alert(halt: &FleetHalt) {
     deliver_alert(&deploy_alert_channels(), &build_fleet_halted_alert(halt));
 }
@@ -4784,11 +4784,11 @@ fn build_drift_alert(report: &fleet::DriftReport, profile: &str) -> Alert {
 }
 
 /// Send an alert for drift found by `deploy status --strict` (issue #2267,
-/// AC-6 of #1621) — the cron path in `docs/guide/fleet-deploys.md`.
+/// AC-6 of #1621). This is the cron path in `docs/guide/fleet-deploys.md`.
 ///
-/// This does nothing if `[alerts]` has no destination set. The caller must
-/// call this only in `--strict` mode: a plain `deploy status` check must
-/// never page anyone.
+/// This does nothing if `[alerts]` has no channel set. The caller must call
+/// this only in `--strict` mode. A plain `deploy status` check must never
+/// page anyone.
 fn emit_drift_alert(report: &fleet::DriftReport, profile: &str) {
     deliver_alert(
         &deploy_alert_channels(),
@@ -5397,7 +5397,7 @@ fn run_status(
     }
     if options.strict && report.drifted() {
         // #2267: send a #1610 alert for the drift. This runs only in
-        // `--strict` mode: an interactive `deploy status` must not page
+        // `--strict` mode. An interactive `deploy status` must not page
         // anyone.
         emit_drift_alert(&report, profile);
         return Err(DeployError::DriftDetected);
