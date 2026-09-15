@@ -581,6 +581,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Macro crate split: `autumn-macros` is now four crates.**
+  The database-layer codegen — `#[model]`/`#[commentable]` (`model.rs`),
+  `#[repository]` (`repository.rs`), `#[service]` (`service.rs`), ~45k of the
+  crate's ~87k lines — moved into the new proc-macro crates
+  `autumn-macros-model` and `autumn-macros-repository`. The genuinely shared
+  helpers (crate-path rewriting, schema emission, table-name inference and
+  pluralisation, `unwrap_single_generic`) moved into the plain library
+  `autumn-macros-support`, which each proc-macro dylib links. Core
+  `autumn-macros` keeps every route/handler/edge macro unchanged, including
+  `#[oauth2_callback]` (it depends on core `route`/`edge`, so it was never a
+  DB-gating candidate despite an earlier report suggesting it). `autumn-web`'s
+  `db` feature now enables the two new crates as optional dependencies instead
+  of `autumn-macros/db` (kept as a no-op for compatibility); all public
+  `autumn_web::{model, repository, service}` re-export paths are unchanged, and
+  `autumn-edge` still depends only on the core macro crate. A no-database
+  build never compiles the DB codegen at all.
 - **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
   CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
   `csrf.rs` and `submit_token.rs` each carried a byte-identical private

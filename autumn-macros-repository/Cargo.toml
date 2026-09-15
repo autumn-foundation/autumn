@@ -1,0 +1,21 @@
+[package]
+name = "autumn-macros-repository"
+description = "Repository proc macros for the Autumn web framework (#[repository]); split from autumn-macros so DB codegen only compiles when the db feature is enabled"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+autumn-macros-support.path = "../autumn-macros-support"
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+proc-macro-crate.workspace = true
+
+[lints]
+workspace = true
