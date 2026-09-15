@@ -150,7 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another package (`cargo install diesel_cli --features postgres` does not),
   a local `[features]` row counts only when it forwards
   (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
-  is tied to an `autumn-web` dependency: unqualified, any crate's array satisfied the gate, and the corpus
+  is tied to an `autumn-web` dependency — in either TOML string form: unqualified, any crate's array satisfied the gate, and the corpus
   carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
   enables axum's websockets and nothing of autumn-web's.
   One level below the root resolves both gated MODULES and gated ITEMS, since

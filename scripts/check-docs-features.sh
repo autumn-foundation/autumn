@@ -1372,6 +1372,10 @@ def uses(blanked, gated):
                 piece = piece.strip()
                 if not piece or '{' in piece:
                     continue
+                # `variant as variants_api` — an alias renames the entry, it
+                # does not change which item is imported, so the name before
+                # `as` is the one to resolve. Found by Codex review on #2800.
+                piece = piece.split(' as ')[0].strip()
                 parts = [q.strip() for q in piece.split('::') if q.strip()]
                 if not parts:
                     continue
@@ -1428,9 +1432,26 @@ def uses(blanked, gated):
 # `-p <pkg>` or `--package <pkg>` naming anything but autumn-web. Used as a
 # negative lookahead so the `--features` flag on such a line is not read as
 # autumn-web's. `autumn-web` and `autumn_web` both spell the crate.
+# Options come BEFORE the dependency in `cargo add [OPTIONS] <DEP>…`, so they
+# have to be skipped before asking which crate the `--features` flag targets.
+# Reading `--optional` as the dependency made `cargo add --optional autumn-web
+# --features ws` look foreign and rejected a valid enabling line — a false
+# positive, the error direction this gate refuses. Value-taking options are
+# listed so their VALUE is skipped too, rather than being mistaken for the
+# crate. Found by Codex review on #2800.
+#
+# The package token must START with a word character. `[a-z0-9_-]+` accepts a
+# leading `-`, so the first attempt at this fix still read `--optional` as the
+# dependency and still rejected the line — the fix looked right and changed
+# nothing, which is why it was run against the cases before being believed.
+_OPT_WITH_VALUE = (r'--(?:features|rename|path|git|branch|tag|rev|registry'
+                   r'|manifest-path|target|vers|version|root|index|profile'
+                   r'|bin|example)|-F')
+_SKIP_OPTS = rf'(?:(?:{_OPT_WITH_VALUE})(?:=\S+|\s+\S+)\s+|--?[a-z][-a-z0-9]*\s+)*'
 _FOREIGN_PKG = (
-    r'[^\n]*(?:cargo\s+(?:install|add)\s+(?!autumn[-_]web\b)[a-z0-9_-]+'
-    r'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_-]+)')
+    rf'[^\n]*(?:cargo\s+(?:install|add)\s+{_SKIP_OPTS}'
+    rf'(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*'
+    rf'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*)')
 
 
 def naming_patterns(feature):
@@ -1461,9 +1482,13 @@ def naming_patterns(feature):
         # `[dependencies.autumn-web]` section with the array beneath it. The
         # window is bounded so a later, unrelated dependency cannot be read as
         # autumn-web's.
-        rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*"{name}"',
+        # TOML has two string forms and Cargo reads both, so a page writing
+        # `features = ['ws']` carries a complete enabling instruction. Matching
+        # only the double-quoted form rejected it. Found by Codex review on
+        # #2800.
+        rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         rf'\[(?:[a-z-]+\.)*dependencies\.autumn-web\][^\[]*?'
-        rf'features\s*=\s*\[[^\]]*"{name}"',
+        rf'features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         # A `--features` flag belongs to the package the COMMAND selects, and
         # the corpus runs `cargo install diesel_cli --no-default-features
         # --features postgres` three times. Round 9 tied dependency ARRAYS to
@@ -1487,7 +1512,7 @@ def naming_patterns(feature):
         # alone accepted `ws = ["dep:tokio-stream"]`, a local feature that
         # activates nothing of autumn-web's. Found by Codex review on #2800,
         # the third spelling in this tuple to need the same tie.
-        rf'^\s*[a-z0-9_-]+\s*=\s*\[[^\]]*"autumn[-_]web/{name}"',
+        rf'^\s*[a-z0-9_-]+\s*=\s*\[[^\]]*[\'"]autumn[-_]web/{name}[\'"]',
     )
 
 
@@ -1746,6 +1771,14 @@ def self_test():
            sorted(set(found(
                '```rust\nuse autumn_web::openapi::{Parameter};\n```\n'))),
            [(2, 'openapi', 'autumn_web::openapi::Parameter')])
+    # An `as` alias renames the entry; it does not change what is imported.
+    expect('an aliased child module still resolves',
+           sorted(set(found(
+               '```rust\nuse autumn_web::storage::{variant as variants_api};'
+               '\n```\n'))),
+           [(2, 'storage', 'autumn_web::storage'),
+            (2, 'storage', 'autumn_web::storage::variant'),
+            (2, 'variants', 'autumn_web::storage::variant')])
     expect('a mixed group resolves both shapes',
            sorted(set(found(
                '```rust\nuse autumn_web::storage::{Blob, variant::{Transform}};'
@@ -1916,6 +1949,20 @@ def self_test():
     expect('an empty same-named local feature does not either',
            names_feature('ws = []', 'ws'), False)
 
+    # TOML has two string forms and Cargo reads both.
+    expect('a literal-string array counts',
+           names_feature(
+               "autumn-web = { version = '0.7', features = ['ws'] }", 'ws'),
+           True)
+    expect('...in the section spelling too',
+           names_feature("[dependencies.autumn-web]\nfeatures = ['ws']\n",
+                         'ws'), True)
+    expect('...and in a forwarding row',
+           names_feature("realtime = ['autumn-web/ws']", 'ws'), True)
+    expect('another crate\'s literal-string array still does not',
+           names_feature("axum = { version = '0.8', features = ['ws'] }",
+                         'ws'), False)
+
     # A `--features` flag belongs to the package the command SELECTS. Every
     # accepting row here is a real corpus line; every rejecting one is a shape
     # the corpus writes (`cargo install diesel_cli …` appears three times) or
@@ -1940,7 +1987,13 @@ def self_test():
             # `cargo add [OPTIONS] <DEP>…` selects a package the same way.
             ('cargo add autumn-web --features constela', 'constela', True),
             ('cargo add axum --features ws', 'ws', False),
-            ('cargo add tokio --features ws', 'ws', False)):
+            ('cargo add tokio --features ws', 'ws', False),
+            # OPTIONS precede the dependency in `cargo add [OPTIONS] <DEP>…`.
+            ('cargo add --optional autumn-web --features ws', 'ws', True),
+            ('cargo add --no-default-features autumn-web --features ws',
+             'ws', True),
+            ('cargo install --locked autumn-cli --features ws', 'ws', False),
+            ('cargo add --optional axum --features ws', 'ws', False)):
         if names_feature(command, feature) != want:
             failures.append(
                 f'--features scope: {command!r} / {feature} -> '
