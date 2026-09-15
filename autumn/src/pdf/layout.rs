@@ -22,9 +22,11 @@ use super::metrics::{char_width_1000em, text_width_pt};
 const MAX_DEPTH: u32 = 512;
 
 thread_local! {
-    /// Set when a walker drops content because it passed [`MAX_DEPTH`].
-    /// [`render_pages`] clears this at the start of every call and reads it
-    /// at the end, so one deep document logs one warning, not one per node.
+    /// Set when a walker drops a non-empty `nodes` slice because it passed
+    /// [`MAX_DEPTH`] — an empty slice past the cap drops nothing, so that
+    /// case leaves this unset. [`render_pages`] clears the flag at the
+    /// start of every call and reads it at the end, so one deep document
+    /// logs one warning, not one per node.
     static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -201,7 +203,9 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     for node in nodes {
@@ -269,7 +273,9 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut index = 0u32;
@@ -311,7 +317,9 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     for node in nodes {
@@ -367,7 +375,9 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut index = 0u32;
@@ -397,7 +407,9 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut pending: Vec<Span> = Vec::new();
@@ -520,7 +532,9 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        if !nodes.is_empty() {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     // Reuse `flatten_blocks` by giving it a scratch buffer, then splice: if
@@ -2653,6 +2667,20 @@ mod tests {
             "513 levels is one past the cap — must log exactly one warning, \
              not zero (silent) and not one per truncated node \
              (issue #2801's own n=513 case)"
+        );
+    }
+
+    #[test]
+    fn empty_span_past_the_depth_cap_does_not_warn() {
+        // 513 empty <span> wrappers around nothing: the cap is hit, but the
+        // capped subtree has no content to drop, so this must not warn.
+        // (Codex review on PR #2810: a bare depth check fires even when
+        // `nodes` is empty, since the guard runs before the no-op loop.)
+        let html = format!("{}{}", "<span>".repeat(513), "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "an empty capped subtree drops no content, so it must not warn"
         );
     }
 
