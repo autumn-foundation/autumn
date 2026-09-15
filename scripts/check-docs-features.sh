@@ -56,8 +56,9 @@
 # "requires the `maud` feature; enabled together with `pdf` in the quick start
 # above" — where the quick start above contains no `Cargo.toml` at all.
 #
-# THE BASELINE RUN found nine such page/feature pairs across eight pages, out
-# of 78 gated uses in the corpus:
+# THE BASELINE RUN found fourteen such page/feature pairs across thirteen pages,
+# out of 113 gated uses in the corpus. Nine were visible from the first version
+# of the extractor:
 #
 #   docs/guide/cloud-native.md:929        `#[ws]`                  -> ws
 #   docs/guide/daemon.md:194              `autumn_web::managed_pg` -> managed-pg
@@ -72,6 +73,20 @@
 # and a tenth, reachable only once the gate resolved a second path segment:
 #
 #   docs/guide/jobs.md:824                `autumn_web::data::csv`  -> csv
+#
+# and four more once a bare name after a prelude glob was read:
+#
+#   docs/guide/custom-subsystems.md:202   `LocalChannelsBackend`   -> ws
+#   docs/guide/events.md:69               `Mailer`                 -> mail
+#   docs/guide/presence.md:48             `Presence`               -> presence
+#   docs/guide/transactions.md:322        `Mailer`                 -> mail
+#
+# `presence.md` is the one to read twice. It was not missing the feature name —
+# it gave the WRONG one, pinning `features = ["ws"]` and saying the extractor
+# "is available from `autumn_web::prelude::*` automatically when `ws` is
+# enabled". `presence = ["ws"]` runs one way only, so a reader who followed that
+# line exactly got an app with no `Presence` in it, from the page whose whole
+# subject is `Presence`.
 #
 # Three of them sit under a literal "**You write:**" heading. None is a page
 # about an obscure corner: `cloud-native.md` is the deployment guide, and its
@@ -170,12 +185,23 @@
 #     today, so this closed a hole rather than fixing a page.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
-#   - Bare identifiers. A fence that writes `use autumn_web::prelude::*;` and
-#     then `Mailer` names no path, and the prelude's gated surface is 174 items
-#     wide with names like `Format`, `Column`, `Link`, `Client`, `Patch`,
-#     `Lock`, `Story` and `Transport`. Matching those as words would report
-#     most of the guide. `check-docs-symbols.sh` draws the line in the same
-#     place and for the same reason. A name inside a `use autumn_web::{…}`
+#   - A bare identifier in a fence with NO prelude glob. One WITH a glob is
+#     read, and this bullet used to refuse that outright, arguing from a
+#     prelude surface "174 items wide with names like `Format`, `Column`,
+#     `Link`, `Client`, `Patch`, `Lock`, `Story` and `Transport`" that
+#     "matching those as words would report most of the guide". That was the
+#     wrong number: every ambiguous name in it is behind `maud` or `db`, both
+#     DEFAULT, so none is gated surface at all. The set actually at risk is 31
+#     uppercase names, and measuring the corpus found 27 occurrences over 14
+#     page/name pairs — of which FOUR were live defects, including
+#     `docs/guide/presence.md`, which told readers to enable `ws` when the
+#     feature is `presence` (`presence = ["ws"]` runs one way only, so that
+#     app has no `Presence` at all). Found by Codex review on #2800. Two rules
+#     keep it safe: the fence must write the glob, and the name must start
+#     UPPERCASE — which excludes `t`, every module and every macro by
+#     construction. `check-docs-symbols.sh` still stops at bare identifiers,
+#     because it is resolving PATHS; this is asking a narrower question.
+#   - A name inside a `use autumn_web::{…}`
 #     GROUP is not a bare identifier and IS read — the group names the path, so
 #     nothing has to be inferred — including a nested `{pdf::Pdf}`. Single-line
 #     groups only: the corpus writes no multi-line one, and this reads a line at
@@ -938,6 +964,7 @@ GROUP_ENTRY = re.compile(
 # `insert!(` and `vec!(` all end in `t!`/`c!`, and a one-letter macro name is
 # not one this gate can be right about across 212 pages.
 BANG_USE = re.compile(r'\b([a-z_][a-z_0-9]{2,})!')
+PRELUDE_GLOB = re.compile(r'\bautumn_web::prelude::\*')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
 BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
@@ -978,19 +1005,38 @@ def rust_fences(text):
     lines earlier — but a shape the extractor cannot see is a shape the gate
     does not cover. Found by Codex review on #2800.
     """
+    for start, body in rust_fence_blocks(text):
+        for offset, line in enumerate(body):
+            yield start + offset, line
+
+
+def rust_fence_blocks(text):
+    """Yield (first_body_line_no, [lines]) for each ```rust fence.
+
+    Whole blocks, not loose lines, because one question is fence-scoped: does
+    THIS fence bring the prelude in with a glob? A bare `Presence` means the
+    gated type only in a fence that wrote `use autumn_web::prelude::*;`, and
+    scoping the bare-name scan to that is what makes it safe to do at all.
+    """
     lang = None
+    start = 0
+    body = []
     for lineno, line in enumerate(text.splitlines(), 1):
         line = BLOCKQUOTE.sub('', line)
         match = FENCE.match(line)
         if match:
             if lang is None:
-                info = match.group(1).lower()
-                lang = info.split(',')[0]
+                lang = match.group(1).lower().split(',')[0]
+                start, body = lineno + 1, []
             else:
+                if lang in RUST_LANGS:
+                    yield start, body
                 lang = None
             continue
-        if lang in RUST_LANGS:
-            yield lineno, line
+        if lang is not None:
+            body.append(line)
+    if lang in RUST_LANGS and body:
+        yield start, body
 
 
 def uses(blanked, gated):
@@ -1016,6 +1062,32 @@ def uses(blanked, gated):
                 return entry, f'autumn_web::{head}::{child}'
         entry = gated.get(head)
         return (entry, f'autumn_web::{head}') if entry else (None, None)
+
+    # Type names a prelude glob brings into scope unqualified. Scoped to a
+    # fence that actually writes the glob, and to names that START UPPERCASE,
+    # which is what makes this safe: the one-letter `t!` and every module and
+    # macro name are excluded by construction.
+    #
+    # The header used to refuse this outright, arguing from a prelude surface
+    # "174 items wide with names like `Format`, `Column`, `Link`, `Client`,
+    # `Patch`, `Lock`, `Story` and `Transport`". That number was the wrong one:
+    # every ambiguous name in it is behind `maud` or `db`, both DEFAULT, so none
+    # of them is gated surface at all. The set actually at risk is 31 names, and
+    # measuring the corpus found 27 occurrences across 14 page/name pairs — not
+    # "most of the guide". One of those 14 was a live defect
+    # (`docs/guide/presence.md`). Found by Codex review on #2800.
+    bare = {n for n in gated if n[:1].isupper()}
+    for start, body in rust_fence_blocks(blanked):
+        if not any(PRELUDE_GLOB.search(line) for line in body):
+            continue
+        for offset, line in enumerate(body):
+            for match in re.finditer(r'\b([A-Z][A-Za-z_0-9]*)\b', line):
+                name = match.group(1)
+                if name not in bare:
+                    continue
+                entry = gated[name]
+                for feature in sorted(entry[0]):
+                    yield start + offset, feature, name
 
     for lineno, line in rust_fences(blanked):
         for match in GROUP_USE.finditer(line):
@@ -1142,8 +1214,13 @@ def check(root):
     for rel in corpus(root):
         text = (pathlib.Path(root) / rel).read_text(
             encoding='utf-8', errors='ignore')
-        if 'autumn_web' not in text and '#[' not in text:
-            continue
+        # No prefilter. `check()` once skipped any page containing neither
+        # `autumn_web` nor `#[`, which `--list` did not — so a fence whose only
+        # gated construct was a bare `embed_static!()` was reported by `--list`
+        # and silently accepted by CI. A fast path that disagrees with the
+        # listing is worse than no fast path: it makes the gate's own
+        # diagnostic wrong about the gate. The whole corpus is 212 files and
+        # the run is under a second. Found by Codex review on #2800.
         # Blanked ONCE, and used for both halves. The first version blanked
         # inside `uses()` and passed the raw text to the naming check, so a page
         # carrying a live `autumn_web::pdf` fence and a hidden
@@ -1268,6 +1345,8 @@ def self_test():
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
         'embed_static': ({'embed-assets'}, {'bang'}),
+        # A prelude-glob type, and one that must stay unread.
+        'Presence': ({'presence'}, {'item'}),
     }
 
     def found(text):
@@ -1298,6 +1377,23 @@ def self_test():
            found('```rust\n#[storage]\nstruct S;\n```\n'), [])
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
+
+    # A bare type name a prelude glob brought into scope. Scoped to a fence
+    # that writes the glob, and to names starting uppercase.
+    glob = '```rust\nuse autumn_web::prelude::*;\n'
+    expect('bare gated type read after a prelude glob',
+           found(glob + 'async fn v(p: Presence) {}\n```\n'),
+           [(3, 'presence', 'Presence')])
+    expect('no glob, no bare-name scan',
+           found('```rust\nasync fn v(p: Presence) {}\n```\n'), [])
+    expect('a lowercase name is never read bare',
+           found(glob + 'let x = storage;\n```\n'), [])
+    expect('an ungated type is not read bare',
+           found(glob + 'let x: Widget = w;\n```\n'), [])
+    # The direction that matters: `presence = ["ws"]`, so naming `ws` does NOT
+    # supply `presence`. This is the live defect on `docs/guide/presence.md`.
+    expect('naming the implied feature does not satisfy the implying one',
+           names_feature('features = ["ws"]', 'presence'), False)
 
     # Ordinary use-tree syntax. `PATH_USE` wants an identifier straight after
     # `::` and sees `{`, so every name in a group went unread.

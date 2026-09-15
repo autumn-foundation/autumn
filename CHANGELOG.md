@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the project the quickstart just scaffolded gets `error[E0433]: failed to
   resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
   whose fix is a line in a file the page never showed them. Baseline: 78 gated
-  uses checked, **10 defects across 9 pages**. Three sat under a literal
+  uses checked, **14 defects across 13 pages**. Three sat under a literal
   "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
   `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
   read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
@@ -139,6 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
   group is read entry by entry, which ordinary use-tree syntax had slipped past.
   Judged
+  A bare type name is read inside a fence that writes
+  `use autumn_web::prelude::*;` — scoped to that glob and to names starting
+  uppercase — which is how four further defects surfaced, among them
+  `docs/guide/presence.md` telling readers to enable `ws` when the feature is
+  `presence` (`presence = ["ws"]` runs one way only, so an app on `ws` alone has
+  no `Presence` extractor at all). Judged
   only inside ```` ```rust ```` fences, since a feature gate is a *compile*
   failure: a capability table naming `autumn_web::pdf::Pdf` describes an
   example, it does not hand anyone a line. Presence is gated, placement is not

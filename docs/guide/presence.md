@@ -28,10 +28,15 @@ Presence is part of the `ws` Cargo feature (same as `Channels`):
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.7", features = ["ws"] }
+autumn-web = { version = "0.7", features = ["presence"] }
 ```
 
-It is available from `autumn_web::prelude::*` automatically when `ws` is enabled.
+The feature is `presence`, not `ws`. `presence = ["ws"]` in the manifest, so
+enabling `presence` turns `ws` on for you — but the reverse does not hold, and
+an app built with `features = ["ws"]` alone has no `Presence` extractor at all.
+
+It is available from `autumn_web::prelude::*` automatically when `presence` is
+enabled.
 
 ## The Contract
 
