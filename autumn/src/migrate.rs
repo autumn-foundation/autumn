@@ -44,7 +44,23 @@ pub use diesel_migrations::embed_migrations;
 ///
 /// These are applied by `autumn migrate` and are also registered
 /// automatically at startup when a framework feature requires its own table.
+///
+/// Backend-forked like [`derivation::DERIVATION_MIGRATIONS`](crate::derivation::DERIVATION_MIGRATIONS):
+/// the Postgres DDL (`BIGSERIAL`/`JSONB`/`TIMESTAMPTZ`/`NOW()`) is not valid
+/// `SQLite`, so the `SQLite` build embeds a parallel set under the same
+/// version dir names, keeping `__diesel_schema_migrations` bookkeeping
+/// identical across backends (issue #2699).
+#[cfg(not(feature = "sqlite"))]
 pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+/// `SQLite` variant of [`FRAMEWORK_MIGRATIONS`]. See that item for the
+/// backend-fork rationale.
+///
+/// A table another module self-manages outside Diesel (the job queue, job
+/// tracking) or a feature `SQLite` does not support (sharding) gets a no-op
+/// shim migration here instead of real DDL — see `autumn/migrations_sqlite`.
+#[cfg(feature = "sqlite")]
+pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations_sqlite");
 
 /// Result of running pending migrations.
 #[derive(Debug)]
@@ -2345,11 +2361,11 @@ pub fn applied_user_migrations_sqlite(
 
 /// The identity map the `SQLite` apply path
 /// ([`run_pending_sqlite_with_framework_migrations`]) records under: the app
-/// set and the shard-required framework sets enumerated together, every
-/// version collision resolved. Rollback has to plan and revert under the
-/// same identities, or a migration tracked under a substitute reads as
-/// applied with no local `down.sql`, and its plain version as the other
-/// side's.
+/// set, [`FRAMEWORK_MIGRATIONS`] and the shard-required framework sets
+/// enumerated together, every version collision resolved. Rollback has to
+/// plan and revert under the same identities, or a migration tracked under a
+/// substitute reads as applied with no local `down.sql`, and its plain
+/// version as the other side's.
 ///
 /// # Errors
 ///
@@ -2362,6 +2378,9 @@ fn sqlite_app_identity_map(
 
     let mut sets: MigrationPairSets =
         vec![migration_versions_and_names::<Sqlite, _>(app_migrations)?];
+    sets.push(migration_versions_and_names::<Sqlite, _>(
+        &FRAMEWORK_MIGRATIONS,
+    )?);
     for set in shard_framework_migration_sets() {
         sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
     }
@@ -2955,14 +2974,19 @@ pub fn run_pending_shard_framework_migrations(
 /// Apply an app's own migrations and then the framework sets a `SQLite`
 /// database requires, under one version-collision map.
 ///
-/// The framework sets are the `SQLite` variants of the version-history,
-/// commit-hook queue and derivation-state tables, the same three
-/// [`run_pending_shard_framework_migrations`] applies to a Postgres shard.
-/// The Postgres control-plane schema (`FRAMEWORK_MIGRATIONS`) has no `SQLite`
-/// variant and is never applied here. This is what gives `autumn migrate` an
-/// apply path for these tables on a `sqlite://` target when startup
-/// auto-migration is off; without it the boot only reports them pending and
-/// a `#[derivation]` reconciliation fails on the missing state table.
+/// The framework sets are [`FRAMEWORK_MIGRATIONS`] (the `SQLite` variant of
+/// the control-plane schema: `api_tokens`, runtime config, feature flags,
+/// experiments, migration checksums, issue #2699) plus the `SQLite` variants
+/// of the version-history, commit-hook queue and derivation-state tables,
+/// the same three [`run_pending_shard_framework_migrations`] applies to a
+/// Postgres shard. `FRAMEWORK_MIGRATIONS` embeds those same three under the
+/// same version dir names (the intended duplicate the control-plane Postgres
+/// set already carries), so applying both here is redundant, not conflicting:
+/// whichever runs first records the version, and the other reports it already
+/// applied. This is what gives `autumn migrate` an apply path for these
+/// tables on a `sqlite://` target when startup auto-migration is off; without
+/// it the boot only reports them pending and a `#[derivation]` reconciliation
+/// fails on the missing state table.
 ///
 /// Diesel tracks applied migrations by version alone, so an app migration
 /// that happens to share a version with one of these framework migrations
@@ -2992,6 +3016,9 @@ where
 
     let mut sets: Vec<Vec<(String, String)>> =
         vec![migration_versions_and_names::<Sqlite, S>(app_migrations)?];
+    sets.push(migration_versions_and_names::<Sqlite, _>(
+        &FRAMEWORK_MIGRATIONS,
+    )?);
     for set in shard_framework_migration_sets() {
         sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
     }
@@ -3002,6 +3029,11 @@ where
         DisambiguatedMigrations::new(app_migrations, &disambiguated),
     )?
     .applied;
+    let framework_result = run_pending_sqlite(
+        database_url,
+        DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &disambiguated),
+    )?;
+    applied.extend(framework_result.applied);
     for set in shard_framework_migration_sets() {
         let result = run_pending_sqlite(
             database_url,

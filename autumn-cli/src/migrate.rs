@@ -79,8 +79,9 @@ fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
 /// Apply pending user migrations against a `SQLite` database through the unlocked
 /// diesel harness (no advisory lock, no `diesel` subprocess — issue #1999/#2036
 /// precedent), then the `SQLite` variants of the framework tables every
-/// database needs, with the two enumerated together first so an app migration
-/// sharing a framework version cannot mask it (see
+/// database needs — the control-plane schema (`FRAMEWORK_MIGRATIONS`, issue
+/// #2699) and the shard-required sets — with the two enumerated together
+/// first so an app migration sharing a framework version cannot mask it (see
 /// [`autumn_web::migrate::run_pending_sqlite_with_framework_migrations`]).
 /// Real only under the `sqlite` feature; the default build returns the
 /// [`SQLITE_FEATURE_MSG`] seam.
@@ -736,13 +737,14 @@ fn run_single_target(
 ///
 /// Deliberately mirrors `autumn schema migrate`'s `SQLite` path: no advisory lock
 /// (`SQLite` is single-writer, #1999), no `diesel` subprocess, and no Postgres
-/// content-checksum bookkeeping. The Postgres control-plane schema is never
-/// applied (its DDL has no `SQLite` variant); the three shard-required sets
-/// that do have one (version history, commit-hook queue, derivation state) are,
-/// so a deployment with startup auto-migration off still gets them (#1769).
-/// The app set and those three are version-disambiguated together before
-/// either is applied, as at boot, so an app migration that shares a version
-/// with a framework one masks nothing.
+/// content-checksum bookkeeping. The Postgres control-plane schema
+/// (`FRAMEWORK_MIGRATIONS`) now has a `SQLite` variant too (issue #2699), so it
+/// applies here alongside the three shard-required sets (version history,
+/// commit-hook queue, derivation state) — a deployment with startup
+/// auto-migration off still gets all of them (#1769). The app set and the
+/// framework sets are version-disambiguated together before any is applied,
+/// as at boot, so an app migration that shares a version with a framework one
+/// masks nothing.
 fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
     let dir = std::path::Path::new(migrations_dir);
     eprintln!(
