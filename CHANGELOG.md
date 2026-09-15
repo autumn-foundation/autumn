@@ -139,12 +139,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
   group is read entry by entry, which ordinary use-tree syntax had slipped past.
   Judged
+  A declaration also made with no feature requirement — a complementary
+  `not(…)` arm — removes its gated siblings in the same namespace, so
+  `db::RuntimeConnection` is not reported as needing `sqlite` when it exists in
+  a default build; per namespace, since `edge` is an ungated attribute macro
+  *and* a gated module re-export.
   `#[cfg(any(test, feature = "X"))]` resolves to `X`, since `cfg(test)` never
   holds for a dependency — a reader testing against autumn-web needs the
   feature. A `--features` flag counts only when the command does not select
   another package (`cargo install diesel_cli --features postgres` does not),
-  and a `features = […]` array only counts when it is tied to an `autumn-web`
-  dependency: unqualified, any crate's array satisfied the gate, and the corpus
+  a local `[features]` row counts only when it forwards
+  (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
+  is tied to an `autumn-web` dependency: unqualified, any crate's array satisfied the gate, and the corpus
   carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
   enables axum's websockets and nothing of autumn-web's.
   One level below the root resolves both gated MODULES and gated ITEMS, since

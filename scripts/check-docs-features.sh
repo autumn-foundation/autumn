@@ -186,6 +186,17 @@
 #     when the feature is OFF, so reading the name out of it would tell a
 #     reader to enable the one feature that removes the item. `lib.rs` has one,
 #     `#[cfg(not(feature = "seed"))]`.
+#   - A declaration made at least once with NO feature requirement removes its
+#     gated siblings in the same namespace. `autumn/src/db.rs` defines
+#     `RuntimeConnection` under both `not(feature = "sqlite")` and
+#     `feature = "sqlite"`; recording only the positive arm put
+#     `db::RuntimeConnection` in the surface as needing `sqlite`, which would
+#     have told a reader on the ordinary Postgres path to enable the one
+#     feature that swaps their database backend. PER NAMESPACE, because
+#     stripping by name alone then removed `autumn_web::edge` — the gated crate
+#     re-export — on account of `#[edge]`, the ungated attribute macro sharing
+#     its name. Both found by Codex review on #2800, the second while fixing
+#     the first.
 #   - `#[cfg(any(…))]` is dropped too — naming ONE alternative satisfies it and
 #     this gate cannot tell which a page meant — with ONE resolved exception:
 #     `any(test, feature = "X")`, where every non-feature predicate is one that
@@ -755,6 +766,7 @@ def gated_items(root, macro_kinds):
     `pub mod … {` blocks this keeps out.
     """
     found = {}
+    unconditional = set()
     for rel in SOURCES:
         lines = (pathlib.Path(root) / rel).read_text(
             encoding='utf-8').splitlines()
@@ -783,6 +795,8 @@ def gated_items(root, macro_kinds):
             if match:
                 if pending:
                     _record(found, match.group(1), pending, 'module')
+                else:
+                    unconditional.add((match.group(1), 'type'))
                 pending = None
                 continue
             match = MACRO_RULES_DECL.match(line)
@@ -792,12 +806,16 @@ def gated_items(root, macro_kinds):
                 # expands into, not a call any reader writes.
                 if pending and not name.startswith('__'):
                     _record(found, name, pending, 'bang')
+                elif not pending:
+                    unconditional.add((name, 'macro'))
                 pending = None
                 continue
             match = USE_CRATE_AS.match(line)
             if match:
                 if pending:
                     _record(found, match.group(2), pending, 'module')
+                else:
+                    unconditional.add((match.group(2), 'type'))
                 pending = None
                 continue
             match = USE_ONE_LINE.match(line)
@@ -806,6 +824,9 @@ def gated_items(root, macro_kinds):
                     for name in _names(match.group(2)):
                         _record(found, name, pending,
                                 macro_kinds.get(name, 'item'))
+                else:
+                    unconditional.update(_ns_pairs(
+                        _names(match.group(2)), macro_kinds))
                 pending = None
                 continue
             match = USE_BRACE_OPEN.match(line)
@@ -819,6 +840,9 @@ def gated_items(root, macro_kinds):
                     for name in _names('\n'.join(body)):
                         _record(found, name, pending,
                                 macro_kinds.get(name, 'item'))
+                else:
+                    unconditional.update(_ns_pairs(
+                        _names('\n'.join(body)), macro_kinds))
                 pending = None
                 continue
             pending = None
@@ -829,6 +853,59 @@ def gated_items(root, macro_kinds):
             'restructured; this gate has no truth set to read and would pass '
             'everything. Fix gated_items() in '
             'scripts/check-docs-features.sh.')
+    return _strip_unconditional(found, unconditional)
+
+
+# Rust resolves a name per NAMESPACE, and this gate has to as well: `module`
+# and `item` live in the type namespace, `attribute` and `bang` in the macro
+# one. `lib.rs` declares `edge` in both — `#[cfg(feature = "edge")] pub use
+# autumn_edge as edge;` (the module, gated) and `pub use autumn_macros::edge;`
+# (the `#[edge]` attribute, NOT gated) — which is legal precisely because they
+# do not collide.
+_NAMESPACE = {'module': 'type', 'item': 'type',
+              'attribute': 'macro', 'bang': 'macro'}
+
+
+def _ns_pairs(names, macro_kinds):
+    """`(name, namespace)` for each name, using the parsed macro kinds."""
+    return {(n, _NAMESPACE.get(macro_kinds.get(n, 'item'), 'type'))
+            for n in names}
+
+
+def _strip_unconditional(found, unconditional):
+    """Drop every name that is ALSO declared without a feature requirement.
+
+    `autumn/src/db.rs` defines `RuntimeConnection` twice — once under
+    `#[cfg(not(feature = "sqlite"))]` and once under `#[cfg(feature =
+    "sqlite")]`. Reading the `not(` arm as "no requirement" and then recording
+    the positive arm left `db::RuntimeConnection` in the surface as needing
+    `sqlite`, when it exists in a DEFAULT build and always has.
+
+    That is a false positive, and the worst-shaped one this gate could produce:
+    it would have told a reader on the ordinary Postgres path to enable the one
+    feature that swaps their database backend. Every other boundary here was
+    drawn to avoid exactly this. Found by Codex review on #2800.
+
+    The rule is general rather than a `not(`-specific patch: a declaration made
+    at least once with no feature requirement — a complementary `cfg` arm, a
+    bare declaration beside a gated re-export — is available in a default build.
+
+    PER NAMESPACE, though, and that distinction is not academic. Stripping by
+    name alone removed `autumn_web::edge` (the gated crate re-export) because
+    `#[edge]` (the ungated attribute macro) shares its name — trading the false
+    positive above for a false negative on a whole module. `unconditional`
+    carries `(name, namespace)` pairs, and only the kinds in that namespace are
+    dropped; a name keeps its entry as long as any kind survives.
+    """
+    for name, namespace in unconditional:
+        entry = found.get(name)
+        if not entry:
+            continue
+        kinds = {k for k in entry[1] if _NAMESPACE.get(k) != namespace}
+        if kinds:
+            found[name] = (entry[0], kinds)
+        else:
+            del found[name]
     return found
 
 
@@ -937,6 +1014,7 @@ def nested_modules(root, parents):
     """
     out = {}
     for name, parent_features in parents.items():
+        unconditional = set()
         for candidate in (f'autumn/src/{name}.rs', f'autumn/src/{name}/mod.rs'):
             path = pathlib.Path(root) / candidate
             if path.exists():
@@ -965,6 +1043,9 @@ def nested_modules(root, parents):
                 if pending:
                     out[f'{name}::{match.group(1)}'] = (
                         set(parent_features) | pending, {'module'})
+                else:
+                    unconditional.add(
+                        (f'{name}::{match.group(1)}', 'type'))
                 pending = None
                 continue
             # A gated public ITEM inside an ungated module is the same hole one
@@ -978,6 +1059,13 @@ def nested_modules(root, parents):
                 if pending:
                     out[f'{name}::{match.group(1)}'] = (
                         set(parent_features) | pending, {'item'})
+                else:
+                    # A complementary arm: `#[cfg(not(feature = "sqlite"))]
+                    # pub type RuntimeConnection = …` beside the gated one. The
+                    # item exists in a default build, so nothing about it is
+                    # worth telling a reader. See `_strip_unconditional`.
+                    unconditional.add(
+                        (f'{name}::{match.group(1)}', 'type'))
                 pending = None
                 continue
             match = PUB_USE_ONE_LINE.match(line)
@@ -986,6 +1074,10 @@ def nested_modules(root, parents):
                     for item in _names(match.group(1)):
                         out[f'{name}::{item}'] = (
                             set(parent_features) | pending, {'item'})
+                else:
+                    unconditional.update(
+                        (f'{name}::{i}', 'type')
+                        for i in _names(match.group(1)))
                 pending = None
                 continue
             match = PUB_USE_BRACE_OPEN.match(line)
@@ -999,9 +1091,14 @@ def nested_modules(root, parents):
                     for item in _names('\n'.join(inner)):
                         out[f'{name}::{item}'] = (
                             set(parent_features) | pending, {'item'})
+                else:
+                    unconditional.update(
+                        (f'{name}::{i}', 'type')
+                        for i in _names('\n'.join(inner)))
                 pending = None
                 continue
             pending = None
+        _strip_unconditional(out, unconditional)
     return out
 
 
@@ -1332,7 +1429,7 @@ def uses(blanked, gated):
 # negative lookahead so the `--features` flag on such a line is not read as
 # autumn-web's. `autumn-web` and `autumn_web` both spell the crate.
 _FOREIGN_PKG = (
-    r'[^\n]*(?:cargo\s+install\s+(?!autumn[-_]web\b)[a-z0-9_-]+'
+    r'[^\n]*(?:cargo\s+(?:install|add)\s+(?!autumn[-_]web\b)[a-z0-9_-]+'
     r'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_-]+)')
 
 
@@ -1385,7 +1482,12 @@ def naming_patterns(feature):
         rf'[^\n]*--features[^\n]*(?:[",\s=]|^){name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
         rf'\bfeatures?\b(?:\s+flag)?\s+`{name}`',
-        rf'^\s*{name}\s*=\s*\[',
+        # A `[features]` table row in the reader's OWN manifest counts only
+        # when it forwards: `ws = ["autumn-web/ws"]`. Matching the row name
+        # alone accepted `ws = ["dep:tokio-stream"]`, a local feature that
+        # activates nothing of autumn-web's. Found by Codex review on #2800,
+        # the third spelling in this tuple to need the same tie.
+        rf'^\s*[a-z0-9_-]+\s*=\s*\[[^\]]*"autumn[-_]web/{name}"',
     )
 
 
@@ -1775,7 +1877,7 @@ def self_test():
             'the `ws` Cargo feature',
             'gated behind the feature `ws`',
             'behind the feature flag `ws`',
-            'ws = ["dep:tokio-stream"]',
+            'ws = ["autumn-web/ws"]',
     ):
         if not names_feature(spelling, 'ws'):
             failures.append(f'naming missed: {spelling!r}')
@@ -1803,6 +1905,17 @@ def self_test():
     expect('a bare features array with no crate does not satisfy it either',
            names_feature('features = ["ws"]', 'ws'), False)
 
+    # A `[features]` row in the reader's own manifest counts only when it
+    # FORWARDS. The row name alone says nothing about autumn-web.
+    expect('a forwarding feature row counts',
+           names_feature('ws = ["autumn-web/ws"]', 'ws'), True)
+    expect('...under any local name',
+           names_feature('realtime = ["autumn-web/ws"]', 'ws'), True)
+    expect('a same-named local feature that forwards nothing does not',
+           names_feature('ws = ["dep:tokio-stream"]', 'ws'), False)
+    expect('an empty same-named local feature does not either',
+           names_feature('ws = []', 'ws'), False)
+
     # A `--features` flag belongs to the package the command SELECTS. Every
     # accepting row here is a real corpus line; every rejecting one is a shape
     # the corpus writes (`cargo install diesel_cli …` appears three times) or
@@ -1823,7 +1936,11 @@ def self_test():
             ('cargo test -p some-other-crate --features ws', 'ws', False),
             ('cargo build --package other --features mail', 'mail', False),
             # autumn-cli is a different package from autumn-web.
-            ('cargo install autumn-cli --features ws', 'ws', False)):
+            ('cargo install autumn-cli --features ws', 'ws', False),
+            # `cargo add [OPTIONS] <DEP>…` selects a package the same way.
+            ('cargo add autumn-web --features constela', 'constela', True),
+            ('cargo add axum --features ws', 'ws', False),
+            ('cargo add tokio --features ws', 'ws', False)):
         if names_feature(command, feature) != want:
             failures.append(
                 f'--features scope: {command!r} / {feature} -> '
@@ -1944,6 +2061,28 @@ def self_test():
         failures.append(
             'truth set: __autumn_register_fake_seeder is internal plumbing '
             'and must not be reported as a macro a reader calls')
+
+    # COMPLEMENTARY cfg arms. `autumn/src/db.rs` defines `RuntimeConnection`
+    # under both `not(feature = "sqlite")` and `feature = "sqlite"`, so it
+    # exists in a default build — recording it as needing `sqlite` would tell a
+    # reader on the ordinary Postgres path to swap their database backend.
+    for name in ('db::RuntimeConnection', 'db::RuntimeBackend'):
+        if name in real:
+            failures.append(
+                f'truth set: {name} -> {real[name]!r}, but it is also declared '
+                f'under a `not(…)` arm and exists in a DEFAULT build; '
+                f'reporting it would be a false positive')
+    expect('an unconditional declaration strips a gated sibling',
+           _strip_unconditional({'a::B': ({'x'}, {'item'}),
+                                 'a::C': ({'x'}, {'item'})},
+                                {('a::B', 'type')}),
+           {'a::C': ({'x'}, {'item'})})
+    # A name in BOTH namespaces keeps the half that is still gated: `edge` is
+    # an ungated attribute macro AND a gated module re-export.
+    expect('an ungated macro does not strip a gated module of the same name',
+           _strip_unconditional({'edge': ({'edge'}, {'module'})},
+                                {('edge', 'macro')}),
+           {'edge': ({'edge'}, {'module'})})
 
     # `metrics::testing` is `#[cfg(any(test, feature = "test-support"))]`, and
     # `docs/guide/metrics.md:465` hands it to the reader.
