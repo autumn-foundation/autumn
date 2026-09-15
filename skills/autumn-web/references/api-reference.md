@@ -47,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -601,6 +601,20 @@ Free functions rendering changeset-aware, accessible inputs:
   `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+- `rich_text_area(&changeset, field, label)` (#1255) renders a Markdown
+  `<textarea>` with a syntax toolbar, a hint line, and (via
+  `rich_text_area_htmx`/`rich_text_area_htmx_with_token_field`) an htmx live
+  preview pane. `required_*` variants add the required signal. `RichTextLabels`
+  (#2227) overrides the toolbar's chrome text: `.toolbar_group(label)`,
+  `.controls(&[(name, syntax)])`, `.hint(text)`, `.preview_heading(text)`. Pass
+  one to the matching `*_with_labels` sibling (e.g.
+  `rich_text_area_htmx_with_token_field_with_labels`); the plain functions
+  keep rendering the English default.
+- `IntoChangeset::into_changeset_with(resolve)` (#2227) is
+  `into_changeset`'s sibling: `resolve: impl Fn(field, code) -> Option<String>`
+  supplies a message for a `#[validate(...)]` rule that has no explicit
+  `message`. Return `None` to keep the default `"validation failed: {code}"`.
+  An explicit `message` on the rule always wins and skips the resolver.
 
 ## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.6.0, #1706)
 
@@ -685,6 +699,12 @@ Per-primitive setters (in addition to the shared set):
   Option<guard>)]`) and `can` is `|to| record.can_transition_<field>_to(to)`;
   a legal edge whose guard currently fails still renders but as a `disabled`
   button. CSS hooks `.autumn-transition-controls` / `.autumn-transition`.
+  `transition_controls_with_labels(..., &TransitionLabels)` (#2227) takes the
+  same arguments plus a trailing `TransitionLabels` builder: `.group(label)`
+  overrides the `"{field} transitions"` aria-label, `.buttons(&[(state,
+  label)])` overrides `"Mark as {state}"` per target state. A state not
+  listed keeps the default text. `transition_controls` still renders the
+  same default text as before.
 - `autumn_web::widgets::{ReactionControls, reaction_controls}` (#1362) — the
   view half of `#[votable]`. `ReactionControls::votes(dom_id, up_action,
   down_action)` (signed up/down, `aggregate = sum`) or
@@ -1043,7 +1063,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,

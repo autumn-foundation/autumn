@@ -3795,28 +3795,34 @@ pub async fn completed_import_ids(
         .collect())
 }
 
-/// Every `(post_type, source slug)` a previous import recorded, and the row it
-/// produced.
+/// Every `(post_type, source slug)` a previous import recorded, and the rows
+/// it produced.
 ///
 /// The id matters as well as the membership: a retry has to be able to reach
 /// the existing row to finish work an interrupted run left undone, not merely
-/// know that it should skip it.
+/// know that it should skip it. A key can name more than one row: a marker
+/// recorded under the pre-`stable_identity` scheme was a bare slug, and two
+/// different pages could compute the identical bare slug — so every id is
+/// kept rather than only the last one a query happens to return.
 ///
 /// Joined to `posts` so a row deleted since the import it came from does not
 /// keep its slug reserved — re-importing content the site no longer holds is a
 /// restore, and should work.
 pub async fn imported_source_slugs(
     conn: &mut AsyncPgConnection,
-) -> AutumnResult<std::collections::HashMap<(String, String), i64>> {
-    Ok(post_meta::table
+) -> AutumnResult<std::collections::HashMap<(String, String), Vec<i64>>> {
+    let mut by_key: std::collections::HashMap<(String, String), Vec<i64>> =
+        std::collections::HashMap::new();
+    for (post_type, slug, id) in post_meta::table
         .inner_join(posts::table.on(posts::id.eq(post_meta::post_id)))
         .filter(post_meta::meta_key.eq(IMPORT_SOURCE_SLUG_KEY))
         .select((posts::post_type, post_meta::meta_value, posts::id))
         .load::<(String, String, i64)>(conn)
         .await?
-        .into_iter()
-        .map(|(post_type, slug, id)| ((post_type, slug), id))
-        .collect())
+    {
+        by_key.entry((post_type, slug)).or_default().push(id);
+    }
+    Ok(by_key)
 }
 
 /// What the content-administration screen is asking for.
@@ -4543,6 +4549,14 @@ pub async fn import_terms(
     incoming: &[ImportedTerm],
 ) -> AutumnResult<usize> {
     use crate::models::NewTerm;
+    use std::collections::{HashMap, HashSet};
+
+    // A big export's terms dwarf a site's registered-taxonomy count (usually
+    // low single digits: `category`, `post_tag`, plus whatever a plugin
+    // registered). Every lookup below is grouped by taxonomy so the round
+    // trips this call pays scale with that count, not with the file's term
+    // count -- a heavy-tagging blog's backup can carry thousands of terms.
+    const CHUNK: usize = 1000;
 
     conn.transaction(async move |conn| {
         // Normalized once, up front, so the slug a row is stored under and the
@@ -4563,22 +4577,115 @@ pub async fn import_terms(
             drafts.push(draft);
         }
 
-        let mut created: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // Every (taxonomy, slug) this call needs to resolve: each draft's own
+        // identity, plus -- for a hierarchical draft naming a parent -- the
+        // parent's identity too. The parent is never inserted by this
+        // function, only linked to, so its row must already exist, either
+        // from earlier in this same file or from before the import. Collecting
+        // the whole set up front is what turns the lookups into one batched
+        // load per taxonomy instead of up to two round trips per incoming term.
+        let mut wanted: HashMap<String, HashSet<String>> = HashMap::new();
         for draft in &drafts {
-            let existing: Option<Term> = terms::table
-                .filter(terms::taxonomy.eq(&draft.taxonomy))
-                .filter(terms::slug.eq(&draft.slug))
-                .select(Term::as_select())
-                .first(conn)
-                .await
-                .optional()?;
-            if existing.is_none() {
-                let row: Term = diesel::insert_into(terms::table)
-                    .values(draft)
-                    .returning(Term::as_returning())
-                    .get_result(conn)
+            wanted
+                .entry(draft.taxonomy.clone())
+                .or_default()
+                .insert(draft.slug.clone());
+        }
+        for (term, draft) in incoming.iter().zip(&drafts) {
+            let Some(parent_slug) = &term.parent else {
+                continue;
+            };
+            let flat = crate::content_types::find_taxonomy(&draft.taxonomy)
+                .is_some_and(|registered| !registered.hierarchical);
+            if flat {
+                continue;
+            }
+            wanted
+                .entry(draft.taxonomy.clone())
+                .or_default()
+                .insert(autumn_web::slugify(parent_slug));
+        }
+
+        let mut by_key: HashMap<(String, String), Term> = HashMap::new();
+        for (taxonomy, slugs) in &wanted {
+            let slugs: Vec<String> = slugs.iter().cloned().collect();
+            for chunk in slugs.chunks(CHUNK) {
+                let rows: Vec<Term> = terms::table
+                    .filter(terms::taxonomy.eq(taxonomy))
+                    .filter(terms::slug.eq_any(chunk))
+                    .select(Term::as_select())
+                    .load(conn)
                     .await?;
+                for row in rows {
+                    by_key.insert((row.taxonomy.clone(), row.slug.clone()), row);
+                }
+            }
+        }
+
+        // Rows this call is about to create, in file order, deduplicated
+        // against both what already exists and an earlier duplicate row
+        // earlier in the same file -- a repeated (taxonomy, slug) resolves to
+        // the first occurrence's row, matching the old row-by-row loop, which
+        // found the second occurrence "already there" once the first had run.
+        let mut created: HashSet<i64> = HashSet::new();
+        let mut to_insert: Vec<NewTerm> = Vec::with_capacity(drafts.len());
+        let mut pending: HashSet<(String, String)> = HashSet::new();
+        for draft in &drafts {
+            let key = (draft.taxonomy.clone(), draft.slug.clone());
+            if by_key.contains_key(&key) || !pending.insert(key) {
+                continue;
+            }
+            to_insert.push(draft.clone());
+        }
+        // `ON CONFLICT ... DO NOTHING`, not a plain INSERT: the keys in
+        // `to_insert` were decided from the batched load above, and a whole
+        // chunk now sits between that snapshot and this statement instead of
+        // the single row-by-row loop's back-to-back SELECT/INSERT. A
+        // concurrent create of the exact same (taxonomy, slug) — another
+        // import, or an editor adding the same tag — during that wider
+        // window must not abort the rest of this restore; it should be
+        // treated the same as "already existed", not a hard failure. Same
+        // pattern `save_tags` (reddit-clone) already uses for this race.
+        for chunk in to_insert.chunks(CHUNK) {
+            let rows: Vec<Term> = diesel::insert_into(terms::table)
+                .values(chunk.to_vec())
+                .on_conflict((terms::taxonomy, terms::slug))
+                .do_nothing()
+                .returning(Term::as_returning())
+                .get_results(conn)
+                .await?;
+            for row in &rows {
                 created.insert(row.id);
+            }
+            let mut inserted_keys: HashSet<(String, String)> = HashSet::with_capacity(rows.len());
+            for row in rows {
+                inserted_keys.insert((row.taxonomy.clone(), row.slug.clone()));
+                by_key.insert((row.taxonomy.clone(), row.slug.clone()), row);
+            }
+            // Any key in this chunk that did not come back from `RETURNING`
+            // lost the race: the row now exists (created by whoever won),
+            // just not created by this call, so it is looked up rather than
+            // added to `created`.
+            let mut races: HashMap<String, Vec<String>> = HashMap::new();
+            for draft in chunk {
+                let key = (draft.taxonomy.clone(), draft.slug.clone());
+                if !inserted_keys.contains(&key) {
+                    races
+                        .entry(draft.taxonomy.clone())
+                        .or_default()
+                        .push(draft.slug.clone());
+                }
+            }
+            for (taxonomy, slugs) in &races {
+                let found: Vec<Term> = terms::table
+                    .filter(terms::taxonomy.eq(taxonomy))
+                    .filter(terms::slug.eq_any(slugs))
+                    .select(Term::as_select())
+                    .load(conn)
+                    .await?;
+                for row in found {
+                    by_key.insert((row.taxonomy.clone(), row.slug.clone()), row);
+                }
             }
         }
 
@@ -4605,31 +4712,42 @@ pub async fn import_terms(
                 continue;
             }
             let parent_slug = autumn_web::slugify(parent_slug);
-            let child: Option<Term> = terms::table
-                .filter(terms::taxonomy.eq(&draft.taxonomy))
-                .filter(terms::slug.eq(&draft.slug))
-                .select(Term::as_select())
-                .first(conn)
-                .await
-                .optional()?;
-            let parent: Option<Term> = terms::table
-                .filter(terms::taxonomy.eq(&draft.taxonomy))
-                .filter(terms::slug.eq(&parent_slug))
-                .select(Term::as_select())
-                .first(conn)
-                .await
-                .optional()?;
-            let (Some(child), Some(parent)) = (child, parent) else {
+            let Some(child) = by_key.get(&(draft.taxonomy.clone(), draft.slug.clone())) else {
+                continue;
+            };
+            let Some(parent) = by_key.get(&(draft.taxonomy.clone(), parent_slug)) else {
                 continue;
             };
             if !created.contains(&child.id) {
                 continue;
             }
             if child.id != parent.id && child.parent_id != Some(parent.id) {
-                diesel::update(terms::table.find(child.id))
-                    .set(terms::parent_id.eq(parent.id))
-                    .execute(conn)
-                    .await?;
+                // `parent` came from the batched snapshot taken before the
+                // create pass, not from a lookup right before this write. For
+                // an early term that snapshot is only microseconds stale, same
+                // as the old row-by-row loop's own SELECT-then-UPDATE gap, but
+                // for a term near the end of a large file it can be however
+                // long the rest of the batch took to process. `parent_id` is
+                // `REFERENCES terms (id) ON DELETE SET NULL`: writing a since-
+                // deleted id straight from the stale snapshot would violate
+                // that constraint and abort the whole restore over an
+                // ordinary concurrent delete, instead of just skipping this
+                // one link the way the original per-row check would have.
+                // Bounded to actual re-parent operations, not to the file's
+                // term count, so re-checking here costs nothing this PR's
+                // measured counters care about.
+                let parent_still_exists: Option<Term> = terms::table
+                    .find(parent.id)
+                    .select(Term::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if parent_still_exists.is_some() {
+                    diesel::update(terms::table.find(child.id))
+                        .set(terms::parent_id.eq(parent.id))
+                        .execute(conn)
+                        .await?;
+                }
             }
         }
 

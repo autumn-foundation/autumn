@@ -1237,6 +1237,39 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
+    // Warden 2026-09-13: `owner = <column>` has no effect on the generated
+    // `api = "..."` CRUD routes. It only emits opt-in `list_scoped`/
+    // `search_page_scoped` repository methods for a hand-written handler to
+    // call with an explicit owner id — the auto-generated `_api_list`,
+    // `_api_get`, `_api_update` and `_api_delete` handlers never call them,
+    // and always fall back to the plain, unscoped `page`/`find_by_id`/
+    // `update`/`delete_by_id`. Only `policy = Type` actually gates the
+    // single-record handlers: `policy_check_show`/`policy_check_update_pre`/
+    // `policy_check_delete_pre` are each generated purely from `has_policy` —
+    // there is no `scope`-driven equivalent for `_api_get`/`_api_update`/
+    // `_api_delete`. `scope = Type` only ever filters the *list* endpoint's
+    // SQL (`scope_list_body`'s `scope_type.is_some()` arm) — it is a
+    // performance companion to a policy, never a substitute for one. So
+    // `policy_type` must be present; `scope_type` may additionally be present
+    // (for a cheaper SQL-level list filter) but never as its replacement. A
+    // first cut of this fix accepted `scope` as an alternative to `policy`,
+    // which left `_api_get`/`_api_update`/`_api_delete` fully unguarded for
+    // `owner = <column>` + `api = "..."` + `scope = Type` with no `policy` —
+    // caught in review (Codex, PR #2770) before merge.
+    if api_path.is_some() && owner_column.is_some() && policy_type.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "owner = <column> has no effect on the generated `api = \"...\"` CRUD routes: only \
+             `policy = Type` gates `GET`/`PUT`/`DELETE <api>/{id}` (via can_show/can_update/\
+             can_delete) and the list endpoint when no `scope` is set. `scope = Type` alone \
+             is not enough — it only filters `GET <api>`'s SQL query and has no effect on the \
+             single-record routes, which would stay fully open. Add `policy = Type` (referencing \
+             `owner_id`/`ctx.user_id_i64()` from it), keeping `scope = Type` alongside it if you \
+             want the list endpoint's cheaper SQL-level filter too, or drop `api = \"...\"` and \
+             call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` \
+             methods from your own hand-written, owner-checked routes instead",
+        ));
+    }
     if validate_on_update_fetch && no_upsert_trait {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -1369,6 +1402,20 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  delete path emits, so realtime subscribers would keep a stale record after a \
                  swept row is gone. Remove `broadcasts = true`, or call \
                  delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
+        if position.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support position(...) yet: the sweep batches up to \
+                 `batch_size` rows into one DELETE/UPDATE statement, and each swept row's \
+                 compaction trigger only sees its own pre-statement OLD position — several \
+                 swept rows from the same scope in one sweep statement can leave a gap in the \
+                 ordered sequence (#2240, same root cause already fixed for \
+                 delete_many/update_many by forcing chunk size 1). Remove `position(...)`, or \
+                 age rows out of the ordered list yourself via delete_many(ids) (already \
+                 single-row-chunked for position tables) from a hand-written #[scheduled] \
                  sweep for now",
             ));
         }
@@ -10910,6 +10957,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let upsert_many_body = {
+            // A position-scoped table's compaction trigger fires per row and only
+            // sees its own pre-statement OLD position, so one multi-row upsert
+            // chunk that reassigns several rows' scope can under- or over-compact
+            // (#2240, same root cause already fixed for delete_many/update_many).
+            // Force every upsert chunk to a single row when a position field
+            // exists, skipping the bind-param-based cap entirely: a plain
+            // `.min(1).max(1)` on that cap is always 1, so clippy's `min_max`
+            // lint (deny-by-default) correctly flags it as dead code.
+            let chunk_size_setup = if config.position.is_some() {
+                quote! {
+                    let chunk_size: usize = 1;
+                }
+            } else {
+                quote! {
+                    let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                }
+            };
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(
                     table_name,
@@ -11204,8 +11269,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
-                        let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                        #chunk_size_setup
                         #cc_serialize
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
@@ -24165,8 +24229,10 @@ mod tests {
     #[test]
     fn parse_repo_args_with_owner() {
         // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        // No `api = "..."` here: paired with `api` and no `policy`/`scope`,
+        // `owner` alone is now a hard compile error (Warden 2026-09-13) — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(
             config.owner_column.as_deref(),
@@ -24181,8 +24247,13 @@ mod tests {
         // applied to BOTH the COUNT and the page query, before the allowlisted
         // sort/filter helpers, so `total` and the returned rows can never be
         // widened past the owner's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `list_scoped` generation
+        // is gated purely on `owner_column`, not on `api`, and `api` +
+        // `owner` with no `policy`/`scope` is now a compile error — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { Post, owner = author_id },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24216,8 +24287,13 @@ mod tests {
         // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
         // hydration query by owner — all three, or `total`/rows would disagree
         // and the endpoint could leak another user's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `search_page_scoped`
+        // generation is gated on `owner_column` + `searchable`, not on `api`,
+        // and `api` + `owner` with no `policy`/`scope` is now a compile error
+        // — see `repository_owner_api_without_policy_or_scope_is_rejected`.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { Post, owner = author_id, searchable },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24251,6 +24327,104 @@ mod tests {
                 "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
             ),
             "search_page_scoped hydration query must filter by owner: {body}"
+        );
+    }
+
+    // Warden 2026-09-13: `owner = <column>` never gated the generated
+    // `api = "..."` CRUD routes — only the opt-in `list_scoped`/
+    // `search_page_scoped` methods a hand-written handler must call
+    // explicitly. `#[repository(api = "...", owner = author_id)]` with no
+    // `policy`/`scope` therefore compiled to a fully public REST API (every
+    // row readable via `GET <api>`, any single row readable/overwritable/
+    // deletable by id via `GET`/`PUT`/`DELETE <api>/{id}`) despite reading,
+    // at the declaration site, like a per-owner-scoped one. Reject the
+    // combination at compile time instead of silently shipping it.
+    #[test]
+    fn repository_owner_api_without_policy_or_scope_is_rejected() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> next to api = \"...\" with no policy/scope must be rejected: \
+                 it silently ships an unscoped CRUD API"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_is_accepted() {
+        // Adding `policy = Type` alongside `owner` + `api` is the documented
+        // way out: the auto-API's `has_policy` branch (`__check_policy_scoped`)
+        // actually gates `show`/`update`/`delete`, and a `policy`-aware list
+        // body gates `GET <api>` too. `owner_column` still drives
+        // `list_scoped`/`search_page_scoped` for any hand-written route that
+        // wants the cheaper SQL-level filter instead.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy"#
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_scope_but_no_policy_is_rejected() {
+        // `scope = Type` alone must NOT satisfy the gate: it only filters the
+        // list endpoint's SQL query (`scope_list_body`'s `scope_type.is_some()`
+        // arm). `_api_get`/`_api_update`/`_api_delete` have no `scope`-driven
+        // equivalent — only `has_policy` gates them
+        // (`policy_check_show`/`policy_check_update_pre`/
+        // `policy_check_delete_pre`) — so accepting `scope` on its own would
+        // leave every single-record route fully unguarded. Caught in review
+        // (Codex, PR #2770) on the first cut of this fix, which wrongly
+        // accepted `scope` as an alternative to `policy`.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, scope = PostScope"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> + scope = Type (no policy) next to api = \"...\" must be \
+                 rejected: scope only filters the list endpoint, leaving show/update/delete open"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_and_scope_is_accepted() {
+        // The full, efficient combination: `policy` gates every single-record
+        // route and (absent a faster `scope`) the list endpoint too;
+        // `scope` on top gives the list endpoint a cheaper SQL-level filter
+        // instead of the in-memory `can_show` sweep.
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy, scope = PostScope"#
+            .parse()
+            .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type + scope = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_without_api_is_accepted() {
+        // `owner =` with no `api =` at all is unaffected: it only emits the
+        // opt-in `list_scoped`/`search_page_scoped` methods for a
+        // hand-written route to call, and generates no HTTP surface of its
+        // own to leave unscoped.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> with no api = \"...\" must be accepted"
         );
     }
 
@@ -26435,6 +26609,27 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_position() {
+        // #2240: the sweep batches many rows into one DELETE/UPDATE statement.
+        // A position-scoped table's per-row compaction trigger only sees its
+        // own pre-statement OLD position, so sweeping several live rows from
+        // the same scope in one statement can leave a gap (same root cause
+        // already fixed for delete_many/update_many). Reject rather than
+        // silently corrupt the ordered sequence.
+        let tokens: proc_macro2::TokenStream =
+            "Post, position, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + position(...) must be rejected");
+        };
+        assert!(
+            error.to_string().contains("position"),
+            "retention + position(...) must be rejected: {error}"
+        );
+    }
+
+    #[test]
     fn retention_rejects_dependent() {
         // Regression (#1342 review): the sweep mutates rows directly and
         // does not run the cascade-aware delete path dependent(...)
@@ -27620,5 +27815,66 @@ mod tests {
                 generated.len(),
             );
         }
+    }
+
+    #[test]
+    fn repository_macro_positioned_upsert_many_forces_single_row_chunks() {
+        // #2240: `upsert_many` sends one `INSERT ... ON CONFLICT DO UPDATE`
+        // per chunk (up to 1000 rows). If the changeset reassigns a scoped
+        // `position` field, several same-scope rows can be rescoped in one
+        // statement -- each row's compaction trigger only sees its own
+        // pre-statement OLD position, so ranks can end up gapped or
+        // duplicated (same root cause already fixed for update_many's scope
+        // reassignment). Cap the chunk size at 1 whenever `position(...)` is
+        // declared.
+        let generated = repository_macro(
+            quote! { Post, position },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must still be generated for a position(...) repository");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size")
+            .expect("upsert_many must set chunk_size")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 60];
+        assert!(
+            chunk_def.contains(": usize = 1 ;"),
+            "position(...) must force upsert_many chunk size to a plain 1 row constant: {chunk_def}"
+        );
+        assert!(
+            !chunk_def.contains("1000"),
+            "position(...) must not leave a 1000-row upsert chunk cap in place: {chunk_def}"
+        );
+        let upsert_body_window = &generated[anchor..(anchor + 4000).min(generated.len())];
+        assert!(
+            !upsert_body_window.contains("__autumn_column_count"),
+            "position(...) must skip the bind-param-based chunk cap entirely, not just cap it \
+             at 1 -- clippy's min_max lint flags a `.min(1).max(1)` chain as dead code: \
+             {upsert_body_window}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_non_positioned_upsert_many_keeps_bulk_chunk_cap() {
+        // Sibling of the test above: a repository without `position(...)`
+        // must keep the original 1000-row chunk cap, i.e. this fix must not
+        // regress bulk upsert throughput for ordinary repositories.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must be generated");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size = if cols")
+            .expect("upsert_many must compute chunk_size from cols")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 160];
+        assert!(
+            chunk_def.contains("1000"),
+            "a non-position repository must keep the bulk 1000-row upsert chunk cap: {chunk_def}"
+        );
     }
 }

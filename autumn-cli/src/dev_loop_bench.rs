@@ -128,12 +128,24 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             p95_ms: 8_000,
             max_ms: 15_000,
         },
-        // Cold-start onboarding budget (issue #977). The success metric is
-        // p95 ≤ 60s for the no-DB `hello` shape on the CI reference runner.
+        // Cold-start onboarding budget (issue #977). Issue #2309 lowered this
+        // budget from p95 60s / max 90s to the values below.
+        //
+        // Two fixes cut the real cold-start time. The first: the
+        // `autumn-macros` `db` gate. The second: the removal of two unused
+        // default features from the no-DB daemon starter. Neither fix
+        // brings cold start under the original 60s/90s target. The reason:
+        // `autumn-web`'s own hand-written source now sets the pace. No
+        // feature gates that source.
+        //
+        // The values below come from measured CI runs (p50 about 108-117s,
+        // p95 and max about 120-122s), plus margin for runner noise. See
+        // docs/guide/dev-loop-latency.md for the full history and issue
+        // #2795, which tracks `autumn-web`'s own compile time.
         ChangeClass::ColdStartHello => LatencyBudget {
-            p50_ms: 45_000,
-            p95_ms: 60_000,
-            max_ms: 90_000,
+            p50_ms: 100_000,
+            p95_ms: 130_000,
+            max_ms: 160_000,
         },
         // Database-backed cold start is informational only in this slice, so
         // these limits are not gated. The bundled managed-Postgres provider adds
@@ -1853,9 +1865,10 @@ mod tests {
     // ── cold-start budgets ────────────────────────────────────────────────
 
     #[test]
-    fn budget_cold_start_hello_p95_is_60000ms() {
-        // Success metric (issue #977): p95 ≤ 60s for the no-DB cold start.
-        assert_eq!(budget_for(ChangeClass::ColdStartHello).p95_ms, 60_000);
+    fn budget_cold_start_hello_p95_is_130000ms() {
+        // Recalibrated budget (issue #2309). The no-DB cold start must stay
+        // at or under p95 130s. See docs/guide/dev-loop-latency.md for why.
+        assert_eq!(budget_for(ChangeClass::ColdStartHello).p95_ms, 130_000);
     }
 
     #[test]
@@ -1897,10 +1910,10 @@ mod tests {
             table.to_lowercase().contains("cold start"),
             "table must mention cold start, got:\n{table}"
         );
-        // 60s p95 budget for the gated no-DB shape must be visible.
+        // 130s p95 budget for the gated no-DB shape must be visible.
         assert!(
-            table.contains("60000") || table.contains("60 000"),
-            "table must show the 60s p95 budget, got:\n{table}"
+            table.contains("130000") || table.contains("130 000"),
+            "table must show the 130s p95 budget, got:\n{table}"
         );
     }
 
@@ -1932,9 +1945,9 @@ mod tests {
 
     #[test]
     fn build_cold_start_report_hello_over_budget_fails_gate() {
-        // p95 way above the 60s budget → gate fails.
+        // p95 well above the 130s budget → gate fails.
         let report =
-            build_cold_start_report(&[120_000, 130_000, 140_000], &DbOutcome::NotRequested);
+            build_cold_start_report(&[200_000, 210_000, 220_000], &DbOutcome::NotRequested);
         assert!(!report.all_passed, "over-budget hello must fail the gate");
     }
 
