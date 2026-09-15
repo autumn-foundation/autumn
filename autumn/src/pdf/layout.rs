@@ -2626,21 +2626,33 @@ mod tests {
         counter.count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// `n` levels of `<span>` wrapped around `MARKER` — the exact shape
+    /// issue #2801 used to find the 512/513 cutover.
+    fn nested_span_html(n: usize) -> String {
+        let mut html = "<span>".repeat(n);
+        html.push_str("MARKER");
+        html.push_str(&"</span>".repeat(n));
+        html
+    }
+
     #[test]
-    fn depth_truncation_emits_exactly_one_warning_per_render() {
-        let mut html = String::new();
-        for _ in 0..600 {
-            html.push_str("<span>");
-        }
-        html.push_str("hi");
-        for _ in 0..600 {
-            html.push_str("</span>");
-        }
+    fn exactly_at_the_depth_cap_emits_no_warning() {
         assert_eq!(
-            count_pdf_depth_warnings(&html),
+            count_pdf_depth_warnings(&nested_span_html(512)),
+            0,
+            "512 levels is the documented cap, not past it — must not warn \
+             (issue #2801's own n=512 case)"
+        );
+    }
+
+    #[test]
+    fn one_level_past_the_depth_cap_emits_one_warning() {
+        assert_eq!(
+            count_pdf_depth_warnings(&nested_span_html(513)),
             1,
-            "one render past the depth cap must log exactly one warning, \
-             not zero (silent) and not one per truncated node"
+            "513 levels is one past the cap — must log exactly one warning, \
+             not zero (silent) and not one per truncated node \
+             (issue #2801's own n=513 case)"
         );
     }
 

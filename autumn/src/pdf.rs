@@ -55,7 +55,7 @@
 //! against very deep HTML. Content past this depth does not render — the
 //! one exception to the "degrades gracefully" promise above.
 //!
-//! When this happens, [`render`](Pdf::render) still returns normal, valid
+//! When this happens, [`render`](crate::pdf::Pdf::render) still returns normal, valid
 //! PDF bytes — it does not return an error. Each render that hits the cap
 //! logs one `tracing::warn!` event at target `autumn::pdf`, so you can
 //! detect truncation from your log pipeline.
