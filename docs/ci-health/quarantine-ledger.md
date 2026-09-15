@@ -74,6 +74,284 @@ _None as of 2026-09-05._
   revert check passed. Un-quarantined and restored to the Docker sweep.
 - **Closed**: 2026-09-04, #2479 (🚦 Semaphore).
 
+### `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
+
+- **Not a flake — a total, deterministic external-dependency outage.**
+  Sampling the ~23.3h window since the 2026-09-11 follow-up's cutoff
+  (2026-09-11T09:09:24Z–2026-09-12T07:46:03Z) found `Test (Docker)` failing
+  on 20 of 24 failed `ci.yml` runs, across completely unrelated branches
+  (`claude/*` and `vesper/bugbash-*`, no shared code change). Every one of
+  the `autumn-cli` `cli_tests` occurrences checked (run IDs 34668965068,
+  34681578354, 34650506433, 34641243320, 34647320725, and others) panics
+  identically at `autumn-cli/tests/integration/offsite_backup.rs:213:10`:
+  `"start MinIO — is Docker running?: Client(PullImage { descriptor:
+  \"minio/minio:RELEASE.2025-02-28T09-55-16Z\", err:
+  DockerResponseServerError { status_code: 404, message: \"pull access
+  denied for minio/minio, repository does not exist or may require 'docker
+  login': denied: requested access to the resource is denied\" } })"`.
+  Since `Test (Docker)` feeds the required `test-gate` aggregator
+  (`Test suite`), this was failing the required check on essentially every
+  open PR in the repo.
+- **Mechanism**: unpinned/vanished external service, not a race or shared
+  state. Confirmed directly against Docker Hub's own API
+  (`https://hub.docker.com/v2/repositories/minio/minio/` →
+  `{"message":"object not found"}`) that the `minio/minio` repository no
+  longer exists on Docker Hub at all — not just this tag. MinIO Inc.
+  stopped publishing free images to Docker Hub in October 2025. The
+  `testcontainers-modules` crate (pinned at 0.15.0 in `Cargo.lock`) hard-codes
+  `minio/minio` as the image name in its `Image` impl, so every
+  `MinIO::default()` call in this repo pulled from the now-dead repository,
+  100% of the time — this is not stochastic, so no rerun-rate campaign is
+  needed to characterize it beyond the cross-commit evidence already in
+  hand (dozens of independent commits, zero passes, identical signature).
+  The same tagged image is still mirrored byte-for-byte on Quay
+  (`quay.io/minio/minio:RELEASE.2025-02-28T09-55-16Z`, confirmed via
+  `quay.io`'s API: identical manifest digest
+  `sha256:379b06de0d24339646b6139860b170c39b004818dcec95259ee680997839f7dc`
+  to the Docker Hub layer that used to serve this tag).
+- **Test-vs-product**: neither — this is test/CI infrastructure depending
+  on a third-party image registry outside this repo's control. No product
+  code path is implicated.
+- **Fix**: redirect every `MinIO::default()` call site to Quay via
+  `testcontainers`'s own `ImageExt::with_name("quay.io/minio/minio")`,
+  keeping the crate's existing default tag unchanged (same verified
+  manifest digest, so container behavior is identical — only the registry
+  changes). Applied to all three affected call sites:
+  `autumn-cli/tests/integration/offsite_backup.rs` (both tests),
+  `autumn/tests/integration/sqlite_replication_s3.rs`, and
+  `examples/reddit-clone/tests/avatar_s3_integration.rs` (not part of
+  either CI Docker sweep, but the same defect, so fixed for consistency
+  rather than left to fail identically whenever someone runs it).
+- **Verification**: `cargo check`/`cargo clippy -D warnings` clean on all
+  three affected test targets (`autumn-cli --test cli_tests`, `autumn-web
+  --test integration_tests --features test-support,offline-sync`,
+  `reddit-clone --test avatar_s3_integration`). No Docker daemon is
+  available in this sandbox, so the actual container pull could not be
+  exercised locally; **CI-native verification is pending on this PR's own
+  `Test (Docker)` job**, which exercises the real pull against
+  `quay.io/minio/minio` for the first time. Revert check: not applicable in
+  the usual sense (nothing in this repo's own logic changed — the defect
+  was entirely in an external registry going away), but the `PullImage`
+  failure this fix removes is fully reproducible pre-fix (see the run IDs
+  above) and specific to the registry, not the tag or image content, so
+  restoring `MinIO::default()` without `.with_name(...)` would reproduce
+  the identical 404 immediately.
+- **Closed**: 2026-09-12, pending this PR's own CI run for the CI-native
+  confirmation noted above (🚦 Semaphore). **Confirmed 2026-09-13, then
+  scope-corrected same day (post-review, via a Codex review comment on PR
+  #2768): CI-native verification covers only two of the three fixed
+  files, not "this entry's fix" as a whole.** PR #2740's own `Test
+  (Docker)` check run (job 103543584136, part of workflow run
+  34688787858) completed `success` at 2026-09-12T11:55:09Z, and that run
+  does exercise the real `quay.io/minio/minio` pull for
+  `autumn-cli/tests/integration/offsite_backup.rs` (via the `autumn-cli`
+  Docker sweep) and `autumn/tests/integration/sqlite_replication_s3.rs`
+  (via the `autumn` Docker sweep) — both confirmed CI-natively, not just
+  locally clippy-clean. **`examples/reddit-clone/tests/avatar_s3_integration.rs`
+  is not part of either sweep** (per this repo's own `AGENTS.md`: only the
+  `autumn` consolidated `integration_tests` binary and `autumn-cli`'s
+  `cli_tests` binary are swept for `#[ignore]`d Docker tests; a separate
+  example crate's own test target is reached by neither, and `ci.yml` has
+  no dedicated job for it either — confirmed by grep, no match), so its
+  `avatar_blob_store_roundtrip` test's actual registry pull remains
+  compile-and-clippy-verified only, not CI-exercised, regardless of how
+  many times this file was subsequently touched by the escape below. See
+  the new escape entry immediately below for a coordination defect this
+  fix's merge timing collided with (independent, not a defect in the fix
+  itself).
+
+### Escape: four independent fixes for the same MinIO/Docker-Hub outage collided at merge, needing two reconciliation commits — ~8.3h of spurious Lint failures (two disjoint intervals) on 5 branches
+
+- **Correction (post-review, via a Codex review comment on PR #2768): the
+  original version of this entry named the wrong commits and the wrong
+  count.** It attributed the cleanup to #2749/#2750/#2751/#2752 and framed
+  this as a two-PR (#2740/#2743) collision. Checked directly against each
+  commit's actual diff rather than its title or PR number: #2750
+  (`cfb5d93`), #2751 (`6dd7bb1`), and #2749 (`4eeeeac`) are **empty
+  merges** — no file changes at all, because by the time each squash-merge
+  landed, `trunk-dev` already carried equivalent content from a different,
+  concurrently-merging branch. #2752 (`1c5312e`) touches
+  `autumn-cli/src/generate/auth.rs`/`schema_edit.rs`/`CHANGELOG.md` only —
+  nothing MinIO-related. Corrected below from the actual diffs (`git show
+  --stat`/`-p` on every commit that touched the three affected test
+  files), not from any commit's own self-description — even the commit
+  that removed the dead helper (#2756) misattributes what added it.
+- **Second correction (post-review, via a further Codex review comment on
+  PR #2768): the lint-fallout window ends at #2756, not #2729.** The
+  first correction pass (above) still closed the window at #2729
+  (2026-09-13T02:30:05Z) and called it "the actual final resolution."
+  Checked directly against the tree at `a7c7c46` (#2756, 02:09:18Z):
+  `start_minio()` already has its two live callers, `MINIO_IMAGE` is
+  already wired into the avatar test's call site, and `minio_image()` is
+  already removed — zero dead code, full stop. #2729 (21 minutes later)
+  refactors that already-clean tree (reintroducing and then re-collapsing
+  its own branch's separate `minio_image()` copy, entirely within its own
+  single squashed commit — trunk-dev itself never saw that intermediate
+  state) and adds the regression test; it is a subsequent architectural
+  cleanup and a genuinely good side effect, not part of resolving the
+  fallout, which had already ended. The impact window and all timing
+  below are corrected to close at #2756.
+- **Third correction (post-review, via two further Codex review comments
+  on PR #2768): "six independent fixes" conflated independent outage
+  diagnoses with reactive cleanup commits, and the branch count was
+  overstated.** #2756 (9h05 after #2740) only deletes an unused helper —
+  it is not an independent diagnosis of the outage, it is cleanup of dead
+  code the collision left behind. #2725's own sub-commit message says so
+  explicitly: "fix: use the MINIO_IMAGE const **the merge from trunk-dev
+  introduced**" — it is repairing dead code its own branch picked up from
+  merging `trunk-dev`, not freshly diagnosing the Docker Hub outage.
+  Separated below into four independent-diagnosis fixes reacted to by two
+  reconciliation commits, not six of a kind. Separately, the claimed "at
+  least 6 distinct, unrelated WIP branches" named only five (counting
+  `brave-goldberg-gyr60j` once, since its two hits are one branch) — the
+  two `fix/reddit-clone-minio-*`/`fix/minio-quay-registry` branches
+  mentioned alongside them are not unrelated victims of the fallout, they
+  are other sessions' own independent attempts at fixing the outage
+  itself, a different category of evidence. Reduced to the 5 branches
+  actually confirmed by job-log inspection.
+- **Fourth correction (post-review, via two further Codex review comments
+  on PR #2768): the lint fallout is two disjoint intervals, not one
+  continuous window, and #2740's CI-native verification (above) does not
+  cover all three files it touched.** Checked directly against the tree
+  at each intermediate commit: `avatar_s3_integration.rs`'s dead-code seed
+  (from #2743) was fixed by #2725 at 23:19:07Z, and `offsite_backup.rs`'s
+  competing `minio_image()` helper was not introduced until #2720 at
+  23:22:06Z — so the tree was briefly, fully dead-code-free for those ~3
+  minutes in between, not continuously broken from #2743 to #2756. The
+  true accounting is two intervals: 17:46:17Z–23:19:07Z (~5h33m, the
+  `MINIO_IMAGE`-unused signature only) and 23:22:06Z–02:09:18Z (~2h47m,
+  the `minio_image()`-unused signature only), totaling ~8.3h, not one
+  continuous ~8.4h span. Separately: the MinIO/Quay entry's "CI-natively
+  verified" note (above) has been scope-corrected — `avatar_s3_integration.rs`'s
+  test is outside both Docker sweeps and was never actually run by that
+  green `Test (Docker)` job.
+- **Not a flake, not a product bug — a coordination gap.** The same
+  universally-visible `ci.yml` failure (every `Test (Docker)` run 404ing
+  on the dead `minio/minio` Docker Hub repository, regardless of a PR's
+  own diff) was independently diagnosed and fixed inside **four separate
+  PRs** within a ~6.3 hour window, none aware of the others — consistent
+  with this role's own and every other session's "red CI is work now"
+  posture: whoever hit the failure on their own PR fixed it in place
+  rather than waiting. Two further commits then had to reconcile the
+  dead code this collision left behind. Chronology, verified against each
+  commit's actual file-level diff and (where quoted) its own commit
+  message, not any commit's self-description of *other* commits — even
+  the commit that removed the dead helper (#2756) misattributes what
+  added it:
+
+  **Independent outage diagnoses (4):**
+  - **#2740** (`abacf9e`, this ledger's own fix, merged
+    2026-09-12T17:03:51Z): inlined
+    `.with_name("quay.io/minio/minio")` at all four call sites across
+    `offsite_backup.rs` (both tests), `sqlite_replication_s3.rs`, and
+    `avatar_s3_integration.rs`. **No helper function or constant** — the
+    original entry's claim that this PR added `minio_image()` is wrong.
+  - **#2743** (`d2693c1`, independent, 17:46:17Z, 43 min later):
+    added `const MINIO_IMAGE` to `avatar_s3_integration.rs` without wiring
+    it into the call site (which already carried #2740's identical inline
+    literal by merge time) — the first dead-code seed.
+  - **#2722** (`e9f90a7`, an unrelated replay-guard test PR, sub-commit
+    "fix: point MinIO testcontainers at quay.io (Docker Hub repo
+    pulled)" — its own message independently re-derives the outage from
+    its own PR's `Test (Docker)` failure, not from a merge conflict,
+    23:21:15Z): introduced a **new** `start_minio()` helper in
+    `offsite_backup.rs`, replacing both tests' inline literals from
+    #2740.
+  - **#2720** (`0917af7`, an unrelated `SeqKey` append-ordering PR,
+    sub-commit "fix: MinIO Docker tests point at quay.io, not the dead
+    Docker Hub repo" — likewise its own independent re-derivation,
+    23:22:06Z, one minute after #2722): independently introduced a
+    **second, competing** `minio_image()` helper in the same file,
+    duplicating `start_minio()`'s purpose with a different tag-pinning
+    strategy, and left it uncalled (dead code) — the second signature,
+    **reopening the fallout window three minutes after #2725 (below)
+    had briefly closed it**.
+
+  **Reconciliation commits, reacting to the above collision rather than
+  independently diagnosing the outage (2):**
+  - **#2725** (`e2cd122`, an unrelated `autumn upgrade` codemod PR,
+    sub-commit explicitly titled "fix: use the MINIO_IMAGE const **the
+    merge from trunk-dev introduced**", 23:19:07Z): wired
+    `avatar_s3_integration.rs`'s call site to #2743's constant, closing
+    that file's dead-code gap — its own message names this as repairing
+    merge-introduced dead code, not a fresh diagnosis. **This closes the
+    first interval**: at this commit the whole tree is briefly
+    dead-code-free (`offsite_backup.rs` had neither helper yet).
+  - **#2756** (`a7c7c46`, 2026-09-13T02:09:18Z, 9h05 after #2740): removed
+    the uncalled `minio_image()` from #2720, keeping `start_minio()`. Its
+    own diff touches nothing but that deletion. **This closes the second
+    interval, ending the fallout for good** — confirmed against the tree
+    at this commit: `start_minio()` has two live callers, `MINIO_IMAGE` is
+    wired into the avatar test, no unused helper remains. Zero dead code.
+
+  **Later, unrelated to either the collision or its cleanup:**
+  - **#2729** (`6e71bfb`, a large wire-contracts feature PR whose
+    long-lived branch had merged `trunk-dev` in three times over the same
+    window and picked up a MinIO fix each time, 2026-09-13T02:30:05Z, 21
+    minutes *after* #2756 already closed the fallout): a subsequent
+    refactor of the already-clean tree, not part of resolving the escape.
+    It reintroduces and then re-collapses its own branch's separate
+    `minio_image()` copy entirely within its own single squashed commit
+    (`trunk-dev` itself never saw that intermediate duplicate state), and
+    lands one clean genuine improvement as a side effect: a new
+    regression test, `minio_image_pulls_from_the_public_registry` — a
+    `#[test]` (not `#[ignore]`d, so it runs in the ordinary lane without
+    Docker) asserting the descriptor's registry and that a tag is pinned,
+    specifically so a future regression "surfaces as a red job naming a
+    registry rather than the file that forgot" (its own doc comment).
+
+  Confirmed directly against `autumn-cli/tests/integration/offsite_backup.rs`
+  at `trunk-dev`'s current tip (`6e71bfb`, post-#2729's later refactor):
+  `start_minio()` calls `minio_image()`, both tests call `start_minio()`,
+  and `minio_image_pulls_from_the_public_registry` passes — one source of
+  truth, no dead code, regression-guarded. This describes the current
+  state, not the fallout's resolution point (#2756, above).
+- **Impact, measured**: sampling `ci.yml` `pull_request` runs across the
+  two disjoint fallout intervals — 2026-09-12T17:46:17Z (#2743, first
+  dead-code seed) to 23:19:07Z (#2725, briefly clean), and 23:22:06Z
+  (#2720, reopened) to 2026-09-13T02:09:18Z (#2756, clean for good) —
+  roughly 8.3 hours combined — found the same `-D dead-code`
+  `Lint` failure on 5 distinct, unrelated WIP branches (confirmed by job
+  log inspection, not inferred from branch name): `claude/friendly-ritchie-uw76a2`,
+  `claude/tender-galileo-6f3dr7`, `claude/epic-clarke-8nbaes`,
+  `claude/brave-goldberg-gyr60j` (hit twice, both signatures below),
+  `claude/busy-cerf-9zos9k`. (Separately, `fix/reddit-clone-minio-*` and
+  `fix/minio-quay-registry` branch names were visible in the same window —
+  those are other sessions' own outage-fix attempts, evidence of the
+  coordination gap's scale, not additional dead-code victims, so they are
+  not counted in this blast-radius figure.) Two distinct signatures, both
+  dead-code, both in MinIO-related test files: `` error: function
+  `minio_image` is never used `` (`autumn-cli/tests/integration/offsite_backup.rs:216`,
+  from #2720's copy) and `` error: constant `MINIO_IMAGE` is never used ``
+  (`examples/reddit-clone/tests/avatar_s3_integration.rs:22`, from #2743's
+  unwired constant). Every hit failed only `Lint`/`Clippy` (and the `Test
+  suite` aggregator that depends on it) — no runtime test behavior was
+  affected, consistent with this being purely a merge-time dead-code
+  artifact, not a functional regression.
+- **Mechanism classification**: neither a test defect nor a product
+  defect — a **process/coordination gap**, a four-way one for the
+  original diagnoses plus two reactive cleanups, not a two-way one.
+  Nothing in `ci.yml` or the repo's own tooling flags "another open PR
+  already fixes this exact failure" before merge, and nothing flags
+  "this branch's own dead code came from a trunk-dev merge, not from its
+  own diff" either — so a failure visible to literally every open PR at
+  once (Docker Hub removing a dependency image) drew independent,
+  uncoordinated fixes from whichever PR happened to notice it first,
+  including inside PRs whose own subject matter (a replay-guard test, a
+  `SeqKey` ordering fix) had nothing to do with MinIO, and each collision
+  between those fixes then needed its own separate reconciliation commit.
+  No action needed here beyond recording it accurately: the fallout is
+  already fully resolved on `trunk-dev`, with a regression test added
+  later, and the affected branches only need an ordinary rebase to pick
+  up the clean state. This is Tier 1 escape-analysis evidence per this
+  role's own evidentiary tiers, not a new quarantine candidate.
+- **Closed**: 2026-09-13 (🚦 Semaphore), recorded after the fact — the
+  fallout resolved itself via the commits above before this pass began;
+  corrected twice, same day (2026-09-13), after Codex review comments on
+  the ledger's own PR (#2768) caught first the misattributed commits,
+  then the wrong window end-point and the conflation of independent
+  diagnoses with reactive cleanup commits.
+
 ## Under active investigation, not yet quarantined
 
 These are tracked here because they are the subject of an open rerun
@@ -280,6 +558,187 @@ without also filling in the intake form above.
   closed-per-this-role's-bar (see the 2026-09-10 update's own closure
   paragraph) — this note marks the verdict as rendered, not the entry as
   closed.
+- **2026-09-11 update — harness still undispatched (4th consecutive daily
+  pass); zero new organic hits inside the sampled window, but one landed
+  live afterward on this ledger's own tracking PR.** **Correction
+  (post-review, via a thirteenth Codex review comment on PR #2711): the
+  original headline here said "zero new organic hits" unscoped, which
+  went stale the moment the live hit below was logged in this same
+  entry.** Scoped now: zero hits in the sampled 109-run window; one hit
+  (run 34591670807, a `status: 0` repeat) outside it — see below.
+  Sampled the ~23.3h since the 2026-09-10 follow-up's actual recorded
+  cutoff (`2026-09-10T09:48:19Z`–`2026-09-11T09:09:24Z`; **correction,
+  post-review, via a sixth Codex review comment on PR #2711**: an earlier
+  version of this line understated the window as starting at
+  `10:30:30Z`, silently skipping the 42-minute gap between the two
+  reports — that gap was separately queried and holds 9 more
+  `pull_request`-triggered `ci.yml` runs, all cancelled, no failures, so
+  the combined population is 109 runs: 70 cancelled/25 success/14
+  failure, not 100/61/25/14). **Second correction (post-review, via an
+  eleventh Codex review comment on PR #2711): the 100-run figure itself
+  was only ever a page-1 result at the `perPage=100` ceiling, not verified
+  complete.** This repo's `total_count` for the underlying query grew
+  visibly during the pass (~7369 → ~8191), evidence of continuous
+  concurrent writes that can shift page boundaries between fetches.
+  Checked page 2 of the identical query: it overlaps this window's near
+  edge (`2026-09-09T10:07:59Z`–`2026-09-10T10:46:39Z`, i.e. past the
+  page-1 minimum), and every run in the overlap back to the actual cutoff
+  is accounted for — 16 runs, all cancelled/success except one failure
+  (34467823999) already identified above. No additional failures surfaced
+  there, but the window's far edge (near `2026-09-11T09:09:24Z`) was never
+  independently re-checked against a later page, and sampling by
+  wall-clock time plus a fixed page count is not reproducible against a
+  table this actively written to. Full reasoning and the reproduce
+  command are in the 2026-09-11 report; a future pass sampling this repo
+  should anchor to a stable run ID or commit rather than wall-clock time.
+  **Live organic hit during this same PR's own CI, 2026-09-11T11:51:57Z —
+  a second occurrence of the previously-unattributed `status: 0`
+  signature, now also on a plain `Test (ubuntu-latest)` job with no
+  coverage instrumentation.** PR #2711 (this ledger's own PR) is a
+  docs-only change with no code diff, so this is pure organic CI noise
+  from `trunk-dev`'s current `live_upgrade.rs`, not anything this PR
+  touched. Run 34591670807, job `Test (ubuntu-latest)`
+  (`check_run_id` 103245977784), branch `claude/sleepy-brown-uykw44`
+  at the same base commit as `trunk-dev`'s tip (which already carries the
+  #2645 fix — confirmed `8fae8af` is an ancestor). Panic at
+  `examples/hot-upgrade/tests/live_upgrade.rs:686:5`: `"every read must be
+  served across the cutover, saw [Observation { status: 0, body: "",
+  latency: 554.629µs }]"` — a single `status: 0`/empty-body observation,
+  same shape as the 2026-09-09T13:59Z hit this ledger already logged as
+  not matching any of PR #2645's three named predicates. `refused`/`hard`/
+  retry-bound assertions above this line did not panic, so those counters
+  were clean, consistent with the earlier hit. This is now two occurrences
+  of this exact signature, and — significantly — this one is on the plain
+  `Test (ubuntu-latest)` job, **not** `Coverage (workspace)`, which weakens
+  the working assumption (never more than a hypothesis) that this
+  signature needs `cargo llvm-cov` instrumentation to manifest: it doesn't.
+  Still undiagnosed and still not campaigned (n=2, not a formal rerun
+  protocol), but this raises its priority for the still-unbuilt
+  Linux-shaped rerun harness the 2026-09-09/10 reports already flagged as
+  needed — it is not coverage-specific after all, so a plain `cargo test`
+  rerun harness (Linux, no `llvm-cov`) could reproduce it, which is a
+  cheaper harness to build than previously assumed. (This hit is outside
+  the sampled 109-run window above — it landed live, after the window
+  closed — so it is not one of the 14 counted failures there.)
+
+  Of the 14 failures counted in the sampled window itself, none match
+  `live_upgrade`, `cache_stampede`, or `sim_fault_plan` —
+  see the new `job_tracking_stores_integration` entry below for the one
+  finding this pass did turn up, on a different test entirely.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-11T~09:5xZ — unchanged for a
+  4th straight day since it became dispatchable 2026-09-08T15:07:44Z.
+  Zero organic hits this pass is reassuring but a ~23h window is not a
+  substitute for the rerun campaign below; the recommendation to dispatch
+  it (macOS half only, `samples: "20"`) stands unchanged from the
+  2026-09-10 pass.
+- **2026-09-13 update — 5th consecutive pass, harness still undispatched;
+  zero new organic hits on any of the four tracked tests (`live_upgrade`'s
+  three signatures included, six signatures total) in the sampled
+  window.** Sampled `ci.yml` `pull_request` runs from roughly
+  2026-09-12T13:58Z to 2026-09-13T09:02Z (~19 hours, ~130+ runs spanning
+  both pages of the query) — **best-effort, not proven-exhaustive**: the
+  two pages were fetched separately against a table under continuous
+  concurrent writes with no anchor to a stable run ID between them, the
+  same pagination risk this ledger already flagged in the 2026-09-11
+  entry above. Every failure this sample surfaced was attributed to
+  one of: the pre-existing MinIO/Docker-Hub outage (pre-#2740, before
+  17:03:52Z), the four-diagnosis MinIO-fix escape documented above (two
+  corrected intervals, 17:46:17Z-23:19:07Z and 23:22:06Z-02:09:18Z), or a
+  WIP branch's own in-progress bug (a
+  `dependabot` toolchain bump breaking `semver_script_checks_...`, a
+  `capture_min_length` feature branch, repeated `Clippy` churn on single
+  branches iterating on lint fixes). None matched `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, or (see below)
+  `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
+  still `total_count: 0` against `workflow_dispatch` runs, checked
+  2026-09-13T~09:1xZ — unchanged for a 5th straight day since it became
+  dispatchable 2026-09-08T15:07:44Z (now ~114 hours idle).
+- **2026-09-14 update — 6th consecutive pass, harness still undispatched;
+  zero new organic hits on any of the four tracked tests (`live_upgrade`'s
+  three signatures included, six signatures total) across everything
+  checked this pass.** Sampled `ci.yml` `pull_request` runs from the
+  2026-09-13 report's own cutoff (2026-09-13T09:02Z) to 2026-09-14T08:00:19Z
+  (~23 hours, one `perPage=100` page whose own span fully covers the window
+  with margin on both ends, so a second page was not needed this pass — 71
+  runs: 45 cancelled/24 success/2 failure). Both run-level failures triaged
+  by job/log inspection and attributed to their own branch's in-progress
+  work, neither a CI health issue: a `dependabot/cargo/validator-0.21.0`
+  bump broke its own `fuzz/Cargo.lock` (`--locked` refused the implicit
+  update) and, separately, `PostForm`'s `Validate` trait bound (`E0599` on
+  `into_changeset`) — both direct, deterministic consequences of that PR's
+  own dependency bump; and `claude/happy-edison-fstb1z` (previously flagged
+  for its own `Clippy` churn) failed a `Test (windows-latest)` repo-hygiene
+  self-check (`edge_conformance_ci_coverage`) because that branch's own
+  in-progress `ci.yml` edit hadn't finished restoring the
+  `edge-conformance:` job block.
+  **Correction (post-review, via a Codex review comment on PR #2786): the
+  original version of this pass called the whole window "zero hits" from
+  only the two run-level failures, but 45 of the 71 runs were `cancelled`
+  overall — and `ci.yml`'s `cancel-in-progress` means a job can fail before
+  its run gets superseded and marked `cancelled`, so those were not
+  established zero-hit observations.** Checked job-level conclusions for the
+  28 most-recently-created of the 45 cancelled runs (62%, best-effort
+  sample — a contiguous prefix by `created_at` descending, from 34773833346
+  through 34819892079; the remaining 17, from 34748838991 through
+  34771611140, weren't checked — full ID list in the matching report's
+  correction note). **Second correction (post-review, caught while
+  reproducing this claim for the "fixed" correction below, not a Codex
+  finding): the sample was originally miscounted as 26/45; it is 28/45.**
+  Found one hidden job-level failure: run 34774043482
+  (branch `claude/epic-meitner-vkej1i`, created 2026-09-13T18:15:04Z,
+  overall `cancelled` when superseded by that branch's next push 13 minutes
+  later) had `Test (ubuntu-latest)` and `Test (windows-latest)` both
+  complete with conclusion `failure` first, on the identical test on both
+  platforms: `starters::tests::embedded_cms_matches_example_cms`
+  (`autumn-cli/src/starters/mod.rs:664:13`), `` assertion `left == right`
+  failed: drift between embedded cms starter and examples/cms at
+  src/routes/front.rs `` — a repo-hygiene drift-check between the embedded
+  CMS starter template and `examples/cms`'s actual source, firing
+  identically on both OS runners because it's a pure file-diff assertion.
+  Branch-owned. **Third correction (post-review, via a further Codex review
+  comment on PR #2786): the same run had two other jobs — `Test (Docker)`
+  and `Test (macos-latest)` — that ran ~38 and ~40 minutes respectively
+  before being cancelled, long enough to have hidden a tracked-signature
+  panic from a conclusion-only check.** Fetched and grepped both full logs
+  for the four tracked signature names and any panic/`FAILED` marker: the
+  Docker job actually ran and passed
+  `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+  (`... ok`) before being cancelled — positive evidence, not absence — with
+  nothing matching any tracked signature anywhere in the log; the macOS job
+  was killed mid-`cargo build` (`Terminate orphan process: pid (37808)
+  (rustc)`) and never reached the test phase. Separately, for every one of
+  the other 27 sampled cancelled runs, every `Test`-shaped job shows the
+  *unexpanded* matrix template name with conclusion `cancelled` and
+  near-simultaneous created/started/completed timestamps — direct evidence
+  those jobs never started, so they carry no risk of hiding a signature
+  either.
+  **Fourth correction (post-review, via a further Codex review comment on
+  PR #2786, written chronologically before the third correction above):
+  whether the branch's next push fixed it is unverified, not
+  established.** An earlier version of this entry claimed the branch's very
+  next push (run 34777703864, ~13 minutes later) "evidently fixed it"
+  because the signature didn't recur in the other 25 sampled cancelled
+  runs — but that run's own `Test`/`Trybuild`/`Windows Tier 1 journey` jobs
+  all show the *unexpanded* matrix template name with conclusion
+  `cancelled` and near-simultaneous created/started/completed timestamps,
+  consistent with being cancelled before the matrix job even started, not
+  after running the test — so there is no completed test-job conclusion
+  from that run either way. Absence of a repeat signature in a sample of
+  cancelled runs whose own Test jobs were themselves cancelled before
+  completing is not evidence anything passed; it's absence of observation.
+  Corrected: not observed again in the runs sampled this pass, full stop —
+  whether or how it was fixed is unverified. Not a CI health issue, and no
+  match to any tracked signature, regardless — but a real correction to the
+  earlier "zero hits" framing (and then to the unverified "fixed" framing)
+  nonetheless.
+  Nothing found this pass — the two run-level failures plus the one
+  job-level failure inside a cancelled run — matched `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, or `job_tracking_stores_integration`.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-14T~08:0xZ — unchanged for a
+  6th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~137 hours idle).
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -344,6 +803,8 @@ without also filling in the intake form above.
   entry it was when it had n=1.
 - **Status**: under active investigation, same rerun campaign as
   `live_upgrade` above (still undispatched).
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -354,3 +815,166 @@ without also filling in the intake form above.
   not an exhausted wall-clock wait.
 - **Status**: one occurrence — suggestive, not yet a repeat signature.
   Covered by the same rerun campaign as `live_upgrade` above.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
+  the `live_upgrade` entry's dated update above for the window and method).
+  Still n=1, still not campaigned.
+
+### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+
+- **New, 2026-09-11.** First occurrence found in the 2026-09-11 follow-up
+  pass. Run 34517281816 (branch `vesper/bugbash-2634-spez-normalize-fallback`,
+  not a change to the job-tracking code itself), job `Test (Docker)`
+  (the bare `--ignored` sweep over the `autumn` consolidated
+  `integration_tests` binary), 2026-09-10T19:24–20:01Z. `test result:
+  FAILED. 369 passed; 1 failed` — a single failure among the whole Docker
+  sweep. Panic at
+  `autumn/tests/integration/job_tracking_stores_integration.rs:264:5`:
+  `"record should be past its configured TTL"`.
+- **Mechanism**: the test (lines 216-264) configures `ttl_secs: 1`, calls
+  `job::enqueue_tracked` (which stamps `expires_at = self.clock.now() +
+  1s` using the *application's* `SystemClock`,
+  `PgJobTrackingStore::expires_at` in
+  `autumn/src/job_tracking.rs:1874-1878`), reads the row back once, then
+  `tokio::time::sleep(Duration::from_millis(1_200))` before asserting
+  `expires_at <= NOW()`, evaluated by Postgres
+  (`autumn/tests/integration/job_tracking_stores_integration.rs:256-258`).
+  `tokio::time::sleep` is `Instant`-backed and cannot fire early, so at
+  least 1200ms of real host time elapses before the check — comfortably
+  over the 1000ms TTL if `expires_at` is never rewritten after the initial
+  enqueue.
+
+  **Originally read (time dependence — dual clock source) as requiring
+  Postgres's wall clock to lag the app host's by more than the ~200ms
+  margin, attributed to contention on a heavily loaded runner.**
+  **Correction (post-review, via a second Codex review comment on PR
+  #2711): drop contention-induced clock skew as a candidate.** The Rust
+  test process and its `testcontainers`-managed Postgres container run on
+  the same GH Actions runner and, absent an explicit Linux time
+  namespace (not configured here), read the same underlying
+  `CLOCK_REALTIME` — they are not two independently-advancing clocks in
+  the sense that framing implied. CPU scheduling contention can delay
+  *when* a descheduled process gets to observe or write the clock, but
+  that only ever adds real elapsed time before the observation happens; it
+  cannot make the value read back *lag behind* true elapsed time, since
+  both sides are reading the same clock. A genuine clock skew here would
+  need a discrete step (e.g. an NTP correction moving the clock backward
+  between the write and the check) rather than ordinary contention — a
+  categorically different and far less likely mechanism, not the
+  contention-driven one originally proposed. Demoted accordingly; not
+  ruled out as a class (a clock step is possible in principle), but no
+  longer treated as comparably likely to the mechanism below.
+
+  **Correction (post-review, via a first Codex review comment on PR
+  #2711): the "only way" framing was wrong regardless — a second,
+  actually well-supported mechanism requires no clock disagreement at
+  all.** `run_job_handler_inner` (`autumn/src/job.rs:2266-2286`) calls
+  `store.mark_running(key)` immediately once the enqueued no-op job is
+  picked up by the running job runtime this test starts, and on
+  completion calls `ctx.settle_success()` (`autumn/src/job.rs:2346`); both
+  route through `PgJobTrackingStore::update`
+  (`autumn/src/job_tracking.rs:1927-1936`), which unconditionally
+  rewrites `expires_at` to *that write's own* `now + ttl`, all on the same
+  clock. If either write lands roughly 200-1000ms after the test's
+  initial read — well within reach of ordinary worker dispatch latency,
+  no contention or clock disagreement of any kind required —
+  `expires_at` is pushed past the 1.2s check point legitimately. This is
+  the same worker/update race the reviewer notes the Redis sibling test
+  (lines 113-117 immediately above) also permits in principle, though no
+  organic hit has been observed there — that sibling test is exposed to
+  the same worker/update race but never crosses a second clock source, so
+  it cannot help isolate the (now-demoted) clock-skew hypothesis, and its
+  clean history so far says nothing about the worker-refresh one either
+  way. **This worker-refresh mechanism is now the primary candidate**;
+  neither it nor a discrete clock step is confirmed.
+- **Test-vs-product**: not yet rendered, under either candidate mechanism.
+  **Correction (post-review, via a fourth Codex review comment on PR
+  #2711): "production never compares against Postgres's own `NOW()`" was
+  flatly wrong — a separate production code path does exactly that,
+  deliberately.** `pg_cleanup_expired_tracking_rows`
+  (`autumn/src/job.rs:9333-9358`), run periodically off a
+  `tracking_cleanup_interval.tick()`, executes `DELETE FROM
+  autumn_job_tracking WHERE expires_at <= NOW()` — the same cross-process
+  shape (an app-clock-stamped `expires_at` against Postgres's own `NOW()`)
+  this test's assertion uses, and the codebase's own test comments
+  (`autumn/src/job.rs:16704-16707`) already document the choice
+  explicitly. So this test doesn't invent a comparison production never
+  makes; it re-derives one production already makes elsewhere.
+  **Correction (post-review, via a seventh Codex review comment on PR
+  #2711): the sweep's cadence does not make ordinary clock disagreement
+  immaterial to it, and the reasoning above was wrong to imply that.**
+  Cadence controls how often the sweep gets a chance to observe a
+  disagreement, not the disagreement's *size* at any one observation —
+  a sweep that runs once every five minutes with the DB clock leading the
+  app clock by, say, 50ms can delete a row `PgJobTrackingStore` still
+  considers live just as readily as one that runs every second; running
+  less often does not shrink the skew.
+  **Correction (post-review, via an eighth Codex review comment on PR
+  #2711): TTL length is not a bound on this risk either, and the previous
+  fix's replacement reasoning repeated the same class of error.** A
+  longer TTL moves the absolute expiry point further into the future; it
+  does not widen any margin around that point, and a fixed clock
+  disagreement (e.g. Postgres leading the stamping host by 50ms) shaves
+  the same 50ms off the effective TTL whether it is 1 second or 24 hours.
+  `JobTrackingConfig::ttl_secs` (`autumn/src/config.rs:3943-3966`) also has
+  no enforced minimum — it is operator-configurable with a 24-hour
+  default and nothing stopping a much smaller value — so "production TTLs
+  are presumably chosen with margin" was an assumption, not a bound.
+  Withdrawn along with the cadence reasoning it echoed: nothing in this
+  entry actually bounds the early-deletion/late-retention risk from a
+  real clock disagreement; it is retained as open, not quantified away.
+
+  **Correction (post-review, via a ninth Codex review comment on PR
+  #2711): the read path is not reliably same-clock either — that was true
+  only for this specific test's single-process shape, not for production
+  generally.** `docs/guide/jobs.md`'s "Web and worker process roles"
+  section documents `web` and `worker` as separate process roles
+  (typically separate replicas/hosts) that share one durable Postgres
+  backend: a `web` replica's `job::enqueue_tracked` can stamp `expires_at`
+  from its own `SystemClock`, while a different `worker` replica's
+  `mark_running`/`settle_success` later calls
+  `PgJobTrackingStore::update` (`autumn/src/job_tracking.rs:1896-1902`)
+  using *that host's* `self.clock.now()` — genuinely two independent
+  clocks in that supported topology, the same shape as the cleanup sweep,
+  not a same-clock comparison at all. Only this test's own `combined`
+  (single-process) shape makes it same-clock; a discrete clock step is
+  not the only way the read path can disagree with an `expires_at` stamped
+  elsewhere — ordinary inter-host skew across `web`/`worker` replicas can
+  too, with no step required. `autumn/src/time.rs:105-108`'s point about
+  wall-clock comparisons lacking a monotonic guarantee still applies and
+  still matters for the single-host clock-step case, but it is no longer
+  the only source of read-path risk. A backward host clock step between a
+  write and a later read would extend a tracked job's effective TTL in
+  production via this path too, not just in this test — a real,
+  product-relevant characteristic of using wall-clock timestamps for TTL
+  comparisons, not dismissible as a test artifact, and now understood to
+  be one of at least two ways (clock step, or ordinary web/worker skew)
+  this path's assumption can fail. None of this means the observed
+  failure *was* a clock-related race of any kind — the worker-refresh
+  mechanism above remains the better-supported explanation for this
+  specific incident, since it fires within a single test process and
+  needs no cross-host clock disagreement at all — only that the
+  scenario's test-vs-product classification was wrong as originally
+  written, repeatedly: once for
+  treating the cross-process comparison itself as production-absent, and
+  once for treating even a clock step as test-only. Refreshing
+  `expires_at` on `mark_running`/`settle_success` (the
+  worker-refresh hypothesis) is deliberate, sensible production behavior
+  in its own right — a job still being worked on should not expire out
+  from under it — so if that mechanism is the one actually firing here,
+  the defect is squarely in the test's assumption that a fixed 1200ms
+  sleep leaves no room for the tracked job's own worker to touch the
+  record, not in the store: a test defect there. Both remain hypotheses
+  from reading the source, not yet confirmed by a rerun campaign or an
+  isolating experiment (e.g. asserting on `updated_at` to see which write,
+  if either, actually fired), so treat the verdict as provisional per this
+  role's own bar.
+- **Status**: n=1, not campaigned. Logged here for recognition per this
+  role's standard for a first hit; escalate to a rerun campaign only if a
+  repeat signature appears. Not quarantined — the Docker sweep is
+  unmodified and this test keeps running on every sweep.
+- **2026-09-13 update**: no repeat in the ~19h window sampled this pass
+  (see the `live_upgrade` entry's dated update above for the window and
+  method). Still n=1, still not campaigned.
+- **2026-09-14 update**: no repeat in the ~23h window sampled this pass
+  (see the `live_upgrade` entry's dated update above for the window and
+  method). Still n=1, still not campaigned.
