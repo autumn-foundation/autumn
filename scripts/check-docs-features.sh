@@ -1654,11 +1654,27 @@ def uses(blanked, gated):
         if root and root[1] & {'bang', 'attribute'}:
             continue
         bare[name] = entry
+    # Direct children of each module, whatever their case. Capitalization was
+    # the wrong axis here for the same reason it was wrong for the prelude —
+    # `openapi::generate_spec` is a lowercase public function behind `openapi`
+    # (`openapi.rs:1181`) — and round 19 fixed that axis on the prelude scan
+    # while leaving its sibling ten lines away untouched. Found by Codex review
+    # on #2800, which is the eighth time on this PR a rule landed on one of two
+    # code paths.
+    #
+    # A grandchild is not in scope from a glob over its grandparent, so an
+    # entry whose remainder still carries `::` is skipped; and a macro is
+    # excluded for the reason the prelude scan excludes one — it cannot be
+    # called by its bare name.
     children = {}
     for full, entry in gated.items():
         head, _, child = full.partition('::')
-        if child and child[:1].isupper():
-            children.setdefault(head, {})[child] = entry
+        if not child or '::' in child:
+            continue
+        root = gated.get(child)
+        if root and root[1] & {'bang', 'attribute'}:
+            continue
+        children.setdefault(head, {})[child] = entry
     for start, body in rust_fence_blocks(blanked):
         # Every glob this looks for — prelude or module — contains the literal
         # `::*`, so a fence without it cannot match either pattern. A necessary
@@ -1701,8 +1717,23 @@ def uses(blanked, gated):
             head = match.group(1).split('::')
             inner = match.group(2)
             # Each `child::{…}` inside the group is a further segment under the
-            # same head.
-            for child in re.findall(r'([a-z_][a-z_0-9]*)\s*::\s*\{', inner):
+            # same head — and so is every LEAF inside that child's braces.
+            # Resolving the child alone stopped at `capsule::capture`, which is
+            # unconditional, so `capsule::{capture::{with_capture_scope}}`
+            # reported nothing while the leaf needs `test-support`. The
+            # direct-entry loop below cannot cover it either: it skips any
+            # piece containing `{`. Found by Codex review on #2800.
+            for child, leaves in re.findall(
+                    r'([a-z_][a-z_0-9]*)\s*::\s*\{([^{}]*)\}', inner):
+                for leaf in leaves.split(','):
+                    leaf = leaf.strip().split(' as ')[0].strip()
+                    if not leaf:
+                        continue
+                    deep = [child, *leaf.split('::')][:MAX_MODULE_DEPTH]
+                    entry, shown = resolve(*head, *deep)
+                    if entry:
+                        for feature in sorted(entry[0]):
+                            yield lineno, feature, shown
                 entry, shown = resolve(*head, child)
                 if entry:
                     for feature in sorted(entry[0]):
@@ -2214,6 +2245,15 @@ def self_test():
         'storage::variant': ({'storage', 'variants'}, {'module'}),
         # A gated ITEM inside an UNCONDITIONAL module — the openapi case.
         'openapi::Parameter': ({'openapi'}, {'item'}),
+        # ...and a LOWERCASE one beside it, which a module glob also exports.
+        'openapi::generate_spec': ({'openapi'}, {'item'}),
+        # A GRANDCHILD: in scope from a glob over `openapi::inner`, never from
+        # one over `openapi`.
+        'openapi::inner::Deep': ({'openapi'}, {'item'}),
+        # Two module levels down, under parents that are both unconditional —
+        # the shape a nested group under a module head has to reach.
+        'capsule::BACKEND_CAPTURE_NOTE': ({'sqlite'}, {'item'}),
+        'capsule::capture::with_capture_scope': ({'test-support'}, {'item'}),
         # Items reachable only through a brace group, and a bang macro.
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
@@ -2457,12 +2497,39 @@ def self_test():
            found('```rust\nuse autumn_web::openapi::*;\n'
                  'async fn h(m: Multipart) {}\n```\n'),
            [])
+    # Lowercase too. Capitalization was the wrong axis here for the same reason
+    # it was wrong for the prelude, and round 19 fixed only the prelude half.
+    expect('a module glob brings its lowercase items into scope',
+           found('```rust\nuse autumn_web::openapi::*;\n'
+                 'let s = generate_spec(&app);\n```\n'),
+           [(3, 'openapi', 'generate_spec (from autumn_web::openapi::*)')])
+    # ...but a GRANDCHILD is not in scope from a glob over its grandparent.
+    # `openapi` is ungated, so nothing else on the line can report either.
+    expect('a glob does not reach a grandchild',
+           found('```rust\nuse autumn_web::openapi::*;\n'
+                 'let d: Deep = x;\n```\n'),
+           [])
     expect('...and only inside the fence that wrote it',
            found('```rust\nuse autumn_web::openapi::*;\n```\n\nprose\n\n'
                  '```rust\nlet p = Parameter {};\n```\n'),
            [])
     expect('a bare gated name with no glob at all is not read',
            found('```rust\nlet p = Parameter {};\n```\n'), [])
+
+    # A nested group under a MODULE head. Resolving the child alone stopped at
+    # `capsule::capture`, which is unconditional, so the leaf's requirement
+    # vanished; the direct-entry loop cannot cover it either, because it skips
+    # any piece containing `{`.
+    expect('a nested group under a module head reaches its leaf',
+           found('```rust\nuse autumn_web::capsule::'
+                 '{capture::{with_capture_scope}};\n```\n'),
+           found('```rust\nuse autumn_web::capsule::capture::'
+                 'with_capture_scope;\n```\n'))
+    expect('...alongside a direct sibling in the same group',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::capsule::{BACKEND_CAPTURE_NOTE, '
+               'capture::{with_capture_scope}};\n```\n')}),
+           ['sqlite', 'test-support'])
 
     # A `use` with no group is not joined, so the line after it keeps its own
     # number.
