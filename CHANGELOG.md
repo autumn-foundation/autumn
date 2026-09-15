@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
+  drops content (#2801):** `Pdf::render`'s layout walker silently dropped
+  any HTML past 512 levels of tag nesting — no error, no log line —
+  contradicting the module docs' "degrades gracefully" promise. Each
+  render that hits the cap now logs one `tracing::warn!` at target
+  `autumn::pdf`, no matter how many nodes it drops, and the cap plus the
+  warning are documented in `autumn_web::pdf`'s new "Nesting depth limit"
+  section. No shipped example is affected today (`examples/invoice` never
+  nests this deep), but any caller who feeds it recursive content (a
+  comment thread, a nested reply tree) can now detect truncation instead
+  of shipping an incomplete PDF unnoticed.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the

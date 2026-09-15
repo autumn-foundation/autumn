@@ -49,6 +49,21 @@
 //! rather than spilling onto a second page — realistic scaffold tables
 //! (invoice line items, a handful of columns) never approach this.
 //!
+//! # Nesting depth limit
+//!
+//! The layout walker stops at 512 levels of tag nesting. This is defense
+//! against very deep HTML. Content past this depth does not render — the
+//! one exception to the "degrades gracefully" promise above.
+//!
+//! When this happens, [`render`](Pdf::render) still returns normal, valid
+//! PDF bytes — it does not return an error. Each render that hits the cap
+//! logs one `tracing::warn!` event at target `autumn::pdf`, so you can
+//! detect truncation from your log pipeline.
+//!
+//! A typical scaffold view (headings, paragraphs, tables) stays far under
+//! 512 levels. Recursive content — a comment thread, a nested reply tree —
+//! can reach it.
+//!
 //! # Determinism
 //!
 //! Rendering the same HTML input always produces the same visible content:

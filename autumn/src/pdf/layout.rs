@@ -21,6 +21,13 @@ use super::metrics::{char_width_1000em, text_width_pt};
 /// element tree it receives.
 const MAX_DEPTH: u32 = 512;
 
+thread_local! {
+    /// Set when a walker drops content because it passed [`MAX_DEPTH`].
+    /// [`render_pages`] clears this at the start of every call and reads it
+    /// at the end, so one deep document logs one warning, not one per node.
+    static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A4 portrait, matching the default most other frameworks in this space
 /// (Rails' `wicked_pdf`, `WeasyPrint`) ship.
 const PAGE_WIDTH_PT: f32 = 595.28;
@@ -194,6 +201,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     for node in nodes {
@@ -261,6 +269,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     let mut index = 0u32;
@@ -302,6 +311,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     for node in nodes {
@@ -357,6 +367,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     let mut index = 0u32;
@@ -386,6 +397,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     let mut pending: Vec<Span> = Vec::new();
@@ -508,6 +520,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        DEPTH_CAP_HIT.with(|hit| hit.set(true));
         return;
     }
     // Reuse `flatten_blocks` by giving it a scratch buffer, then splice: if
@@ -1300,7 +1313,13 @@ impl Writer {
 }
 
 /// Render a parsed HTML-subset document as one or more [`PdfPage`]s.
+///
+/// If the input nests past [`MAX_DEPTH`], the excess content is dropped and
+/// this logs one `tracing::warn!` at target `autumn::pdf` — see the
+/// [module docs](crate::pdf)'s "Nesting depth limit" section.
 pub(super) fn render_pages(html: &str) -> Vec<PdfPage> {
+    DEPTH_CAP_HIT.with(|hit| hit.set(false));
+
     let nodes = super::html::parse(html);
     let mut blocks = Vec::new();
     flatten_blocks(&nodes, 0, &mut blocks);
@@ -1309,6 +1328,15 @@ pub(super) fn render_pages(html: &str) -> Vec<PdfPage> {
     for block in &blocks {
         writer.draw_block(block);
     }
+
+    if DEPTH_CAP_HIT.with(std::cell::Cell::get) {
+        tracing::warn!(
+            target: "autumn::pdf",
+            max_depth = MAX_DEPTH,
+            "pdf layout: nesting depth cap reached; content past this depth was dropped",
+        );
+    }
+
     writer.finish()
 }
 
@@ -2561,6 +2589,69 @@ mod tests {
         // asserts it completes and still produces at least one page.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
+    }
+
+    // ── Depth-cap truncation must be visible, not silent (issue #2801) ──
+
+    /// Counts `WARN` events at `target` seen while it is the default
+    /// subscriber. Scoped to one thread by [`tracing::subscriber::set_default`],
+    /// so parallel tests do not see each other's events.
+    #[derive(Clone, Default)]
+    struct WarnCounter {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if meta.target() == "autumn::pdf" && *meta.level() == tracing::Level::WARN {
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Render `html` under a capture subscriber and return how many
+    /// `autumn::pdf` warnings it emitted.
+    fn count_pdf_depth_warnings(html: &str) -> usize {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let counter = WarnCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        render_pages(html);
+        counter.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn depth_truncation_emits_exactly_one_warning_per_render() {
+        let mut html = String::new();
+        for _ in 0..600 {
+            html.push_str("<span>");
+        }
+        html.push_str("hi");
+        for _ in 0..600 {
+            html.push_str("</span>");
+        }
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "one render past the depth cap must log exactly one warning, \
+             not zero (silent) and not one per truncated node"
+        );
+    }
+
+    #[test]
+    fn shallow_nesting_emits_no_warning() {
+        let html = "<p>Hello <strong>world</strong></p>";
+        assert_eq!(
+            count_pdf_depth_warnings(html),
+            0,
+            "ordinary shallow content must never log a depth-cap warning"
+        );
     }
 
     #[test]
