@@ -605,6 +605,12 @@ USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
 # Found by Codex review on #2800. It is a module to a reader, so it is recorded
 # as one.
 USE_CRATE_AS = re.compile(r'^pub use ([a-z_0-9]+) as ([a-z_0-9]+);')
+# `pub use redis;` — a whole crate re-exported under its own name, which
+# `USE_CRATE_AS` misses for want of an `as` and `PUB_USE_ONE_LINE` misses for
+# want of a `::`. `lib.rs`'s inline `reexports` module is built entirely out of
+# this shape, and `reexports::redis` is behind the non-default `redis` feature.
+# Found by Codex review on #2800.
+USE_CRATE_PLAIN = re.compile(r'^pub use ([a-z_0-9]+);')
 # `#[cfg(all(feature = "embed-assets", feature = "i18n"))] #[macro_export]
 # macro_rules! embed_locales { … }` — a BANG macro, exported from the crate
 # root, and the only way to reach it is `autumn_web::embed_locales!()` or a
@@ -1033,6 +1039,7 @@ def root_modules(root):
     read "every top-level module whatever its own gate" while the code did not.
     """
     out = {}
+    bodies = {}
     lines = (pathlib.Path(root) / 'autumn/src/lib.rs').read_text(
         encoding='utf-8').splitlines()
     pending = None
@@ -1051,8 +1058,25 @@ def root_modules(root):
         if line.startswith(('///', '//!', '//', '#[')):
             continue
         match = PUB_MOD_DECL.match(line)
-        if match:
+        if match and not match.group(1).startswith('__'):
+            # `__fuzz` and `__private` are crate-internal plumbing — the same
+            # `__` convention the bang-macro scan already declines for
+            # `__autumn_register_fake_seeder`. Descending into them added
+            # eleven `__fuzz::parse_*` and `__private::*` entries, none of them
+            # a path any reader writes.
             out[match.group(1)] = set(pending or ())
+            # A root module declared INLINE has no file, and nothing else
+            # supplies its body: an inline module found while scanning another
+            # module is queued by that scan, but `lib.rs` is scanned here and
+            # nowhere else, so its inline modules reached `nested_modules` as a
+            # name with no source and were skipped. `lib.rs:2037` is
+            # `pub mod reexports {`, and `reexports::redis` inside it is behind
+            # the non-default `redis` feature — so a fence writing
+            # `autumn_web::reexports::redis::Client` resolved to nothing at
+            # all. Found by Codex review on #2800.
+            body, index = _inline_module_body(lines, index, line)
+            if body is not None:
+                bodies[match.group(1)] = body
         pending = None
     if not out:
         sys.exit(
@@ -1061,7 +1085,7 @@ def root_modules(root):
             'pass has nothing to descend into and would silently check only '
             'the head segment. Fix root_modules() in '
             'scripts/check-docs-features.sh.')
-    return out
+    return out, bodies
 
 
 def _inline_module_body(lines, index, decl):
@@ -1084,7 +1108,7 @@ def _inline_module_body(lines, index, decl):
     return body, index + 1
 
 
-def nested_modules(root, parents):
+def nested_modules(root, parents, bodies=None):
     """`{"parent::child": features}` for one level below the crate root.
 
     A feature gate below an UNCONDITIONAL module is invisible from the first
@@ -1120,8 +1144,10 @@ def nested_modules(root, parents):
     declines. `MAX_MODULE_DEPTH` names it so the boundary is one number rather
     than a shape buried in a loop.
     """
+    bodies = bodies or {}
     out = {}
-    queue = [(name, set(features), None) for name, features in parents.items()]
+    queue = [(name, set(features), bodies.get(name))
+             for name, features in parents.items()]
     seen = set()
     while queue:
         name, parent_features, lines = queue.pop()
@@ -1204,6 +1230,15 @@ def nested_modules(root, parents):
                         (f'{name}::{match.group(1)}', 'type'))
                 pending = None
                 continue
+            match = USE_CRATE_PLAIN.match(line)
+            if match:
+                child = f'{name}::{match.group(1)}'
+                if pending:
+                    out[child] = (set(parent_features) | pending, {'module'})
+                else:
+                    unconditional.add((child, 'type'))
+                pending = None
+                continue
             match = PUB_USE_ONE_LINE.match(line)
             if match:
                 if pending:
@@ -1267,8 +1302,9 @@ def surface(root):
     # gated or not — because the interesting case is a gated child under an
     # UNCONDITIONAL parent, and seeding from the gated set alone skipped it.
     # `data::csv` is that case, and it was a live defect. See `root_modules()`.
+    roots, inline = root_modules(root)
     for name, (features, kinds) in nested_modules(
-            root, root_modules(root)).items():
+            root, roots, inline).items():
         needed = features - closure
         if needed:
             out[name] = (needed, kinds)
@@ -1382,53 +1418,84 @@ PATH_USE = re.compile(
     r'(?:::([A-Za-z_][A-Za-z_0-9]*))?'
     r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
 ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
-# `use autumn_web::{Mail, Mailer};` — ordinary use-tree syntax, and the corpus
-# writes 16 of them in rust fences. `PATH_USE` wants an identifier straight
-# after `::` and sees `{`, so every name in the group went unread. Found by
-# Codex review on #2800. Both ends of the group have to be in the string this
-# is matched against, which is why `rust_fences` joins a multi-line `use` back
-# onto one line first — the claim that stood here, that the corpus writes no
-# multi-line group, was never measured and is false six times over.
-#
-# The body is brace-BALANCED rather than brace-free, because `[^{}]*` did not
-# merely miss a nested entry — it failed the whole group, so
-# `use autumn_web::{pdf::Pdf, openapi::{Parameter}};` reported NEITHER name,
-# losing the `pdf::Pdf` that resolves perfectly well on its own. One nested
-# entry blinded the entire line. `PATH_USE` could not pick up the slack either,
-# since it wants an identifier straight after `::` and sees `{`. Found by Codex
-# review on #2800.
-GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
-# `use autumn_web::storage::{blob::Blob, variant::{Transform, VariantBudget}};`
-# — a group hanging off a MODULE segment, which `GROUP_USE` (anchored straight
-# after `autumn_web::`) cannot see. `storage-variants.md:71` writes exactly
-# that, and the inner `variant::` is where the `variants` requirement lives, so
-# the line resolved to `storage` alone. Found by Codex review on #2800.
-#
-# The module path before the brace may be SEVERAL segments. `use
-# autumn_web::mail::suppression::{record_inbound, …}` is how
-# `skills/autumn-web/SKILL.md:1494` writes it, and a single-segment head
-# resolved the line to `mail` alone — which is a default-adjacent feature the
-# page already names, so the gated `record_inbound` inside vanished. Found by
-# Codex review on #2800, in the same round as the inline module it lives in.
-MODULE_GROUP_USE = re.compile(
-    r'\bautumn_web::([a-z_][a-z_0-9]*(?:::[a-z_][a-z_0-9]*)*)'
-    r'::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
-MODULE_GROUP_ENTRY = re.compile(r'([a-z_][a-z_0-9]*)\s*::\s*\{|'
-                                r'^\s*([A-Za-z_][A-Za-z_0-9]*)')
-# The child segment takes UPPERCASE too. `use autumn_web::{openapi::Parameter};`
-# names a gated ITEM under an unconditional module, and restricting the child to
-# lowercase resolved the entry to `openapi` alone — which is ungated, so the
-# line reported nothing. Round 8 widened `PATH_USE` for exactly this and left
-# the group form behind. Found by Codex review on #2800.
-#
-# One entry of a root group that is itself a group — `openapi::{Parameter}`.
-# `MODULE_GROUP_USE` is anchored on `autumn_web::<mod>::{` and so cannot see a
-# group nested one level further in. Found by Codex review on #2800.
-NESTED_GROUP_ENTRY = re.compile(
-    r'^\s*([a-z_][a-z_0-9]*)\s*::\s*\{([^{}]*)\}\s*$')
-GROUP_ENTRY = re.compile(
-    r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)'
-    r'(?:::([A-Za-z_][A-Za-z_0-9]*))?')
+# Every `autumn_web::…::{` in a line, however deep the group nests. The body is
+# taken by BRACE MATCHING rather than by a regex, because a balanced-group
+# pattern can only ever express a fixed nesting depth: the one-level form
+# accepted `{mail::{suppression}}` and failed the whole match on
+# `{mail::{suppression::{record_inbound}}}`, reporting nothing at all. Four
+# rounds of this review (15, 18, 21, 22) each added one more shape of group;
+# `use_tree_paths` reads the grammar instead, so there is no next shape.
+GROUP_ANCHOR = re.compile(r'\bautumn_web::((?:[a-z_][a-z_0-9]*::)*)\{')
+
+
+def balanced_body(text, open_index):
+    """The text between `text[open_index]` (a `{`) and its matching `}`."""
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:index]
+    return None
+
+
+def split_entries(body):
+    """`body` split on its TOP-level commas — those inside braces are not."""
+    out, depth, current = [], 0, []
+    for char in body:
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+        if char == ',' and depth == 0:
+            out.append(''.join(current))
+            current = []
+        else:
+            current.append(char)
+    out.append(''.join(current))
+    return [entry.strip() for entry in out if entry.strip()]
+
+
+def use_tree_paths(prefix, body):
+    """Every path a use-tree body names, as segment lists under `prefix`.
+
+    Both the module a nested group hangs off and the leaves inside it, because
+    either can be the gated one: `storage::{variant::Transform}` needs
+    `variants` from the module, and `capsule::{capture::{with_capture_scope}}`
+    needs `test-support` from the leaf under two unconditional parents.
+    """
+    for entry in split_entries(body):
+        entry = entry.split(' as ')[0].strip()
+        if not entry:
+            continue
+        brace = entry.find('{')
+        if brace == -1:
+            parts = [p.strip() for p in entry.split('::') if p.strip()]
+            # `self` in a group names the module the group hangs off, which the
+            # caller has already yielded.
+            if parts and parts[0] != 'self':
+                yield prefix + parts
+            continue
+        head = [p.strip() for p in entry[:brace].split('::') if p.strip()]
+        inner = balanced_body(entry, brace)
+        if inner is None:
+            continue
+        if head:
+            yield prefix + head
+        yield from use_tree_paths(prefix + head, inner)
+
+
+# The shapes this replaced, kept as the record of what a group can be — every
+# one was a live gap found by review, and `use_tree_paths` above subsumes all
+# of them: the plain root group `{Mail, Mailer}` (16 in the corpus), the group
+# hanging off a module segment `storage::{variant::Transform}`, a head of
+# SEVERAL segments `mail::suppression::{record_inbound}`, an UPPERCASE child
+# `{openapi::Parameter}`, a group nested inside a group, and the same written
+# across lines. Five regexes accumulated one per round; matching a balanced
+# grammar with a regex can only ever express a fixed depth, which is why the
+# next shape always arrived. Removed in favour of brace matching.
 # A bang-macro call, `autumn_web::embed_static!()` or a bare `embed_static!()`.
 # The real filter is membership in the gated `bang` set — a name this gate read
 # off a `macro_rules!` declaration in the crate root — so the pattern only has
@@ -1709,96 +1776,17 @@ def uses(blanked, gated):
                         yield start + offset, feature, shown
 
     for lineno, line in rust_fences(blanked):
-        for match in MODULE_GROUP_USE.finditer(line):
-            # The head may be several module segments, so it is split before
-            # `resolve` sees it — `resolve` walks segment by segment, and a
-            # head handed over whole would never fall back past its own first
-            # segment.
-            head = match.group(1).split('::')
-            inner = match.group(2)
-            # Each `child::{…}` inside the group is a further segment under the
-            # same head — and so is every LEAF inside that child's braces.
-            # Resolving the child alone stopped at `capsule::capture`, which is
-            # unconditional, so `capsule::{capture::{with_capture_scope}}`
-            # reported nothing while the leaf needs `test-support`. The
-            # direct-entry loop below cannot cover it either: it skips any
-            # piece containing `{`. Found by Codex review on #2800.
-            for child, leaves in re.findall(
-                    r'([a-z_][a-z_0-9]*)\s*::\s*\{([^{}]*)\}', inner):
-                for leaf in leaves.split(','):
-                    leaf = leaf.strip().split(' as ')[0].strip()
-                    if not leaf:
-                        continue
-                    deep = [child, *leaf.split('::')][:MAX_MODULE_DEPTH]
-                    entry, shown = resolve(*head, *deep)
-                    if entry:
-                        for feature in sorted(entry[0]):
-                            yield lineno, feature, shown
-                entry, shown = resolve(*head, child)
-                if entry:
-                    for feature in sorted(entry[0]):
-                        yield lineno, feature, shown
-            # A DIRECT entry is `head::<entry>` — the commonest spelling of all
-            # (`storage::{BlobStoreState, …}`, `widgets::{ActiveSearchConfig,
-            # …}`), and reading only the nested `child::{…}` groups meant every
-            # one of them fell back to the head alone. `storage-variants.md:71`
-            # writes both shapes in one line. Found by Codex review on #2800.
-            for piece in re.split(r',(?![^{]*\})', inner):
-                piece = piece.strip()
-                if not piece or '{' in piece:
-                    continue
-                # `variant as variants_api` — an alias renames the entry, it
-                # does not change which item is imported, so the name before
-                # `as` is the one to resolve. Found by Codex review on #2800.
-                piece = piece.split(' as ')[0].strip()
-                parts = [q.strip() for q in piece.split('::') if q.strip()]
-                if not parts:
-                    continue
-                entry, shown = resolve(*head, *parts[:MAX_MODULE_DEPTH])
-                if entry:
-                    for feature in sorted(entry[0]):
-                        yield lineno, feature, shown
-            entry, shown = resolve(*head)
-            if entry:
-                for feature in sorted(entry[0]):
-                    yield lineno, feature, shown
-        for match in GROUP_USE.finditer(line):
-            # The split guards against commas INSIDE a nested entry, the same
-            # way the module-group loop above does: `{pdf::Pdf, openapi::{A, B}}`
-            # is two entries, not three.
-            for piece in re.split(r',(?![^{]*\})', match.group(1)):
-                piece = piece.strip()
-                if not piece:
-                    continue
-                # A nested entry is a module segment with its own group:
-                # `openapi::{Parameter}` resolves as `openapi::Parameter`, the
-                # same pair `openapi::Parameter` written flat would give. Read
-                # here rather than left to `MODULE_GROUP_USE`, which is anchored
-                # on `autumn_web::<mod>::{` and so cannot see a group nested
-                # one level further in.
-                nested = NESTED_GROUP_ENTRY.match(piece)
-                if nested:
-                    head = nested.group(1)
-                    for child in re.split(r',', nested.group(2)):
-                        child = child.strip().split(' as ')[0].strip()
-                        first = child.split('::')[0].strip()
-                        if not first:
-                            continue
-                        deep = child.split('::')[:MAX_MODULE_DEPTH]
-                        entry, shown = resolve(head, *deep)
-                        if entry:
-                            for feature in sorted(entry[0]):
-                                yield lineno, feature, shown
-                    entry, shown = resolve(head)
-                    if entry:
-                        for feature in sorted(entry[0]):
-                            yield lineno, feature, shown
-                    continue
-                entry_match = GROUP_ENTRY.match(piece)
-                if not entry_match:
-                    continue
-                entry, shown = resolve(entry_match.group(1),
-                                       entry_match.group(2))
+        # One reader for every group shape, at any nesting depth.
+        for match in GROUP_ANCHOR.finditer(line):
+            prefix = [p for p in match.group(1).split('::') if p]
+            inner = balanced_body(line, match.end() - 1)
+            if inner is None:
+                continue
+            paths = list(use_tree_paths(prefix, inner))
+            if prefix:
+                paths.append(prefix)
+            for path in paths:
+                entry, shown = resolve(*path)
                 if entry:
                     for feature in sorted(entry[0]):
                         yield lineno, feature, shown
@@ -2531,6 +2519,34 @@ def self_test():
                'capture::{with_capture_scope}};\n```\n')}),
            ['sqlite', 'test-support'])
 
+    # Arbitrary nesting depth. A balanced-group REGEX can only express a fixed
+    # depth, and each of rounds 15, 18, 21 and 22 added one more shape; the
+    # walker reads the grammar, so `{mail::{suppression::{record_inbound}}}`
+    # and its flat twin are the same import to it.
+    expect('a doubly-nested root group reads as its flat twin',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{mail::{suppression::'
+               '{record_inbound}}};\n```\n')}),
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::mail::suppression::record_inbound;'
+               '\n```\n')}))
+    expect('...and so does a triply-nested one under a module head',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{capsule::{capture::'
+               '{with_capture_scope}}};\n```\n')}),
+           ['test-support'])
+    # `self` names the module the group hangs off, which is yielded anyway.
+    expect('`self` in a group is not a child named self',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::storage::{self, variant::Transform};'
+               '\n```\n')}),
+           ['storage', 'variants'])
+    # An unbalanced group cannot swallow the rest of the fence or throw.
+    expect('an unbalanced group reports nothing rather than failing',
+           found('```rust\nuse autumn_web::{mail::{suppression::'
+                 '{record_inbound};\n```\n'),
+           [])
+
     # A `use` with no group is not joined, so the line after it keeps its own
     # number.
     expect('consecutive single-line uses keep their own lines',
@@ -3024,7 +3040,7 @@ def self_test():
     # The nested pass descends into UNCONDITIONAL parents too. `pub mod data;`
     # carries no `#[cfg]`, so seeding from the gated set alone skipped it — and
     # `data::csv` was a live defect behind that gap (`docs/guide/jobs.md:824`).
-    roots = root_modules(ROOT)
+    roots, _inline = root_modules(ROOT)
     for name in ('data', 'db', 'storage'):
         if name not in roots:
             failures.append(
