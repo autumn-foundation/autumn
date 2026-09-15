@@ -7641,6 +7641,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn/tests/integration/commentable.rs`, and scaffold-output tests in
   `autumn-cli`'s `scaffold_commentable.rs`.
 
+### Performance
+
+- **The Postgres pool no longer pings twice per checkout (#2485):** every
+  `#[repository]`-generated acquire, and every `Db::checkout`, already runs
+  `SET statement_timeout` on each checkout — a round trip to Postgres that
+  already proves the connection is alive. Deadpool's default
+  `RecyclingMethod::Verified` sent a second, redundant `SELECT 1` for the
+  same signal. `create_pool`'s `ManagerConfig` now sets
+  `RecyclingMethod::Fast`, dropping that extra round trip — the same
+  recycling method the `record_db`/`replay_db` capture pools already use,
+  for the same reason. A dead connection still fails fast: at the `SET
+  statement_timeout` call, not at the pool's own ping. Measured in the
+  issue's `repository_crud` bench: -13.00% instructions and
+  -14.44%/-16.20% allocation blocks/bytes per round (`valgrind
+  --tool=callgrind`/`--tool=dhat`, 5,020 rounds).
+
+  Two health/readiness checks relied on the pool's own ping instead of
+  running a query: `ShardHealthIndicator`'s primary/replica checks
+  (`sharding.rs`) and the replica readiness probe (`probe.rs`) checked out a
+  connection and dropped it, with no query in between. Under `Fast` that
+  checkout alone no longer proves the connection is alive, so a dead
+  primary or replica could report ready. Both now run a `SELECT 1` (the new
+  `db::probe_connection_alive`) on the checked-out connection before
+  deciding readiness, independent of the pool's recycling method.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the
