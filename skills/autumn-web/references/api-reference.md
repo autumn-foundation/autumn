@@ -47,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -1063,7 +1063,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,

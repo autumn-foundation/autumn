@@ -832,6 +832,16 @@ pub use db::Db;
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
 
+/// Lazy database connection extractor.
+///
+/// Use `LazyDb` instead of `Db` in a handler that also takes a body
+/// extractor (`Form`, `Json`, `Multipart`, ...). `Db` checks out a pooled
+/// connection before the body is read. `LazyDb` waits until the handler
+/// calls [`db::LazyDb::checkout`]. See [`db::LazyDb`] for the full contract
+/// and an example.
+#[cfg(feature = "db")]
+pub use db::LazyDb;
+
 /// The runtime database connection type (Postgres by default; `SQLite` under the
 /// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
 /// `::autumn_web::RuntimeConnection`. See [`db::RuntimeConnection`].

@@ -527,37 +527,53 @@ async fn exhausted(
 
 /// Re-enqueue every open schedule row at its due time and prune the event
 /// ledger. Waits for the job runtime (the test harness starts it after
-/// startup hooks).
+/// startup hooks). Fire-and-forget wrapper around [`rearm_pending_now`] — the
+/// startup hook cannot await it without blocking every other plugin's
+/// `on_startup`, so it spawns instead.
 pub(crate) fn rearm_pending(state: AppState, service: Arc<BillingService>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("🍂 Autumn Billing: no async runtime; dunning rows not re-armed");
         return;
     };
     handle.spawn(async move {
-        if !wait_for_job_client(&state).await {
-            tracing::warn!(
-                "🍂 Autumn Billing: job runtime did not start within {REARM_WAIT:?}; dunning rows not re-armed"
-            );
-            return;
-        }
-        let rows = match service.store().open_dunning().await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(error = %error, "🍂 Autumn Billing: could not read open dunning rows");
-                return;
-            }
-        };
-        let mut armed = 0_usize;
-        for row in rows {
-            if rearm_row(&state, &row).await {
-                armed = armed.saturating_add(1);
-            }
-        }
-        if armed > 0 {
-            tracing::info!(armed, "🍂 Autumn Billing: dunning retries re-armed");
-        }
-        prune_events(&state, &service).await;
+        rearm_pending_now(&state, &service).await;
     });
+}
+
+/// The re-arm body `rearm_pending` spawns.
+///
+/// Waits for the job runtime, loads every open row, re-enqueues each one,
+/// then prunes the event ledger. Exposed (rather than kept file-private) so
+/// a Ledger profiling harness can await its completion deterministically
+/// instead of racing a spawned task — same shape as
+/// `autumn_web::test::drain_ready_repository_commit_hooks`'s exposure of the
+/// repository-commit-hooks drain loop for the same reason. Returns the
+/// number of rows successfully re-armed.
+pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) -> usize {
+    if !wait_for_job_client(state).await {
+        tracing::warn!(
+            "🍂 Autumn Billing: job runtime did not start within {REARM_WAIT:?}; dunning rows not re-armed"
+        );
+        return 0;
+    }
+    let rows = match service.store().open_dunning().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(error = %error, "🍂 Autumn Billing: could not read open dunning rows");
+            return 0;
+        }
+    };
+    let mut armed = 0_usize;
+    for row in rows {
+        if rearm_row(state, &row).await {
+            armed = armed.saturating_add(1);
+        }
+    }
+    if armed > 0 {
+        tracing::info!(armed, "🍂 Autumn Billing: dunning retries re-armed");
+    }
+    prune_events(state, service).await;
+    armed
 }
 
 /// Queue one open row. A `Running` row is queued for when it can be

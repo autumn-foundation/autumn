@@ -101,7 +101,7 @@ fn query_escape(value: &str) -> String {
 /// What the editor submits.
 ///
 /// Decoded by [`PostForm::from_body`] rather than the `Form` extractor.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct PostForm {
     pub title: String,
     #[serde(default)]
@@ -233,10 +233,16 @@ async fn resolve_featured_media(
     Ok(Some(id))
 }
 
+/// `Err` only for a local time that does not exist — the hour a
+/// daylight-saving change skips. A plain `&'static str` rather than
+/// `AutumnResult`: [`validate_submission`] folds this into the same
+/// `("publish_at", message)` shape its other checks produce, not into a
+/// generic `AutumnError` response, so there is nothing here for `?` to
+/// short-circuit through.
 fn scheduled_at(
     form: &PostForm,
     settings: &crate::settings::Settings,
-) -> AutumnResult<Option<chrono::NaiveDateTime>> {
+) -> Result<Option<chrono::NaiveDateTime>, &'static str> {
     let Some(local) = form
         .publish_at
         .as_deref()
@@ -246,14 +252,10 @@ fn scheduled_at(
     else {
         return Ok(None);
     };
-    // `None` only for a local time that does not exist — the hour a
-    // daylight-saving change skips. Saying so is better than silently
-    // scheduling an hour the editor did not choose.
-    settings.from_local(local).map(Some).ok_or_else(|| {
-        AutumnError::unprocessable_msg(
-            "That time does not exist in this site's timezone — daylight saving skips it",
-        )
-    })
+    settings
+        .from_local(local)
+        .map(Some)
+        .ok_or("That time does not exist in this site's timezone — daylight saving skips it")
 }
 
 fn resolve_type(slug: &str) -> AutumnResult<PostType> {
@@ -2481,5 +2483,86 @@ mod editor_validation_tests {
             "private" => "private",
             _ => "scheduled",
         }
+    }
+
+    #[test]
+    fn validate_submission_does_not_require_a_publish_date_for_draft_or_publish() {
+        let settings = crate::settings::Settings::default();
+        // Only "future" schedules; draft and an immediate "publish" never
+        // carry a publish date the editor picked.
+        for status in ["draft", "publish"] {
+            let submitted = form("Titled", status);
+            let (_, errors) = validate_submission(&submitted, status, &settings);
+            assert_eq!(
+                field_error(&errors, "publish_at"),
+                None,
+                "{status} must not require a publish date: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_at_with_no_publish_at_field_is_unscheduled() {
+        let form = PostForm::default();
+        let settings = crate::settings::Settings::default();
+        assert_eq!(scheduled_at(&form, &settings), Ok(None));
+    }
+
+    #[test]
+    fn scheduled_at_resolves_an_ordinary_local_time() {
+        let submitted = PostForm {
+            publish_at: Some("2026-06-15T09:00".to_owned()),
+            ..PostForm::default()
+        };
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        assert!(scheduled_at(&submitted, &settings).unwrap().is_some());
+    }
+
+    /// The exact failure Codex flagged on #2790: a syntactically valid local
+    /// time that daylight saving skips must be caught here — *before*
+    /// `validate_submission`'s `require_future_publish_date` call, which
+    /// never sees a value `scheduled_at` could not resolve — not reach
+    /// `AutumnError` via a bare `?` and discard the author's draft.
+    #[test]
+    fn scheduled_at_rejects_a_daylight_saving_gap_time() {
+        // 2026-03-08 is the day America/Los_Angeles springs forward: the
+        // wall clock jumps from 02:00 directly to 03:00, so 02:30 never
+        // happens that day. This is a calendar fact fixed by the IANA tz
+        // database, not by whenever this test happens to run.
+        let submitted = PostForm {
+            publish_at: Some("2026-03-08T02:30".to_owned()),
+            ..PostForm::default()
+        };
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        assert_eq!(
+            scheduled_at(&submitted, &settings),
+            Err("That time does not exist in this site's timezone — daylight saving skips it")
+        );
+    }
+
+    /// `validate_submission` folds `scheduled_at`'s `Err` into the same
+    /// `("publish_at", message)` shape its other checks produce, so a
+    /// DST-gap time redisplays the editor exactly like a missing or past
+    /// date does, rather than reaching `AutumnError` via `?`.
+    #[test]
+    fn a_daylight_saving_gap_time_redisplays_as_a_publish_at_field_error() {
+        let mut submitted = form("Titled", "future");
+        submitted.publish_at = Some("2026-03-08T02:30".to_owned());
+        let settings = crate::settings::Settings {
+            timezone: "America/Los_Angeles".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        let (scheduled_for, errors) = validate_submission(&submitted, "future", &settings);
+        assert_eq!(scheduled_for, None);
+        assert_eq!(
+            field_error(&errors, "publish_at"),
+            Some("That time does not exist in this site's timezone — daylight saving skips it")
+        );
     }
 }

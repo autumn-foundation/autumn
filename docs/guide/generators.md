@@ -863,7 +863,9 @@ tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscribe
 
 SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
 htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
-client JS authored by the user**:
+client JS authored by the user**. `autumn_web::sse::stream` is behind the
+non-default `ws` feature (`features = ["ws"]`); see
+[WebSockets](websockets.md):
 
 ```rust
 #[get("/chat/events")]
@@ -1331,6 +1333,10 @@ autumn generate scaffold Post title:String comments:commentable
   attribute is what brings `add_comment` / `comment_thread` / `delete_comment`
   onto the generated repository and registers the model with the framework's
   comment router.
+- The **model's own migration** also gets an `AFTER DELETE` trigger (#2265).
+  `commentable_id` has no foreign key. Nothing else removes a deleted
+  parent's comments. The trigger removes them on any hard delete — a
+  delete through the repository, raw SQL, or an admin tool.
 - **No comment routes are generated at all.** Mount the framework's once:
 
   ```rust

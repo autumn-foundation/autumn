@@ -119,6 +119,14 @@ before — but each also widens a Rust type that user code can name.
 Three types moved. You are affected only if your code constructs or matches one
 of them exhaustively; none of them changes meaning.
 
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
 **Before (`{X.Y}`):**
 
 ```rust
@@ -243,7 +251,10 @@ the generated spec names that encoding instead of staying silent about it
 
 Only code that constructs a `Parameter` *by struct literal*, outside this
 crate, has to change. Every route macro and the OpenAPI generator itself
-already build one field at a time and are unaffected.
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
 
 **Before (`{X.Y}`):**
 
@@ -1002,6 +1013,66 @@ async fn beta_page() -> &'static str {
 **Automation:** `manual` — moving the gate from an attribute to
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
+
+### repository: `owner = column` next to `api = "..."` now requires `policy`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them. Declared on its own
+next to `api = "..."`, `owner` therefore compiled to a fully public REST API
+that read, at the declaration site, like a per-owner-scoped one: `GET <api>`
+returned every user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any
+authenticated caller read, overwrite, or delete any other user's row by id.
+
+`scope = Type` does not close this on its own either: it only filters `GET
+<api>`'s SQL query (a performance optimization for the list endpoint), and
+has no effect on `_api_get`/`_api_update`/`_api_delete` — only `policy =
+Type` gates those (`can_show`/`can_update`/`can_delete`). An initial version
+of this fix accepted `scope` as an alternative to `policy`, which still left
+every single-record route unguarded; that gap was caught in review before
+merge, so the gate now requires `policy` unconditionally.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes. So
+did adding `scope = Type` alone: the list endpoint would then filter
+correctly, but `GET`/`PUT`/`DELETE /api/notes/{id}` stayed wide open.
+
+**After (`{X.Z}`):** add `policy = Type`, comparing `ctx.user_id_i64()`
+against the owner column in `can_show`/`can_update`/`can_delete`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Keep `scope = Type` alongside `policy` if you also want the list endpoint's
+cheaper SQL-level filter instead of `policy`'s in-memory `can_show` sweep —
+`scope` is accepted as an addition to `policy`, never as a replacement for
+it. Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — what the policy actually checks is an application
+decision no codemod can make.
 
 ### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
 
