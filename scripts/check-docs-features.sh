@@ -1350,7 +1350,11 @@ def enablers(graph):
 CONTINUATION = re.compile(r'\\\s*$')
 # `&&`, `||` and `;` end one shell command and start another. Outside quotes
 # only, so a `;` inside `features = ["a;b"]` is not a separator.
-COMMAND_SEPARATOR = re.compile(r'(?:&&|\|\||;)(?=(?:[^"\']*["\'][^"\']*["\'])*[^"\']*$)')
+# `&&`, `||`, `;`, and the lone `|` and `&` — a pipeline and a background
+# launch start a new command just as surely as a list does. Outside quotes
+# only, so a `;` inside `features = ["a;b"]` is not a separator.
+COMMAND_SEPARATOR = re.compile(
+    r'(?:&&|\|\||[;|&])(?=(?:[^"\']*["\'][^"\']*["\'])*[^"\']*$)')
 
 
 def join_continuations(text):
@@ -1525,7 +1529,7 @@ PRELUDE_GLOB = re.compile(r'\bautumn_web::prelude::\*')
 # review on #2800.
 MODULE_GLOB = re.compile(
     r'\bautumn_web::(?!prelude::\*)'
-    r'([a-z_][a-z_0-9]*(?:::[a-z_][a-z_0-9]*)*)::\*')
+    r'((?:[a-z_][a-z_0-9]*::)*)\*')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
 BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
@@ -1745,13 +1749,19 @@ def uses(blanked, gated):
     # entry whose remainder still carries `::` is skipped; and a macro is
     # excluded for the reason the prelude scan excludes one — it cannot be
     # called by its bare name.
+    # Keyed by the FULL parent path, with the crate root itself under `''`:
+    # `use autumn_web::*;` imports the gated root exports exactly as a module
+    # glob imports its module's children, and requiring at least one named
+    # module before `::*` meant neither scan activated on it. Found by Codex
+    # review on #2800.
     children = {}
     for full, entry in gated.items():
-        parent, sep, child = full.rpartition('::')
-        if not sep:
-            continue
+        parent, _, child = full.rpartition('::')
         root = gated.get(child)
         if root and root[1] & {'bang', 'attribute'}:
+            continue
+        if parent == 'prelude':
+            # The prelude scan owns those, against its own candidate set.
             continue
         children.setdefault(parent, {})[child] = entry
     for start, body in rust_fence_blocks(blanked):
@@ -1764,7 +1774,7 @@ def uses(blanked, gated):
         if '::*' not in fence:
             continue
         prelude = PRELUDE_GLOB.search(fence) is not None
-        globbed = {m.group(1) for m in MODULE_GLOB.finditer(fence)}
+        globbed = {m.group(1).rstrip(':') for m in MODULE_GLOB.finditer(fence)}
         scoped = {n: (e, head) for head in globbed
                   for n, e in children.get(head, {}).items()}
         if not prelude and not scoped:
@@ -1911,6 +1921,18 @@ def _whole_key(key):
 _TABLE_PREFIX = r'''(?:(?:[a-z][a-z0-9_-]*|'[^'\n]*'|"[^"\n]*")\.)*'''
 
 
+def _quoted(key):
+    """`key` as a TOML key: bare, or in either quote form.
+
+    Cargo accepts `[dependencies."autumn-web"]` — quoting a key changes
+    nothing about which dependency it names — and `_TABLE_PREFIX` already
+    allowed quotes in the segments BEFORE `dependencies` while the dependency
+    segment itself stayed bare. Rejecting the quoted spelling failed a page
+    carrying a complete enabling instruction. Found by Codex review on #2800.
+    """
+    return rf'''(?:{key}|"{key}"|'{key}')'''
+
+
 def naming_patterns(feature):
     """The spellings that tell a reader how to turn `feature` on.
 
@@ -1960,10 +1982,12 @@ def naming_patterns(feature):
         rf'{_whole_key("autumn_web")}\s*=\s*\{{'
         rf'(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn-web\]'
+        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.'
+        rf'{_quoted("autumn-web")}\]'
         rf'[^\[]*?'
         rf'features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn_web\]'
+        rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.'
+        rf'{_quoted("autumn_web")}\]'
         rf'(?=[^\[]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^\[]*?features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         # A dependency-QUALIFIED value names autumn-web itself, so the package
@@ -2510,6 +2534,16 @@ def self_test():
            [(3, 'openapi', 'generate_spec (from autumn_web::openapi::*)')])
     # ...but a GRANDCHILD is not in scope from a glob over its grandparent.
     # `openapi` is ungated, so nothing else on the line can report either.
+    # The CRATE ROOT is globbable too, and `use autumn_web::*;` imports the
+    # gated root exports exactly as a module glob imports its children.
+    expect('a crate-root glob brings the gated root exports into scope',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::*;\nlet m: Mailer = x;\n```\n')}),
+           ['mail'])
+    expect('...but not a name one level down',
+           found('```rust\nuse autumn_web::*;\n'
+                 'let p: Parameter = x;\n```\n'),
+           [])
     # The globbed path may be several segments deep.
     expect('a multi-segment module glob brings its children into scope',
            sorted({f for _, f, _ in found(
@@ -2813,7 +2847,23 @@ def self_test():
             # ...but a separator inside QUOTES separates nothing.
             ('cargo test -p autumn-web --features "ws,mail" && echo "x;y"',
              'ws', True),
-            ('cargo test -p autumn-web --features "ws mail"', 'mail', True)):
+            ('cargo test -p autumn-web --features "ws mail"', 'mail', True),
+            # A lone `|` and a lone `&` start a new command as surely as a
+            # list separator does.
+            ('cargo test -p autumn-web | cargo test -p other --features ws',
+             'ws', False),
+            ('cargo test -p autumn-web & cargo test -p other --features ws',
+             'ws', False),
+            ('cargo test -p autumn-web --features ws | grep x', 'ws', True),
+            # A TOML key may be quoted; quoting changes nothing about which
+            # dependency it names.
+            ('[dependencies."autumn-web"]\nfeatures = ["ws"]\n', 'ws', True),
+            ("[dependencies.'autumn-web']\nfeatures = [\"ws\"]\n",
+             'ws', True),
+            ('[target.\'cfg(unix)\'.dev-dependencies."autumn-web"]\n'
+             'features = ["ws"]\n', 'ws', True),
+            ('[dependencies."not-autumn-web"]\nfeatures = ["ws"]\n',
+             'ws', False)):
         if names_feature(spelling, feature) != want:
             failures.append(
                 f'naming: {spelling!r} / {feature} -> '
