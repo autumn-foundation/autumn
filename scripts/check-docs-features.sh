@@ -56,8 +56,8 @@
 # "requires the `maud` feature; enabled together with `pdf` in the quick start
 # above" — where the quick start above contains no `Cargo.toml` at all.
 #
-# THE BASELINE RUN found fourteen such page/feature pairs across thirteen pages,
-# out of 113 gated uses in the corpus. Nine were visible from the first version
+# THE BASELINE RUN found fifteen such page/feature pairs across twelve pages,
+# out of 137 gated uses in the corpus. Nine were visible from the first version
 # of the extractor:
 #
 #   docs/guide/cloud-native.md:929        `#[ws]`                  -> ws
@@ -81,6 +81,10 @@
 #   docs/guide/presence.md:48             `Presence`               -> presence
 #   docs/guide/transactions.md:322        `Mailer`                 -> mail
 #
+# and a fifteenth once `t!` was read:
+#
+#   docs/guide/macro-transparency.md:1727 `t!`                     -> i18n
+#
 # `presence.md` is the one to read twice. It was not missing the feature name —
 # it gave the WRONG one, pinning `features = ["ws"]` and saying the extractor
 # "is available from `autumn_web::prelude::*` automatically when `ws` is
@@ -97,11 +101,16 @@
 #   1. Inside a ```rust fence, a path `autumn_web::<item>` whose first segment
 #      is a top-level item of `autumn-web` carrying a `#[cfg(feature = "…")]`
 #      for a feature OUTSIDE the default closure.
-#   2. Inside a ```rust fence, an attribute `#[<macro>]` naming an attribute
-#      macro re-exported under such a `#[cfg]` — `#[ws]`, `#[mailer]`,
-#      `#[mailer_preview]`, `#[mail_previews]`, `#[inbound_mail]`,
-#      `#[wire_client]`. An attribute is the form the prelude is USED in, so
-#      leaving it out would exempt the most-copied construct in the guide.
+#   2. Inside a ```rust fence, an attribute `#[<macro>]` or a bang macro
+#      `<name>!` gated under such a `#[cfg]`. WHICH of the two a name is comes
+#      from `autumn-macros/src/lib.rs`, where every export carries
+#      `#[proc_macro]` or `#[proc_macro_attribute]` one line above it — 12 bang
+#      and 35 attribute. This list was once written by hand as "`#[ws]`,
+#      `#[mailer]`, `#[mailer_preview]`, `#[mail_previews]`, `#[inbound_mail]`,
+#      `#[wire_client]`", and two of those six are not attributes at all:
+#      `mail_previews![…]` and `wire_client!` are bang macros. An attribute is
+#      the form the prelude is USED in, so leaving either kind out would exempt
+#      the most-copied constructs in the guide.
 #   3. The page then has to NAME that feature, in a spelling a reader can act
 #      on: a `features = [ … "ws" … ]` array (newlines and comments inside it
 #      are fine — the corpus writes them that way), a `--features ws`
@@ -207,16 +216,18 @@
 #     groups only: the corpus writes no multi-line one, and this reads a line at
 #     a time. Found by Codex review on #2800, over 16 grouped imports in the
 #     corpus's rust fences.
-#   - A ONE- OR TWO-LETTER bang macro. `t!("key")` is the `i18n` feature's whole
-#     call surface, and `\bt!\(` is one character long: `assert!(`, `insert!(`,
-#     `expect!(` and `vec!(` all end in it, and requiring a word boundary still
-#     leaves a one-letter token this gate would have to be right about on 160
-#     pages. Longer bang macros ARE read — `embed_static!()` and
-#     `embed_locales!()` are `#[macro_export] macro_rules!` declarations gated
-#     in the crate root, reachable no other way, and a fence calling only one of
-#     them passed until they were recorded (Codex review, #2800). The filter is
-#     membership in the set this gate read off a `macro_rules!` line, with a
-#     three-character floor so the `t!` case cannot come back by accident.
+#   - (Nothing about bang macros. This bullet twice claimed `t!` could not be
+#     read — "`\bt!\(` is one character long: `assert!(`, `insert!(`,
+#     `expect!(` and `vec!(` all end in it" — and that is simply false. A word
+#     boundary requires a NON-word character before the `t`, and in `assert!`
+#     the `t` follows `r`. `\bt!` matches none of them, which one `re` call
+#     would have shown either time. The claim survived two rounds because it
+#     was reasoned about rather than run. `t!` is read now, with no length
+#     floor: the boundary plus membership in the parsed bang set is the whole
+#     filter. It had a live defect behind it —
+#     `docs/guide/macro-transparency.md:1727` offers `t!(locale, …)` under a
+#     "**You write:**" heading on a page that names `i18n` nowhere. Found by
+#     Codex review on #2800.)
 #   - Anything past the SECOND path segment. One level down IS resolved, and has
 #     to be: a gate below an unconditional module is invisible from the head,
 #     and worst when the head is a DEFAULT feature —
@@ -572,6 +583,56 @@ def default_features(root):
     return closure, set(graph), graph
 
 
+PROC_MACRO_SRC = 'autumn-macros/src/lib.rs'
+PROC_BANG = re.compile(r'^#\[proc_macro\]$')
+PROC_ATTR = re.compile(r'^#\[proc_macro_attribute\]$')
+PROC_FN = re.compile(r'^pub fn ([a-z_][a-z_0-9]*)')
+
+
+def proc_macro_kinds(root):
+    """`{name: 'bang' | 'attribute'}` for every macro `autumn-macros` exports.
+
+    PARSED, because guessing was wrong. The header used to list `#[ws]`,
+    `#[mailer]`, `#[mailer_preview]`, `#[mail_previews]`, `#[inbound_mail]` and
+    `#[wire_client]` as the attribute macros this gate reads — and two of those
+    six are not attributes at all: `mail_previews` and `wire_client` are
+    `#[proc_macro]`, called as `mail_previews![…]`. The crate declares 12 bang
+    macros and 35 attributes, and which is which is written down one line above
+    each `pub fn`. Reading it costs nothing and cannot drift.
+
+    This is also what lets `t` be read. It reaches the crate root as
+    `pub use crate::i18n::t` — a plain re-export this gate recorded as an
+    `item`, so a bare `t!("key")` matched nothing. Found by Codex review on
+    #2800, with a live defect behind it
+    (`docs/guide/macro-transparency.md:1726`).
+    """
+    out = {}
+    lines = (pathlib.Path(root) / PROC_MACRO_SRC).read_text(
+        encoding='utf-8').splitlines()
+    pending = None
+    for line in lines:
+        if PROC_BANG.match(line):
+            pending = 'bang'
+            continue
+        if PROC_ATTR.match(line):
+            pending = 'attribute'
+            continue
+        if line.startswith(('///', '//!', '//', '#[')):
+            continue
+        match = PROC_FN.match(line)
+        if match and pending:
+            out[match.group(1)] = pending
+        pending = None
+    if not out:
+        sys.exit(
+            f'FAIL: no `#[proc_macro]`/`#[proc_macro_attribute]` declarations '
+            f'found in {PROC_MACRO_SRC}. The macro crate was restructured; '
+            f'this gate cannot tell `#[mailer]` from `mail_previews![…]` and '
+            f'would judge both wrongly. Fix proc_macro_kinds() in '
+            f'scripts/check-docs-features.sh.')
+    return out
+
+
 def _cfg_requirement(lines, index):
     """Read one column-zero `#[cfg(…)]` and return (required_features, next_i).
 
@@ -620,7 +681,7 @@ def _cfg_requirement(lines, index):
     return (set(names) if names else None), index
 
 
-def gated_items(root):
+def gated_items(root, macro_kinds):
     """Map every column-zero item behind a `#[cfg(…)]` to the features it needs.
 
     Returns `{name: (features, kinds)}`. `features` is the set the item
@@ -685,9 +746,9 @@ def gated_items(root):
             match = USE_ONE_LINE.match(line)
             if match:
                 if pending:
-                    kind = 'macro' if match.group(1) == MACRO_CRATE else 'item'
                     for name in _names(match.group(2)):
-                        _record(found, name, pending, kind)
+                        _record(found, name, pending,
+                                macro_kinds.get(name, 'item'))
                 pending = None
                 continue
             match = USE_BRACE_OPEN.match(line)
@@ -698,9 +759,9 @@ def gated_items(root):
                     index += 1
                 index += 1
                 if pending:
-                    kind = 'macro' if match.group(1) == MACRO_CRATE else 'item'
                     for name in _names('\n'.join(body)):
-                        _record(found, name, pending, kind)
+                        _record(found, name, pending,
+                                macro_kinds.get(name, 'item'))
                 pending = None
                 continue
             pending = None
@@ -863,7 +924,7 @@ def surface(root):
     — `live`, behind `htmx` + `maud` — drops out entirely.
     """
     closure, declared, _graph = default_features(root)
-    gated = gated_items(root)
+    gated = gated_items(root, proc_macro_kinds(root))
     unknown = sorted(set().union(*(f for f, _ in gated.values())) - declared)
     if unknown:
         sys.exit(
@@ -954,6 +1015,15 @@ ATTR_USE = re.compile(r'#\[([a-z_][a-z_0-9]*)')
 # Codex review on #2800. Single-line groups only: the corpus writes no
 # multi-line one, and a line-at-a-time reader cannot see both ends of one.
 GROUP_USE = re.compile(r'\bautumn_web::\{([^{}]*)\}')
+# `use autumn_web::storage::{blob::Blob, variant::{Transform, VariantBudget}};`
+# — a group hanging off a MODULE segment, which `GROUP_USE` (anchored straight
+# after `autumn_web::`) cannot see. `storage-variants.md:71` writes exactly
+# that, and the inner `variant::` is where the `variants` requirement lives, so
+# the line resolved to `storage` alone. Found by Codex review on #2800.
+MODULE_GROUP_USE = re.compile(
+    r'\bautumn_web::([a-z_][a-z_0-9]*)::\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
+MODULE_GROUP_ENTRY = re.compile(r'([a-z_][a-z_0-9]*)\s*::\s*\{|'
+                                r'^\s*([A-Za-z_][A-Za-z_0-9]*)')
 GROUP_ENTRY = re.compile(
     r'^\s*(?:self\s*)?([A-Za-z_][A-Za-z_0-9]*)(?:::([a-z_][a-z_0-9]*))?')
 # A bang-macro call, `autumn_web::embed_static!()` or a bare `embed_static!()`.
@@ -963,7 +1033,12 @@ GROUP_ENTRY = re.compile(
 # `t!` problem out by construction as well as by membership: `assert!(`,
 # `insert!(` and `vec!(` all end in `t!`/`c!`, and a one-letter macro name is
 # not one this gate can be right about across 212 pages.
-BANG_USE = re.compile(r'\b([a-z_][a-z_0-9]{2,})!')
+# No length floor. The `\b` is the filter, and it is sufficient: `assert!`,
+# `insert!`, `expect!` and `vec!` contain no word boundary before their final
+# letter, so `\bt!` matches none of them — verified, after two rounds of this
+# header asserting the opposite without testing it. Membership in the parsed
+# bang set does the rest.
+BANG_USE = re.compile(r'\b([a-z_][a-z_0-9]*)!')
 PRELUDE_GLOB = re.compile(r'\bautumn_web::prelude::\*')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
@@ -1090,6 +1165,19 @@ def uses(blanked, gated):
                     yield start + offset, feature, name
 
     for lineno, line in rust_fences(blanked):
+        for match in MODULE_GROUP_USE.finditer(line):
+            head, inner = match.group(1), match.group(2)
+            # Each `child::{…}` inside the group is a second segment under the
+            # same head; a bare entry resolves against the head alone.
+            for child in re.findall(r'([a-z_][a-z_0-9]*)\s*::\s*\{', inner):
+                entry, shown = resolve(head, child)
+                if entry:
+                    for feature in sorted(entry[0]):
+                        yield lineno, feature, shown
+            entry, shown = resolve(head, None)
+            if entry:
+                for feature in sorted(entry[0]):
+                    yield lineno, feature, shown
         for match in GROUP_USE.finditer(line):
             for piece in match.group(1).split(','):
                 entry_match = GROUP_ENTRY.match(piece)
@@ -1125,7 +1213,7 @@ def uses(blanked, gated):
             # An attribute is only judged against an attribute MACRO. A module
             # named `storage` is not `#[storage]`, and reading it as one would
             # have this gate guessing at a construct that does not exist.
-            if entry and 'macro' in entry[1]:
+            if entry and 'attribute' in entry[1]:
                 shown = f'#[{match.group(1)}]'
                 for feature in sorted(entry[0]):
                     yield lineno, feature, shown
@@ -1331,22 +1419,27 @@ def self_test():
             failures.append(f'{label}: got {got!r}, want {want!r}')
 
     gated = {
-        'ws': ({'ws'}, {'module', 'macro'}),
+        'ws': ({'ws'}, {'module', 'attribute'}),
         'channels': ({'ws'}, {'module'}),
         'pdf': ({'pdf'}, {'module'}),
         'storage': ({'storage'}, {'module'}),
-        'mailer': ({'mail'}, {'macro'}),
+        'mailer': ({'mail'}, {'attribute'}),
         # The conjunction shape: two non-default requirements on one item.
         'presence_stream': ({'presence', 'ws'}, {'item'}),
         # One level down, under a DEFAULT parent — the case that is invisible
         # from the head segment alone.
         'db::sqlite_types': ({'sqlite'}, {'module'}),
+        # A nested module whose requirements include the parent's.
+        'storage::variant': ({'storage', 'variants'}, {'module'}),
         # Items reachable only through a brace group, and a bang macro.
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
         'embed_static': ({'embed-assets'}, {'bang'}),
         # A prelude-glob type, and one that must stay unread.
         'Presence': ({'presence'}, {'item'}),
+        # The one-letter bang macro. Reachable because `\b` excludes
+        # `assert!`/`insert!`/`vec!` on its own — no length floor needed.
+        't': ({'i18n'}, {'bang'}),
     }
 
     def found(text):
@@ -1377,6 +1470,21 @@ def self_test():
            found('```rust\n#[storage]\nstruct S;\n```\n'), [])
     expect('unrelated attribute ignored',
            found('```rust\n#[derive(Debug)]\nstruct S;\n```\n'), [])
+
+    # `\bt!` matches none of these, which is why the length floor came off.
+    expect('a one-letter bang macro does not match other macros',
+           found('```rust\nassert!(x);\ninsert!(y);\nvec![1];\n```\n'), [])
+    expect('...but does match its own call',
+           found('```rust\nlet s = t!(locale, "welcome.title");\n```\n'),
+           [(2, 'i18n', 't!')])
+
+    # A group hanging off a MODULE segment, not off `autumn_web::` itself.
+    expect('a group after a module segment resolves the inner child',
+           sorted(set(found(
+               '```rust\nuse autumn_web::storage::{variant::{Transform}};\n```\n'))),
+           [(2, 'storage', 'autumn_web::storage'),
+            (2, 'storage', 'autumn_web::storage::variant'),
+            (2, 'variants', 'autumn_web::storage::variant')])
 
     # A bare type name a prelude glob brought into scope. Scoped to a fence
     # that writes the glob, and to names starting uppercase.
@@ -1529,9 +1637,9 @@ def self_test():
     expect('a default feature is not gated surface',
            any(f == 'db' for f, _ in real.values()), False)
     for name, features, kinds in (
-            ('ws', {'ws'}, {'module', 'macro'}),
+            ('ws', {'ws'}, {'module', 'attribute'}),
             ('pdf', {'pdf'}, {'module'}),
-            ('mailer', {'mail'}, {'macro'}),
+            ('mailer', {'mail'}, {'attribute'}),
             ('storage', {'storage'}, {'module'}),
             ('managed_pg', {'managed-pg'}, {'module'}),
             # `all(feature = "presence", feature = "maud")` — `maud` is
@@ -1576,6 +1684,22 @@ def self_test():
     expect('naming `ws` alone does not satisfy `presence`',
            activation_lines('features = ["ws"]\n', {'presence'},
                             enabled_by).get('presence'), None)
+
+    # The proc-macro kind map, parsed rather than guessed. Two of the six names
+    # the header once called attribute macros are bang macros.
+    kinds = proc_macro_kinds(ROOT)
+    for name, want in (('ws', 'attribute'), ('mailer', 'attribute'),
+                       ('t', 'bang'), ('mail_previews', 'bang'),
+                       ('wire_client', 'bang'), ('routes', 'bang')):
+        if kinds.get(name) != want:
+            failures.append(
+                f'proc-macro kind: {name} -> {kinds.get(name)!r}, want {want!r}')
+    # `t` reaches the crate root as `pub use crate::i18n::t`, a plain
+    # re-export — so only the kind map can tell it is callable as `t!`.
+    got = real.get('t')
+    if got is None or got[0] != {'i18n'} or 'bang' not in got[1]:
+        failures.append(
+            f'truth set: t -> {got!r}, want features {{\'i18n\'}} and kind bang')
 
     # Gated `macro_rules!` exports, against the real crate. Neither is reachable
     # as a module or a `pub use`, so both were discarded before this.

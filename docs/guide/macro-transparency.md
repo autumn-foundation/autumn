@@ -1719,7 +1719,9 @@ Recipient matching: `to = "address@example.com"` (exact),
 ### `t!` (i18n translate)
 
 Translates an i18n key, with **compile-time validation** that the key exists in
-the default locale's `.ftl` file.
+the default locale's `.ftl` file. Behind the non-default `i18n` feature —
+`autumn-web = { version = "0.7", features = ["i18n"] }`; see
+[Internationalization](./i18n.md).
 
 **You write:**
 
