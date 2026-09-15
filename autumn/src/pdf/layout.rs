@@ -11,6 +11,8 @@ use printpdf::{
     BuiltinFont, Color, Line, LinePoint, Op, PdfFontHandle, PdfPage, Point, Pt, Rgb, TextItem,
 };
 
+use std::cell::Cell;
+
 use super::html::Node;
 use super::metrics::{char_width_1000em, text_width_pt};
 
@@ -19,7 +21,28 @@ use super::metrics::{char_width_1000em, text_width_pt};
 /// [`super::html`] parser itself is iterative and immune to this, but this
 /// layout walker recurses per nesting level for the (normally shallow)
 /// element tree it receives.
+///
+/// Content past the cap is *omitted*, not an error — but never silently:
+/// each walker records the truncation via [`note_depth_truncated`], and
+/// [`render_pages`] emits one `tracing::warn!` per render that truncated
+/// anything. The cap is also part of the public contract — see the
+/// [`crate::pdf`] module docs' "Nesting depth limit" section.
 const MAX_DEPTH: u32 = 512;
+
+thread_local! {
+    /// Set while the current [`render_pages`] call is walking the tree if any
+    /// walker dropped content past [`MAX_DEPTH`]. Per-thread so concurrent
+    /// renders never share state; reset at the top of every render.
+    static TRUNCATED_DEPTH: Cell<bool> = Cell::new(false);
+}
+
+/// Record that a layout walker omitted content nested deeper than
+/// [`MAX_DEPTH`]. Callers keep their early `return`; [`render_pages`]
+/// collapses any number of these into a single `tracing::warn!` per render
+/// instead of flooding the log once per truncated subtree.
+fn note_depth_truncated() {
+    TRUNCATED_DEPTH.set(true);
+}
 
 /// A4 portrait, matching the default most other frameworks in this space
 /// (Rails' `wicked_pdf`, `WeasyPrint`) ship.
@@ -194,6 +217,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     for node in nodes {
@@ -261,6 +285,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     let mut index = 0u32;
@@ -302,6 +327,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     for node in nodes {
@@ -357,6 +383,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     let mut index = 0u32;
@@ -386,6 +413,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     let mut pending: Vec<Span> = Vec::new();
@@ -508,6 +536,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        note_depth_truncated();
         return;
     }
     // Reuse `flatten_blocks` by giving it a scratch buffer, then splice: if
@@ -1303,7 +1332,16 @@ impl Writer {
 pub(super) fn render_pages(html: &str) -> Vec<PdfPage> {
     let nodes = super::html::parse(html);
     let mut blocks = Vec::new();
+    TRUNCATED_DEPTH.set(false);
     flatten_blocks(&nodes, 0, &mut blocks);
+    if TRUNCATED_DEPTH.take() {
+        tracing::warn!(
+            max_depth = MAX_DEPTH,
+            "autumn_web::pdf: HTML nested deeper than the layout depth cap was omitted \
+             from the PDF; content past {MAX_DEPTH} nesting levels is dropped, not an error — \
+             see the Nesting depth limit section of the autumn_web::pdf module docs"
+        );
+    }
 
     let mut writer = Writer::new();
     for block in &blocks {
@@ -2561,6 +2599,88 @@ mod tests {
         // asserts it completes and still produces at least one page.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
+    }
+
+    /// Minimal [`tracing::Subscriber`] that counts `WARN` (and above) events.
+    /// Used with [`tracing::subscriber::with_default`] so truncation tests can
+    /// assert on the warning without touching the process-global subscriber.
+    #[derive(Clone, Default)]
+    struct WarnCounter {
+        warns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WarnCounter {
+        fn count(&self) -> usize {
+            self.warns.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {
+            self.warns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Render `html` with warnings captured, returning the WARN event count.
+    fn render_pages_counting_warnings(html: &str) -> usize {
+        let counter = WarnCounter::default();
+        let probe = counter.clone();
+        tracing::subscriber::with_default(counter, || {
+            let pages = render_pages(html);
+            assert!(!pages.is_empty());
+        });
+        probe.count()
+    }
+
+    #[test]
+    fn depth_truncation_emits_exactly_one_warning_per_render() {
+        // The issue's repro shape: content nested past MAX_DEPTH is omitted
+        // from the layout. That omission must not be silent — exactly one
+        // warning per render, no matter how many subtrees were truncated.
+        let html = format!("{}MARKER{}", "<b>".repeat(600), "</b>".repeat(600));
+        assert_eq!(
+            render_pages_counting_warnings(&html),
+            1,
+            "a render that truncates deep nesting must warn exactly once"
+        );
+        // And a second deep render warns again — the flag resets per render.
+        assert_eq!(
+            render_pages_counting_warnings(&html),
+            1,
+            "the truncation warning must fire on every truncating render"
+        );
+    }
+
+    #[test]
+    fn shallow_nesting_emits_no_warning() {
+        assert_eq!(
+            render_pages_counting_warnings("<h1>Invoice</h1><p>Total: $42.00</p>"),
+            0,
+            "a render inside the depth cap must not warn"
+        );
+        // Nesting right at the cap is still fine — only *past* it truncates.
+        let at_cap = format!("{}x{}", "<b>".repeat(512), "</b>".repeat(512));
+        assert_eq!(
+            render_pages_counting_warnings(&at_cap),
+            0,
+            "nesting exactly at MAX_DEPTH must not warn"
+        );
     }
 
     #[test]
