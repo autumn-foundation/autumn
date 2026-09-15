@@ -117,11 +117,23 @@
 #      the form the prelude is USED in, so leaving either kind out would exempt
 #      the most-copied constructs in the guide.
 #   3. The page then has to NAME that feature, in a spelling a reader can act
-#      on: a `features = [ … "ws" … ]` array (newlines and comments inside it
-#      are fine — the corpus writes them that way), a `--features ws`
-#      invocation, the prose forms `` `ws` feature ``/`` `ws` Cargo feature ``/
-#      `` feature `ws` ``/`` feature flag `i18n` ``, or a `[features]` table
-#      row `ws = [`. All five spellings are live in the corpus today.
+#      on: a `features = [ … "ws" … ]` array TIED TO autumn-web — either the
+#      inline table `autumn-web = { …, features = [ … ] }` or a
+#      `[dependencies.autumn-web]` section, with newlines and comments inside
+#      the array fine, since the corpus writes them that way — a `--features
+#      ws` invocation, the prose forms `` `ws` feature ``/`` `ws` Cargo
+#      feature ``/`` feature `ws` ``/`` feature flag `i18n` ``, or a
+#      `[features]` table row `ws = [`. Every spelling is live in the corpus.
+#
+#      The TIE matters and was missing at first. An unqualified `features = […]`
+#      match let ANY dependency's array satisfy the gate, and
+#      `skills/autumn-web/references/api-reference.md:1303` carries
+#      `axum = { version = "0.8", features = ["macros", "ws"] }` — which enables
+#      axum's websocket support and does nothing for autumn-web's `ws`. `ws`,
+#      `mail`, `tls`, `redis`, `openapi`, `markdown` and `csv` are all ordinary
+#      feature names in other crates, so that was a standing false-negative
+#      channel rather than one page's bad luck. Found by Codex review on #2800;
+#      no page in the corpus was relying on it, so the tie cost nothing to add.
 #
 # NAMING, NOT PLACEMENT. The rule is that the feature is named SOMEWHERE on the
 # page, not that it is named before the first fence that needs it. Placement is
@@ -1217,9 +1229,25 @@ def uses(blanked, gated):
         for match in MODULE_GROUP_USE.finditer(line):
             head, inner = match.group(1), match.group(2)
             # Each `child::{…}` inside the group is a second segment under the
-            # same head; a bare entry resolves against the head alone.
+            # same head.
             for child in re.findall(r'([a-z_][a-z_0-9]*)\s*::\s*\{', inner):
                 entry, shown = resolve(head, child)
+                if entry:
+                    for feature in sorted(entry[0]):
+                        yield lineno, feature, shown
+            # A DIRECT entry is `head::<entry>` — the commonest spelling of all
+            # (`storage::{BlobStoreState, …}`, `widgets::{ActiveSearchConfig,
+            # …}`), and reading only the nested `child::{…}` groups meant every
+            # one of them fell back to the head alone. `storage-variants.md:71`
+            # writes both shapes in one line. Found by Codex review on #2800.
+            for piece in re.split(r',(?![^{]*\})', inner):
+                piece = piece.strip()
+                if not piece or '{' in piece:
+                    continue
+                parts = [q.strip() for q in piece.split('::') if q.strip()]
+                if not parts:
+                    continue
+                entry, shown = resolve(head, parts[0])
                 if entry:
                     for feature in sorted(entry[0]):
                         yield lineno, feature, shown
@@ -1281,8 +1309,23 @@ def naming_patterns(feature):
     """
     name = re.escape(feature)
     return (
-        # `features = ["ws"]`, including the multi-line, commented spelling
-        # `skills/autumn-web/SKILL.md` writes.
+        # A `features = […]` array TIED TO autumn-web. Untied, any dependency's
+        # array satisfied the gate: `skills/autumn-web/references/
+        # api-reference.md:1303` carries `axum = { version = "0.8", features =
+        # ["macros", "ws"] }`, which enables axum's websocket support and does
+        # nothing for autumn-web's `ws`. `ws`, `mail`, `tls`, `redis`,
+        # `openapi`, `markdown` and `csv` are all ordinary feature names in
+        # other crates, so this was a standing false-negative channel rather
+        # than one page's bad luck. Found by Codex review on #2800.
+        #
+        # Two spellings, both live in the corpus: the inline table
+        # `autumn-web = { version = "0.7", features = [ … ] }` (the array may
+        # wrap over lines and carry comments, which `SKILL.md` does), and the
+        # `[dependencies.autumn-web]` section with the array beneath it. The
+        # window is bounded so a later, unrelated dependency cannot be read as
+        # autumn-web's.
+        rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*"{name}"',
+        rf'\[(?:[a-z-]+\.)*dependencies\.autumn-web\][^\[]*?'
         rf'features\s*=\s*\[[^\]]*"{name}"',
         rf'--features[^\n]*(?:[",\s=]|^){name}(?:[",\s]|$)',
         rf'`{name}`(?:\s+Cargo)?\s+features?\b',
@@ -1529,6 +1572,20 @@ def self_test():
            found('```rust\nlet s = t!(locale, "welcome.title");\n```\n'),
            [(2, 'i18n', 't!')])
 
+    # A DIRECT entry in a module-qualified group — the commonest import shape
+    # in the corpus, and one that used to fall back to the head alone.
+    expect('a direct entry in a module group resolves under the head',
+           sorted(set(found(
+               '```rust\nuse autumn_web::openapi::{Parameter};\n```\n'))),
+           [(2, 'openapi', 'autumn_web::openapi::Parameter')])
+    expect('a mixed group resolves both shapes',
+           sorted(set(found(
+               '```rust\nuse autumn_web::storage::{Blob, variant::{Transform}};'
+               '\n```\n'))),
+           [(2, 'storage', 'autumn_web::storage'),
+            (2, 'storage', 'autumn_web::storage::variant'),
+            (2, 'variants', 'autumn_web::storage::variant')])
+
     # An uppercase second segment names an item, not a module, and resolves the
     # same way. `pub mod openapi;` is unconditional; `Parameter` is not.
     expect('a gated item under an ungated module is read',
@@ -1624,13 +1681,16 @@ def self_test():
     # helper alone — the helper was already right; the call path was not.
     expect('comment blanked',
            found('```rust\n<!-- autumn_web::pdf -->\n```\n'), [])
+    # Both halves use a properly SCOPED array, so this pair isolates the
+    # comment-blanking behaviour rather than re-testing the autumn-web tie.
+    enabling = 'autumn-web = { version = "0.7", features = ["pdf"] }'
     hidden = ('```rust\nuse autumn_web::pdf::Pdf;\n```\n'
-              '\n<!-- features = ["pdf"] -->\n')
+              f'\n<!-- {enabling} -->\n')
     expect('a hidden enabling line does not satisfy the naming rule',
            names_feature(blank_comments(hidden), 'pdf'), False)
     expect('...while the same line in view does',
            names_feature(
-               blank_comments('```toml\nfeatures = ["pdf"]\n```\n'), 'pdf'),
+               blank_comments(f'```toml\n{enabling}\n```\n'), 'pdf'),
            True)
     expect('a conjunction is reported once per non-default feature',
            found('```rust\nuse autumn_web::presence_stream;\n```\n'),
@@ -1640,7 +1700,10 @@ def self_test():
     # The naming rule.
     for spelling in (
             'autumn-web = { version = "0.7", features = ["ws"] }',
-            'features = [\n    "mail",  # email\n    "ws",\n]',
+            'autumn-web = { version = "0.7", features = [\n'
+            '    "mail",  # email\n    "ws",\n] }',
+            '[dependencies.autumn-web]\nversion = "0.7"\n'
+            'features = ["ws"]\n',
             'cargo build --features ws',
             'the `ws` feature',
             'the `ws` Cargo feature',
@@ -1658,7 +1721,21 @@ def self_test():
                'the quick start above', 'pdf'),
            False)
     expect('a longer feature name is not a shorter one',
-           names_feature('features = ["ws-compat"]', 'ws'), False)
+           names_feature(
+               'autumn-web = { features = ["ws-compat"] }', 'ws'), False)
+    # A features array belonging to ANOTHER crate enables that crate, not this
+    # one. `api-reference.md:1303` carries exactly this axum line.
+    expect('another crate\'s features array does not satisfy the gate',
+           names_feature(
+               'axum = { version = "0.8", features = ["macros", "ws"] }', 'ws'),
+           False)
+    expect('...even directly beside an autumn-web dependency',
+           names_feature(
+               'autumn-web = { version = "0.7" }\n'
+               'axum = { version = "0.8", features = ["ws"] }\n', 'ws'),
+           False)
+    expect('a bare features array with no crate does not satisfy it either',
+           names_feature('features = ["ws"]', 'ws'), False)
     expect('a comment naming the feature does not count',
            names_feature(blank_comments('<!-- features = ["ws"] -->'), 'ws'),
            False)

@@ -139,6 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
   group is read entry by entry, which ordinary use-tree syntax had slipped past.
   Judged
+  A `features = […]` array only counts when it is tied to an `autumn-web`
+  dependency: unqualified, any crate's array satisfied the gate, and the corpus
+  carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
+  enables axum's websockets and nothing of autumn-web's.
   One level below the root resolves both gated MODULES and gated ITEMS, since
   `pub mod openapi;` carries no `#[cfg]` while `openapi::Parameter` does.
   Which macros are attributes and which are bang calls is read from
