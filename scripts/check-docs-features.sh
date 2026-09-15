@@ -69,6 +69,10 @@
 #   docs/guide/testing.md:739             `autumn_web::storage`    -> storage
 #   docs/migrations/next.md:136           `autumn_web::tls`        -> tls
 #
+# and a tenth, reachable only once the gate resolved a second path segment:
+#
+#   docs/guide/jobs.md:824                `autumn_web::data::csv`  -> csv
+#
 # Three of them sit under a literal "**You write:**" heading. None is a page
 # about an obscure corner: `cloud-native.md` is the deployment guide, and its
 # `#[ws]` block is the WebSocket *drain contract* — read by someone wiring up a
@@ -690,7 +694,53 @@ def _names(blob):
     return out
 
 
-def nested_modules(root, top_level):
+def root_modules(root):
+    """`{name: features}` for every column-zero `pub mod` in `lib.rs`.
+
+    Features is the module's OWN requirement set, empty for an unconditional
+    one — and the empty ones are the point. `nested_modules()` was first seeded
+    from `gated_items()`, which records only declarations carrying a `#[cfg]`,
+    so it never descended into an unconditional parent. That skipped exactly
+    the case the nested pass exists for: `pub mod data;` is unconditional,
+    `data::csv` is behind the non-default `csv` feature, and
+    `docs/guide/jobs.md:824` imports `autumn_web::data::csv::export_csv` in a
+    rust fence without naming it — a live defect the gate reported as clean.
+    Found by Codex review on #2800, and the comment on that seeding claimed it
+    read "every top-level module whatever its own gate" while the code did not.
+    """
+    out = {}
+    lines = (pathlib.Path(root) / 'autumn/src/lib.rs').read_text(
+        encoding='utf-8').splitlines()
+    pending = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line or line[:1].isspace():
+            index += 1
+            continue
+        if CFG_OPEN.match(line):
+            required, index = _cfg_requirement(lines, index)
+            if required:
+                pending = required
+            continue
+        index += 1
+        if line.startswith(('///', '//!', '//', '#[')):
+            continue
+        match = PUB_MOD_DECL.match(line)
+        if match:
+            out[match.group(1)] = set(pending or ())
+        pending = None
+    if not out:
+        sys.exit(
+            'FAIL: no column-zero `pub mod` declarations found in '
+            'autumn/src/lib.rs. The crate root was restructured; the nested '
+            'pass has nothing to descend into and would silently check only '
+            'the head segment. Fix root_modules() in '
+            'scripts/check-docs-features.sh.')
+    return out
+
+
+def nested_modules(root, parents):
     """`{"parent::child": features}` for one level below the crate root.
 
     A feature gate below an UNCONDITIONAL module is invisible from the first
@@ -715,9 +765,7 @@ def nested_modules(root, top_level):
     guessing at those is how a gate starts reporting confident nonsense.
     """
     out = {}
-    for name, (parent_features, kinds) in top_level.items():
-        if 'module' not in kinds:
-            continue
+    for name, parent_features in parents.items():
         for candidate in (f'autumn/src/{name}.rs', f'autumn/src/{name}/mod.rs'):
             path = pathlib.Path(root) / candidate
             if path.exists():
@@ -777,9 +825,12 @@ def surface(root):
         if needed:
             out[name] = (needed, kinds)
     # One level down, keyed `parent::child`, resolved BEFORE the head in
-    # `uses()`. Seeded from every top-level module whatever its own gate, since
-    # the interesting case is a gated child under an ungated parent.
-    for name, (features, kinds) in nested_modules(root, gated).items():
+    # `uses()`. Seeded from `root_modules()` — EVERY column-zero `pub mod`,
+    # gated or not — because the interesting case is a gated child under an
+    # UNCONDITIONAL parent, and seeding from the gated set alone skipped it.
+    # `data::csv` is that case, and it was a live defect. See `root_modules()`.
+    for name, (features, kinds) in nested_modules(
+            root, root_modules(root)).items():
         needed = features - closure
         if needed:
             out[name] = (needed, kinds)
@@ -1327,6 +1378,25 @@ def self_test():
     expect('naming `ws` alone does not satisfy `presence`',
            activation_lines('features = ["ws"]\n', {'presence'},
                             enabled_by).get('presence'), None)
+
+    # The nested pass descends into UNCONDITIONAL parents too. `pub mod data;`
+    # carries no `#[cfg]`, so seeding from the gated set alone skipped it — and
+    # `data::csv` was a live defect behind that gap (`docs/guide/jobs.md:824`).
+    roots = root_modules(ROOT)
+    for name in ('data', 'db', 'storage'):
+        if name not in roots:
+            failures.append(
+                f'root_modules: {name} missing — the nested pass cannot '
+                f'descend into it')
+    expect('an unconditional root module carries no requirement',
+           roots.get('data'), set())
+    expect('a gated root module carries its own',
+           roots.get('pdf'), {'pdf'})
+    if real.get('data::csv') != ({'csv'}, {'module'}):
+        failures.append(
+            f'truth set: data::csv -> {real.get("data::csv")!r}, want '
+            f'({{\'csv\'}}, {{\'module\'}}) — a gated child under an '
+            f'unconditional parent')
 
     # The nested pass, against the real crate. `db` is a DEFAULT feature, so
     # `db::sqlite_types` exists only because the second segment is resolved.

@@ -100,13 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the project the quickstart just scaffolded gets `error[E0433]: failed to
   resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
   whose fix is a line in a file the page never showed them. Baseline: 78 gated
-  uses checked, **9 defects across 8 pages**. Three sat under a literal
+  uses checked, **10 defects across 9 pages**. Three sat under a literal
   "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
   `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
   read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
   the missing line — "requires the `maud` feature; enabled together with `pdf`
   in the quick start above", where the quick start above carried no
-  `Cargo.toml` at all. All nine are fixed in the same commit. Truth set is
+  `Cargo.toml` at all. The tenth — `docs/guide/jobs.md:824`, a
+  `use autumn_web::data::csv::export_csv;` in the async-CSV-export walkthrough,
+  on a page that never names `csv` — is reachable only once a second path
+  segment is resolved: `pub mod data;` is unconditional, so the gate that reads
+  only the head segment drops the path entirely. All ten are fixed in the same
+  commit. Truth set is
   parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs` and
   `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
   snapshot — so moving an item behind a new feature moves the gate in the same
