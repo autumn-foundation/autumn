@@ -332,6 +332,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 MODE = sys.argv[1]
@@ -558,10 +559,30 @@ SOURCES = ('autumn/src/lib.rs', 'autumn/src/prelude.rs')
 
 CFG_OPEN = re.compile(r'^#\[cfg\(')
 CFG_FEATURE_NAME = re.compile(r'feature\s*=\s*"([a-z0-9_.+-]+)"')
-MOD_DECL = re.compile(r'^(?:pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
+# Every visibility, because the line has to be CONSUMED either way: a `#[cfg]`
+# sitting above `pub(crate) mod session_redis;` is that module's gate, and a
+# matcher that skipped the line would carry the gate forward onto the next
+# declaration instead. Group 1 is the visibility prefix, and only a bare `pub `
+# makes the module a path a reader outside the crate can write — see
+# `_is_public`.
+MOD_DECL = re.compile(r'^(pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
 # Strictly `pub`, for the nested pass: a `pub(crate)` or private `mod tests`
 # gated by a feature is not a path a reader can write.
 PUB_MOD_DECL = re.compile(r'^pub mod ([a-z_0-9]+)\s*[;{]')
+
+
+def _is_public(visibility):
+    """True for `pub`, false for `pub(…)` and for no visibility at all.
+
+    `pub(crate)`, `pub(super)` and a bare `mod` are all invisible downstream, so
+    a reader cannot write the path however many features they enable — which
+    makes reporting one exactly backwards: the gate would demand `redis` for
+    `autumn_web::session_redis` (`lib.rs:632`) and enabling it would not make
+    the path resolve. The nested pass has required strict `pub` since round 8
+    and said why; the root pass did not, which is the fifth time on this PR a
+    rule landed on one of two code paths. Found by Codex review on #2800.
+    """
+    return visibility == 'pub '
 # A public item declared or re-exported at column zero INSIDE a root module.
 # `pub mod openapi;` is unconditional; `openapi::Parameter` is not.
 PUB_ITEM_DECL = re.compile(
@@ -838,10 +859,16 @@ def gated_items(root, macro_kinds):
                 continue
             match = MOD_DECL.match(line)
             if match:
-                if pending:
-                    _record(found, match.group(1), pending, 'module')
-                else:
-                    unconditional.add((match.group(1), 'type'))
+                # A non-`pub` module is neither gated surface nor an
+                # unconditional definition that could strip one: it is not a
+                # path a reader can write under ANY feature set, so it should
+                # neither be demanded nor vouch for a public namesake. The line
+                # still clears `pending` — its `#[cfg]` belongs to it.
+                if _is_public(match.group(1)):
+                    if pending:
+                        _record(found, match.group(2), pending, 'module')
+                    else:
+                        unconditional.add((match.group(2), 'type'))
                 pending = None
                 continue
             match = MACRO_RULES_DECL.match(line)
@@ -2415,6 +2442,48 @@ def self_test():
     expect('an ungated macro does not strip a gated module of the same name',
            _strip_unconditional({'edge': ({'edge'}, {'module'})},
                                 {('edge', 'macro')}),
+           {'edge': ({'edge'}, {'module'})})
+
+    # Visibility. `pub(crate) mod session_redis;` (`lib.rs:632`) is gated by
+    # `redis` and is NOT a path a reader can write — enabling `redis` would not
+    # make it resolve downstream — so demanding the feature for it would be a
+    # false positive the reader could do nothing about.
+    expect('a bare `pub` module is public', _is_public('pub '), True)
+    expect('`pub(crate)` is not', _is_public('pub(crate) '), False)
+    expect('`pub(super)` is not', _is_public('pub(super) '), False)
+    expect('no visibility at all is not', _is_public(None), False)
+    if 'session_redis' in real:
+        failures.append(
+            f'truth set: session_redis -> {real["session_redis"]!r}, but '
+            f'`lib.rs` declares it `pub(crate)` — a reader cannot write that '
+            f'path under any feature set')
+    # ...and the crate-private declaration must still CONSUME its `#[cfg]`,
+    # rather than letting the gate fall through onto whatever follows. `redis`
+    # really does gate `session_redis`, so a leak would show up as the next
+    # public declaration wrongly requiring it.
+    def scan(*lines):
+        """`gated_items()` over a synthetic crate root, for shape questions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / 'autumn' / 'src'
+            src.mkdir(parents=True)
+            (src / 'lib.rs').write_text('\n'.join(lines) + '\n')
+            (src / 'prelude.rs').write_text('')
+            return gated_items(tmp, {})
+
+    expect('a private module still swallows its own gate',
+           scan('#[cfg(feature = "redis")]',
+                'pub(crate) mod session_redis;',
+                '#[cfg(feature = "pdf")]',
+                'pub mod pdf;'),
+           {'pdf': ({'pdf'}, {'module'})})
+    expect('...while its public twin is recorded',
+           scan('#[cfg(feature = "redis")]',
+                'pub mod session_redis;'),
+           {'session_redis': ({'redis'}, {'module'})})
+    expect('a private module does not vouch for a gated public namesake',
+           scan('mod edge;',
+                '#[cfg(feature = "edge")]',
+                'pub use autumn_edge as edge;'),
            {'edge': ({'edge'}, {'module'})})
 
     # `metrics::testing` is `#[cfg(any(test, feature = "test-support"))]`, and
