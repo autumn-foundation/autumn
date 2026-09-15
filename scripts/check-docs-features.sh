@@ -1348,6 +1348,9 @@ def enablers(graph):
 
 
 CONTINUATION = re.compile(r'\\\s*$')
+# `&&`, `||` and `;` end one shell command and start another. Outside quotes
+# only, so a `;` inside `features = ["a;b"]` is not a separator.
+COMMAND_SEPARATOR = re.compile(r'(?:&&|\|\||;)(?=(?:[^"\']*["\'][^"\']*["\'])*[^"\']*$)')
 
 
 def join_continuations(text):
@@ -1379,12 +1382,14 @@ def join_continuations(text):
         else:
             current += ' ' + stripped.lstrip()
         if not CONTINUATION.search(line):
-            joined.append(current)
-            line_of.append(start)
+            for command in COMMAND_SEPARATOR.split(current):
+                joined.append(command)
+                line_of.append(start)
             current = None
     if current is not None:
-        joined.append(current)
-        line_of.append(start)
+        for command in COMMAND_SEPARATOR.split(current):
+            joined.append(command)
+            line_of.append(start)
     return '\n'.join(joined), line_of
 
 
@@ -1513,7 +1518,14 @@ PRELUDE_GLOB = re.compile(r'\bautumn_web::prelude::\*')
 # `use autumn_web::openapi::*;` — a glob over a ROOT module, which brings that
 # module's gated items into scope under their bare names. `prelude` is excluded
 # because `PRELUDE_GLOB` already covers it against a wider candidate set.
-MODULE_GLOB = re.compile(r'\bautumn_web::(?!prelude\b)([a-z_][a-z_0-9]*)::\*')
+# The globbed path may be SEVERAL module segments: `use
+# autumn_web::mail::suppression::*;` puts `record_inbound` in scope bare, and a
+# one-segment matcher saw no glob at all while the qualified import beside it
+# resolved to `mail` — a feature such a page already names. Found by Codex
+# review on #2800.
+MODULE_GLOB = re.compile(
+    r'\bautumn_web::(?!prelude::\*)'
+    r'([a-z_][a-z_0-9]*(?:::[a-z_][a-z_0-9]*)*)::\*')
 # One or more `>` markers and the space after each: a nested quote writes
 # `> > `, and a fence inside one is still a fence.
 BLOCKQUOTE = re.compile(r'^\s*(?:>\s?)+')
@@ -1735,13 +1747,13 @@ def uses(blanked, gated):
     # called by its bare name.
     children = {}
     for full, entry in gated.items():
-        head, _, child = full.partition('::')
-        if not child or '::' in child:
+        parent, sep, child = full.rpartition('::')
+        if not sep:
             continue
         root = gated.get(child)
         if root and root[1] & {'bang', 'attribute'}:
             continue
-        children.setdefault(head, {})[child] = entry
+        children.setdefault(parent, {})[child] = entry
     for start, body in rust_fence_blocks(blanked):
         # Every glob this looks for — prelude or module — contains the literal
         # `::*`, so a fence without it cannot match either pattern. A necessary
@@ -2242,6 +2254,11 @@ def self_test():
         # the shape a nested group under a module head has to reach.
         'capsule::BACKEND_CAPTURE_NOTE': ({'sqlite'}, {'item'}),
         'capsule::capture::with_capture_scope': ({'test-support'}, {'item'}),
+        # A gated item two levels down whose PARENT is also gated — the shape a
+        # multi-segment module glob has to reach.
+        'mail::suppression::record_inbound': ({'inbound-mail', 'mail'},
+                                              {'item'}),
+        'mail': ({'mail'}, {'module'}),
         # Items reachable only through a brace group, and a bang macro.
         'Mail': ({'mail'}, {'item'}),
         'Mailer': ({'mail'}, {'item'}),
@@ -2493,6 +2510,12 @@ def self_test():
            [(3, 'openapi', 'generate_spec (from autumn_web::openapi::*)')])
     # ...but a GRANDCHILD is not in scope from a glob over its grandparent.
     # `openapi` is ungated, so nothing else on the line can report either.
+    # The globbed path may be several segments deep.
+    expect('a multi-segment module glob brings its children into scope',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::mail::suppression::*;\n'
+               'record_inbound(s, &e).await?;\n```\n')}),
+           ['inbound-mail', 'mail'])
     expect('a glob does not reach a grandchild',
            found('```rust\nuse autumn_web::openapi::*;\n'
                  'let d: Deep = x;\n```\n'),
@@ -2773,7 +2796,24 @@ def self_test():
             ('cargo check -p app --features diesel/postgres',
              'postgres', False),
             # A BARE value still belongs to the selected package.
-            ('cargo check -p app --features ws', 'ws', False)):
+            ('cargo check -p app --features ws', 'ws', False),
+            # A selector binds to ITS OWN command. `&&`, `||` and `;` end one
+            # and start another, and an unbounded scan found the first
+            # command's autumn-web selector for the second command's flag.
+            ('cargo test -p autumn-web && cargo test -p other --features ws',
+             'ws', False),
+            ('cargo test -p other --features ws || cargo test -p autumn-web',
+             'ws', False),
+            ('cargo test -p autumn-web; cargo test -p other --features ws',
+             'ws', False),
+            ('cargo build && cargo test -p autumn-web --features ws',
+             'ws', True),
+            ('cargo test -p autumn-web --features test-support && cargo build',
+             'test-support', True),
+            # ...but a separator inside QUOTES separates nothing.
+            ('cargo test -p autumn-web --features "ws,mail" && echo "x;y"',
+             'ws', True),
+            ('cargo test -p autumn-web --features "ws mail"', 'mail', True)):
         if names_feature(spelling, feature) != want:
             failures.append(
                 f'naming: {spelling!r} / {feature} -> '
