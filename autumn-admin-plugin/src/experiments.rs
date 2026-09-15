@@ -23,13 +23,33 @@ use crate::{
 // primary, NOT a replica. A request-scoped constructor would let the same query
 // route to a replica for free.
 
+// ── Backend portability (issue #2108) ────────────────────────────────────────
+//
+// `changed_at` is a `timestamptz` column, but the table and the model declare
+// the portable `Timestamp` type with a `NaiveDateTime` field. The `Timestamptz`
+// SQL type is Postgres-only — `SQLite: HasSqlType<Timestamptz>` does not exist
+// — so the generated DSL below does not compile under `autumn-web/sqlite`.
+//
+// The flip does not change what Postgres returns. Postgres sends `timestamp`
+// and `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC.
+// A `Timestamp` read of a `timestamptz` column therefore gives the UTC wall
+// clock, whatever the session time zone is, and `and_utc()` puts the offset
+// back at the JSON boundary. `tests/experiment_admin_db.rs` asserts that on a
+// non-UTC session.
+//
+// The write direction is safe too. This crate never writes `changed_at`
+// through the model — the audit rows come from the raw-SQL statements below,
+// which let the column default supply the value. If an application writes one
+// through the generated CRUD, Postgres coerces the bound `timestamp` with the
+// session time zone, and diesel-async sets every new session to UTC
+// (`set_config_options` in `diesel_async::pg`).
 diesel::table! {
     autumn_experiment_changes (id) {
         id -> diesel::sql_types::Int8,
         experiment -> diesel::sql_types::Text,
         mutation -> diesel::sql_types::Text,
         actor -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        changed_at -> diesel::sql_types::Timestamptz,
+        changed_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -42,7 +62,7 @@ pub struct ExperimentChange {
     pub mutation: String,
     pub actor: Option<String>,
     #[default]
-    pub changed_at: chrono::DateTime<chrono::Utc>,
+    pub changed_at: chrono::NaiveDateTime,
 }
 
 #[autumn_web::repository(ExperimentChange, table = "autumn_experiment_changes")]
@@ -499,8 +519,6 @@ impl AdminModel for ExperimentAdminModel {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        use diesel_async::RunQueryDsl;
-
         // `ExperimentAdminModel` never declares soft delete
         // (`supports_soft_delete()` is the trait default, `false`), so
         // `actions()` (traits.rs) only ever offers `"delete"` — the admin UI
@@ -515,51 +533,72 @@ impl AdminModel for ExperimentAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // Batch every id into ONE round trip instead of the trait
-                // default's one-CTE-per-id loop (an operator selecting
-                // hundreds of concluded/archived experiments in the admin
-                // list and clicking "Delete selected" otherwise costs one
-                // statement, and one connection checkout, per experiment).
-                // Same CTE shape as the single-row `delete()`: the cascading
-                // assignment/override deletes and the audit INSERT's
-                // `SELECT name, 'deleted', NULL FROM deleted` already fan out
-                // to one row per id the `DELETE ... RETURNING name` actually
-                // removed, so widening the predicate to `id = ANY($1)` is
-                // enough — an id that doesn't exist contributes no row to
-                // `deleted` and so no cascading delete or audit row either,
-                // exactly like the loop it replaces.
-                //
-                // The returned count matches the *ids submitted*, not rows
-                // actually deleted, exactly like the loop this replaces
-                // (which incremented its counter once per id regardless of
-                // whether that id matched a row).
-                let mut conn = pool
-                    .get()
-                    .await
-                    .map_err(|e| AdminError::Database(e.to_string()))?;
-                diesel::sql_query(
-                    "WITH deleted AS ( \
-                         DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING name \
-                     ), \
-                     _del_assignments AS ( \
-                         DELETE FROM autumn_experiment_assignments \
-                         WHERE experiment IN (SELECT name FROM deleted) \
-                     ), \
-                     _del_overrides AS ( \
-                         DELETE FROM autumn_experiment_overrides \
-                         WHERE experiment IN (SELECT name FROM deleted) \
-                     ), \
-                     _audit AS ( \
-                         INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-                         SELECT name, 'deleted', NULL FROM deleted \
-                     ) \
-                     SELECT COUNT(*) AS count FROM deleted",
-                )
-                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
-                .get_result::<CountRow>(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-                Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                // The batched form binds a Postgres array. `SQLite` has no
+                // array bind type, so that statement cannot type-check there.
+                // `backend_select!` keeps the tokens of one arm and drops the
+                // other, so the array never reaches the `SQLite` type-checker
+                // (issue #2108). The `SQLite` arm falls back to the per-id
+                // path: the same statement `delete()` issues, the same count,
+                // one round trip per id.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-CTE-per-id loop (an operator selecting
+                        // hundreds of concluded/archived experiments in the admin
+                        // list and clicking "Delete selected" otherwise costs one
+                        // statement, and one connection checkout, per experiment).
+                        // Same CTE shape as the single-row `delete()`: the cascading
+                        // assignment/override deletes and the audit INSERT's
+                        // `SELECT name, 'deleted', NULL FROM deleted` already fan out
+                        // to one row per id the `DELETE ... RETURNING name` actually
+                        // removed, so widening the predicate to `id = ANY($1)` is
+                        // enough — an id that doesn't exist contributes no row to
+                        // `deleted` and so no cascading delete or audit row either,
+                        // exactly like the loop it replaces.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually deleted, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id matched a row).
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "WITH deleted AS ( \
+                                 DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING name \
+                             ), \
+                             _del_assignments AS ( \
+                                 DELETE FROM autumn_experiment_assignments \
+                                 WHERE experiment IN (SELECT name FROM deleted) \
+                             ), \
+                             _del_overrides AS ( \
+                                 DELETE FROM autumn_experiment_overrides \
+                                 WHERE experiment IN (SELECT name FROM deleted) \
+                             ), \
+                             _audit AS ( \
+                                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                                 SELECT name, 'deleted', NULL FROM deleted \
+                             ) \
+                             SELECT COUNT(*) AS count FROM deleted",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .get_result::<CountRow>(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let mut count: u64 = 0;
+                        for id in ids {
+                            self.delete(&pool, id).await?;
+                            count += 1;
+                        }
+                        Ok(count)
+                    }},
+                }
             });
         }
 
@@ -647,7 +686,7 @@ impl AdminModel for ExperimentAdminModel {
                 op: r.op,
                 request_id: None,
                 changes: vec![],
-                recorded_at: r.changed_at,
+                recorded_at: r.changed_at.and_utc(),
             })
             .collect();
 
@@ -790,8 +829,8 @@ struct ExperimentRow {
     variants: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     winner: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl ExperimentRow {
@@ -803,7 +842,7 @@ impl ExperimentRow {
             "state": self.state,
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -839,8 +878,8 @@ struct ExperimentDetailRow {
     winner: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     exclusion_group: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl ExperimentDetailRow {
@@ -853,7 +892,7 @@ impl ExperimentDetailRow {
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
             "exclusion_group": self.exclusion_group,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -866,8 +905,8 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    changed_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    changed_at: chrono::NaiveDateTime,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

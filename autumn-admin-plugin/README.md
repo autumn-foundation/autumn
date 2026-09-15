@@ -37,10 +37,9 @@ autumn-web = { version = "0.7", features = ["db", "flash", "htmx", "maud"] }
 autumn-admin-plugin = "0.7"
 ```
 
-`autumn-admin-plugin` expects a configured Autumn database pool for registered
-admin models because model operations receive the app's Postgres pool. The
-built-in jobs dashboard can render without a database pool when no model route
-is accessed.
+`autumn-admin-plugin` expects a configured Autumn database pool: model
+operations receive the app's pool. The built-in jobs dashboard can render
+without a database pool when no model route is accessed.
 
 ## Quick Start
 
@@ -81,6 +80,45 @@ When mounted at the default `/admin` prefix, the plugin serves:
 
 The plugin also serves a hashed same-origin JavaScript asset under
 `/admin/static/admin.<hash>.js` so long-lived caching stays safe across deploys.
+
+## Database Backends
+
+The plugin is backend-agnostic. It takes the app's
+`autumn_web::RuntimeConnection` pool, which is Postgres by default and `SQLite`
+under `autumn-web/sqlite`. An app on either backend can register its own models
+and get the full admin UI.
+
+The three **built-in** models are Postgres-only, because the tables they manage
+are Postgres-only:
+
+| Model | Table | Backends |
+| --- | --- | --- |
+| `tokens::TokenAdminModel` | `api_tokens` | Postgres |
+| `experiments::ExperimentAdminModel` | `autumn_experiments` | Postgres |
+| `feature_flags::FeatureFlagAdminModel` | `autumn_feature_flags` | Postgres |
+
+Do not register those three on `SQLite`. Autumn's experiment and feature-flag
+stores refuse a `SQLite` target as well, so the tables do not exist there.
+
+### Writing a model that runs on both backends
+
+Your own models decide their own SQL. Four rules keep it portable:
+
+1. **Write `$N` placeholders in ascending order, and use each one once.**
+   Postgres reads the digits. SQLite numbers `$N` by FIRST APPEARANCE and gives
+   one index per distinct name, so `SET name = $2 ... WHERE id = $1` binds the
+   id into `name`. To repeat a value, bind it twice under two placeholders.
+2. **Do not use `ILIKE`.** `LOWER(col) LIKE LOWER($1)` is case-insensitive on
+   both backends.
+3. **Do not use a `::type` cast, an `ANY($1)` array bind, or a writable CTE.**
+   SQLite has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
+   separate statements inside a transaction.
+4. **Use `CURRENT_TIMESTAMP`, not `NOW()`**, and read a timestamp column as
+   `Timestamp` into a `NaiveDateTime`. The `Timestamptz` SQL type is
+   Postgres-only.
+
+`tests/custom_admin_model.rs` is a worked example. The same test body runs on
+both backends.
 
 ## `AdminModel` Contract
 

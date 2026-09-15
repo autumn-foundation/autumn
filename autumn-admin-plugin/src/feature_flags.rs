@@ -444,8 +444,6 @@ impl AdminModel for FeatureFlagAdminModel {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        use diesel_async::RunQueryDsl;
-
         // `FeatureFlagAdminModel` never declares soft delete
         // (`supports_soft_delete()` is the trait default, `false`), so
         // `actions()` (traits.rs) only ever offers `"delete"` — the admin UI
@@ -459,41 +457,62 @@ impl AdminModel for FeatureFlagAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // Batch every id into ONE round trip instead of the trait
-                // default's one-CTE-per-id loop (an operator selecting
-                // hundreds of stale flags in the admin list and clicking
-                // "Delete selected" otherwise costs one statement, and one
-                // connection checkout, per flag). Same CTE shape as the
-                // single-row `delete()`: the audit INSERT's `SELECT key,
-                // 'deleted', NULL FROM deleted` already fans out to one row
-                // per id the `DELETE ... RETURNING key` actually removed, so
-                // widening the predicate to `id = ANY($1)` is enough — an id
-                // that doesn't exist contributes no row to `deleted` and so
-                // no audit row either, exactly like the loop it replaces.
-                //
-                // The returned count matches the *ids submitted*, not rows
-                // actually deleted, exactly like the loop this replaces
-                // (which incremented its counter once per id regardless of
-                // whether that id matched a row).
-                let mut conn = pool
-                    .get()
-                    .await
-                    .map_err(|e| AdminError::Database(e.to_string()))?;
-                diesel::sql_query(
-                    "WITH deleted AS ( \
-                         DELETE FROM autumn_feature_flags WHERE id = ANY($1) RETURNING key \
-                     ), \
-                     _audit AS ( \
-                         INSERT INTO feature_flag_changes (key, mutation, actor) \
-                         SELECT key, 'deleted', NULL FROM deleted \
-                     ) \
-                     SELECT COUNT(*) AS count FROM deleted",
-                )
-                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
-                .get_result::<CountRow>(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-                Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                // The batched form binds a Postgres array. `SQLite` has no
+                // array bind type, so that statement cannot type-check there.
+                // `backend_select!` keeps the tokens of one arm and drops the
+                // other, so the array never reaches the `SQLite` type-checker
+                // (issue #2108). The `SQLite` arm falls back to the per-id
+                // path: the same statement `delete()` issues, the same count,
+                // one round trip per id.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-CTE-per-id loop (an operator selecting
+                        // hundreds of stale flags in the admin list and clicking
+                        // "Delete selected" otherwise costs one statement, and one
+                        // connection checkout, per flag). Same CTE shape as the
+                        // single-row `delete()`: the audit INSERT's `SELECT key,
+                        // 'deleted', NULL FROM deleted` already fans out to one row
+                        // per id the `DELETE ... RETURNING key` actually removed, so
+                        // widening the predicate to `id = ANY($1)` is enough — an id
+                        // that doesn't exist contributes no row to `deleted` and so
+                        // no audit row either, exactly like the loop it replaces.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually deleted, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id matched a row).
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "WITH deleted AS ( \
+                                 DELETE FROM autumn_feature_flags WHERE id = ANY($1) RETURNING key \
+                             ), \
+                             _audit AS ( \
+                                 INSERT INTO feature_flag_changes (key, mutation, actor) \
+                                 SELECT key, 'deleted', NULL FROM deleted \
+                             ) \
+                             SELECT COUNT(*) AS count FROM deleted",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .get_result::<CountRow>(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let mut count: u64 = 0;
+                        for id in ids {
+                            self.delete(&pool, id).await?;
+                            count += 1;
+                        }
+                        Ok(count)
+                    }},
+                }
             });
         }
 
@@ -585,7 +604,7 @@ impl AdminModel for FeatureFlagAdminModel {
                 op: r.op,
                 request_id: None,
                 changes: vec![],
-                recorded_at: r.changed_at,
+                recorded_at: r.changed_at.and_utc(),
             })
             .collect();
 
@@ -655,8 +674,8 @@ struct FlagRow {
     actor_allowlist: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     group_allowlist: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl FlagRow {
@@ -669,7 +688,7 @@ impl FlagRow {
             "rollout_pct": self.rollout_pct,
             "actor_allowlist": self.actor_allowlist,
             "group_allowlist": self.group_allowlist,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -682,8 +701,8 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    changed_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    changed_at: chrono::NaiveDateTime,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

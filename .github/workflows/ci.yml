@@ -1358,6 +1358,14 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
             || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          # Issue #2108: the same AdminModel cover token_admin_db gives, for
+          # the two models whose rows carry a timestamp. Both assert the audit
+          # timestamp stays UTC after the Timestamptz -> Timestamp flip.
+          cargo test -p autumn-admin-plugin --test experiment_admin_db -- --ignored
+          cargo test -p autumn-admin-plugin --test feature_flag_admin_db -- --ignored
+          # The Postgres half of the cross-backend proof. The SQLite half runs
+          # in the `sqlite-runtime` job, from the same test body.
+          cargo test -p autumn-admin-plugin --test custom_admin_model -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test experiment_admin_bulk_delete_batch_profile -- --ignored
@@ -1809,6 +1817,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test experiment_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test feature_flag_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test custom_admin_model -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
@@ -1926,6 +1940,21 @@ jobs:
         # newly-added module rot the same way the pool tests did — silently,
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
+      - name: Build autumn-admin-plugin under the sqlite backend
+        # Issue #2108. The plugin has no `sqlite` feature of its own — a
+        # manifest edge would flip the backend for the whole workspace, and
+        # `scripts/check-sqlite-unification.sh` rejects one — so the flip is an
+        # EXPLICIT `--features autumn-web/sqlite` here, and nowhere else.
+        # Without this step nothing proves a SQLite app can build the plugin.
+        run: cargo clippy -p autumn-admin-plugin --features autumn-web/sqlite --lib -- -D warnings
+      - name: Run the admin-plugin cross-backend model suite (sqlite half)
+        # The SAME test body the `Test (Docker)` job runs on Postgres: an
+        # application model driven through the whole `AdminModel` surface.
+        # Green here means a SQLite app can register its own admin models.
+        # No Docker: the fixture is an in-memory SQLite database.
+        run: |
+          cargo test -p autumn-admin-plugin --features autumn-web/sqlite \
+            --test custom_admin_model -- --ignored
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,

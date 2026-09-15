@@ -296,8 +296,6 @@ impl AdminModel for TokenAdminModel {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        use diesel_async::RunQueryDsl;
-
         // `TokenAdminModel` never declares soft delete (`supports_soft_delete`
         // is the trait default, `false`), so `actions()` (traits.rs) only
         // ever offers `"delete"` — the admin UI can't reach `"restore"` or
@@ -310,33 +308,54 @@ impl AdminModel for TokenAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // Batch every id into ONE round trip instead of the trait
-                // default's one-`UPDATE`-per-id loop (an operator selecting
-                // hundreds of rows in the admin list and clicking "Delete
-                // selected" otherwise costs hundreds of statements and pool
-                // checkouts for what is, on the wire, one predicate). Same
-                // idempotent semantics as `delete()`: an id that doesn't
-                // exist, or is already revoked, is silently a no-op for that
-                // id.
-                //
-                // The returned count matches the *ids submitted*, not rows
-                // actually changed, exactly like the loop this replaces
-                // (which incremented its counter once per id regardless of
-                // whether that id's `UPDATE` matched a row) — a duplicate or
-                // already-revoked id was, and still is, counted as "applied".
-                let mut conn = pool
-                    .get()
-                    .await
-                    .map_err(|e| AdminError::Database(e.to_string()))?;
-                diesel::sql_query(
-                    "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
-                     WHERE id = ANY($1) AND revoked_at IS NULL",
-                )
-                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
-                .execute(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-                Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                // The batched form binds a Postgres array. `SQLite` has no
+                // array bind type, so that statement cannot type-check there.
+                // `backend_select!` keeps the tokens of one arm and drops the
+                // other, so the array never reaches the `SQLite` type-checker
+                // (issue #2108). The `SQLite` arm falls back to the per-id
+                // path: the same statement `delete()` issues, the same count,
+                // one round trip per id.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-`UPDATE`-per-id loop (an operator selecting
+                        // hundreds of rows in the admin list and clicking "Delete
+                        // selected" otherwise costs hundreds of statements and pool
+                        // checkouts for what is, on the wire, one predicate). Same
+                        // idempotent semantics as `delete()`: an id that doesn't
+                        // exist, or is already revoked, is silently a no-op for that
+                        // id.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually changed, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id's `UPDATE` matched a row) — a duplicate or
+                        // already-revoked id was, and still is, counted as "applied".
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                             WHERE id = ANY($1) AND revoked_at IS NULL",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let mut count: u64 = 0;
+                        for id in ids {
+                            self.delete(&pool, id).await?;
+                            count += 1;
+                        }
+                        Ok(count)
+                    }},
+                }
             });
         }
 

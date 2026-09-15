@@ -189,6 +189,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn-admin-plugin` builds and runs on the `SQLite` backend (#2108)
+  [no-plugin].** A `SQLite` app could not compile the admin plugin at all.
+  The crate carried 32 Postgres-only type errors under
+  `--features autumn-web/sqlite`: the `Timestamptz` SQL type on five
+  `QueryableByName` rows and on the typed `ExperimentChange` model, plus three
+  `Array<BigInt>` bulk binds. PR #2125 already flipped the connection type to
+  `RuntimeConnection`; this closes what a connection-type flip could not
+  reach. Every timestamp row now declares the portable `Timestamp` type with a
+  `NaiveDateTime` field, and the three batched bulk deletes sit in the `pg` arm
+  of `autumn_web::backend_select!`, with a per-id fallback on `SQLite`.
+  **No Postgres behaviour changes.** Postgres sends `timestamp` and
+  `timestamptz` in the same binary form — microseconds from 2000-01-01 UTC — so
+  a `Timestamp` read of a `timestamptz` column gives the same instant; the new
+  `experiment_admin_db` / `feature_flag_admin_db` suites assert that on a
+  non-UTC session. The Postgres statement text is byte-for-byte unchanged, so
+  the one-statement claim the `*_bulk_delete_batch_profile` harnesses measure
+  still holds, and a new guard test pins it. An app on either backend can now
+  register its own `AdminModel`s and get the full admin UI;
+  `tests/custom_admin_model.rs` runs one test body on both, from CI's
+  `Test (Docker)` and `SQLite runtime` jobs. The three BUILT-IN models
+  (`tokens`, `experiments`, `feature_flags`) stay Postgres-only, because the
+  tables they manage are Postgres-only — the plugin README now says so, and
+  lists the four rules that keep an application model's SQL portable.
+
 - **`scripts/check-docs-features.sh` — feature-gate documentation gate
   [no-plugin].** Every reader-facing page that shows Rust reaching for an
   `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature
