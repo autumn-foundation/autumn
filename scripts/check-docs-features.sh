@@ -1765,16 +1765,41 @@ def uses(blanked, gated):
             continue
         children.setdefault(parent, {})[child] = entry
     for start, body in rust_fence_blocks(blanked):
-        # Every glob this looks for — prelude or module — contains the literal
-        # `::*`, so a fence without it cannot match either pattern. A necessary
-        # condition read off the patterns themselves, not a guess about the
-        # corpus: unlike the `check()` prefilter round 11 removed, this one
-        # cannot drift away from what it is filtering for.
+        # Every glob contains a `*`, so a fence without one cannot match any of
+        # these patterns. A necessary condition read off the shapes themselves
+        # rather than a guess about the corpus.
+        #
+        # It was `'::*' not in fence` until round 25, justified in this very
+        # comment as one that "cannot drift away from what it is filtering
+        # for". It drifted: a glob nested in a group writes `::{*}`, so
+        # `use autumn_web::{*};` was skipped before any pattern ran. The
+        # condition was sound for the shapes that existed when it was written,
+        # which is exactly the trap the round-11 prefilter fell into — a
+        # prefilter is only as current as the last shape someone added.
         fence = '\n'.join(body)
-        if '::*' not in fence:
+        if '*' not in fence:
             continue
         prelude = PRELUDE_GLOB.search(fence) is not None
         globbed = {m.group(1).rstrip(':') for m in MODULE_GLOB.finditer(fence)}
+        # A glob may sit INSIDE a group: `use autumn_web::{openapi::*};` is
+        # valid and common enough in a short example, and both glob patterns
+        # are anchored on `autumn_web::<path>::*` so a `{` straight after the
+        # crate name hid it from them. The use-tree walker already yields the
+        # leaf — `['openapi', '*']` — so the glob scan reads it from there
+        # rather than growing a third pattern. Found by Codex review on #2800.
+        for match in GROUP_ANCHOR.finditer(fence):
+            body_text = balanced_body(fence, match.end() - 1)
+            if body_text is None:
+                continue
+            anchor = [q for q in match.group(1).split('::') if q]
+            for path in use_tree_paths(anchor, body_text):
+                if not path or path[-1] != '*':
+                    continue
+                target = '::'.join(path[:-1])
+                if target == 'prelude':
+                    prelude = True
+                else:
+                    globbed.add(target)
         scoped = {n: (e, head) for head in globbed
                   for n, e in children.get(head, {}).items()}
         if not prelude and not scoped:
@@ -2543,6 +2568,27 @@ def self_test():
     expect('...but not a name one level down',
            found('```rust\nuse autumn_web::*;\n'
                  'let p: Parameter = x;\n```\n'),
+           [])
+    # A glob may sit INSIDE a group — valid Rust, and the walker already yields
+    # the leaf, so the glob scan reads it from there rather than growing a
+    # third pattern.
+    expect('a grouped module glob is still a glob',
+           found('```rust\nuse autumn_web::{openapi::*};\n'
+                 'let p: Parameter = x;\n```\n'),
+           found('```rust\nuse autumn_web::openapi::*;\n'
+                 'let p: Parameter = x;\n```\n'))
+    expect('...including the grouped ROOT glob',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{*};\nlet m: Mailer = x;\n```\n')}),
+           ['mail'])
+    expect('...and a glob beside a named entry keeps both',
+           sorted({f for _, f, _ in found(
+               '```rust\nuse autumn_web::{pdf::Pdf, openapi::*};\n'
+               'let p: Parameter = x;\n```\n')}),
+           ['openapi', 'pdf'])
+    expect('a grouped glob still reaches only its own module',
+           found('```rust\nuse autumn_web::{openapi::*};\n'
+                 'let m: Multipart = x;\n```\n'),
            [])
     # The globbed path may be several segments deep.
     expect('a multi-segment module glob brings its children into scope',
