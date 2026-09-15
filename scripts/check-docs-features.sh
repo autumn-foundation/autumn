@@ -1570,10 +1570,40 @@ _OPT_WITH_VALUE = (r'--(?:features|rename|path|git|branch|tag|rev|registry'
                    r'|manifest-path|target|vers|version|root|index|profile'
                    r'|bin|example)|-F')
 _SKIP_OPTS = rf'(?:(?:{_OPT_WITH_VALUE})(?:=\S+|\s+\S+)\s+|--?[a-z][-a-z0-9]*\s+)*'
+# `-p` takes its value attached as well as separated (`cargo test -pother`),
+# the same shape `-F` needed two rounds ago, and requiring a delimiter after it
+# meant an attached selector named no package — so the command counted and the
+# feature it enabled for SOMEONE ELSE'S crate satisfied the rule. The lookbehind
+# is what makes the attached form safe to accept: without it the `-p` inside
+# `--profile` reads as a selector for a package called `rofile`, which would
+# reject a correct line. Found by Codex review on #2800.
+# Each spelling carries its own lookbehind so the literal still leads — a
+# shared `(?:^|[^-\w])` prefix in front of the alternation is correct but makes
+# this row, already the most expensive in the tuple, try to match at nearly
+# every position: 0.057s -> 0.105s per pass. Split this way it stays at 0.057s.
+# The lookbehinds must be separate because Python requires a FIXED width and
+# `(?:-p|--package)` has two.
+_PKG_SELECTOR = (r'(?:-p(?<![-\w]-p)|--package(?<![-\w]--package))\s*=?\s*')
 _FOREIGN_PKG = (
     rf'[^\n]*(?:cargo\s+(?:install|add)\s+{_SKIP_OPTS}'
     rf'(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*'
-    rf'|(?:-p|--package)[= ]\s*(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*)')
+    rf'|{_PKG_SELECTOR}(?!autumn[-_]web\b)[a-z0-9_][a-z0-9_-]*)')
+# A TOML key is the WHOLE key. `autumn-web = { … }` unanchored also matched the
+# tail of `not-autumn-web = { … }`, so an unrelated dependency whose name merely
+# ends in `autumn-web` satisfied the rule that exists to tie the array to
+# autumn-web. The section and forwarding-row spellings were already safe — the
+# first is bounded by `dependencies\.` and `\]`, the second by the quote before
+# the crate name — so only the two inline-table patterns need this. Found by
+# Codex review on #2800.
+#
+# Written as a lookbehind AFTER the literal rather than before it, which is the
+# same assertion placed where it does not cost anything: a pattern that STARTS
+# with a lookbehind cannot be scanned for its literal prefix, and measuring the
+# leading form showed these two rows going 0.002s -> 0.022s per pass, ten times
+# over, once per (page, feature) pair.
+def _whole_key(key):
+    """`key` as a complete TOML key, not the tail of a longer one."""
+    return rf'{key}(?<![A-Za-z0-9_-]{key})'
 
 # What may sit between the `[` and `dependencies` of a dependency table. Cargo
 # puts platform-specific dependencies under `[target.<what>.dependencies.<dep>]`
@@ -1631,8 +1661,10 @@ def naming_patterns(feature):
         # to patch it — and requiring the literal `autumn-web` key rejected a
         # page carrying a complete enabling instruction. Found by Codex review
         # on #2800.
-        rf'autumn-web\s*=\s*\{{[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
-        rf'autumn_web\s*=\s*\{{(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
+        rf'{_whole_key("autumn-web")}\s*=\s*\{{'
+        rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
+        rf'{_whole_key("autumn_web")}\s*=\s*\{{'
+        rf'(?=[^}}]*package\s*=\s*[\'"]autumn-web[\'"])'
         rf'[^}}]*features\s*=\s*\[[^\]]*[\'"]{name}[\'"]',
         rf'\[{_TABLE_PREFIX}(?:dev-|build-)?dependencies\.autumn-web\]'
         rf'[^\[]*?'
@@ -2248,7 +2280,35 @@ def self_test():
             # ...and a platform-specific table for a DIFFERENT crate is still
             # a different crate.
             ("[target.'cfg(unix)'.dependencies.axum]\nfeatures = [\"ws\"]\n",
-             'ws', False)):
+             'ws', False),
+            # `-p` takes its value attached, so an attached selector names a
+            # package just as a separated one does.
+            ('cargo test -pother --features ws', 'ws', False),
+            ('cargo test -p=other --features ws', 'ws', False),
+            ('cargo test --package=other --features ws', 'ws', False),
+            ('cargo test -pautumn-web --features test-support',
+             'test-support', True),
+            # The lookbehind that makes the attached form safe: the `-p` inside
+            # `--profile` is not a package selector, and reading it as one would
+            # reject a correct line.
+            ('cargo build --profile release --features ws', 'ws', True),
+            # A TOML key is the WHOLE key, not a suffix of one.
+            ('not-autumn-web = { features = ["ws"] }', 'ws', False),
+            ('xautumn-web = { version = "0.7", features = ["ws"] }',
+             'ws', False),
+            ('not_autumn_web = { package = "autumn-web", features = ["ws"] }',
+             'ws', False),
+            ('  autumn-web = { version = "0.7", features = ["ws"] }',
+             'ws', True),
+            # ...and the key is NOT anchored to the line, because the corpus
+            # writes the inline table mid-sentence inside backticks —
+            # `macro-transparency.md:292` (`ws`) and `:1723` (`i18n`),
+            # `STABILITY.md:427` (`csv`) — and two of those are the fix for one
+            # of this PR's own seventeen defects. Anchoring would have been
+            # cheaper and would have re-broken them.
+            ('Behind the non-default `ws` Cargo feature — '
+             '`autumn-web = { version = "0.7", features = ["ws"] }`',
+             'ws', True)):
         if names_feature(spelling, feature) != want:
             failures.append(
                 f'naming: {spelling!r} / {feature} -> '
