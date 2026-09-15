@@ -115,10 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[cfg(all(…))]` conjunction requires every conjunct, so each non-default one
   is reported separately and `autumn_web::presence_stream` asks for `presence`
   *and* `ws`; the attribute is read by parenthesis balance, since that item's
-  gate wraps across four lines. `any(…)` and `not(…)` leave an item ungated —
-  naming one alternative already satisfies the first, and the second marks an
-  item that exists when the feature is *off*, so demanding it would tell a
-  reader to enable the one flag that removes what they came for. Judged
+  gate wraps across four lines, and `pub use autumn_edge as edge;` is read as
+  the module it is to a reader despite carrying no `::`. `any(…)` and `not(…)`
+  leave an item ungated — naming one alternative already satisfies the first,
+  and the second marks an item that exists when the feature is *off*, so
+  demanding it would tell a reader to enable the one flag that removes what
+  they came for. Naming an *implying* feature counts, walking the manifest's
+  implication graph rather than subtracting the default closure alone:
+  `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
+  `presence_stream` snippet is complete, and demanding `ws` by name there would
+  be the gate telling an author to break a page that works. Judged
   only inside ```` ```rust ```` fences, since a feature gate is a *compile*
   failure: a capability table naming `autumn_web::pdf::Pdf` describes an
   example, it does not hand anyone a line. Presence is gated, placement is not

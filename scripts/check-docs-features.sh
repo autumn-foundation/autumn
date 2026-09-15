@@ -144,6 +144,26 @@
 #     an item that exists when the feature is OFF, so reading the name out of
 #     it would tell a reader to enable the one feature that removes the item.
 #     `lib.rs` has one, `#[cfg(not(feature = "seed"))]`.
+#   - NAMING AN IMPLYING FEATURE COUNTS, because Cargo activates what a feature
+#     implies. `presence = ["ws"]`, so a page that writes
+#     `features = ["presence"]` beside a `presence_stream` snippet is correct
+#     and complete — the reader's build gets `ws` too. Subtracting only the
+#     default closure and then demanding each conjunct BY NAME reported `ws` as
+#     missing on exactly that correct page: the gate telling an author to break
+#     something that works, which is the one error direction this whole family
+#     refuses to trade for. The check now asks whether anything the page names
+#     ACTIVATES the requirement, walking the manifest's implication graph. The
+#     same edge runs through `mcp = ["openapi"]`, `constela = ["maud"]`,
+#     `offline-sync = ["db", "http-client"]` and `oauth2 = ["http-client"]`, so
+#     it is a rule about the manifest, not a special case. Found by Codex
+#     review on #2800.
+#   - A WHOLE CRATE re-exported under a new name is a module to the reader.
+#     `#[cfg(feature = "edge")] pub use autumn_edge as edge;` is how
+#     `autumn_web::edge::…` exists at all, and it carries no `::` for either
+#     `pub use` pattern to bite on, so `edge` was missing from the truth set
+#     and a fence writing `autumn_web::edge::EdgeRoute` would have passed
+#     ungated. Found by Codex review on #2800. No page uses it in a rust fence
+#     today, so this closed a hole rather than fixing a page.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - Bare identifiers. A fence that writes `use autumn_web::prelude::*;` and
@@ -439,6 +459,15 @@ CFG_FEATURE_NAME = re.compile(r'feature\s*=\s*"([a-z0-9_.+-]+)"')
 MOD_DECL = re.compile(r'^(?:pub(?:\([^)]*\))? )?mod ([a-z_0-9]+)\s*[;{]')
 USE_ONE_LINE = re.compile(r'^pub use ([a-z_0-9:]+)::\{?([^;{}]+?)\}?;')
 USE_BRACE_OPEN = re.compile(r'^pub use ([a-z_0-9:]+)::\{$')
+# A whole CRATE re-exported under a new name, with no `::` anywhere:
+# `#[cfg(feature = "edge")] pub use autumn_edge as edge;` is how
+# `autumn_web::edge::…` exists at all. The two patterns above both require a
+# `::`, so this declaration parsed as nothing and `edge` was missing from the
+# truth set — a fence writing `autumn_web::edge::EdgeRoute` would have passed
+# while the reader's build failed for want of the non-default `edge` feature.
+# Found by Codex review on #2800. It is a module to a reader, so it is recorded
+# as one.
+USE_CRATE_AS = re.compile(r'^pub use ([a-z_0-9]+) as ([a-z_0-9]+);')
 # `pub use autumn_macros::foo;` is the only source of an ATTRIBUTE a reader
 # writes. Anything re-exported from a `crate::…` path is a type or a function,
 # reachable only as a path or (after a prelude glob) as a bare name.
@@ -479,7 +508,8 @@ def default_features(root):
             continue
         closure.add(feature)
         stack.extend(edges(feature))
-    return closure, set(table) - {'default'}
+    graph = {name: edges(name) for name in table if name != 'default'}
+    return closure, set(graph), graph
 
 
 def _cfg_requirement(lines, index):
@@ -577,6 +607,12 @@ def gated_items(root):
                     _record(found, match.group(1), pending, 'module')
                 pending = None
                 continue
+            match = USE_CRATE_AS.match(line)
+            if match:
+                if pending:
+                    _record(found, match.group(2), pending, 'module')
+                pending = None
+                continue
             match = USE_ONE_LINE.match(line)
             if match:
                 if pending:
@@ -651,7 +687,7 @@ def surface(root):
     page that is otherwise correct. An item whose every requirement is default
     — `live`, behind `htmx` + `maud` — drops out entirely.
     """
-    closure, declared = default_features(root)
+    closure, declared, _graph = default_features(root)
     gated = gated_items(root)
     unknown = sorted(set().union(*(f for f, _ in gated.values())) - declared)
     if unknown:
@@ -672,6 +708,53 @@ def surface(root):
 # ---------------------------------------------------------------------------
 # What a page shows, and whether it names the feature
 # ---------------------------------------------------------------------------
+
+
+def enablers(graph):
+    """feature -> every feature whose activation also activates it.
+
+    Cargo features imply one another, and a page that names the IMPLYING one has
+    already told the reader everything they need. `presence = ["ws"]`, so a page
+    that writes `features = ["presence"]` beside an `autumn_web::presence_stream`
+    snippet is correct and complete: Cargo turns `ws` on for them. Subtracting
+    only the default closure and then demanding each conjunct by name reported
+    `ws` as missing on exactly that correct page — a gate telling an author to
+    break something that works, which is the one error direction this whole
+    family of gates refuses to trade for. Found by Codex review on #2800.
+
+    The same edge runs through `mcp = ["openapi"]`, `constela = ["maud"]`,
+    `offline-sync = ["db", "http-client"]` and `oauth2 = ["http-client"]`, so
+    this is a rule about the manifest rather than a special case for `presence`.
+    """
+    out = {}
+    for feature in graph:
+        stack = [feature]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(graph.get(current, ()))
+        for reached in seen:
+            out.setdefault(reached, set()).add(feature)
+    return out
+
+
+def activation_lines(text, needed, enabled_by):
+    """feature -> the first line naming ANYTHING that turns that feature on.
+
+    Whole-text search per candidate rather than a per-line scan, because the
+    corpus writes `features = [` arrays across several lines with comments
+    inside them, and a line-at-a-time reader sees neither end of one.
+    """
+    out = {}
+    for feature in needed:
+        for candidate in sorted(enabled_by.get(feature, {feature})):
+            line = first_naming_line(text, candidate)
+            if line is not None and (feature not in out or line < out[feature]):
+                out[feature] = line
+    return out
 
 FENCE = re.compile(r'^\s*```([A-Za-z0-9_+-]*)')
 # The languages a reader compiles. `rs` and `rust,no_run` are both live in the
@@ -825,6 +908,9 @@ def waived_lines(text):
 def check(root):
     """(problems, checked, waived, late) over the whole corpus."""
     gated = surface(root)
+    _closure, _declared, graph = default_features(root)
+    enabled_by = enablers(graph)
+    needed = set().union(*(f for f, _ in gated.values()))
     problems = []
     checked = 0
     waived = 0
@@ -851,8 +937,12 @@ def check(root):
                 waived += 1
                 continue
             first.setdefault(feature, (lineno, shown))
+        if not first:
+            continue
+        # Naming an IMPLYING feature counts: see `enablers()`.
+        active = activation_lines(blanked, needed, enabled_by)
         for feature, (lineno, shown) in sorted(first.items()):
-            named = first_naming_line(blanked, feature)
+            named = active.get(feature)
             if named is None:
                 problems.append(
                     f'{rel}:{lineno}: {shown} needs the non-default '
@@ -874,7 +964,7 @@ def print_corpus():
 
 
 def print_surface():
-    closure, _ = default_features(ROOT)
+    closure, _declared, _graph = default_features(ROOT)
     gated = surface(ROOT)
     print(f'default feature closure ({len(closure)}): '
           f'{", ".join(sorted(closure))}')
@@ -898,6 +988,9 @@ def print_surface():
 
 def list_uses():
     gated = surface(ROOT)
+    _closure, _declared, graph = default_features(ROOT)
+    enabled_by = enablers(graph)
+    needed = set().union(*(f for f, _ in gated.values()))
     total = 0
     for rel in corpus(ROOT):
         text = (pathlib.Path(ROOT) / rel).read_text(
@@ -905,8 +998,9 @@ def list_uses():
         blanked = blank_comments(text)
         covered = waived_lines(text)
         rows = []
+        active = activation_lines(blanked, needed, enabled_by)
         for lineno, feature, shown in uses(blanked, gated):
-            named = first_naming_line(blanked, feature)
+            named = active.get(feature)
             if named is None:
                 verdict = 'NOT NAMED'
             elif named > lineno:
@@ -1041,7 +1135,7 @@ def self_test():
 
     # The truth set, against the real crate.
     real = surface(ROOT)
-    closure, declared = default_features(ROOT)
+    closure, declared, graph = default_features(ROOT)
     for feature in ('maud', 'htmx', 'tailwind', 'db', 'cache-moka',
                     'http-client', 'reporting', 'flash'):
         if feature not in closure:
@@ -1071,6 +1165,37 @@ def self_test():
             failures.append(
                 f'truth set: {name} -> {real.get(name)!r}, want '
                 f'{(features, kinds)!r}')
+    # A whole crate re-exported under a new name — `pub use autumn_edge as
+    # edge;` — has no `::` for the two `pub use` patterns to bite on, so it
+    # parsed as nothing and `autumn_web::edge::…` was ungated.
+    if real.get('edge') != ({'edge'}, {'module'}):
+        failures.append(
+            f'truth set: edge -> {real.get("edge")!r}, want '
+            f'({{\'edge\'}}, {{\'module\'}}) — `pub use autumn_edge as edge;`')
+
+    # Naming an IMPLYING feature is enough, because Cargo activates what it
+    # implies. `presence = ["ws"]`, so a page pinning only `presence` beside a
+    # `presence_stream` snippet compiles, and reporting `ws` missing there is
+    # the gate telling an author to break a page that works.
+    if graph.get('presence') != ['ws']:
+        failures.append(
+            f'manifest: presence -> {graph.get("presence")!r}, want [\'ws\'] '
+            f'— the implication this case is built on has moved')
+    enabled_by = enablers(graph)
+    expect('an implying feature enables the implied one',
+           'presence' in enabled_by.get('ws', set()), True)
+    expect('implication does not run backwards',
+           'ws' in enabled_by.get('presence', set()), False)
+    expect('a feature always enables itself',
+           'ws' in enabled_by.get('ws', set()), True)
+    page = 'autumn-web = { version = "0.7", features = ["presence"] }\n'
+    active = activation_lines(page, {'presence', 'ws'}, enabled_by)
+    expect('naming `presence` satisfies `ws`', active.get('ws'), 1)
+    expect('naming `presence` satisfies `presence`', active.get('presence'), 1)
+    expect('naming `ws` alone does not satisfy `presence`',
+           activation_lines('features = ["ws"]\n', {'presence'},
+                            enabled_by).get('presence'), None)
+
     # An item whose every requirement is default is not gated surface at all:
     # `live` is behind `all(feature = "htmx", feature = "maud")`.
     if 'live' in real:
