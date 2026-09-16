@@ -1,4 +1,4 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
      Running tests/integration_tests.rs (target/debug/deps/integration_tests-43de7a2ea5486ee3)
 
 running 1 test

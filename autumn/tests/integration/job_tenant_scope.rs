@@ -133,20 +133,23 @@ fn tenancy_config() -> AutumnConfig {
     config
 }
 
-/// Requires the tenant extractor, not just a bare handler: if
-/// `tenancy_middleware` ever stopped applying to this route (a config
-/// regression, or the route becoming exempt), extraction itself would fail
-/// closed rather than let the enqueue happen with no tenant context — which
-/// would make this whole test's precondition silently vacuous (the job would
-/// then correctly observe `NoTenant`, but only because there never was one).
+/// Checks `CURRENT_TENANT` itself, not the `Tenant` extractor: `Tenant::
+/// from_request_parts` (`autumn/src/tenancy.rs`) falls back to re-resolving
+/// the tenant straight from request headers when the task-local is absent,
+/// so it would still return `tenant-a-sentinel` even if `tenancy_middleware`
+/// never ran for this route — which would make the extractor useless as a
+/// precondition check here. Reading the task-local directly is the only way
+/// to confirm the enqueue below actually happens *inside*
+/// `CURRENT_TENANT.scope(...)`, which is the one thing this whole test's
+/// hypothesis is about.
 #[post("/enqueue-probe")]
-async fn enqueue_probe(tenant: autumn_web::tenancy::Tenant) -> AutumnResult<&'static str> {
-    if tenant.0 != "tenant-a-sentinel" {
+async fn enqueue_probe() -> AutumnResult<&'static str> {
+    let ambient = CURRENT_TENANT.try_with(Clone::clone).ok().flatten();
+    if ambient.as_deref() != Some("tenant-a-sentinel") {
         return Err(AutumnError::internal_server_error_msg(format!(
-            "enqueue route resolved tenant {:?}, not the expected tenant-a-sentinel; \
-             this test's precondition (enqueuing under an established tenant context) \
-             did not hold",
-            tenant.0
+            "CURRENT_TENANT was {ambient:?} at enqueue time, not the expected \
+             Some(\"tenant-a-sentinel\"); this test's precondition (enqueuing from \
+             inside an established tenant scope) did not hold"
         )));
     }
     TenantLeakProbeJob::enqueue(ProbeArgs {}).await.unwrap();

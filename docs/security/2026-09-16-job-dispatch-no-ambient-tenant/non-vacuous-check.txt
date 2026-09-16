@@ -114,3 +114,43 @@ Verified non-vacuous two ways:
 Both temporary header changes were reverted immediately after
 (git diff -- autumn/tests/integration/job_tenant_scope.rs shows only the
 permanent Tenant-extractor guard as a real change, not a header edit).
+
+Third Codex round — the Tenant extractor itself has a fallback that masks this
+--------------------------------------------------------------------------------
+
+A third Codex review round correctly noted that the previous fix (checking
+the `Tenant` extractor's resolved value) was itself still vacuous:
+`Tenant::from_request_parts` (autumn/src/tenancy.rs) checks CURRENT_TENANT
+first, but *falls back to re-resolving the tenant directly from request
+headers* when the task-local is absent. So if tenancy_middleware ever
+stopped scoping CURRENT_TENANT for this route, the extractor would still
+independently resolve "tenant-a-sentinel" from the x-tenant-id header, the
+previous check would pass, and the test would remain vacuous exactly the
+way the second round worried about — just one layer deeper.
+
+Fixed by reading CURRENT_TENANT directly in the handler instead of going
+through the Tenant extractor at all:
+
+    let ambient = CURRENT_TENANT.try_with(Clone::clone).ok().flatten();
+    if ambient.as_deref() != Some("tenant-a-sentinel") { ...500... }
+
+Verified non-vacuous by simulating exactly the scenario Codex named:
+temporarily edited tenancy_middleware (autumn/src/tenancy.rs) to stop
+scoping CURRENT_TENANT while leaving tenant *resolution* (header parsing)
+fully intact —
+
+    let _ = &tenant_id;
+    let response = crate::tenant_cell::CURRENT_TENANT_CELL
+        .scope(Some(handle), next.run(request))
+        .await;
+
+Reran the test with this in place. Result: FAILED, on exactly the new
+precondition check:
+
+    assertion `left == right` failed: expected 200 OK, got 500 Internal Server Error.
+    Body: {...,"detail":"Internal server error",...}
+
+This confirms the new check catches the middleware-stops-scoping scenario
+even though tenant *resolution* from headers would have kept working (the
+exact gap the old Tenant-extractor-based check missed). Reverted
+immediately after (git diff -- autumn/src/tenancy.rs empty afterward).

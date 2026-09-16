@@ -56,11 +56,11 @@ Added `autumn/tests/integration/job_tenant_scope.rs`,
    `CURRENT_TENANT.try_with(Clone::clone)` and records what it saw; it
    returns `Err` (naming the leaked value) if it observes *any* tenant, `Ok`
    only if it observes none.
-3. POSTs to a route that takes the `Tenant` extractor, asserts (500s if not)
-   that it resolved exactly `tenant-a-sentinel`, and only then calls
+3. POSTs to a route that reads `CURRENT_TENANT` directly, asserts (500s if
+   not) that it is exactly `Some("tenant-a-sentinel")`, and only then calls
    `TenantLeakProbeJob::enqueue(...)` — so the test's own precondition
-   (enqueuing under an actually-established tenant context) is self-checking
-   rather than assumed.
+   (enqueuing from *inside* an established `CURRENT_TENANT` scope) is
+   self-checking rather than assumed.
 4. **Phase 1**: waits (`wait_until`, polling) for `TestApp::build`'s
    in-process worker — started by default, the real production dispatch
    path — to actually run the probe, then asserts what it observed.
@@ -93,10 +93,24 @@ A second Codex round then caught that the test never verified its own
 precondition — if tenancy middleware ever stopped applying to the enqueue
 route, the request would still succeed and both phases would correctly
 (but vacuously) observe `NoTenant`, since there was never a tenant to leak
-in the first place. Added the explicit `Tenant`-extractor check in item 3
-above, verified non-vacuous by sending no tenant header (caught earlier,
-by `tenancy_middleware` itself, 400) and by sending the *wrong* tenant
-header (caught only by the new check, 500) — see `non-vacuous-check.txt`.
+in the first place. Added an explicit `Tenant`-extractor check, verified
+non-vacuous by sending no tenant header (caught earlier, by
+`tenancy_middleware` itself, 400) and by sending the *wrong* tenant header
+(caught only by the new check, 500).
+
+A third Codex round then caught that *that* fix was itself still vacuous:
+`Tenant::from_request_parts` (`autumn/src/tenancy.rs`) checks `CURRENT_TENANT`
+first but falls back to re-resolving the tenant straight from request headers
+when the task-local is absent — so even if `tenancy_middleware` stopped
+scoping `CURRENT_TENANT` for this route, the extractor would still
+independently resolve `tenant-a-sentinel` from the header, one layer below
+where the previous check looked. Fixed by reading `CURRENT_TENANT` directly
+in the handler (item 3 above), bypassing the extractor's fallback entirely.
+Verified non-vacuous by simulating exactly that scenario — temporarily
+editing `tenancy_middleware` to stop scoping `CURRENT_TENANT` while leaving
+header-based tenant *resolution* fully intact — and confirming the new check
+still fails (500) even though the old extractor-based check would not have.
+See `non-vacuous-check.txt` for all three rounds' full runs.
 
 ## 🔎 Root cause of the fail-safe behavior
 
