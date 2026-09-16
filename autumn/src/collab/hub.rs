@@ -270,8 +270,19 @@ const MAX_LAG_RESENDS: u32 = 3;
 ///
 /// Available from a handler as `state.collab()`, or as the [`CollabHub`]
 /// extractor. Cloning is cheap and shares the same documents.
+///
+/// One pointer wide on purpose. [`AppState`](crate::state::AppState) holds a
+/// hub by value and lives inside large futures, so four inline fields here
+/// cost 72 bytes in every one of them — enough to push
+/// `SystemTest::build()` past `clippy::large_futures`. The seams beside it
+/// (`Channels`, `Presence`) are handles for the same reason.
 #[derive(Clone)]
 pub struct CollabHub {
+    inner: Arc<HubInner>,
+}
+
+/// What a hub owns. Shared by every clone.
+struct HubInner {
     /// `key -> weak handle`. **Weak** on purpose: the live [`CollabDoc`]
     /// handles own the document, so it stays findable for exactly as long as
     /// somebody holds one and disappears on its own afterwards.
@@ -282,6 +293,9 @@ pub struct CollabHub {
     /// from the stale row and the departing save overwrites it. A weak entry
     /// has neither problem — the handler's own handle keeps the document
     /// discoverable until it has finished writing it back.
+    ///
+    /// Its own `Arc` so [`CollabHub::with_limits`] can build a second hub
+    /// over the same registry.
     docs: Arc<Mutex<HashMap<String, Weak<Mutex<DocState>>>>>,
     channels: Channels,
     presence: Presence,
@@ -293,24 +307,35 @@ impl CollabHub {
     #[must_use]
     pub fn new(channels: Channels, presence: Presence) -> Self {
         Self {
-            docs: Arc::new(Mutex::new(HashMap::new())),
-            channels,
-            presence,
-            limits: CollabLimits::default(),
+            inner: Arc::new(HubInner {
+                docs: Arc::new(Mutex::new(HashMap::new())),
+                channels,
+                presence,
+                limits: CollabLimits::default(),
+            }),
         }
     }
 
     /// Replace the per-message bounds.
+    ///
+    /// The result shares the same documents, so it is safe to call on a hub
+    /// that is already serving.
     #[must_use]
-    pub const fn with_limits(mut self, limits: CollabLimits) -> Self {
-        self.limits = limits;
-        self
+    pub fn with_limits(self, limits: CollabLimits) -> Self {
+        Self {
+            inner: Arc::new(HubInner {
+                docs: Arc::clone(&self.inner.docs),
+                channels: self.inner.channels.clone(),
+                presence: self.inner.presence.clone(),
+                limits,
+            }),
+        }
     }
 
     /// The bounds in effect.
     #[must_use]
-    pub const fn limits(&self) -> CollabLimits {
-        self.limits
+    pub fn limits(&self) -> CollabLimits {
+        self.inner.limits
     }
 
     /// Open `key`, starting from an empty document if it is not live yet.
@@ -350,7 +375,11 @@ impl CollabHub {
         // the value twice and discards the loser, which nothing observes.
         let seeded = seed();
 
-        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        let mut docs = self
+            .inner
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned");
         // Somebody may have won the race while the seed ran.
         if let Some(state) = docs.get(key).and_then(Weak::upgrade) {
             drop(docs);
@@ -359,11 +388,11 @@ impl CollabHub {
         // Drop entries whose document is gone before counting: a dead weak
         // reference costs a map slot, not a document.
         docs.retain(|_, weak| weak.strong_count() > 0);
-        if docs.len() >= self.limits.max_documents {
+        if docs.len() >= self.inner.limits.max_documents {
             tracing::warn!(
                 key,
                 open = docs.len(),
-                limit = self.limits.max_documents,
+                limit = self.inner.limits.max_documents,
                 "collab: document registry is full; serving a detached document"
             );
             drop(docs);
@@ -381,7 +410,8 @@ impl CollabHub {
     ///
     /// Panics if the internal document registry mutex is poisoned.
     fn live(&self, key: &str) -> Option<Arc<Mutex<DocState>>> {
-        self.docs
+        self.inner
+            .docs
             .lock()
             .expect("collab registry lock poisoned")
             .get(key)
@@ -393,9 +423,9 @@ impl CollabHub {
         CollabDoc {
             key: key.to_owned(),
             state,
-            channels: self.channels.clone(),
-            presence: self.presence.clone(),
-            limits: self.limits,
+            channels: self.inner.channels.clone(),
+            presence: self.inner.presence.clone(),
+            limits: self.inner.limits,
         }
     }
 
@@ -408,7 +438,11 @@ impl CollabHub {
     ///
     /// Panics if the internal document registry mutex is poisoned.
     pub fn close(&self, key: &str) -> Option<CollabText> {
-        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        let mut docs = self
+            .inner
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned");
         let state = docs.get(key).and_then(Weak::upgrade)?;
         let guard = state.lock().expect("collab document lock poisoned");
         // Refuse while an editor is still here. Removing the entry would not
@@ -432,7 +466,11 @@ impl CollabHub {
     /// Panics if the internal document registry mutex is poisoned.
     #[must_use]
     pub fn open_keys(&self) -> Vec<String> {
-        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        let mut docs = self
+            .inner
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned");
         docs.retain(|_, weak| weak.strong_count() > 0);
         let mut keys: Vec<String> = docs.keys().cloned().collect();
         drop(docs);
@@ -445,7 +483,7 @@ impl std::fmt::Debug for CollabHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CollabHub")
             .field("open", &self.open_keys().len())
-            .field("limits", &self.limits)
+            .field("limits", &self.inner.limits)
             .finish_non_exhaustive()
     }
 }
