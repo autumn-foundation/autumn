@@ -27,7 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Protecting routes" in `docs/guide/authentication.md` naming all four
   commands and linking the Rust equivalents, and a pointer from
   `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
-  reader with an `InMemoryApiTokenStore` and no way to mint a real token.
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token. The
+  worked block captures what `issue` and `rotate` print (they write the token to
+  stdout and the confirmation to stderr, so a `$(…)` capture gets the secret and
+  nothing else), and says plainly that `rotate` and `revoke` are alternatives
+  rather than steps: rotating already revokes the token passed to it, so a
+  following `revoke "$TOKEN"` would retire a dead token and strand the live
+  replacement with its secret lost. The Rust pointers name one helper per
+  subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
+  `revoke_api_token` — rather than omitting list and rotate and listing the
+  `IssueTokenSpec` data type as though it were an operation.
 - **📖 Folio: add `check-docs-cli-coverage.sh`, the first docs gate that
   runs code → docs:** the corpus had eleven docs gates and every one ran
   docs → code — "is what we wrote still true?", which is drift. None asked

@@ -453,17 +453,26 @@ flow. Manage them with `autumn token` — run any of these with `--help` for the
 full argument list:
 
 ```bash
-# Printed once, and only its hash is stored — capture it now or lose it.
+# `issue` and `rotate` print the new token on stdout — and only its hash is
+# stored, so capture it now or it is unrecoverable. (The "✓ …" confirmation
+# goes to stderr, so it stays out of the captured value.)
 TOKEN=$(autumn token issue service:ci --name ci --scope posts:write)
 
-autumn token list service:ci   # name, scopes, expiry, last-used — never the secret
-autumn token rotate "$TOKEN"   # revoke + reissue, same name and scopes
-autumn token revoke "$TOKEN"   # 401 for every later request
+autumn token list service:ci        # name, scopes, expiry, last-used — never the secret
+
+# Then EITHER rotate — the old token stops working and this is the new one:
+TOKEN=$(autumn token rotate "$TOKEN")
+
+# …OR revoke, to stop it working with no replacement:
+autumn token revoke "$TOKEN"
 ```
 
-`issue` prints the raw token **once** — only its SHA-256 hash is stored, so
-there is no way to recover it later. `--expires-at <ISO-8601>` makes the token
-expire; omit it for a non-expiring one.
+`rotate` and `revoke` are alternatives, not steps. Rotating already revokes the
+token you passed it, so running `revoke "$TOKEN"` afterwards without
+re-capturing would retire a token that is already dead and leave the live
+replacement in the database with its secret lost.
+
+`--expires-at <ISO-8601>` makes a token expire; omit it for a non-expiring one.
 
 These commands read and write the managed `api_tokens` table, so they reach
 your app only when it mounts [`DbApiTokenStore`](../../autumn/src/auth.rs) and
@@ -481,8 +490,11 @@ presenting it.
 replacement carrying the same name and scopes, so only the stored secret
 changes.
 
-In Rust, the same operations are
-[`issue_scoped_api_token`, `IssueTokenSpec` and `revoke_api_token`](../../autumn/src/auth.rs).
+In Rust, the same four operations are
+[`issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token` and
+`revoke_api_token`](../../autumn/src/auth.rs) — one per CLI subcommand.
+`issue_scoped_api_token` takes its name, scopes and expiry as an
+[`IssueTokenSpec`](../../autumn/src/auth.rs).
 
 ### `RequireAuth` and `Auth<T>`
 
