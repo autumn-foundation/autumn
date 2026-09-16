@@ -826,7 +826,16 @@ struct QueueGaugeState {
     /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`] regardless, as a backstop for
     /// jobs enqueued but never claimed (a crashed worker, a queue with no
     /// consumer) — without it those would still leak one entry each forever.
+    ///
+    /// Removed with [`indexmap::IndexMap::swap_remove_index`], not
+    /// `shift_remove_index`: this map's *physical* order is never read (each
+    /// [`PgMark`] carries its own [`PgMark::seq`] for that), so there is no
+    /// reason to pay `shift_remove_index`'s O(n) shift-every-later-entry cost
+    /// on every capacity eviction — under sustained enqueue-only load past
+    /// the cap, that is *every* subsequent enqueue.
     pg_marks_by_job_id: indexmap::IndexMap<String, PgMark>,
+    /// Monotonic counter handing out each new [`PgMark`]'s [`PgMark::seq`].
+    pg_marks_next_seq: u64,
 }
 
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
@@ -874,6 +883,12 @@ pub(crate) enum PgMarkTimeline {
 struct PgMark {
     ms: u64,
     timeline: PgMarkTimeline,
+    /// This entry's position in insertion order, from
+    /// [`QueueGaugeState::pg_marks_next_seq`] — capacity eviction's
+    /// "oldest" fallback reads this instead of the map's physical position,
+    /// so removal can use O(1) `swap_remove_index` instead of an
+    /// order-preserving (and so O(n)) shift.
+    seq: u64,
 }
 
 /// Rebase a surveyed age onto the registry's timeline.
@@ -1310,7 +1325,7 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id))
+            .and_then(|mut guard| guard.pg_marks_by_job_id.swap_remove(id))
             .map(|mark| mark.ms);
         let removed_exact = exact_ms.is_some_and(|exact_ms| self.pop_waiting_exact(name, exact_ms));
         if !removed_exact {
@@ -1330,7 +1345,7 @@ impl JobRegistry {
     /// or an entry already removed).
     pub(crate) fn forget_pg_job_mark(&self, id: &str) {
         if let Ok(mut guard) = self.queues.write() {
-            guard.pg_marks_by_job_id.shift_remove(id);
+            guard.pg_marks_by_job_id.swap_remove(id);
         }
     }
 
@@ -1408,21 +1423,38 @@ impl JobRegistry {
                 let registry_now = self.now_ms();
                 let real_now =
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
-                let evict_idx = guard
-                    .pg_marks_by_job_id
-                    .iter()
-                    .position(|(_, mark)| match mark.timeline {
+                // Oldest (by `seq`, not physical position — `swap_remove`
+                // below does not preserve that) due entry, if any; else the
+                // oldest entry overall. One pass finds both: `seq`s are
+                // unique and only ever increase, so the running minimums
+                // never need revisiting.
+                let mut oldest_due: Option<(&str, u64)> = None;
+                let mut oldest_any: Option<(&str, u64)> = None;
+                for (key, mark) in &guard.pg_marks_by_job_id {
+                    if oldest_any.is_none_or(|(_, seq)| mark.seq < seq) {
+                        oldest_any = Some((key, mark.seq));
+                    }
+                    let due = match mark.timeline {
                         PgMarkTimeline::Real => mark.ms <= real_now,
                         PgMarkTimeline::Registry => mark.ms <= registry_now,
-                    })
-                    .unwrap_or(0);
-                guard.pg_marks_by_job_id.shift_remove_index(evict_idx);
+                    };
+                    if due && oldest_due.is_none_or(|(_, seq)| mark.seq < seq) {
+                        oldest_due = Some((key, mark.seq));
+                    }
+                }
+                if let Some((evict_id, _)) = oldest_due.or(oldest_any) {
+                    let evict_id = evict_id.to_string();
+                    guard.pg_marks_by_job_id.swap_remove(&evict_id);
+                }
             }
+            let seq = guard.pg_marks_next_seq;
+            guard.pg_marks_next_seq = guard.pg_marks_next_seq.wrapping_add(1);
             guard.pg_marks_by_job_id.insert(
                 id.to_string(),
                 PgMark {
                     ms: ready_at_ms,
                     timeline,
+                    seq,
                 },
             );
         }
@@ -1491,7 +1523,7 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id))
+            .and_then(|mut guard| guard.pg_marks_by_job_id.swap_remove(id))
             .map(|mark| mark.ms);
         if let Some(exact_ms) = exact_ms
             && self.pop_waiting_exact(name, exact_ms)

@@ -3928,12 +3928,22 @@ impl JobClient {
             let id = self.entropy.uuid_v4().to_string();
             let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
 
-            if let Some(due) = due_at {
-                let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
-                self.registry.record_enqueue_scheduled(name, ready_at_ms);
-            } else {
-                self.registry.record_enqueue(name);
-            }
+            // `enqueue_many_pg` only ever runs when `durable_is_pg()`
+            // (`can_batch_enqueue`), so every item here is Postgres-backed —
+            // route through `record_pg_enqueue`, not the plain
+            // `record_enqueue`/`record_enqueue_scheduled` the sequential
+            // fallback uses, so `id` is tracked in `pg_marks_by_job_id`
+            // exactly like the single-row path (`enqueue_with_outcome_due_inner`)
+            // registers it. Without this, no batch-enqueued job's id is ever
+            // in that table, so its admin-cancel always falls to nearest-match
+            // instead of the exact lookup.
+            let ready_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
+            self.registry.record_pg_enqueue(
+                name,
+                &id,
+                ready_at_ms,
+                crate::actuator::PgMarkTimeline::Real,
+            );
             self.job_admin.record_enqueue_due(
                 id.clone(),
                 name,
@@ -3953,6 +3963,7 @@ impl JobClient {
                     } else {
                         self.registry.record_cancel(name);
                     }
+                    self.registry.forget_pg_job_mark(&id);
                     self.job_admin.record_cancelled(&id);
                     let autumn_error = AutumnError::internal_server_error_msg(format!(
                         "serialize job payload: {error}"
@@ -3999,6 +4010,7 @@ impl JobClient {
                         } else {
                             self.registry.record_cancel(name);
                         }
+                        self.registry.forget_pg_job_mark(&row.id);
                         self.job_admin.record_cancelled(&row.id);
                         let row_error = AutumnError::service_unavailable_msg(
                             "job queue's Postgres pool is not active",
@@ -4023,6 +4035,7 @@ impl JobClient {
                             } else {
                                 self.registry.record_cancel(name);
                             }
+                            self.registry.forget_pg_job_mark(&row.id);
                             self.job_admin.record_cancelled(&row.id);
                             let row_error = AutumnError::service_unavailable(
                                 std::io::Error::other("job queue circuit breaker is open"),
@@ -4075,6 +4088,7 @@ impl JobClient {
                                     } else {
                                         self.registry.record_cancel(name);
                                     }
+                                    self.registry.forget_pg_job_mark(&row.id);
                                     self.job_admin.record_cancelled(&row.id);
                                     let row_error =
                                         AutumnError::internal_server_error_msg(message.clone());
