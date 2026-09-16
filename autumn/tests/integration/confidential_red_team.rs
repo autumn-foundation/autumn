@@ -381,28 +381,59 @@ async fn no_operator_reachable_sink_holds_the_confidential_plaintext() {
     );
 }
 
-/// #1771: sealing holds even when the application hands its own request body to
-/// the error path. The client sealed the value before sending, so the body this
-/// handler quotes carries an envelope and a token, never the plaintext.
+/// Captures every `ErrorEvent` the reporting layer dispatches, so a test can
+/// read the message `LogReporter` would interpolate into its `tracing::error!`.
 ///
-/// What this test deliberately does *not* assert is the converse — that the
-/// envelope and token DO reach the error log through the handler's message.
-/// `LogReporter` interpolates `event.message` into a `tracing::error!`, and the
-/// parameter filter matches parameter *names* rather than message text, so the
-/// mechanism is there; but no ERROR event reaches this capture buffer, so the
-/// claim is not one this harness can honestly pin. `### Outside the guarantee`
-/// in `docs/guide/confidential-fields.md` states the limit in prose instead.
+/// Reading the log buffer cannot do this. `ReporterChain::dispatch` spawns the
+/// report, and `install_log_capture` uses `tracing::subscriber::set_default`,
+/// which is thread-local — so the ERROR event is emitted on a runtime worker
+/// thread that never sees the test's subscriber. A global subscriber would see
+/// it and would also capture every other test in this binary, so the reporter
+/// hook is the seam that works.
+#[derive(Clone, Default)]
+struct CapturedErrors(Arc<Mutex<Vec<String>>>);
+
+impl CapturedErrors {
+    fn messages(&self) -> Vec<String> {
+        self.0.lock().expect("captured errors lock").clone()
+    }
+}
+
+impl autumn_web::reporting::ErrorReporter for CapturedErrors {
+    fn report<'a>(
+        &'a self,
+        event: &'a autumn_web::reporting::ErrorEvent,
+    ) -> autumn_web::reporting::ReportFuture<'a> {
+        let sink = self.0.clone();
+        let message = event.message.clone();
+        Box::pin(async move {
+            sink.lock().expect("captured errors lock").push(message);
+        })
+    }
+}
+
+/// #1771: what the error-reporting path carries when the application hands it
+/// the raw request body.
+///
+/// The plaintext is absent, which is the part the guarantee covers: the client
+/// sealed the value before sending, so the body this handler quotes never held
+/// it. The envelope and the token *are* present, which is the part it does not
+/// cover — `LogReporter` interpolates this same message into a `tracing::error!`
+/// and the parameter filter matches parameter names rather than message text.
+/// `### Outside the guarantee` in `docs/guide/confidential-fields.md` says so,
+/// and this test is what keeps that statement honest.
 #[tokio::test]
-async fn a_handler_that_quotes_the_request_body_still_logs_no_plaintext() {
+async fn a_handler_that_quotes_the_request_body_reports_the_envelope_but_no_plaintext() {
     let dir = tempfile::tempdir().expect("temp dir");
     let key = RootKey::generate();
     let uid = "note-echoed-in-error";
     let sealed = key.seal(&ctx(OWNER, uid), MARKER).expect("seal");
     let token = key.blind_index(&ctx(OWNER, uid), MARKER);
 
-    let (log, _guard) = install_log_capture();
+    let errors = CapturedErrors::default();
     let client = TestApp::new()
         .config(capture_config(dir.path()))
+        .with_error_reporter(errors.clone())
         .routes(routes![log_in, store_note, read_note, store_note_failing])
         .build();
 
@@ -426,17 +457,40 @@ async fn a_handler_that_quotes_the_request_body_still_logs_no_plaintext() {
         .await
         .assert_status(500);
 
-    // The plaintext is the part the guarantee covers, and it holds even here:
-    // the client sealed the value before sending, so the body this handler
-    // quoted never contained it.
+    // The report is spawned, so it lands after the response does.
+    let mut messages = errors.messages();
+    for _ in 0..100 {
+        if !messages.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        messages = errors.messages();
+    }
+    assert!(
+        !messages.is_empty(),
+        "the reporting layer must dispatch an event for a 5xx"
+    );
+    let reported = messages.join("\n");
+
+    // Holds: the guarantee is about plaintext, and the client sealed it first.
     assert_blind(
-        "the error log, for a handler that quotes the request body",
+        "the error-reporting message, for a handler that quotes the body",
         MARKER,
-        log.contents().as_bytes(),
+        reported.as_bytes(),
+    );
+
+    // Does not hold, and is documented as not holding.
+    assert!(
+        reported.contains(sealed.as_envelope()),
+        "the envelope reaches the error-reporting message through the handler's \
+         own format string; if this now fails, something learned to scrub message \
+         text and `### Outside the guarantee` needs updating: {reported}"
     );
     assert!(
-        log.contents().contains("/notes/fail"),
-        "the sweep must have read real output"
+        reported.contains(token.as_token()),
+        "the blind-index token reaches it the same way; if this now fails, update \
+         `### Outside the guarantee` and the `access_log` row of \
+         `OPERATOR_BLIND_SINKS`: {reported}"
     );
 }
 

@@ -188,6 +188,9 @@ out of scope for this release.
   error messages, or name the field rather than quoting its value. This is a
   property of the parameter filter, not of `#[confidential]`: the same holds for
   `#[encrypted]` columns and for every key in `[log] filter_parameters`.
+  `a_handler_that_quotes_the_request_body_reports_the_envelope_but_no_plaintext`
+  pins both halves of this: the plaintext is absent, the envelope and token are
+  not.
 - **Updating the pair.** The generated `Update<Model>` carries the envelope and
   its token as two independent fields, so a PATCH that sets only the envelope is
   accepted and leaves the token indexing the **previous** value: lookups for the
