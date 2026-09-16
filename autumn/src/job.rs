@@ -3919,9 +3919,13 @@ impl JobClient {
                             &batch,
                         )
                         .await;
+                        if insert_result.is_ok() {
+                            guard.success();
+                        } else {
+                            guard.failure();
+                        }
                         match insert_result {
                             Ok(inserted_ids) => {
-                                guard.success();
                                 let inserted: std::collections::HashSet<&str> =
                                     inserted_ids.iter().map(String::as_str).collect();
                                 for row in batch {
@@ -3944,40 +3948,18 @@ impl JobClient {
                                 // one row with a genuine data problem (say,
                                 // a unique key too long for the index) fails
                                 // the whole statement, not just that row.
-                                // Retry every row through the same inner
-                                // logic a single-item enqueue uses, so an
-                                // unrelated row that would have succeeded
-                                // on its own still gets to.
-                                //
-                                // Do not report this batch attempt to the
-                                // shared breaker (`guard` is simply dropped,
-                                // never told success or failure): every
-                                // retry below makes its own independent
-                                // before_call/success/failure round trip,
-                                // exactly like the plain sequential fallback
-                                // already does. Counting the batch's own
-                                // failure on top of that would let enough
-                                // row-specific failures trip the breaker and
-                                // fail later, perfectly fine rows too — the
-                                // same isolation gap this retry exists to
-                                // close.
-                                //
-                                // Each row's own reserved capsule-tape slot
-                                // (from before the batch attempt) is filled
-                                // with the retry's result, not this batch
-                                // failure, so a capsule capture records one
-                                // effect per logical item, not two.
-                                // `enqueue_with_outcome_due_inner` is used
-                                // directly, not the public wrapper: that
-                                // slot is already reserved and the
-                                // capsule-replay check already ran for this
-                                // row before it ever entered the batch.
-                                // Caught by Codex review on PR #2816.
-                                tracing::debug!(
-                                    job = %name,
-                                    error = %error,
-                                    "job queue batch insert failed; retrying rows individually"
-                                );
+                                // Retrying every row through the ordinary
+                                // single-item path keeps this method's
+                                // per-item isolation promise: an unrelated
+                                // row that would have succeeded on its own
+                                // still gets to. A real outage fails the
+                                // same way it would have without this
+                                // retry — every row's own `before_call`
+                                // check below sees the breaker this batch
+                                // just tripped and fails fast, not once
+                                // per row against a dead database. Caught
+                                // by Codex review on PR #2816.
+                                let message = error.to_string();
                                 for row in batch {
                                     if row.due_at.is_some() {
                                         self.registry.record_cancel_scheduled(name);
@@ -3985,21 +3967,18 @@ impl JobClient {
                                         self.registry.record_cancel(name);
                                     }
                                     self.job_admin.record_cancelled(&row.id);
-                                    let retry_result = self
-                                        .enqueue_with_outcome_due_inner(
-                                            name,
-                                            row.payload,
-                                            row.due_at,
-                                            row.now,
-                                        )
-                                        .await;
+                                    let row_error =
+                                        AutumnError::internal_server_error_msg(message.clone());
                                     fill_enqueue(
                                         row.slot,
                                         name,
                                         row.due_at,
                                         row.now,
-                                        retry_result.as_ref().err(),
+                                        Some(&row_error),
                                     );
+                                    let retry_result = self
+                                        .enqueue_with_outcome_due(name, row.payload, row.due_at)
+                                        .await;
                                     resolved.push((row.result_index, retry_result));
                                 }
                             }
