@@ -874,14 +874,16 @@ impl TenantCellRegistry {
             .sum();
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
         let registry_element_capacity = cells.capacity();
-        drop(cells);
-        // Use allocation history rather than only current capacity. Removals
-        // create tombstones that can reduce effective element capacity while
-        // `HashMap` retains the original backing allocation.
+        // Read allocation history while the map's read guard is still held.
+        // Growth updates the watermark under the corresponding write guard, so
+        // this keeps the resident count, entries, ids, capacity, and watermark
+        // in one coherent registry snapshot. Removals can reduce effective
+        // element capacity via tombstones while retaining the allocation.
         let registry_bucket_count = self
             .inner
             .registry_bucket_high_water
             .load(Ordering::Relaxed);
+        drop(cells);
         let registry_bucket_bytes = (registry_bucket_count - resident_cells)
             * std::mem::size_of::<RegistryEntry>()
             + registry_bucket_count;
