@@ -103,11 +103,42 @@ fn nodes_contain_an_li(nodes: &[Node]) -> bool {
         .any(|node| matches!(node, Node::Element { tag, .. } if tag == "li"))
 }
 
+/// True if `nodes`, or anything nested inside them, holds non-empty text —
+/// skipping [`is_non_rendered`] subtrees, same as [`subtree_has_visible_content`].
+///
+/// Unlike that function, a structural tag (`<div>`, `<p>`, ...) does *not*
+/// count on its own here: `extract_table_rows`'s catch-all arm builds this
+/// exact `children` list into a fresh, empty `Vec<Span>` via `inline_spans`,
+/// so `push_block_break`'s "skip a leading/trailing break" rule empties out
+/// any break a content-free structural tag would otherwise add (unlike
+/// `inline_spans`'s *other* callers, which hand it a buffer that already
+/// has real siblings' text in it). Only actual text survives that, so only
+/// actual text should count here.
+fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(text) => {
+                if !text.is_empty() {
+                    return true;
+                }
+            }
+            Node::Element { tag, children } => {
+                if !is_non_rendered(tag) {
+                    stack.extend(children);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// True if `nodes` has something [`extract_table_rows`] would act on: a
-/// `<tr>` (always emits a row, even an empty one — see its own
-/// unconditional `out.push`), a `<thead>`/`<tbody>`/`<tfoot>` with such a
-/// child inside it, or any other non-[`is_non_rendered`] tag (its text, if
-/// any, becomes a one-cell row via the catch-all arm).
+/// `<tr>` with at least one `<td>`/`<th>` cell (an empty `<tr>` pushes a
+/// zero-cell row too, but [`Writer::draw_table`] draws nothing once every
+/// row's cell count is 0), a `<thead>`/`<tbody>`/`<tfoot>` with such a
+/// `<tr>` inside it, or any other non-[`is_non_rendered`] tag with real
+/// text in it (the catch-all arm turns that into a one-cell row).
 ///
 /// For `extract_table_rows`'s own depth-cap guard, not
 /// [`subtree_has_visible_content`]: that walker's loop skips every bare
@@ -121,9 +152,12 @@ fn nodes_contain_table_output(nodes: &[Node]) -> bool {
             return false;
         };
         match tag.as_str() {
+            "tr" => children.iter().any(
+                |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
+            ),
             "thead" | "tbody" | "tfoot" => nodes_contain_table_output(children),
             _ if is_non_rendered(tag) => false,
-            _ => true,
+            _ => subtree_has_nonempty_text(children),
         }
     })
 }
@@ -2804,6 +2838,57 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "a <table> with no real row content draws nothing, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn empty_tr_past_the_depth_cap_does_not_warn() {
+        // extract_table_rows pushes a TableRow for any <tr>, even a
+        // cell-less one — but Writer::draw_table returns immediately when
+        // every row's cell count maxes out at 0 (n_cols == 0), so a table
+        // that is nothing but empty <tr>s draws no mark at all.
+        let html = format!(
+            "{}<table><tr></tr></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a <tr> with no <td>/<th> cells draws nothing, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn empty_caption_past_the_depth_cap_does_not_warn() {
+        // extract_table_rows's catch-all arm only pushes a row when the
+        // tag's own inline content is non-empty; an empty <caption> (or any
+        // other non-tr tag with nothing in it) produces none.
+        let html = format!(
+            "{}<table><caption></caption></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "an empty <caption> draws nothing, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn table_with_real_cell_content_past_the_depth_cap_still_warns() {
+        // Sanity check alongside the two tests above: a <tr> that DOES have
+        // a real cell must still warn when dropped.
+        let html = format!(
+            "{}<table><tr><td>X</td></tr></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a <tr> with a real <td> cell draws a row, so this must warn"
         );
     }
 
