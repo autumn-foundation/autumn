@@ -73,11 +73,13 @@ async fn two_browser_sessions_converge_on_the_same_text() {
 
     // AC3: each session lists both editors.
     for page in [&ada, &linus] {
-        let roster = page
+        let roster: i64 = page
             .evaluate("document.querySelectorAll('#roster li').length")
             .await
-            .expect("read the roster");
-        assert_eq!(roster.as_i64(), Some(2), "both editors are listed");
+            .expect("read the roster")
+            .into_value()
+            .expect("the roster count is a number");
+        assert_eq!(roster, 2, "both editors are listed");
     }
 
     for page in [&ada, &linus] {
@@ -91,9 +93,8 @@ async fn editor_value(page: &autumn_web::system_test::Page) -> String {
     page.evaluate("document.getElementById('editor').value")
         .await
         .expect("read the editor")
-        .as_str()
+        .into_value::<String>()
         .unwrap_or_default()
-        .to_owned()
 }
 
 /// Type at the very end of the textarea, the way a person would.
