@@ -93,9 +93,16 @@ both organic** (neither triggering branch touches hot-upgrade code):
    re-confirmed this pass**. Recorded as consistent with, not confirmed as,
    the same `status: 0` signature, on line number and result shape alone.
 
-Two hits in one day, breaking six straight zero-hit passes
-(2026-09-09 through 2026-09-15), is itself a data point worth flagging even
-though neither hit alone clears the rerun-rate bar.
+**Correction (post-review, via a further Codex review comment on this PR):
+"six straight zero-hit passes (2026-09-09 through 2026-09-15)" is wrong —
+the ledger's own 2026-09-10 and 2026-09-11 updates both record organic
+`live_upgrade` hits (2026-09-09T13:59Z and 2026-09-11T11:51:57Z
+respectively), so that range cannot be hit-free.** The ledger's own dated
+updates establish only three consecutive zero-hit passes immediately
+preceding today's: 2026-09-13, 2026-09-14, and 2026-09-15 (each explicitly
+states "zero new organic hits" for its sampled window). Two hits in one day
+breaking that three-pass zero-hit streak is still a data point worth
+flagging, just not the six-pass streak originally claimed.
 
 ## 🔍 Diagnosis
 
@@ -114,7 +121,8 @@ ambiguity a rerun campaign exists to resolve before anyone touches code.
 ## 🔧 Treatment
 
 No fix PR — neither hit has a rerun-rate baseline, and jumping to a code
-change off n=1 (line-714) or an unconfirmed n=2 (line-686) would be the
+change off n=1 (line-714) or a possible, unconfirmed 3rd occurrence
+(line-686 — 2 already confirmed per the correction above) would be the
 "retry in disguise" this role exists to refuse. The standing recommendation
 is unchanged in kind but more urgent in fact: dispatch
 `manual-macos-contention-check.yml` (`samples: "20"`) against a `trunk-dev`

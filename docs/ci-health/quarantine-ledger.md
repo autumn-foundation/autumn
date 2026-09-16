@@ -933,11 +933,17 @@ without also filling in the intake form above.
      needed to confirm the message text exactly, per the same truncation
      caveat the 2026-09-11 entry already flagged for this job type.
 
-  Two hits in one day, after six straight passes (2026-09-09 through
-  2026-09-15) of zero organic `live_upgrade` hits in the sampled windows,
-  is itself worth noting even though neither hit alone clears this role's
-  own rerun-rate bar. **Correction (post-review, via a further Codex review
-  comment on PR #2823): line-552 and line-686 are the same `status: 0`
+  **Correction (post-review, via a further Codex review comment on PR
+  #2823): "six straight passes (2026-09-09 through 2026-09-15)" of zero
+  organic hits is wrong — this entry's own 2026-09-10 and 2026-09-11 dated
+  updates above record organic hits (2026-09-09T13:59Z and
+  2026-09-11T11:51:57Z respectively), so that range was not hit-free.**
+  Only three consecutive passes are explicitly documented as zero-hit
+  immediately before today: 2026-09-13, 2026-09-14, and 2026-09-15. Two
+  hits in one day, breaking that three-pass zero-hit streak, is itself
+  worth noting even though neither hit alone clears this role's own
+  rerun-rate bar. **Second correction (post-review, via a further Codex
+  review comment on PR #2823): line-552 and line-686 are the same `status: 0`
   signature at two different line numbers (the file was refactored between
   2026-09-09 and 2026-09-11), not two separate n=1 signatures — the
   2026-09-11 update above already states this explicitly ("now two
