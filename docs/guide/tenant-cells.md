@@ -185,6 +185,50 @@ its memory reclaiming on drop, and the eviction takes effect for subsequent
 requests. The registry also exposes `len()`, `is_empty()`, and
 `total_tracked_bytes()` for observability.
 
+### Resident-cell structural overhead
+
+`total_tracked_bytes()` is **API-accounted tenant payload**, not the cost of
+the accounting machinery itself. An empty cell therefore reports zero tracked
+bytes while still occupying process memory. `TenantCellRegistry::structural_overhead()`
+reports that second quantity separately. The density smoke test creates 1,000
+empty cells with fixed-width `tenant-NNNN` ids, verifies the configured
+1,000-cell resident target, prints total and per-cell structure, then evicts
+every entry.
+
+The lower-bound estimate sums the current platform's `size_of` layouts for `TenantCell` and
+`TenantCellInner` (including atomics, the scratch-map header, and mutex), both
+per-cell `Arc` counter headers, occupied registry entries, both tenant-id
+allocation capacities, and amortized spare registry buckets plus control bytes.
+Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
+the model rounds it up to the current SwissTable implementation's power-of-two
+backing bucket count. For this workload that means 1,792 elements map to 2,048
+buckets, including the load-factor-reserved slots. The registry retains that
+bucket estimate as a high-water mark: removals can consume tombstones and lower
+the map's reported element capacity without shrinking its backing allocation,
+so recomputing solely from the current capacity would undercount churned
+registries.
+It also reports the one-off registry allocation separately. On 64-bit Linux,
+the 1,000-cell smoke test currently measures **257 lower-bound structural bytes
+per cell** plus a **168-byte one-off registry structure** (257,752 bytes total);
+run the
+following command to reproduce the exact number for a toolchain/platform:
+
+```sh
+cargo test -p autumn-web --test integration_tests \
+  integration::tenant_cell_unit::density_smoke_thousand_cells -- --exact --nocapture
+```
+
+This is a deterministic **structural lower bound**, not RSS. Rust does not expose
+allocator allocation headers, size-class rounding, internal fragmentation, or
+page residency portably, so those are explicitly excluded. The registry bucket
+element capacity is observed exactly; the backing bucket conversion and
+one-control-byte-per-bucket component model the current SwissTable
+implementation. Its trailing control group and allocation padding are excluded,
+as are allocator details, so the result is deliberately labeled a lower bound.
+The ordinary CI test never asserts RSS; an RSS
+sample would only be an observational, allocator- and environment-dependent
+metric.
+
 **Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than
 frozen at creation. Every access refreshes a resident cell's quota from the
 configured `quota_bytes`, so a future config-reload path could change the
