@@ -737,6 +737,27 @@ pub(crate) enum EnqueueOutcome {
     Skipped,
 }
 
+/// One item on its way into [`JobClient::enqueue_many_pg`]'s batched
+/// `INSERT`. Every in-memory step already ran for it: capsule replay, id,
+/// constraints, registry and admin bookkeeping.
+#[cfg(feature = "db")]
+struct BatchEnqueueRow {
+    /// Index into the caller's `items`. Used to send the batch's outcome
+    /// back to the right slot, no matter what order rows insert in.
+    result_index: usize,
+    id: String,
+    payload_json: String,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    unique_key: Option<String>,
+    concurrency_key: Option<String>,
+    slot: Option<EnqueueSlot>,
+    now: chrono::DateTime<chrono::Utc>,
+    #[cfg(feature = "telemetry-otlp")]
+    traceparent: Option<String>,
+    #[cfg(feature = "telemetry-otlp")]
+    tracestate: Option<String>,
+}
+
 /// Specifies the due instant for an after-commit enqueue.
 ///
 /// `At` carries a pre-resolved absolute instant (or `None` for immediate).
@@ -3621,6 +3642,339 @@ impl JobClient {
         })
     }
 
+    /// Enqueue many jobs with one name. Use as few round trips as the
+    /// backend and job settings allow.
+    ///
+    /// Some cases fall back to one [`Self::enqueue_due`] call per item —
+    /// the same as today's behavior. This happens when a registered
+    /// [`crate::interceptor::JobInterceptor`] exists, the backend is not
+    /// Postgres (local, redis, or `SQLite`), or the job uses a TTL
+    /// uniqueness window (its key eviction needs its own round trip per
+    /// key). Only the Postgres case, with no interceptor and no TTL
+    /// window, batches every `INSERT` into one round trip. This is the
+    /// case `dunning::rearm_pending` hits on each restart (issue #2748).
+    ///
+    /// Returns one result per item in `items`, in the same order. A
+    /// coalesced duplicate counts as success, same as [`Self::enqueue_due`].
+    /// On the sequential fallback path, one item's dedup or backend
+    /// failure never affects the others — the same as calling
+    /// [`Self::enqueue_due`] once per item.
+    ///
+    /// The batched path shares that guarantee only while its one `INSERT`
+    /// statement succeeds: each row still dedupes on its own. If that one
+    /// statement itself fails — a dropped connection, a row-specific data
+    /// problem — every item in the batch fails together, since they are
+    /// one SQL statement, not many. This method does not retry that
+    /// failure on its own: whether the statement actually committed before
+    /// the failure was seen cannot be told apart from the error alone, and
+    /// a blind retry could insert every row a second time under a fresh
+    /// id. A caller that needs every item attempted despite one bad row
+    /// should call [`Self::enqueue_due`] once per item instead.
+    ///
+    /// If two items in the same batch share a unique key, only one of them
+    /// gets stored on the batched path; the other is treated as a
+    /// coalesced duplicate. Which one wins is not guaranteed to follow
+    /// `items`' order the way calling [`Self::enqueue_due`] once per item,
+    /// in order, would. Give this batch method distinct unique keys, one
+    /// per item, when the caller's own uniqueness relies on order.
+    pub async fn enqueue_many_due(
+        &self,
+        name: &str,
+        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> Vec<AutumnResult<()>> {
+        self.enqueue_many_with_outcome_due(name, items)
+            .await
+            .into_iter()
+            .map(|result| result.map(|_| ()))
+            .collect()
+    }
+
+    /// Same as [`Self::enqueue_many_due`], but reports each item's
+    /// [`EnqueueOutcome`] instead of turning a coalesced duplicate into a
+    /// plain success.
+    pub(crate) async fn enqueue_many_with_outcome_due(
+        &self,
+        name: &str,
+        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> Vec<AutumnResult<EnqueueOutcome>> {
+        #[cfg(feature = "db")]
+        if self.can_batch_enqueue(name) {
+            return self.enqueue_many_pg(name, items).await;
+        }
+        let mut results = Vec::with_capacity(items.len());
+        for (payload, due_at) in items {
+            // `enqueue_with_outcome_due` is the crate-private inner
+            // method — unlike the public `enqueue_due`, it does not check
+            // this itself. Check it here so the fallback path validates
+            // exactly like `enqueue_due` does.
+            if let Err(error) = crate::job_tracking::reject_reserved_envelope_marker(&payload) {
+                results.push(Err(error));
+                continue;
+            }
+            results.push(self.enqueue_with_outcome_due(name, payload, due_at).await);
+        }
+        results
+    }
+
+    /// Check if `name`'s settings and this client's backend allow the
+    /// single-round-trip path in [`Self::enqueue_many_with_outcome_due`].
+    ///
+    /// `false` means the sequential fallback runs instead. That path stays
+    /// exactly as it works today; nothing changes for it.
+    #[cfg(feature = "db")]
+    fn can_batch_enqueue(&self, name: &str) -> bool {
+        if self.interceptor.is_some() || !self.durable_is_pg() {
+            return false;
+        }
+        let Some(settings) = self.per_job_settings.get(name) else {
+            return false;
+        };
+        !matches!(
+            settings.uniqueness.as_ref().map(|u| u.window),
+            Some(JobUniquenessWindow::TtlMs(_))
+        )
+    }
+
+    /// The batched Postgres path behind [`Self::can_batch_enqueue`].
+    ///
+    /// Does the same per-item bookkeeping as
+    /// [`Self::enqueue_with_outcome_due_inner`] — capsule replay, registry
+    /// and admin marks, capsule tape reservation — but does not write each
+    /// row on its own. Instead, it collects every item that needs a row
+    /// and writes them all in one [`pg_insert_jobs_many`] call.
+    ///
+    /// Each result carries its item's original index and the results are
+    /// sorted by that index before return. This avoids writing into a
+    /// pre-sized slot by index, which this module's panic-free gate does
+    /// not allow.
+    #[cfg(feature = "db")]
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_many_pg(
+        &self,
+        name: &str,
+        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> Vec<AutumnResult<EnqueueOutcome>> {
+        let Some(settings) = self.per_job_settings.get(name) else {
+            // `can_batch_enqueue` already checked this. Reaching here would
+            // mean the client's settings changed during this call. Answer
+            // the same way `enqueue_with_outcome_due_inner` does for an
+            // unregistered job. Do not panic.
+            return items
+                .iter()
+                .map(|_| {
+                    Err(AutumnError::internal_server_error(std::io::Error::other(
+                        format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
+                    )))
+                })
+                .collect();
+        };
+        let job_max_attempts = if settings.max_attempts != 0 {
+            settings.max_attempts
+        } else {
+            self.default_max_attempts
+        };
+        let job_backoff_ms = if settings.initial_backoff_ms != 0 {
+            settings.initial_backoff_ms
+        } else {
+            self.default_initial_backoff_ms
+        };
+        let job_queue = normalize_queue_name(&settings.queue);
+        let unique_window_tag = settings.uniqueness.as_ref().map(|u| u.window.tag());
+        let concurrency_limit = settings
+            .concurrency
+            .as_ref()
+            .map(|c| i32::try_from(c.limit).unwrap_or(i32::MAX));
+
+        let mut resolved: Vec<(usize, AutumnResult<EnqueueOutcome>)> =
+            Vec::with_capacity(items.len());
+        let mut batch: Vec<BatchEnqueueRow> = Vec::with_capacity(items.len());
+
+        for (result_index, (payload, due_at)) in items.into_iter().enumerate() {
+            if let Err(error) = crate::job_tracking::reject_reserved_envelope_marker(&payload) {
+                resolved.push((result_index, Err(error)));
+                continue;
+            }
+            let now = self.due_origin();
+            let due_at = due_at.filter(|due| *due > now);
+            let schedule = due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
+            if let Some(answer) = replayed_enqueue(name, &payload, schedule) {
+                resolved.push((result_index, answer.map(|()| EnqueueOutcome::Queued)));
+                continue;
+            }
+            let slot = reserve_enqueue(&payload);
+            let id = self.entropy.uuid_v4().to_string();
+            let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
+
+            if let Some(due) = due_at {
+                let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
+                self.registry.record_enqueue_scheduled(name, ready_at_ms);
+            } else {
+                self.registry.record_enqueue(name);
+            }
+            self.job_admin.record_enqueue_due(
+                id.clone(),
+                name,
+                &job_queue,
+                payload.clone(),
+                1,
+                job_max_attempts,
+                due_at,
+                now,
+            );
+
+            let payload_json = match serde_json::to_string(&payload) {
+                Ok(json) => json,
+                Err(error) => {
+                    if due_at.is_some() {
+                        self.registry.record_cancel_scheduled(name);
+                    } else {
+                        self.registry.record_cancel(name);
+                    }
+                    self.job_admin.record_cancelled(&id);
+                    let autumn_error = AutumnError::internal_server_error_msg(format!(
+                        "serialize job payload: {error}"
+                    ));
+                    fill_enqueue(slot, name, due_at, now, Some(&autumn_error));
+                    resolved.push((result_index, Err(autumn_error)));
+                    continue;
+                }
+            };
+
+            #[cfg(feature = "telemetry-otlp")]
+            let (traceparent, tracestate) = capture_job_trace_context();
+
+            batch.push(BatchEnqueueRow {
+                result_index,
+                id,
+                payload_json,
+                due_at,
+                unique_key: constraints.unique_key,
+                concurrency_key: if constraints.concurrency_limit.is_some() {
+                    constraints.concurrency_scope
+                } else {
+                    None
+                },
+                slot,
+                now,
+                #[cfg(feature = "telemetry-otlp")]
+                traceparent,
+                #[cfg(feature = "telemetry-otlp")]
+                tracestate,
+            });
+        }
+
+        if !batch.is_empty() {
+            match self.pg_pool.as_ref() {
+                None => {
+                    // `can_batch_enqueue` already checked this. Answer
+                    // every staged row as a backend failure. Do not panic.
+                    // A real connection failure below is handled the same
+                    // way.
+                    for row in batch {
+                        if row.due_at.is_some() {
+                            self.registry.record_cancel_scheduled(name);
+                        } else {
+                            self.registry.record_cancel(name);
+                        }
+                        self.job_admin.record_cancelled(&row.id);
+                        let row_error = AutumnError::service_unavailable_msg(
+                            "job queue's Postgres pool is not active",
+                        );
+                        fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                        resolved.push((row.result_index, Err(row_error)));
+                    }
+                }
+                Some(pool) => {
+                    // This is the same "job_queue" breaker the single-row
+                    // path (`enqueue_durable`) uses. An outage must fail
+                    // this batch fast too, not send one more large
+                    // statement at a down database. This call's own
+                    // success or failure must also update that same
+                    // shared health signal, for every other enqueuer to
+                    // read.
+                    let breaker = self.job_queue_breaker();
+                    if breaker.before_call().is_err() {
+                        for row in batch {
+                            if row.due_at.is_some() {
+                                self.registry.record_cancel_scheduled(name);
+                            } else {
+                                self.registry.record_cancel(name);
+                            }
+                            self.job_admin.record_cancelled(&row.id);
+                            let row_error = AutumnError::service_unavailable(
+                                std::io::Error::other("job queue circuit breaker is open"),
+                            );
+                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                            resolved.push((row.result_index, Err(row_error)));
+                        }
+                    } else {
+                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
+                        let insert_result = pg_insert_jobs_many(
+                            pool,
+                            name,
+                            &job_queue,
+                            job_max_attempts,
+                            job_backoff_ms,
+                            unique_window_tag,
+                            concurrency_limit,
+                            &batch,
+                        )
+                        .await;
+                        if insert_result.is_ok() {
+                            guard.success();
+                        } else {
+                            guard.failure();
+                        }
+                        match insert_result {
+                            Ok(inserted_ids) => {
+                                let inserted: std::collections::HashSet<&str> =
+                                    inserted_ids.iter().map(String::as_str).collect();
+                                for row in batch {
+                                    let outcome = if inserted.contains(row.id.as_str()) {
+                                        EnqueueOutcome::Queued
+                                    } else {
+                                        self.record_deduplicated_enqueue(
+                                            name,
+                                            &row.id,
+                                            row.due_at.is_some(),
+                                        );
+                                        EnqueueOutcome::Deduplicated
+                                    };
+                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                    resolved.push((row.result_index, Ok(outcome)));
+                                }
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                for row in batch {
+                                    if row.due_at.is_some() {
+                                        self.registry.record_cancel_scheduled(name);
+                                    } else {
+                                        self.registry.record_cancel(name);
+                                    }
+                                    self.job_admin.record_cancelled(&row.id);
+                                    let row_error =
+                                        AutumnError::internal_server_error_msg(message.clone());
+                                    fill_enqueue(
+                                        row.slot,
+                                        name,
+                                        row.due_at,
+                                        row.now,
+                                        Some(&row_error),
+                                    );
+                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        resolved.sort_by_key(|(index, _)| *index);
+        resolved.into_iter().map(|(_, result)| result).collect()
+    }
+
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
     ///
     /// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
@@ -3821,19 +4175,15 @@ impl JobClient {
         self.job_admin.record_deduplicated(id);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn enqueue_durable(
-        &self,
-        id: String,
-        name: &str,
-        queue: &str,
-        payload: Value,
-        max_attempts: u32,
-        backoff_ms: u64,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
-        constraints: &ResolvedJobConstraints,
-    ) -> AutumnResult<EnqueueOutcome> {
-        let breaker = self.resilience_config.as_ref().map_or_else(
+    /// The shared `"job_queue"` circuit breaker. Uses this client's
+    /// resilience-config override when one is set.
+    ///
+    /// Every durable Postgres write goes through this breaker, whether it
+    /// comes from [`Self::enqueue_durable`]'s single-row path or
+    /// [`Self::enqueue_many_pg`]'s batched path. An outage trips the same
+    /// breaker for both, so every caller fails fast together.
+    fn job_queue_breaker(&self) -> crate::circuit_breaker::CircuitBreaker {
+        self.resilience_config.as_ref().map_or_else(
             || {
                 crate::circuit_breaker::global_registry().get_or_create(
                     "job_queue",
@@ -3846,7 +4196,22 @@ impl JobClient {
                 crate::circuit_breaker::global_registry()
                     .get_or_create_with_config("job_queue", policy)
             },
-        );
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue_durable(
+        &self,
+        id: String,
+        name: &str,
+        queue: &str,
+        payload: Value,
+        max_attempts: u32,
+        backoff_ms: u64,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        constraints: &ResolvedJobConstraints,
+    ) -> AutumnResult<EnqueueOutcome> {
+        let breaker = self.job_queue_breaker();
 
         if breaker.before_call().is_err() {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
@@ -8535,6 +8900,159 @@ async fn pg_insert_job(
     Ok(EnqueueOutcome::Queued)
 }
 
+/// Batched, multi-row form of [`pg_insert_job`]. Inserts every row in
+/// `rows` in one round trip. Each row still goes through the same dedup
+/// guard and partial unique index `ON CONFLICT DO NOTHING` a single-row
+/// call would use, so the result is the same as if each row had called
+/// `pg_insert_job` on its own. Returns the ids that were inserted. An id
+/// missing from the result was deduplicated.
+///
+/// Every row shares `name`, `queue`, `max_attempts`, `initial_backoff_ms`
+/// (one job type, one settings lookup), and the job's uniqueness window
+/// tag. Only the id, payload, due time, unique key, and concurrency key
+/// vary per row. Do not include a row whose job settings declare a TTL
+/// uniqueness window: its expired-key eviction
+/// (`pg_evict_expired_unique_key`) needs its own round trip per key, and
+/// this batch does not run it. [`JobClient::can_batch_enqueue`] checks
+/// this before any row reaches here.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn pg_insert_jobs_many(
+    pool: &PgPool,
+    name: &str,
+    queue: &str,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    unique_window_tag: Option<&'static str>,
+    concurrency_limit: Option<i32>,
+    rows: &[BatchEnqueueRow],
+) -> AutumnResult<Vec<String>> {
+    use diesel_async::RunQueryDsl as _;
+
+    // The batch form of `pg_insert_job`'s `DEDUP_GUARD`, with the TTL
+    // branch removed. A TTL-windowed job never reaches this function (see
+    // above), so every row here dedupes on status alone.
+    const DEDUP_GUARD: &str = "(t.unique_key IS NULL OR NOT EXISTS ( \
+           SELECT 1 FROM autumn_jobs dup \
+           WHERE dup.name = $1 AND dup.unique_key = t.unique_key \
+             AND dup.status IN ('enqueued', 'running') \
+         ))";
+    const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
+         WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
+
+    #[derive(diesel::QueryableByName)]
+    struct InsertedId {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+    }
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job pool error: {e}")))?;
+
+    // Borrowed, not cloned. `rows` already owns every one of these
+    // strings, including the full payload JSON. Binding `&str` /
+    // `Option<&str>` reuses that memory instead of copying the whole
+    // batch again.
+    let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    let payloads: Vec<&str> = rows.iter().map(|row| row.payload_json.as_str()).collect();
+    let run_ats: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        rows.iter().map(|row| row.due_at).collect();
+    let unique_keys: Vec<Option<&str>> = rows.iter().map(|row| row.unique_key.as_deref()).collect();
+    let concurrency_keys: Vec<Option<&str>> = rows
+        .iter()
+        .map(|row| row.concurrency_key.as_deref())
+        .collect();
+
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let inserted = diesel::sql_query(format!(
+        "INSERT INTO autumn_jobs \
+         (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
+          enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
+         SELECT t.id, $1, $2, t.payload::JSONB, 'enqueued', 1, $3, $4, NOW(), \
+                COALESCE(t.run_at, NOW()), t.unique_key, $5, t.concurrency_key, $6 \
+         FROM UNNEST($7::TEXT[], $8::TEXT[], $9::TIMESTAMPTZ[], $10::TEXT[], $11::TEXT[]) \
+           AS t(id, payload, run_at, unique_key, concurrency_key) \
+         WHERE {DEDUP_GUARD} \
+         {UNIQUE_CONFLICT} \
+         RETURNING id"
+    ))
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(unique_window_tag)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(payloads)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>>, _>(
+        run_ats,
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+        unique_keys,
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+        concurrency_keys,
+    )
+    .get_results::<InsertedId>(&mut conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))?;
+
+    #[cfg(feature = "telemetry-otlp")]
+    let inserted = {
+        let traceparents: Vec<Option<&str>> =
+            rows.iter().map(|row| row.traceparent.as_deref()).collect();
+        let tracestates: Vec<Option<&str>> =
+            rows.iter().map(|row| row.tracestate.as_deref()).collect();
+        diesel::sql_query(format!(
+            "INSERT INTO autumn_jobs \
+             (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
+              enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
+              traceparent, tracestate) \
+             SELECT t.id, $1, $2, t.payload::JSONB, 'enqueued', 1, $3, $4, NOW(), \
+                    COALESCE(t.run_at, NOW()), t.unique_key, $5, t.concurrency_key, $6, \
+                    t.traceparent, t.tracestate \
+             FROM UNNEST($7::TEXT[], $8::TEXT[], $9::TIMESTAMPTZ[], $10::TEXT[], $11::TEXT[], \
+                         $12::TEXT[], $13::TEXT[]) \
+               AS t(id, payload, run_at, unique_key, concurrency_key, traceparent, tracestate) \
+             WHERE {DEDUP_GUARD} \
+             {UNIQUE_CONFLICT} \
+             RETURNING id"
+        ))
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+        .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(unique_window_tag)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(payloads)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>>, _>(
+            run_ats,
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+            unique_keys,
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+            concurrency_keys,
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+            traceparents,
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+            tracestates,
+        )
+        .get_results::<InsertedId>(&mut conn)
+        .await
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
+        })?
+    };
+
+    Ok(inserted.into_iter().map(|row| row.id).collect())
+}
+
 /// Insert a new job row into `autumn_jobs` for immediate execution.
 ///
 /// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
@@ -10667,6 +11185,176 @@ mod tests {
             due_origin_for(false, &clock),
             epoch,
             "every other backend compares against the injected clock, so it stamps from it"
+        );
+    }
+
+    /// `enqueue_many_due`'s batched single-round-trip path
+    /// (`JobClient::can_batch_enqueue`) must turn on only in one case:
+    /// a Postgres-served backend, no registered `JobInterceptor`, a
+    /// registered job, and no TTL uniqueness window (its per-key eviction
+    /// needs its own round trip, which the batch does not run). Every
+    /// other case must fall back to the sequential per-item path,
+    /// unchanged. Regression test for the batching fix in issue #2748.
+    #[cfg(feature = "db")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn can_batch_enqueue_only_when_postgres_uninterrupted_and_non_ttl() {
+        struct NoopInterceptor;
+        impl crate::interceptor::JobInterceptor for NoopInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+        }
+
+        fn clock() -> Arc<dyn crate::time::ClockSource> {
+            Arc::new(crate::time::FixedClock::at(chrono::Utc::now()))
+        }
+
+        // A deadpool `Pool` dials a connection only when `.get()` is
+        // called. This pool only needs to exist for
+        // `can_batch_enqueue`'s `is_some()` check. It never reaches the
+        // bogus host.
+        fn dummy_pg_pool() -> PgPool {
+            use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+            use diesel_async::pooled_connection::deadpool::Pool;
+            let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+                "postgres://bogus-host-never-dialed/db",
+            );
+            Pool::builder(manager)
+                .max_size(1)
+                .build()
+                .expect("pool builder never dials a connection")
+        }
+
+        // Postgres backend, no interceptor, plain (non-unique) job: eligible.
+        let mut client = JobClient::bare_for_test(clock());
+        client.pg_pool = Some(dummy_pg_pool());
+        client
+            .per_job_settings
+            .insert("plain_job".to_string(), JobRuntimeSettings::basic(3, 250));
+        assert!(
+            client.can_batch_enqueue("plain_job"),
+            "Postgres, no interceptor, no uniqueness window: must be eligible for batching"
+        );
+
+        assert!(
+            !client.can_batch_enqueue("unregistered_job"),
+            "an unregistered job name must fall back rather than batch"
+        );
+
+        // A registered interceptor must disable batching: it observes each
+        // enqueue individually, and the batch never calls it per row.
+        let mut with_interceptor = JobClient::bare_for_test(clock());
+        with_interceptor.pg_pool = Some(dummy_pg_pool());
+        with_interceptor
+            .per_job_settings
+            .insert("plain_job".to_string(), JobRuntimeSettings::basic(3, 250));
+        with_interceptor.interceptor = Some(Arc::new(NoopInterceptor));
+        assert!(
+            !with_interceptor.can_batch_enqueue("plain_job"),
+            "a registered JobInterceptor must fall back to the sequential path"
+        );
+
+        // A TTL uniqueness window needs a per-key eviction round trip the
+        // batch does not perform.
+        let mut ttl_windowed = JobClient::bare_for_test(clock());
+        ttl_windowed.pg_pool = Some(dummy_pg_pool());
+        ttl_windowed.per_job_settings.insert(
+            "ttl_job".to_string(),
+            JobRuntimeSettings {
+                uniqueness: Some(JobUniqueness {
+                    by: vec![],
+                    window: JobUniquenessWindow::TtlMs(60_000),
+                }),
+                ..JobRuntimeSettings::basic(3, 250)
+            },
+        );
+        assert!(
+            !ttl_windowed.can_batch_enqueue("ttl_job"),
+            "a TTL uniqueness window must fall back to the sequential path"
+        );
+
+        // A non-`pending`/`running` uniqueness window has no per-key
+        // eviction step, so it stays eligible.
+        let mut running_windowed = JobClient::bare_for_test(clock());
+        running_windowed.pg_pool = Some(dummy_pg_pool());
+        running_windowed.per_job_settings.insert(
+            "running_job".to_string(),
+            JobRuntimeSettings {
+                uniqueness: Some(JobUniqueness {
+                    by: vec![],
+                    window: JobUniquenessWindow::Running,
+                }),
+                ..JobRuntimeSettings::basic(3, 250)
+            },
+        );
+        assert!(
+            running_windowed.can_batch_enqueue("running_job"),
+            "a status-based (non-TTL) uniqueness window is still eligible for batching"
+        );
+
+        // The local in-process backend has no round trip to collapse.
+        let mut local_backed = JobClient::bare_for_test(clock());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        local_backed.local_sender = Some(tx);
+        local_backed
+            .per_job_settings
+            .insert("plain_job".to_string(), JobRuntimeSettings::basic(3, 250));
+        assert!(
+            !local_backed.can_batch_enqueue("plain_job"),
+            "the local in-process backend must fall back to the sequential path"
+        );
+    }
+
+    /// `enqueue_many_due`'s sequential fallback path (used for a local
+    /// backend, a registered interceptor, an unregistered job, or a TTL
+    /// job) must reject a top-level `__autumn_tracked` key, the same as
+    /// the public `enqueue_due` does. That check lives in `enqueue_due`,
+    /// not in the crate-private `enqueue_with_outcome_due` the fallback
+    /// calls, so the fallback loop must run the check itself. Regression
+    /// test for a finding on PR #2816.
+    #[tokio::test]
+    async fn enqueue_many_due_rejects_reserved_envelope_marker_on_the_fallback_path() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let mut client = JobClient::bare_for_test(Arc::new(crate::time::SystemClock));
+        client.local_sender = Some(tx);
+
+        let payload = serde_json::json!({"__autumn_tracked": {"k": "v"}, "other": 1});
+        let results = client
+            .enqueue_many_due("some_unregistered_job", vec![(payload, None)])
+            .await;
+
+        assert_eq!(results.len(), 1, "one result per item");
+        let error = results
+            .first()
+            .expect("one result")
+            .as_ref()
+            .expect_err("a reserved envelope marker must be rejected");
+        assert!(
+            error.to_string().contains("__autumn_tracked"),
+            "unexpected error: {error}"
         );
     }
 
