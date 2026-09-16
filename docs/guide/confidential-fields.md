@@ -154,6 +154,12 @@ out of scope for this release.
 - **Memory on the client.** `RootKey` zeroizes on drop and the AES key schedule
   is wiped with it, but a compiler or an allocator can still leave copies. The
   wipe is best effort, not a guarantee against a memory dump of a live client.
+- **Updating the pair.** The generated `Update<Model>` carries the envelope and
+  its token as two independent fields, so a PATCH that sets only the envelope is
+  accepted and leaves the token indexing the **previous** value: lookups for the
+  new value miss the row, and lookups with the old token return a row that no
+  longer holds it. Always set `<field>` and `<field>_bidx` together. Making the
+  partial update unrepresentable is a follow-up.
 
 ## What the build refuses
 
