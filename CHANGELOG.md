@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `version_history_migrations_sqlite`) already use. `FRAMEWORK_MIGRATIONS`
   is now backend-forked behind `#[cfg(feature = "sqlite")]` like those
   three, and `run_pending_sqlite_with_framework_migrations` applies it
-  alongside them.
+  alongside them. `autumn-cli`'s `--features sqlite` build now refuses a
+  non-`sqlite://` target instead of silently applying its (now SQLite-only)
+  embedded framework migrations to it: `FRAMEWORK_MIGRATIONS` is chosen once,
+  at compile time, by that cargo feature, not per target at runtime.
 - **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
   api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
   token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
