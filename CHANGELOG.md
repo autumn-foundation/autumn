@@ -791,15 +791,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING (`autumn-admin-plugin`): `experiments::ExperimentChange::changed_at`
-  is now `chrono::NaiveDateTime`, was `chrono::DateTime<Utc>` (#2108).** The
-  field type decides the SQL type the generated DSL binds, and `DateTime<Utc>`
-  maps to the Postgres-only `Timestamptz`. Three consequences for a downstream
-  that names this public type: the field type itself; the `Serialize` output,
-  which now reads `"2024-01-15T12:34:56"` with no `Z`; and the derived OpenAPI
-  schema, which loses `"format": "date-time"`. Call `.and_utc()` to recover a
-  `DateTime<Utc>`. The column stays `timestamptz`, and the value does not move
-  — see the `Added` entry.
+- **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
+  `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL
+  type the generated DSL binds, and `DateTime<Utc>` maps to the Postgres-only
+  `Timestamptz`, which stopped the crate compiling under `autumn-web/sqlite`.
+  **Breaking:** a downstream that names this public type sees three changes —
+  the field type itself, the `Serialize` output (now `"2024-01-15T12:34:56"`,
+  with no `Z`), and the derived OpenAPI schema (no `"format": "date-time"`).
+  Call `.and_utc()` to recover a `DateTime<Utc>`. The column stays
+  `timestamptz`, and the value does not move. See the
+  [migration guide](docs/migrations/next.md#admin-plugin-experimentchangechanged_at-is-now-naivedatetime).
 
 - **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
   CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
