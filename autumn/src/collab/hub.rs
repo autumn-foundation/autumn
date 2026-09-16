@@ -291,6 +291,14 @@ struct DocState {
     /// an app that never calls [`CollabHub::close`] still does not leak one
     /// per record it ever opened.
     sessions: usize,
+    /// Bumped on every change to `doc`.
+    ///
+    /// [`CollabClose`] records it and refuses to evict a document that moved
+    /// on: the state it handed the app to persist would no longer be the
+    /// document's, and evicting would drop the difference. Occupancy alone
+    /// cannot see this — an editor can arrive, type, and leave entirely
+    /// inside the window.
+    revision: u64,
 }
 
 impl DocState {
@@ -299,7 +307,15 @@ impl DocState {
             doc,
             cursors: BTreeMap::new(),
             sessions: 0,
+            revision: 0,
         }
+    }
+
+    /// Mutate the document and record that it moved.
+    fn edit<T>(&mut self, change: impl FnOnce(&mut CollabText) -> T) -> T {
+        let out = change(&mut self.doc);
+        self.revision = self.revision.wrapping_add(1);
+        out
     }
 }
 
@@ -367,8 +383,25 @@ impl CollabHub {
 
     /// Replace the per-message bounds.
     ///
-    /// The result shares the same documents, so it is safe to call on a hub
-    /// that is already serving.
+    /// Configure the hub **before** it serves. The returned hub shares the
+    /// live-document registry, so it sees the same documents — but the bounds
+    /// are copied into each [`CollabDoc`] as it is handed out, so a handle
+    /// taken before this call keeps the bounds it was given, and so does any
+    /// surviving clone of the hub it came from. Tightening a limit on a hub
+    /// that is already serving therefore binds the next handle, not the ones
+    /// already in flight.
+    ///
+    /// Build it once, at startup, and put the result in state:
+    ///
+    /// ```ignore
+    /// let hub = CollabHub::new(channels, presence).with_limits(CollabLimits {
+    ///     max_document_chars: 4_000,
+    ///     ..CollabLimits::default()
+    /// });
+    /// ```
+    ///
+    /// `max_document_chars` is held to [`MAX_WIRE_ELEMENTS`] by
+    /// [`CollabLimits::clamped`]; see that method for why.
     #[must_use]
     pub fn with_limits(self, limits: CollabLimits) -> Self {
         Self {
@@ -526,6 +559,7 @@ impl CollabHub {
             return None;
         }
         let text = guard.doc.clone();
+        let revision = guard.revision;
         drop(guard);
         drop(docs);
         Some(CollabClose {
@@ -533,6 +567,7 @@ impl CollabHub {
             key: key.to_owned(),
             state,
             text,
+            revision,
         })
     }
 
@@ -572,16 +607,22 @@ impl CollabHub {
 /// alone, because it is no longer the app's to evict.
 ///
 /// ```ignore
-/// if let Some(closing) = hub.close(&key) {
-///     repo.update(id, body(closing.text())).await?;
-///     closing.finalize(); // the row is written; the next editor may re-seed
+/// let mut closing = hub.close(&key);
+/// while let Some(pending) = closing {
+///     repo.update(id, body(pending.text())).await?;
+///     closing = pending.finalize();
 /// }
 /// ```
 ///
-/// Dropping it without finalizing is safe: nothing holds the document after
-/// that, so the registry's weak reference dies and the next open re-seeds.
-/// Finalizing is how the app says the row is written, and releases the slot
-/// against [`CollabLimits::max_documents`] promptly rather than eventually.
+/// The loop is not ceremony: [`finalize`](Self::finalize) hands the guard
+/// back when the document changed while the write was in flight, because this
+/// guard is the last thing keeping that text alive and no row has it yet.
+///
+/// Dropping it without finalizing is safe for the registry: nothing holds the
+/// document after that, so the weak reference dies and the next open
+/// re-seeds. It is how an app loses an edit made inside the window, though,
+/// and it releases the slot against [`CollabLimits::max_documents`] only
+/// eventually rather than promptly.
 #[must_use = "the document stays open until this guard is finalized or dropped"]
 pub struct CollabClose {
     hub: CollabHub,
@@ -591,6 +632,8 @@ pub struct CollabClose {
     /// the stale row, which is the whole hazard.
     state: Arc<Mutex<DocState>>,
     text: CollabText,
+    /// The document's revision when `text` was taken.
+    revision: u64,
 }
 
 impl CollabClose {
@@ -608,31 +651,67 @@ impl CollabClose {
 
     /// Release the document: the write has committed.
     ///
-    /// Leaves it alone if an editor joined while the write was in flight, or
-    /// if the key now names a different document. Either way the live
-    /// document is the authority and evicting it would strand its editors.
+    /// Returns `None` when the document is released, or when an editor is on
+    /// it — an occupied document belongs to that editor's handler, which will
+    /// persist it in turn.
+    ///
+    /// Returns `Some` when the document **changed** while the write was in
+    /// flight. The state just committed is not the document's any more, so
+    /// the returned guard carries the newer text: persist that and finalize
+    /// again. This is not hypothetical, and occupancy cannot see it — an
+    /// editor can reconnect, type, and leave again entirely inside the
+    /// window, and nothing else will ever write their characters down. The
+    /// loop ends as soon as a finalize finds the document where it left it:
+    ///
+    /// ```ignore
+    /// let mut closing = hub.close(&key);
+    /// while let Some(pending) = closing {
+    ///     repo.update(id, body(pending.text())).await?;
+    ///     closing = pending.finalize();
+    /// }
+    /// ```
     ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
-    pub fn finalize(self) {
+    #[must_use = "a returned guard means the document moved on and still needs persisting"]
+    pub fn finalize(self) -> Option<Self> {
         let mut docs = self
             .hub
             .inner
             .docs
             .lock()
             .expect("collab registry lock poisoned");
-        // Only this document, and only if it is still empty of editors.
-        let Some(live) = docs.get(&self.key).and_then(Weak::upgrade) else {
-            return;
-        };
+        let live = docs.get(&self.key).and_then(Weak::upgrade)?;
+        // A different document now wears this key.
         if !Arc::ptr_eq(&live, &self.state) {
-            return;
+            return None;
         }
-        if live.lock().expect("collab document lock poisoned").sessions > 0 {
-            return;
+        let state = live.lock().expect("collab document lock poisoned");
+        // Occupied: its editor's handler owns persisting it from here.
+        if state.sessions > 0 {
+            return None;
         }
+        // Moved on since the state that was just written was taken. Hand the
+        // caller what the document actually holds now. Releasing here would
+        // drop it: this guard is the last thing keeping it alive, so the
+        // difference would exist in no row and no memory.
+        if state.revision != self.revision {
+            let text = state.doc.clone();
+            let revision = state.revision;
+            drop(state);
+            drop(docs);
+            return Some(Self {
+                hub: self.hub,
+                key: self.key,
+                state: self.state,
+                text,
+                revision,
+            });
+        }
+        drop(state);
         docs.remove(&self.key);
+        None
     }
 }
 
@@ -861,7 +940,7 @@ impl CollabDoc {
                             limit: self.limits.max_document_chars,
                         });
                     }
-                    state.doc.insert_after(actor, after.as_ref(), &text)
+                    state.edit(|doc| doc.insert_after(actor, after.as_ref(), &text))
                 };
                 self.broadcast_ops(&ops);
                 Ok(ops)
@@ -880,7 +959,7 @@ impl CollabDoc {
                     // buffered. Buffered, it would tombstone that character
                     // the moment somebody typed it — one message could
                     // pre-delete another editor's next thousand keystrokes.
-                    state.doc.remove_known(&ids)
+                    state.edit(|doc| doc.remove_known(&ids))
                 };
                 self.broadcast_ops(&ops);
                 Ok(ops)
@@ -934,7 +1013,7 @@ impl CollabDoc {
             let accepted: Vec<CollabOp> = ops
                 .iter()
                 .filter(|op| {
-                    let integrated = state.doc.apply((*op).clone());
+                    let integrated = state.edit(|doc| doc.apply((*op).clone()));
                     integrated || state.doc.holds_pending(op)
                 })
                 .cloned()
@@ -977,7 +1056,7 @@ impl CollabDoc {
                 limit: self.limits.max_document_chars,
             });
         }
-        state.doc.apply_all(ops.iter().cloned());
+        state.edit(|doc| doc.apply_all(ops.iter().cloned()));
         drop(state);
         Ok(())
     }

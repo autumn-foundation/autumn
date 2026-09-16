@@ -284,7 +284,7 @@ fn closing_a_document_returns_its_final_state() {
     // stale row and overwrite it.
     assert_eq!(hub.open_keys(), vec!["notes:7:body".to_owned()]);
 
-    closing.finalize();
+    assert!(closing.finalize().is_none(), "nothing changed since");
     assert!(hub.open_keys().is_empty(), "the write committed");
     assert!(
         hub.close("notes:7:body").is_none(),
@@ -331,8 +331,9 @@ fn a_reconnect_during_the_write_window_finds_the_live_document() {
         .expect("insert");
     assert_eq!(rejoined.text(), "drafted");
 
-    // The write commits. The document is occupied now, so it is not evicted.
-    closing.finalize();
+    // The write commits. The document is occupied now, so it is not evicted
+    // and not handed back: that editor's handler owns persisting it.
+    assert!(closing.finalize().is_none(), "an editor is on it");
     assert_eq!(
         hub.open_keys(),
         vec!["notes:20:body".to_owned()],
@@ -703,6 +704,108 @@ fn a_refused_remote_operation_is_not_broadcast() {
     assert!(
         watcher.try_recv().is_err(),
         "and nothing was published, so no client can integrate it"
+    );
+}
+
+/// An editor who arrives and leaves inside the write window is not dropped.
+///
+/// `finalize` checking occupancy alone could not see this: by the time it
+/// runs, the reconnecting editor has gone and `sessions` is zero again — but
+/// the row being committed was taken before they typed. Evicting there would
+/// throw away the only copy of their characters.
+#[test]
+fn an_edit_made_and_ended_inside_the_write_window_survives() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:21:body", || CollabText::from_text("seed", "draft"))
+        .expect("open the document");
+
+    let closing = hub.close("notes:21:body").expect("the document was live");
+    assert_eq!(closing.text().text(), "draft", "what the app will persist");
+    drop(doc);
+
+    // A reconnect lands, types, and goes again — all before the write lands.
+    {
+        let rejoined = hub
+            .open_with("notes:21:body", || panic!("a second authority"))
+            .expect("open the document");
+        let _editor = rejoined.join("ada", "Ada");
+        rejoined
+            .handle(
+                "ada",
+                CollabClientMessage::Insert {
+                    after: rejoined.document().id_at(4),
+                    text: "ed".to_owned(),
+                },
+            )
+            .expect("insert");
+        assert_eq!(rejoined.text(), "drafted");
+    }
+
+    // The write commits the pre-reconnect snapshot. The document moved on
+    // since, so finalize does not release it — it hands back what the
+    // document actually holds, because this guard is the last thing keeping
+    // that text alive and no row has it.
+    let again = closing
+        .finalize()
+        .expect("the document moved on while the write was in flight");
+    assert_eq!(
+        again.text().text(),
+        "drafted",
+        "the reconnect's edit, handed back to persist"
+    );
+
+    // The app persists that, and finalizes again. Nothing has changed since,
+    // so this time the document is released.
+    assert!(
+        again.finalize().is_none(),
+        "the second write matched the document, so it is released"
+    );
+    assert!(hub.open_keys().is_empty());
+}
+
+/// `with_limits` binds the handles taken after it, not the ones already out.
+#[test]
+fn with_limits_binds_the_next_handle_not_the_last_one() {
+    let loose = hub();
+    let early = loose
+        .open_with("notes:22:body", CollabText::new)
+        .expect("open the document");
+
+    let tight = loose.with_limits(CollabLimits {
+        max_document_chars: 2,
+        ..CollabLimits::default()
+    });
+
+    // The handle taken before the call keeps the bounds it was given.
+    early
+        .handle(
+            "ada",
+            CollabClientMessage::Insert {
+                after: None,
+                text: "abcdef".to_owned(),
+            },
+        )
+        .expect("the earlier handle keeps its own bounds");
+
+    // A handle taken after it does not. It is the same document — the
+    // registry is shared — so the characters above are already there.
+    let late = tight
+        .document("notes:22:body")
+        .expect("the same live document");
+    assert_eq!(late.text(), "abcdef");
+    let refused = late
+        .handle(
+            "ada",
+            CollabClientMessage::Insert {
+                after: None,
+                text: "g".to_owned(),
+            },
+        )
+        .expect_err("over the tightened limit");
+    assert!(
+        matches!(refused, CollabError::DocumentFull { .. }),
+        "the new bounds apply to the new handle: {refused:?}"
     );
 }
 

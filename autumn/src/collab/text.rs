@@ -392,7 +392,26 @@ impl CollabText {
             .filter(|op| !self.buffered.contains(**op))
             .collect();
 
-        charged.len()
+        // Credit what the batch frees. A buffered delete occupies a slot only
+        // until its target arrives: applying the insert tombstones it and the
+        // delete leaves the buffer, so the pair costs one element, not two.
+        // Charging both made a delete for an unknown id able to lock its own
+        // insert out of a full document — permanently, since the delete can
+        // never drain without it.
+        //
+        // Only deletes are credited. A buffered *insert* that integrates
+        // moves from the buffer to the elements and occupies a slot either
+        // way, so it frees nothing.
+        let freed = self
+            .pending
+            .iter()
+            .filter(|op| match op {
+                CollabOp::Delete { target } => introduced.contains(target),
+                CollabOp::Insert { .. } => false,
+            })
+            .count();
+
+        charged.len().saturating_sub(freed)
     }
 
     /// The operations still waiting for the character they name.
@@ -1089,6 +1108,38 @@ mod tests {
             target: OpId::new(9, "bob"),
         }];
         assert_eq!(doc.novel_count(orphan.iter()), 1);
+    }
+
+    /// A buffered delete does not lock its own insert out of a full document.
+    ///
+    /// The delete waits for the character it names, so it holds a slot. The
+    /// insert that would free it was charged as if it were new, and a
+    /// document at its limit refused it — leaving the delete stuck forever,
+    /// because nothing else can ever drain it.
+    #[test]
+    fn an_insert_that_drains_a_buffered_delete_is_free() {
+        let mut doc = CollabText::new();
+        let target = OpId::new(7, "ada");
+        doc.apply(CollabOp::Delete {
+            target: target.clone(),
+        });
+        assert_eq!(doc.pending_len(), 1, "the delete is waiting for its target");
+
+        let batch = [CollabOp::Insert {
+            id: target,
+            after: None,
+            ch: 'x',
+        }];
+        assert_eq!(
+            doc.novel_count(batch.iter()),
+            0,
+            "one slot out, one slot in: the pair costs what the delete already holds"
+        );
+
+        // And that is what it really costs.
+        doc.apply_all(batch);
+        assert_eq!(doc.element_count(), 1);
+        assert_eq!(doc.pending_len(), 0);
     }
 
     /// An untrusted document past the element ceiling is refused, not

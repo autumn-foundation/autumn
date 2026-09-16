@@ -141,18 +141,28 @@ copy of the row. Write it back with `doc.document()`, and evict it with
 `hub.close(key)`, which hands you the final state to persist:
 
 ```rust
-if let Some(closing) = hub.close(&key) {
-    repo.update(id, UpdateNote { body: Some(closing.text().clone()), ..Default::default() }).await?;
-    closing.finalize();
+let mut closing = hub.close(&key);
+while let Some(pending) = closing {
+    repo.update(id, UpdateNote { body: Some(pending.text().clone()), ..Default::default() }).await?;
+    closing = pending.finalize();
 }
 ```
 
 The document stays discoverable until you `finalize`. That window is the
 write: an editor who reconnects inside it joins the document on its way out
-rather than seeding a second authority from a row the write has not reached,
-and `finalize` then finds them there and leaves the document alone. Dropping
-the guard without finalizing is safe — the next open re-seeds — but finalizing
-is how you say the row is written.
+rather than seeding a second authority from a row the write has not reached.
+
+`finalize` returns `Some` when the document changed while the write was in
+flight — an editor can reconnect, type and leave again entirely inside the
+window, and the row you just wrote would not carry their characters. The guard
+it hands back holds what the document actually has now, so persist that and
+finalize again; the loop ends as soon as a finalize finds the document where
+it left it. It returns `None` when the document is released, or when an editor
+is still on it, in which case that editor's handler persists it in turn.
+
+Dropping the guard without finalizing is safe — the next open re-seeds — but
+finalizing is how you say the row is written, and the only way you learn that
+it needs writing again.
 
 It returns `CollabError::RegistryFull` when the registry is at
 `CollabLimits::max_documents` and the key is not already live. The hub

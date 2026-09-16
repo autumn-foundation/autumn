@@ -26,7 +26,7 @@ use crate::sync::protocol::{Change, Op, RemoteRow};
 use crate::sync::resolver::{ConflictResolver, LwwResolver, Resolution};
 
 use super::registry::collaborative_columns_for_table;
-use super::text::CollabText;
+use super::text::{CollabText, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING};
 
 /// A conflict resolver that merges collaborative fields instead of
 /// overwriting them.
@@ -154,6 +154,25 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
                         continue;
                     };
                     mine.merge(&theirs);
+                    // Two documents inside the limits can merge into one that
+                    // is not: 6 000 distinct elements each make 12 000. Storing
+                    // it would be worse than not merging — every later read
+                    // would refuse it, this resolver would fall through to
+                    // last-write-wins, and the side it drops would be gone for
+                    // good. Leave the wrapped verdict instead, which is at
+                    // least a document that can still be read.
+                    if mine.element_count() > MAX_WIRE_ELEMENTS
+                        || mine.pending_len() > MAX_WIRE_PENDING
+                    {
+                        tracing::warn!(
+                            field,
+                            elements = mine.element_count(),
+                            pending = mine.pending_len(),
+                            "collab: merged document is past the wire limits; leaving the \
+                             wrapped verdict rather than storing one that cannot be read"
+                        );
+                        continue;
+                    }
                     let Ok(encoded) = serde_json::to_value(&mine) else {
                         continue;
                     };
