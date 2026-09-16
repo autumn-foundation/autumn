@@ -141,20 +141,49 @@ and generator templates — not something to fold into this report as a
 side-effect — but it is *not* the "no clean fix exists" claim an earlier
 draft of this paragraph made.
 
+**Round 6 (review correction): rustdoc/docs.rs.** `autumn/Cargo.toml`'s
+`[package.metadata.docs.rs]` feature list deliberately **excludes**
+`test-support` (comment: *"only meaningful in test binary contexts"*), yet
+several always-compiled public doc comments link into the modules this
+report proposes gating — e.g. `lib.rs:1555`'s
+`` [`crate::test::TestResponse::assert_max_queries`] ``, plus links in
+`entropy.rs` and `state.rs`. `scripts/check-docs.sh` builds exactly that
+docs.rs feature posture with `-D rustdoc::broken_intra_doc_links`. Gating
+`test`/`sim` would turn every one of those into a broken intra-doc link and
+fail the docs gate, on top of dropping both modules' public API pages
+entirely from published docs.
+
+**Round 7 (review correction): the lint gate and the benches.**
+`.github/workflows/ci.yml` runs `cargo clippy --workspace --all-targets -- -D
+warnings` — the documented local lint command in `AGENTS.md` too — and
+`autumn/benches/{request_pipeline,csrf_verify,captcha_check,throttle_check}.rs`
+import `autumn_web::test::TestApp` with no `required-features` on their
+`[[bench]]` entries. `--all-targets` compiles benches, so this would fail the
+lint gate as well.
+
 **Bottom line on the mechanism**, independent of the verdict below: what
 looked, at first read of `test.rs`'s module doc and one existing feature
-flag, like an obviously-available and already-proven fix is not that either —
-five rounds of review (three from outside, two self-corrections while
-drafting this section) kept finding real, previously-uncounted places the
-proposed gate would need to reach: two generator templates, one CI bin
-target's feature gate, and the primary CI job's own test invocation plus
-this repo's documented standard test command. None of those individually is
-a blocker — each has a known fix — but together they add up to a real,
-scoped follow-up change, not the one-line, purely-additive gate this report
-first described. Moot either way given the timing verdict below (there is no
-compile-time win to chase), but recorded in full because the mechanism's
-actual scope, not just this report's numbers, is worth getting right before
-anyone tries it.
+flag, like an obviously-available and already-proven fix keeps turning out
+not to be, and — after seven rounds of finding a new required touch point
+roughly every time this section was re-read (five from outside review, two
+self-corrections) — this report stops treating its own enumeration as
+complete. Every round found the *same shape* of gap: some Cargo target kind
+(a generator template, a `[[bin]]`, the primary test invocation, docs.rs,
+now benches/clippy) uses `test`/`sim` unconditionally and isn't yet
+accounted for. There is no reason to believe examples, doc-tests, or the
+`autumn-cli`/other workspace crates' own test suites are clean either — they
+were never systematically checked, only whatever review happened to name.
+**The actual prerequisite for ever attempting this gate is a full audit
+across every Cargo target kind** (lib, every `[[bin]]`, every `[[test]]`,
+every `[[bench]]`, doc-tests, the docs.rs feature list, and every workspace
+member that depends on `autumn-web`) for `test`/`sim` usage — not another
+round of ad hoc discovery, and not this report. None of the seven gaps found
+so far is individually a blocker — each has a known fix — but the pattern
+across all seven is the finding: **this was never the additive, one-line,
+low-risk gate its first description claimed.** Moot either way given the
+timing verdict below (there is no compile-time win to chase), but recorded
+in full because the mechanism's actual scope, not just this report's
+numbers, is worth getting right before anyone tries it.
 
 **Falsifiable question:** does removing these 12,337 always-on lines produce
 a measurable compile-time reduction for the no-DB daemon feature set
