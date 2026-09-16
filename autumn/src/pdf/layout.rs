@@ -237,12 +237,17 @@ fn nodes_contain_table_output(nodes: &[Node], table_has_other_populated_row: boo
     false
 }
 
-/// True if `node`, recursively through `<thead>`/`<tbody>`/`<tfoot>` (the
-/// only tags [`extract_table_rows`] descends into without emitting a row of
-/// its own), contains a `<tr>` with at least one `<td>`/`<th>` cell — i.e.
-/// a row that would push [`Writer::draw_table`]'s `n_cols` above zero.
-/// Walks with an explicit stack for the same stack-safety reason as
-/// [`subtree_has_visible_content`].
+/// True if `node` — via the exact same dispatch [`extract_table_rows`]
+/// itself uses — would ever push a [`TableRow`] with at least one cell:
+/// a `<tr>` with a real `<td>`/`<th>`, recursively through
+/// `<thead>`/`<tbody>`/`<tfoot>` (the only tags it descends into without
+/// emitting a row of its own), or its catch-all arm turning any other
+/// tag's real text (most commonly `<caption>`) into a one-cell row. Any of
+/// these push [`Writer::draw_table`]'s `n_cols` above zero. Mirrors
+/// [`nodes_contain_table_output`]'s own catch-all arm, which needs the
+/// exact same [`subtree_has_nonempty_text`] check for the exact same
+/// reason. Walks with an explicit stack for the same stack-safety reason
+/// as [`subtree_has_visible_content`].
 fn node_contains_a_populated_row(node: &Node) -> bool {
     let mut stack: Vec<&Node> = vec![node];
     while let Some(node) = stack.pop() {
@@ -258,7 +263,12 @@ fn node_contains_a_populated_row(node: &Node) -> bool {
                 }
             }
             "thead" | "tbody" | "tfoot" => stack.extend(children),
-            _ => {}
+            _ if is_non_rendered(tag) => {}
+            _ => {
+                if subtree_has_nonempty_text(children) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -3337,6 +3347,39 @@ mod tests {
         assert!(
             DEPTH_CAP_HIT.with(std::cell::Cell::get),
             "the table already has a real row, so the dropped empty <tr> still shifts layout"
+        );
+    }
+
+    #[test]
+    fn node_contains_a_populated_row_recognizes_catch_all_content() {
+        // node_contains_a_populated_row (the "does a later sibling
+        // populate this table" lookahead extract_table_rows' depth-cap
+        // guard uses) only recognized a literal <tr> with a real cell —
+        // but extract_table_rows's own catch-all arm (most commonly
+        // <caption>) also turns real content into a one-cell row, which
+        // is just as capable of making Writer::draw_table's n_cols
+        // nonzero. A <caption> with real text must count too, the same
+        // way nodes_contain_table_output's own catch-all arm already
+        // does via subtree_has_nonempty_text. (Codex review on PR #2810.)
+        //
+        // Unit-tested directly on the helper rather than through
+        // extract_table_rows/DEPTH_CAP_HIT end to end: a sibling <tr>'s
+        // own recursion and a sibling <caption>'s own cell-content check
+        // are both checked at the same depth + 1 relative to their shared
+        // parent, so wrapping the whole thing deep enough to cap the
+        // <tr>'s recursion caps the <caption>'s own content at the exact
+        // same point too — there's no depth where only one of them is
+        // capped, the same shallower-depth conflict
+        // empty_tr_past_the_depth_cap_still_warns_when_the_table_has_other_rows's
+        // doc comment already ran into for cell content specifically.
+        let caption = Node::Element {
+            tag: "caption".to_owned(),
+            children: vec![Node::Text("X".to_owned())],
+        };
+        assert!(
+            node_contains_a_populated_row(&caption),
+            "a <caption> with real text draws a one-cell row via extract_table_rows's \
+             catch-all arm, so this must count as a populated row"
         );
     }
 
