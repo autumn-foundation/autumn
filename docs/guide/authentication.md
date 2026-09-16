@@ -498,8 +498,14 @@ new one** carrying the same principal, name, scopes and expiry, then prints the
 new secret. The replacement is a distinct token: new id, new `created_at`, and
 no `last_used_at` until it is used. The retired row stays in the table with
 `revoked_at` set, so `autumn token list` shows both — expect one live row and
-one revoked row per rotation, and key any tooling on the token's *name* rather
-than its id.
+one revoked row per rotation.
+
+Nothing on the row survives a rotation as an identifier, and `name` is not a
+substitute: the column is `TEXT NOT NULL DEFAULT ''` with no unique
+constraint, and `--name` defaults to the empty string, so it is a label that
+several tokens — including every unnamed one — can share. Tooling should
+filter on `revoked_at IS NULL` to find the live token rather than treating
+either the id or the name as a stable handle across rotations.
 
 In Rust, the same four operations are
 [`issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token` and
