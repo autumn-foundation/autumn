@@ -20,6 +20,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nests this deep), but any caller who feeds it recursive content (a
   comment thread, a nested reply tree) can now detect truncation instead
   of shipping an incomplete PDF unnoticed.
+- **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
+  api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
+  token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
+  nowhere told them where the token comes from or how to take it back. All
+  four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
+  `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
+  reached readers only through the agent skill tree and `list` / `rotate` /
+  `revoke` reached them nowhere: searching all 160 guide pages for "revoke
+  api token" returned **zero results**, and `issue_scoped_api_token` /
+  `IssueTokenSpec` appeared on none of them. A reader holding a leaked
+  credential had no path from the page that raised the question to the
+  command that answers it. This is a findability defect, not a coverage
+  one — the answer existed and was correct — so the fix is a crosslink at
+  the point the question arises rather than a new page: a section under
+  "Protecting routes" in `docs/guide/authentication.md` naming all four
+  commands and linking the Rust equivalents, and a pointer from
+  `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token. The
+  worked block captures what `issue` and `rotate` print (they write the token to
+  stdout and the confirmation to stderr, so a `$(…)` capture gets the secret and
+  nothing else), and says plainly that `rotate` and `revoke` are alternatives
+  rather than steps: rotating already revokes the token passed to it, so a
+  following `revoke "$TOKEN"` would retire a dead token and strand the live
+  replacement with its secret lost. The Rust pointers name one helper per
+  subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
+  `revoke_api_token` — rather than omitting list and rotate and listing the
+  `IssueTokenSpec` data type as though it were an operation.
+
+  Found by running the docs corpus against the CLI surface in the direction
+  no existing gate runs: the eleven docs gates all ask "is what we wrote
+  still true?" (drift), and none asks "is what we shipped written down
+  anywhere?" (coverage), so a command can ship documented nowhere and the
+  whole tree stays green. That measurement found 26 of 194 command paths
+  absent from all 212 reader-facing pages; most were benign (13 `destroy`
+  subcommands covered by the rule `generators.md` states over the family,
+  one `#[command(hide = true)]` internal), and the `autumn token` family was
+  the defect worth fixing. A gate to hold that line is NOT included here —
+  see the note in the PR: a correct one has to reuse
+  `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
+  its own change.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the
@@ -199,6 +239,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/commentable.md`.
 
 ### Added
+
+- **`autumn-admin-plugin` builds under the `SQLite` backend, and an
+  application's own `AdminModel`s run there (#2108) [no-plugin].** A `SQLite`
+  app could not compile the admin plugin at all. Two Postgres-only diesel
+  constructs stopped it: the `Timestamptz` SQL type on five `QueryableByName`
+  rows and on the typed `ExperimentChange` model, and three `Array<BigInt>`
+  bulk binds. PR #2125 changed the connection type to `RuntimeConnection`. That
+  change did not remove these errors. This change removes them. Every timestamp
+  row now declares the portable `Timestamp` type with a `NaiveDateTime` field,
+  and the three batched bulk deletes sit in the `pg` arm of
+  `autumn_web::backend_select!`. `cargo clippy -p autumn-admin-plugin --features
+  autumn-web/sqlite --all-targets` is clean, and CI's `SQLite runtime` job gates
+  it. **No change to any SQL sent, or to any value read, on Postgres.** Postgres
+  sends `timestamp` and `timestamptz` in the same binary form: microseconds from
+  2000-01-01 UTC. A `Timestamp` read of a `timestamptz` column gives the same
+  instant. The new `experiment_admin_db` and `feature_flag_admin_db` suites
+  assert this on a non-UTC session, for `changed_at` and for `updated_at`. The
+  Postgres statement text does not change, so the one-statement result the
+  `*_bulk_delete_batch_profile` harnesses measure still holds; a new guard test
+  keeps the batched fragment of each statement. An app on either backend can now
+  register its own `AdminModel`s;
+  `autumn-admin-plugin/tests/custom_admin_model.rs` runs one test body on both,
+  from CI's `Test (Docker)` and `SQLite runtime` jobs. The three BUILT-IN models
+  (`tokens`, `experiments`, `feature_flags`) stay Postgres-only, because their
+  migrations use Postgres-only DDL and the tables do not exist on `SQLite`. On
+  `SQLite` each refuses every call with an error that names the model and points
+  at the README, instead of sending Postgres SQL to a `SQLite` driver — a
+  source guard keeps every method opening with that check, and a SQLite-lane
+  test drives all 23 of them. The
+  plugin README lists the four rules that keep an application model's SQL
+  portable.
 
 - **`scripts/check-docs-features.sh` — feature-gate documentation gate
   [no-plugin].** Every reader-facing page that shows Rust reaching for an
@@ -770,6 +841,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fifth unwatched spelling is how that recurs.
 
 ### Changed
+
+- **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
+  `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL
+  type the generated DSL binds, and `DateTime<Utc>` maps to the Postgres-only
+  `Timestamptz`, which stopped the crate compiling under `autumn-web/sqlite`.
+  **Breaking:** a downstream that names this public type sees three changes —
+  the field type itself, the `Serialize` output (now `"2024-01-15T12:34:56"`,
+  with no `Z`), and the derived OpenAPI schema (no `"format": "date-time"`).
+  Call `.and_utc()` to recover a `DateTime<Utc>`. The column stays
+  `timestamptz`, and the value does not move. See the
+  [migration guide](docs/migrations/next.md#admin-plugin-experimentchangechanged_at-is-now-naivedatetime).
 
 - **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
   CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
@@ -1687,6 +1769,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `docs/security/2026-09-13-repository-owner-api-bypass/`.
 
 ### Performance
+
+- **⚡ Bolt: `MemorySearchBackend::keyword_search` sorts only the requested
+  page instead of the whole match set (instructions -15.4%, DHAT bytes
+  -24.9%):** `keyword_search` (`autumn-search/src/memory.rs`) collected every
+  matching document into `hits`, ran a full `sort_hits` (stable `sort_by`)
+  over the entire match set, then handed the sorted `Vec` to `paginate`,
+  which only ever keeps one `size`-row page (20 rows in
+  `benches/keyword_search.rs`, the shape `SearchClient::search` exposes). An
+  AND query over a shared vocabulary routinely matches a large fraction of
+  the corpus — profiling the committed 5,000-document/2-field bench found
+  the sort (`quicksort`/`quicksort'2`) costing ~13.5% of the bench's own
+  instructions to serve a 20-row page out of matches numbering in the
+  thousands. `keyword_search` now computes the page's `offset + size` window
+  up front and calls a new `sort_top_k`, which uses
+  `select_nth_unstable_by` to partition the match set around the last
+  needed index in O(n), then runs the same canonical-order `sort_by` (now
+  `hit_order`, factored out of `sort_hits`) over only that prefix — falling
+  back to a full `sort_hits` when the requested window covers the whole
+  match set. `vector_search`'s own `sort_hits` + `truncate` is untouched:
+  this fix only changes what `keyword_search` measurably pays for, per its
+  committed benchmark.
+  Measured on `autumn-search/benches/keyword_search.rs` (2,000 queries):
+  `valgrind --tool=callgrind` instructions 23,551,537,844 → 19,919,821,513
+  (**-15.4%** overall, **-16.2%** on the per-query marginal after
+  subtracting the shared 0-iteration fixed cost); `valgrind --tool=dhat`
+  total allocated bytes 1,158,185,947 → 870,024,907 (**-24.9%**, block count
+  unchanged at ~18.45M — Rust's stable sort allocates a merge buffer sized
+  to the slice being sorted, so sorting ~20 elements instead of the whole
+  match set shrinks that buffer's size, not the number of allocations).
+  Behavior is unchanged: all 128 `autumn-search` lib tests pass unmodified,
+  including the pagination-total and tie-break-by-id cases.
 
 - **⚡ Bolt: cache the AES-256-GCM cipher on `DataKey` instead of rebuilding
   it on every `encrypt`/`decrypt` call (instructions -25.5%):**
