@@ -4737,8 +4737,40 @@ fn declared_alert_config_in(
         break;
     }
 
+    // Review finding on #2267: `strict_config` hard-fails `load_runtime_config`
+    // on a typo'd key inside `[alerts]`/`[http]` (e.g. `enabeld` for
+    // `enabled`) — the exact scenario landing here. Plain deserialize
+    // ignores an unrecognized field silently, which would default a
+    // mistyped `enabled` switch back to `true`. Reject it instead, using
+    // the SAME schema the primary path checks against.
+    if merged_alerts_or_http_has_unknown_key(&merged) {
+        return None;
+    }
+
     let root: AlertsHttpTomlRoot = merged.try_into().ok()?;
     Some((root.alerts, root.http))
+}
+
+/// Whether `merged` has an unrecognized key under `alerts` or `http`.
+///
+/// Reuses [`AutumnConfig::validate_toml`]/[`AutumnConfig::get_schema_keys`]
+/// — the same schema check `strict_config` runs on the primary path —
+/// filtered to `alerts`/`http` paths only, so an unrelated unknown
+/// top-level root (a plugin-owned table) is never mistaken for our own
+/// error.
+fn merged_alerts_or_http_has_unknown_key(merged: &toml::Value) -> bool {
+    let Ok(toml_str) = toml::to_string(merged) else {
+        return false;
+    };
+    let schema = AutumnConfig::get_schema_keys();
+    AutumnConfig::validate_toml(&toml_str, &schema)
+        .iter()
+        .any(|(path, _)| {
+            path == "alerts"
+                || path.starts_with("alerts.")
+                || path == "http"
+                || path.starts_with("http.")
+        })
 }
 
 /// Load `[alerts]` under the TARGET deploy profile. Build its channels.
@@ -9948,6 +9980,27 @@ mod tests {
         assert!(
             declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
             "a malformed profile override file must fail closed, not fall back to base config"
+        );
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unknown_alerts_key() {
+        // Review finding on #2267: `strict_config` would hard-fail
+        // `load_runtime_config` on a typo'd `[alerts]` key (`enabeld` for
+        // `enabled`), landing here. Plain deserialize would silently drop
+        // it and default the switch back to `true` -- exactly the
+        // operator's mistyped attempt to turn it off.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\nenabeld = false\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a typo'd [alerts] key must fail closed, not silently default enabled back to true"
         );
     }
 
