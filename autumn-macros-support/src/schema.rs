@@ -976,6 +976,21 @@ fn scalar_json_schema(
             Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
         ),
         "Uuid" => ("string", Some("uuid"), None),
+        // #1771: both confidential wrappers serialize as a string — `Sealed` as
+        // the base64 envelope, `BlindIndex` as its hex token. Without an entry
+        // here the emitter publishes an unresolved `$ref` backfilled as an
+        // opaque object, so a generated client would send an object where only
+        // a string is accepted.
+        "Sealed" => (
+            "string",
+            None,
+            Some("Base64 envelope of a value sealed under the owner's key; opaque to the server"),
+        ),
+        "BlindIndex" => (
+            "string",
+            None,
+            Some("Client-computed equality token: 32 lowercase hex characters"),
+        ),
         _ => return None,
     })
 }
@@ -1012,6 +1027,8 @@ fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
         "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
         "NaiveTime" => quote! { #chrono::NaiveTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        "Sealed" => quote! { ::autumn_web::confidential::Sealed },
+        "BlindIndex" => quote! { ::autumn_web::confidential::BlindIndex },
         _ => return None,
     };
     Some(quote! { __identity == ::core::any::type_name::<#real>() })

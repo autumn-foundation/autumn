@@ -1300,7 +1300,16 @@ async fn model_export_csv(
 
     // Page through records in batches to avoid buffering the entire dataset
     // as JSON in memory at once.
-    let columns = model.csv_export_columns();
+    // #1771: `csv_export_columns` is overridable, and an override that returns a
+    // curated list never runs the default's filter. The export is the one admin
+    // surface that leaves the database in a file built for sharing, so the
+    // confidential columns and their blind-index companions are dropped here,
+    // where no model can opt back in.
+    let columns: Vec<&'static str> = model
+        .csv_export_columns()
+        .into_iter()
+        .filter(|name| !::autumn_web::confidential::is_confidential_column_name(name))
+        .collect();
     let mut buf = Vec::new();
     {
         let mut wtr = csv::WriterBuilder::new()

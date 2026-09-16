@@ -4495,6 +4495,10 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                // #1771: `#[confidential]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Sealed` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("confidential")
         })
         .collect()
 }
@@ -4628,6 +4632,294 @@ fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedSpec> {
 /// Convenience: just the mode (used by the diesel-wrapper routing).
 fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> {
     Ok(parse_field_encrypted(field)?.mode)
+}
+
+// ── #1771: `#[confidential]` field attribute ─────────────────────
+
+/// Parsed `#[confidential(...)]` field specification (issue #1771).
+#[derive(Clone, Copy, Default)]
+struct ConfidentialSpec {
+    /// The field carries `#[confidential]`.
+    present: bool,
+    /// `blind_index` — a companion `<field>_bidx` column holds the equality
+    /// token, so the field supports `WHERE <field>_bidx = $1` lookups.
+    blind_index: bool,
+}
+
+/// The companion column name for a `#[confidential(blind_index)]` field.
+fn blind_index_column(field: &syn::Ident) -> String {
+    format!("{}_bidx", unraw_ident(field))
+}
+
+/// Parse `#[confidential]` / `#[confidential(blind_index)]`.
+fn parse_field_confidential(field: &syn::Field) -> syn::Result<ConfidentialSpec> {
+    let mut spec = ConfidentialSpec::default();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("confidential") {
+            continue;
+        }
+        spec.present = true;
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("blind_index") {
+                spec.blind_index = true;
+                return Ok(());
+            }
+            Err(meta.error(
+                "unsupported `#[confidential]` option; the first slice supports \
+                 `blind_index` only (issue #1771). Write `#[confidential]` or \
+                 `#[confidential(blind_index)]`.",
+            ))
+        })?;
+    }
+    Ok(spec)
+}
+
+/// Reject every marker that would make the operator read, index, order or join
+/// a sealed column. Split out of [`validate_confidential_field`] so the table
+/// of reasons stays one readable list.
+fn reject_confidential_marker_conflicts(field: &syn::Field) -> syn::Result<()> {
+    // Anything that makes the operator read, index, order or join the column is
+    // refused: the server holds ciphertext it cannot compare or rank.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "`#[encrypted]` seals the column under a key the operator holds, which \
+             is the trust boundary `#[confidential]` exists to remove",
+        ),
+        (
+            "classified",
+            "a classification gates where a plaintext may go; a confidential column \
+             has no server-side plaintext to gate",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, and an index over \
+             ciphertext matches nothing",
+        ),
+        (
+            "normalize",
+            "a normalizer rewrites the column in place, which needs the plaintext \
+             the server does not have",
+        ),
+        (
+            "unique",
+            "a UNIQUE constraint compares stored values, and sealing is randomized, \
+             so equal plaintexts never collide. Put the constraint on the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "indexed",
+            "an index over randomized ciphertext serves no lookup. Index the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "references",
+            "a foreign key is a server-side join, which cannot read a sealed value",
+        ),
+        (
+            "translatable",
+            "a per-locale container is a JSON document, not the single sealed value",
+        ),
+        (
+            "id",
+            "a primary key is echoed back in URLs, ETags and pagination cursors, \
+             and the server must be able to compare it",
+        ),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, which the state-machine \
+             codegen reads and writes directly",
+        ),
+        (
+            "default",
+            "a default is a server-side value, and the server cannot seal one",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("`#[confidential]` cannot be combined with `#[{marker}]`: {why}."),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a `#[confidential]` field against the whole struct.
+///
+/// `siblings` is every field of the model, needed to prove that a
+/// `blind_index` field has its companion token column.
+fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::Result<()> {
+    let spec = parse_field_confidential(field)?;
+    if !spec.present {
+        return Ok(());
+    }
+
+    reject_confidential_marker_conflicts(field)?;
+
+    if ty_last_ident(&field.ty).as_deref() != Some("Sealed") {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[confidential]` requires the field type \
+             `autumn_web::confidential::Sealed` (issue #1771). The server never \
+             holds the plaintext, so the column is declared as the envelope it \
+             actually stores.",
+        ));
+    }
+
+    let ident = field
+        .ident
+        .as_ref()
+        .ok_or_else(|| syn::Error::new_spanned(field, "`#[confidential]` needs a named field"))?;
+
+    if unraw_ident(ident) == "tenant_id" {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` cannot be applied to `tenant_id`: the tenancy codegen \
+             reads the column directly as its isolation key, so the server must be \
+             able to compare it.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A Diesel rename would desync the two.
+    if diesel_column_name(field).is_some() {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` fields cannot use `#[diesel(column_name = ...)]`: the \
+             column is registered under its Rust name, which the build-time query \
+             guard, the log filter, version history and admin redaction all key off.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A serde rename or alias would desync the two.
+    if let Some(key) = field_serde_wire_name_override(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which the log filter, version history \
+                 and admin redaction all key off. An alias is accepted on the way in, so \
+                 a request could deliver the envelope under a name no filter knows, and \
+                 `flatten` removes the key altogether.",
+                serde_key_display(key)
+            ),
+        ));
+    }
+
+    // The envelope is what the owning client needs back, so a confidential
+    // column is always serialized. Skipping it would also drop it out of the
+    // version-history snapshot, which is built from the `Serialize` view: the
+    // column would then produce no "changed" marker at all rather than the
+    // redacted one the registry promises. On the way in, the client's own bytes
+    // are the only valid value, so an omission has no server-side substitute.
+    if let Some(attr) = field_serde_omission(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential]` fields cannot use `#[{attr}]`: the envelope is \
+                 ciphertext the owning client needs back, a skipped column leaves \
+                 version history with no record that it changed, and a defaulted one \
+                 stores an envelope no key opens."
+            ),
+        ));
+    }
+
+    if spec.blind_index {
+        validate_blind_index_companion(field, ident, siblings)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the `<field>_bidx` companion of a `#[confidential(blind_index)]`
+/// field: it must exist, be a `BlindIndex`, and keep its Rust name.
+fn validate_blind_index_companion(
+    field: &syn::Field,
+    ident: &syn::Ident,
+    siblings: &[&Field],
+) -> syn::Result<()> {
+    let expected = blind_index_column(ident);
+    let companion = siblings
+        .iter()
+        .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
+    match companion {
+        Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {
+            // The companion is registered under its Rust name too, and every
+            // protection it gets is keyed off that name: version-history
+            // redaction, the log parameter filter and the CSV export. A rename
+            // on the companion would leave the token unprotected under a name
+            // none of them look for, which is worse than a rename on the sealed
+            // column: the token is what tells an operator which of an owner's
+            // rows hold the same value.
+            // Markers that keep a column out of the `New*` struct leave the
+            // client-computed token with nowhere to go: the insert either fails
+            // on the non-null column or stores a server-side default that does
+            // not match the sealed value, and every equality lookup then misses
+            // the row.
+            for marker in ["default", "id", "lock_version", "position"] {
+                if has_attr(f, marker) {
+                    return Err(syn::Error::new_spanned(
+                        f,
+                        format!(
+                            "`{expected}` is a blind-index companion, so it cannot be \
+                             `#[{marker}]`: that keeps the column out of the insert, and \
+                             the token has to be the one the client computed for the \
+                             sealed value."
+                        ),
+                    ));
+                }
+            }
+            if field_serde_wire_name_override(f).is_some()
+                || diesel_column_name(f).is_some()
+                || field_serde_omission(f).is_some()
+            {
+                return Err(syn::Error::new_spanned(
+                    f,
+                    format!(
+                        "`{expected}` is a blind-index companion, so it cannot use \
+                         `#[serde(rename/alias = ...)]`, `#[serde(flatten)]`, \
+                         `#[diesel(column_name = ...)]`, `#[private]`, \
+                         `#[serde(skip_serializing)]`, `#[serde(default)]` or \
+                         `#[serde(skip_deserializing)]`: the token is registered under \
+                         its Rust name, which version history, the log filter and the CSV \
+                         export all key off, and a defaulted token matches no envelope."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Some(f) => Err(syn::Error::new_spanned(
+            &f.ty,
+            format!(
+                "`{expected}` is the blind-index companion of a \
+                 `#[confidential(blind_index)]` field, so it must be typed \
+                 `autumn_web::confidential::BlindIndex`."
+            ),
+        )),
+        None => Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential(blind_index)]` needs a companion column \
+                 `{expected}: autumn_web::confidential::BlindIndex` on this \
+                 model. The client computes the token; the server only \
+                 compares it."
+            ),
+        )),
+    }
 }
 
 // ── #1654: `#[classified]` field attribute ───────────────────────────────────
@@ -5375,6 +5667,95 @@ fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
     found
 }
 
+/// The attribute, if any, that lets a confidential value leave or enter the
+/// model without the client's own bytes. Named as the author wrote it.
+///
+/// On the way out, a column omitted on any path is absent from the
+/// version-history snapshot, which is built from the `Serialize` view, so it
+/// produces no "changed" marker at all. This is broader than
+/// [`field_already_skips_serialization`], which drives attribute injection and
+/// must not treat a conditional skip as an unconditional one.
+///
+/// On the way in, both wrappers implement `Default`, so serde reads an omitted
+/// value as valid input rather than an error: a defaulted `Sealed` is an
+/// envelope no key opens, and a defaulted `BlindIndex` is a random token that
+/// matches no envelope.
+fn field_serde_omission(field: &syn::Field) -> Option<&'static str> {
+    if has_attr(field, "private") {
+        return Some("private");
+    }
+    if field_already_skips_serialization(field) {
+        return Some("serde(skip_serializing)");
+    }
+    if field_has_skip_serializing_if(field) {
+        return Some("serde(skip_serializing_if = ...)");
+    }
+    match serde_bare_word(&field.attrs, &["skip_deserializing", "default"]) {
+        Some("skip_deserializing") => Some("serde(skip_deserializing)"),
+        Some(_) => Some("serde(default)"),
+        None => None,
+    }
+}
+
+/// Render a serde key as it is written: `flatten` and `transparent` take no
+/// value, the others do.
+fn serde_key_display(key: &str) -> String {
+    if matches!(key, "flatten" | "transparent") {
+        key.to_owned()
+    } else {
+        format!("{key} = ...")
+    }
+}
+
+/// Whether a container reshapes its serialized form: `#[serde(into = "...")]`,
+/// `from`, `try_from` or `transparent`.
+///
+/// The first three decide the keys and `transparent` removes them, so a registry
+/// keyed on the model's own field names cannot see through any of them.
+fn attrs_have_serde_shape_conversion(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            for key in ["into", "from", "try_from", "transparent"] {
+                if meta.path.is_ident(key) {
+                    found = found.or(Some(key));
+                }
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a container lets serde fill a missing field from `Default`:
+/// `#[serde(default)]` or `#[serde(default = "...")]` written on the struct.
+///
+/// Serde applies it to every field the input omits, so unlike the field-level
+/// spelling it reaches the sealed column and its token without either of them
+/// carrying an attribute of its own.
+fn attrs_have_serde_container_default(attrs: &[syn::Attribute]) -> bool {
+    let mut found = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                found = true;
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
 /// Whether a field carries a `#[serde(rename = "...")]` (which would desync the
 /// encrypted-column registry from the serialized key).
 fn field_has_serde_rename(field: &syn::Field) -> bool {
@@ -5392,6 +5773,42 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
         });
     }
     renamed
+}
+
+/// The `#[serde(...)]` key that stops a field appearing under its Rust name:
+/// `rename` (what it serializes as), `alias` (what it also accepts on the way
+/// in) or `flatten` (no key of its own at all).
+///
+/// `#[confidential]` keys every protection off the Rust name, so all three
+/// matter. `alias` is the subtlest: the field still serializes under its Rust
+/// name, but a request may deliver it under the alias, and a raw-JSON capture
+/// path (a failure capsule, an error-page body preview) filters on names the
+/// registry knows. `flatten` does not even work on a `Sealed` column — serde
+/// takes the derive and fails at run time, because the value serializes as a
+/// string — and `version_column_values()` turns that failure into an empty
+/// snapshot, so the update records no change marker at all.
+fn field_serde_wire_name_override(field: &syn::Field) -> Option<&'static str> {
+    if let Some(word) = serde_bare_word(&field.attrs, &["flatten"]) {
+        return Some(word);
+    }
+    let mut found = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                found = Some("rename");
+            } else if meta.path.is_ident("alias") {
+                found = found.or(Some("alias"));
+            }
+            // Consume any `= value` so sibling metas keep parsing.
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -7545,6 +7962,140 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|(_, col, _)| col.as_str())
         .collect();
 
+    // Collect `#[confidential]` columns (issue #1771, validated to be `Sealed`).
+    // Each entry: (column name, blind-index companion column).
+    let mut confidential_columns: Vec<(String, Option<String>)> = Vec::new();
+    // One type assertion per confidential field. The attribute checks the field's
+    // type by name, which is a friendly diagnostic but not a proof: an app type
+    // that happens to be called `Sealed` would otherwise earn every guarantee the
+    // registry then claims, over a column holding plaintext. This is the proof.
+    let mut confidential_type_assertions: Vec<TokenStream> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_confidential_field(f, &all_fields) {
+            return err.to_compile_error();
+        }
+        let spec = match parse_field_confidential(f) {
+            Ok(spec) => spec,
+            Err(err) => return err.to_compile_error(),
+        };
+        if !spec.present {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        let bidx = spec.blind_index.then(|| blind_index_column(ident));
+        confidential_type_assertions.push(quote! {
+            const _: () = {
+                #[allow(dead_code)]
+                fn __autumn_confidential_column_is_sealed(
+                    m: &#name,
+                ) -> &::autumn_web::confidential::Sealed {
+                    &m.#ident
+                }
+            };
+        });
+        if let Some(ref bidx_name) = bidx {
+            let bidx_ident = format_ident!("{bidx_name}");
+            confidential_type_assertions.push(quote! {
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __autumn_blind_index_column_is_a_token(
+                        m: &#name,
+                    ) -> &::autumn_web::confidential::BlindIndex {
+                        &m.#bidx_ident
+                    }
+                };
+            });
+        }
+        confidential_columns.push((unraw_ident(ident), bidx));
+    }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registered column
+    // name from the wire name, exactly as it does for encrypted columns.
+    if !confidential_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): confidential columns are registered under their Rust names, \
+             which the log filter, version history and admin redaction key off.",
+        )
+        .to_compile_error();
+    }
+    // A container conversion decides the serialized keys, and version history
+    // snapshots the model through `Serialize`. A `Wire` type that moves the
+    // sealed column under another key would carry the envelope past the
+    // sensitive-column lookup and into the history table; `from`/`try_from` are
+    // the same bypass on the way in. `transparent` is worse: the model
+    // serializes as the bare envelope, so the snapshot is a string, and
+    // `compute_diff_owned` returns no change at all for a non-object value.
+    if !confidential_columns.is_empty()
+        && let Some(key) = attrs_have_serde_shape_conversion(outer_attrs)
+    {
+        let key = serde_key_display(key);
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`#[serde({key})]` cannot be combined with `#[confidential]` fields \
+                 (issue #1771): the attribute decides the serialized shape, so version \
+                 history and the raw-request filters — which key off the model's own field \
+                 names — cannot see the sealed column or its token through it."
+            ),
+        )
+        .to_compile_error();
+    }
+
+    // The field-level rule refuses the same omission written on the field. On
+    // the container it needs no field attribute at all: serde fills every key
+    // the request leaves out, and both wrappers implement `Default`, so the row
+    // takes an envelope no key opens or a token that indexes no envelope.
+    if !confidential_columns.is_empty() && attrs_have_serde_container_default(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(default)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): it lets a request omit the sealed column or its blind-index \
+             companion, and both wrappers implement `Default`, so the row stores an \
+             envelope no key opens or a token that indexes no envelope. The client's own \
+             bytes are the only valid value for either column.",
+        )
+        .to_compile_error();
+    }
+    let confidential_column_names: Vec<&str> = confidential_columns
+        .iter()
+        .map(|(col, _)| col.as_str())
+        .collect();
+    // A shard key routes a write by reading the column, which a sealed value
+    // cannot answer.
+    if let Ok(Some(shard_key)) = parse_model_shard_key(outer_attrs)
+        && confidential_column_names.contains(&shard_key.as_str())
+    {
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`{shard_key}` is this model's shard key, so it cannot be \
+                 `#[confidential]`: the router reads the column to pick a shard, and \
+                 a sealed value is opaque to the server."
+            ),
+        )
+        .to_compile_error();
+    }
+    let confidential_inventory: Vec<TokenStream> = confidential_columns
+        .iter()
+        .map(|(col, bidx)| {
+            let bidx = bidx.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |b| quote! { ::core::option::Option::Some(#b) },
+            );
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::confidential::ConfidentialColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                        blind_index: #bidx,
+                    }
+                }
+            }
+        })
+        .collect();
+
     // Collect `#[translatable]` columns (issue #1384, validated to be
     // non-null `Translated`). Each entry is the field ident; the column name is
     // the Rust field name, which is also the key the field-name-driven
@@ -9633,6 +10184,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if classified_columns.iter().any(|(cid, ..)| *cid == ident) {
             continue;
         }
+        // #1771: the same reasoning for a confidential column and its
+        // blind-index companion. Neither is orderable or filterable today (the
+        // type lists below hold no `Sealed` or `BlindIndex`), but the exclusion
+        // is explicit so a later edit to those lists cannot open a client-driven
+        // equality oracle over a sealed value.
+        let name = unraw_ident(ident);
+        if confidential_columns
+            .iter()
+            .any(|(col, bidx)| *col == name || bidx.as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
         let is_option = option_inner_type(&field.ty).is_some();
@@ -9847,6 +10410,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
                 &[#(#classified_column_names),*];
 
+            /// Column names on this model marked `#[confidential]` (#1771).
+            ///
+            /// Emitted for every model (empty when none are confidential). The
+            /// `#[repository]` macro reads this list at build time to refuse a
+            /// server-side predicate over a sealed column, and surfaces without
+            /// a compile-time view of the model read it to redact.
+            #[doc(hidden)]
+            pub const __AUTUMN_CONFIDENTIAL_COLUMNS: &'static [&'static str] =
+                &[#(#confidential_column_names),*];
+
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
             /// Emitted for every model (empty when none are translatable) so
@@ -9858,6 +10431,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #(#encrypted_inventory)*
+        #(#confidential_type_assertions)*
+        #(#confidential_inventory)*
 
         #translatable_items
         #(#translatable_inventory)*
@@ -14198,6 +14773,224 @@ mod tests {
         assert!(
             !expanded.contains("__autumn_tenant"),
             "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
+
+    /// #1771: a rename on the blind-index companion would leave the token
+    /// unprotected under a name version history, the log filter and the CSV
+    /// export do not look for.
+    #[test]
+    fn a_renamed_blind_index_companion_is_refused() {
+        for rename in [
+            quote! { #[serde(rename = "lookup")] },
+            quote! { #[diesel(column_name = lookup)] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #rename
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a renamed companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a marker that keeps the companion out of the insert leaves the
+    /// client-computed token with nowhere to go.
+    #[test]
+    fn a_write_excluded_blind_index_companion_is_refused() {
+        for marker in [
+            quote! { #[default] },
+            quote! { #[id] },
+            quote! { #[lock_version] },
+            quote! { #[position] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #marker
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a write-excluded companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a container conversion decides the serialized keys, so a registry
+    /// keyed on the model's own field names cannot see the sealed column through
+    /// it — and version history snapshots the model through `Serialize`.
+    #[test]
+    fn a_serde_shape_conversion_on_a_confidential_model_is_refused() {
+        for conversion in [
+            quote! { #[serde(into = "Wire")] },
+            quote! { #[serde(from = "Wire")] },
+            quote! { #[serde(try_from = "Wire")] },
+            quote! { #[serde(transparent)] },
+        ] {
+            let input: TokenStream = quote! {
+                #conversion
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a reshaped confidential model must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: the container-level counterpart of the field-level omission rule.
+    /// Written on the struct, one attribute reaches both columns without either
+    /// of them carrying an attribute of its own.
+    #[test]
+    fn a_serde_container_default_on_a_confidential_model_is_refused() {
+        for container in [
+            quote! { #[serde(default)] },
+            quote! { #[serde(default = "seed")] },
+        ] {
+            let input: TokenStream = quote! {
+                #container
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a container-level serde default must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: both wrappers implement `Default`, so an omitted value is not an
+    /// error. The sealed field becomes an envelope no key opens; the companion
+    /// becomes a random token that matches no envelope.
+    #[test]
+    fn a_confidential_field_omitted_on_input_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(default)] }, quote! {}),
+            (quote! { #[serde(default = "seed")] }, quote! {}),
+            (quote! { #[serde(skip_deserializing)] }, quote! {}),
+            (quote! {}, quote! { #[serde(default)] }),
+            (quote! {}, quote! { #[serde(default = "seed")] }),
+            (quote! {}, quote! { #[serde(skip_deserializing)] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "a confidential column the client may omit must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: an alias is accepted on the way in, so a request could deliver the
+    /// envelope or the token under a name no filter knows; `flatten` removes the
+    /// key entirely.
+    #[test]
+    fn a_serde_alias_or_flatten_on_a_confidential_field_or_companion_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(alias = "lookup")] }, quote! {}),
+            (quote! {}, quote! { #[serde(alias = "lookup")] }),
+            (quote! { #[serde(flatten)] }, quote! {}),
+            (quote! {}, quote! { #[serde(flatten)] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "an aliased confidential column must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a skipped column never reaches the version-history snapshot, which
+    /// is built from the `Serialize` view, so it would leave no "changed" marker.
+    /// `skip_serializing_if` counts: a predicate true on both sides of an update
+    /// omits the column from both snapshots.
+    #[test]
+    fn a_confidential_field_that_skips_serialization_is_refused() {
+        for (skip, named) in [
+            (quote! { #[private] }, "private"),
+            (
+                quote! { #[serde(skip_serializing)] },
+                "serde(skip_serializing)",
+            ),
+            (
+                quote! { #[serde(skip_serializing_if = "always")] },
+                "serde(skip_serializing_if = ...)",
+            ),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #skip
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains(&format!("cannot use `#[{named}]`")),
+                "a skipped confidential column must be refused by name: {expanded}"
+            );
+        }
+    }
+
+    /// The companion is accepted when it is not renamed.
+    #[test]
+    fn a_plain_blind_index_companion_is_accepted() {
+        let input: TokenStream = quote! {
+            pub struct Note {
+                pub id: i32,
+                #[confidential(blind_index)]
+                pub body: autumn_web::confidential::Sealed,
+                pub body_bidx: autumn_web::confidential::BlindIndex,
+            }
+        };
+        let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+        assert!(!expanded.contains("compile_error"), "{expanded}");
+        assert!(
+            expanded.contains("__AUTUMN_CONFIDENTIAL_COLUMNS"),
+            "{expanded}"
         );
     }
 
