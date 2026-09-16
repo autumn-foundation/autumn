@@ -274,8 +274,9 @@ fn closing_a_document_returns_its_final_state() {
 #[ws("/collab/{key}/{actor}")]
 #[public]
 async fn collaborate(hub: CollabHub, path: Path<(String, String)>) -> impl WsHandler {
-    let (key, actor) = path.0.clone();
-    let doc = hub.open_with(&key, || CollabText::from_text("seed", "hello world"));
+    let (key, actor) = &path.0;
+    let doc = hub.open_with(key, || CollabText::from_text("seed", "hello world"));
+    let actor = actor.clone();
     move |socket: WebSocket| async move {
         serve_socket(&doc, actor.clone(), actor, socket).await;
     }
