@@ -112,6 +112,14 @@ fn subtree_has_visible_content(
     let mut stack: Vec<&Node> = nodes.iter().rev().collect();
     let mut has_whitespace_only_text = false;
     let mut seen_break = false;
+    // True once any whitespace-only text has been emitted (as a
+    // `Span::Run`, uncapped) *before* the first `<br>` is reached — which
+    // means that `<br>`, if rendered, would NOT land at `content_start`
+    // after all, so `inline_list_items`'s leading-break strip would never
+    // touch it. Only relevant to `leading_break_is_stripped`, which
+    // otherwise assumes the break is the very first thing emitted.
+    // (Codex review on PR #2810.)
+    let mut emitted_before_first_break = false;
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
@@ -135,11 +143,16 @@ fn subtree_has_visible_content(
                     if seen_break && trailing_break_is_trimmed && !leading_break_is_stripped {
                         return true;
                     }
+                    if !seen_break {
+                        emitted_before_first_break = true;
+                    }
                     has_whitespace_only_text = true;
                 }
             }
             Node::Element { tag, children } => {
                 if tag == "br" {
+                    let leading_break_is_stripped =
+                        leading_break_is_stripped && !emitted_before_first_break;
                     if seen_break || (!trailing_break_is_trimmed && !leading_break_is_stripped) {
                         return true;
                     }
@@ -4273,6 +4286,28 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "the leading <br> is stripped regardless of trailing whitespace, and that whitespace is itself invisible"
+        );
+    }
+
+    #[test]
+    fn whitespace_then_br_capped_in_a_list_item_still_warns_when_real_text_follows() {
+        // Unlike whitespace *after* the capped <br> (which the leading-
+        // strip exemption tolerates — see the previous test), whitespace
+        // *before* it means the <br>, if rendered, would NOT land at
+        // content_start after all (the whitespace's own Span::Run would
+        // land there first) — so inline_list_items's leading-break strip
+        // would never reach it. With real text ("B") also following as a
+        // separate sibling, neither exemption applies, so this must warn.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><ul><li>{} <br>{}B</li></ul></h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "leading whitespace means the <br> would not actually land at content_start, so this must warn"
         );
     }
 
