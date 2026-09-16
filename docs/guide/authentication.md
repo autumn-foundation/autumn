@@ -453,10 +453,12 @@ flow. Manage them with `autumn token` — run any of these with `--help` for the
 full argument list:
 
 ```bash
-autumn token issue service:ci --name ci --scope posts:write   # prints the raw token once
-autumn token list service:ci                                  # name, scopes, expiry, last-used
-autumn token rotate <RAW_TOKEN>                               # revoke + reissue, same name and scopes
-autumn token revoke <RAW_TOKEN>                               # 401 for every later request
+# Printed once, and only its hash is stored — capture it now or lose it.
+TOKEN=$(autumn token issue service:ci --name ci --scope posts:write)
+
+autumn token list service:ci   # name, scopes, expiry, last-used — never the secret
+autumn token rotate "$TOKEN"   # revoke + reissue, same name and scopes
+autumn token revoke "$TOKEN"   # 401 for every later request
 ```
 
 `issue` prints the raw token **once** — only its SHA-256 hash is stored, so
@@ -470,12 +472,12 @@ has that table — pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run
 the process and seeds them in code: a token issued by the CLI is invisible to
 it, and verification answers `401`.
 
-**To revoke a leaked API token**, run `autumn token revoke <RAW_TOKEN>`: it sets
+**To revoke a leaked API token**, run `autumn token revoke "$TOKEN"`: it sets
 `revoked_at`, and `RequireApiToken` answers `401` for every later request
 presenting it.
 
 **To rotate an API token** — a CI credential that must keep working — run
-`autumn token rotate <RAW_TOKEN>` instead. It revokes the old token and prints a
+`autumn token rotate "$TOKEN"` instead. It revokes the old token and prints a
 replacement carrying the same name and scopes, so only the stored secret
 changes.
 
