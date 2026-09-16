@@ -429,6 +429,59 @@ async fn accept_invitation_redisplays_form_on_rejected_password() {
         .assert_body_contains("redo@acme.test");
 }
 
+/// The admin-facing "Send Invitation" form on `/members` used to `Err(...)`
+/// out to the generic JSON/error-page response on either of its two
+/// recoverable failure modes — a malformed email or an unrecognized role —
+/// dropping the admin off the page and losing what they'd typed (Wayfinder:
+/// error-path inventory). Each must now redisplay the same `/members` page
+/// at 422, with the roster and pending invitations still shown, the
+/// attempted email/role preserved in the form, and the message next to it;
+/// a corrected resubmission must still send the invite.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_invitation_redisplays_members_page_on_rejected_submission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner3@acme.test").await;
+
+    // Malformed email.
+    let resp = client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=not-an-email&role=member")
+        .send()
+        .await;
+    resp.assert_status(422);
+    assert!(resp.text().contains("Enter a valid email address"));
+    assert!(resp.text().contains(r#"value="not-an-email""#));
+    // The rest of the page — roster and chrome — must still be there, not
+    // replaced by a bare error page.
+    assert!(resp.text().contains("owner3@acme.test"));
+    assert!(resp.text().contains("Pending invitations"));
+
+    // Unknown role.
+    let resp = client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie3@acme.test&role=superadmin")
+        .send()
+        .await;
+    resp.assert_status(422);
+    assert!(resp.text().contains("Unknown role"));
+    assert!(resp.text().contains(r#"value="newbie3@acme.test""#));
+
+    // A corrected resubmission still sends the invite.
+    let before = count_emls(dir.path());
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie3@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    assert_eq!(count_emls(dir.path()), before + 1);
+}
+
 /// Two concurrent submissions of the same signup-and-join accept form (a
 /// double-submit, or a browser retry) must not leave one of them with a
 /// raw 422 — the invitation lock must serialize the two requests, so the
