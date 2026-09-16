@@ -3130,6 +3130,18 @@ struct SqliteCollisionMove {
     to: String,
 }
 
+/// The one `FRAMEWORK_MIGRATIONS` full name that is NOT new to `SQLite` even
+/// though it is absent from [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]: the legacy
+/// compatibility shim's `SELECT 1;` is plain, portable SQL, so it could
+/// already have recorded this version on `SQLite` before `FRAMEWORK_MIGRATIONS`
+/// had a real `SQLite` variant (issue #2699) — unlike every other pre-fork
+/// migration in the set, whose Postgres-only DDL would have failed outright.
+/// It creates no table, so [`sqlite_collision_history_moves`] cannot probe it
+/// either; treat it like an ordinary ambiguous collision instead of assuming
+/// it never ran.
+#[cfg(feature = "sqlite")]
+const SQLITE_LEGACY_SHIM_MIGRATION: &str = "00000000000000_create_api_tokens";
+
 /// The records [`adopt_sqlite_collision_history`] would move, decided on
 /// `conn` without changing anything.
 ///
@@ -3139,10 +3151,11 @@ struct SqliteCollisionMove {
 /// already applied on `SQLite` before `FRAMEWORK_MIGRATIONS` gained a
 /// `SQLite` variant (issue #2699): for those, either side could hold the
 /// plain-version record, so a table probe decides. Every other framework
-/// migration is new to `SQLite` as of that fork — it never had a chance to
-/// apply here before, so a pre-existing plain-version record can only be the
-/// app's own migration, and no probe is needed. The listing path resolves
-/// these virtually and the write paths apply them.
+/// migration except [`SQLITE_LEGACY_SHIM_MIGRATION`] is new to `SQLite` as of
+/// that fork — it never had a chance to apply here before, so a pre-existing
+/// plain-version record can only be the app's own migration, and no probe is
+/// needed. The listing path resolves these virtually and the write paths
+/// apply them.
 #[cfg(feature = "sqlite")]
 fn sqlite_collision_history_moves(
     conn: &mut diesel::SqliteConnection,
@@ -3173,9 +3186,10 @@ fn sqlite_collision_history_moves(
                     .into_iter()
                     .map(|(_, name)| name)
                     .filter(|name| {
-                        !SQLITE_FRAMEWORK_MIGRATION_TABLES
-                            .iter()
-                            .any(|(migration, _)| *migration == name)
+                        name != SQLITE_LEGACY_SHIM_MIGRATION
+                            && !SQLITE_FRAMEWORK_MIGRATION_TABLES
+                                .iter()
+                                .any(|(migration, _)| *migration == name)
                     })
                     .collect()
             })
@@ -4204,6 +4218,61 @@ mod tests {
         assert!(
             moves.is_empty(),
             "a non-framework collision must not be guessed at: {moves:?}"
+        );
+    }
+
+    /// A collision with [`SQLITE_LEGACY_SHIM_MIGRATION`] is left unresolved
+    /// too (issue #2699 review finding). Its `SELECT 1;` is plain, portable
+    /// SQL, so — unlike every other pre-fork framework migration, whose
+    /// Postgres-only DDL would have failed outright on `SQLite` — an app that
+    /// already tried the old, unforked `FRAMEWORK_MIGRATIONS` against
+    /// `SQLite` could have this version recorded from the shim, not from its
+    /// own colliding migration. It creates no table, so there is nothing to
+    /// probe; treating it as "new to `SQLite`, never ran" the way the other
+    /// fifteen are would risk silently marking the app's own migration
+    /// applied without its DDL ever running.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_collision_with_the_legacy_shim_migration_is_left_unresolved() {
+        let (migrations_dir, url) = sqlite_scratch("legacy-shim-collision");
+        let older = migrations_dir.join("00000000000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // A record under "00000000000000" from before this fork existed —
+        // either the app's own migration, or a prior partial attempt at the
+        // old, unforked FRAMEWORK_MIGRATIONS. Nothing here can tell them
+        // apart.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "00000000000000".to_owned(),
+                SQLITE_LEGACY_SHIM_MIGRATION.to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "00000000000000_zzz_app".to_owned(),
+            "00000000000000+deadbeef".to_owned(),
+        );
+
+        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect("resolve moves");
+        assert!(
+            moves.is_empty(),
+            "a collision with the legacy shim must not be guessed at: {moves:?}"
         );
     }
 
