@@ -569,7 +569,15 @@ fn inline_spans(
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(out) && has_more_after.resolve(),
-            trimmed && has_more_after.nothing_follows(),
+            // Safe only if dropping this subtree's own lone break truly
+            // changes nothing — which also requires `out` not to
+            // *already* end in a break: if it does, appending ours would
+            // still get trimmed away, but the earlier one would then
+            // survive as the buffer's new actual last span (uncapped),
+            // whereas capping this subtree leaves that earlier break as
+            // the trailing span too, which trim_trailing_break removes —
+            // a real, visible difference. (Codex review on PR #2810.)
+            trimmed && has_more_after.nothing_follows() && !matches!(out.last(), Some(Span::Break)),
             leading_break_strip_point == Some(out.len()),
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
@@ -4308,6 +4316,31 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "leading whitespace means the <br> would not actually land at content_start, so this must warn"
+        );
+    }
+
+    #[test]
+    fn br_past_the_depth_cap_still_warns_when_an_earlier_break_would_be_exposed() {
+        // A real, un-capped <br> already sits in `out` before the capped
+        // subtree (another deeply wrapped <br>). Uncapped: out ends in
+        // [Break, Break] — trim_trailing_break removes only the *second*
+        // one, leaving the first as a real visible line break. Capped:
+        // out ends in just [Break] (the first) — now the buffer's actual
+        // last span, so trim_trailing_break removes *that* one instead,
+        // leaving no break at all. Dropping the capped subtree therefore
+        // silently erases a break that would otherwise have survived —
+        // the "nothing follows, so it's safe" trailing exemption isn't
+        // enough on its own; `out` must not already end in a break either.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><br>{}<br>{}</h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "dropping the capped break exposes the earlier break to trimming that wouldn't otherwise happen"
         );
     }
 
