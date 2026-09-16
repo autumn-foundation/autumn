@@ -844,6 +844,44 @@ async fn a_failed_publish_still_reaches_this_node() {
     assert_eq!(doc.text(), "hi!");
 }
 
+/// A replayed operation that is already buffered is not broadcast again.
+///
+/// A reconnecting peer replays its whole history. An operation whose cause
+/// never arrives stays in the buffer, and re-broadcasting it on every replay
+/// put another copy into every connected editor's causal buffer — a buffer
+/// only ever drained by the cause arriving.
+#[test]
+fn an_already_buffered_replay_is_not_broadcast_again() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:28:body", || CollabText::from_text("seed", "hi"))
+        .expect("open the document");
+    let mut watcher = doc.subscribe();
+
+    // An operation whose anchor the document has never seen.
+    let orphan = autumn_web::collab::CollabOp::Insert {
+        id: OpId::new(500, "peer"),
+        after: Some(OpId::new(900, "ghost")),
+        ch: 'Z',
+    };
+
+    doc.apply_remote(std::slice::from_ref(&orphan))
+        .expect("within the budget");
+    assert!(
+        watcher.try_recv().is_ok(),
+        "the first arrival is news: every editor needs it buffered"
+    );
+
+    // The same peer reconnects and replays it. Nothing has changed.
+    doc.apply_remote(std::slice::from_ref(&orphan))
+        .expect("within the budget");
+    assert!(
+        watcher.try_recv().is_err(),
+        "the replay is not news, and a client's buffer only grows"
+    );
+    assert_eq!(doc.document().pending_len(), 1, "still the one copy");
+}
+
 /// Only one close is outstanding for a document at a time.
 ///
 /// Two persistence paths can reach `close` together — an idle sweep against a

@@ -48,7 +48,7 @@
 //! tombstones. This suits note-sized and comment-sized fields, which is the
 //! scope of the first slice.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -351,11 +351,14 @@ impl CollabText {
     ///
     /// The batch is weighed as a whole, in two passes, because an operation's
     /// cost depends on what the rest of the batch brings. A delete costs
-    /// nothing when its target is already here **or arrives in the same
-    /// batch** — only a delete left with nothing to tombstone occupies the
-    /// buffer. Judging each operation against the pre-batch state alone would
-    /// charge an insert and its own delete twice over and refuse a history
-    /// that fits.
+    /// nothing when its target is already here **or lands in the same batch**
+    /// — only a delete left with nothing to tombstone occupies the buffer.
+    /// Judging each operation against the pre-batch state alone would charge
+    /// an insert and its own delete twice over and refuse a history that fits.
+    ///
+    /// "Lands", not "appears": an insert whose own anchor is unknown stays in
+    /// the buffer, and the delete waiting on it stays there too, so a batch
+    /// carrying both would otherwise pay for one slot and occupy two.
     ///
     /// Cost is per distinct **operation**, not per distinct id, because that
     /// is what the buffer holds. `buffered` keys on the whole operation, so
@@ -368,14 +371,34 @@ impl CollabText {
     pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
         let ops: Vec<&CollabOp> = ops.into_iter().collect();
 
-        // Pass one: the characters this batch brings that are not here yet.
-        let introduced: HashSet<&OpId> = ops
-            .iter()
-            .filter_map(|op| match op {
-                CollabOp::Insert { id, .. } if !self.index.contains(id) => Some(id),
-                _ => None,
-            })
-            .collect();
+        // Pass one: the characters this batch brings that will actually take
+        // their place. Naming an id is not enough — an insert whose own anchor
+        // is unknown stays in the buffer, and so does any delete waiting on
+        // it, so treating it as satisfied charged two slots as one. It is a
+        // fixed point because the batch can carry a chain: each insert that
+        // lands may be the anchor the next one was waiting for.
+        let mut integrable: HashSet<&OpId> = HashSet::new();
+        loop {
+            let mut grew = false;
+            for op in &ops {
+                let CollabOp::Insert { id, after, .. } = op else {
+                    continue;
+                };
+                if self.index.contains(id) || integrable.contains(id) {
+                    continue;
+                }
+                let anchored = after.as_ref().is_none_or(|anchor| {
+                    self.index.contains(anchor) || integrable.contains(anchor)
+                });
+                if anchored {
+                    integrable.insert(id);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
 
         // Pass two: the distinct operations that will occupy a slot.
         let charged: HashSet<&&CollabOp> = ops
@@ -383,9 +406,9 @@ impl CollabText {
             .filter(|op| match op {
                 // An id already here integrates as a no-op and stores nothing.
                 CollabOp::Insert { id, .. } => !self.index.contains(id),
-                // A target the batch satisfies is tombstoned, not buffered.
+                // A target the batch *lands* is tombstoned, not buffered.
                 CollabOp::Delete { target } => {
-                    !self.index.contains(target) && !introduced.contains(target)
+                    !self.index.contains(target) && !integrable.contains(target)
                 }
             })
             // Anything already buffered is paid for.
@@ -406,7 +429,7 @@ impl CollabText {
             .pending
             .iter()
             .filter(|op| match op {
-                CollabOp::Delete { target } => introduced.contains(target),
+                CollabOp::Delete { target } => integrable.contains(target),
                 CollabOp::Insert { .. } => false,
             })
             .count();
@@ -654,7 +677,32 @@ impl CollabText {
         match op {
             CollabOp::Insert { id, after, ch } => {
                 if self.index.contains(id) {
-                    return true; // already integrated
+                    // Idempotent replay — unless it is not the same operation.
+                    // An id is supposed to name one character typed in one
+                    // place; the same id carrying different text means a
+                    // replica minted it twice, which the model has no answer
+                    // for. Keep what is here and say so.
+                    //
+                    // This is first-wins, so two documents that disagree this
+                    // way merge to whichever was merged into. Repairing that
+                    // would mean repositioning the element, and its position
+                    // comes from an anchor the conflicting copy disagrees
+                    // about — so nothing short of replaying the whole document
+                    // converges. `Deserialize` refuses such a document at the
+                    // door instead, which is where a crafted one arrives.
+                    if let Some(pos) = self.position_of(id) {
+                        let held = &self.elems[pos];
+                        if held.ch != *ch || held.after != *after {
+                            tracing::warn!(
+                                %id,
+                                held = %held.ch,
+                                incoming = %ch,
+                                "collab: an id was reused for a different character; \
+                                 keeping the one already integrated"
+                            );
+                        }
+                    }
+                    return true;
                 }
                 let Some(start) = self.slot_after(after.as_ref()) else {
                     return false;
@@ -923,6 +971,24 @@ impl<'de> Deserialize<'de> for CollabText {
                  counter {} is at or past the ceiling of {MAX_COUNTER}",
                 id.counter,
             )));
+        }
+        // One id, two different characters. An id names one character typed
+        // in one place; reuse makes the document's own text depend on the
+        // order it is read in, and makes a merge with it depend on which side
+        // went first. In memory the replay can only keep the first and say so,
+        // because the element's position comes from an anchor the other copy
+        // disagrees about — so this door is where such a document is stopped.
+        let mut seen: HashMap<&OpId, (&Option<OpId>, char)> =
+            HashMap::with_capacity(wire.elems.len());
+        for elem in &wire.elems {
+            if let Some((after, ch)) = seen.insert(&elem.id, (&elem.after, elem.ch))
+                && (*after != elem.after || ch != elem.ch)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "collaborative document reuses the id {} for two different characters",
+                    elem.id,
+                )));
+            }
         }
         if let Some(op) = wire
             .pending
@@ -1233,6 +1299,113 @@ mod tests {
             refused.to_string().contains("buffered operations"),
             "the refusal names the buffer: {refused}"
         );
+    }
+
+    /// A delete is only free when the insert it waits on actually lands.
+    ///
+    /// Naming the id in the batch is not enough: an insert whose own anchor is
+    /// unknown stays in the buffer, and the delete stays with it. Charging the
+    /// pair as one let a batch occupy two slots while paying for one, which is
+    /// how a document gets past its own limit — and past `MAX_WIRE_PENDING`,
+    /// into a state its own deserializer refuses.
+    #[test]
+    fn a_delete_waiting_on_an_unanchored_insert_is_charged() {
+        let doc = CollabText::new();
+        let target = OpId::new(2, "ada");
+        let batch = [
+            CollabOp::Delete {
+                target: target.clone(),
+            },
+            CollabOp::Insert {
+                id: target,
+                // An anchor the document has never seen: this insert waits.
+                after: Some(OpId::new(99, "ghost")),
+                ch: 'b',
+            },
+        ];
+
+        assert_eq!(
+            doc.novel_count(batch.iter()),
+            2,
+            "neither one lands, so both sit in the buffer"
+        );
+
+        // And that is what it really costs.
+        let mut doc = doc;
+        doc.apply_all(batch);
+        assert_eq!(doc.pending_len(), 2);
+    }
+
+    /// The waiver still applies down a chain the batch carries whole.
+    #[test]
+    fn a_delete_is_free_when_its_insert_lands_behind_another_in_the_batch() {
+        let doc = CollabText::new();
+        let first = OpId::new(1, "ada");
+        let second = OpId::new(2, "ada");
+        let batch = [
+            // Deliberately out of causal order: the fixed point has to find
+            // that `second` lands only once `first` does.
+            CollabOp::Delete {
+                target: second.clone(),
+            },
+            CollabOp::Insert {
+                id: second,
+                after: Some(first.clone()),
+                ch: 'b',
+            },
+            CollabOp::Insert {
+                id: first,
+                after: None,
+                ch: 'a',
+            },
+        ];
+
+        assert_eq!(
+            doc.novel_count(batch.iter()),
+            2,
+            "two characters land; the delete tombstones one of them for free"
+        );
+
+        let mut doc = doc;
+        doc.apply_all(batch);
+        assert_eq!(doc.element_count(), 2);
+        assert_eq!(doc.pending_len(), 0);
+        assert_eq!(doc.text(), "a");
+    }
+
+    /// A document that reuses one id for two different characters is refused.
+    ///
+    /// Its own text would depend on the order it was read in, and a merge with
+    /// it on which side went first.
+    #[test]
+    fn a_document_reusing_an_id_for_two_characters_is_refused() {
+        let json = serde_json::json!({
+            "elems": [
+                { "id": "1@ada", "ch": "a" },
+                { "id": "1@ada", "after": "1@ada", "ch": "z" },
+            ],
+            "pending": [],
+        })
+        .to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("reused id");
+        assert!(
+            refused.to_string().contains("two different characters"),
+            "the refusal says why: {refused}"
+        );
+
+        // An honest duplicate — the same character twice — is still fine: the
+        // replay drops the repeat, which is what makes a document canonical.
+        let honest = serde_json::json!({
+            "elems": [
+                { "id": "1@ada", "ch": "a" },
+                { "id": "1@ada", "ch": "a" },
+            ],
+            "pending": [],
+        })
+        .to_string();
+        let doc = serde_json::from_str::<CollabText>(&honest).expect("a repeat, not a conflict");
+        assert_eq!(doc.text(), "a");
     }
 
     /// A stored column with an unusable id still reads, and says what it lost.

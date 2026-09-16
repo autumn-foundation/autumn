@@ -92,7 +92,14 @@
   // buffer after every success, since one arrival can unblock several.
   function integrate(op) {
     if (!apply(op)) {
-      waiting.push(op);
+      // Hold it until its cause arrives — but only once. A server that
+      // re-sent an operation whose cause never came would otherwise grow this
+      // buffer on every delivery, and this list is only ever drained by
+      // something arriving.
+      const key = JSON.stringify(op);
+      if (!waiting.some((held) => JSON.stringify(held) === key)) {
+        waiting.push(op);
+      }
       return;
     }
     let progressed = true;

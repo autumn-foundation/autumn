@@ -1060,16 +1060,25 @@ impl CollabDoc {
                     limit: self.limits.max_document_chars,
                 });
             }
-            // Keep only what the authority took. `apply` refuses an id past
-            // `MAX_COUNTER` outright, and a browser replica has no such
-            // check — broadcasting a refused operation would put a character
-            // in every client that the document does not have, and every
-            // later edit anchored to it would then come back as unknown.
+            // Keep only what the authority took, and only the first time it
+            // takes it. `apply` refuses an id past `MAX_COUNTER` outright, and
+            // a browser replica has no such check — broadcasting a refused
+            // operation would put a character in every client that the
+            // document does not have, and every later edit anchored to it
+            // would then come back as unknown.
+            //
+            // `holds_pending` alone cannot tell "newly buffered" from "was
+            // already buffered", so asking it after the fact re-broadcast
+            // every idempotent replay. A reconnecting peer replays its whole
+            // history, so an operation whose cause never arrives would go out
+            // again on every reconnect and sit in every client's causal buffer
+            // once more.
             let accepted: Vec<CollabOp> = ops
                 .iter()
                 .filter(|op| {
+                    let held_before = state.doc.holds_pending(op);
                     let integrated = state.edit(|doc| doc.apply((*op).clone()));
-                    integrated || state.doc.holds_pending(op)
+                    integrated || (!held_before && state.doc.holds_pending(op))
                 })
                 .cloned()
                 .collect();
