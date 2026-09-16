@@ -1303,16 +1303,39 @@ impl JobRegistry {
     /// can remove precisely that mark instead of guessing which of several
     /// co-queued marks belongs to it.
     ///
-    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`], evicting the oldest-inserted
-    /// entry first: a job that falls out (or was never entered — see that
-    /// method's fallback) is not lost, it just falls back to
-    /// candidate-based matching there.
+    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`]: a job that falls out (or was
+    /// never entered — see that method's fallback) is not lost, it just
+    /// falls back to candidate-based matching there.
+    ///
+    /// This table is per-process, in-memory state — in a split web/worker
+    /// deployment, a web replica that only enqueues (`run_workers == false`,
+    /// see `start_postgres_runtime`) never calls [`Self::record_pg_start`],
+    /// so every entry it inserts would otherwise sit here until capacity
+    /// eviction, regardless of whether some other replica has long since
+    /// claimed and finished the job. Eviction therefore prefers an entry
+    /// whose `ready_at_ms` has already passed: Postgres never hands a row to
+    /// a claimer before its own `run_at`, so an entry still in the future is
+    /// *guaranteed* to be a live, uncontested "enqueued but not yet
+    /// claimable" mark, while an already-due one may well have been claimed
+    /// by this process or another already. This protects exactly the
+    /// scenario that otherwise degrades worst — an older, still genuinely
+    /// delayed job's entry evicted by a burst of newer immediate enqueues —
+    /// without needing to know this process's worker/web role or query the
+    /// database. Falls back to the oldest-inserted entry only when every
+    /// tracked entry is still in the future (evicting one then is
+    /// unavoidable, and no candidate is more "used up" than another).
     pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64) {
         if let Ok(mut guard) = self.queues.write() {
             if guard.pg_marks_by_job_id.len() >= PG_MARKS_BY_JOB_ID_CAP
                 && !guard.pg_marks_by_job_id.contains_key(id)
             {
-                guard.pg_marks_by_job_id.shift_remove_index(0);
+                let now = self.now_ms();
+                let evict_idx = guard
+                    .pg_marks_by_job_id
+                    .iter()
+                    .position(|(_, mark)| *mark <= now)
+                    .unwrap_or(0);
+                guard.pg_marks_by_job_id.shift_remove_index(evict_idx);
             }
             guard.pg_marks_by_job_id.insert(id.to_string(), ready_at_ms);
         }
@@ -1480,6 +1503,15 @@ impl JobRegistry {
     #[cfg(test)]
     pub(crate) fn pg_marks_len_for_test(&self) -> usize {
         self.queues.read().map_or(0, |g| g.pg_marks_by_job_id.len())
+    }
+
+    /// Whether `pg_marks_by_job_id` currently holds an entry for `id`.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn pg_mark_contains_id_for_test(&self, id: &str) -> bool {
+        self.queues
+            .read()
+            .is_ok_and(|g| g.pg_marks_by_job_id.contains_key(id))
     }
 
     /// Record a successful execution.
@@ -5026,6 +5058,47 @@ mod tests {
             PG_MARKS_BY_JOB_ID_CAP,
             "the exact-mark table must never grow past its cap, even when every job it \
              tracks is enqueued and never claimed at all"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit 763da93: in a split
+    /// web/worker deployment, a web replica that only enqueues never calls
+    /// `record_pg_start` (it runs no worker loop at all), so every entry it
+    /// inserts sits here until capacity eviction regardless of whether some
+    /// other replica has long since claimed and finished the job. Plain
+    /// oldest-inserted-first eviction could just as easily pick an older job
+    /// that is still genuinely delayed — and therefore, by construction
+    /// (Postgres never hands out a row before its own `run_at`), definitely
+    /// NOT yet claimed by anyone, anywhere — over one that is already due
+    /// and plausibly claimed elsewhere already.
+    #[test]
+    fn note_pg_job_mark_eviction_protects_entries_still_in_the_future() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("mixed_cap", "mail");
+
+        let now = now_epoch_ms();
+        let far_future = now + 3_600_000; // an hour out: cannot possibly be claimed yet.
+
+        // Inserted first, so plain FIFO eviction would pick it first — but
+        // it is still genuinely delayed.
+        registry.record_pg_enqueue("mixed_cap", "still-delayed", Some(far_future));
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            registry.record_pg_enqueue("mixed_cap", &format!("already-due-{i}"), Some(0));
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("mixed_cap", "one-more", Some(0));
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "an entry still in the future must never be evicted while an already-due \
+             entry is available to evict instead"
         );
     }
 
