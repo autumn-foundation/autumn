@@ -3154,7 +3154,16 @@ const SQLITE_LEGACY_SHIM_MIGRATION: &str = "00000000000000_create_api_tokens";
 /// migration except [`SQLITE_LEGACY_SHIM_MIGRATION`] is new to `SQLite` as of
 /// that fork — it never had a chance to apply here before, so a pre-existing
 /// plain-version record can only be the app's own migration, and no probe is
-/// needed. The listing path resolves these virtually and the write paths
+/// needed, PROVIDED it is the only other registered migration claiming that
+/// version. When a `FRAMEWORK_MIGRATIONS` name shares a version with more
+/// than one other source, or with [`SQLITE_LEGACY_SHIM_MIGRATION`] (whose own
+/// history is itself unresolvable), which side ran cannot be determined —
+/// this returns an error rather than silently leaving it, since the caller
+/// would otherwise still apply the disambiguated migrations and hit a hard
+/// error or a silently-skipped framework migration downstream. A collision
+/// between two registered sources that never involves any
+/// `FRAMEWORK_MIGRATIONS` name is left alone, exactly as before this fork
+/// existed. The listing path resolves these virtually and the write paths
 /// apply them.
 #[cfg(feature = "sqlite")]
 fn sqlite_collision_history_moves(
@@ -3240,32 +3249,53 @@ fn sqlite_collision_history_moves(
                 .filter(|(v, _)| v == version)
                 .map(|(_, name)| name.as_str())
                 .collect();
+            let has_shim_participant = names_at_version.contains(&SQLITE_LEGACY_SHIM_MIGRATION);
             let has_new_framework_participant = names_at_version
                 .iter()
                 .any(|name| new_framework_names.contains(*name));
+            if !has_shim_participant && !has_new_framework_participant {
+                // No `FRAMEWORK_MIGRATIONS` name shares this version at all —
+                // an ordinary collision between two other registered sources
+                // (e.g. the app's own migrations and a plugin's). Which side
+                // ran is genuinely ambiguous from names alone; leave it for
+                // an operator, exactly as before this fork existed.
+                continue;
+            }
             let non_framework_participants = names_at_version
                 .iter()
-                .filter(|name| !new_framework_names.contains(**name))
+                .filter(|name| {
+                    **name != SQLITE_LEGACY_SHIM_MIGRATION && !new_framework_names.contains(**name)
+                })
                 .count();
-            if has_new_framework_participant && non_framework_participants == 1 {
+            if !has_shim_participant && non_framework_participants == 1 {
                 // Exactly one non-framework name shares this version (the
                 // migration new to `SQLite` proven never to have run, plus
                 // `full_name` alone) — the pre-existing record can only be
                 // `full_name`'s, winner or not.
                 true
             } else {
-                // Either no framework migration new to `SQLite` shares this
-                // version (an ordinary collision between two other
-                // registered sources, e.g. the app's own migrations and a
-                // plugin's — which side ran is genuinely ambiguous from
-                // names alone), or more than one does (a three-or-more-way
-                // collision, where a second non-framework participant, such
-                // as the winner that keeps the plain version, could be the
-                // true owner instead). Generating a move for every
-                // remapped name here would risk marking more than one
-                // migration applied against a single database row. Leave
-                // it for an operator, as before this fork existed.
-                continue;
+                // A `FRAMEWORK_MIGRATIONS` name shares this version, but
+                // which side actually holds the plain-version record is
+                // still ambiguous: either the shim (whose own history is
+                // itself unresolvable, see [`SQLITE_LEGACY_SHIM_MIGRATION`])
+                // is one of the participants, or more than one non-framework
+                // source is. Silently leaving this unresolved is not safe
+                // the way the fully unrelated case above is: the caller
+                // still goes on to apply the disambiguated migrations
+                // regardless, which would record the framework migration as
+                // already applied (skipping its real DDL) while a
+                // non-framework migration re-runs under its substitute and
+                // hard-errors on non-idempotent DDL. Fail loudly instead, so
+                // an operator resolves the naming collision by hand before
+                // anything is applied.
+                return Err(MigrationError::Migration(format!(
+                    "SQLite migration version {version} is claimed by more than \
+                     one registered migration ({names_at_version:?}), including \
+                     one this SQLite fork introduces (issue #2699), and which \
+                     side already applied cannot be determined automatically. \
+                     Rename the conflicting migration to a fresh version so its \
+                     history can be resolved unambiguously."
+                )));
             }
         };
         if remapped_ran {
@@ -4240,18 +4270,21 @@ mod tests {
     }
 
     /// A collision with [`SQLITE_LEGACY_SHIM_MIGRATION`] is left unresolved
-    /// too (issue #2699 review finding). Its `SELECT 1;` is plain, portable
-    /// SQL, so — unlike every other pre-fork framework migration, whose
-    /// Postgres-only DDL would have failed outright on `SQLite` — an app that
-    /// already tried the old, unforked `FRAMEWORK_MIGRATIONS` against
-    /// `SQLite` could have this version recorded from the shim, not from its
-    /// own colliding migration. It creates no table, so there is nothing to
-    /// probe; treating it as "new to `SQLite`, never ran" the way the other
+    /// too, as a hard error rather than a silent skip (issue #2699 review
+    /// finding). Its `SELECT 1;` is plain, portable SQL, so — unlike every
+    /// other pre-fork framework migration, whose Postgres-only DDL would
+    /// have failed outright on `SQLite` — an app that already tried the
+    /// old, unforked `FRAMEWORK_MIGRATIONS` against `SQLite` could have this
+    /// version recorded from the shim, not from its own colliding
+    /// migration. It creates no table, so there is nothing to probe;
+    /// treating it as "new to `SQLite`, never ran" the way the other
     /// fifteen are would risk silently marking the app's own migration
-    /// applied without its DDL ever running.
+    /// applied without its DDL ever running. Erroring here, rather than
+    /// leaving it for `run_pending_sqlite` to hit downstream, fails before
+    /// anything is applied.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_collision_with_the_legacy_shim_migration_is_left_unresolved() {
+    fn a_collision_with_the_legacy_shim_migration_is_rejected() {
         let (migrations_dir, url) = sqlite_scratch("legacy-shim-collision");
         let older = migrations_dir.join("00000000000000_zzz_app");
         std::fs::create_dir_all(&older).expect("app migration dir");
@@ -4286,25 +4319,29 @@ mod tests {
             "00000000000000+deadbeef".to_owned(),
         );
 
-        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
-            .expect("resolve moves");
+        let error = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect_err("a collision with the legacy shim must be rejected, not guessed at");
+        let message = error.to_string();
         assert!(
-            moves.is_empty(),
-            "a collision with the legacy shim must not be guessed at: {moves:?}"
+            message.contains("00000000000000"),
+            "the error names the ambiguous version: {message}"
         );
     }
 
     /// A three-way version collision — a framework migration new to
     /// `SQLite` plus TWO other registered sources (e.g. the app's own
-    /// migrations and a plugin's) — is left unresolved for the
-    /// non-framework side too (issue #2699 review finding). There is only
-    /// one row in `__diesel_schema_migrations` for the shared version;
+    /// migrations and a plugin's) — is rejected as a hard error too, not
+    /// silently left half-resolved (issue #2699 review finding). There is
+    /// only one row in `__diesel_schema_migrations` for the shared version;
     /// generating a move for every remapped non-framework name would claim
     /// more than one migration is that row's owner, marking a migration
-    /// applied that never actually ran.
+    /// applied that never actually ran. Continuing silently is not safe
+    /// either: the caller still applies the disambiguated migrations
+    /// afterward, so an unresolved collision must fail loudly before that
+    /// happens.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_three_way_collision_with_a_new_framework_migration_is_left_unresolved() {
+    fn a_three_way_collision_with_a_new_framework_migration_is_rejected() {
         let (migrations_dir, url) = sqlite_scratch("three-way-collision");
         let older = migrations_dir.join("20260512000000_aaa_app");
         std::fs::create_dir_all(&older).expect("app migration dir");
@@ -4350,11 +4387,12 @@ mod tests {
             "20260512000000+cafef00d".to_owned(),
         );
 
-        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
-            .expect("resolve moves");
+        let error = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect_err("a three-way collision must be rejected, not guessed at");
+        let message = error.to_string();
         assert!(
-            moves.is_empty(),
-            "a three-way collision must not be guessed at: {moves:?}"
+            message.contains("20260512000000"),
+            "the error names the ambiguous version: {message}"
         );
     }
 
