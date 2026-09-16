@@ -97,8 +97,19 @@ const TOKEN_BYTES: usize = 16;
 type HmacSha256 = Hmac<Sha256>;
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    hmac_sha256_parts(key, msg, &[])
+}
+
+/// HMAC over two message parts, without joining them first.
+///
+/// The blind index MACs a fixed-length constant followed by the plaintext.
+/// Concatenating them would put a copy of the plaintext in a heap block that
+/// nothing wipes, so the parts are fed to the MAC directly. The prefix is a
+/// constant, so the split adds no ambiguity.
+fn hmac_sha256_parts(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(msg);
+    mac.update(first);
+    mac.update(second);
     mac.finalize().into_bytes().into()
 }
 
@@ -384,9 +395,9 @@ impl RootKey {
             )
             .map_err(|_| ConfidentialError::UnsealFailed)?;
         String::from_utf8(plaintext).map_err(|e| {
-            // The error owns the recovered bytes; wipe them before it drops.
-            let mut recovered = e.into_bytes();
-            recovered.zeroize();
+            // The error owns the recovered bytes; `Zeroizing` wipes them when it
+            // drops at the end of this closure.
+            let _wiped = zeroize::Zeroizing::new(e.into_bytes());
             ConfidentialError::NotUtf8
         })
     }
@@ -402,14 +413,11 @@ impl RootKey {
     #[must_use]
     pub fn blind_index(&self, ctx: &FieldContext, plaintext: &str) -> BlindIndex {
         let mut index_key = self.derive(b"autumn:confidential:index:v1:", ctx);
-        // Fed to the MAC in two parts rather than concatenated, so no heap block
-        // holds a copy of the plaintext. The prefix is a fixed constant, so the
-        // split adds no ambiguity.
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(&index_key).expect("HMAC accepts any key length");
-        mac.update(b"autumn:confidential:bidx:v1:");
-        mac.update(plaintext.as_bytes());
-        let tag: [u8; 32] = mac.finalize().into_bytes().into();
+        let tag = hmac_sha256_parts(
+            &index_key,
+            b"autumn:confidential:bidx:v1:",
+            plaintext.as_bytes(),
+        );
         index_key.zeroize();
         BlindIndex(hex::encode(&tag[..TOKEN_BYTES]))
     }
@@ -452,11 +460,14 @@ impl Sealed {
     /// Returns [`ConfidentialError::MalformedEnvelope`] or
     /// [`ConfidentialError::UnsupportedEnvelope`] when the header does not
     /// parse, so junk is refused at the boundary rather than stored.
-    pub fn from_envelope(envelope: String) -> Result<Self, ConfidentialError> {
-        // Trimmed once, here, so two `Sealed` values are equal exactly when they
-        // decode to the same envelope. An operator cannot make one row look
-        // different from another by adding a space.
-        let candidate = Self(envelope.trim().to_owned());
+    pub fn from_envelope(mut envelope: String) -> Result<Self, ConfidentialError> {
+        // Trimmed once, here, and in place, so two `Sealed` values are equal
+        // exactly when they decode to the same envelope. An operator cannot make
+        // one row look different from another by adding a space.
+        envelope.truncate(envelope.trim_end().len());
+        let leading = envelope.len() - envelope.trim_start().len();
+        envelope.drain(..leading);
+        let candidate = Self(envelope);
         candidate.to_bytes()?;
         Ok(candidate)
     }
@@ -544,10 +555,29 @@ impl<'de> Deserialize<'de> for Sealed {
 /// The client computes it with [`RootKey::blind_index`] and sends it alongside
 /// the sealed value. The server stores it in its own column and compares it,
 /// which is the only server-side predicate a confidential field supports.
-#[derive(Clone, Eq, Hash, Debug)]
+#[derive(Clone, Eq)]
 #[cfg_attr(feature = "db", derive(diesel::AsExpression, diesel::FromSqlRow))]
 #[cfg_attr(feature = "db", diesel(sql_type = diesel::sql_types::Text))]
 pub struct BlindIndex(String);
+
+/// Hand-written to stay consistent with the constant-time [`PartialEq`] below:
+/// equal tokens hash equally, which a derived `Hash` could not be shown to do
+/// once `PartialEq` stopped being derived.
+impl std::hash::Hash for BlindIndex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// Redacted, for the same reason the token is filtered out of logs and the CSV
+/// export: it is stable per value per owner, so anyone who reads it can tell
+/// which of an owner's rows hold the same value. `Debug` output reaches logs,
+/// panic messages and error pages, which would walk straight past those filters.
+impl fmt::Debug for BlindIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BlindIndex(<token>)")
+    }
+}
 
 /// Constant time, so an application that compares a submitted token against a
 /// stored one does not turn the comparison into a timing oracle. The database

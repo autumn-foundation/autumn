@@ -150,11 +150,19 @@ fn two_seals_of_one_plaintext_differ() {
 }
 
 #[test]
-fn debug_output_shows_no_ciphertext_or_key_material() {
+fn debug_output_shows_no_ciphertext_key_material_or_token() {
     let key = RootKey::generate();
     let sealed = key.seal(&ctx(), PLAINTEXT).expect("seal");
+    let token = key.blind_index(&ctx(), PLAINTEXT);
+
     assert_eq!(format!("{sealed:?}"), "Sealed(<sealed>)");
     assert_eq!(format!("{key:?}"), "RootKey(<redacted>)");
+    // The token is filtered out of logs and the CSV export because it says
+    // which of an owner's rows hold the same value. `Debug` must not walk past
+    // those filters.
+    let rendered = format!("{token:?}");
+    assert_eq!(rendered, "BlindIndex(<token>)");
+    assert!(!rendered.contains(token.as_token()));
 }
 
 // ── Blind index (AC4) ───────────────────────────────────────────────────────

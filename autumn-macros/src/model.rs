@@ -4820,7 +4820,26 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
             .iter()
             .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
         match companion {
-            Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {}
+            Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {
+                // The companion is registered under its Rust name too, and every
+                // protection it gets is keyed off that name: version-history
+                // redaction, the log parameter filter and the CSV export. A
+                // rename on the companion would leave the token unprotected
+                // under a name none of them look for, which is worse than a
+                // rename on the sealed column: the token is what tells an
+                // operator which of an owner's rows hold the same value.
+                if field_has_serde_rename(f) || diesel_column_name(f).is_some() {
+                    return Err(syn::Error::new_spanned(
+                        f,
+                        format!(
+                            "`{expected}` is a blind-index companion, so it cannot use \
+                             `#[serde(rename = ...)]` or `#[diesel(column_name = ...)]`: \
+                             the token is registered under its Rust name, which version \
+                             history, the log filter and the CSV export all key off."
+                        ),
+                    ));
+                }
+            }
             Some(f) => {
                 return Err(syn::Error::new_spanned(
                     &f.ty,
@@ -14603,6 +14622,51 @@ mod tests {
         assert!(
             !expanded.contains("__autumn_tenant"),
             "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
+
+    /// #1771: a rename on the blind-index companion would leave the token
+    /// unprotected under a name version history, the log filter and the CSV
+    /// export do not look for.
+    #[test]
+    fn a_renamed_blind_index_companion_is_refused() {
+        for rename in [
+            quote! { #[serde(rename = "lookup")] },
+            quote! { #[diesel(column_name = lookup)] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #rename
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a renamed companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// The companion is accepted when it is not renamed.
+    #[test]
+    fn a_plain_blind_index_companion_is_accepted() {
+        let input: TokenStream = quote! {
+            pub struct Note {
+                pub id: i32,
+                #[confidential(blind_index)]
+                pub body: autumn_web::confidential::Sealed,
+                pub body_bidx: autumn_web::confidential::BlindIndex,
+            }
+        };
+        let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+        assert!(!expanded.contains("compile_error"), "{expanded}");
+        assert!(
+            expanded.contains("__AUTUMN_CONFIDENTIAL_COLUMNS"),
+            "{expanded}"
         );
     }
 
