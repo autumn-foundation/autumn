@@ -131,7 +131,8 @@ async fn stash() -> AutumnResult<&'static str> {
 
         // Removing frees only the key + value capacity back to the quota; the
         // fixed per-entry overhead is retained (against the entry high-water
-        // mark) until the cell is evicted.
+        // mark) until the accounting domain is no longer resident and its last
+        // request/eviction handle drops.
         let _ = cell.scratch_remove("draft");
     }
     Ok("ok")
@@ -158,32 +159,46 @@ the memory it owns, not every byte a handler touches on the way there.
 ## Eviction and lifecycle
 
 Cells live in a process-wide `TenantCellRegistry` shared by every clone of the
-app state. Two properties matter operationally:
+app state. Three properties matter operationally:
 
 - **Lazy creation.** Binding a request to a tenant does not allocate a cell;
   the first call to `current_tenant_cell()` (internally a registry
   `get_or_create`) materializes it. Routes that never touch tenant memory leave
   the registry untouched.
-- **Deterministic eviction.** `TenantCellRegistry::evict(tenant_id)` removes
-  the tenant's cell from the registry and returns it; once that handle and any
-  outstanding request references drop, the cell's owned memory (scratch buffer
-  and all) is reclaimed, and its tracked bytes leave the process-wide gauge.
-  This is ordinary Rust `Drop`, not a background sweep — reclaim is immediate
-  and predictable.
+- **Residency eviction with deferred teardown.**
+  `TenantCellRegistry::evict(tenant_id)` removes the tenant's cell from the
+  resident cache and returns it. Eviction does not create permission for a
+  second accounting domain: while the returned handle, an outstanding request,
+  or a live `Charge` still owns the old domain, a subsequent `get_or_create` for
+  that tenant resurrects the same quota counter and scratch map and makes it
+  resident again. The scratch contents therefore remain visible to that
+  subsequent request, and its charges aggregate with the earlier request's
+  charges under one tenant quota.
+
+  Teardown occurs only after the domain is no longer resident and its final
+  strong owner drops. At that point the scratch buffer is reclaimed and its
+  tracked bytes leave the process-wide gauge through ordinary Rust `Drop`, not
+  a background reclamation task. If an operator needs to purge a tenant's
+  scratch state, traffic for that tenant must first quiesce; then call `evict`
+  and drop its returned handle after all outstanding request/charge handles have
+  completed. A request arriving before teardown prevents the purge by
+  resurrecting and re-residenting the existing domain.
 - **Automatic eviction.** With `max_cells` or `idle_ttl_secs` set (see
   [Configuration](#configuration)), the registry evicts on its own — LRU cells
   above the cap, and cells idle past the TTL — enforced lazily on cell insert.
-  Automatic eviction reclaims memory exactly like the manual `evict` above: it
-  drops only the registry's strong reference, so the same deterministic `Drop`
-  applies and an in-flight holder is never disturbed.
+  Automatic eviction has the same residency-versus-lifecycle semantics as
+  manual `evict`: it drops only the resident-cache reference, so an in-flight
+  holder is never disturbed and a same-tenant request arriving before teardown
+  reuses and re-residents the domain.
 
 Eviction is safe to do mid-request. Each in-flight request caches the cell it
-first materialized, so evicting a tenant while one of its requests is running
-does **not** reset that request's state or hand it a fresh empty cell: the
-running request keeps its own cached `Arc` and its stable cell to completion,
-its memory reclaiming on drop, and the eviction takes effect for subsequent
-requests. The registry also exposes `len()`, `is_empty()`, and
-`total_tracked_bytes()` for observability.
+first materialized, so eviction does **not** reset that request's state. It also
+does not hand a subsequent request a fresh empty cell while the old domain is
+alive: both requests share its scratch state and aggregate quota. `len()` and
+`is_empty()` report resident-cache membership, `accounting_domain_count()` also
+includes evicted domains retained by in-flight work (plus dead tombstones
+awaiting bounded incremental cleanup), and `total_tracked_bytes()` covers every
+live domain regardless of residency.
 
 **Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than
 frozen at creation. Every access refreshes a resident cell's quota from the
@@ -204,15 +219,17 @@ refresh simply re-applies the same configured value.
 - a fixed per-entry overhead, exposed as
   `TenantCell::scratch_entry_overhead()`, charged against the **high-water mark**
   of live scratch entries (not the current count), so that a tenant storing many
-  tiny entries cannot amplify its footprint past the cap via map growth. Because a
-  `HashMap` never shrinks its bucket array on removal, this overhead is *retained*
-  after a `scratch_remove` (which frees only the removed key and value capacity)
-  and is reclaimed only when the cell is dropped on eviction. So `tracked_bytes()`
-  can stay elevated after you insert then remove scratch entries, and re-inserting
-  within the prior peak adds no new overhead (churn-safe).
+  tiny entries cannot amplify its footprint past the cap via map growth. Because
+  a `HashMap` never shrinks its bucket array on removal, this overhead is
+  *retained* after a `scratch_remove` (which frees only the removed key and value
+  capacity) and is reclaimed only when the evicted accounting domain's final
+  owner drops. So `tracked_bytes()` can stay elevated after you insert then
+  remove scratch entries, and re-inserting within the prior peak adds no new
+  overhead (churn-safe).
 
-Everything tracked is deterministically reclaimed when the cell is dropped on
-eviction. What it is **not**: a measurement of the tenant's true process RSS.
+Everything tracked is deterministically reclaimed when a non-resident
+accounting domain's final owner drops. What it is **not**: a measurement of the
+tenant's true process RSS.
 Allocator-internal fragmentation, size-class rounding, and any allocation a
 handler makes *outside* the cell's API (a bare `Box::new`, a `Vec` you build
 and never charge) are invisible to the counter by design. Charge through the
