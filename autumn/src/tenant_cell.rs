@@ -66,7 +66,7 @@ impl TenantArena {
             .try_reserve_exact(len)
             .map_err(|error| TenantAllocationError::Allocator {
                 requested: len,
-                message: error.to_string(),
+                source: error,
             })?;
         let excess_charge = (value.capacity() > len)
             .then(|| self.cell.try_charge(value.capacity() - len))
@@ -93,7 +93,7 @@ impl TenantArena {
             .try_reserve_exact(value.len())
             .map_err(|error| TenantAllocationError::Allocator {
                 requested: value.len(),
-                message: error.to_string(),
+                source: error,
             })?;
         let excess_charge = (owned.capacity() > value.len())
             .then(|| self.cell.try_charge(owned.capacity() - value.len()))
@@ -166,7 +166,10 @@ pub enum TenantAllocationError {
     /// The tenant's finite cooperative quota was exhausted.
     Quota(QuotaExceeded),
     /// The system allocator rejected a reservation after quota was reserved.
-    Allocator { requested: usize, message: String },
+    Allocator {
+        requested: usize,
+        source: std::collections::TryReserveError,
+    },
 }
 
 impl From<QuotaExceeded> for TenantAllocationError {
@@ -179,15 +182,22 @@ impl fmt::Display for TenantAllocationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quota(error) => error.fmt(f),
-            Self::Allocator { requested, message } => write!(
+            Self::Allocator { requested, source } => write!(
                 f,
-                "allocator rejected tenant scratch reservation of {requested} bytes: {message}"
+                "allocator rejected tenant scratch reservation of {requested} bytes: {source}"
             ),
         }
     }
 }
 
-impl std::error::Error for TenantAllocationError {}
+impl std::error::Error for TenantAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Quota(error) => Some(error),
+            Self::Allocator { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
 /// the `String` and `Vec` structs stored inline in the bucket array plus an
@@ -808,8 +818,14 @@ impl TenantCellRegistry {
                 .domains
                 .lock()
                 .expect("tenant cell domain index lock poisoned");
-            domains.retain(|_, domain| domain.strong_count() > 0);
-            domains.get(tenant_id).and_then(Weak::upgrade).map_or_else(
+            let live_domain = domains.get(tenant_id).and_then(Weak::upgrade);
+            if live_domain.is_none() {
+                // Clean only this lookup's stale tombstone. A full retain here
+                // makes N distinct tenant misses quadratic and serializes them
+                // behind both registry locks.
+                domains.remove(tenant_id);
+            }
+            let cell = live_domain.map_or_else(
                 || {
                     let cell = Arc::new(TenantCell::new(
                         tenant_id.to_string(),
@@ -824,7 +840,9 @@ impl TenantCellRegistry {
                     cell.set_quota_bytes(quota_bytes);
                     cell
                 },
-            )
+            );
+            drop(domains);
+            cell
         };
         // Capture `now` under the write guard, immediately before stamping the
         // new cell and sweeping, so the age comparison in `enforce_limits_locked`

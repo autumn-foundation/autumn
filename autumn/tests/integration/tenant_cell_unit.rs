@@ -8,6 +8,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
+fn allocator_failure_is_returned_without_leaking_reserved_usage() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 0);
+    let error = cell
+        .arena()
+        .try_bytes(usize::MAX)
+        .expect_err("impossible capacity must fail fallibly");
+
+    match error {
+        autumn_web::tenant_cell::TenantAllocationError::Allocator { requested, source } => {
+            assert_eq!(requested, usize::MAX);
+            assert!(!source.to_string().is_empty());
+        }
+        autumn_web::tenant_cell::TenantAllocationError::Quota(_) => {
+            panic!("unlimited quota must reach the allocator")
+        }
+    }
+    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+#[test]
 fn arena_happy_path_and_exact_boundary() {
     let registry = TenantCellRegistry::new();
     let cell = registry.get_or_create("tenant", 64);

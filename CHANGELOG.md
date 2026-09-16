@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   framework, third-party, stack, allocator, and native allocations remain
   outside this cooperative tracked-memory boundary. Evicted-but-live domains
   are weakly indexed and rebound for later requests, so LRU/TTL churn cannot
-  reset usage and admit overlapping full-quota allocation generations.
+  reset usage and admit overlapping full-quota allocation generations. Arena
+  allocation failures retain `TryReserveError` directly (without allocating an
+  error `String` under memory pressure), and domain misses clean only their own
+  stale weak entry rather than scanning the entire tenant index.
 
 - **`autumn generate webhook` for signed, replay-safe provider intake
   (#1366):** the `SignedWebhook` substrate has shipped since 0.4.0, but every
