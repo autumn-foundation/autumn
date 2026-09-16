@@ -32,7 +32,7 @@ pub struct ManifestOptions<'a> {
 ///
 /// `Command` inherits this process's environment by default, and any of these
 /// left over in the CLI's own environment would answer this command with that
-/// manifest instead of the jobs one (AUTUMN_DUMP_CACHE_COHERENCE in
+/// manifest instead of the jobs one (`AUTUMN_DUMP_CACHE_COHERENCE` in
 /// particular — issue #2370).
 fn clear_competing_dump_modes(command: &mut Command) {
     command

@@ -67,7 +67,7 @@ pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
 /// left over in the CLI's own environment would hijack the task invocation:
 /// the child would print a manifest where the task listing JSON is expected,
 /// or exit 0 after printing a manifest without ever running the task
-/// (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
+/// (`AUTUMN_DUMP_CACHE_COHERENCE` in particular — issue #2370).
 fn clear_competing_dump_modes(command: &mut Command) {
     command
         .env_remove(crate::data_flow::DUMP_ENV)
