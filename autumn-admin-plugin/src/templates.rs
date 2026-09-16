@@ -2172,6 +2172,19 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 /// Shows the current value as static text with no form control so the admin
 /// can see it but cannot alter it (and it is never submitted to the server).
 fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup {
+    // #1771: a `create_only` column reaches this instead of `render_form_widget`
+    // on EDIT, so the mask has to be here too. Redacting in the renderer rather
+    // than at the one call site keeps a future caller from reopening the hole.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+                span title="sealed for its owner" { "••••••••" }
+            }
+            small class="form-help" style="color: #888;" {
+                "This field cannot be changed after creation."
+            }
+        };
+    }
     let value = record
         .and_then(|r| r.get(field.name))
         .map(|v| match v {
@@ -2798,6 +2811,68 @@ mod tests {
         );
         assert!(cell.contains("••••••••"));
         assert!(detail.contains("••••••••"));
+    }
+
+    // #1771: a confidential column is registered process-wide, so the admin can
+    // mask it by name on every surface. Registered here directly rather than
+    // through a `#[model]`, which would need a database schema this crate has no
+    // reason to carry.
+    autumn_web::reexports::inventory::submit! {
+        autumn_web::confidential::ConfidentialColumnDescriptor {
+            model: "AdminSealedNote",
+            table: "admin_sealed_notes",
+            column: "admin_sealed_body",
+            blind_index: ::core::option::Option::Some("admin_sealed_body_bidx"),
+        }
+    }
+
+    /// The envelope and the token are masked in the list, the detail view and
+    /// the editable control.
+    #[test]
+    fn confidential_columns_are_masked_across_admin_views() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "admin_sealed_body_bidx": "0123456789abcdef0123456789abcdef",
+        });
+        for name in ["admin_sealed_body", "admin_sealed_body_bidx"] {
+            let field = AdminField::new(name, AdminFieldKind::Text);
+            let value = record.get(name).and_then(Value::as_str).unwrap();
+            for (what, rendered) in [
+                (
+                    "list cell",
+                    render_cell_value(&record, &field).into_string(),
+                ),
+                ("detail", render_detail_value(&record, &field).into_string()),
+                (
+                    "form widget",
+                    render_form_widget(&field, Some(&record), true, &[]).into_string(),
+                ),
+            ] {
+                assert!(
+                    !rendered.contains(value),
+                    "{what} leaked `{name}`: {rendered}"
+                );
+                assert!(rendered.contains("••••••••"), "{what}: {rendered}");
+            }
+        }
+    }
+
+    /// A `create_only` column reaches `render_readonly_display` on EDIT instead
+    /// of `render_form_widget`, so the mask has to live in the renderer.
+    #[test]
+    fn a_create_only_confidential_column_is_masked_on_the_edit_form() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        let field = AdminField::new("admin_sealed_body", AdminFieldKind::Text);
+        let rendered = render_readonly_display(&field, Some(&record)).into_string();
+        assert!(
+            !rendered.contains("z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "the read-only display leaked the envelope: {rendered}"
+        );
+        assert!(rendered.contains("••••••••"), "{rendered}");
     }
 
     #[test]

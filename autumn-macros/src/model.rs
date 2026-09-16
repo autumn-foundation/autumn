@@ -4809,11 +4809,12 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
         return Err(syn::Error::new_spanned(
             field,
             format!(
-                "`#[confidential]` fields cannot use `#[serde({key} = ...)]`: the column \
-                 is registered under its Rust name, which the log filter, version \
-                 history and admin redaction all key off. An alias is accepted on the \
-                 way in, so a request could deliver the envelope under a name no filter \
-                 knows."
+                "`#[confidential]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which the log filter, version history \
+                 and admin redaction all key off. An alias is accepted on the way in, so \
+                 a request could deliver the envelope under a name no filter knows, and \
+                 `flatten` removes the key altogether.",
+                serde_key_display(key)
             ),
         ));
     }
@@ -4868,10 +4869,11 @@ fn validate_blind_index_companion(
                     f,
                     format!(
                         "`{expected}` is a blind-index companion, so it cannot use \
-                         `#[serde(rename/alias = ...)]`, `#[diesel(column_name = ...)]`, \
-                         `#[private]` or `#[serde(skip_serializing)]`: the token is \
-                         registered under its Rust name, which version history, the log \
-                         filter and the CSV export all key off."
+                         `#[serde(rename/alias = ...)]`, `#[serde(flatten)]`, \
+                         `#[diesel(column_name = ...)]`, `#[private]` or \
+                         `#[serde(skip_serializing)]`: the token is registered under its \
+                         Rust name, which version history, the log filter and the CSV \
+                         export all key off."
                     ),
                 ));
             }
@@ -5650,24 +5652,16 @@ fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
 /// is absent from the version-history snapshot, which is built from the
 /// `Serialize` view, so it produces no "changed" marker at all.
 fn field_may_skip_serialization(field: &syn::Field) -> bool {
-    if field_already_skips_serialization(field) {
-        return true;
+    field_already_skips_serialization(field) || field_has_skip_serializing_if(field)
+}
+
+/// Render a serde key as it is written: `flatten` takes no value, the others do.
+fn serde_key_display(key: &str) -> String {
+    if key == "flatten" {
+        key.to_owned()
+    } else {
+        format!("{key} = ...")
     }
-    let mut conditional = false;
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("skip_serializing_if") {
-                conditional = true;
-            }
-            if let Ok(value) = meta.value() {
-                let _: syn::Result<syn::Lit> = value.parse();
-            } else if meta.input.peek(syn::token::Paren) {
-                let _ = meta.parse_nested_meta(|_| Ok(()));
-            }
-            Ok(())
-        });
-    }
-    conditional
 }
 
 /// Whether a container reshapes its serialized form through a conversion type:
@@ -5714,16 +5708,22 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
     renamed
 }
 
-/// The `#[serde(...)]` key that gives a field a wire name other than its Rust
-/// name: `rename` (what it serializes as) or `alias` (what it also accepts on
-/// the way in).
+/// The `#[serde(...)]` key that stops a field appearing under its Rust name:
+/// `rename` (what it serializes as), `alias` (what it also accepts on the way
+/// in) or `flatten` (no key of its own at all).
 ///
-/// `#[confidential]` keys every protection off the Rust name, so both matter.
-/// An `alias` is the subtler of the two: the field still serializes under its
-/// Rust name, but a request may deliver it under the alias, and a raw-JSON
-/// capture path (a failure capsule, an error-page body preview) filters on
-/// names the registry knows.
+/// `#[confidential]` keys every protection off the Rust name, so all three
+/// matter. `alias` is the subtlest: the field still serializes under its Rust
+/// name, but a request may deliver it under the alias, and a raw-JSON capture
+/// path (a failure capsule, an error-page body preview) filters on names the
+/// registry knows. `flatten` does not even work on a `Sealed` column — serde
+/// takes the derive and fails at run time, because the value serializes as a
+/// string — and `version_column_values()` turns that failure into an empty
+/// snapshot, so the update records no change marker at all.
 fn field_serde_wire_name_override(field: &syn::Field) -> Option<&'static str> {
+    if let Some(word) = serde_bare_word(&field.attrs, &["flatten"]) {
+        return Some(word);
+    }
     let mut found = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
@@ -14810,12 +14810,15 @@ mod tests {
     }
 
     /// #1771: an alias is accepted on the way in, so a request could deliver the
-    /// envelope or the token under a name no filter knows.
+    /// envelope or the token under a name no filter knows; `flatten` removes the
+    /// key entirely.
     #[test]
-    fn a_serde_alias_on_a_confidential_field_or_its_companion_is_refused() {
+    fn a_serde_alias_or_flatten_on_a_confidential_field_or_companion_is_refused() {
         for (sealed_attr, companion_attr) in [
             (quote! { #[serde(alias = "lookup")] }, quote! {}),
             (quote! {}, quote! { #[serde(alias = "lookup")] }),
+            (quote! { #[serde(flatten)] }, quote! {}),
+            (quote! {}, quote! { #[serde(flatten)] }),
         ] {
             let input: TokenStream = quote! {
                 pub struct Note {
