@@ -39,6 +39,11 @@
 #      the reader cannot discover. Hidden commands are read out of the clap
 #      derive input rather than listed here, so hiding a command exempts it and
 #      un-hiding one puts it back under the gate, with no edit to this file.
+#      They are tracked by FULL PATH, resolved through the enclosing enum
+#      (`RunService` in `enum ServeCommands` is `serve run-service`): matching
+#      the last component alone would hand a later visible `deploy run-service`
+#      this one's exemption, and the "more than one component" guard that came
+#      with it meant a hidden TOP-LEVEL command was never exempted at all.
 #
 #   2. COMMANDS COVERED BY A GENERIC RULE. `docs/guide/generators.md` documents
 #      `autumn destroy` as a rule over its argument — "`autumn destroy <thing>
@@ -76,6 +81,12 @@
 # ON THAT PAGE. When such a command ships, the gate fails and names the page
 # still denying it, so the stale passage is deleted rather than the waiver
 # widened.
+#
+# The stale-denial check runs over the whole SURFACE, not over the failing
+# rows, and fails on its own. Coverage and staleness are independent questions:
+# a command that ships WITH proper docs on a new page is classified
+# `documented`, so a check that only looked at defects would go quiet on the
+# old page's denial at exactly the moment the denial became false.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - Whether the mention is any GOOD. A command named once in a table is
@@ -139,19 +150,55 @@ def corpus_pages():
 HIDE = re.compile(r'#\[command\([^)]*\bhide\s*=\s*true')
 
 
-def hidden_variants(root):
-    """Variant names carrying `#[command(hide = true)]`, kebab-cased."""
-    out = set()
-    for src in (root / 'autumn-cli' / 'src').rglob('*.rs'):
+ENUM = re.compile(r'^(?:pub )?enum ([A-Za-z0-9_]+)', re.M)
+
+
+def _kebab(name):
+    return re.sub(r'(?<!^)(?=[A-Z])', '-', name).lower()
+
+
+def hidden_paths(root, surface):
+    """FULL command paths carrying `#[command(hide = true)]`.
+
+    The first cut kept only the variant name and matched it against a command's
+    LAST component, which is wrong in both directions: a later visible
+    `deploy run-service` would inherit `serve run-service`'s exemption, and a
+    hidden TOP-LEVEL command was never exempted at all (it was guarded by
+    `len(path.split()) > 1`). Resolve the owning path instead.
+
+    The owner is the enclosing enum: `RunService` inside `enum ServeCommands`
+    is `serve run-service`, and a variant of the root `enum Commands` is
+    top-level. Anything that does not resolve to a real command path is
+    reported rather than dropped — a silent miss here re-exempts nothing and
+    hides a command from the gate forever.
+    """
+    found, unplaced = set(), []
+    known = set(surface)
+    for src in sorted((root / 'autumn-cli' / 'src').rglob('*.rs')):
         text = src.read_text(errors='replace')
+        enums = [(m.start(), m.group(1)) for m in ENUM.finditer(text)]
         for m in HIDE.finditer(text):
-            tail = text[m.end():]
-            # the next identifier at the start of a line is the variant name
-            nxt = re.search(r'\n\s*([A-Z][A-Za-z0-9_]*)\s*[{(,]', tail)
-            if nxt:
-                name = nxt.group(1)
-                out.add(re.sub(r'(?<!^)(?=[A-Z])', '-', name).lower())
-    return out
+            nxt = re.search(r'\n\s*([A-Z][A-Za-z0-9_]*)\s*[{(,]', text[m.end():])
+            if not nxt:
+                continue
+            variant = _kebab(nxt.group(1))
+            owner = ''
+            for pos, name in enums:
+                if pos < m.start():
+                    owner = name
+                else:
+                    break
+            if owner == 'Commands':
+                path = variant
+            else:
+                parent = re.sub(r'(?:Sub)?[Cc]ommands$', '', owner)
+                path = f"{_kebab(parent)} {variant}".strip() if parent else variant
+            if path in known:
+                found.add(path)
+            else:
+                unplaced.append(f"{path!r} (variant of `enum {owner}`, "
+                                f"{src.relative_to(root)})")
+    return found, unplaced
 
 
 # ----------------------------------------------------------------- the rules
@@ -289,12 +336,11 @@ def analyse(root):
     cmds = command_paths()
     paths = corpus_pages()
     pages = read_pages(root, paths)
-    hidden = hidden_variants(root)
+    hidden, unplaced = hidden_paths(root, cmds)
 
     rows, rule_failures = [], []
     for c in cmds:
-        last = c.split()[-1]
-        if last in hidden and len(c.split()) > 1:
+        if c in hidden:
             rows.append((c, 'hidden')); continue
         if mentioned(c, pages):
             rows.append((c, 'documented')); continue
@@ -303,17 +349,21 @@ def analyse(root):
         if c in BACKLOG:
             rows.append((c, 'backlog')); continue
         rows.append((c, 'DEFECT'))
-    # A command that SHIPPED while a page still waives it as nonexistent is the
-    # worst case this gate has: the docs actively deny a feature the reader can
-    # run. Name those pages in the failure so the stale passage gets deleted
-    # rather than the waiver being widened.
-    stale = [(c, p) for c, k in rows if k == 'DEFECT'
-             for p, _t, w in pages if c in w]
-    return rows, rule_failures, len(paths), stale
+
+    # A command that SHIPPED while a page still denies it exists is the worst
+    # state this gate can describe: the docs actively tell a reader a feature
+    # they can run is unavailable. It is computed over the whole SURFACE, not
+    # over the defect rows — a shipped command documented on some new page is
+    # classified `documented`, and the old page's denial would go unreported
+    # precisely when the command became real. Coverage and staleness are
+    # independent questions, and this one fails on its own.
+    surface = set(cmds)
+    stale = sorted({(c, p) for p, _t, w in pages for c in w if c in surface})
+    return rows, rule_failures, len(paths), stale, unplaced
 
 
 def report(root):
-    rows, rule_failures, npages, stale = analyse(root)
+    rows, rule_failures, npages, stale, unplaced = analyse(root)
     counts = {}
     for _, k in rows:
         counts[k] = counts.get(k, 0) + 1
@@ -337,9 +387,13 @@ def report(root):
 
     for f in rule_failures:
         print(f"RULE BROKEN: {f}")
+    for u in unplaced:
+        print(f"HIDDEN COMMAND NOT PLACED: {u} does not resolve to any command "
+              f"path. Its exemption is not being applied — fix the owner "
+              f"derivation in hidden_paths() rather than leaving it unmatched.")
 
-    print(f"defects: {len(defects)}")
-    if not defects and not rule_failures:
+    print(f"defects: {len(defects)}  stale denials: {len(stale)}")
+    if not defects and not rule_failures and not stale and not unplaced:
         print("CLI coverage gate OK.")
         return 0
 
@@ -347,10 +401,12 @@ def report(root):
         print(f"\n  `autumn {c}` is documented on none of the "
               f"{npages} reader-facing pages.")
     for c, p in stale:
-        print(f"\n  …and {p} still carries a `cli-surface-allow` waiver saying "
+        print(f"\n  {p} still carries a `cli-surface-allow` waiver saying "
               f"`autumn {c}` does not exist. It SHIPPED. Delete that passage and "
-              f"its waiver — the page is now telling readers a feature they can "
-              f"run is unavailable, which is worse than the missing docs.")
+              f"its waiver — the page is telling readers a feature they can run "
+              f"is unavailable, which is worse than missing docs. This fails "
+              f"even when another page documents the command: the denial is a "
+              f"defect on its own.")
     print("""
 A command a reader can run and cannot find is a coverage defect: the answer does
 not exist where they look, so they conclude the feature does not exist. Fix it at
@@ -371,7 +427,7 @@ Inspect what the gate read:  scripts/check-docs-cli-coverage.sh --list""")
 
 
 def show(root):
-    rows, rule_failures, npages, _stale = analyse(root)
+    rows, rule_failures, npages, _stale, _unplaced = analyse(root)
     for c, k in sorted(rows):
         print(f"{k:11} autumn {c}")
     for f in rule_failures:
@@ -442,6 +498,38 @@ def self_test():
     # hidden detection
     check('hide parsed', bool(HIDE.search('#[command(hide = true)]')), True)
     check('hide not over-matched', bool(HIDE.search('#[command(verbatim_doc_comment)]')), False)
+
+    # REGRESSION: hidden commands are tracked by FULL PATH. Matching only the
+    # last component let `serve run-service`'s exemption cover a hypothetical
+    # `deploy run-service`, and the `len(path.split()) > 1` guard meant a hidden
+    # TOP-LEVEL command was never exempted at all.
+    fake = pathlib.Path(os.environ['SELFTEST_TMP']) / 'hid'
+    (fake / 'autumn-cli' / 'src').mkdir(parents=True, exist_ok=True)
+    (fake / 'autumn-cli' / 'src' / 'main.rs').write_text(
+        'enum Commands {\n'
+        '    /// doc\n'
+        '    #[command(hide = true)]\n'
+        '    SecretTop,\n'
+        '    Serve(ServeCommands),\n'
+        '}\n'
+        'enum ServeCommands {\n'
+        '    Status,\n'
+        '    #[command(hide = true)]\n'
+        '    RunService {\n'
+        '        x: u8,\n'
+        '    },\n'
+        '}\n')
+    surface = ['secret-top', 'serve status', 'serve run-service',
+               'deploy run-service']
+    got, unplaced = hidden_paths(fake, surface)
+    check('hidden resolved to full path', got, {'secret-top', 'serve run-service'})
+    check('a sibling sharing the last component is NOT hidden',
+          'deploy run-service' in got, False)
+    check('a hidden top-level command IS exempted', 'secret-top' in got, True)
+    check('nothing left unplaced', unplaced, [])
+    # an owner that resolves to no command path is reported, never dropped
+    _got2, unplaced2 = hidden_paths(fake, ['serve status'])
+    check('unresolvable hidden path is reported', len(unplaced2), 2)
 
     # a rule stops exempting once its page stops stating it
     missing = []

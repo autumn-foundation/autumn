@@ -62,7 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `check-docs-orphans.sh` draws — and a page's waived commands do not count as
   mentioned on that page. When one of those ships, the gate fails and names
   the page still denying it, so the stale passage is deleted rather than the
-  waiver widened.
+  waiver widened — and that check runs over the whole surface rather than over
+  the failing rows, since a command that ships WITH docs on a new page is
+  classified `documented`, and a defect-only check would go quiet on the old
+  denial at exactly the moment it became false. Hidden commands are likewise
+  tracked by full path, resolved through the enclosing enum (`RunService` in
+  `enum ServeCommands` is `serve run-service`): matching the last component
+  alone would hand a later visible `deploy run-service` this one's exemption,
+  and the guard that came with it meant a hidden top-level command was never
+  exempted at all.
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
