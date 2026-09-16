@@ -1211,33 +1211,36 @@ impl JobRegistry {
         self.pop_waiting(name, false);
     }
 
-    /// Record that an enqueued job was canceled, given the durable backend's
-    /// own measurement of how far its due time still is from *now*
-    /// (`offset_ms`; zero or negative means already claimable), relative to
-    /// `mark_reference_ms` — the same "now" reference this job's own
-    /// registry mark was stamped against at enqueue time.
+    /// Record that an enqueued Postgres-backed job was canceled, given the
+    /// database's own measurement of its due time, and remove whichever
+    /// waiting mark that job actually pushed — without knowing, from the
+    /// offset alone, which of three timelines that mark lives on:
     ///
-    /// `mark_reference_ms` is **not** necessarily `self.now_ms()`: a
-    /// Postgres-backed job's marks are stamped from real time regardless of
-    /// this registry's own injected clock (`JobClient::due_origin` reads
-    /// real time whenever the durable backend is Postgres, precisely so the
-    /// registry's marks for such a job line up with the database's own
-    /// `run_at`/`clock_timestamp()`), so the caller supplies the reference
-    /// its own marks actually live on rather than this method assuming its
-    /// injected clock is authoritative.
+    /// * an **absolute** enqueue (`enqueue_at`) stamps the registry mark with
+    ///   the caller's own instant verbatim, byte-identical to `absolute_ms`
+    ///   (Postgres's stored `run_at`, forwarded unchanged) — no clock read
+    ///   in between, so this candidate matches it exactly;
+    /// * a **relative-delay** enqueue (`enqueue_in`) stamps the mark from
+    ///   `JobClient::due_origin`'s real-time reading at enqueue time, so
+    ///   `real_reference_ms + offset_ms` (translating the database's
+    ///   `run_at - clock_timestamp()` onto that same real timeline)
+    ///   reconstructs it;
+    /// * an **immediate** enqueue stamps the mark from this registry's own
+    ///   injected clock (`record_enqueue`), so `self.now_ms() + offset_ms`
+    ///   reconstructs it instead.
     ///
-    /// Mirrors [`ready_at_from_age`]: the offset is translated onto that
-    /// reference as `mark_reference_ms + offset_ms` before searching, and the
-    /// nearest waiting mark to that translated instant is removed — rather
-    /// than deciding a ready/scheduled *category* from the offset alone and
-    /// asking this registry's internal category search to find any mark
-    /// sharing it, which is only guaranteed correct when every mark in the
-    /// queue was stamped on the exact same reference the offset itself is
-    /// relative to.
+    /// Mirrors [`ready_at_from_age`]'s translate-onto-a-known-timeline
+    /// approach, tried against all three candidates rather than one: the
+    /// nearest existing mark to *any* candidate is removed, instead of
+    /// deciding a ready/scheduled category from the offset and asking this
+    /// registry's internal category search to find any mark sharing it,
+    /// which is only correct when every mark in the queue shares one
+    /// timeline with the offset.
     pub fn record_cancel_at_backend_offset(
         &self,
         name: &str,
-        mark_reference_ms: u64,
+        absolute_ms: Option<u64>,
+        real_reference_ms: u64,
         offset_ms: i64,
     ) {
         if let Ok(mut guard) = self.inner.write()
@@ -1245,8 +1248,11 @@ impl JobRegistry {
         {
             status.queued = status.queued.saturating_sub(1);
         }
-        let target_ready_at_ms = mark_reference_ms.saturating_add_signed(offset_ms);
-        self.pop_waiting_nearest(name, target_ready_at_ms);
+        let mut candidates: Vec<u64> = Vec::with_capacity(3);
+        candidates.extend(absolute_ms);
+        candidates.push(real_reference_ms.saturating_add_signed(offset_ms));
+        candidates.push(self.now_ms().saturating_add_signed(offset_ms));
+        self.pop_waiting_nearest(name, &candidates);
     }
 
     /// Drop one waiting mark for this job's queue (its wait is over).
@@ -1272,10 +1278,10 @@ impl JobRegistry {
         }
     }
 
-    /// Drop the waiting mark closest to `target_ready_at_ms`, on whatever
-    /// timeline the caller resolved that instant against. A queue with no
+    /// Drop the waiting mark closest to any of `candidates`, each expressed
+    /// on whatever timeline the caller resolved it against. A queue with no
     /// marks removes nothing — there is nothing to leak.
-    fn pop_waiting_nearest(&self, name: &str, target_ready_at_ms: u64) {
+    fn pop_waiting_nearest(&self, name: &str, candidates: &[u64]) {
         let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
             && let Some(waiting) = guard.waiting.get_mut(&queue)
@@ -1283,7 +1289,12 @@ impl JobRegistry {
             let idx = waiting
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, ready_at)| ready_at.abs_diff(target_ready_at_ms))
+                .min_by_key(|(_, ready_at)| {
+                    candidates
+                        .iter()
+                        .map(|target| ready_at.abs_diff(*target))
+                        .min()
+                })
                 .map(|(idx, _)| idx);
             if let Some(idx) = idx {
                 waiting.remove(idx);
@@ -4678,70 +4689,98 @@ mod tests {
         }
     }
 
-    /// An admin-cancel offset from a durable backend's own measurement of
-    /// "now" must pick the correct waiting mark using that same reference,
-    /// regardless of what this registry's own injected clock reads.
+    /// An admin-cancel must find the correct waiting mark whichever of the
+    /// three timelines it lives on: an absolute `enqueue_at` mark (matched
+    /// exactly by `run_at`'s own value), a relative-delay `enqueue_in` mark
+    /// (stamped from real time via `due_origin()`, reconstructed from
+    /// `real_reference_ms + offset_ms`), or an immediate-enqueue mark
+    /// (stamped from this registry's own clock, reconstructed from
+    /// `self.now_ms() + offset_ms`) — regardless of what this registry's own
+    /// injected clock reads, since only the immediate case actually lives on
+    /// it.
     ///
-    /// `record_cancel_at_backend_offset` translates the backend's offset
-    /// (e.g. Postgres's `run_at - clock_timestamp()`) onto the
-    /// *caller-supplied* `mark_reference_ms`, not `self.now_ms()`, mirroring
-    /// `ready_at_from_age`: a Postgres-backed job's marks are stamped from
-    /// real time regardless of this registry's own clock
-    /// (`JobClient::due_origin`), so a category decided on the backend's
-    /// clock and matched against marks judged on the registry's own
-    /// *separate* clock (`pop_waiting`) can disagree about the boundary.
-    /// Pin the registry's own clock somewhere irrelevant in each direction
-    /// and confirm it is never consulted for this decision.
+    /// Mirrors `ready_at_from_age`'s translate-onto-a-known-timeline
+    /// approach, tried against all three candidates. A category decided on
+    /// the backend's clock and matched against marks judged on the
+    /// registry's own *separate* clock (`pop_waiting`) can disagree about a
+    /// boundary; trying each mark's own plausible timeline directly cannot.
     #[test]
-    fn cancel_at_backend_offset_finds_the_matching_mark_regardless_of_the_registry_clock() {
+    fn cancel_at_backend_offset_finds_the_matching_mark_on_any_of_its_three_timelines() {
         use chrono::{TimeZone, Utc};
 
         // An arbitrary "backend now" reference, unrelated to either pinned
         // registry clock below — standing in for a Postgres `clock_timestamp()`
         // reading, which a real cancel would supply.
         const BACKEND_NOW_MS: u64 = 1_800_000_000_000;
+        // An arbitrary absolute due-at instant, far from every other value
+        // used here, standing in for an `enqueue_at(some_instant)` mark.
+        const ABSOLUTE_MARK_MS: u64 = 9_999_999_999_999;
 
         for year in [1999, 2036] {
             let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
+            let epoch_ms = u64::try_from(epoch.timestamp_millis()).unwrap();
             let registry = JobRegistry::new()
                 .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
-            registry.register_on_queue("send_email", "mail");
-            registry.register_on_queue("nightly_report", "mail");
+            registry.register_on_queue("immediate_job", "mail");
+            registry.register_on_queue("relative_job", "mail");
+            registry.register_on_queue("absolute_job", "mail");
 
-            // Both marks stamped on the backend's own reference timeline,
-            // not this registry's pinned clock — mirroring a Postgres-backed
-            // enqueue, whose `due_origin()` always reads real time. Asserted
-            // via `waiting_marks_for_test` rather than `queue_snapshot`'s
-            // depth: that method buckets marks against its own `now_ms()`
-            // (the registry's pinned clock here), which — unrelated to the
-            // fix under test — would itself misjudge a mark stamped on a
-            // wildly different timeline as "not yet ready".
-            registry.record_enqueue_scheduled("send_email", BACKEND_NOW_MS);
-            registry.record_enqueue_scheduled("nightly_report", BACKEND_NOW_MS + 3_600_000);
+            // Three marks, three timelines — mirroring how the three enqueue
+            // shapes actually stamp a Postgres-backed job's registry mark.
+            // Asserted via `waiting_marks_for_test` rather than
+            // `queue_snapshot`'s depth: that method buckets marks against its
+            // own `now_ms()` (the registry's pinned clock here), which —
+            // unrelated to the fix under test — would itself misjudge a mark
+            // stamped on a wildly different timeline as "not yet ready".
+            registry.record_enqueue("immediate_job");
+            registry.record_enqueue_scheduled("relative_job", BACKEND_NOW_MS + 3_600_000);
+            registry.record_enqueue_scheduled("absolute_job", ABSOLUTE_MARK_MS);
             assert_eq!(
-                registry.waiting_marks_for_test("send_email"),
-                vec![BACKEND_NOW_MS, BACKEND_NOW_MS + 3_600_000],
-                "both marks pushed onto the shared queue"
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![epoch_ms, BACKEND_NOW_MS + 3_600_000, ABSOLUTE_MARK_MS],
+                "all three marks pushed onto the shared queue"
             );
 
-            // Cancel the scheduled job: offset ~+1h from BACKEND_NOW_MS. The
-            // translated target (BACKEND_NOW_MS + 3_600_000) sits exactly on
-            // nightly_report's mark and far from send_email's.
-            registry.record_cancel_at_backend_offset("nightly_report", BACKEND_NOW_MS, 3_600_000);
+            // Cancel the relative-delay job: offset ~+1h from BACKEND_NOW_MS
+            // (real time). No `run_at` supplied (irrelevant to this branch).
+            registry.record_cancel_at_backend_offset(
+                "relative_job",
+                None,
+                BACKEND_NOW_MS,
+                3_600_000,
+            );
             assert_eq!(
-                registry.waiting_marks_for_test("send_email"),
-                vec![BACKEND_NOW_MS],
-                "canceling the scheduled job (registry clock pinned to {year}) must remove \
-                 nightly_report's mark and leave send_email's ready mark intact"
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![epoch_ms, ABSOLUTE_MARK_MS],
+                "canceling the relative-delay job (registry clock pinned to {year}) must \
+                 remove its own real-time mark and leave the other two intact"
             );
 
-            // Cancel the ready job: offset ~0 from BACKEND_NOW_MS.
-            registry.record_cancel_at_backend_offset("send_email", BACKEND_NOW_MS, 0);
+            // Cancel the immediate job: offset ~0, no `run_at`. The only
+            // candidate that can match is `self.now_ms() + 0` — this
+            // registry's own (pinned) clock.
+            registry.record_cancel_at_backend_offset("immediate_job", None, BACKEND_NOW_MS, 0);
             assert_eq!(
-                registry.waiting_marks_for_test("send_email"),
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![ABSOLUTE_MARK_MS],
+                "canceling the immediate job (registry clock pinned to {year}) must remove \
+                 its own registry-clock mark and leave the absolute mark intact"
+            );
+
+            // Cancel the absolute job: `run_at` supplied verbatim, matching
+            // ABSOLUTE_MARK_MS exactly regardless of the (irrelevant, and
+            // here deliberately wrong) offset/real-reference pair.
+            registry.record_cancel_at_backend_offset(
+                "absolute_job",
+                Some(ABSOLUTE_MARK_MS),
+                BACKEND_NOW_MS,
+                0,
+            );
+            assert_eq!(
+                registry.waiting_marks_for_test("immediate_job"),
                 Vec::<u64>::new(),
-                "canceling the ready job (registry clock pinned to {year}) must drain the \
-                 queue to zero, not leave the already-removed scheduled mark's slot empty"
+                "canceling the absolute job (registry clock pinned to {year}) must remove \
+                 its own mark via the exact run_at match and drain the queue to zero"
             );
         }
     }

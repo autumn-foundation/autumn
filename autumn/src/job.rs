@@ -3488,21 +3488,25 @@ impl JobClient {
         let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = self.entropy.uuid_v4().to_string();
-        // Stamp the registry mark from `due_at` when it is set (a future due
-        // time only becomes claimable later — local timer / durable
-        // `run_at` — so it must not count toward ready per-queue depth until
-        // its ready time arrives), or from `now` (this enqueue's own
-        // `due_origin()` reading) when it is not. Both arms go through
-        // `record_enqueue_scheduled` rather than `record_enqueue` for the
-        // immediate case: `record_enqueue` would stamp the registry's own
-        // injected clock, which for a Postgres-backed job is not `now` —
-        // `due_origin()` deliberately reads real time there instead (see
-        // `JobClient::due_origin`) — so an admin-cancel of the immediate job
-        // and a co-queued relative-delay job would then hold marks on two
-        // different timelines, exactly the mismatch that breaks the
-        // `pg_cancel_enqueued`/`record_cancel_at_backend_offset` translation.
-        let ready_at_ms = u64::try_from(due_at.unwrap_or(now).timestamp_millis()).unwrap_or(0);
-        self.registry.record_enqueue_scheduled(name, ready_at_ms);
+        if let Some(due) = due_at {
+            // A future due time only becomes claimable later (local timer /
+            // durable `run_at`), so record it as scheduled: it must not count
+            // toward ready per-queue depth until its ready time arrives. For
+            // a Postgres-backed job this mark lives on `due_origin()`'s real
+            // time (see `JobClient::due_origin`), not this registry's own
+            // injected clock — `record_cancel_at_backend_offset` knows to
+            // look for it there.
+            let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
+            self.registry.record_enqueue_scheduled(name, ready_at_ms);
+        } else {
+            // An immediate enqueue's mark stays on this registry's own
+            // injected clock (never `due_origin()`'s real time): it is what
+            // `JobRegistry::queue_snapshot`'s own depth/age reporting
+            // compares marks against, so moving it to another timeline would
+            // make that reporting wrong for every immediate Postgres job
+            // whenever the registry runs a virtual clock.
+            self.registry.record_enqueue(name);
+        }
         self.job_admin.record_enqueue_due(
             id.clone(),
             name,
@@ -9839,23 +9843,28 @@ struct PgJobAdminBackend {
 /// Row returned when an admin-cancel transitions a still-enqueued Postgres job
 /// to `discarded`. Carries the fields needed to settle the tracked record
 /// (`payload`) and to decrement the correct per-queue waiting gauge (`name`
-/// resolves the queue, `offset_ms` locates the mark).
+/// resolves the queue, `run_at`/`offset_ms` together locate the mark).
+///
+/// A canceled job's registry mark can live on any of three timelines
+/// depending on how it was enqueued (see
+/// [`crate::actuator::JobRegistry::record_cancel_at_backend_offset`] for how
+/// each is reconstructed):
+///
+/// * `enqueue_at` (absolute) stamps the mark with the caller's own instant
+///   verbatim — the same value `run_at` stores, no clock read in between —
+///   so `run_at` matches it exactly;
+/// * `enqueue_in` (relative delay) stamps the mark from `due_origin()`'s
+///   real-time reading, reconstructed via `offset_ms`;
+/// * an immediate enqueue stamps the mark from the registry's own injected
+///   clock, also reconstructed via `offset_ms`, on that clock's timeline
+///   instead.
 ///
 /// `offset_ms` is `run_at - clock_timestamp()` in milliseconds, computed
-/// entirely in SQL, never against `self.clock.now()`: `run_at` can now be
-/// stamped by Postgres's own clock (a relative-delay enqueue, issue #2111
-/// follow-up), so comparing it to the app's clock reintroduces the same
-/// app-vs-database skew this whole change exists to remove. It is passed to
-/// [`crate::actuator::JobRegistry::record_cancel_at_backend_offset`] along
-/// with a real-time reference reading, which translates the offset onto
-/// that reference before picking a mark — deciding a ready/scheduled
-/// category on Postgres's clock and asking the registry for *any* mark in
-/// that category (its own injected clock) would still be right only when
-/// the two clocks happen to agree on the boundary, and a Postgres-backed
-/// job's own mark is stamped from real time regardless of the registry's
-/// injected clock (see `JobClient::due_origin`). A NULL `run_at` (never
-/// happens in practice — it is stored as `COALESCE($run_at, NOW())`)
-/// coalesces to a very negative offset, treating it as ready for safety.
+/// entirely in SQL, never against `self.clock.now()`: comparing `run_at` to
+/// the app's clock directly would reintroduce the same app-vs-database skew
+/// this whole change exists to remove. A NULL `run_at` (never happens in
+/// practice — it is stored as `COALESCE($run_at, NOW())`) coalesces
+/// `offset_ms` to a very negative value, treating it as ready for safety.
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct PgCancelRow {
@@ -9863,6 +9872,8 @@ struct PgCancelRow {
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     offset_ms: i64,
 }
@@ -10043,7 +10054,7 @@ impl PgJobAdminBackend {
             "UPDATE autumn_jobs \
              SET status = 'discarded', finished_at = NOW() \
              WHERE id = $1 AND status = 'enqueued' \
-             RETURNING payload::TEXT AS payload, name, \
+             RETURNING payload::TEXT AS payload, name, run_at, \
              COALESCE((EXTRACT(EPOCH FROM (run_at - clock_timestamp())) * 1000)::BIGINT, -1) \
              AS offset_ms",
         )
@@ -10062,20 +10073,31 @@ impl PgJobAdminBackend {
         // A row was actually canceled (RETURNING yielded it), so remove the
         // per-queue waiting mark this job pushed at enqueue time — otherwise a
         // phantom `queues.<name>.depth`/`oldest_waiting_age_ms` lingers on this
-        // process. The reference this offset translates onto must be real
-        // time, not `self.clock.now()` or the registry's own injected clock:
-        // `enqueue_with_outcome_due_inner` stamps a Postgres-backed job's own
-        // mark from `due_origin()`, which always reads real time for
-        // Postgres (see `JobClient::due_origin`), regardless of what this
-        // backend's or the registry's own clock is set to.
+        // process. `record_cancel_at_backend_offset` tries all three
+        // timelines a mark could live on (see `PgCancelRow`'s doc comment):
+        // `run_at` verbatim (an absolute `enqueue_at`), `offset_ms`
+        // translated onto real time (a relative-delay `enqueue_in`, whose
+        // mark `due_origin()` stamped from real time — see
+        // `JobClient::due_origin`), and `offset_ms` translated onto this
+        // registry's own clock (an immediate enqueue). The real-time
+        // reference must be read here, not passed as `self.clock.now()` or
+        // the registry's own clock: it has to match `due_origin()`'s choice
+        // for Postgres regardless of what either of those is set to.
         #[allow(
             clippy::disallowed_methods,
-            reason = "must match the real-time reference `due_origin()` stamped this job's \
-                      own registry mark from — see `JobClient::due_origin`."
+            reason = "must match the real-time reference `due_origin()` stamped a relative-delay \
+                      job's own registry mark from — see `JobClient::due_origin`."
         )]
-        let mark_reference_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-        self.registry
-            .record_cancel_at_backend_offset(&row.name, mark_reference_ms, row.offset_ms);
+        let real_reference_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let absolute_ms = row
+            .run_at
+            .and_then(|dt| u64::try_from(dt.timestamp_millis()).ok());
+        self.registry.record_cancel_at_backend_offset(
+            &row.name,
+            absolute_ms,
+            real_reference_ms,
+            row.offset_ms,
+        );
         // An operator can cancel a job before any worker ever claims it,
         // which never reaches run_job_handler — settle the tracked record
         // here too, or it stays pending until TTL expiry even though the
@@ -17313,18 +17335,20 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "requires Docker (testcontainers)"]
+        #[allow(clippy::too_many_lines)]
         async fn pg_cancel_classification_uses_the_database_clock_not_the_app_clock() {
-            // `pg_cancel_enqueued`'s ready-vs-scheduled classification (which
-            // per-queue waiting gauge an admin-cancel decrements) must come
-            // from Postgres's own clock (`run_at - clock_timestamp()`), and
-            // that offset must then be translated onto *real time* — the
-            // same reference `enqueue_with_outcome_due_inner` stamps a
-            // Postgres-backed job's own registry mark from via
-            // `due_origin()` — never onto this registry's own injected
-            // clock (`JobRegistry::pop_waiting`'s usual timeline). Pin the
-            // *registry's* clock far from real time (issue #2111 follow-up)
-            // and confirm cancellation still finds the right mark, proving
-            // the registry's own clock plays no part in this decision.
+            // `pg_cancel_enqueued` must find the canceled job's own waiting
+            // mark whichever of three timelines it lives on:
+            //   - an immediate enqueue's mark stays on this registry's own
+            //     injected clock (`record_enqueue`);
+            //   - a relative-delay enqueue's mark lives on real time, via
+            //     `due_origin()` (`JobClient::due_origin`, issue #2111
+            //     follow-up);
+            //   - an absolute `enqueue_at` mark is the caller's own instant
+            //     verbatim, matched exactly against Postgres's own `run_at`.
+            // Pin the *registry's* clock far from real time and confirm all
+            // three still cancel correctly, proving the fix tries each
+            // mark's own plausible timeline rather than assuming one.
             use chrono::{TimeZone, Utc};
             use testcontainers::runners::AsyncRunner as _;
             use testcontainers_modules::postgres::Postgres;
@@ -17340,13 +17364,20 @@ mod tests {
             ));
             registry.register_on_queue("send_email", "mail");
             registry.register_on_queue("nightly_report", "mail");
-            // Both marks stamped on real time, mirroring what the fixed
-            // `enqueue_with_outcome_due_inner` does for a Postgres-backed
-            // job regardless of the registry's own (here, 2100-pinned) clock.
+            registry.register_on_queue("midnight_digest", "mail");
+            // An immediate job's mark stays on the registry's own (here,
+            // 2100-pinned) clock, matching `enqueue_with_outcome_due_inner`'s
+            // immediate branch.
+            registry.record_enqueue("send_email");
+            // A relative-delay job's mark lives on real time, matching that
+            // same function's scheduled branch for a Postgres-backed job.
             let real_now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap();
-            registry.record_enqueue_scheduled("send_email", real_now_ms);
             let real_far_future_ms = real_now_ms + 3_600_000;
             registry.record_enqueue_scheduled("nightly_report", real_far_future_ms);
+            // An absolute `enqueue_at` job's mark is the caller's own
+            // instant, unrelated to either clock above.
+            let absolute_due_ms = real_now_ms + 7_200_000;
+            registry.record_enqueue_scheduled("midnight_digest", absolute_due_ms);
 
             pg_enqueue_job(
                 &pool,
@@ -17378,6 +17409,30 @@ mod tests {
                  WHERE id = 'scheduled-job'",
             )
             .await;
+            pg_enqueue_job(
+                &pool,
+                "absolute-job".to_string(),
+                "midnight_digest",
+                "default",
+                serde_json::json!({}),
+                5,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+            let absolute_due_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                i64::try_from(absolute_due_ms).unwrap(),
+            )
+            .unwrap();
+            pg_exec(
+                &pool,
+                &format!(
+                    "UPDATE autumn_jobs SET run_at = '{}' WHERE id = 'absolute-job'",
+                    absolute_due_at.to_rfc3339()
+                ),
+            )
+            .await;
 
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
@@ -17388,7 +17443,7 @@ mod tests {
             // Postgres reports "scheduled-job" as ~1h from clock_timestamp();
             // translating that offset onto real time (not the registry's
             // 2100-pinned clock) must land on nightly_report's mark
-            // (real_far_future_ms), not send_email's. Asserted on the raw
+            // (real_far_future_ms), not the other two. Asserted on the raw
             // marks rather than `queue_snapshot`'s depth: with the registry
             // pinned to 2100, every real-time-ish mark reads as "ready" in
             // that method's own `now_ms()`-relative bucketing regardless of
@@ -17398,26 +17453,46 @@ mod tests {
                 .cancel("scheduled-job")
                 .await
                 .expect("cancel should succeed");
+            let registry_now_ms = u64::try_from(
+                Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+                    .unwrap()
+                    .timestamp_millis(),
+            )
+            .unwrap();
             assert_eq!(
                 registry.waiting_marks_for_test("send_email"),
-                vec![real_now_ms],
-                "canceling the scheduled job must remove nightly_report's mark and leave \
-                 send_email's ready mark intact, even with the registry's clock pinned to \
-                 2100 while Postgres runs on real time"
+                vec![registry_now_ms, absolute_due_ms],
+                "canceling the scheduled job must remove nightly_report's mark and leave the \
+                 other two intact, even with the registry's clock pinned to 2100 while \
+                 Postgres runs on real time"
             );
 
             // Postgres reports "ready-job" as already due (offset <= 0); the
-            // translated target lands on send_email's mark, the only one left.
+            // only candidate that can match is this registry's own (pinned)
+            // clock, since no `run_at` for an immediate job matches
+            // anything on real time or exactly.
             backend
                 .cancel("ready-job")
                 .await
                 .expect("cancel should succeed");
             assert_eq!(
                 registry.waiting_marks_for_test("send_email"),
+                vec![absolute_due_ms],
+                "canceling the ready job must remove send_email's registry-clock mark and \
+                 leave midnight_digest's absolute mark intact"
+            );
+
+            // Postgres reports "absolute-job"'s own `run_at`, matching
+            // absolute_due_ms exactly regardless of either clock.
+            backend
+                .cancel("absolute-job")
+                .await
+                .expect("cancel should succeed");
+            assert_eq!(
+                registry.waiting_marks_for_test("send_email"),
                 Vec::<u64>::new(),
-                "canceling the ready job must remove send_email's mark and drain the queue to \
-                 zero, even with the registry's clock pinned to 2100 while Postgres runs on \
-                 real time"
+                "canceling the absolute job must remove midnight_digest's mark via the exact \
+                 run_at match and drain the queue to zero"
             );
         }
 
