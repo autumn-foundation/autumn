@@ -120,6 +120,7 @@ fn nodes_contain_an_li(nodes: &[Node]) -> bool {
 /// `empty_li_past_the_depth_cap_still_warns`), so it is never trimmed away.
 fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
+    let mut br_count = 0u32;
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
@@ -130,6 +131,19 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
             Node::Element { tag, children } => {
                 if (tag == "ul" || tag == "ol") && nodes_contain_an_li(children) {
                     return true;
+                }
+                // Two or more <br> tags survive trim_trailing_break (it
+                // pops only the last one), leaving a real Span::Break that
+                // draws a row. <br> pushes its break directly, bypassing
+                // push_block_break's "no two in a row" suppression that
+                // every other break-producing tag goes through, so a
+                // plain occurrence count is enough here regardless of
+                // order or nesting.
+                if tag == "br" {
+                    br_count += 1;
+                    if br_count >= 2 {
+                        return true;
+                    }
                 }
                 if !is_non_rendered(tag) {
                     stack.extend(children);
@@ -2917,6 +2931,27 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "a real <li>'s marker draws even when the <li> itself is empty, so this must warn"
+        );
+    }
+
+    #[test]
+    fn table_caption_with_two_breaks_past_the_depth_cap_still_warns() {
+        // Two literal <br> tags survive trim_trailing_break (it pops only
+        // the last one), so extract_table_rows's catch-all arm pushes a
+        // real one-cell row for the leftover break — but <br> pushes its
+        // Span::Break directly, bypassing push_block_break's "no two
+        // breaks in a row" suppression that every other break-producing
+        // tag goes through. subtree_has_nonempty_text doesn't count <br>
+        // at all, so it misses this case. (Codex review on PR #2810.)
+        let html = format!(
+            "{}<table><caption><br><br></caption></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "two <br>s survive trimming and draw a row, so this must warn"
         );
     }
 
