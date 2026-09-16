@@ -504,3 +504,59 @@ fn an_oversized_collaborative_field_is_skipped_not_replayed() {
         "refused before the replay, not after: took {elapsed:?}"
     );
 }
+
+/// Two documents a hub would each open can merge into one it never will.
+///
+/// The hub charges elements *plus* buffered operations against one limit, so
+/// bounding the merged arrays separately let 9 500 elements and 600 buffered
+/// operations through. That document deserializes, the resolver stores it,
+/// and the next editor to open the row gets `DocumentFull` — for good, since
+/// nothing ever shrinks it.
+#[test]
+fn a_merge_that_would_pass_the_hubs_total_is_not_stored() {
+    use autumn_web::collab::{MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING};
+
+    let now = Utc::now();
+    let resolver = CollabResolver::new(["body"]);
+
+    // Each side is openable on its own: the shared elements are well under
+    // the limit, and the buffered operations are well under theirs.
+    let shared = MAX_WIRE_ELEMENTS - 500;
+    let each_pending = (MAX_WIRE_PENDING / 2) + 100;
+    let elems: Vec<serde_json::Value> = (1..=shared)
+        .map(|n| json!({ "id": format!("{n}@shared"), "ch": "x" }))
+        .collect();
+    let side = |actor: &str| {
+        let pending: Vec<serde_json::Value> = (1..=each_pending)
+            .map(|n| {
+                json!({
+                    "op": "insert",
+                    "id": format!("{n}@{actor}"),
+                    "after": format!("{}@ghost", 900_000 + n),
+                    "ch": "y",
+                })
+            })
+            .collect();
+        json!({ "elems": elems, "pending": pending })
+    };
+
+    let mine = side("phone");
+    let theirs = side("server");
+    for one in [&mine, &theirs] {
+        assert!(
+            serde_json::from_value::<CollabText>(one.clone()).is_ok(),
+            "each side is a document the hub would open"
+        );
+    }
+
+    let verdict = resolver.resolve(
+        "phone",
+        &client_change(json!({ "body": mine }), now),
+        &server_row(json!({ "body": theirs }), now),
+    );
+    assert_eq!(
+        verdict,
+        Resolution::KeepServer,
+        "the merge would be past the hub's total, so it is not stored"
+    );
+}

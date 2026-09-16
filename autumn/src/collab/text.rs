@@ -668,7 +668,7 @@ impl CollabText {
         text: &str,
     ) -> Result<Vec<CollabOp>, CollabEditError> {
         let wanted = text.chars().count();
-        Self::preflight(actor, self.clock, wanted)?;
+        Self::preflight_insert(actor, self.clock, wanted)?;
         Ok(self.mint(actor, after, text))
     }
 
@@ -729,7 +729,15 @@ impl CollabText {
     /// Called before anything is mutated — `set_text` in particular removes
     /// the replaced span before inserting its replacement, so a mid-edit
     /// refusal there would tombstone text and put back only part of it.
-    const fn preflight(actor: &str, clock: u64, wanted: usize) -> Result<(), CollabEditError> {
+    ///
+    /// Reachable from the hub for the same reason: its `Replace` deletes and
+    /// then inserts, and must know that the insert will be accepted before it
+    /// tombstones anything.
+    pub(crate) const fn preflight_insert(
+        actor: &str,
+        clock: u64,
+        wanted: usize,
+    ) -> Result<(), CollabEditError> {
         if actor.is_empty() {
             return Err(CollabEditError::EmptyActor);
         }
@@ -830,7 +838,7 @@ impl CollabText {
         // replaced span, so refusing between the two would delete the old
         // text and put back only as much of the new as the counter space
         // happened to seat.
-        Self::preflight(actor, self.clock, added.chars().count())?;
+        Self::preflight_insert(actor, self.clock, added.chars().count())?;
 
         let mut ops = self.remove(prefix, old.len() - prefix - suffix);
         if !added.is_empty() {
@@ -1234,10 +1242,17 @@ impl<'de> Deserialize<'de> for CollabText {
         // replay ignores that, so the document would deserialize "fine" minus
         // those characters — the server quietly deleting text from a document
         // it accepted. Refuse the whole thing instead.
+        //
+        // The anchor counts as much as the id. An element anchored past the
+        // ceiling names a character no replica can mint, so `apply` refuses
+        // the whole insert and the element goes missing just the same — which
+        // is the silent deletion this refusal exists to prevent. Round fifteen
+        // closed this for buffered operations and left the elements checking
+        // only their own id.
         if let Some(id) = wire
             .elems
             .iter()
-            .map(|elem| &elem.id)
+            .flat_map(|elem| std::iter::once(&elem.id).chain(elem.after.as_ref()))
             .find(|id| id.counter >= MAX_COUNTER)
         {
             return Err(serde::de::Error::custom(format!(
@@ -2077,6 +2092,28 @@ mod tests {
         assert!(
             refused.to_string().contains("ceiling"),
             "the refusal names the ceiling: {refused}"
+        );
+    }
+
+    /// An element anchored past the ceiling names a character no replica can
+    /// mint, so `apply` refuses the whole insert and the element goes
+    /// missing. Deserializing "fine" minus a character is the silent deletion
+    /// this refusal exists to stop — and round fifteen closed it for buffered
+    /// operations while leaving elements checking only their own id.
+    #[test]
+    fn an_element_anchored_past_the_ceiling_is_refused_not_dropped() {
+        let json = serde_json::json!({
+            "elems": [
+                { "id": "1@a", "after": format!("{MAX_COUNTER}@b"), "ch": "x" },
+            ],
+            "pending": [],
+        })
+        .to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("unusable anchor");
+        assert!(
+            refused.to_string().contains("ceiling"),
+            "refused rather than silently emptied: {refused}"
         );
     }
 

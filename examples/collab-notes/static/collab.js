@@ -338,6 +338,8 @@
     }
 
     const shown = visible();
+    // Held until we know whether an insert rides along with it.
+    let pendingDeletes = [];
     const removed = shown.slice(prefix, before.length - suffix);
     if (removed.length > 0) {
       // Only real, server-known characters can be deleted. A placeholder has
@@ -357,11 +359,14 @@
           ids.push(element.id);
         }
       }
-      if (ids.length > 0) send({ type: "delete", ids });
+      pendingDeletes = ids;
     }
 
     const added = after.slice(prefix, after.length - suffix);
-    if (added.length > 0) {
+    if (added.length === 0) {
+      // A pure delete: nothing is waiting on it, so send it as it is.
+      if (pendingDeletes.length > 0) send({ type: "delete", ids: pendingDeletes });
+    } else {
       // Anchor to the element left of the insertion point in the full list,
       // tombstones included — that is the neighbour the server knows. A
       // placeholder cannot be an anchor: the server has never heard of it.
@@ -373,7 +378,21 @@
           break;
         }
       }
-      send({ type: "insert", after: anchor, text: added.join("") });
+      // One message when this edit both removes and adds — typing over a
+      // selection. Two messages let the delete land while the insert is
+      // refused for a document at its limit, which is the editor destroying
+      // the text it was asked to replace. `replace` is refused whole or not
+      // at all.
+      if (pendingDeletes.length > 0) {
+        send({
+          type: "replace",
+          ids: pendingDeletes,
+          after: anchor,
+          text: added.join(""),
+        });
+      } else {
+        send({ type: "insert", after: anchor, text: added.join("") });
+      }
 
       // Splice the characters in locally so the textarea and `elems` agree.
       // A remote character arriving before the echo then merges in beside

@@ -19,7 +19,7 @@ use autumn_web::channels::Channels;
 use autumn_web::collab::hub::{doc_key, serve_socket};
 use autumn_web::collab::{
     CollabClientMessage, CollabError, CollabHub, CollabLimits, CollabServerMessage, CollabText,
-    MAX_WIRE_PENDING, OpId,
+    MAX_ACTOR_LEN, MAX_WIRE_PENDING, OpId,
 };
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
@@ -1431,4 +1431,124 @@ async fn a_long_in_order_replay_is_not_refused_by_the_buffer_bound() {
         .expect("an in-order replay integrates as it goes and buffers nothing");
     assert_eq!(doc.document().pending_len(), 0);
     assert_eq!(doc.text().chars().count(), ops.len());
+}
+
+/// Typing over a selection must not be able to delete the text and then fail
+/// to put anything back.
+///
+/// A tombstone costs what a character costs, so a document at its limit
+/// refuses the insert — and when the delete travelled as its own message, it
+/// had already landed. The editor destroyed the text it was asked to replace.
+#[tokio::test]
+async fn a_replacement_at_the_document_limit_leaves_the_text_alone() {
+    let hub = hub().with_limits(CollabLimits {
+        max_document_chars: 5,
+        ..CollabLimits::default()
+    });
+    let doc = hub
+        .open_with("notes:18:body", CollabText::new)
+        .expect("open the document");
+
+    doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: None,
+            text: "hello".to_owned(),
+        },
+    )
+    .expect("fills the document exactly");
+    assert_eq!(doc.text(), "hello");
+
+    let ids: Vec<OpId> = doc
+        .document()
+        .elements()
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+
+    // The old shape, for the record: the delete alone is accepted, because a
+    // delete is never refused for size.
+    let refused = doc.handle(
+        "ada",
+        CollabClientMessage::Replace {
+            ids,
+            after: None,
+            text: "goodbye".to_owned(),
+        },
+    );
+    assert!(
+        matches!(refused, Err(CollabError::DocumentFull { .. })),
+        "the replacement is refused: {refused:?}"
+    );
+    assert_eq!(
+        doc.text(),
+        "hello",
+        "and refused whole — the selection is still there"
+    );
+}
+
+/// A replacement that fits applies both halves and broadcasts them together.
+#[tokio::test]
+async fn a_replacement_that_fits_removes_and_adds_in_one_edit() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:19:body", CollabText::new)
+        .expect("open the document");
+
+    doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: None,
+            text: "hello world".to_owned(),
+        },
+    )
+    .expect("seed");
+
+    let elems = doc.document();
+    let elems = elems.elements();
+    // Replace "hello" with "goodbye", anchored before the span.
+    let ids: Vec<OpId> = elems[..5].iter().map(|e| e.id.clone()).collect();
+
+    doc.handle(
+        "ada",
+        CollabClientMessage::Replace {
+            ids,
+            after: None,
+            text: "goodbye".to_owned(),
+        },
+    )
+    .expect("within the limits");
+    assert_eq!(doc.text(), "goodbye world");
+}
+
+/// A session whose name is long enough to push `name#seat` past the actor
+/// limit must still be able to type.
+///
+/// The bound that rejects an overlong actor is exactly what made this
+/// reachable: the session joined, took a presence lease, and then failed
+/// every edit. It also depended on the seat counter's digit count, so the
+/// same name worked until the process had served enough sessions.
+#[tokio::test]
+async fn a_long_session_name_still_mints_ids() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:20:body", CollabText::new)
+        .expect("open the document");
+
+    let session = doc.join("l".repeat(MAX_ACTOR_LEN * 2), "long");
+    assert!(
+        session.actor().len() <= MAX_ACTOR_LEN,
+        "the generated actor fits: {} bytes",
+        session.actor().len()
+    );
+
+    doc.handle(
+        session.actor(),
+        CollabClientMessage::Insert {
+            after: None,
+            text: "hi".to_owned(),
+        },
+    )
+    .expect("a joined session can type");
+    assert_eq!(doc.text(), "hi");
 }

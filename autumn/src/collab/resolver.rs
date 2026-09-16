@@ -161,13 +161,24 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
                     // last-write-wins, and the side it drops would be gone for
                     // good. Leave the wrapped verdict instead, which is at
                     // least a document that can still be read.
-                    if mine.element_count() > MAX_WIRE_ELEMENTS
+                    //
+                    // The *total* as well as each array, because that is what
+                    // the hub charges: `open_with` refuses once elements plus
+                    // buffered operations pass `max_document_chars`, which
+                    // defaults to `MAX_WIRE_ELEMENTS`. Checking the arrays
+                    // separately let 9 500 elements and 600 buffered
+                    // operations through — a document that deserializes and
+                    // that no live session can ever open.
+                    let total = mine.element_count() + mine.pending_len();
+                    if total > MAX_WIRE_ELEMENTS
+                        || mine.element_count() > MAX_WIRE_ELEMENTS
                         || mine.pending_len() > MAX_WIRE_PENDING
                     {
                         tracing::warn!(
                             field,
                             elements = mine.element_count(),
                             pending = mine.pending_len(),
+                            total,
                             "collab: merged document is past the wire limits; leaving the \
                              wrapped verdict rather than storing one that cannot be read"
                         );

@@ -78,7 +78,8 @@ use crate::channels::{Channels, Subscriber};
 use crate::presence::{Presence, PresenceHandle};
 
 use super::text::{
-    CollabEditError, CollabElement, CollabOp, CollabText, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId,
+    CollabEditError, CollabElement, CollabOp, CollabText, MAX_ACTOR_LEN, MAX_WIRE_ELEMENTS,
+    MAX_WIRE_PENDING, OpId,
 };
 
 /// Channel and presence topic for a document key.
@@ -238,6 +239,28 @@ pub enum CollabClientMessage {
         /// Characters to remove.
         ids: Vec<OpId>,
     },
+    /// Remove the characters `ids` names and add `text` in their place, as
+    /// one edit.
+    ///
+    /// Not a convenience for a delete followed by an insert — the point is
+    /// that it cannot half-happen. Sent separately, the delete lands and the
+    /// insert is then refused when the document is at
+    /// [`CollabLimits::max_document_chars`], because a tombstone still counts
+    /// against the limit and so deleting frees nothing. The selection is gone
+    /// and the replacement never arrives: the editor destroyed text by typing
+    /// over it. Here the whole edit is checked first, and a refusal leaves the
+    /// text exactly as it was.
+    Replace {
+        /// Characters to remove.
+        ids: Vec<OpId>,
+        /// Left neighbour for the new text, resolved by the client against
+        /// its own view. The character before the replaced span, so it is
+        /// unaffected by the removal.
+        #[serde(default)]
+        after: Option<OpId>,
+        /// Text to add.
+        text: String,
+    },
     /// Report where this editor's caret is, as a visible character index.
     Cursor {
         /// Caret position.
@@ -367,6 +390,31 @@ impl DocState {
 /// Per-connection discriminator, so two connections that pass the same actor
 /// id still get distinct presence keys, cursors and character ids.
 static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `name#seat`, trimmed to fit [`MAX_ACTOR_LEN`].
+///
+/// The seat is what makes two connections distinct, so it is the half that
+/// must survive; the name is a label and is cut from the right to make room.
+/// Without this a long enough name produced a session that joined, took a
+/// presence lease and a cursor, and then failed every edit it attempted with
+/// `ActorTooLong` — an editor that could watch but never type, for as long as
+/// it stayed connected. Worse, it depended on the seat: the same name worked
+/// until the counter gained a digit and then stopped, once per process, at
+/// whatever traffic made the tenth or hundredth session.
+///
+/// Cutting on a character boundary, because an actor is carried as a string
+/// and a half-written code point would not survive the round trip that
+/// `MAX_ACTOR_LEN` exists to protect.
+fn seated_actor(name: &str, seat: u64) -> String {
+    let suffix = format!("#{seat}");
+    // A `u64` is at most 20 digits, so the suffix always leaves room.
+    let budget = MAX_ACTOR_LEN.saturating_sub(suffix.len());
+    let mut cut = name.len().min(budget);
+    while cut > 0 && !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &name[..cut])
+}
 
 /// How often [`serve_socket`] renews an editor's presence lease. Comfortably
 /// inside the 30-second default TTL, so one missed tick costs nothing.
@@ -926,7 +974,7 @@ impl CollabDoc {
     #[must_use = "dropping the session immediately ends the editor's presence lease"]
     pub fn join(&self, actor: impl Into<String>, label: impl Into<String>) -> CollabSession {
         let seat = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let actor = format!("{}#{seat}", actor.into());
+        let actor = seated_actor(&actor.into(), seat);
         let label = label.into();
         {
             let mut state = self.state.lock().expect("collab document lock poisoned");
@@ -1053,6 +1101,55 @@ impl CollabDoc {
                     // the moment somebody typed it — one message could
                     // pre-delete another editor's next thousand keystrokes.
                     state.edit(|doc| doc.remove_known(&ids))
+                };
+                self.broadcast_ops(&ops);
+                Ok(ops)
+            }
+            CollabClientMessage::Replace { ids, after, text } => {
+                let added = text.chars().count();
+                if added > self.limits.max_insert_chars {
+                    return Err(CollabError::InsertTooLarge {
+                        got: added,
+                        limit: self.limits.max_insert_chars,
+                    });
+                }
+                if ids.len() > self.limits.max_delete_ids {
+                    return Err(CollabError::DeleteTooLarge {
+                        got: ids.len(),
+                        limit: self.limits.max_delete_ids,
+                    });
+                }
+                let ops = {
+                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    if let Some(anchor) = after.as_ref()
+                        && !state.doc.knows(anchor)
+                    {
+                        return Err(CollabError::UnknownCharacter {
+                            id: anchor.to_string(),
+                        });
+                    }
+                    // Every refusal before the first mutation. That is the
+                    // whole reason this is one message: the delete cannot be
+                    // the part that lands while the insert is turned away.
+                    //
+                    // The insert is charged in full, with no credit for what
+                    // the delete removes — a tombstone costs what a character
+                    // costs. So a document at the limit refuses this too, and
+                    // refuses it whole, which is the difference that matters.
+                    let held = state.doc.element_count() + state.doc.pending_len();
+                    if held + added > self.limits.max_document_chars {
+                        return Err(CollabError::DocumentFull {
+                            got: held,
+                            limit: self.limits.max_document_chars,
+                        });
+                    }
+                    CollabText::preflight_insert(actor, state.doc.clock(), added)?;
+
+                    let mut ops = state.edit(|doc| doc.remove_known(&ids));
+                    ops.extend(
+                        state.try_edit(|doc| doc.insert_after(actor, after.as_ref(), &text))?,
+                    );
+                    ops
                 };
                 self.broadcast_ops(&ops);
                 Ok(ops)
