@@ -260,6 +260,45 @@ impl CollabOp {
             Self::Delete { .. } => 0,
         }
     }
+
+    /// Whether every id this operation carries can be written and read back.
+    ///
+    /// [`OpId::from_str`] refuses an empty actor, so an id minted with one
+    /// formats as `"1@"` and cannot be parsed again: a document holding it
+    /// encodes and then fails its own decode, and
+    /// [`decode_column`](CollabText::decode_column) reads that JSON as legacy
+    /// prose and shows it as the text. The minting API refuses an empty actor,
+    /// but an operation can also arrive already built — over `apply`,
+    /// `apply_remote` or `remove_ids` — so the check belongs here too.
+    ///
+    /// The references count, not just the minted id: an insert anchored to an
+    /// id no well-formed operation can ever mint would wait in the causal
+    /// buffer for a cause that cannot arrive.
+    ///
+    /// [`OpId::from_str`]: std::str::FromStr
+    fn well_formed(&self) -> bool {
+        let usable = |id: &OpId| !id.actor.is_empty();
+        match self {
+            Self::Insert { id, after, .. } => usable(id) && after.as_ref().is_none_or(usable),
+            Self::Delete { target } => usable(target),
+        }
+    }
+
+    /// The `(after, ch)` an insert claims for its id, if it is an insert.
+    const fn variant(&self) -> Option<(&Option<OpId>, char)> {
+        match self {
+            Self::Insert { after, ch, .. } => Some((after, *ch)),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    /// The id an insert claims, if it is an insert.
+    const fn insert_id(&self) -> Option<&OpId> {
+        match self {
+            Self::Insert { id, .. } => Some(id),
+            Self::Delete { .. } => None,
+        }
+    }
 }
 
 /// One character in the document, tombstoned or not.
@@ -765,6 +804,39 @@ impl CollabText {
         if op.minted_counter() >= MAX_COUNTER {
             return false;
         }
+        // Drop for the same reason as the ceiling above: an id that cannot be
+        // parsed back can never become valid, so buffering it would only park
+        // an unwritable document in memory.
+        if !op.well_formed() {
+            tracing::warn!(
+                "collab: refused an operation carrying an id with an empty actor; \
+                 it could not be read back"
+            );
+            return false;
+        }
+        // An id names one character typed in one place. The same id carrying
+        // different text or a different anchor means a replica minted it
+        // twice, and taking the second copy would make this document's text
+        // depend on which order the two arrived in — so two replicas holding
+        // the *same* operations would render differently, which is the one
+        // thing this type promises cannot happen.
+        //
+        // `integrate` already held the line for an id that is integrated. The
+        // buffer needs it too, and more sharply: it dedups whole operations,
+        // so both variants could sit in `pending` at once, each waiting to
+        // integrate and each spreading to every other replica on the next
+        // snapshot.
+        if let CollabOp::Insert { id, after, ch } = &op
+            && let Some((held_after, held_ch)) = self.held_variant(id)
+            && (held_after != after || held_ch != *ch)
+        {
+            tracing::warn!(
+                %id,
+                "collab: an id was reused for a different character; \
+                 keeping the copy this replica already holds"
+            );
+            return false;
+        }
         self.clock = self.clock.max(op.minted_counter());
         if self.integrate(&op) {
             self.drain_pending();
@@ -825,31 +897,18 @@ impl CollabText {
         match op {
             CollabOp::Insert { id, after, ch } => {
                 if self.index.contains(id) {
-                    // Idempotent replay — unless it is not the same operation.
-                    // An id is supposed to name one character typed in one
-                    // place; the same id carrying different text means a
-                    // replica minted it twice, which the model has no answer
-                    // for. Keep what is here and say so.
+                    // A genuine idempotent replay: `apply` has already turned
+                    // back anything reusing this id for a different character,
+                    // so reaching here means the same operation twice.
                     //
-                    // This is first-wins, so two documents that disagree this
-                    // way merge to whichever was merged into. Repairing that
-                    // would mean repositioning the element, and its position
-                    // comes from an anchor the conflicting copy disagrees
-                    // about — so nothing short of replaying the whole document
-                    // converges. `Deserialize` refuses such a document at the
-                    // door instead, which is where a crafted one arrives.
-                    if let Some(pos) = self.position_of(id) {
-                        let held = &self.elems[pos];
-                        if held.ch != *ch || held.after != *after {
-                            tracing::warn!(
-                                %id,
-                                held = %held.ch,
-                                incoming = %ch,
-                                "collab: an id was reused for a different character; \
-                                 keeping the one already integrated"
-                            );
-                        }
-                    }
+                    // Still first-wins rather than convergent: two replicas
+                    // that each saw a *different* variant first keep different
+                    // text. Repairing that means repositioning the element,
+                    // and its position comes from an anchor the conflicting
+                    // copy disagrees about, so nothing short of replaying the
+                    // whole document converges. `Deserialize` refuses such a
+                    // document at the door instead, which is where a crafted
+                    // one arrives.
                     return true;
                 }
                 let Some(start) = self.slot_after(after.as_ref()) else {
@@ -899,6 +958,19 @@ impl CollabText {
     }
 
     /// Index of the character `id` names.
+    /// The `(after, ch)` this replica already holds for `id`, integrated or
+    /// buffered, or `None` when the id is new here.
+    fn held_variant(&self, id: &OpId) -> Option<(&Option<OpId>, char)> {
+        if let Some(pos) = self.position_of(id) {
+            let held = &self.elems[pos];
+            return Some((&held.after, held.ch));
+        }
+        self.pending
+            .iter()
+            .find(|op| op.insert_id() == Some(id))
+            .and_then(CollabOp::variant)
+    }
+
     fn position_of(&self, id: &OpId) -> Option<usize> {
         if !self.index.contains(id) {
             return None;
@@ -1135,6 +1207,26 @@ impl<'de> Deserialize<'de> for CollabText {
                 return Err(serde::de::Error::custom(format!(
                     "collaborative document reuses the id {} for two different characters",
                     elem.id,
+                )));
+            }
+        }
+        // The buffered half, which the element scan above cannot see. Two
+        // conflicting inserts can both sit in `pending` — the buffer dedups
+        // whole operations, not ids — and then a replica that receives one
+        // cause first integrates one variant while a replica that receives the
+        // other cause first integrates the other. Both replicas end up holding
+        // the same operations and rendering different text, which is the
+        // guarantee this type exists to make. Refused at the door, in the same
+        // pass and for the same reason as the integrated case.
+        for op in &wire.pending {
+            let (Some(id), Some((after, ch))) = (op.insert_id(), op.variant()) else {
+                continue;
+            };
+            if let Some((held_after, held_ch)) = seen.insert(id, (after, ch))
+                && (held_after != after || held_ch != ch)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "collaborative document reuses the id {id} for two different characters",
                 )));
             }
         }
@@ -1714,6 +1806,135 @@ mod tests {
         );
     }
 
+    /// Two conflicting inserts could both sit in the buffer, because it
+    /// dedups whole operations rather than ids: each waited to integrate, and
+    /// each spread to every other replica on the next snapshot.
+    ///
+    /// Only one is kept now. That stops the propagation, and it is all it
+    /// stops: keeping the first one *seen* is order-dependent, so two replicas
+    /// that met different variants first still disagree — exactly the
+    /// first-wins limitation `integrate` already documents for an id reused
+    /// among integrated elements, and unchanged by this. Converging instead
+    /// would mean evicting an element whose children are already positioned
+    /// against it. `Deserialize` refusing such a document is the protection
+    /// that actually holds, which is why that refusal now covers the buffered
+    /// half too.
+    #[test]
+    fn conflicting_inserts_do_not_both_wait_in_the_buffer() {
+        let anchor_a = OpId::new(1, "a");
+        let anchor_b = OpId::new(1, "b");
+        let clash = OpId::new(9, "twice");
+        let x = CollabOp::Insert {
+            id: clash.clone(),
+            after: Some(anchor_a.clone()),
+            ch: 'x',
+        };
+        let y = CollabOp::Insert {
+            id: clash.clone(),
+            after: Some(anchor_b.clone()),
+            ch: 'y',
+        };
+
+        let mut doc = CollabText::new();
+        assert!(!doc.apply(x.clone()), "waits for its anchor");
+        assert!(
+            !doc.apply(y.clone()),
+            "the second variant of the same id is refused, not buffered"
+        );
+        assert_eq!(doc.pending_len(), 1, "only one variant is held");
+
+        // What is fixed: neither replica stores or re-broadcasts both
+        // variants, so the conflict stops here instead of spreading.
+        let seed_a = CollabOp::Insert {
+            id: anchor_a,
+            after: None,
+            ch: 'a',
+        };
+        let seed_b = CollabOp::Insert {
+            id: anchor_b,
+            after: None,
+            ch: 'b',
+        };
+        let mut kept_from_x = CollabText::new();
+        kept_from_x.apply_all([x.clone(), y.clone(), seed_a.clone(), seed_b.clone()]);
+        let mut saw_y_first = CollabText::new();
+        saw_y_first.apply_all([y, x, seed_b, seed_a]);
+        for doc in [&kept_from_x, &saw_y_first] {
+            assert_eq!(
+                doc.ops()
+                    .iter()
+                    .filter(|op| op.insert_id() == Some(&clash))
+                    .count(),
+                1,
+                "one variant of the id, never both, in what this replica passes on"
+            );
+        }
+
+        // And what is not: first-wins is order-dependent, so these two still
+        // disagree. Pinned deliberately — a change that made them converge
+        // should come here and say so, rather than pass silently.
+        assert_eq!(kept_from_x.text(), "bax");
+        assert_eq!(saw_y_first.text(), "bya");
+    }
+
+    /// The minting API refuses an empty actor, but an operation can arrive
+    /// already built — over `apply`, `apply_remote` or `remove_ids`. Such an
+    /// id formats as `"1@"`, which the parser refuses, so a document holding
+    /// one encodes and then fails its own decode.
+    #[test]
+    fn an_operation_carrying_an_empty_actor_is_refused_on_the_apply_path() {
+        let mut doc = CollabText::new();
+        assert!(
+            !doc.apply(CollabOp::Insert {
+                id: OpId::new(1, ""),
+                after: None,
+                ch: 'x',
+            }),
+            "an empty-actor id is refused"
+        );
+        // An anchor counts too: no well-formed operation can ever mint it, so
+        // buffering this would wait for a cause that cannot arrive.
+        assert!(!doc.apply(CollabOp::Insert {
+            id: OpId::new(2, "ada"),
+            after: Some(OpId::new(1, "")),
+            ch: 'y',
+        }));
+        assert!(!doc.apply(CollabOp::Delete {
+            target: OpId::new(1, ""),
+        }));
+        assert_eq!(doc.pending_len(), 0, "nothing unwritable is buffered");
+
+        doc.insert("ada", 0, "ok").expect("collab edit refused");
+        let encoded = serde_json::to_string(&doc).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<CollabText>(&encoded)
+                .expect("decode")
+                .text(),
+            "ok",
+            "what the document holds can always be read back"
+        );
+    }
+
+    /// The buffered half of the id-reuse refusal: a crafted document can put
+    /// both variants in `pending`, where the element scan cannot see them.
+    #[test]
+    fn a_document_reusing_an_id_across_buffered_operations_is_refused() {
+        let json = serde_json::json!({
+            "elems": [],
+            "pending": [
+                { "op": "insert", "id": "9@twice", "after": "1@a", "ch": "x" },
+                { "op": "insert", "id": "9@twice", "after": "1@b", "ch": "y" },
+            ],
+        })
+        .to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("reused id");
+        assert!(
+            refused.to_string().contains("two different characters"),
+            "the refusal names the reuse: {refused}"
+        );
+    }
+
     /// A document that reuses one id for two different characters is refused.
     ///
     /// Its own text would depend on the order it was read in, and a merge with
@@ -1831,13 +2052,17 @@ mod tests {
         assert_eq!(back.len(), MAX_WIRE_ELEMENTS);
     }
 
-    /// One id with many unknown anchors costs what it really occupies.
+    /// One id with many unknown anchors lands once, and is charged for
+    /// conservatively.
     ///
-    /// `buffered` keys on the whole operation, so each variant is its own
-    /// buffer entry. Counting distinct ids charged one and let the rest past
-    /// the document limit — an unbounded buffer from a single batch.
+    /// `buffered` keys on the whole operation, so each variant used to be its
+    /// own buffer entry and a single batch could inflate the buffer without
+    /// bound. `apply` now refuses a second variant of an id it already holds,
+    /// which removes that at the source. The preflight still charges per
+    /// operation rather than per landed character: it may over-count, never
+    /// under-count, which is the safe direction for a bound.
     #[test]
-    fn a_batch_pays_for_every_buffered_variant_of_one_id() {
+    fn a_batch_of_many_variants_of_one_id_lands_once() {
         let doc = CollabText::new();
         let id = OpId::new(1, "ada");
         let batch: Vec<CollabOp> = (0..5)
@@ -1848,13 +2073,19 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(doc.novel_count(batch.iter()), 5);
+        assert_eq!(
+            doc.novel_count(batch.iter()),
+            5,
+            "the preflight charges for the whole batch"
+        );
 
-        // The count is what the batch really costs: every anchor is unknown,
-        // so every variant lands in the buffer.
         let mut doc = doc;
         doc.apply_all(batch);
-        assert_eq!(doc.pending_len(), 5);
+        assert_eq!(
+            doc.pending_len(),
+            1,
+            "only the first variant of the id is kept"
+        );
     }
 
     /// A delete on one replica and an insert on another both survive.
