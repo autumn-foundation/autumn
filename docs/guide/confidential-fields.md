@@ -140,7 +140,7 @@ out of scope for this release.
 | Sink | Why |
 | --- | --- |
 | `database` | The column type is `Sealed`, so the only value bound into an INSERT or UPDATE is the envelope. |
-| `access_log` | The access log carries no bodies, and confidential column names are folded into the log parameter filter. |
+| `access_log` | The access log carries no bodies, and confidential column names are folded into the log parameter filter, which matches parameter names rather than message text: a handler that interpolates a request body into an error message puts the envelope and its token there itself. |
 | `db_backup` | A backup is a dump of the database, which holds only envelopes. |
 | `replay_capsule` | A capsule copies the request body and the SQL binds, both of which carry envelopes. |
 | `version_history` | Confidential columns are version-sensitive, so a revision records that the column changed, not what it changed to. |
@@ -178,6 +178,16 @@ out of scope for this release.
 - **Memory on the client.** `RootKey` zeroizes on drop and the AES key schedule
   is wiped with it, but a compiler or an allocator can still leave copies. The
   wipe is best effort, not a guarantee against a memory dump of a live client.
+- **Handler-authored error messages.** The parameter filter matches parameter
+  *names*, so it redacts `body` and `body_bidx` wherever they arrive as named
+  values. It cannot see into free text. A handler that quotes the raw request
+  body into a 5xx message — `format!("could not store {body}")` — writes the
+  envelope and the blind-index token into the error log itself, and the token is
+  the correlation handle this feature otherwise withholds. The plaintext is still
+  absent, because the client sealed it before sending. Keep request values out of
+  error messages, or name the field rather than quoting its value. This is a
+  property of the parameter filter, not of `#[confidential]`: the same holds for
+  `#[encrypted]` columns and for every key in `[log] filter_parameters`.
 - **Updating the pair.** The generated `Update<Model>` carries the envelope and
   its token as two independent fields, so a PATCH that sets only the envelope is
   accepted and leaves the token indexing the **previous** value: lookups for the

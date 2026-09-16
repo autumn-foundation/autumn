@@ -832,7 +832,9 @@ pub const OPERATOR_BLIND_SINKS: &[OperatorSink] = &[
     OperatorSink {
         id: "access_log",
         why: "the access log carries no bodies, and confidential column names are \
-              folded into the log parameter filter",
+              folded into the log parameter filter, which matches parameter names \
+              rather than message text: a handler that interpolates a request body \
+              into an error message puts the envelope and its token there itself",
     },
     OperatorSink {
         id: "db_backup",

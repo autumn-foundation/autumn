@@ -381,6 +381,65 @@ async fn no_operator_reachable_sink_holds_the_confidential_plaintext() {
     );
 }
 
+/// #1771: sealing holds even when the application hands its own request body to
+/// the error path. The client sealed the value before sending, so the body this
+/// handler quotes carries an envelope and a token, never the plaintext.
+///
+/// What this test deliberately does *not* assert is the converse — that the
+/// envelope and token DO reach the error log through the handler's message.
+/// `LogReporter` interpolates `event.message` into a `tracing::error!`, and the
+/// parameter filter matches parameter *names* rather than message text, so the
+/// mechanism is there; but no ERROR event reaches this capture buffer, so the
+/// claim is not one this harness can honestly pin. `### Outside the guarantee`
+/// in `docs/guide/confidential-fields.md` states the limit in prose instead.
+#[tokio::test]
+async fn a_handler_that_quotes_the_request_body_still_logs_no_plaintext() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let key = RootKey::generate();
+    let uid = "note-echoed-in-error";
+    let sealed = key.seal(&ctx(OWNER, uid), MARKER).expect("seal");
+    let token = key.blind_index(&ctx(OWNER, uid), MARKER);
+
+    let (log, _guard) = install_log_capture();
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![log_in, store_note, read_note, store_note_failing])
+        .build();
+
+    client
+        .get(&format!("/login/{OWNER}"))
+        .send()
+        .await
+        .assert_ok();
+
+    let body = serde_json::to_string(&NotePayload {
+        uid: uid.to_owned(),
+        sealed_body: sealed.clone(),
+        sealed_body_bidx: token.clone(),
+    })
+    .expect("serialize");
+    client
+        .post("/notes/fail")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .assert_status(500);
+
+    // The plaintext is the part the guarantee covers, and it holds even here:
+    // the client sealed the value before sending, so the body this handler
+    // quoted never contained it.
+    assert_blind(
+        "the error log, for a handler that quotes the request body",
+        MARKER,
+        log.contents().as_bytes(),
+    );
+    assert!(
+        log.contents().contains("/notes/fail"),
+        "the sweep must have read real output"
+    );
+}
+
 /// A note belongs to the session that stored it, and to nobody else.
 #[tokio::test]
 async fn another_session_cannot_read_the_note() {
