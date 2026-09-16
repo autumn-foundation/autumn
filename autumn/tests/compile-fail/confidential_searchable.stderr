@@ -1,0 +1,7 @@
+error: `#[confidential]` cannot be combined with `#[searchable]`: full-text search indexes the stored column, and an index over ciphertext matches nothing.
+  --> tests/compile-fail/confidential_searchable.rs:16:5
+   |
+16 | /     #[confidential]
+17 | |     #[searchable]
+18 | |     pub body: autumn_web::confidential::Sealed,
+   | |______________________________________________^

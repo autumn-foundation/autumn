@@ -1,0 +1,52 @@
+running 1 test
+test permalink_search_ancestry_batch_profile ... 
+=== pg_stat_statements: tier Zqualvora (2 leaves, shared 8-level chain) ===
+calls=9      buffers=33       SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=588      SELECT id FROM posts WHERE status = $5 AND (CASE WHEN password = $6 THEN search_vector ELSE setweight(to_tsvector($7, COALESCE(title, $8)), $9) || setweight(to_tsvector($10, COALESCE(excerpt, $11)), $12) END) @@ websearch_to_tsquery($13, $1) AND post_type = ANY($2) ORDER BY ts_rank((CASE WHEN password = $14 THEN search_vector ELSE setweight(to_tsvector($15, COALESCE(title, $16)), $17) || setweight(to_tsvector($18, COALESCE(excerpt, $19)), $20) END), websearch_to_tsquery($21, $1)) DESC, published_at DESC NULLS LAST, id DESC LIMIT $3 OFFSET $4
+calls=1      buffers=579      SELECT COUNT(*) AS count FROM posts WHERE status = $3 AND (CASE WHEN password = $4 THEN search_vector ELSE setweight(to_tsvector($5, COALESCE(title, $6)), $7) || setweight(to_tsvector($8, COALESCE(excerpt, $9)), $10) END) @@ websearch_to_tsquery($11, $1) AND post_type = ANY($2)
+-- search statements: calls=2 buffers=1167 -- single-row "id = $1" (unbatched ancestor walk): calls=0 buffers=0 -- batched "id = ANY($1)" (search's own row-fetch, always 1 call, plus any batched ancestor calls): calls=9 buffers=33 --
+
+=== pg_stat_statements: tier Zqbrenthil (5 leaves, shared 8-level chain) ===
+calls=9      buffers=39       SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=579      SELECT id FROM posts WHERE status = $5 AND (CASE WHEN password = $6 THEN search_vector ELSE setweight(to_tsvector($7, COALESCE(title, $8)), $9) || setweight(to_tsvector($10, COALESCE(excerpt, $11)), $12) END) @@ websearch_to_tsquery($13, $1) AND post_type = ANY($2) ORDER BY ts_rank((CASE WHEN password = $14 THEN search_vector ELSE setweight(to_tsvector($15, COALESCE(title, $16)), $17) || setweight(to_tsvector($18, COALESCE(excerpt, $19)), $20) END), websearch_to_tsquery($21, $1)) DESC, published_at DESC NULLS LAST, id DESC LIMIT $3 OFFSET $4
+calls=1      buffers=579      SELECT COUNT(*) AS count FROM posts WHERE status = $3 AND (CASE WHEN password = $4 THEN search_vector ELSE setweight(to_tsvector($5, COALESCE(title, $6)), $7) || setweight(to_tsvector($8, COALESCE(excerpt, $9)), $10) END) @@ websearch_to_tsquery($11, $1) AND post_type = ANY($2)
+-- search statements: calls=2 buffers=1158 -- single-row "id = $1" (unbatched ancestor walk): calls=0 buffers=0 -- batched "id = ANY($1)" (search's own row-fetch, always 1 call, plus any batched ancestor calls): calls=9 buffers=39 --
+
+=== pg_stat_statements: tier Zqcortanix (10 leaves, shared 8-level chain) ===
+calls=9      buffers=54       SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=579      SELECT id FROM posts WHERE status = $5 AND (CASE WHEN password = $6 THEN search_vector ELSE setweight(to_tsvector($7, COALESCE(title, $8)), $9) || setweight(to_tsvector($10, COALESCE(excerpt, $11)), $12) END) @@ websearch_to_tsquery($13, $1) AND post_type = ANY($2) ORDER BY ts_rank((CASE WHEN password = $14 THEN search_vector ELSE setweight(to_tsvector($15, COALESCE(title, $16)), $17) || setweight(to_tsvector($18, COALESCE(excerpt, $19)), $20) END), websearch_to_tsquery($21, $1)) DESC, published_at DESC NULLS LAST, id DESC LIMIT $3 OFFSET $4
+calls=1      buffers=579      SELECT COUNT(*) AS count FROM posts WHERE status = $3 AND (CASE WHEN password = $4 THEN search_vector ELSE setweight(to_tsvector($5, COALESCE(title, $6)), $7) || setweight(to_tsvector($8, COALESCE(excerpt, $9)), $10) END) @@ websearch_to_tsquery($11, $1) AND post_type = ANY($2)
+-- search statements: calls=2 buffers=1158 -- single-row "id = $1" (unbatched ancestor walk): calls=0 buffers=0 -- batched "id = ANY($1)" (search's own row-fetch, always 1 call, plus any batched ancestor calls): calls=9 buffers=54 --
+
+=== statement-count scaling across tiers ===
+tier           leaves      "id = $1" "id = $1" buffers "id = ANY($1)" (incl. search's own 1)
+Zqualvora           2              0                0                            9
+Zqbrenthil          5              0                0                            9
+Zqcortanix         10              0                0                            9
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row ancestor lookup shape (find_by_id, one per level per leaf, unbatched) ===
+SELECT * FROM posts WHERE id = 1
+Index Scan using posts_pkey on public.posts  (cost=0.29..8.30 rows=1 width=347) (actual time=0.034..0.035 rows=1 loops=1)
+  Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+  Index Cond: (posts.id = 1)
+  Buffers: shared hit=6
+Query Identifier: 708269860891876367
+Planning:
+  Buffers: shared hit=57
+Planning Time: 0.384 ms
+Execution Time: 0.055 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched ancestor lookup shape (posts_with_ancestors, one per level for the whole batch) ===
+SELECT * FROM posts WHERE id = ANY(ARRAY[1, 2, 3])
+Index Scan using posts_pkey on public.posts  (cost=0.29..20.41 rows=3 width=347) (actual time=0.033..0.036 rows=3 loops=1)
+  Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+  Index Cond: (posts.id = ANY ('{1,2,3}'::integer[]))
+  Buffers: shared hit=10
+Query Identifier: 259020315571012220
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.084 ms
+Execution Time: 0.051 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.16s

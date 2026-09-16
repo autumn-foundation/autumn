@@ -1,0 +1,19 @@
+   Compiling autumn-macros v0.7.0 (/home/user/autumn/autumn-macros)
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+warning: unused import: `autumn_web::prelude`
+  --> autumn/tests/integration/warden_scratch_owner_bypass.rs:11:5
+   |
+11 | use autumn_web::prelude::*;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `autumn-web` (test "integration_tests") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 07s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-571e18559bf8509b)
+
+running 1 test
+test integration::warden_scratch_owner_bypass::owner_scoped_api_leaks_and_allows_writes_to_another_users_row ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2030 filtered out; finished in 0.11s
+

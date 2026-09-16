@@ -1237,6 +1237,39 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
+    // Warden 2026-09-13: `owner = <column>` has no effect on the generated
+    // `api = "..."` CRUD routes. It only emits opt-in `list_scoped`/
+    // `search_page_scoped` repository methods for a hand-written handler to
+    // call with an explicit owner id — the auto-generated `_api_list`,
+    // `_api_get`, `_api_update` and `_api_delete` handlers never call them,
+    // and always fall back to the plain, unscoped `page`/`find_by_id`/
+    // `update`/`delete_by_id`. Only `policy = Type` actually gates the
+    // single-record handlers: `policy_check_show`/`policy_check_update_pre`/
+    // `policy_check_delete_pre` are each generated purely from `has_policy` —
+    // there is no `scope`-driven equivalent for `_api_get`/`_api_update`/
+    // `_api_delete`. `scope = Type` only ever filters the *list* endpoint's
+    // SQL (`scope_list_body`'s `scope_type.is_some()` arm) — it is a
+    // performance companion to a policy, never a substitute for one. So
+    // `policy_type` must be present; `scope_type` may additionally be present
+    // (for a cheaper SQL-level list filter) but never as its replacement. A
+    // first cut of this fix accepted `scope` as an alternative to `policy`,
+    // which left `_api_get`/`_api_update`/`_api_delete` fully unguarded for
+    // `owner = <column>` + `api = "..."` + `scope = Type` with no `policy` —
+    // caught in review (Codex, PR #2770) before merge.
+    if api_path.is_some() && owner_column.is_some() && policy_type.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "owner = <column> has no effect on the generated `api = \"...\"` CRUD routes: only \
+             `policy = Type` gates `GET`/`PUT`/`DELETE <api>/{id}` (via can_show/can_update/\
+             can_delete) and the list endpoint when no `scope` is set. `scope = Type` alone \
+             is not enough — it only filters `GET <api>`'s SQL query and has no effect on the \
+             single-record routes, which would stay fully open. Add `policy = Type` (referencing \
+             `owner_id`/`ctx.user_id_i64()` from it), keeping `scope = Type` alongside it if you \
+             want the list endpoint's cheaper SQL-level filter too, or drop `api = \"...\"` and \
+             call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` \
+             methods from your own hand-written, owner-checked routes instead",
+        ));
+    }
     if validate_on_update_fetch && no_upsert_trait {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -1471,8 +1504,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
 struct DerivedQuery {
     prefix: String,      // "find", "count", "delete", "exists"
     fields: Vec<String>, // ["title", "published"]
-    #[allow(dead_code)] // reserved for Tier 2 OR support
-    combinator: String, // "and" or "or"
+    combinator: String,  // "and" or "or"
 }
 
 fn parse_query_name(name: &str) -> Option<DerivedQuery> {
@@ -1736,6 +1768,53 @@ struct FindOrCreateSpec {
     error: Option<String>,
 }
 
+/// A build-time refusal of a server-side predicate over a `#[confidential]`
+/// column (issue #1771).
+///
+/// `#[model]` publishes every model's confidential columns as
+/// `__AUTUMN_CONFIDENTIAL_COLUMNS`. This macro cannot see the model's fields, so
+/// it emits a `const` that reads that list and fails const evaluation when the
+/// column is sealed. Unlike the at-rest encryption guard above, which can only
+/// be a runtime check, this one stops the build — which is the point: a sealed
+/// column can never satisfy the predicate, so shipping it is never correct.
+///
+/// The message is composed here, where the method and column names are known.
+///
+/// The `const` is non-generic in every emission site (a fn body, a closure body,
+/// an `async` block), so it is always evaluated eagerly. Moving it into an
+/// associated const of a generic impl would defer it to monomorphization and
+/// silently stop refusing anything.
+///
+/// The const list is emitted for every `#[model]`, so this resolves for every
+/// repository over one. A repository over a hand-rolled Diesel struct fails with
+/// `E0599: no associated item named __AUTUMN_CONFIDENTIAL_COLUMNS` — the same
+/// class of error that struct already gets from the other `#[model]` items this
+/// macro calls.
+fn confidential_column_guard(
+    model_name: &Ident,
+    column: &str,
+    method: &str,
+    clause: &str,
+) -> TokenStream {
+    let msg = format!(
+        "`{method}` puts `{model_name}::{column}` in a server-side {clause}, but that column \
+         is `#[confidential]`: it is sealed under a key the server never holds, so the \
+         database only ever compares ciphertext. Declare the field \
+         `#[confidential(blind_index)]` and query its companion column `{column}_bidx`, \
+         whose token the client computes and the server can compare."
+    );
+    quote! {
+        const _: () = {
+            if ::autumn_web::confidential::__column_is_confidential(
+                #model_name::__AUTUMN_CONFIDENTIAL_COLUMNS,
+                #column,
+            ) {
+                ::core::panic!(#msg);
+            }
+        };
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -1748,6 +1827,18 @@ fn generate_derived_query_for_source(
     let field_idents: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let param_names: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let table_name_str = table_ident.to_string();
+
+    // #1771: refuse a WHERE over a sealed column at build time.
+    let method_name = format!(
+        "{}_by_{}",
+        query.prefix,
+        query.fields.join(&format!("_{}_", query.combinator))
+    );
+    let confidential_guards: Vec<TokenStream> = query
+        .fields
+        .iter()
+        .map(|f| confidential_column_guard(model_name, f, &method_name, "WHERE clause"))
+        .collect();
 
     // Build the filter chain. For `String`-typed parameters we route the value
     // through the encrypted-column registry at runtime: a deterministic-encrypted
@@ -1806,6 +1897,7 @@ fn generate_derived_query_for_source(
     match query.prefix.as_str() {
         "find" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -1818,6 +1910,7 @@ fn generate_derived_query_for_source(
         }
         "count" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -1832,6 +1925,7 @@ fn generate_derived_query_for_source(
         "delete" => {
             if soft_delete {
                 quote! {
+                    #(#confidential_guards)*
                     #(#encode_lets)*
                     // The derived soft-delete / timestamp write has no `AppState`
                     // in scope, so it cannot reach the injected clock. The allow is
@@ -1854,6 +1948,7 @@ fn generate_derived_query_for_source(
                 }
             } else {
                 quote! {
+                    #(#confidential_guards)*
                     #(#encode_lets)*
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
@@ -1866,6 +1961,7 @@ fn generate_derived_query_for_source(
         }
         "exists" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 ::autumn_web::reexports::diesel::select(
@@ -13771,6 +13867,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.cursor_key
     {
         let cursor_key_ident = format_ident!("{ck}");
+        // #1771: the keyset paginator both orders by this column and compares it.
+        // Over randomized ciphertext the order is arbitrary and the keyset never
+        // converges, so this is a build failure rather than silent nonsense.
+        let cursor_confidential_guard = confidential_column_guard(
+            model_name,
+            ck,
+            "cursor_page",
+            "ORDER BY and keyset predicate",
+        );
         let trait_method = quote! {
             /// Fetch one page of records using keyset (cursor) pagination.
             ///
@@ -13808,6 +13913,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -13852,6 +13958,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -14117,6 +14224,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // a runtime guard against the same registry `find_by` consults, not a
             // `compile_error!`. It rejects only genuinely encrypted columns, so
             // grouping a plain `String` is unchanged. The escape hatch is a raw query.
+            // #1771: a sealed column cannot be a GROUP BY key or an aggregated
+            // value, so this one is refused at build time rather than at runtime.
+            let confidential_guards: Vec<TokenStream> = ::core::iter::once(&spec.group_col)
+                .chain(spec.value_col.as_ref())
+                .map(|col| {
+                    confidential_column_guard(
+                        model_name,
+                        col,
+                        &spec.fn_ident.to_string(),
+                        "GROUP BY / aggregate",
+                    )
+                })
+                .collect();
+
             let enc_guard = {
                 let fn_name_str = spec.fn_ident.to_string();
                 let group_col_raw = spec.group_col.as_str();
@@ -14152,7 +14273,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     });
                 }
-                quote! { #(#checks)* }
+                quote! { #(#confidential_guards)* #(#checks)* }
             };
             // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
             // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
@@ -14488,6 +14609,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map(|(name, ty)| quote! { #name: #ty })
                 .collect();
 
+            // #1771: a get-or-insert looks the row up first, so a sealed
+            // column is refused here on the same terms as `find_by`.
+            let foc_name = fn_ident.to_string();
+            let confidential_guards: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, _)| {
+                    confidential_column_guard(
+                        model_name,
+                        &name.to_string(),
+                        &foc_name,
+                        "WHERE clause",
+                    )
+                })
+                .collect();
+
             // Encrypted-column encoding (string fields) + boxed-query filters,
             // matching the `find_by` derived-query surface (#805).
             let table_name_str = table_ident.to_string();
@@ -14775,6 +14912,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // matching rows on other shards go unseen. Same guard used by
                     // save/update/delete; a no-op token on non-sharded repos.
                     #cross_shard_write_guard
+                    #(#confidential_guards)*
                     #(#encode_lets)*
                     // Step 1: preliminary lookup on the read path (replica-eligible).
                     {
@@ -17953,6 +18091,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let declared: &[&'static str] = #sensitive_ts;
                             let mut cols: ::std::vec::Vec<&'static str> = declared.to_vec();
                             ::autumn_web::encryption::merge_encrypted_columns_for_table(
+                                #table_name,
+                                &mut cols,
+                            );
+                            // #1771: a confidential column is sensitive too, so a
+                            // revision records that it changed, never the envelope.
+                            ::autumn_web::confidential::merge_confidential_columns_for_table(
                                 #table_name,
                                 &mut cols,
                             );
@@ -24196,8 +24340,10 @@ mod tests {
     #[test]
     fn parse_repo_args_with_owner() {
         // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        // No `api = "..."` here: paired with `api` and no `policy`/`scope`,
+        // `owner` alone is now a hard compile error (Warden 2026-09-13) — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(
             config.owner_column.as_deref(),
@@ -24212,8 +24358,13 @@ mod tests {
         // applied to BOTH the COUNT and the page query, before the allowlisted
         // sort/filter helpers, so `total` and the returned rows can never be
         // widened past the owner's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `list_scoped` generation
+        // is gated purely on `owner_column`, not on `api`, and `api` +
+        // `owner` with no `policy`/`scope` is now a compile error — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { Post, owner = author_id },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24247,8 +24398,13 @@ mod tests {
         // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
         // hydration query by owner — all three, or `total`/rows would disagree
         // and the endpoint could leak another user's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `search_page_scoped`
+        // generation is gated on `owner_column` + `searchable`, not on `api`,
+        // and `api` + `owner` with no `policy`/`scope` is now a compile error
+        // — see `repository_owner_api_without_policy_or_scope_is_rejected`.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { Post, owner = author_id, searchable },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -24282,6 +24438,104 @@ mod tests {
                 "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
             ),
             "search_page_scoped hydration query must filter by owner: {body}"
+        );
+    }
+
+    // Warden 2026-09-13: `owner = <column>` never gated the generated
+    // `api = "..."` CRUD routes — only the opt-in `list_scoped`/
+    // `search_page_scoped` methods a hand-written handler must call
+    // explicitly. `#[repository(api = "...", owner = author_id)]` with no
+    // `policy`/`scope` therefore compiled to a fully public REST API (every
+    // row readable via `GET <api>`, any single row readable/overwritable/
+    // deletable by id via `GET`/`PUT`/`DELETE <api>/{id}`) despite reading,
+    // at the declaration site, like a per-owner-scoped one. Reject the
+    // combination at compile time instead of silently shipping it.
+    #[test]
+    fn repository_owner_api_without_policy_or_scope_is_rejected() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> next to api = \"...\" with no policy/scope must be rejected: \
+                 it silently ships an unscoped CRUD API"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_is_accepted() {
+        // Adding `policy = Type` alongside `owner` + `api` is the documented
+        // way out: the auto-API's `has_policy` branch (`__check_policy_scoped`)
+        // actually gates `show`/`update`/`delete`, and a `policy`-aware list
+        // body gates `GET <api>` too. `owner_column` still drives
+        // `list_scoped`/`search_page_scoped` for any hand-written route that
+        // wants the cheaper SQL-level filter instead.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy"#
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_scope_but_no_policy_is_rejected() {
+        // `scope = Type` alone must NOT satisfy the gate: it only filters the
+        // list endpoint's SQL query (`scope_list_body`'s `scope_type.is_some()`
+        // arm). `_api_get`/`_api_update`/`_api_delete` have no `scope`-driven
+        // equivalent — only `has_policy` gates them
+        // (`policy_check_show`/`policy_check_update_pre`/
+        // `policy_check_delete_pre`) — so accepting `scope` on its own would
+        // leave every single-record route fully unguarded. Caught in review
+        // (Codex, PR #2770) on the first cut of this fix, which wrongly
+        // accepted `scope` as an alternative to `policy`.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, scope = PostScope"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> + scope = Type (no policy) next to api = \"...\" must be \
+                 rejected: scope only filters the list endpoint, leaving show/update/delete open"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_and_scope_is_accepted() {
+        // The full, efficient combination: `policy` gates every single-record
+        // route and (absent a faster `scope`) the list endpoint too;
+        // `scope` on top gives the list endpoint a cheaper SQL-level filter
+        // instead of the in-memory `can_show` sweep.
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy, scope = PostScope"#
+            .parse()
+            .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type + scope = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_without_api_is_accepted() {
+        // `owner =` with no `api =` at all is unaffected: it only emits the
+        // opt-in `list_scoped`/`search_page_scoped` methods for a
+        // hand-written route to call, and generates no HTTP surface of its
+        // own to leave unscoped.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> with no api = \"...\" must be accepted"
         );
     }
 
@@ -24960,7 +25214,13 @@ mod tests {
         let cursor_pos = generated
             .find("async fn cursor_page")
             .expect("cursor_page impl must be generated");
-        let section = &generated[cursor_pos..cursor_pos + 800];
+        // Scope to the method body: the next `async fn` ends it. A fixed-width
+        // window breaks when the body gains a long item, such as the #1771
+        // confidential-column assertion.
+        let body = &generated[cursor_pos..];
+        let section = body[1..]
+            .find("async fn ")
+            .map_or(body, |end| &body[..=end]);
         assert!(
             section.contains("is_null"),
             "cursor_page impl must apply deleted_at IS NULL filter in soft-delete mode: {section}"

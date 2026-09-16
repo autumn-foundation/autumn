@@ -54,12 +54,16 @@
 #
 # THE INVARIANT, in two halves, over the set of files each gate actually reads:
 #
-#   1. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
-#      read the SAME PAGES. These three ask about three different things a
-#      reader copies off one page; a page that is reader-facing for one of them
-#      is reader-facing for all three.
+#   1. `check-docs-cli.sh`, `check-docs-config.sh`, `check-docs-symbols.sh` and
+#      `check-docs-versions.sh` read the SAME PAGES. These ask about different
+#      things a reader copies off one page — the command, the `AUTUMN_*`
+#      variable, the `autumn_web::…` path, the `autumn-* = "0.7"` pin — and a
+#      page that is reader-facing for one of them is reader-facing for all.
+#      `check-docs-versions.sh` was registered here in the commit that added it,
+#      not after its corpus had a chance to drift: it copies the same scope
+#      block, and copying is precisely what this file exists to watch.
 #
-#   2. Every page `check-docs-routes.sh` reads that those three do not, or the
+#   2. Every page `check-docs-routes.sh` reads that the siblings do not, or the
 #      reverse, is DECLARED below in `DECLARED_DIFFERENCES` — with the DIRECTION
 #      the difference runs in, so a note cannot outlive the thing it describes
 #      and waive its own opposite.
@@ -82,7 +86,7 @@
 # argument is about URLs and does not carry to commands or config keys, so the
 # difference is deliberate and stays.
 #
-# This gate reads no page's CONTENT. It runs each of the four gates with the
+# This gate reads no page's CONTENT. It runs each registered gate with the
 # `--corpus` mode this change adds to them, which prints that gate's own
 # resolved corpus one path per line, and compares the lists. It therefore fails
 # at the moment a scope is edited rather than when a page that scope stopped
@@ -97,9 +101,9 @@
 # mirrored — a second implementation with its own drift, gating the first. So a
 # gate answers for itself.
 #
-# WHAT THIS GATE CANNOT SEE: agreement is not correctness. It compares the four
+# WHAT THIS GATE CANNOT SEE: agreement is not correctness. It compares the
 # gates against each other, so a blindness they SHARE is invisible to it — if
-# every gate's corpus rule misses the same page, all four agree and this passes.
+# every gate's corpus rule misses the same page, they all agree and this passes.
 # That is not hypothetical — the shared manifest parser produced three of these
 # in a row, each invisible here and each caught only by review:
 #
@@ -150,11 +154,27 @@ import os
 import subprocess
 import sys
 
-# The three gates that must agree, and the one that must contain them.
+# The gates that must agree, and the one that must contain them.
+#
+# `check-docs-versions.sh` joins as a sibling in the commit that adds it, rather
+# than after its corpus has had a chance to drift. It copies the same
+# `INCLUDE_DIRS`/`INCLUDE_FILES`/`package_readmes` block the other three carry,
+# and the whole argument of this file is that copying is exactly what needs
+# watching: a fifth spelling of "reader-facing", unwatched, is how the three
+# divergences in the header happened.
+#
+# `check-docs-features.sh` joins on the same terms, in the same commit that adds
+# it. It asks the sixth question about one page — whether the page names the
+# Cargo feature the Rust it shows needs — and a page that is reader-facing for
+# the `autumn_web::…` path in a fence is reader-facing for the feature that path
+# is behind. The two gates read the same fences; splitting their corpora would
+# put an item under one owner and its enabling line under none.
 SIBLINGS = (
     'scripts/check-docs-cli.sh',
     'scripts/check-docs-config.sh',
+    'scripts/check-docs-features.sh',
     'scripts/check-docs-symbols.sh',
+    'scripts/check-docs-versions.sh',
 )
 SUPERSET = 'scripts/check-docs-routes.sh'
 SELF = 'scripts/check-docs-scope.sh'
@@ -467,10 +487,13 @@ PYEOF
 case "${1-}" in
   --self-test)
     # The gate asks each gate for its corpus and checks each declaration's claim
-    # against the tracked tree, so a synthetic test is a small git repo plus
-    # four stub gates: scripts that answer `--corpus` with a page list. Stubbing
-    # the ANSWER rather than the rules is the point — this script no longer
-    # cares how a corpus is built, only that the four agree on it.
+    # against the tracked tree, so a synthetic test is a small git repo plus one
+    # stub gate per entry in `SIBLINGS`, and one for `SUPERSET`: scripts that
+    # answer `--corpus` with a page list. Stubbing the ANSWER rather than the
+    # rules is the point — this script no longer cares how a corpus is built,
+    # only that the gates agree on it. The stub loop below must name every
+    # sibling; a gate in `SIBLINGS` with no stub answers nothing and fails the
+    # cases that expect a clean shape to pass.
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
     fails=0
@@ -495,7 +518,10 @@ examples/todo/NOTES.md'
       git -C "$dir" init -q
       git -C "$dir" add -A
 
-      for g in cli config symbols; do
+      # Every name in `SIBLINGS`: a synthetic tree missing one of them makes
+      # the gate fail for want of a script rather than over the corpora the
+      # case is about, which is how three passing cases read as failures.
+      for g in cli config features symbols versions; do
         { echo '#!/usr/bin/env bash'; echo "cat <<'CORPUS'"; echo "$sib"
           echo 'CORPUS'; } > "$dir/scripts/check-docs-$g.sh"
       done
@@ -531,7 +557,7 @@ examples/wiki/content/p.md
 examples/todo/NOTES.md"
 
     c1="$tmp/c1"; make_gates "$c1" "$SIB_OK" "$RTS_OK"
-    check "four gates agreeing, with the declared difference, pass" pass "$c1"
+    check "every gate agreeing, with the declared difference, pass" pass "$c1"
 
     c2="$tmp/c2"; make_gates "$c2" "$SIB_OK" "$RTS_OK"
     echo 'echo docs/guide/extra.md' >> "$c2/scripts/check-docs-config.sh"
