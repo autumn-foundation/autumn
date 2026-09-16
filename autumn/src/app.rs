@@ -2007,7 +2007,7 @@ impl AppBuilder {
     where
         P: crate::edge_support::EdgeIdentityProvider,
     {
-        self.layer(axum::Extension(Arc::new(provider)))
+        self.layer(crate::edge_support::EdgeIdentityLayer::new(provider))
     }
 
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for

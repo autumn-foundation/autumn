@@ -26,5 +26,6 @@ pub use axum::extract::{Path, Query};
 pub use http::{HeaderMap, Method, StatusCode};
 
 pub use crate::extract::EdgeCache;
+pub use crate::identity::{EdgeIdentity, EdgeRole, EdgeUserId};
 pub use crate::kv::EdgeKv;
 pub use crate::route::{EdgeCapability, EdgeRoute};

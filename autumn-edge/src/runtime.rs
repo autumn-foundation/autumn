@@ -279,6 +279,7 @@ where
     W: Write + Send + 'static,
 {
     let uri = request.uri.clone();
+    let identity = request.identity.clone();
 
     let mut builder = http::Request::builder().method(method).uri(&request.uri);
     // Defensive second strip: the host is supposed to have done this, but a
@@ -303,6 +304,9 @@ where
             .insert(EdgeCache::new(Arc::new(DialogueKv {
                 transport: Arc::clone(transport),
             })));
+    }
+    if let Some(identity) = identity {
+        http_request.extensions_mut().insert(identity);
     }
 
     let router = router.clone();

@@ -65,80 +65,21 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use autumn_edge::EdgeKv;
+use tower::{Layer, Service};
 
 use crate::cache::Cache;
+
+pub use autumn_edge::{EdgeIdentity, EdgeRole, EdgeUserId};
 
 /// Opaque, validated identifier used while consulting an authoritative store.
 /// It deliberately has no public accessor and is never part of [`EdgeIdentity`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
-
-/// Stable, normalized user identifier safe to send to an edge capsule.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct EdgeUserId(String);
-
-impl EdgeUserId {
-    /// Construct a normalized edge user id.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-    /// Read the normalized value.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A normalized authorization role safe to disclose to a capsule.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct EdgeRole(String);
-
-impl EdgeRole {
-    /// Construct a normalized role.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-    /// Read the normalized role.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// The complete and intentionally small identity envelope crossing the edge wire.
-///
-/// Its private fields make it structurally impossible to expose a cookie,
-/// session id/signature, session map, signing secret, or backend key.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct EdgeIdentity {
-    user_id: EdgeUserId,
-    roles: Vec<EdgeRole>,
-}
-
-impl EdgeIdentity {
-    /// Construct an identity from normalized claims only.
-    #[must_use]
-    pub fn new(user_id: EdgeUserId, roles: Vec<EdgeRole>) -> Self {
-        Self { user_id, roles }
-    }
-    /// Authenticated user claim.
-    #[must_use]
-    pub fn user_id(&self) -> &EdgeUserId {
-        &self.user_id
-    }
-    /// Normalized role claims.
-    #[must_use]
-    pub fn roles(&self) -> &[EdgeRole] {
-        &self.roles
-    }
-}
 
 /// Host-only authentication contract for the Autumn edge integration.
 ///
@@ -154,6 +95,88 @@ pub trait EdgeIdentityProvider: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<EdgeIdentity>, Self::Error>> + Send;
 }
 
+/// Host middleware that resolves identity before an edge handler is extracted.
+pub struct EdgeIdentityLayer<P>(Arc<P>);
+
+impl<P> Clone for EdgeIdentityLayer<P> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<P> EdgeIdentityLayer<P> {
+    /// Wrap a provider in the host request middleware.
+    #[must_use]
+    pub fn new(provider: P) -> Self {
+        Self(Arc::new(provider))
+    }
+}
+
+impl<P, Inner> Layer<Inner> for EdgeIdentityLayer<P>
+where
+    P: EdgeIdentityProvider,
+{
+    type Service = EdgeIdentityService<P, Inner>;
+    fn layer(&self, inner: Inner) -> Self::Service {
+        EdgeIdentityService {
+            provider: Arc::clone(&self.0),
+            inner,
+        }
+    }
+}
+
+/// Service produced by [`EdgeIdentityLayer`].
+pub struct EdgeIdentityService<P, Inner> {
+    provider: Arc<P>,
+    inner: Inner,
+}
+
+impl<P, Inner: Clone> Clone for EdgeIdentityService<P, Inner> {
+    fn clone(&self) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<P, Inner> Service<axum::extract::Request> for EdgeIdentityService<P, Inner>
+where
+    P: EdgeIdentityProvider,
+    Inner: Service<axum::extract::Request, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    Inner::Future: Send + 'static,
+    Inner::Error: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = Inner::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
+        let provider = Arc::clone(&self.provider);
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
+        Box::pin(async move {
+            match provider.resolve(&request).await {
+                Ok(Some(identity)) => {
+                    request.extensions_mut().insert(identity);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "edge identity infrastructure failure; falling through to origin")
+                }
+            }
+            inner.call(request).await
+        })
+    }
+}
+
 /// Projects an authoritative session map into explicitly allowed edge claims.
 pub trait EdgeIdentityProjector: Send + Sync + 'static {
     /// Return no identity when the session is not authenticated.
@@ -166,18 +189,20 @@ pub struct SessionIdentityProvider<S, P> {
     store: S,
     projector: P,
     cookie_name: String,
-    signing_keys: Arc<crate::security::config::ResolvedSigningKeys>,
+    signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 }
 
 impl<S, P> SessionIdentityProvider<S, P> {
     /// Build an adapter. The caller supplies the configured cookie name and the
-    /// same resolved current/previous keys installed on `SessionLayer`.
+    /// same optional resolved current/previous keys installed on `SessionLayer`.
+    /// Pass `None` for the unsigned development/test policy; raw session ids
+    /// are then accepted exactly as they are by the session middleware.
     #[must_use]
     pub fn new(
         store: S,
         projector: P,
         cookie_name: impl Into<String>,
-        signing_keys: Arc<crate::security::config::ResolvedSigningKeys>,
+        signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     ) -> Self {
         Self {
             store,
@@ -199,10 +224,10 @@ where
         &self,
         request: &http::Request<axum::body::Body>,
     ) -> impl Future<Output = Result<Option<EdgeIdentity>, Self::Error>> + Send {
-        let raw_id = crate::session::verified_session_id(
+        let raw_id = crate::session::session_id_from_headers(
             request.headers(),
             &self.cookie_name,
-            &self.signing_keys,
+            self.signing_keys.as_deref(),
         );
         async move {
             let Some(raw_id) = raw_id else {
@@ -312,6 +337,51 @@ mod tests {
     use crate::cache::{MokaCache, insert_cached};
     use crate::session::{MemoryStore, SessionStore};
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("provider failed")]
+    struct TestProviderError;
+
+    struct StaticProvider(Option<EdgeIdentity>);
+
+    impl EdgeIdentityProvider for StaticProvider {
+        type Error = TestProviderError;
+
+        fn resolve(
+            &self,
+            _request: &http::Request<axum::body::Body>,
+        ) -> impl Future<Output = Result<Option<EdgeIdentity>, Self::Error>> + Send {
+            std::future::ready(Ok(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_layer_resolves_before_handler_extraction() {
+        use tower::ServiceExt as _;
+
+        async fn handler(identity: EdgeIdentity) -> String {
+            identity.user_id().as_str().to_owned()
+        }
+
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(handler))
+            .layer(EdgeIdentityLayer::new(StaticProvider(Some(
+                EdgeIdentity::new(EdgeUserId::new("alice"), Vec::new()),
+            ))));
+        let response = router
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, "alice");
+    }
+
     #[tokio::test]
     async fn session_identity_projects_only_normalized_claims() {
         let store = MemoryStore::new();
@@ -328,7 +398,7 @@ mod tests {
             store,
             AuthSessionProjector::new("account_id"),
             "custom.sid",
-            keys,
+            Some(keys),
         );
         let request = http::Request::builder()
             .header(
@@ -361,7 +431,7 @@ mod tests {
             store,
             AuthSessionProjector::new("user_id"),
             "autumn.sid",
-            keys,
+            Some(keys),
         );
         let request = http::Request::builder()
             .header(http::header::COOKIE, "autumn.sid=gone.invalid")
@@ -370,6 +440,39 @@ mod tests {
         assert_eq!(
             provider.resolve(&request).await.expect("store available"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_session_matches_unsigned_session_layer_policy() {
+        let store = MemoryStore::new();
+        store
+            .save(
+                "plain-id",
+                HashMap::from([("user_id".into(), "alice".into())]),
+            )
+            .await
+            .expect("memory save");
+        let provider = SessionIdentityProvider::new(
+            store,
+            AuthSessionProjector::new("user_id"),
+            "autumn.sid",
+            None,
+        );
+        let request = http::Request::builder()
+            .header(http::header::COOKIE, "autumn.sid=plain-id")
+            .body(axum::body::Body::empty())
+            .expect("request");
+
+        assert_eq!(
+            provider
+                .resolve(&request)
+                .await
+                .expect("store available")
+                .expect("authenticated")
+                .user_id()
+                .as_str(),
+            "alice"
         );
     }
 

@@ -35,6 +35,10 @@ async fn note(Path(key): Path<String>, cache: EdgeCache) -> String {
         .unwrap_or_else(|| "not cached here".to_owned())
 }
 
+async fn whoami(identity: EdgeIdentity) -> String {
+    identity.user_id().as_str().to_owned()
+}
+
 /// A handler that declines explicitly by setting the sentinel itself.
 async fn optout() -> (
     http::StatusCode,
@@ -102,6 +106,13 @@ fn routes() -> Vec<EdgeRoute> {
     vec![
         EdgeRoute {
             method: http::Method::GET,
+            path: "/whoami",
+            handler: edge_get(whoami),
+            name: "whoami",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
             path: "/greet/{name}",
             handler: edge_get(greet),
             name: "greet",
@@ -150,6 +161,32 @@ fn routes() -> Vec<EdgeRoute> {
             needs: &[],
         },
     ]
+}
+
+#[test]
+fn normalized_identity_reaches_the_capsule_extractor() {
+    let identity = EdgeIdentity::new(EdgeUserId::new("alice"), vec![EdgeRole::new("reader")]);
+    let frames = drive(&[request_line(
+        EdgeRequest::get("/whoami").with_identity(identity),
+        &[],
+    )]);
+    let GuestFrame::Response(response) = &frames[0] else {
+        panic!("expected response");
+    };
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"alice");
+}
+
+#[test]
+fn identity_required_miss_falls_through_without_calling_handler() {
+    let frames = drive(&[request_line(EdgeRequest::get("/whoami"), &[])]);
+    assert!(matches!(
+        &frames[0],
+        GuestFrame::Fallthrough {
+            reason: FallthroughReason::MissingCapability,
+            ..
+        }
+    ));
 }
 
 // ── in-memory transport ──────────────────────────────────────────────
@@ -209,6 +246,7 @@ fn post(uri: &str) -> EdgeRequest {
         uri: uri.to_owned(),
         headers: Vec::new(),
         body: Vec::new(),
+        identity: None,
     }
 }
 

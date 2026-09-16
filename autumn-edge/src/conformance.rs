@@ -81,6 +81,7 @@ impl ConformanceCase {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             body: Vec::new(),
+            identity: None,
         }
     }
 }

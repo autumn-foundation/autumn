@@ -690,6 +690,18 @@ pub(crate) fn verified_session_id(
         .then(|| id.to_owned())
 }
 
+/// Apply the exact optional-signing policy used by [`SessionLayer`].
+pub(crate) fn session_id_from_headers(
+    headers: &http::HeaderMap,
+    cookie_name: &str,
+    signing_keys: Option<&crate::security::config::ResolvedSigningKeys>,
+) -> Option<String> {
+    match signing_keys {
+        Some(keys) => verified_session_id(headers, cookie_name, keys),
+        None => get_cookie(headers, cookie_name),
+    }
+}
+
 /// Fuzzing seam: exercise the cookie-header parser plus the signed-session
 /// cookie verification path (`{session_id}.{hmac_hex}` split + HMAC verify)
 /// over arbitrary bytes. Mirrors the decode performed by `SessionLayer`.
@@ -866,14 +878,11 @@ where
 
         Box::pin(async move {
             // 1. Extract or create session ID (verify HMAC if signing is active)
-            let raw_cookie = get_cookie(req.headers(), &config.cookie_name);
-            let existing_id: Option<String> = match (raw_cookie, &signing_keys) {
-                (None, _) => None,
-                (Some(raw), None) => Some(raw),
-                (Some(_), Some(keys)) => {
-                    verified_session_id(req.headers(), &config.cookie_name, keys)
-                }
-            };
+            let existing_id = session_id_from_headers(
+                req.headers(),
+                &config.cookie_name,
+                signing_keys.as_deref(),
+            );
 
             let mut stale_cookie_session_id = None;
             let (session_id, data) = if let Some(ref id) = existing_id {

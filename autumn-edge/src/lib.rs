@@ -86,6 +86,7 @@
 pub mod conformance;
 pub mod extract;
 pub mod handler;
+pub mod identity;
 pub mod kv;
 pub mod prelude;
 pub mod reexports;
@@ -112,6 +113,7 @@ pub use autumn_macros::{edge, edge_routes, get};
 
 pub use extract::{EdgeCache, EdgeCacheUnavailable};
 pub use handler::{EdgeHandler, edge_get};
+pub use identity::{EdgeIdentity, EdgeIdentityRequired, EdgeRole, EdgeUserId};
 pub use kv::{EdgeKv, EmptyEdgeKv, InMemoryEdgeKv};
 pub use route::{EdgeCapability, EdgeRoute, EdgeState};
 pub use router::{CapabilityProbe, build_edge_router};

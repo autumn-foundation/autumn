@@ -252,6 +252,10 @@ pub struct EdgeRequest {
     /// Request body. Always empty for the read-path methods slice 1 accepts.
     #[serde(default, rename = "body_b64", with = "body_b64")]
     pub body: Vec<u8>,
+    /// Host-verified, normalized claims. Credentials and session state are
+    /// never represented on this wire type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::identity::EdgeIdentity>,
 }
 
 impl EdgeRequest {
@@ -264,7 +268,15 @@ impl EdgeRequest {
             uri: uri.into(),
             headers: Vec::new(),
             body: Vec::new(),
+            identity: None,
         }
+    }
+
+    /// Attach host-verified normalized identity claims.
+    #[must_use]
+    pub fn with_identity(mut self, identity: crate::identity::EdgeIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Add a request header.
@@ -595,6 +607,28 @@ mod tests {
             serde_json::to_string(&frame).expect("serializes"),
             r#"{"op":"request","wire_version":1,"provided_capabilities":["kv"],"method":"GET","uri":"/x?y=z","headers":[["accept","text/html"]],"body_b64":""}"#
         );
+        assert_eq!(
+            from_line::<HostFrame>(&to_line(&frame).expect("line")).expect("round trips"),
+            frame
+        );
+    }
+
+    #[test]
+    fn request_frame_carries_only_normalized_identity_claims() {
+        let identity = crate::identity::EdgeIdentity::new(
+            crate::identity::EdgeUserId::new("user-7"),
+            vec![crate::identity::EdgeRole::new("reader")],
+        );
+        let frame = EdgeRequest::get("/private")
+            .with_header("Cookie", "autumn.sid=raw-secret")
+            .with_identity(identity)
+            .into_host_frame(&[]);
+        let json = serde_json::to_string(&frame).expect("serializes");
+
+        assert!(json.contains("user-7"), "{json}");
+        assert!(json.contains("reader"), "{json}");
+        assert!(!json.contains("raw-secret"), "{json}");
+        assert!(!json.contains("cookie"), "{json}");
         assert_eq!(
             from_line::<HostFrame>(&to_line(&frame).expect("line")).expect("round trips"),
             frame
