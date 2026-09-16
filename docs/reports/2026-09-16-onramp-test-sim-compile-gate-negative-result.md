@@ -125,13 +125,25 @@ shipped):
 - **gated**: `#[cfg(feature = "onramp-experiment")]` (a scratch, undeclared
   feature — `cfg` on an unknown feature name is a warning, not an error) added
   above `pub mod sim;`, `pub mod test;`, and `mod test_html;`. Verified this
-  compiles **clean, zero errors**, with `cargo build -p autumn-web
-  --no-default-features --features maud,htmx,tailwind,reporting` — every other
-  reference to `crate::test::`/`crate::sim::` found by
+  compiles **clean, zero errors, for the `--lib` target**, with `cargo build
+  -p autumn-web --no-default-features --features maud,htmx,tailwind,reporting`
+  — every other reference to `crate::test::`/`crate::sim::` found by
   `grep -rn 'crate::test::\|crate::sim::' autumn/src/` outside the pair itself
   is either a rustdoc intra-doc link (`[TestApp](crate::test::TestApp)`,
   inert for `cargo build`) or inside a `#[cfg(test)]` block (stripped before
-  name resolution on a non-test build regardless).
+  name resolution on a non-test build regardless). **Not checked, and a real
+  gap found on review:** the crate's `[[bin]]` targets. `autumn/src/bin/
+  sim_sweep.rs` (`sim-sweep`, `required-features = ["sim-testing"]`) imports
+  `autumn_web::sim::sweep` from outside the crate (so a `crate::`-scoped grep
+  inside `autumn/src/` can't see it), and `.github/workflows/ci.yml`'s
+  "Sim sweep (sim-testing)" job runs it with `--features sim-testing` and no
+  `test-support`. Gating `sim` behind `test-support` as proposed would break
+  that existing CI lane outright unless `sim-testing` is also made to imply
+  `test-support` (or the CI invocation adds it) — a real, uncounted item in
+  the mechanism's blast radius, on top of the two generator templates already
+  corrected above. This gate is only ever discussed as a proposal in this
+  report, never shipped, but the proposal's stated scope was still incomplete
+  as written.
 
 Both conditions built with `cargo build -p autumn-web --no-default-features
 --features maud,htmx,tailwind,reporting`, `CARGO_INCREMENTAL=0`, dependencies
@@ -188,9 +200,12 @@ than the swing either condition shows on its own across runs.
 
 Removing all 12,337 lines of `test.rs`/`sim.rs` (and its 7 submodules) —
 currently the largest **unconditionally-compiled, unambiguously test-only**
-source in `autumn-web`, confirmed compile-clean to remove with zero other
-call sites — produced **no measurable, directional change** to the crate's
-own compile time on this box across 5 runs per condition, 2 of them
+source in `autumn-web`, confirmed compile-clean to remove **for the `--lib`
+target** (the measurement's own build target, so the timing numbers below are
+unaffected — but see the `sim-sweep` `[[bin]]` gap noted in 🧪 Apparatus,
+which means the *module itself* isn't as cleanly severable as this report
+first claimed) — produced **no measurable, directional change** to the
+crate's own compile time on this box across 5 runs per condition, 2 of them
 interleaved specifically to rule out ordering/drift effects. The hypothesis
 that these modules are a meaningful contributor to the ~43-55s issue #2795
 measured is **not supported**.
