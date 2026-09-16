@@ -84,17 +84,31 @@ thread_local! {
 fn subtree_has_visible_content(
     nodes: &[Node],
     glue_risk: bool,
-    lone_trailing_break_is_trimmed: bool,
+    // True when the caller's buffer gets `trim_trailing_break`d and
+    // nothing else would ever be appended after this subtree — a *lone*
+    // break is safe here only if truly nothing (not even whitespace)
+    // follows it: any whitespace found after it becomes the buffer's
+    // actual trailing span, keeping the break alive.
+    trailing_break_is_trimmed: bool,
+    // True when this subtree is `inline_list_items`'s marker call, at the
+    // exact position (`content_start`) whose leading `Span::Break` it
+    // strips unconditionally, regardless of what follows. Unlike the
+    // trailing case, whitespace *after* the break here doesn't keep it
+    // alive — the break is gone either way, and any whitespace-only
+    // remainder is itself invisible (isolated whitespace never becomes a
+    // word), since a list marker always ends in its own trailing space,
+    // so `glue_risk` can never be true here. When both this and
+    // `trailing_break_is_trimmed` apply, this — the stronger, unconditional
+    // guarantee — wins.
+    leading_break_is_stripped: bool,
 ) -> bool {
     // Document order matters here, not just for its own sake: telling a
-    // truly trailing `<br>` (nothing rendered after it — safe to drop
-    // under `lone_trailing_break_is_trimmed`) apart from one merely
-    // followed by whitespace (`trim_trailing_break` only pops the very
-    // last span, so that whitespace keeps the break alive) requires
-    // walking in the order those spans would actually get pushed. A plain
-    // `Vec` used as a stack pops last-in-first-out, so both this initial
-    // collect and each `children` push below are reversed to compensate —
-    // same trick `node_glue_lookahead` already uses.
+    // truly trailing `<br>` (nothing rendered after it) apart from one
+    // merely followed by whitespace requires walking in the order those
+    // spans would actually get pushed. A plain `Vec` used as a stack pops
+    // last-in-first-out, so both this initial collect and each `children`
+    // push below are reversed to compensate — same trick
+    // `node_glue_lookahead` already uses.
     let mut stack: Vec<&Node> = nodes.iter().rev().collect();
     let mut has_whitespace_only_text = false;
     let mut seen_break = false;
@@ -113,12 +127,12 @@ fn subtree_has_visible_content(
                     return true;
                 }
                 if !text.is_empty() {
-                    if seen_break {
-                        // Anything, even whitespace-only text, after the
-                        // break means that break isn't trailing after
-                        // all — it survives trim_trailing_break (which
-                        // only ever pops the very last span) and still
-                        // advances layout. (Codex review on PR #2810.)
+                    // Only the trailing exemption cares whether this
+                    // break stays the buffer's *actual* last span — the
+                    // leading-strip exemption removes it unconditionally,
+                    // so trailing whitespace afterward doesn't revive it.
+                    // (Codex review on PR #2810.)
+                    if seen_break && trailing_break_is_trimmed && !leading_break_is_stripped {
                         return true;
                     }
                     has_whitespace_only_text = true;
@@ -126,7 +140,7 @@ fn subtree_has_visible_content(
             }
             Node::Element { tag, children } => {
                 if tag == "br" {
-                    if !lone_trailing_break_is_trimmed || seen_break {
+                    if seen_break || (!trailing_break_is_trimmed && !leading_break_is_stripped) {
                         return true;
                     }
                     seen_break = true;
@@ -542,8 +556,8 @@ fn inline_spans(
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(out) && has_more_after.resolve(),
-            (trimmed && has_more_after.nothing_follows())
-                || leading_break_strip_point == Some(out.len()),
+            trimmed && has_more_after.nothing_follows(),
+            leading_break_strip_point == Some(out.len()),
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
@@ -875,7 +889,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         // a dropped whitespace-only span onto. Not trimmed either: this
         // call's own paragraph buffer never runs through
         // `trim_trailing_break` (see `flatten_blocks`'s `flush`).
-        if subtree_has_visible_content(nodes, false, false) {
+        if subtree_has_visible_content(nodes, false, false, false) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -1069,6 +1083,7 @@ fn flatten_into_pending(
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(pending) && has_more_after.resolve(),
+            false,
             false,
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
@@ -4234,6 +4249,30 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "a lone <br> as a list item's leading content gets stripped either way, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn br_then_whitespace_capped_as_a_list_items_leading_content_does_not_warn() {
+        // Unlike the trailing-trim case (where whitespace after a capped
+        // <br> keeps it alive — see
+        // br_followed_by_whitespace_past_the_depth_cap_inside_a_heading_still_warns),
+        // here the <br> is the list item's leading content, and
+        // inline_list_items strips it unconditionally regardless of what
+        // follows. The remaining whitespace-only text is itself invisible
+        // (isolated whitespace never becomes a word) — a list marker
+        // always ends in its own trailing space, so there is no earlier
+        // word for it to glue to either way. Capped and uncapped render
+        // identically: just the marker. (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><ul><li>{}<br> {}</li></ul></h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "the leading <br> is stripped regardless of trailing whitespace, and that whitespace is itself invisible"
         );
     }
 
