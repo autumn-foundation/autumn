@@ -25214,7 +25214,14 @@ mod tests {
         let cursor_pos = generated
             .find("async fn cursor_page")
             .expect("cursor_page impl must be generated");
-        let section = &generated[cursor_pos..cursor_pos + 800];
+        // Scope to the method body: the next `async fn` ends it. A fixed-width
+        // window breaks when the body gains a long item, such as the #1771
+        // confidential-column assertion.
+        let body = &generated[cursor_pos..];
+        let section = match body[1..].find("async fn ") {
+            Some(end) => &body[..=end],
+            None => body,
+        };
         assert!(
             section.contains("is_null"),
             "cursor_page impl must apply deleted_at IS NULL filter in soft-delete mode: {section}"

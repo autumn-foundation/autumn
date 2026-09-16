@@ -5673,25 +5673,26 @@ fn field_may_skip_serialization(field: &syn::Field) -> bool {
     field_already_skips_serialization(field) || field_has_skip_serializing_if(field)
 }
 
-/// Render a serde key as it is written: `flatten` takes no value, the others do.
+/// Render a serde key as it is written: `flatten` and `transparent` take no
+/// value, the others do.
 fn serde_key_display(key: &str) -> String {
-    if key == "flatten" {
+    if matches!(key, "flatten" | "transparent") {
         key.to_owned()
     } else {
         format!("{key} = ...")
     }
 }
 
-/// Whether a container reshapes its serialized form through a conversion type:
-/// `#[serde(into = "...")]`, `from` or `try_from`.
+/// Whether a container reshapes its serialized form: `#[serde(into = "...")]`,
+/// `from`, `try_from` or `transparent`.
 ///
-/// The conversion decides the keys, so a registry keyed on the model's own field
-/// names cannot see through it.
+/// The first three decide the keys and `transparent` removes them, so a registry
+/// keyed on the model's own field names cannot see through any of them.
 fn attrs_have_serde_shape_conversion(attrs: &[syn::Attribute]) -> Option<&'static str> {
     let mut found = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
-            for key in ["into", "from", "try_from"] {
+            for key in ["into", "from", "try_from", "transparent"] {
                 if meta.path.is_ident(key) {
                     found = found.or(Some(key));
                 }
@@ -7972,15 +7973,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // snapshots the model through `Serialize`. A `Wire` type that moves the
     // sealed column under another key would carry the envelope past the
     // sensitive-column lookup and into the history table; `from`/`try_from` are
-    // the same bypass on the way in.
+    // the same bypass on the way in. `transparent` is worse: the model
+    // serializes as the bare envelope, so the snapshot is a string, and
+    // `compute_diff_owned` returns no change at all for a non-object value.
     if !confidential_columns.is_empty()
         && let Some(key) = attrs_have_serde_shape_conversion(outer_attrs)
     {
+        let key = serde_key_display(key);
         return syn::Error::new_spanned(
             name,
             format!(
-                "`#[serde({key} = ...)]` cannot be combined with `#[confidential]` fields \
-                 (issue #1771): the conversion decides the serialized keys, so version \
+                "`#[serde({key})]` cannot be combined with `#[confidential]` fields \
+                 (issue #1771): the attribute decides the serialized shape, so version \
                  history and the raw-request filters — which key off the model's own field \
                  names — cannot see the sealed column or its token through it."
             ),
@@ -14837,6 +14841,7 @@ mod tests {
             quote! { #[serde(into = "Wire")] },
             quote! { #[serde(from = "Wire")] },
             quote! { #[serde(try_from = "Wire")] },
+            quote! { #[serde(transparent)] },
         ] {
             let input: TokenStream = quote! {
                 #conversion
