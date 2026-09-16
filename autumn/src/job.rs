@@ -2217,6 +2217,7 @@ async fn run_job_handler(
         // capsule identically.
         let mut filter_parameters = config.log.filter_parameters.clone();
         filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
         let filter = std::sync::Arc::new(crate::log::filter::ParameterFilter::new(
             &filter_parameters,
             &config.log.unfilter_parameters,
