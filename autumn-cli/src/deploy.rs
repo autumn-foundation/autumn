@@ -4681,9 +4681,10 @@ fn alert_channels_for(
 }
 
 /// Read `[alerts]` and `[http]` from the raw project TOML layers alone — no
-/// env-var overlay, no full [`AutumnConfig`] deserialize. Mirrors
-/// [`declared_server_port_in`]'s own merge of base `autumn.toml` ← inline
-/// `[profile.<name>]` ← `autumn-<profile>.toml`.
+/// env-var overlay yet (the caller applies one — see
+/// [`apply_alert_env_overrides`]), no full [`AutumnConfig`] deserialize.
+/// Mirrors [`declared_server_port_in`]'s own merge of base `autumn.toml` ←
+/// inline `[profile.<name>]` ← `autumn-<profile>.toml`.
 ///
 /// Review finding on #2267: [`load_runtime_config`] can fail on a section
 /// this command does not even use (a bad `[scheduler]`/`[database]` value),
@@ -4693,12 +4694,6 @@ fn alert_channels_for(
 /// hear about. Deserializing only `alerts`/`http` out of the merged TOML
 /// ignores every other top-level key, so a bad value there can not break
 /// this the way it breaks the full `AutumnConfig` deserialize.
-///
-/// Limitation: `AUTUMN_ALERTS__*` env vars are read only on the primary
-/// `load_runtime_config` path, not here — this is a TOML-only fallback. A
-/// destination set ONLY via env var is silent on this path, which is
-/// narrower than the primary path but safer than dropping the alert
-/// outright.
 fn declared_alert_config_in(
     dirs: &[PathBuf],
     profile_raw: &str,
@@ -4755,11 +4750,47 @@ fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>
     if let Ok(config) = load_runtime_config(profile) {
         return alert_channels_for(&config.alerts, &config.http);
     }
-    if let Some((alerts, http)) = declared_alert_config_in(&manifest_project_dirs(), profile) {
-        return alert_channels_for(&alerts, &http);
-    }
-    eprintln!("  \u{26A0} alert skipped: could not load configuration for profile {profile}");
-    Vec::new()
+    let Some((alerts, http)) = declared_alert_config_in(&manifest_project_dirs(), profile) else {
+        eprintln!("  \u{26A0} alert skipped: could not load configuration for profile {profile}");
+        return Vec::new();
+    };
+    // Review finding on #2267: the TOML-only fallback above must still see
+    // `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides, or a destination
+    // set only via env var (the documented, recommended way to supply a
+    // secret) gets nothing here, and an `AUTUMN_ALERTS__ENABLED=false`
+    // meant to silence a TOML-configured destination is ignored. A failure
+    // building the profile's env overlay is not fatal — the TOML-only
+    // values found above still apply.
+    let (alerts, http) = match deploy_profile_env_overlay(profile) {
+        Ok(env) => apply_alert_env_overrides(alerts, http, &env),
+        Err(_) => (alerts, http),
+    };
+    alert_channels_for(&alerts, &http)
+}
+
+/// Apply the same `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides the
+/// primary [`load_runtime_config`] path applies (issue #2267 review).
+///
+/// Reuses [`AutumnConfig::apply_env_overrides_with_env`] verbatim on a
+/// scratch value — the exact method `AutumnConfig::load_with_env` itself
+/// calls — so this can never drift from the primary path's env semantics.
+/// Every OTHER section of the scratch value is a throwaway default; only
+/// `alerts`/`http` are read back out.
+fn apply_alert_env_overrides(
+    alerts: autumn_web::alerts::AlertConfig,
+    http: autumn_web::config::HttpConfig,
+    env: &dyn Env,
+) -> (
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+) {
+    let mut scratch = AutumnConfig {
+        alerts: Box::new(alerts),
+        http,
+        ..AutumnConfig::default()
+    };
+    scratch.apply_env_overrides_with_env(env);
+    (*scratch.alerts, scratch.http)
 }
 
 /// Send `alert` to every channel in `channels`.
@@ -9876,6 +9907,38 @@ mod tests {
             .expect("a bad [scheduler] value must not break the [alerts] read");
 
         assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_reads_autumn_alerts_env_vars() {
+        // Review finding on #2267: a destination set ONLY via env var (the
+        // documented, recommended way to supply a secret) must still fire
+        // on the TOML-only degraded-status fallback.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig::default();
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY", "R9999");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R9999"));
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_can_disable_a_toml_configured_destination() {
+        // The other half of the same finding: AUTUMN_ALERTS__ENABLED=false
+        // must still silence a destination the TOML-only read already found.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig {
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__ENABLED", "false");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert!(!alerts.is_active());
     }
 
     #[test]
