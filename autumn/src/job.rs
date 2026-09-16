@@ -8538,7 +8538,16 @@ fn pg_due_from(
     relative_delay.map_or_else(
         || due_at.map_or(PgDueAt::Immediate, PgDueAt::Absolute),
         |delay| {
-            let ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            // Round up, never down: `Duration::as_millis` truncates, so a
+            // delay with a sub-millisecond remainder (e.g. 1.9ms) would
+            // otherwise bind as 1ms and could make `run_at` claimable before
+            // the caller's delay actually elapsed. Adding just under 1ms
+            // before truncating rounds any remainder up to the next whole
+            // millisecond and leaves an exact value unchanged.
+            let ceil_delay = delay
+                .checked_add(std::time::Duration::from_nanos(999_999))
+                .unwrap_or(delay);
+            let ms = i64::try_from(ceil_delay.as_millis()).unwrap_or(i64::MAX);
             if ms > PG_MAX_RELATIVE_DELAY_MS {
                 // Matches `due_at_from`'s own overflow fallback so both paths
                 // clamp to the same, representable instant.
@@ -15666,6 +15675,28 @@ mod tests {
             assert_eq!(
                 pg_due_from(Some(Duration::from_secs(u64::MAX)), None),
                 PgDueAt::Absolute(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            );
+        }
+
+        /// A sub-millisecond remainder must round up, never down: truncating
+        /// (as `Duration::as_millis` does) could make `run_at` claimable
+        /// before the caller's requested delay actually elapsed.
+        #[test]
+        fn pg_due_from_rounds_a_fractional_millisecond_delay_up_not_down() {
+            assert_eq!(
+                pg_due_from(Some(Duration::from_micros(1_900)), None),
+                PgDueAt::RelativeMs(2),
+                "1.9ms must round up to 2ms, not truncate down to 1ms"
+            );
+            assert_eq!(
+                pg_due_from(Some(Duration::from_nanos(1)), None),
+                PgDueAt::RelativeMs(1),
+                "any positive sub-millisecond delay must round up to 1ms, never down to 0"
+            );
+            assert_eq!(
+                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                PgDueAt::RelativeMs(2_000),
+                "an exact millisecond value must round-trip unchanged"
             );
         }
 
