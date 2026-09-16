@@ -1297,6 +1297,16 @@ impl JobRegistry {
     /// offset. It can still, rarely, pick an unrelated co-queued job's mark
     /// (the reason the exact lookup exists at all) — that mismatch corrects
     /// itself at the next durable-backend survey tick.
+    ///
+    /// An exact entry can itself be stale: `record_start` pops a job's
+    /// original waiting mark without clearing its `pg_marks_by_job_id`
+    /// entry, and a non-terminal retry then pushes a *new* mark without
+    /// updating that entry either, so a cancel racing a retry can find a
+    /// value that is no longer in the queue at all. The exact removal
+    /// reports whether it actually removed something, and this only trusts
+    /// the exact lookup when it did — a stale entry falls through to the
+    /// same candidate fallback as no entry at all, rather than silently
+    /// leaving the job's real (retried) mark in place.
     pub fn record_cancel_at_backend_offset(
         &self,
         name: &str,
@@ -1315,8 +1325,9 @@ impl JobRegistry {
             .write()
             .ok()
             .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id));
-        if let Some(exact_ms) = exact_ms {
-            self.pop_waiting_exact(name, exact_ms);
+        if let Some(exact_ms) = exact_ms
+            && self.pop_waiting_exact(name, exact_ms)
+        {
             return;
         }
         let mut candidates: Vec<u64> = Vec::with_capacity(3);
@@ -1373,17 +1384,21 @@ impl JobRegistry {
         }
     }
 
-    /// Drop the waiting mark equal to `exact_ms`. A no-op if it is not
-    /// present — e.g. something else already removed it — rather than
-    /// falling back to a guess, which would risk removing an unrelated mark.
-    fn pop_waiting_exact(&self, name: &str, exact_ms: u64) {
+    /// Drop the waiting mark equal to `exact_ms`, returning whether one was
+    /// found. A no-op (returning `false`) when `exact_ms` is not present —
+    /// e.g. it is a stale entry pointing at a mark something else already
+    /// removed — so the caller can fall back to a heuristic guess rather
+    /// than silently leaving the job's real, current mark in place.
+    fn pop_waiting_exact(&self, name: &str, exact_ms: u64) -> bool {
         let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
             && let Some(waiting) = guard.waiting.get_mut(&queue)
             && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
         {
             waiting.remove(idx);
+            return true;
         }
+        false
     }
 
     /// The raw waiting marks (epoch ms) for `name`'s queue, in push order.
@@ -1407,10 +1422,7 @@ impl JobRegistry {
     /// holds without exposing the table itself.
     #[cfg(test)]
     pub(crate) fn pg_marks_len_for_test(&self) -> usize {
-        self.queues
-            .read()
-            .map(|g| g.pg_marks_by_job_id.len())
-            .unwrap_or(0)
+        self.queues.read().map_or(0, |g| g.pg_marks_by_job_id.len())
     }
 
     /// Record a successful execution.
@@ -4956,6 +4968,55 @@ mod tests {
             PG_MARKS_BY_JOB_ID_CAP,
             "the exact-mark table must never grow past its cap, even when every job it \
              tracks starts or completes normally and is never looked up again"
+        );
+    }
+
+    /// A stale `pg_marks_by_job_id` entry must not swallow the cancel: if the
+    /// exact-looked-up value is no longer in the queue, the cancel has to
+    /// fall back to the candidate heuristic, not silently remove nothing.
+    ///
+    /// `record_start` pops a job's original mark without clearing its exact
+    /// entry, and a non-terminal retry then pushes a *new* mark under the
+    /// same job name without updating that entry either — so a cancel
+    /// racing a retry finds a value (`pop_waiting_exact`) that is no longer
+    /// in the queue at all.
+    #[test]
+    fn cancel_at_backend_offset_falls_back_when_the_exact_mark_is_stale() {
+        const MARK_A: u64 = 1_000;
+        const MARK_B: u64 = 2_000;
+
+        let registry = JobRegistry::new();
+        registry.register_on_queue("flaky_job", "mail");
+
+        // Original enqueue: pushes mark_a and notes it under "job-id".
+        registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A));
+
+        // The job starts: `record_start` pops mark_a from the queue, but
+        // has no way to know about (and so cannot clear) "job-id"'s exact
+        // entry, which now stales at mark_a.
+        registry.record_start("flaky_job");
+        assert_eq!(
+            registry.waiting_marks_for_test("flaky_job"),
+            Vec::<u64>::new(),
+            "record_start must have popped mark_a"
+        );
+
+        // The job fails non-terminally and is requeued as a retry: a new
+        // mark is pushed under the same job name, but — mirroring the real
+        // retry-lifecycle code, which predates `record_pg_enqueue` and does
+        // not call it — without updating "job-id"'s exact entry.
+        registry.record_enqueue_scheduled("flaky_job", MARK_B);
+
+        // Cancel "job-id": the exact lookup finds the stale mark_a, which
+        // `pop_waiting_exact` cannot find in the queue (only mark_b is
+        // there) — the fallback candidate (real_reference_ms + offset_ms)
+        // is set up to land exactly on mark_b.
+        registry.record_cancel_at_backend_offset("flaky_job", "job-id", None, MARK_B, 0);
+        assert_eq!(
+            registry.waiting_marks_for_test("flaky_job"),
+            Vec::<u64>::new(),
+            "the stale exact entry must not stop the cancel from removing the job's real, \
+             current mark (mark_b) via the candidate fallback"
         );
     }
 
