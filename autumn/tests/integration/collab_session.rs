@@ -1610,3 +1610,61 @@ async fn a_seed_past_the_causal_buffer_limit_is_refused() {
         "the hub only serves documents its own decoder accepts"
     );
 }
+
+/// A handle that outlived the registry entry must not be able to lose a write.
+///
+/// `CollabDoc` is `Clone` and holding one is not a session, so a background
+/// job that kept one still owns the state after the last editor leaves and
+/// the close commits. Editing it then writes to a document nothing persists
+/// and no `open_with` returns — the write vanishes with no error anywhere.
+#[tokio::test]
+async fn a_released_document_refuses_edits_through_a_retained_handle() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:23:body", CollabText::new)
+        .expect("open the document");
+
+    doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: None,
+            text: "hi".to_owned(),
+        },
+    )
+    .expect("seed");
+
+    // No session is live — the handle alone is what keeps this alive.
+    let guard = hub.close("notes:23:body").expect("nobody is editing");
+    assert_eq!(guard.text().text(), "hi");
+    assert!(guard.finalize().is_none(), "released");
+
+    // Reading still works: this is the final state, and reading cannot lose it.
+    assert_eq!(doc.text(), "hi");
+
+    // Editing does not, through any of the paths that could lose the write.
+    let refused = doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: None,
+            text: "!".to_owned(),
+        },
+    );
+    assert!(
+        matches!(refused, Err(CollabError::DocumentReleased { .. })),
+        "the write is refused, not silently orphaned: {refused:?}"
+    );
+    assert!(matches!(
+        doc.apply_remote(&[]),
+        Err(CollabError::DocumentReleased { .. })
+    ));
+    assert!(matches!(
+        doc.merge_delivered(&[]),
+        Err(CollabError::DocumentReleased { .. })
+    ));
+
+    // And the next opener gets a fresh document from the row, not the orphan.
+    let reopened = hub
+        .open_with("notes:23:body", CollabText::new)
+        .expect("reopen");
+    assert_eq!(reopened.text(), "", "seeded fresh, as the caller intended");
+}

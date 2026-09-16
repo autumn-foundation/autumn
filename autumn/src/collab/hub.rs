@@ -206,6 +206,18 @@ pub enum CollabError {
         /// The wire limit.
         limit: usize,
     },
+    /// The document was released by [`CollabClose::finalize`].
+    ///
+    /// The handle still works for reading the final state; what it cannot do
+    /// is edit. A write here would land on a document that is out of the
+    /// registry: nothing persists it, and the next
+    /// [`open_with`](CollabHub::open_with) seeds a fresh one from the row, so
+    /// the edit would vanish without an error. Re-open the key to carry on.
+    #[error("document {key} has been released; re-open it to edit")]
+    DocumentReleased {
+        /// The key that was released.
+        key: String,
+    },
     /// An edit could not be minted — see [`CollabEditError`].
     #[error(transparent)]
     Edit(#[from] CollabEditError),
@@ -342,6 +354,18 @@ struct DocState {
     /// dropped, or lost to a panic — this stops upgrading and the next close
     /// may proceed.
     close_claim: Weak<()>,
+    /// Set when [`CollabClose::finalize`] takes this document out of the
+    /// registry.
+    ///
+    /// A handle can outlive the registry entry: [`CollabDoc`] is `Clone` and
+    /// holding one does not count as a session, so a background job that kept
+    /// one — the documented way to reach `apply_remote` — still owns this
+    /// state after the last editor left and the close committed. Editing it
+    /// then writes to a document nothing will persist and no `open_with` will
+    /// return: the next caller seeds a fresh one from the row, and the edit is
+    /// gone with no error anywhere. Edits are refused once this is set, so the
+    /// caller learns the document moved on instead of losing the write.
+    released: bool,
     /// Bumped on every change to `doc`.
     ///
     /// [`CollabClose`] records it and refuses to evict a document that moved
@@ -359,6 +383,7 @@ impl DocState {
             cursors: BTreeMap::new(),
             sessions: 0,
             close_claim: Weak::new(),
+            released: false,
             revision: 0,
         }
     }
@@ -854,7 +879,7 @@ impl CollabClose {
         if !Arc::ptr_eq(&live, &self.state) {
             return None;
         }
-        let state = live.lock().expect("collab document lock poisoned");
+        let mut state = live.lock().expect("collab document lock poisoned");
         // Occupied: its editor's handler owns persisting it from here.
         if state.sessions > 0 {
             return None;
@@ -878,6 +903,9 @@ impl CollabClose {
                 claim: self.claim,
             });
         }
+        // Under the same lock as the removal, so no edit can slip between
+        // "still registered" and "released".
+        state.released = true;
         drop(state);
         docs.remove(&self.key);
         None
@@ -924,6 +952,21 @@ pub struct CollabDoc {
 }
 
 impl CollabDoc {
+    /// Lock the document for a change, refusing one that has been released.
+    ///
+    /// Every path that can *lose* a write goes through here. A read does not:
+    /// the final state is still worth reading through a handle that outlived
+    /// the registry entry, and reading it cannot be lost.
+    fn editable(&self) -> Result<std::sync::MutexGuard<'_, DocState>, CollabError> {
+        let state = self.state.lock().expect("collab document lock poisoned");
+        if state.released {
+            return Err(CollabError::DocumentReleased {
+                key: self.key.clone(),
+            });
+        }
+        Ok(state)
+    }
+
     /// The document key.
     #[must_use]
     pub const fn key(&self) -> &str {
@@ -1087,7 +1130,7 @@ impl CollabDoc {
                     });
                 }
                 let ops = {
-                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    let mut state = self.editable()?;
                     // The hub minted every id in this document, so an anchor
                     // it has never seen is a client fault. Refusing it here
                     // stops two things at once: an anchor from the future
@@ -1122,7 +1165,7 @@ impl CollabDoc {
                     });
                 }
                 let ops = {
-                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    let mut state = self.editable()?;
                     // `remove_known`, not `remove_ids`: a delete for a
                     // character the hub has never seen must be dropped, not
                     // buffered. Buffered, it would tombstone that character
@@ -1148,7 +1191,7 @@ impl CollabDoc {
                     });
                 }
                 let ops = {
-                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    let mut state = self.editable()?;
                     if let Some(anchor) = after.as_ref()
                         && !state.doc.knows(anchor)
                     {
@@ -1214,7 +1257,7 @@ impl CollabDoc {
     /// Panics if the internal document mutex is poisoned.
     pub fn apply_remote(&self, ops: &[CollabOp]) -> Result<usize, CollabError> {
         let (accepted, waiting) = {
-            let mut state = self.state.lock().expect("collab document lock poisoned");
+            let mut state = self.editable()?;
             let held = state.doc.element_count() + state.doc.pending_len();
             // Charge only what the batch would actually add. A reconnecting
             // peer replays its whole history, so counting the batch length
@@ -1287,7 +1330,7 @@ impl CollabDoc {
     ///
     /// Panics if the internal document mutex is poisoned.
     pub fn merge_delivered(&self, ops: &[CollabOp]) -> Result<(), CollabError> {
-        let mut state = self.state.lock().expect("collab document lock poisoned");
+        let mut state = self.editable()?;
         let held = state.doc.element_count() + state.doc.pending_len();
         let novel = state.doc.novel_count(ops.iter());
         // The same bound `handle` and `apply_remote` enforce. Without it a

@@ -5450,15 +5450,42 @@ fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
             ));
         }
     }
-    // The column is registered under its Rust field name, which the registry
-    // and the generated field-name-keyed accessors match against. A
-    // `#[serde(rename)]` would desync them.
-    if field_has_serde_rename(field) {
+    // The column is registered under its Rust field name, which the registry,
+    // the generated field-name-keyed accessors and `CollabResolver` all match
+    // against. Anything that gives the field a different wire name — or no
+    // name of its own — desyncs them.
+    //
+    // `rename` moves the key, `alias` adds a second one a request may arrive
+    // under, and `flatten` removes it entirely: the document's `elems` and
+    // `pending` are emitted at the row's top level, so the resolver's lookup
+    // of the registered name finds nothing, falls through to the wrapped
+    // last-write-wins verdict, and discards one replica's edits — silently,
+    // which is the outcome this whole feature exists to prevent.
+    if let Some(key) = field_serde_wire_name_override(field) {
         return Err(syn::Error::new_spanned(
             field,
-            "`#[collaborative]` fields cannot use `#[serde(rename = ...)]`: the column is \
-             registered under its Rust name, which must match the field name passed to \
-             `collaborative(..)` and used as the session key.",
+            format!(
+                "`#[collaborative]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which must match the field name passed to \
+                 `collaborative(..)`, used as the session key, and looked up by \
+                 `CollabResolver` when it merges an offline edit.",
+                serde_key_display(key),
+            ),
+        ));
+    }
+    // And anything that drops the column from the serialized form. The
+    // resolver reads both sides of a conflict out of the row's JSON, so a
+    // column that is not there is a column it cannot merge: the offline edit
+    // loses to last-write-wins exactly as if the field had never been marked.
+    if let Some(key) = field_serde_omission(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[collaborative]` fields cannot use `#[{key}]`: the column must be present \
+                 in the serialized row for `CollabResolver` to find and merge it. Without it \
+                 a conflicting offline edit falls back to last-write-wins and one side's \
+                 text is discarded."
+            ),
         ));
     }
     // `#[diesel(column_name = ...)]` renames the *database* column, so it
@@ -15085,6 +15112,57 @@ mod tests {
             pub body: CollabText
         };
         assert!(validate_collaborative_field(&column_renamed).is_err());
+    }
+
+    /// Every other way to give the column a wire name the registry does not
+    /// know. `flatten` is the one that hides best: the field still *exists*,
+    /// but its `elems` and `pending` are emitted at the row's top level, so
+    /// `CollabResolver`'s lookup of the registered name finds nothing and the
+    /// conflict quietly falls back to last-write-wins.
+    #[test]
+    fn collaborative_rejects_every_serde_wire_name_override() {
+        for attr in [
+            quote! { #[serde(flatten)] },
+            quote! { #[serde(alias = "text")] },
+            quote! { #[serde(rename = "text")] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            let msg = validate_collaborative_field(&field)
+                .expect_err("the override must be refused")
+                .to_string();
+            assert!(
+                msg.contains("CollabResolver"),
+                "the error must say what breaks: {msg}"
+            );
+        }
+    }
+
+    /// And every way to drop the column from the serialized row, which leaves
+    /// the resolver nothing to merge for the same end result.
+    #[test]
+    fn collaborative_rejects_serialization_omissions() {
+        for attr in [
+            quote! { #[serde(skip_serializing)] },
+            quote! { #[serde(skip_serializing_if = "Option::is_none")] },
+            quote! { #[serde(default)] },
+            quote! { #[serde(skip_deserializing)] },
+            quote! { #[private] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            assert!(
+                validate_collaborative_field(&field).is_err(),
+                "an omitted collaborative column cannot be merged: {}",
+                quote! { #attr }
+            );
+        }
     }
 
     /// The marker never reaches the Diesel derives, and the generated surface
