@@ -1,9 +1,57 @@
 Non-vacuousness check for job_dispatch_carries_no_ambient_tenant
 ==================================================================
 
-Temporarily edited autumn/src/test.rs's TestApp::perform_enqueued_jobs to
-wrap the handler invocation in a fake tenant scope, simulating exactly the
-leak the hypothesis worried about:
+The test has two independent phases; each was verified separately against
+the real code path it claims to exercise, since a Codex review on this PR
+correctly flagged that the original single-phase version (asserting only
+on `perform_enqueued_jobs()`'s result) never actually drove the real
+in-process worker's own dispatch path, and — worse — was racy against it:
+the worker runs the same job concurrently and writes to the same shared
+static, so a leak specific to the worker's dispatch could have been
+silently overwritten by perform_enqueued_jobs()'s own (correct) result
+before the assertion ever read it.
+
+Phase 1 — the real in-process worker's dispatch path
+------------------------------------------------------
+
+`run_job_handler_inner` in autumn/src/job.rs is, per its own doc comment,
+"the single choke point all three backends run handlers through." Injected
+a fake tenant scope around the actual handler *poll*, not just its
+construction (the first attempt wrapped `(handler)(state, payload)`'s
+*construction* in `sync_scope`, which is a no-op for an async fn — the
+task-local has to wrap the `.await` that actually polls it):
+
+    let next = Box::pin(async move {
+        let future_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (handler)(state, payload_for_handler)
+        }));
+        let future = match future_res {
+            Ok(f) => f,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        crate::tenancy::CURRENT_TENANT
+            .scope(Some("fake-leaked-tenant".to_string()), future)
+            .await
+    });
+
+Reran:
+  cargo test -p autumn-web --test integration_tests --features test-support \
+    -- job_tenant_scope --nocapture
+
+Result: FAILED, on exactly phase 1's assertion:
+
+thread 'integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant' (637) panicked at autumn/tests/integration/job_tenant_scope.rs:178:5:
+assertion `left == right` failed: the in-process worker's own dispatch must not observe an ambient tenant
+  left: Leaked("fake-leaked-tenant")
+ right: NoTenant
+
+Reverted (git diff -- autumn/src/job.rs empty afterward).
+
+Phase 2 — TestApp::perform_enqueued_jobs()'s own direct invocation
+--------------------------------------------------------------------
+
+Temporarily edited `TestApp::perform_enqueued_jobs` (autumn/src/test.rs)
+to wrap its handler invocation in the same fake tenant scope:
 
     let result = match handler {
         Some(handler) => {
@@ -17,21 +65,16 @@ leak the hypothesis worried about:
         None => Err(crate::AutumnError::internal_server_error(
         ...
 
-Reran:
-  cargo test -p autumn-web --test integration_tests --features test-support \
-    -- job_tenant_scope --nocapture
+Reran the same test. Result: FAILED, on exactly phase 2's assertion:
 
-Result: FAILED, on exactly the intended assertion:
-
-running 1 test
-
-thread 'integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant' (8724) panicked at autumn/src/test.rs:590:9:
+thread 'integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant' (761) panicked at autumn/src/test.rs:590:9:
 expected all performed jobs to succeed, but 1 failed:
   - tenant_leak_probe: AutumnError { status: 500, inner: StringError("job dispatch observed ambient tenant \"fake-leaked-tenant\"; CURRENT_TENANT leaked from the enqueuing request into job execution"), details: None, problem_type: None, cache_idempotency_response: false, .. }
 
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2041 filtered out; finished in 0.28s
+Reverted (git diff -- autumn/src/test.rs empty afterward).
 
-The synthetic leak was caught immediately and precisely (naming the leaked
-tenant id). The production code was restored immediately after (verified
-`git diff -- autumn/src/test.rs` is empty); only the new test file and the
-mod.rs registration are committed.
+Both synthetic leaks were caught immediately and precisely (naming the
+leaked tenant id), each on the phase whose real dispatch path it was
+injected into, with no cross-phase masking. Only the test file itself
+(autumn/tests/integration/job_tenant_scope.rs) is committed; both
+production-code edits above were reverted after use.

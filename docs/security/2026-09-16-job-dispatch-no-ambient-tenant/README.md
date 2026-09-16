@@ -6,9 +6,11 @@
 `autumn-macros/src/job.rs`) × `autumn_web::tenancy::CURRENT_TENANT`
 (`autumn/src/tenancy.rs`). Entry point investigated: an `#[job(...)]`
 handler enqueued via `SomeJob::enqueue(...)` from inside a tenant-scoped
-request, then executed through `TestApp::perform_enqueued_jobs()` — the
-framework's own documented tool for asserting "the same handler the
-[in-process worker] runtime would invoke."
+request, then executed two ways — through `TestApp`'s own in-process worker
+(the real production dispatch path, `run_job_handler_inner` in
+`autumn/src/job.rs`) and through `TestApp::perform_enqueued_jobs()`, the
+framework's documented synchronous test tool for driving a job through its
+registered handler.
 
 ## 🕵️ Threat model (hypothesis)
 
@@ -56,18 +58,33 @@ Added `autumn/tests/integration/job_tenant_scope.rs`,
    only if it observes none.
 3. POSTs to a route that calls `TenantLeakProbeJob::enqueue(...)` while the
    request is scoped to `tenant-a-sentinel`.
-4. Runs `client.perform_enqueued_jobs().await.assert_all_succeeded()` — the
-   framework's own sanctioned tool for driving a job through its real
-   registered handler — and asserts the probe recorded "no tenant", not
-   `tenant-a-sentinel`.
+4. **Phase 1**: waits (`wait_until`, polling) for `TestApp::build`'s
+   in-process worker — started by default, the real production dispatch
+   path — to actually run the probe, then asserts what it observed.
+5. **Phase 2**: resets the observation and separately calls
+   `client.perform_enqueued_jobs().await.assert_all_succeeded()` — the
+   framework's own sanctioned tool for driving a job through its registered
+   handler synchronously — and asserts again.
 
 ```
 cargo test -p autumn-web --test integration_tests --features test-support \
   -- job_tenant_scope --nocapture
 ```
 
-Result: **pass** — `CURRENT_TENANT` is `None` inside the job handler. See
-`after.txt`.
+Result: **pass** — `CURRENT_TENANT` is `None` inside the job handler, on
+both the real worker's own dispatch and `perform_enqueued_jobs()`'s direct
+invocation. See `after.txt`.
+
+**Revision note**: a Codex review on this PR caught that the first version
+of this test asserted only on `perform_enqueued_jobs()`, and did so
+concurrently with `TestApp`'s own in-process worker (which drains and runs
+the same job independently) writing to the *same* shared static — so a
+real leak specific to the worker's own dispatch path could have been
+silently overwritten by `perform_enqueued_jobs()`'s clean result before the
+assertion ever read it, passing green while proving nothing about the path
+a production deployment actually uses. Restructured into the two
+sequenced, individually-asserted phases above, each verified non-vacuous
+against the specific code path it targets (see `non-vacuous-check.txt`).
 
 ## 🔎 Root cause of the fail-safe behavior
 
@@ -107,30 +124,39 @@ None — no bug found. Test-only addition:
 `idempotency_tenant_scope.rs` and `rate_limit_tenant_scope.rs`, which also
 need no `db`/Docker feature since the assertion never touches a database).
 
-Confirmed the test is not vacuous: temporarily edited
-`TestApp::perform_enqueued_jobs` (`autumn/src/test.rs`) to wrap the handler
-invocation in `CURRENT_TENANT.scope(Some("fake-leaked-tenant".into()), ...)`
-— simulating exactly the leak the hypothesis worried about — and reran the
-same test. It failed immediately, on the exact assertion this report is
-about, naming the injected value:
+Confirmed **each phase independently** is not vacuous:
+
+- **Phase 1** (real worker dispatch): temporarily edited
+  `run_job_handler_inner` (`autumn/src/job.rs`) — its own doc comment calls
+  it "the single choke point all three backends run handlers through" — to
+  wrap the handler's `.await` (not merely its construction; task-local
+  scope has to wrap the actual poll) in
+  `CURRENT_TENANT.scope(Some("fake-leaked-tenant".into()), future).await`.
+  Reran: failed immediately, on phase 1's assertion, naming the injected
+  tenant.
+- **Phase 2** (`perform_enqueued_jobs()`): temporarily edited
+  `TestApp::perform_enqueued_jobs` (`autumn/src/test.rs`) to wrap its own
+  handler invocation the same way. Reran: failed immediately, on phase 2's
+  assertion, naming the injected tenant:
 
 ```
 expected all performed jobs to succeed, but 1 failed:
   - tenant_leak_probe: AutumnError { status: 500, inner: StringError("job dispatch observed ambient tenant \"fake-leaked-tenant\"; CURRENT_TENANT leaked from the enqueuing request into job execution"), ... }
 ```
 
-See `non-vacuous-check.txt`. The production code was restored immediately
-after (verified `git diff -- autumn/src/test.rs` is empty); only the new
-test file and the `mod.rs` registration are committed.
+See `non-vacuous-check.txt` for both full runs. Both production-code edits
+were reverted immediately after use (verified `git diff -- autumn/src/job.rs
+autumn/src/test.rs` is empty); only the test file and its `mod.rs`
+registration are committed.
 
 ## ✅ Verification
 
 - `cargo fmt --all -- --check` — clean.
 - `cargo clippy -p autumn-web --test integration_tests --features test-support -- -D warnings` — clean (no new warnings from the added file).
-- `cargo test -p autumn-web --test integration_tests --features test-support -- job_tenant_scope --nocapture` — 1/1 pass (`after.txt`).
+- `cargo test -p autumn-web --test integration_tests --features test-support -- job_tenant_scope --nocapture` — 1/1 pass, both phases (`after.txt`).
 - `cargo test -p autumn-web --test integration_tests --features test-support -- job_tenant_scope job_recorder_integration --nocapture` — 14/14 pass, no collateral breakage in the sibling job-recorder suite (`full-suite-run.txt`).
 - `./scripts/check-panic-gate.sh` — 35/35 self-tests pass, 81 request-path modules gated (unaffected by a test-only change).
-- Non-vacuousness check above: the same test fails loudly, naming the leaked value, when a synthetic ambient-tenant leak is injected into the dispatch path (`non-vacuous-check.txt`).
+- Non-vacuousness check above: each phase fails loudly, naming the leaked value, when a synthetic ambient-tenant leak is injected into the specific dispatch path it targets (`non-vacuous-check.txt`).
 - `./scripts/pre-push-check.sh` — the panic-gate and determinism-gate steps passed (35/35 and 20/20 self-tests); the plugin-surface step needed `git fetch --unshallow` first (this sandbox started from a shallow clone) and then passed clean; its final `cargo test --workspace --no-run` step was killed by the sandbox's own memory limit partway through an unrelated crate (`autumn-macros`, which this diff never touches) under this script's default parallelism — an environment constraint, not a compile error. Re-ran the equivalent compile check with reduced parallelism instead: `CARGO_BUILD_JOBS=2 cargo check --workspace --tests` completed clean, 0 errors, confirming every workspace member (including every test target) still compiles with this change.
 
 ## 📡 Blast radius

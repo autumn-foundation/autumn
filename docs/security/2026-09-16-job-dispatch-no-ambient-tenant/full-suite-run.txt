@@ -36,7 +36,7 @@ test integration::job_recorder_integration::recorders_are_isolated_between_apps 
 test integration::job_recorder_integration::user_job_interceptor_composes_with_recorder ... ok
 test integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2028 filtered out; finished in 0.31s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2028 filtered out; finished in 0.35s
 
 
 [exited with code 0]
