@@ -1222,18 +1222,39 @@ impl JobRegistry {
     }
 
     /// [`Self::record_start`] for a Postgres-backed job, additionally
-    /// forgetting `id`'s `pg_marks_by_job_id` entry: the mark it pointed at
-    /// was just popped from the waiting queue above, so keeping the entry
-    /// around would only let it go stale (a later cancel-during-retry racing
-    /// a fresh, different waiting mark) rather than bounding
-    /// [`PG_MARKS_BY_JOB_ID_CAP`] by actual queue residency. A non-terminal
-    /// retry re-adds the entry with the retry's own mark via
-    /// [`Self::record_pg_enqueue`]; a job that succeeds or terminally fails
-    /// never needs it again.
+    /// removing `id`'s own `pg_marks_by_job_id` entry — precisely, not via
+    /// the generic [`Self::pop_waiting`] plain `record_start` delegates to.
+    ///
+    /// `pop_waiting` does not know about job identity: it removes whichever
+    /// ready mark comes first in this queue's internal order, which is not
+    /// necessarily `id`'s own mark — Postgres can start a later-enqueued job
+    /// ahead of an older one this process still has concurrency-blocked.
+    /// Popping generically and then unconditionally forgetting `id`'s entry
+    /// would tear down `id`'s mapping even when its actual mark never left
+    /// the queue, while some other still-waiting job's mark vanished in its
+    /// place. Look up and remove `id`'s own mark first instead, falling back
+    /// to the generic pop (matching plain `record_start`) only when no exact
+    /// entry exists or it is already stale — the same stale-degrades-to-
+    /// fallback pattern [`Self::record_cancel_at_backend_offset`] uses — so a
+    /// cancel racing this start never finds a torn-down mapping for a mark
+    /// that in fact never left the queue. A non-terminal retry re-adds the
+    /// entry with the retry's own mark via [`Self::record_pg_enqueue`]; a
+    /// job that succeeds or terminally fails never needs it again.
     pub(crate) fn record_pg_start(&self, name: &str, id: &str) {
-        self.record_start(name);
-        if let Ok(mut guard) = self.queues.write() {
-            guard.pg_marks_by_job_id.shift_remove(id);
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
+        }
+        let exact_ms = self
+            .queues
+            .write()
+            .ok()
+            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id));
+        let removed_exact = exact_ms.is_some_and(|exact_ms| self.pop_waiting_exact(name, exact_ms));
+        if !removed_exact {
+            self.pop_waiting(name, true);
         }
     }
 
@@ -5021,15 +5042,54 @@ mod tests {
         );
     }
 
+    /// Regression for the Codex P2 raised on commit 034e47a:
+    /// `record_start`'s generic `pop_waiting` removes whichever ready mark
+    /// comes first in the queue's internal order, not necessarily the mark
+    /// belonging to the job actually starting — Postgres can start a
+    /// later-enqueued job ahead of an older one this process still has
+    /// concurrency-blocked. The first cut of `record_pg_start` popped
+    /// generically and then unconditionally forgot the starting job's exact
+    /// entry regardless, which could tear down its mapping while its real
+    /// mark stayed in the queue and a different, still-waiting job's mark
+    /// vanished in its place.
+    #[test]
+    fn record_pg_start_removes_its_own_mark_even_when_an_older_job_is_still_first_in_queue() {
+        const OLDER_MARK: u64 = 1_000;
+        const NEWER_MARK: u64 = 2_000;
+
+        let registry = JobRegistry::new();
+        registry.register_on_queue("mixed", "work");
+
+        // job-a enqueued first (older, still queued/concurrency-blocked);
+        // job-b enqueued second but starts first.
+        registry.record_pg_enqueue("mixed", "job-a", Some(OLDER_MARK));
+        registry.record_pg_enqueue("mixed", "job-b", Some(NEWER_MARK));
+
+        registry.record_pg_start("mixed", "job-b");
+
+        assert_eq!(
+            registry.waiting_marks_for_test("mixed"),
+            vec![OLDER_MARK],
+            "starting job-b must remove its own mark, leaving job-a's still-queued \
+             mark untouched even though job-a's mark sits first in the queue"
+        );
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            1,
+            "job-a's exact entry must survive; only job-b's own entry is removed"
+        );
+    }
+
     /// A stale `pg_marks_by_job_id` entry must not swallow the cancel: if the
     /// exact-looked-up value is no longer in the queue, the cancel has to
     /// fall back to the candidate heuristic, not silently remove nothing.
     ///
-    /// `record_start` pops a job's original mark without clearing its exact
-    /// entry, and a non-terminal retry then pushes a *new* mark under the
-    /// same job name without updating that entry either — so a cancel
-    /// racing a retry finds a value (`pop_waiting_exact`) that is no longer
-    /// in the queue at all.
+    /// Simulates staleness via the plain `record_start` (which knows nothing
+    /// about `pg_marks_by_job_id`) rather than `record_pg_start` (which keeps
+    /// the entry in sync): a non-terminal retry then pushes a *new* mark
+    /// under the same job name without updating that entry either — so a
+    /// cancel racing a retry finds a value (`pop_waiting_exact`) that is no
+    /// longer in the queue at all.
     #[test]
     fn cancel_at_backend_offset_falls_back_when_the_exact_mark_is_stale() {
         const MARK_A: u64 = 1_000;
