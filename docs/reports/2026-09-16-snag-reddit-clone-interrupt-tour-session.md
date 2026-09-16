@@ -395,9 +395,10 @@ database): a **clean 10/10 on both races** — `[303]*10` /
 `[200]*10`, confirmed with the `SELECT count(*)` queries the script prints
 (`10` and `10`). One earlier re-run against an app instance that had been
 running for a while and had accumulated other concurrent load from this same
-session's testing produced `[303, 303, 303, 303, 303, 303, 303, 303, 303,
-303]` → `[303]*5 + [503]*5`: five requests lost the race for this app's own
-documented 10-connection pool ceiling
+session's testing produced `[303, 503, 503, 503, 503, 503, 303, 303, 303,
+303]` — five `303`s and five `503`s, interleaved in arrival order, not two
+separate runs: five requests lost the race for this app's own documented
+10-connection pool ceiling
 (`examples/reddit-clone/src/routes/posts.rs`'s own comment: *"this app runs
 the default pool (10 connections, no read replica)"*) and got a `503` after
 a ~13s checkout timeout instead of a row — a capacity artifact of this
