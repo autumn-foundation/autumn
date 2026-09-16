@@ -156,16 +156,23 @@ async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsH
     let note_id = *id;
     let store = state.extension::<Notes>();
     // `open_with` seeds from the record only the first time; a second editor
-    // joins the live document rather than a stale copy of the row.
+    // joins the live document rather than a stale copy of the row. It refuses
+    // when the registry is full, which closes the socket: an app under that
+    // load asks the editor to come back rather than serving a second, private
+    // copy of the note.
     let doc = store
         .as_ref()
         .and_then(|store| store.get(note_id))
-        .map(|note| hub.open_with(&doc_key("notes", note_id, "body"), || note.body.clone()));
+        .and_then(|note| {
+            // The hub logs the refusal itself, so `ok()` loses nothing.
+            hub.open_with(&doc_key("notes", note_id, "body"), || note.body.clone())
+                .ok()
+        });
     let actor = state.entropy().uuid_v4().to_string();
     let label = format!("Guest {}", &actor[..4]);
 
     move |socket: WebSocket| async move {
-        // An unknown note closes the socket: there is nothing to edit.
+        // An unknown note, or a full registry, closes the socket.
         let (Some(doc), Some(store)) = (doc, store) else {
             return;
         };

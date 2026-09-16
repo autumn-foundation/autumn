@@ -350,13 +350,20 @@ impl CollabText {
     /// already has would refuse an idempotent replay that adds nothing.
     ///
     /// The batch is weighed as a whole, in two passes, because an operation's
-    /// cost depends on what the rest of the batch brings. An insert costs one
-    /// element, once, however many times it is repeated. A delete costs
+    /// cost depends on what the rest of the batch brings. A delete costs
     /// nothing when its target is already here **or arrives in the same
     /// batch** — only a delete left with nothing to tombstone occupies the
     /// buffer. Judging each operation against the pre-batch state alone would
     /// charge an insert and its own delete twice over and refuse a history
     /// that fits.
+    ///
+    /// Cost is per distinct **operation**, not per distinct id, because that
+    /// is what the buffer holds. `buffered` keys on the whole operation, so
+    /// one id paired with a thousand different unknown `after` values is a
+    /// thousand buffer entries. Counting ids there would charge one and let
+    /// the rest past [`CollabLimits::max_document_chars`].
+    ///
+    /// [`CollabLimits::max_document_chars`]: crate::collab::CollabLimits::max_document_chars
     #[must_use]
     pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
         let ops: Vec<&CollabOp> = ops.into_iter().collect();
@@ -370,31 +377,32 @@ impl CollabText {
             })
             .collect();
 
-        // Pass two: deletes that will find no target, even after pass one.
-        let stranded: HashSet<&OpId> = ops
+        // Pass two: the distinct operations that will occupy a slot.
+        let charged: HashSet<&&CollabOp> = ops
             .iter()
-            .filter_map(|op| match op {
-                CollabOp::Delete { target }
-                    if !self.index.contains(target) && !introduced.contains(target) =>
-                {
-                    Some(target)
+            .filter(|op| match op {
+                // An id already here integrates as a no-op and stores nothing.
+                CollabOp::Insert { id, .. } => !self.index.contains(id),
+                // A target the batch satisfies is tombstoned, not buffered.
+                CollabOp::Delete { target } => {
+                    !self.index.contains(target) && !introduced.contains(target)
                 }
-                _ => None,
             })
+            // Anything already buffered is paid for.
+            .filter(|op| !self.buffered.contains(**op))
             .collect();
 
-        // Anything already buffered is paid for.
-        introduced
-            .iter()
-            .chain(stranded.iter())
-            .filter(|id| {
-                !self.pending.iter().any(|op| match op {
-                    CollabOp::Insert { id: pending, .. } | CollabOp::Delete { target: pending } => {
-                        pending == **id
-                    }
-                })
-            })
-            .count()
+        charged.len()
+    }
+
+    /// The operations still waiting for the character they name.
+    ///
+    /// A snapshot must carry these: an editor who joins while one waits would
+    /// otherwise never see it. The hub broadcasts an operation when it
+    /// arrives, not when it later integrates, so there is no second chance.
+    #[must_use]
+    pub fn pending_ops(&self) -> &[CollabOp] {
+        &self.pending
     }
 
     /// Whether `op` is waiting in the causal buffer.
@@ -1024,6 +1032,32 @@ mod tests {
             target: OpId::new(9, "bob"),
         }];
         assert_eq!(doc.novel_count(orphan.iter()), 1);
+    }
+
+    /// One id with many unknown anchors costs what it really occupies.
+    ///
+    /// `buffered` keys on the whole operation, so each variant is its own
+    /// buffer entry. Counting distinct ids charged one and let the rest past
+    /// the document limit — an unbounded buffer from a single batch.
+    #[test]
+    fn a_batch_pays_for_every_buffered_variant_of_one_id() {
+        let doc = CollabText::new();
+        let id = OpId::new(1, "ada");
+        let batch: Vec<CollabOp> = (0..5)
+            .map(|n| CollabOp::Insert {
+                id: id.clone(),
+                after: Some(OpId::new(100 + n, "ghost")),
+                ch: 'x',
+            })
+            .collect();
+
+        assert_eq!(doc.novel_count(batch.iter()), 5);
+
+        // The count is what the batch really costs: every anchor is unknown,
+        // so every variant lands in the buffer.
+        let mut doc = doc;
+        doc.apply_all(batch);
+        assert_eq!(doc.pending_len(), 5);
     }
 
     /// A delete on one replica and an insert on another both survive.

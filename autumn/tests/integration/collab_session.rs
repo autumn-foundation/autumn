@@ -43,10 +43,14 @@ fn hub() -> CollabHub {
 #[test]
 fn a_document_is_seeded_once_and_shared() {
     let hub = hub();
-    let first = hub.open_with("notes:1:body", || CollabText::from_text("seed", "hello"));
-    let second = hub.open_with("notes:1:body", || {
-        panic!("the seed must not run for an already-live document")
-    });
+    let first = hub
+        .open_with("notes:1:body", || CollabText::from_text("seed", "hello"))
+        .expect("open the document");
+    let second = hub
+        .open_with("notes:1:body", || {
+            panic!("the seed must not run for an already-live document")
+        })
+        .expect("open the document");
     first
         .handle(
             "ada",
@@ -65,9 +69,11 @@ fn a_document_is_seeded_once_and_shared() {
 #[test]
 fn two_sessions_converge_over_the_channel() {
     let hub = hub();
-    let doc = hub.open_with(&doc_key("notes", 1, "body"), || {
-        CollabText::from_text("seed", "hello world")
-    });
+    let doc = hub
+        .open_with(&doc_key("notes", 1, "body"), || {
+            CollabText::from_text("seed", "hello world")
+        })
+        .expect("open the document");
     let mut watcher = doc.subscribe();
 
     let ada = doc.join("ada", "Ada");
@@ -105,7 +111,7 @@ fn two_sessions_converge_over_the_channel() {
 #[test]
 fn presence_reports_participants_and_cursors() {
     let hub = hub();
-    let doc = hub.document("notes:2:body");
+    let doc = hub.document("notes:2:body").expect("open the document");
 
     let ada = doc.join("ada", "Ada");
     {
@@ -138,7 +144,7 @@ fn presence_reports_participants_and_cursors() {
 #[test]
 fn a_cursor_move_is_broadcast() {
     let hub = hub();
-    let doc = hub.document("notes:3:body");
+    let doc = hub.document("notes:3:body").expect("open the document");
     let ada = doc.join("ada", "Ada");
     let mut watcher = doc.subscribe();
 
@@ -162,17 +168,24 @@ fn a_cursor_move_is_broadcast() {
 #[test]
 fn the_snapshot_carries_the_document_and_the_participants() {
     let hub = hub();
-    let doc = hub.open_with("notes:4:body", || CollabText::from_text("seed", "hi"));
+    let doc = hub
+        .open_with("notes:4:body", || CollabText::from_text("seed", "hi"))
+        .expect("open the document");
     let _ada = doc.join("ada", "Ada");
 
     match doc.snapshot() {
         CollabServerMessage::Snapshot {
             elems,
+            pending,
             participants,
             actor,
         } => {
             assert_eq!(elems.len(), 2);
             assert_eq!(elems.iter().map(|e| e.ch).collect::<String>(), "hi");
+            assert!(
+                pending.is_empty(),
+                "nothing is buffered, so the snapshot carries no operations"
+            );
             assert_eq!(participants.len(), 1);
             assert!(
                 actor.is_none(),
@@ -193,7 +206,7 @@ fn oversized_messages_are_refused() {
         max_delete_ids: 2,
         ..CollabLimits::default()
     });
-    let doc = hub.document("notes:5:body");
+    let doc = hub.document("notes:5:body").expect("open the document");
 
     let too_long = doc.handle(
         "ada",
@@ -230,7 +243,9 @@ fn oversized_messages_are_refused() {
 #[test]
 fn remote_operations_merge_and_broadcast() {
     let hub = hub();
-    let doc = hub.open_with("notes:6:body", || CollabText::from_text("seed", "ab"));
+    let doc = hub
+        .open_with("notes:6:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
     let mut watcher = doc.subscribe();
 
     // An offline replica branched from the same base and edited.
@@ -250,7 +265,9 @@ fn remote_operations_merge_and_broadcast() {
 #[test]
 fn closing_a_document_returns_its_final_state() {
     let hub = hub();
-    let doc = hub.open_with("notes:7:body", || CollabText::from_text("seed", "draft"));
+    let doc = hub
+        .open_with("notes:7:body", || CollabText::from_text("seed", "draft"))
+        .expect("open the document");
     doc.handle(
         "ada",
         CollabClientMessage::Insert {
@@ -275,7 +292,9 @@ fn closing_a_document_returns_its_final_state() {
 #[public]
 async fn collaborate(hub: CollabHub, path: Path<(String, String)>) -> impl WsHandler {
     let (key, actor) = &path.0;
-    let doc = hub.open_with(key, || CollabText::from_text("seed", "hello world"));
+    let doc = hub
+        .open_with(key, || CollabText::from_text("seed", "hello world"))
+        .expect("open the document");
     let actor = actor.clone();
     move |socket: WebSocket| async move {
         serve_socket(&doc, actor.clone(), actor, socket).await;
@@ -458,7 +477,9 @@ async fn a_malformed_message_is_answered_with_an_error() {
 #[test]
 fn an_anchor_the_hub_never_minted_is_refused() {
     let hub = hub();
-    let doc = hub.open_with("notes:11:body", || CollabText::from_text("seed", "hi"));
+    let doc = hub
+        .open_with("notes:11:body", || CollabText::from_text("seed", "hi"))
+        .expect("open the document");
 
     let refused = doc.handle(
         "ada",
@@ -487,7 +508,9 @@ fn an_anchor_the_hub_never_minted_is_refused() {
 #[test]
 fn a_delete_cannot_pre_empt_a_character_that_does_not_exist() {
     let hub = hub();
-    let doc = hub.open_with("notes:12:body", || CollabText::from_text("seed", "ab"));
+    let doc = hub
+        .open_with("notes:12:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
     let victim = doc.join("victim", "Victim");
 
     // An attacker names the victim's next thousand character ids.
@@ -515,7 +538,7 @@ fn a_delete_cannot_pre_empt_a_character_that_does_not_exist() {
 #[test]
 fn two_connections_sharing_a_name_stay_distinct() {
     let hub = hub();
-    let doc = hub.document("notes:13:body");
+    let doc = hub.document("notes:13:body").expect("open the document");
     let one = doc.join("ada", "Ada");
     let two = doc.join("ada", "Ada");
 
@@ -537,7 +560,9 @@ fn two_connections_sharing_a_name_stay_distinct() {
 fn a_document_lives_as_long_as_its_handles() {
     let hub = hub();
     {
-        let doc = hub.open_with("notes:14:body", || CollabText::from_text("seed", "x"));
+        let doc = hub
+            .open_with("notes:14:body", || CollabText::from_text("seed", "x"))
+            .expect("open the document");
         {
             let _first = doc.join("ada", "Ada");
             let second = doc.join("linus", "Linus");
@@ -568,7 +593,9 @@ fn a_document_lives_as_long_as_its_handles() {
 fn a_reconnect_before_persistence_finds_the_same_document() {
     let hub = hub();
     // The handler's handle, held across the whole save window.
-    let doc = hub.open_with("notes:17:body", || CollabText::from_text("seed", "base"));
+    let doc = hub
+        .open_with("notes:17:body", || CollabText::from_text("seed", "base"))
+        .expect("open the document");
     {
         let editor = doc.join("ada", "Ada");
         editor
@@ -581,9 +608,11 @@ fn a_reconnect_before_persistence_finds_the_same_document() {
     // Editor gone; the handler has not written the row back yet. A reconnect
     // arrives and would re-seed from the stale "base" if the document had
     // been evicted.
-    let reconnected = hub.open_with("notes:17:body", || {
-        panic!("a reconnect must not re-seed a document the handler still holds")
-    });
+    let reconnected = hub
+        .open_with("notes:17:body", || {
+            panic!("a reconnect must not re-seed a document the handler still holds")
+        })
+        .expect("open the document");
     assert_eq!(reconnected.text(), "base!", "the edit is still there");
 
     // Only once every handle is gone does the key free up.
@@ -598,7 +627,9 @@ fn a_reconnect_before_persistence_finds_the_same_document() {
 #[test]
 fn a_refused_remote_operation_is_not_broadcast() {
     let hub = hub();
-    let doc = hub.open_with("notes:18:body", || CollabText::from_text("seed", "ab"));
+    let doc = hub
+        .open_with("notes:18:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
     let mut watcher = doc.subscribe();
 
     let refused = autumn_web::collab::CollabOp::Insert {
@@ -617,17 +648,37 @@ fn a_refused_remote_operation_is_not_broadcast() {
 
 /// The registry is bounded: a route that opens documents from a
 /// client-supplied key cannot grow it without limit.
+///
+/// At capacity the hub **refuses**. Serving an untracked document instead
+/// bounded nothing — each open still allocated one, and the caller kept it —
+/// and it split the record: two editors of one key would each get their own
+/// authority and each persist over the other.
 #[test]
-fn the_document_registry_is_bounded() {
+fn the_document_registry_refuses_at_its_limit() {
     let hub = hub().with_limits(CollabLimits {
         max_documents: 2,
         ..CollabLimits::default()
     });
-    let _a = hub.document("a");
-    let _b = hub.document("b");
-    let c = hub.document("c");
+    let _a = hub.document("a").expect("open the document");
+    let b = hub.document("b").expect("open the document");
+
+    let refused = hub.document("c").expect_err("the registry is full");
+    assert!(
+        matches!(
+            refused,
+            autumn_web::collab::CollabError::RegistryFull { open: 2, limit: 2 }
+        ),
+        "the refusal names the limit: {refused:?}"
+    );
     assert_eq!(hub.open_keys(), vec!["a".to_owned(), "b".to_owned()]);
-    // The overflow document still works; it is simply not shared.
+
+    // An editor already on a live key is never refused: turning them away
+    // would split a document that is open.
+    assert!(hub.document("a").is_ok(), "a live key still opens");
+
+    // A freed slot admits the next key.
+    drop(b);
+    let c = hub.document("c").expect("the slot freed by `b`");
     c.handle(
         "ada",
         CollabClientMessage::Insert {
@@ -636,8 +687,44 @@ fn the_document_registry_is_bounded() {
         },
     )
     .expect("insert");
-    assert_eq!(c.text(), "hi");
-    assert_eq!(hub.document("c").text(), "", "and it was not registered");
+    assert_eq!(
+        hub.document("c").expect("still live").text(),
+        "hi",
+        "and this one is registered, so the next editor finds it"
+    );
+}
+
+/// A snapshot carries the operations the document cannot place yet.
+///
+/// The hub broadcasts an operation when it arrives, not when it later
+/// integrates. An editor who joined after one was buffered would never hear
+/// of it, and would diverge the moment its cause landed.
+#[test]
+fn a_snapshot_carries_the_buffered_operations() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:19:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
+
+    // A peer's operation arrives before the character it is anchored to.
+    let orphan = autumn_web::collab::CollabOp::Insert {
+        id: OpId::new(500, "peer"),
+        after: Some(OpId::new(900, "ghost")),
+        ch: 'Z',
+    };
+    doc.apply_remote(std::slice::from_ref(&orphan))
+        .expect("within the budget");
+    assert_eq!(doc.document().pending_len(), 1, "it is buffered, not lost");
+
+    let CollabServerMessage::Snapshot { elems, pending, .. } = doc.snapshot() else {
+        panic!("a document snapshot is a snapshot");
+    };
+    assert_eq!(
+        elems.iter().map(|e| e.ch).collect::<String>(),
+        "ab",
+        "the integrated characters"
+    );
+    assert_eq!(pending, vec![orphan], "and the one still waiting");
 }
 
 /// The buffer counts toward the document budget, so unintegrable operations
@@ -648,7 +735,9 @@ fn buffered_operations_count_toward_the_document_limit() {
         max_document_chars: 4,
         ..CollabLimits::default()
     });
-    let doc = hub.open_with("notes:15:body", CollabText::new);
+    let doc = hub
+        .open_with("notes:15:body", CollabText::new)
+        .expect("open the document");
 
     // Fill the budget with operations from a peer that will never integrate.
     let orphans: Vec<autumn_web::collab::CollabOp> = (1..=4)
@@ -733,7 +822,9 @@ fn replaying_a_history_is_not_charged_against_the_limit() {
         max_document_chars: 4,
         ..CollabLimits::default()
     });
-    let doc = hub.open_with("notes:19:body", || CollabText::from_text("seed", "abcd"));
+    let doc = hub
+        .open_with("notes:19:body", || CollabText::from_text("seed", "abcd"))
+        .expect("open the document");
     assert_eq!(doc.document().element_count(), 4, "the document is full");
 
     // The peer resends everything it has. None of it is new.
@@ -760,7 +851,9 @@ fn replaying_a_history_is_not_charged_against_the_limit() {
 #[test]
 fn a_peer_id_at_the_ceiling_cannot_exhaust_local_minting() {
     let hub = hub();
-    let doc = hub.open_with("notes:20:body", || CollabText::from_text("seed", "a"));
+    let doc = hub
+        .open_with("notes:20:body", || CollabText::from_text("seed", "a"))
+        .expect("open the document");
 
     doc.apply_remote(&[autumn_web::collab::CollabOp::Insert {
         id: OpId::new(autumn_web::collab::MAX_COUNTER, "peer"),
@@ -791,7 +884,9 @@ fn a_peer_id_at_the_ceiling_cannot_exhaust_local_minting() {
 #[test]
 fn operations_delivered_on_the_channel_reach_the_local_authority() {
     let hub = hub();
-    let doc = hub.open_with("notes:21:body", || CollabText::from_text("seed", "ab"));
+    let doc = hub
+        .open_with("notes:21:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
 
     // Another replica's edit, as it would arrive off the channel.
     let mut elsewhere = doc.document();

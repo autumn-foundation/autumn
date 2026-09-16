@@ -99,13 +99,14 @@ async fn collaborate(
     // from a client-supplied key before that: the hub would allocate a live
     // document for every id a caller can type.
     let note = load_note_for(&session, note_id).await;
-    let doc = note.map(|note| {
-        hub.open_with(&doc_key("notes", note_id, "body"), || note.body.clone())
+    let doc = note.and_then(|note| {
+        hub.open_with(&doc_key("notes", note_id, "body"), || note.body.clone()).ok()
     });
     let actor = state.entropy().uuid_v4().to_string();
 
     move |socket: WebSocket| async move {
-        let Some(doc) = doc else { return }; // not allowed, or no such note
+        // Not allowed, no such note, or the registry is full.
+        let Some(doc) = doc else { return };
         serve_socket(&doc, actor, "Guest", socket).await;
     }
 }
@@ -131,13 +132,19 @@ compares those as UTF-16 while the server compares UTF-8 bytes.
 
 ```rust
 let note = repo.find_by_id(id).await?.expect("note");
-let doc = hub.open_with(&doc_key("notes", id, "body"), || note.body.clone());
+let doc = hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?;
 ```
 
 `open_with` runs the seed only when the document is not already live, so the
 second editor joins the document the first is editing rather than a stale
 copy of the row. Write it back with `doc.document()`, and evict it with
 `hub.close(key)`, which hands you the final state.
+
+It returns `CollabError::RegistryFull` when the registry is at
+`CollabLimits::max_documents` and the key is not already live. The hub
+refuses rather than serving an untracked document: a document outside the
+registry is a second authority for the same record, so the next editor
+would silently edit a different copy.
 
 ## The wire protocol
 

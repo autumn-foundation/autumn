@@ -54,7 +54,10 @@
 //!
 //! # fn wire(state: AppState, stored: String) {
 //! let hub = state.collab().clone();
-//! let doc = hub.open_with("notes:42:body", || CollabText::decode_column(&stored));
+//! let Ok(doc) = hub.open_with("notes:42:body", || CollabText::decode_column(&stored))
+//! else {
+//!     return; // the registry is full; ask the caller to retry
+//! };
 //! let session = doc.join("session-1", "Ada");
 //!
 //! // ... apply client messages, broadcast operations ...
@@ -146,6 +149,20 @@ pub enum CollabError {
         /// Configured limit.
         limit: usize,
     },
+    /// The registry is at [`CollabLimits::max_documents`].
+    ///
+    /// The hub refuses rather than serving an untracked document: a document
+    /// outside the registry is a second authority for the same key, so the
+    /// next editor of that record would silently start editing a different
+    /// copy — the loss this feature exists to prevent — and it would count
+    /// against no limit.
+    #[error("the document registry holds {open} documents, at the limit of {limit}")]
+    RegistryFull {
+        /// Documents the registry holds.
+        open: usize,
+        /// Configured limit.
+        limit: usize,
+    },
     /// A message named a character the document has never seen.
     ///
     /// The hub is the authority, so a live editor can only anchor to an id the
@@ -191,6 +208,15 @@ pub enum CollabServerMessage {
     Snapshot {
         /// Every character, tombstones included, in document order.
         elems: Vec<CollabElement>,
+        /// Operations the document holds but cannot place yet, because the
+        /// character they name has not arrived.
+        ///
+        /// A joining editor needs them. The hub broadcasts an operation when
+        /// it arrives, not when it later integrates, so an editor who joined
+        /// after one was buffered would never hear of it and would diverge
+        /// the moment its cause landed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending: Vec<CollabOp>,
         /// Who else is editing.
         participants: Vec<CollabParticipant>,
         /// The receiving editor's own actor id, when the snapshot was built
@@ -340,11 +366,15 @@ impl CollabHub {
 
     /// Open `key`, starting from an empty document if it is not live yet.
     ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError::RegistryFull`] when the registry is at
+    /// [`CollabLimits::max_documents`] and `key` is not already live.
+    ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
-    #[must_use]
-    pub fn document(&self, key: &str) -> CollabDoc {
+    pub fn document(&self, key: &str) -> Result<CollabDoc, CollabError> {
         self.open_with(key, CollabText::new)
     }
 
@@ -354,18 +384,29 @@ impl CollabHub {
     /// most once per key, so a second editor joins the document the first one
     /// is already editing rather than a stale copy of the row.
     ///
-    /// `seed` runs while the registry is locked, so keep it cheap — load the
-    /// row first and hand the closure the value, as `examples/collab-notes`
-    /// does. It must not block on I/O.
+    /// `seed` runs with the registry **unlocked**, so a race may build the
+    /// value twice and discard the loser. Keep it cheap and free of side
+    /// effects — load the row first and hand the closure the value, as
+    /// `examples/collab-notes` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError::RegistryFull`] when the registry is at
+    /// [`CollabLimits::max_documents`] and `key` is not already live. An
+    /// editor already on `key` always gets the live document, whatever the
+    /// limit says: refusing them would split a document that is open.
     ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
-    #[must_use]
-    pub fn open_with(&self, key: &str, seed: impl FnOnce() -> CollabText) -> CollabDoc {
+    pub fn open_with(
+        &self,
+        key: &str,
+        seed: impl FnOnce() -> CollabText,
+    ) -> Result<CollabDoc, CollabError> {
         // Already live: hand back the shared document and never call the seed.
         if let Some(state) = self.live(key) {
-            return self.handle_for(key, state);
+            return Ok(self.handle_for(key, state));
         }
 
         // Not live: build the seed with the registry UNLOCKED. Under the lock
@@ -383,25 +424,30 @@ impl CollabHub {
         // Somebody may have won the race while the seed ran.
         if let Some(state) = docs.get(key).and_then(Weak::upgrade) {
             drop(docs);
-            return self.handle_for(key, state);
+            return Ok(self.handle_for(key, state));
         }
         // Drop entries whose document is gone before counting: a dead weak
         // reference costs a map slot, not a document.
         docs.retain(|_, weak| weak.strong_count() > 0);
         if docs.len() >= self.inner.limits.max_documents {
+            let open = docs.len();
+            drop(docs);
+            drop(seeded);
             tracing::warn!(
                 key,
-                open = docs.len(),
+                open,
                 limit = self.inner.limits.max_documents,
-                "collab: document registry is full; serving a detached document"
+                "collab: document registry is full; refusing to open"
             );
-            drop(docs);
-            return self.handle_for(key, Arc::new(Mutex::new(DocState::new(seeded))));
+            return Err(CollabError::RegistryFull {
+                open,
+                limit: self.inner.limits.max_documents,
+            });
         }
         let state = Arc::new(Mutex::new(DocState::new(seeded)));
         docs.insert(key.to_owned(), Arc::downgrade(&state));
         drop(docs);
-        self.handle_for(key, state)
+        Ok(self.handle_for(key, state))
     }
 
     /// The live document for `key`, if one is still held somewhere.
@@ -555,8 +601,10 @@ impl CollabDoc {
     /// Panics if the internal document mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> CollabServerMessage {
+        let (elems, pending) = self.with_doc(|doc| (doc.elements(), doc.pending_ops().to_vec()));
         CollabServerMessage::Snapshot {
-            elems: self.with_doc(CollabText::elements),
+            elems,
+            pending,
             participants: self.participants(),
             actor: None,
         }
@@ -899,10 +947,12 @@ impl CollabSession {
         match self.doc.snapshot() {
             CollabServerMessage::Snapshot {
                 elems,
+                pending,
                 participants,
                 ..
             } => CollabServerMessage::Snapshot {
                 elems,
+                pending,
                 participants,
                 actor: Some(self.actor.clone()),
             },

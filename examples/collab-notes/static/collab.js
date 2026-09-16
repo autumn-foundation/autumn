@@ -262,6 +262,13 @@
         elems.push({ id: element.id, ch: element.ch, deleted: !!element.deleted });
         known.add(element.id);
       }
+      // Operations the server holds but cannot place yet. They are broadcast
+      // when they arrive, not when they integrate, so an editor who joins
+      // after one was buffered hears of it here or never. `integrate` puts
+      // each in the same waiting list the server keeps it in.
+      for (const op of message.pending ?? []) {
+        integrate(op);
+      }
       editor.disabled = false;
       render();
       updateWritability();

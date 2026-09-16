@@ -291,7 +291,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   migration** (it must be `NOT NULL`; back-fill `''` first).
   **Live sessions** (needs `presence` too): `state.collab()` is a
   `collab::CollabHub` holding one live document per field instance.
-  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())` seeds it
+  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?` seeds it
   from the row once, and `collab::hub::serve_socket(&doc, actor, label, socket)`
   is the whole client protocol from a `#[ws]` handler — operations fan out over
   a `Channels` topic, membership comes from `Presence`, cursors ride a message

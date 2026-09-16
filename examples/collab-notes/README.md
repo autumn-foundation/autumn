@@ -58,7 +58,7 @@ row:
 
 ```rust
 let note = repo.find_by_id(id).await?.expect("note");
-let doc = hub.open_with(&doc_key("notes", id, "body"), || note.body.clone());
+let doc = hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?;
 // ... later, write it back:
 repo.update(id, UpdateNote { body: Some(doc.document()), ..Default::default() }).await?;
 ```
