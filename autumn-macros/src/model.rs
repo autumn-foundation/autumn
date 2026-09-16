@@ -4804,13 +4804,31 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
     }
 
     // The column is registered under its Rust name, which every sink-side
-    // lookup keys off. A serde rename would desync the two.
-    if field_has_serde_rename(field) {
+    // lookup keys off. A serde rename or alias would desync the two.
+    if let Some(key) = field_serde_wire_name_override(field) {
         return Err(syn::Error::new_spanned(
             field,
-            "`#[confidential]` fields cannot use `#[serde(rename = ...)]`: the column \
-             is registered under its Rust name, which the log filter, version \
-             history and admin redaction all key off.",
+            format!(
+                "`#[confidential]` fields cannot use `#[serde({key} = ...)]`: the column \
+                 is registered under its Rust name, which the log filter, version \
+                 history and admin redaction all key off. An alias is accepted on the \
+                 way in, so a request could deliver the envelope under a name no filter \
+                 knows."
+            ),
+        ));
+    }
+
+    // The envelope is what the owning client needs back, so a confidential
+    // column is always serialized. Skipping it would also drop it out of the
+    // version-history snapshot, which is built from the `Serialize` view: the
+    // column would then produce no "changed" marker at all rather than the
+    // redacted one the registry promises.
+    if has_attr(field, "private") || field_already_skips_serialization(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` fields cannot be `#[private]` or `#[serde(skip_serializing)]`: \
+             the envelope is ciphertext the owning client needs back, and a skipped column \
+             leaves version history with no record that it changed.",
         ));
     }
 
@@ -4828,14 +4846,19 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
                 // under a name none of them look for, which is worse than a
                 // rename on the sealed column: the token is what tells an
                 // operator which of an owner's rows hold the same value.
-                if field_has_serde_rename(f) || diesel_column_name(f).is_some() {
+                if field_serde_wire_name_override(f).is_some()
+                    || diesel_column_name(f).is_some()
+                    || has_attr(f, "private")
+                    || field_already_skips_serialization(f)
+                {
                     return Err(syn::Error::new_spanned(
                         f,
                         format!(
                             "`{expected}` is a blind-index companion, so it cannot use \
-                             `#[serde(rename = ...)]` or `#[diesel(column_name = ...)]`: \
-                             the token is registered under its Rust name, which version \
-                             history, the log filter and the CSV export all key off."
+                             `#[serde(rename/alias = ...)]`, `#[diesel(column_name = ...)]`, \
+                             `#[private]` or `#[serde(skip_serializing)]`: the token is \
+                             registered under its Rust name, which version history, the log \
+                             filter and the CSV export all key off."
                         ),
                     ));
                 }
@@ -5629,6 +5652,36 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
         });
     }
     renamed
+}
+
+/// The `#[serde(...)]` key that gives a field a wire name other than its Rust
+/// name: `rename` (what it serializes as) or `alias` (what it also accepts on
+/// the way in).
+///
+/// `#[confidential]` keys every protection off the Rust name, so both matter.
+/// An `alias` is the subtler of the two: the field still serializes under its
+/// Rust name, but a request may deliver it under the alias, and a raw-JSON
+/// capture path (a failure capsule, an error-page body preview) filters on
+/// names the registry knows.
+fn field_serde_wire_name_override(field: &syn::Field) -> Option<&'static str> {
+    let mut found = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                found = Some("rename");
+            } else if meta.path.is_ident("alias") {
+                found = found.or(Some("alias"));
+            }
+            // Consume any `= value` so sibling metas keep parsing.
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -14647,6 +14700,53 @@ mod tests {
             assert!(
                 expanded.contains("is a blind-index companion"),
                 "a renamed companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: an alias is accepted on the way in, so a request could deliver the
+    /// envelope or the token under a name no filter knows.
+    #[test]
+    fn a_serde_alias_on_a_confidential_field_or_its_companion_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(alias = "lookup")] }, quote! {}),
+            (quote! {}, quote! { #[serde(alias = "lookup")] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "an aliased confidential column must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a skipped column never reaches the version-history snapshot, which
+    /// is built from the `Serialize` view, so it would leave no "changed" marker.
+    #[test]
+    fn a_confidential_field_that_skips_serialization_is_refused() {
+        for skip in [quote! { #[private] }, quote! { #[serde(skip_serializing)] }] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #skip
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be `#[private]`"),
+                "a skipped confidential column must be refused: {expanded}"
             );
         }
     }
