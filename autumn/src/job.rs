@@ -9823,24 +9823,31 @@ struct PgJobAdminBackend {
     /// Job registry whose per-queue waiting gauges the admin-cancel path must
     /// decrement, mirroring the redis backend.
     registry: crate::actuator::JobRegistry,
-    /// Injected clock source for the snapshot window boundaries and the
-    /// admin-cancel scheduled/ready classification. Defaults to
+    /// Injected clock source for the snapshot window boundaries. Defaults to
     /// [`crate::time::SystemClock`]; a simulation pins it for determinism.
+    /// The admin-cancel scheduled/ready classification does not use this —
+    /// see [`PgCancelRow`].
     clock: Arc<dyn crate::time::ClockSource>,
 }
 
 /// Row returned when an admin-cancel transitions a still-enqueued Postgres job
 /// to `discarded`. Carries the fields needed to settle the tracked record
 /// (`payload`) and to decrement the correct per-queue waiting gauge (`name`
-/// resolves the queue, `was_scheduled` selects the ready/scheduled category).
+/// resolves the queue, `offset_ms` locates the mark).
 ///
-/// `was_scheduled` is computed in SQL as `run_at > clock_timestamp()`, not in
-/// Rust against `self.clock.now()`: `run_at` can now be stamped by
-/// Postgres's own clock (a relative-delay enqueue, issue #2111 follow-up), so
-/// comparing it to the app's clock reintroduces the same app-vs-database skew
-/// this whole change exists to remove. A NULL `run_at` (never happens in
-/// practice — it is stored as `COALESCE($run_at, NOW())`) is treated as ready
-/// for safety, mirroring the redis admin-cancel path's ready/scheduled split.
+/// `offset_ms` is `run_at - clock_timestamp()` in milliseconds, computed
+/// entirely in SQL, never against `self.clock.now()`: `run_at` can now be
+/// stamped by Postgres's own clock (a relative-delay enqueue, issue #2111
+/// follow-up), so comparing it to the app's clock reintroduces the same
+/// app-vs-database skew this whole change exists to remove. It is passed to
+/// [`crate::actuator::JobRegistry::record_cancel_at_backend_offset`], which
+/// translates it onto the registry's own clock before picking a mark —
+/// deciding a ready/scheduled category on Postgres's clock and asking the
+/// registry for *any* mark in that category (its own `self.clock.now()`)
+/// would still be right only when the two clocks happen to agree on the
+/// boundary. A NULL `run_at` (never happens in practice — it is stored as
+/// `COALESCE($run_at, NOW())`) coalesces to a very negative offset, treating
+/// it as ready for safety.
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct PgCancelRow {
@@ -9848,8 +9855,8 @@ struct PgCancelRow {
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    was_scheduled: bool,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    offset_ms: i64,
 }
 
 #[cfg(feature = "db")]
@@ -10029,7 +10036,8 @@ impl PgJobAdminBackend {
              SET status = 'discarded', finished_at = NOW() \
              WHERE id = $1 AND status = 'enqueued' \
              RETURNING payload::TEXT AS payload, name, \
-             COALESCE(run_at > clock_timestamp(), FALSE) AS was_scheduled",
+             COALESCE((EXTRACT(EPOCH FROM (run_at - clock_timestamp())) * 1000)::BIGINT, -1) \
+             AS offset_ms",
         )
         .bind::<diesel::sql_types::Text, _>(id)
         .get_result::<PgCancelRow>(&mut *conn)
@@ -10046,14 +10054,13 @@ impl PgJobAdminBackend {
         // A row was actually canceled (RETURNING yielded it), so remove the
         // per-queue waiting mark this job pushed at enqueue time — otherwise a
         // phantom `queues.<name>.depth`/`oldest_waiting_age_ms` lingers on this
-        // process. Category-aware, mirroring the redis admin-cancel path and the
-        // enqueue side: a still-future `run_at` was a scheduled mark, a
-        // ready/past one a ready mark.
-        if row.was_scheduled {
-            self.registry.record_cancel_scheduled(&row.name);
-        } else {
-            self.registry.record_cancel(&row.name);
-        }
+        // process. `record_cancel_at_backend_offset` translates Postgres's own
+        // measurement of how far run_at still is from clock_timestamp() onto
+        // the registry's timeline before picking a mark, mirroring the
+        // enqueue side's ready/scheduled split without needing the two
+        // clocks to agree on an absolute boundary.
+        self.registry
+            .record_cancel_at_backend_offset(&row.name, row.offset_ms);
         // An operator can cancel a job before any worker ever claims it,
         // which never reaches run_job_handler — settle the tracked record
         // here too, or it stays pending until TTL expiry even though the
@@ -10593,53 +10600,6 @@ mod tests {
                 assert!(delay <= base, "delay {delay} exceeded base {base}");
             }
         }
-    }
-
-    #[cfg(feature = "db")]
-    #[test]
-    fn pg_cancel_enqueued_gauge_accounting_is_category_aware() {
-        // The Postgres admin-cancel-of-enqueued path must decrement the same
-        // per-queue waiting mark the enqueue pushed, category-aware, mirroring
-        // the redis admin-cancel path (`record_cancel` vs
-        // `record_cancel_scheduled`). `PgCancelRow::was_scheduled` selects the
-        // category; it is computed in SQL against Postgres's own clock (see
-        // `pg_cancel_classification_uses_the_database_clock_not_the_app_clock`
-        // for that half), so this test only covers the registry routing given
-        // an already-decided `was_scheduled` value.
-        use crate::actuator::JobRegistry;
-
-        let now = chrono::Utc::now();
-        let registry = JobRegistry::new();
-        registry.register_on_queue("send_email", "mail");
-        registry.register_on_queue("nightly_report", "mail");
-
-        registry.record_enqueue("send_email");
-        let far_future = now + chrono::TimeDelta::seconds(60);
-        let far_future_ms = u64::try_from(far_future.timestamp_millis()).unwrap();
-        registry.record_enqueue_scheduled("nightly_report", far_future_ms);
-        assert_eq!(
-            registry.queue_snapshot().get("mail").unwrap().depth,
-            1,
-            "only the ready job counts toward ready depth"
-        );
-
-        // Admin-cancels the still-scheduled row: was_scheduled is true, so it
-        // routes to record_cancel_scheduled and must leave the ready mark intact.
-        registry.record_cancel_scheduled("nightly_report");
-        assert_eq!(
-            registry.queue_snapshot().get("mail").unwrap().depth,
-            1,
-            "canceling the scheduled enqueued job must not steal the co-queued ready mark"
-        );
-
-        // Admin-cancels the ready row: was_scheduled is false, so it routes to
-        // record_cancel and drains the queue to zero (no leaked mark).
-        registry.record_cancel("send_email");
-        assert_eq!(
-            registry.queue_snapshot().get("mail").unwrap().depth,
-            0,
-            "canceling the ready enqueued job drains the queue to zero"
-        );
     }
 
     #[test]
@@ -17341,13 +17301,16 @@ mod tests {
         async fn pg_cancel_classification_uses_the_database_clock_not_the_app_clock() {
             // `pg_cancel_enqueued`'s ready-vs-scheduled classification (which
             // per-queue waiting gauge an admin-cancel decrements) must come
-            // from Postgres's own clock (`run_at > clock_timestamp()`), not
-            // from `self.clock.now()`: `run_at` can be stamped by the database
-            // clock for a relative-delay enqueue (issue #2111 follow-up), so
-            // comparing it against the app's clock reintroduces exactly the
-            // app-vs-database skew the rest of this change removes. Pin
-            // `self.clock` to a wildly wrong instant on each side of "now" and
-            // confirm the classification still lands correctly.
+            // from Postgres's own clock (`run_at - clock_timestamp()`), and
+            // that offset must then be *translated onto the registry's own
+            // clock* rather than used to pick a ready/scheduled category the
+            // registry is asked to find any member of: the registry's marks
+            // are stamped and searched entirely on its own injected clock
+            // (`JobRegistry::pop_waiting`), so a bucket decided on Postgres's
+            // clock is only guaranteed correct if the two clocks agree on the
+            // boundary. Pin the *registry's* clock far from Postgres's real
+            // time (issue #2111 follow-up) and confirm cancellation still
+            // finds the right mark.
             use chrono::{TimeZone, Utc};
             use testcontainers::runners::AsyncRunner as _;
             use testcontainers_modules::postgres::Postgres;
@@ -17358,14 +17321,16 @@ mod tests {
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
-            let registry = crate::actuator::JobRegistry::new();
+            let registry_epoch = Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap();
+            let registry = crate::actuator::JobRegistry::new().with_clock(std::sync::Arc::new(
+                crate::time::FixedClock::at(registry_epoch),
+            ));
             registry.register_on_queue("send_email", "mail");
             registry.register_on_queue("nightly_report", "mail");
             registry.record_enqueue("send_email");
-            let far_future_ms =
-                u64::try_from((Utc::now() + chrono::TimeDelta::hours(1)).timestamp_millis())
-                    .unwrap();
-            registry.record_enqueue_scheduled("nightly_report", far_future_ms);
+            let registry_far_future_ms =
+                u64::try_from(registry_epoch.timestamp_millis()).unwrap() + 3_600_000;
+            registry.record_enqueue_scheduled("nightly_report", registry_far_future_ms);
 
             pg_enqueue_job(
                 &pool,
@@ -17398,17 +17363,18 @@ mod tests {
             )
             .await;
 
-            // App clock pinned far in the future: an app-clock comparison
-            // would see the scheduled job's real run_at (~1h from now) as
-            // already past, misclassifying it as ready.
-            let backend_future_skew = PgJobAdminBackend {
+            let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: registry.clone(),
-                clock: std::sync::Arc::new(crate::time::FixedClock::at(
-                    Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap(),
-                )),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
-            backend_future_skew
+
+            // Postgres reports "scheduled-job" as ~1h from clock_timestamp();
+            // the registry's clock, pinned to 2100, has no idea what year
+            // Postgres thinks it is. Translating the offset onto the
+            // registry's own timeline must still land on nightly_report's
+            // mark (registry_far_future_ms), not send_email's.
+            backend
                 .cancel("scheduled-job")
                 .await
                 .expect("cancel should succeed");
@@ -17416,21 +17382,13 @@ mod tests {
                 registry.queue_snapshot().get("mail").unwrap().depth,
                 1,
                 "canceling the scheduled job must decrement the scheduled mark and leave the \
-                 ready mark intact, even though a 2100-pinned app clock would see its real \
-                 run_at (~1h in Postgres's future) as already past"
+                 ready mark intact, even with the registry's clock pinned to 2100 while \
+                 Postgres runs on real time"
             );
 
-            // App clock pinned far in the past: an app-clock comparison would
-            // see the ready job's real run_at (~now) as still in the future,
-            // misclassifying it as scheduled.
-            let backend_past_skew = PgJobAdminBackend {
-                pool: pool.clone(),
-                registry: registry.clone(),
-                clock: std::sync::Arc::new(crate::time::FixedClock::at(
-                    Utc.with_ymd_and_hms(1990, 1, 1, 0, 0, 0).unwrap(),
-                )),
-            };
-            backend_past_skew
+            // Postgres reports "ready-job" as already due (offset <= 0); the
+            // translated target lands on send_email's mark, the only one left.
+            backend
                 .cancel("ready-job")
                 .await
                 .expect("cancel should succeed");
@@ -17438,8 +17396,8 @@ mod tests {
                 registry.queue_snapshot().get("mail").unwrap().depth,
                 0,
                 "canceling the ready job must decrement the ready mark and drain the queue to \
-                 zero, even though a 1990-pinned app clock would see its real run_at (~now) as \
-                 still in the future"
+                 zero, even with the registry's clock pinned to 2100 while Postgres runs on \
+                 real time"
             );
         }
 

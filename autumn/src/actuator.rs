@@ -1211,6 +1211,32 @@ impl JobRegistry {
         self.pop_waiting(name, false);
     }
 
+    /// Record that an enqueued job was canceled, given how far its own
+    /// due time still is from *now* on the durable backend's own clock
+    /// (`offset_ms`; zero or negative means already claimable).
+    ///
+    /// Mirrors [`ready_at_from_age`]: the offset is computed entirely on the
+    /// backend's clock (e.g. Postgres's `run_at - clock_timestamp()`) and
+    /// translated onto this registry's own timeline as
+    /// `now_ms() + offset_ms` before searching, rather than deciding a
+    /// ready/scheduled *category* on the backend's clock and asking
+    /// [`Self::pop_waiting`] to find *any* mark in that category on the
+    /// registry's clock. The two clocks agreeing on which category a mark
+    /// falls into is not guaranteed — an injected clock far from real time
+    /// (a virtual clock over a real Postgres backend) can disagree with the
+    /// backend about a boundary a raw category comparison would cross — so
+    /// this removes whichever mark sits closest to the translated instant
+    /// instead of the first one sharing its category.
+    pub fn record_cancel_at_backend_offset(&self, name: &str, offset_ms: i64) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+        let target_ready_at_ms = self.now_ms().saturating_add_signed(offset_ms);
+        self.pop_waiting_nearest(name, target_ready_at_ms);
+    }
+
     /// Drop one waiting mark for this job's queue (its wait is over).
     ///
     /// `prefer_ready` picks which mark to remove when the queue holds a mix of
@@ -1228,6 +1254,25 @@ impl JobRegistry {
                 .iter()
                 .position(|ready_at| (*ready_at <= now) == prefer_ready)
                 .or(if waiting.is_empty() { None } else { Some(0) });
+            if let Some(idx) = idx {
+                waiting.remove(idx);
+            }
+        }
+    }
+
+    /// Drop the waiting mark closest to `target_ready_at_ms` on this
+    /// registry's own clock. A queue with no marks removes nothing — there
+    /// is nothing to leak.
+    fn pop_waiting_nearest(&self, name: &str, target_ready_at_ms: u64) {
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+        {
+            let idx = waiting
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, ready_at)| ready_at.abs_diff(target_ready_at_ms))
+                .map(|(idx, _)| idx);
             if let Some(idx) = idx {
                 waiting.remove(idx);
             }
@@ -4601,6 +4646,64 @@ mod tests {
                 "the database-computed age must come back unchanged with the \
                  registry clock at {year}; got {}ms",
                 status.oldest_waiting_age_ms
+            );
+        }
+    }
+
+    /// An admin-cancel offset from a durable backend's own clock must pick
+    /// the correct waiting mark regardless of how far the registry's own
+    /// clock is pinned from real time.
+    ///
+    /// `record_cancel_at_backend_offset` translates the backend's offset
+    /// (e.g. Postgres's `run_at - clock_timestamp()`) onto the registry's
+    /// timeline via `now_ms() + offset_ms`, mirroring `ready_at_from_age`.
+    /// A category-based removal (`record_cancel`/`record_cancel_scheduled`,
+    /// via `pop_waiting`) instead searches the registry's own marks for
+    /// *any* member of a ready/scheduled bucket decided on the backend's
+    /// clock — a bucket a virtual registry clock might not agree the mark
+    /// belongs to. Translating onto the registry's timeline first and
+    /// removing the nearest mark cannot mismatch that way.
+    #[test]
+    fn cancel_at_backend_offset_finds_the_matching_mark_regardless_of_the_registry_clock() {
+        use chrono::{TimeZone, Utc};
+
+        for year in [1999, 2036] {
+            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
+            let registry = JobRegistry::new()
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+            registry.register_on_queue("send_email", "mail");
+            registry.register_on_queue("nightly_report", "mail");
+
+            // A ready mark (stamped "now") and a scheduled mark an hour out,
+            // both on the registry's own pinned clock.
+            registry.record_enqueue("send_email");
+            let registry_now = u64::try_from(epoch.timestamp_millis()).unwrap();
+            registry.record_enqueue_scheduled("nightly_report", registry_now + 3_600_000);
+            assert_eq!(
+                registry.queue_snapshot().get("mail").unwrap().depth,
+                1,
+                "only the ready job counts toward ready depth"
+            );
+
+            // Cancel the scheduled job: the backend reports it is still
+            // ~1h from due (a positive offset), translated onto the
+            // registry's own timeline via now_ms() + offset_ms.
+            registry.record_cancel_at_backend_offset("nightly_report", 3_600_000);
+            assert_eq!(
+                registry.queue_snapshot().get("mail").unwrap().depth,
+                1,
+                "canceling the scheduled job (registry clock pinned to {year}) must not \
+                 steal the co-queued ready mark"
+            );
+
+            // Cancel the ready job: the backend reports it is already due
+            // (a zero/negative offset).
+            registry.record_cancel_at_backend_offset("send_email", 0);
+            assert_eq!(
+                registry.queue_snapshot().get("mail").unwrap().depth,
+                0,
+                "canceling the ready job (registry clock pinned to {year}) must drain the \
+                 queue to zero, not leave the already-removed scheduled mark's slot empty"
             );
         }
     }
