@@ -272,19 +272,32 @@ def rule_exempt(cmd, root, failures):
     return False
 
 
-# Everything a reader may type between `autumn` and the command path. The `Cli`
-# struct carries no global options — it is `#[command(subcommand)] command` and
-# nothing else — so this is only clap's builtins, and on the current corpus
-# skipping them changes nothing (23 undocumented either way). It is here so a
-# global option added later does not start hiding commands.
+# NOTHING may sit between `autumn` and the command path. The root `Cli` carries
+# no global options — it is `#[command(subcommand)] command` and nothing else —
+# so the only flags that could appear are clap's own builtins, and those are
+# TERMINAL: `scripts/check-docs-cli.sh` models exactly this set
+# (`TERMINAL_OPTIONS = {'--help', '-h', '--version', '-V'}`) and stops its parse
+# on them. `autumn --help db reset` prints root help and exits; `db reset` never
+# runs and is never shown, so that line demonstrates nothing about `db reset`
+# and must not count as its documentation.
 #
-# The first cut allowed ARBITRARY text here (`autumn[^\n`]{0,80}?\bcmd\b`) and
-# that was wrong in the direction that matters: a longer command satisfied a
-# shorter one as a suffix. `autumn openapi export`, documented in openapi.md,
-# made the runnable TOP-LEVEL `export` command report as documented, so the gate
-# was green while missing a real undocumented command — the exact failure it
-# exists to catch. Match the path as a token PREFIX of what follows `autumn`.
-GLOBAL_OPTS = ('--help', '-h', '--version', '-V')
+# Two earlier cuts got this wrong in the same direction — too permissive about
+# what may precede the path:
+#
+#   - The first allowed ARBITRARY text (`autumn[^\n`]{0,80}?\bcmd\b`), so a
+#     longer command satisfied a shorter one as a suffix: `autumn openapi
+#     export`, documented in openapi.md, made the runnable TOP-LEVEL `export`
+#     command report as documented.
+#   - The second SKIPPED the builtins and kept matching, which is how a
+#     non-invocation became coverage. That one was worse than a plain bug: the
+#     self-test asserted it, so the mistake was pinned in place by a test
+#     claiming it was intended.
+#
+# The path is therefore the immediate token prefix of what follows `autumn`.
+# On the current corpus this changes nothing (23 undocumented either way, and
+# no page puts a terminal flag before a command); it is the semantics that were
+# wrong, not the count.
+TERMINAL_OPTIONS = frozenset({'--help', '-h', '--version', '-V'})
 
 # Stop at a newline or a backtick: a command does not span either, and running
 # past a closing backtick is how a code span's neighbour gets read as arguments.
@@ -358,9 +371,6 @@ def mentioned(cmd, pages):
             continue
         for m in INVOCATION.finditer(text):
             toks = m.group(1).split()
-            while toks and (toks[0] in GLOBAL_OPTS
-                            or (toks[0].startswith('--') and '=' in toks[0])):
-                toks.pop(0)
             if toks[:len(want)] == want:
                 return True
     return False
@@ -487,8 +497,13 @@ def self_test():
 
     check('bare command', mentioned('token revoke', page('run `autumn token revoke`')), True)
     check('trailing args ignored', mentioned('db reset', page('autumn db reset --force')), True)
-    check('builtin global flag skipped',
-          mentioned('db reset', page('autumn --help db reset')), True)
+    # REGRESSION: clap's builtins are TERMINAL, not skippable. `autumn --help db
+    # reset` prints root help and exits — `db reset` never runs and is never
+    # shown, so the line documents nothing. A previous cut skipped these flags
+    # and kept matching, and this assertion asserted the wrong answer.
+    for flag in sorted(TERMINAL_OPTIONS):
+        check(f'{flag} is terminal, not skipped',
+              mentioned('db reset', page(f'autumn {flag} db reset')), False)
     check('absent', mentioned('token revoke', page('autumn token issue')), False)
     check('not a substring match',
           mentioned('db reset', page('autumn db resetting-is-not-a-command')), False)

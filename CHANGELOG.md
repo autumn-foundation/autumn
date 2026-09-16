@@ -78,7 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a command unhidden by commenting its attribute out
   (`// #[command(hide = true)]`, the usual way to unhide) would keep its
   exemption — each leaving the gate green over documentation no reader sees and
-  behaviour the binary does not have.
+  behaviour the binary does not have. Relatedly, nothing may sit between
+  `autumn` and the command path at all: the root `Cli` carries no global
+  options, and clap's own builtins are terminal (the sibling gate models the
+  same `{--help, -h, --version, -V}` set and stops its parse on them), so
+  `autumn --help db reset` prints root help and never runs or shows
+  `db reset`. An earlier cut skipped those flags and kept matching, turning a
+  non-invocation into coverage — and the self-test asserted that behaviour, so
+  the mistake was pinned in place by a test claiming it was intended.
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
