@@ -67,9 +67,21 @@ both organic** (neither triggering branch touches hot-upgrade code):
    ruling that one out for this occurrence. The other two (the
    `wait_until_ready` startup-barrier poll, and the adaptive post-cutover
    wait replacing the old fixed 3.5s window) have no counter at all, so
-   whether either was active when this write was rejected is unknown from
-   this log alone. `test result: FAILED. 5 passed; 1 failed`, same shape as
-   every other hit on this test.
+   whether either was active is unknown from this log alone. **Second
+   correction (post-review, via a further Codex review comment): "the write
+   was rejected" overstates what the assertion actually checks.** Read
+   against the test source (`examples/hot-upgrade/tests/live_upgrade.rs:706-718`):
+   the panic fires when no element of `writes` has `status == 200 &&
+   parse_line(&w.body).is_some_and(|r| r.version == "v2")` — i.e. no
+   recorded post-cutover write observation was a parseable, v2-tagged
+   200. The preceding loop in the same test already permits `status == 503`
+   as an explicitly-allowed "refused as retryable" outcome, so this
+   assertion's failure is equally consistent with every post-cutover write
+   getting a 503, a 200 tagged `v1` (stale, not literally rejected), or a
+   200 with an unparseable body — not only an outright rejection. Recorded
+   as "no post-cutover write observation matched 200+parseable+v2," not as
+   a confirmed write rejection. `test result: FAILED. 5 passed; 1 failed`,
+   same shape as every other hit on this test.
 2. **Run 35069353632** (branch `claude/friendly-ritchie-wol314`, completed
    2026-09-16T09:15:56Z): panic at `./tests/live_upgrade.rs:686:5`, `test
    result: FAILED. 5 passed; 1 failed` — same line number and same
@@ -122,8 +134,8 @@ one — neither of which this pass can authorize on its own.
 
 | Item | This pass | Status |
 |---|---|---|
-| `live_upgrade` line-552/567 | No occurrence | Unchanged |
-| `live_upgrade` line-686 (`status: 0`) | Possible 2nd occurrence (run 35069353632) — line/shape match, exact message not re-confirmed | Escalated, unconfirmed |
+| `live_upgrade` line-567 ("new build never served") | No occurrence | Unchanged, fixed by #2645 |
+| `live_upgrade` `status: 0` (line-552 2026-09-09, line-686 2026-09-11 — already 2 confirmed occurrences before this pass) | Possible 3rd occurrence today at line-686 (run 35069353632) — line/shape match, exact message not re-confirmed | Escalated, unconfirmed |
 | `live_upgrade` line-714 | **New signature, n=1** (run 35044877808) | New, undiagnosed |
 | `cache_stampede` | No occurrence in any log inspected this pass | Unchanged, undiagnosed |
 | `sim_fault_plan` | No occurrence | Unchanged, undiagnosed |

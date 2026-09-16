@@ -899,8 +899,21 @@ without also filling in the intake form above.
      clean here, ruling that one out for this occurrence. The other two
      (the `wait_until_ready` startup-barrier poll, and the adaptive
      post-cutover wait that replaced the old fixed 3.5s window) have no
-     counter at all, so whether either was active when this write was
-     rejected is unknown from this log alone.
+     counter at all, so whether either was active is unknown from this log
+     alone. **Second correction (post-review, via a further Codex review
+     comment on PR #2823): "the write was rejected" overstates what the
+     assertion actually checks.** Read against the test source
+     (`examples/hot-upgrade/tests/live_upgrade.rs:706-718`): the panic
+     fires when no element of `writes` has `status == 200 &&
+     parse_line(&w.body).is_some_and(|r| r.version == "v2")` — i.e. no
+     recorded post-cutover write observation was a parseable, v2-tagged
+     200. The preceding loop in the same test already permits `status ==
+     503` as an explicitly-allowed "refused as retryable" outcome, so this
+     failure is equally consistent with every post-cutover write getting a
+     503, a `v1`-tagged 200 (stale, not literally rejected), or a 200 with
+     an unparseable body — not only an outright rejection. Recorded as "no
+     post-cutover write observation matched 200+parseable+v2," not as a
+     confirmed write rejection.
      `test result: FAILED. 5 passed; 1 failed`, same as every other hit
      on this test. Undiagnosed — a fourth distinct assertion on this test
      (after the macOS connection-error cluster, the Linux line-567
@@ -923,16 +936,23 @@ without also filling in the intake form above.
   Two hits in one day, after six straight passes (2026-09-09 through
   2026-09-15) of zero organic `live_upgrade` hits in the sampled windows,
   is itself worth noting even though neither hit alone clears this role's
-  own rerun-rate bar. Still not campaigned — n counts per signature now
-  stand at line-552 (n=1), line-567 (n=1, fixed by #2645's mechanism 2),
-  line-686/`status: 0` (n=2-3 depending on whether hit 2 above confirms),
-  and line-714 (n=1, new). `manual-macos-contention-check.yml`: still
-  `total_count: 0` against `workflow_dispatch` runs, checked
-  2026-09-16T~09:5xZ — unchanged for an 8th straight pass since it became
-  dispatchable 2026-09-08T15:07:44Z (now ~186.5 hours idle, well over a
-  week). The recommendation to dispatch it is now materially more urgent
-  than a restatement: this pass found a brand-new failure mode (write
-  rejection post-cutover, not merely a read/connection issue) on a test
+  own rerun-rate bar. **Correction (post-review, via a further Codex review
+  comment on PR #2823): line-552 and line-686 are the same `status: 0`
+  signature at two different line numbers (the file was refactored between
+  2026-09-09 and 2026-09-11), not two separate n=1 signatures — the
+  2026-09-11 update above already states this explicitly ("now two
+  occurrences of this exact signature").** Still not campaigned — n counts
+  per signature now stand at: `status: 0` (line-552 2026-09-09 + line-686
+  2026-09-11 = 2 confirmed occurrences before this pass; today's line-686
+  hit would make 3 if its unconfirmed message text is later verified to
+  match), line-567 (n=1, fixed by #2645's mechanism 2), and line-714 (n=1,
+  new). `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-16T~09:5xZ — unchanged for an
+  8th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~186.5 hours idle, well over a week). The recommendation to dispatch it
+  is now materially more urgent than a restatement: this pass found a
+  brand-new failure signature (no post-cutover write observed as a
+  parseable, v2-tagged 200 — not merely a read/connection issue) on a test
   covering exactly the hot-upgrade handoff path, and the harness that could
   start separating "timing-sensitive test" from "product race" has sat
   unexercised for over a week while the signature count on this one test
