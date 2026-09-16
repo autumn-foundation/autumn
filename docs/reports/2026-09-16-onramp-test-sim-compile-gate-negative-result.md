@@ -313,11 +313,15 @@ nothing committed to `autumn/src/lib.rs`. Per Onramp's impact floor, a change
 that doesn't move the counter doesn't ship, so filing this as a negative
 result (with the ruled-out hypothesis and the measurement) rather than a PR.
 
-**What this does leave for #2795's next attempt:** the always-on core modules
-by line count — `job.rs` (21,003), `app.rs` (19,695), `config.rs` (19,686),
-`router.rs` (15,224), `widgets.rs` (8,882), `actuator.rs` (9,006), `mail.rs`
-(7,948), `form.rs` (7,662), `db.rs` (6,710), `auth.rs` (5,596), `migrate.rs`
-(5,762) — are the honest remaining candidates by size, but a further pass
+**What this does leave for #2795's next attempt:** filtered to modules that
+actually compile under `DAEMON_NO_DB_FEATURES` (`maud,htmx,tailwind,
+reporting`) — **not** `mail.rs`, `db.rs`, or `migrate.rs`, each gated behind
+`#[cfg(feature = "mail")]`/`#[cfg(feature = "db")]` in `lib.rs` and so absent
+from this build entirely, a wrong candidate an earlier draft of this list
+included — the honest remaining candidates by line count are `job.rs`
+(21,003), `app.rs` (19,695), `config.rs` (19,686), `router.rs` (15,224),
+`widgets.rs` (8,882), `actuator.rs` (9,006), `form.rs` (7,662), and `auth.rs`
+(5,596), all confirmed unconditional `pub mod` declarations. But a further pass
 needs real per-module attribution inside the 22s "frontend" (type-check/MIR/
 borrowck) phase specifically, since that dominates over codegen here and a
 crude line-count/module-removal experiment (this report's own method) is
