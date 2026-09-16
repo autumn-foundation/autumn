@@ -184,6 +184,11 @@
     }
   }
 
+  // Nothing can be sent before the socket is open and the snapshot has named
+  // our actor, and a dropped message would leave the bookkeeping below
+  // permanently out of step. Hold the editor closed until then.
+  editor.disabled = true;
+
   const socket = new WebSocket(
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${editor.dataset.socket}`,
   );
@@ -192,6 +197,7 @@
     if (status) status.textContent = "connected";
   });
   socket.addEventListener("close", () => {
+    editor.disabled = true;
     if (status) status.textContent = "disconnected — reload to rejoin";
   });
 
@@ -210,6 +216,7 @@
         elems.push({ id: element.id, ch: element.ch, deleted: !!element.deleted });
         known.add(element.id);
       }
+      editor.disabled = false;
       render();
       flush();
       renderRoster(message.participants);
@@ -226,6 +233,14 @@
     } else if (message.type === "presence") {
       renderRoster(message.participants);
     } else if (message.type === "error") {
+      // The server refused an edit — a document at its limit, or a message it
+      // could not read. Clear the bookkeeping for it: left counted, `settled`
+      // would never come back true and the editor would freeze, sending
+      // nothing and showing nobody else's changes again. The refused text is
+      // dropped, so redraw from the authority to show what really happened.
+      unsentChars = 0;
+      unsentDeletes.clear();
+      render();
       if (status) status.textContent = message.message;
     }
   });

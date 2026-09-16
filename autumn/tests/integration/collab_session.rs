@@ -237,7 +237,7 @@ fn remote_operations_merge_and_broadcast() {
     let mut offline = doc.document();
     let ops = offline.insert("offline", 1, "-");
 
-    let waiting = doc.apply_remote(ops).expect("within the limits");
+    let waiting = doc.apply_remote(&ops).expect("within the limits");
     assert_eq!(waiting, 0, "the peer sent a complete history");
     assert_eq!(doc.text(), "a-b");
     assert!(
@@ -530,27 +530,88 @@ fn two_connections_sharing_a_name_stay_distinct() {
     assert!(cursors.contains(&Some(1)) && cursors.contains(&Some(7)));
 }
 
-/// The last editor to leave evicts the document, so an app that never calls
-/// `close` does not hold one per record it ever opened.
+/// A document lives exactly as long as a handle to it does: no leak, and no
+/// eviction while the handler still needs it.
 #[test]
-fn the_last_editor_to_leave_evicts_the_document() {
+fn a_document_lives_as_long_as_its_handles() {
     let hub = hub();
-    let doc = hub.open_with("notes:14:body", || CollabText::from_text("seed", "x"));
     {
-        let _first = doc.join("ada", "Ada");
-        let second = doc.join("linus", "Linus");
-        assert_eq!(hub.open_keys(), vec!["notes:14:body".to_owned()]);
-        // An occupied document is not the app's to evict.
-        assert!(hub.close("notes:14:body").is_none());
-        drop(second);
-        assert_eq!(hub.open_keys().len(), 1, "one editor is still here");
+        let doc = hub.open_with("notes:14:body", || CollabText::from_text("seed", "x"));
+        {
+            let _first = doc.join("ada", "Ada");
+            let second = doc.join("linus", "Linus");
+            assert_eq!(hub.open_keys(), vec!["notes:14:body".to_owned()]);
+            // An occupied document is not the app's to evict.
+            assert!(hub.close("notes:14:body").is_none());
+            drop(second);
+        }
+        // Every editor has left, but the handler still holds the handle — the
+        // window in which it persists. The document must stay findable.
+        assert_eq!(
+            hub.open_keys(),
+            vec!["notes:14:body".to_owned()],
+            "the handler's handle keeps it discoverable while it persists"
+        );
+        assert_eq!(doc.text(), "x");
     }
     assert!(
         hub.open_keys().is_empty(),
-        "the last editor's departure evicted it"
+        "dropping the last handle releases it"
     );
-    // The handle still reads, so a handler can persist after the socket ends.
-    assert_eq!(doc.text(), "x");
+}
+
+/// The race the weak registry closes: a reconnect that lands *after* the last
+/// editor left but *before* the handler persisted must reach the same
+/// document, not a second one seeded from the stale row.
+#[test]
+fn a_reconnect_before_persistence_finds_the_same_document() {
+    let hub = hub();
+    // The handler's handle, held across the whole save window.
+    let doc = hub.open_with("notes:17:body", || CollabText::from_text("seed", "base"));
+    {
+        let editor = doc.join("ada", "Ada");
+        editor
+            .handle(CollabClientMessage::Insert {
+                after: doc.document().id_at(3),
+                text: "!".to_owned(),
+            })
+            .expect("insert");
+    }
+    // Editor gone; the handler has not written the row back yet. A reconnect
+    // arrives and would re-seed from the stale "base" if the document had
+    // been evicted.
+    let reconnected = hub.open_with("notes:17:body", || {
+        panic!("a reconnect must not re-seed a document the handler still holds")
+    });
+    assert_eq!(reconnected.text(), "base!", "the edit is still there");
+
+    // Only once every handle is gone does the key free up.
+    drop(reconnected);
+    drop(doc);
+    assert!(hub.open_keys().is_empty());
+}
+
+/// An operation the authority refuses is not broadcast. A browser replica has
+/// no counter ceiling of its own, so forwarding a refused one would put a
+/// character in every client that the document does not have.
+#[test]
+fn a_refused_remote_operation_is_not_broadcast() {
+    let hub = hub();
+    let doc = hub.open_with("notes:18:body", || CollabText::from_text("seed", "ab"));
+    let mut watcher = doc.subscribe();
+
+    let refused = autumn_web::collab::CollabOp::Insert {
+        id: OpId::new(autumn_web::collab::MAX_COUNTER + 1, "peer"),
+        after: None,
+        ch: 'X',
+    };
+    doc.apply_remote(&[refused]).expect("within the budget");
+
+    assert_eq!(doc.text(), "ab", "the document refused it");
+    assert!(
+        watcher.try_recv().is_err(),
+        "and nothing was published, so no client can integrate it"
+    );
 }
 
 /// The registry is bounded: a route that opens documents from a
@@ -596,7 +657,7 @@ fn buffered_operations_count_toward_the_document_limit() {
             ch: 'x',
         })
         .collect();
-    doc.apply_remote(orphans).expect("within the budget");
+    doc.apply_remote(&orphans).expect("within the budget");
     assert_eq!(doc.document().pending_len(), 4);
     assert_eq!(doc.text(), "");
 
@@ -660,4 +721,93 @@ async fn a_cursor_reaches_the_other_editor_over_the_wire() {
 
     ada.close(None).await.ok();
     linus.close(None).await.ok();
+}
+
+/// A reconnecting peer replays its whole history. That replay adds nothing,
+/// so a capacity preflight must not charge for it — charging the batch length
+/// would refuse an idempotent resend from a document at its limit.
+#[test]
+fn replaying_a_history_is_not_charged_against_the_limit() {
+    let hub = hub().with_limits(CollabLimits {
+        max_document_chars: 4,
+        ..CollabLimits::default()
+    });
+    let doc = hub.open_with("notes:19:body", || CollabText::from_text("seed", "abcd"));
+    assert_eq!(doc.document().element_count(), 4, "the document is full");
+
+    // The peer resends everything it has. None of it is new.
+    let replay = doc.document().ops();
+    assert!(
+        doc.apply_remote(&replay).is_ok(),
+        "an idempotent replay adds nothing and must be accepted"
+    );
+    assert_eq!(doc.text(), "abcd");
+
+    // A genuinely new character is still refused: the limit still holds.
+    let overflow = doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: doc.document().id_at(3),
+            text: "e".to_owned(),
+        },
+    );
+    assert!(matches!(overflow, Err(CollabError::DocumentFull { .. })));
+}
+
+/// A peer id at the ceiling must not pin the clock there: every later local
+/// keystroke would mint nothing, silently and permanently.
+#[test]
+fn a_peer_id_at_the_ceiling_cannot_exhaust_local_minting() {
+    let hub = hub();
+    let doc = hub.open_with("notes:20:body", || CollabText::from_text("seed", "a"));
+
+    doc.apply_remote(&[autumn_web::collab::CollabOp::Insert {
+        id: OpId::new(autumn_web::collab::MAX_COUNTER, "peer"),
+        after: None,
+        ch: 'X',
+    }])
+    .expect("within the budget");
+    assert_eq!(doc.text(), "a", "the ceiling id was refused");
+
+    // Local editing still works.
+    let ops = doc
+        .handle(
+            "ada",
+            CollabClientMessage::Insert {
+                after: doc.document().id_at(0),
+                text: "b".to_owned(),
+            },
+        )
+        .expect("insert");
+    assert_eq!(ops.len(), 1, "the replica can still mint");
+    assert_eq!(doc.text(), "ab");
+}
+
+/// Operations delivered on the document's own channel — how another replica's
+/// edits arrive under a Redis backend — reach the local authority, not just
+/// the socket. Otherwise a client anchors its next edit to a character this
+/// replica has never heard of.
+#[test]
+fn operations_delivered_on_the_channel_reach_the_local_authority() {
+    let hub = hub();
+    let doc = hub.open_with("notes:21:body", || CollabText::from_text("seed", "ab"));
+
+    // Another replica's edit, as it would arrive off the channel.
+    let mut elsewhere = doc.document();
+    let ops = elsewhere.insert("other-replica", 2, "!");
+
+    doc.merge_delivered(&ops);
+    assert_eq!(doc.text(), "ab!", "the local authority has it");
+
+    // And a client can now anchor to the character it just saw.
+    let anchor = doc.document().id_at(2);
+    doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: anchor,
+            text: "?".to_owned(),
+        },
+    )
+    .expect("anchoring to a replicated character is accepted");
+    assert_eq!(doc.text(), "ab!?");
 }

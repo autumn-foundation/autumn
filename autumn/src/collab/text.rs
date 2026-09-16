@@ -92,7 +92,8 @@ fn import_actor_for(text: &str) -> String {
 /// characters differently in the browser and in the stored document.
 ///
 /// 2^53 characters is far beyond what this slice's linear merge can hold, so
-/// the ceiling costs nothing real.
+/// the ceiling costs nothing real. A peer operation must stay *below* it; the
+/// value itself is reserved so a replica can always mint one more id.
 pub const MAX_COUNTER: u64 = 1 << 53;
 
 /// The encoding of an empty document — the SQL default a `#[collaborative]`
@@ -342,6 +343,34 @@ impl CollabText {
         self.elems.len()
     }
 
+    /// How many of `ops` this replica does not already hold.
+    ///
+    /// A capacity preflight counts this, not the batch length: a reconnect
+    /// replays the whole history, and charging a document for operations it
+    /// already has would refuse an idempotent replay that adds nothing.
+    #[must_use]
+    pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
+        ops.into_iter()
+            .filter(|op| match op {
+                // A delete consumes no room: it tombstones a character that
+                // is already counted.
+                CollabOp::Delete { .. } => false,
+                CollabOp::Insert { id, .. } => !self.index.contains(id),
+            })
+            .filter(|op| !self.buffered.contains(*op))
+            .count()
+    }
+
+    /// Whether `op` is waiting in the causal buffer.
+    ///
+    /// Distinguishes the two `false` answers [`apply`](Self::apply) gives:
+    /// "buffered, it will land later" from "refused, it never will". A caller
+    /// that forwards operations must not pass on a refused one.
+    #[must_use]
+    pub fn holds_pending(&self, op: &CollabOp) -> bool {
+        self.buffered.contains(op)
+    }
+
     /// Whether this replica already holds the character `id` names.
     ///
     /// The authority check a hub makes before accepting a client's anchor.
@@ -488,10 +517,16 @@ impl CollabText {
     /// until the character it refers to arrives. A buffered operation is
     /// never lost: every later integration retries the buffer.
     pub fn apply(&mut self, op: CollabOp) -> bool {
-        // Refuse an id past the ceiling before the clock can adopt it. Drop
-        // it rather than buffer it: it can never become valid, and a buffered
-        // copy would just sit in the document forever.
-        if op.minted_counter() > MAX_COUNTER {
+        // Refuse an id at or past the ceiling before the clock can adopt it.
+        // Drop it rather than buffer it: it can never become valid, and a
+        // buffered copy would just sit in the document forever.
+        //
+        // At or past, not past: a peer id of exactly `MAX_COUNTER` would pin
+        // the clock to the ceiling, and every later local keystroke would
+        // then mint nothing at all — silently, for good. Reserving the last
+        // counter for this replica keeps minting possible after any
+        // operation a peer can send.
+        if op.minted_counter() >= MAX_COUNTER {
             return false;
         }
         self.clock = self.clock.max(op.minted_counter());

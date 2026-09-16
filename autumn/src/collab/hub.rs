@@ -50,7 +50,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -255,7 +255,17 @@ const MAX_LAG_RESENDS: u32 = 3;
 /// extractor. Cloning is cheap and shares the same documents.
 #[derive(Clone)]
 pub struct CollabHub {
-    docs: Arc<Mutex<HashMap<String, Arc<Mutex<DocState>>>>>,
+    /// `key -> weak handle`. **Weak** on purpose: the live [`CollabDoc`]
+    /// handles own the document, so it stays findable for exactly as long as
+    /// somebody holds one and disappears on its own afterwards.
+    ///
+    /// A strong map leaks a document per record ever opened. Evicting on the
+    /// last editor's departure instead loses data: `CollabSession::drop` runs
+    /// before the handler persists, so a reconnect in that window re-seeds
+    /// from the stale row and the departing save overwrites it. A weak entry
+    /// has neither problem — the handler's own handle keeps the document
+    /// discoverable until it has finished writing it back.
+    docs: Arc<Mutex<HashMap<String, Weak<Mutex<DocState>>>>>,
     channels: Channels,
     presence: Presence,
     limits: CollabLimits,
@@ -312,13 +322,7 @@ impl CollabHub {
     #[must_use]
     pub fn open_with(&self, key: &str, seed: impl FnOnce() -> CollabText) -> CollabDoc {
         // Already live: hand back the shared document and never call the seed.
-        if let Some(state) = self
-            .docs
-            .lock()
-            .expect("collab registry lock poisoned")
-            .get(key)
-            .map(Arc::clone)
-        {
+        if let Some(state) = self.live(key) {
             return self.handle_for(key, state);
         }
 
@@ -330,9 +334,15 @@ impl CollabHub {
         let seeded = seed();
 
         let mut docs = self.docs.lock().expect("collab registry lock poisoned");
-        // Bound the registry: a route that opens a document from a
-        // client-supplied key would otherwise hold one per key ever seen.
-        if !docs.contains_key(key) && docs.len() >= self.limits.max_documents {
+        // Somebody may have won the race while the seed ran.
+        if let Some(state) = docs.get(key).and_then(Weak::upgrade) {
+            drop(docs);
+            return self.handle_for(key, state);
+        }
+        // Drop entries whose document is gone before counting: a dead weak
+        // reference costs a map slot, not a document.
+        docs.retain(|_, weak| weak.strong_count() > 0);
+        if docs.len() >= self.limits.max_documents {
             tracing::warn!(
                 key,
                 open = docs.len(),
@@ -342,12 +352,23 @@ impl CollabHub {
             drop(docs);
             return self.handle_for(key, Arc::new(Mutex::new(DocState::new(seeded))));
         }
-        let state = Arc::clone(
-            docs.entry(key.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(DocState::new(seeded)))),
-        );
+        let state = Arc::new(Mutex::new(DocState::new(seeded)));
+        docs.insert(key.to_owned(), Arc::downgrade(&state));
         drop(docs);
         self.handle_for(key, state)
+    }
+
+    /// The live document for `key`, if one is still held somewhere.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    fn live(&self, key: &str) -> Option<Arc<Mutex<DocState>>> {
+        self.docs
+            .lock()
+            .expect("collab registry lock poisoned")
+            .get(key)
+            .and_then(Weak::upgrade)
     }
 
     /// Wrap one document's state in a handle.
@@ -372,7 +393,7 @@ impl CollabHub {
     /// Panics if the internal document registry mutex is poisoned.
     pub fn close(&self, key: &str) -> Option<CollabText> {
         let mut docs = self.docs.lock().expect("collab registry lock poisoned");
-        let state = docs.get(key).map(Arc::clone)?;
+        let state = docs.get(key).and_then(Weak::upgrade)?;
         let guard = state.lock().expect("collab document lock poisoned");
         // Refuse while an editor is still here. Removing the entry would not
         // stop them: they hold the same `Arc` and keep editing a document
@@ -384,6 +405,7 @@ impl CollabHub {
         let doc = guard.doc.clone();
         drop(guard);
         docs.remove(key);
+        drop(docs);
         Some(doc)
     }
 
@@ -394,13 +416,10 @@ impl CollabHub {
     /// Panics if the internal document registry mutex is poisoned.
     #[must_use]
     pub fn open_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .docs
-            .lock()
-            .expect("collab registry lock poisoned")
-            .keys()
-            .cloned()
-            .collect();
+        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        docs.retain(|_, weak| weak.strong_count() > 0);
+        let mut keys: Vec<String> = docs.keys().cloned().collect();
+        drop(docs);
         keys.sort();
         keys
     }
@@ -431,9 +450,9 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for CollabHub {
 pub struct CollabDoc {
     key: String,
     state: Arc<Mutex<DocState>>,
-    /// The registry this document lives in, so the last session to leave can
-    /// evict it. A detached document (registry full) is simply absent here.
-    docs: Arc<Mutex<HashMap<String, Arc<Mutex<DocState>>>>>,
+    /// The registry this document is listed in. The handle owns the state;
+    /// the registry only points at it weakly.
+    docs: Arc<Mutex<HashMap<String, Weak<Mutex<DocState>>>>>,
     channels: Channels,
     presence: Presence,
     limits: CollabLimits,
@@ -674,21 +693,53 @@ impl CollabDoc {
     /// # Panics
     ///
     /// Panics if the internal document mutex is poisoned.
-    pub fn apply_remote(&self, ops: Vec<CollabOp>) -> Result<usize, CollabError> {
-        let waiting = {
+    pub fn apply_remote(&self, ops: &[CollabOp]) -> Result<usize, CollabError> {
+        let (accepted, waiting) = {
             let mut state = self.state.lock().expect("collab document lock poisoned");
             let held = state.doc.element_count() + state.doc.pending_len();
-            if held + ops.len() > self.limits.max_document_chars {
+            // Charge only what the batch would actually add. A reconnecting
+            // peer replays its whole history, so counting the batch length
+            // would refuse an idempotent replay that adds nothing.
+            let novel = state.doc.novel_count(ops.iter());
+            if held + novel > self.limits.max_document_chars {
                 return Err(CollabError::DocumentFull {
                     got: held,
                     limit: self.limits.max_document_chars,
                 });
             }
-            state.doc.apply_all(ops.iter().cloned());
-            state.doc.pending_len()
+            // Keep only what the authority took. `apply` refuses an id past
+            // `MAX_COUNTER` outright, and a browser replica has no such
+            // check — broadcasting a refused operation would put a character
+            // in every client that the document does not have, and every
+            // later edit anchored to it would then come back as unknown.
+            let accepted: Vec<CollabOp> = ops
+                .iter()
+                .filter(|op| {
+                    let integrated = state.doc.apply((*op).clone());
+                    integrated || state.doc.holds_pending(op)
+                })
+                .cloned()
+                .collect();
+            let waiting = state.doc.pending_len();
+            (accepted, waiting)
         };
-        self.broadcast_ops(&ops);
+        self.broadcast_ops(&accepted);
         Ok(waiting)
+    }
+
+    /// Merge operations that arrived **on this document's own channel** into
+    /// the local replica, without broadcasting them again.
+    ///
+    /// The re-broadcast is what separates this from
+    /// [`apply_remote`](Self::apply_remote): these operations are already on
+    /// the channel, so publishing them once more would loop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    pub fn merge_delivered(&self, ops: &[CollabOp]) {
+        let mut state = self.state.lock().expect("collab document lock poisoned");
+        state.doc.apply_all(ops.iter().cloned());
     }
 
     fn with_doc<T>(&self, f: impl FnOnce(&CollabText) -> T) -> T {
@@ -816,24 +867,12 @@ impl Drop for CollabSession {
         drop(self.presence.take());
         self.doc.broadcast_presence();
 
-        // The last editor evicts the document. Without this, an app that
-        // never calls `close` holds one live document per record it ever
-        // opened. The caller's `CollabDoc` keeps working — it holds the same
-        // `Arc` — so a handler can still read `document()` to persist after
-        // the socket ends, which is what `examples/collab-notes` does.
-        if last_editor {
-            let mut docs = self
-                .doc
-                .docs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if docs
-                .get(&self.doc.key)
-                .is_some_and(|live| Arc::ptr_eq(live, &self.doc.state))
-            {
-                docs.remove(&self.doc.key);
-            }
-        }
+        // Nothing is evicted here on purpose. The registry points at the
+        // document weakly, so it goes when the last `CollabDoc` handle does —
+        // which is *after* the handler has persisted it. Removing it here
+        // instead would let a reconnect in that window re-seed from the stale
+        // row and then lose the departing editor's work to the late save.
+        let _ = last_editor;
     }
 }
 
@@ -922,11 +961,22 @@ pub async fn serve_socket(
             update = updates.recv() => {
                 match update {
                     Ok(update) => {
-                        if socket
-                            .send(Message::Text(update.into_string().into()))
-                            .await
-                            .is_err()
+                        let text = update.into_string();
+                        // With a multi-replica backend (Redis), this is how
+                        // another replica's operations reach us. Merge them
+                        // into the local authority before forwarding: a
+                        // client that saw a character here would otherwise
+                        // anchor its next edit to one this replica has never
+                        // heard of, and `handle` would refuse it as unknown.
+                        // Locally-produced operations arrive here too and
+                        // re-apply as no-ops, which is what idempotence is
+                        // for.
+                        if let Ok(CollabServerMessage::Ops { ops }) =
+                            serde_json::from_str::<CollabServerMessage>(&text)
                         {
+                            doc.merge_delivered(&ops);
+                        }
+                        if socket.send(Message::Text(text.into())).await.is_err() {
                             break;
                         }
                     }

@@ -7847,6 +7847,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             collaborative_columns.push(ident);
         }
     }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registry (Rust
+    // name) from the serialized key, exactly as it does for encrypted and
+    // classified columns — and here it is worse than a reporting mismatch:
+    // `CollabResolver` looks the field up by the registered name in a sync
+    // payload that carries the renamed one, finds neither side's document,
+    // and silently falls back to last-write-wins. That is the data loss the
+    // whole feature exists to prevent, so reject the combination.
+    if !collaborative_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[collaborative]` fields:              collaborative columns are registered under their Rust names, which must match              the serialized keys `CollabResolver` looks for in an offline-sync payload. A              renamed key would make the resolver miss the field and fall back to              last-write-wins, discarding one side's edits.",
+        )
+        .to_compile_error();
+    }
     let collaborative_column_names: Vec<String> = collaborative_columns
         .iter()
         .map(|i| unraw_ident(i))
@@ -14426,11 +14440,15 @@ mod tests {
             "position",
             "state_machine",
         ] {
-            let attr: syn::Attribute = syn::parse_quote! { #[collaborative] };
-            let other: syn::Attribute =
-                syn::parse_str(&format!("#[{marker}]")).expect("marker parses");
+            // `Attribute` has no `Parse` impl of its own — attributes are
+            // parsed as a list, so go through `parse_outer`.
+            let parsed = syn::parse::Parser::parse_str(
+                syn::Attribute::parse_outer,
+                &format!("#[collaborative] #[{marker}]"),
+            )
+            .expect("both markers parse");
             let mut field: syn::Field = syn::parse_quote! { pub body: CollabText };
-            field.attrs = vec![attr, other];
+            field.attrs = parsed;
             let msg = validate_collaborative_field(&field)
                 .unwrap_err()
                 .to_string();
@@ -14496,6 +14514,51 @@ mod tests {
         assert!(
             !generated.contains("# [collaborative]"),
             "the marker must be stripped before the Diesel derives see it"
+        );
+    }
+
+    /// A container `rename_all` desyncs the registry from the serialized key,
+    /// which would make `CollabResolver` miss the field and silently fall
+    /// back to last-write-wins — the loss the feature exists to prevent.
+    #[test]
+    fn collaborative_rejects_a_container_rename_all() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                #[serde(rename_all = "camelCase")]
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub note_body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("rename_all") && generated.contains("compile_error"),
+            "expected a compile error naming the conflict, got: {generated}"
+        );
+    }
+
+    /// The advertised schema must require `elems`, because the wire type does.
+    #[test]
+    fn collaborative_schema_requires_the_elements_array() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"required\""),
+            "the collaborative field's schema must mark `elems` required"
         );
     }
 

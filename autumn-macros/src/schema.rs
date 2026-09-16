@@ -577,7 +577,11 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
                 "properties": {
                     "elems": { "type": "array", "items": { "type": "object" } },
                     "pending": { "type": "array", "items": { "type": "object" } }
-                }
+                },
+                // `elems` is required on the wire, so the advertised contract
+                // has to say so — otherwise a generated client treats `{}` as
+                // a valid document and the endpoint rejects it.
+                "required": ["elems"]
             })
         };
     }
