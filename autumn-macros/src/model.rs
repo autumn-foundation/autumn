@@ -4860,6 +4860,24 @@ fn validate_blind_index_companion(
             // none of them look for, which is worse than a rename on the sealed
             // column: the token is what tells an operator which of an owner's
             // rows hold the same value.
+            // Markers that keep a column out of the `New*` struct leave the
+            // client-computed token with nowhere to go: the insert either fails
+            // on the non-null column or stores a server-side default that does
+            // not match the sealed value, and every equality lookup then misses
+            // the row.
+            for marker in ["default", "id", "lock_version", "position"] {
+                if has_attr(f, marker) {
+                    return Err(syn::Error::new_spanned(
+                        f,
+                        format!(
+                            "`{expected}` is a blind-index companion, so it cannot be \
+                             `#[{marker}]`: that keeps the column out of the insert, and \
+                             the token has to be the one the client computed for the \
+                             sealed value."
+                        ),
+                    ));
+                }
+            }
             if field_serde_wire_name_override(f).is_some()
                 || diesel_column_name(f).is_some()
                 || has_attr(f, "private")
@@ -14779,6 +14797,33 @@ mod tests {
             assert!(
                 expanded.contains("is a blind-index companion"),
                 "a renamed companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a marker that keeps the companion out of the insert leaves the
+    /// client-computed token with nowhere to go.
+    #[test]
+    fn a_write_excluded_blind_index_companion_is_refused() {
+        for marker in [
+            quote! { #[default] },
+            quote! { #[id] },
+            quote! { #[lock_version] },
+            quote! { #[position] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #marker
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a write-excluded companion must be refused: {expanded}"
             );
         }
     }
