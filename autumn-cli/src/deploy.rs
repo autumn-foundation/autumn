@@ -1778,13 +1778,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
         ),
         DeployAction::Rollback => run_rollback(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
@@ -1828,7 +1828,7 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
-                &load_runtime_config(&resolved)?,
+                &load_runtime_config(&resolved.profile)?,
                 &resolved,
                 &targets,
                 host_list.len(),
@@ -2077,7 +2077,10 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 ///
 /// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
 /// profile (`resolved.profile`), and this reload then resolves the full config
-/// under it. The `.env.<profile>` overlay is selected via
+/// under it. Takes the RAW profile string rather than the whole
+/// [`ResolvedDeployConfig`] — that field is all this needs, and issue #2267's
+/// alert path reloads by profile alone, with no `ResolvedDeployConfig` at
+/// hand. The `.env.<profile>` overlay is selected via
 /// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
 /// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
 /// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
@@ -2085,14 +2088,14 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
 /// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
 /// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
-/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// to the RAW profile so the loader layers `[profile.<profile>]` /
 /// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
 /// env vars still win over `.env` (the
 /// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
-fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
-    let forced = deploy_profile_env_overlay(&resolved.profile)?;
+fn load_runtime_config(profile: &str) -> Result<AutumnConfig, DeployError> {
+    let forced = deploy_profile_env_overlay(profile)?;
     // Lenient unknown top-level roots (#2063): keep strict validation of the
     // core sections the CLI knows while accepting plugin-owned roots (e.g.
     // `[media]`) as opaque — app boot stays the authoritative strict gate.
@@ -2137,7 +2140,7 @@ struct StatusPort {
 /// upload runtime VALUES (the signing secret, the DB URL), so an invalid config
 /// must stop them. `plan` never loads the runtime config at all.
 fn status_public_port(resolved: &ResolvedDeployConfig) -> Result<StatusPort, DeployError> {
-    let loaded = load_runtime_config(resolved);
+    let loaded = load_runtime_config(&resolved.profile);
     status_public_port_with(&manifest_project_dirs(), &resolved.profile, loaded)
 }
 
@@ -3690,6 +3693,7 @@ fn run_up(
 
     run_up_with(
         &FleetUpInput {
+            profile: &resolved.profile,
             fleet: &fleet,
             proxy: &proxy,
             checks: &checks,
@@ -3756,6 +3760,10 @@ struct FleetDatabaseFacts {
 /// is what makes the loop testable: nothing here reads the clock, the filesystem,
 /// or a socket.
 struct FleetUpInput<'a, P: ProxyController> {
+    /// The TARGET deploy profile (e.g. `"prod"`). A halt reloads `[alerts]`
+    /// under this profile (issue #2267), never the operator's ambient shell
+    /// profile.
+    profile: &'a str,
     /// The rollout targets, in order. Never empty.
     fleet: &'a ResolvedFleet,
     /// The proxy controller. kamal-proxy is PER HOST (it binds that host's public
@@ -4405,7 +4413,7 @@ where
         // #2267: send a #1610 alert for the halt. This is best-effort. It
         // does not change `error` below.
         if let DeployError::FleetHalted(ref halt) = error {
-            emit_fleet_halted_alert(halt);
+            emit_fleet_halted_alert(halt, input.profile);
         }
         return Err(error);
     }
@@ -4642,20 +4650,40 @@ fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::Ho
 // config, build the same channels `autumn alert test` uses, and deliver
 // directly. This is best-effort. It never changes the command's exit code.
 
-/// Load the config. Build the alert channels for a CLI-fired alert.
+/// Build the alert channels for an already-loaded config.
 ///
-/// Return an empty list if the config fails to load. An empty list is a
-/// no-op downstream, so a broken config can not block the real exit code.
-fn deploy_alert_channels() -> Vec<Arc<dyn AlertChannel>> {
-    let config = match AutumnConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  \u{26A0} alert skipped: could not load configuration: {e}");
-            return Vec::new();
-        }
-    };
+/// Check `[alerts] enabled` first, the master switch (review finding on
+/// #2267: a disabled config with transport credentials left in place must
+/// send nothing). `is_active()` checks `enabled` AND a set destination.
+/// Return an empty list when either check fails. An empty list is a no-op
+/// downstream.
+fn alert_channels_for(config: &AutumnConfig) -> Vec<Arc<dyn AlertChannel>> {
+    if !config.alerts.is_active() {
+        return Vec::new();
+    }
     let client = autumn_web::http::Client::from_config(&config.http.client);
     crate::alert::configured_http_channels(&config.alerts, &client)
+}
+
+/// Load the config under the TARGET deploy profile. Build its alert channels.
+///
+/// Review finding on #2267: the ambient ("ambient" means the operator's
+/// shell) profile can differ from the deploy profile, so a plain
+/// `AutumnConfig::load()` can miss a production-only destination or send a
+/// production incident to a dev one. Use [`load_runtime_config`] instead —
+/// the same forced-profile load `run` uses for `check`/`rollback`/`up`.
+///
+/// Return an empty list if the config fails to load. A broken or unrelated
+/// bad section must not block the real exit code, nor take a read-only
+/// `deploy status` offline.
+fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>> {
+    match load_runtime_config(profile) {
+        Ok(config) => alert_channels_for(&config),
+        Err(e) => {
+            eprintln!("  \u{26A0} alert skipped: could not load configuration: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// Send `alert` to every channel in `channels`.
@@ -4735,12 +4763,14 @@ fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
 
 /// Send an alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
 ///
-/// This runs on any halt, if `[alerts]` names a channel. If no channel is
-/// set, this builds an empty list and does nothing. So an operator with no
-/// alert channel sees the same behavior as before. They see a message and
-/// a non-zero exit.
-fn emit_fleet_halted_alert(halt: &FleetHalt) {
-    deliver_alert(&deploy_alert_channels(), &build_fleet_halted_alert(halt));
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This runs on any halt, if `[alerts]`
+/// names a channel there. If no channel is set, this does nothing. So an
+/// operator with no alert channel sees the same behavior as before. They
+/// see a message and a non-zero exit.
+fn emit_fleet_halted_alert(halt: &FleetHalt, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(&channels, &build_fleet_halted_alert(halt));
 }
 
 /// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
@@ -4786,14 +4816,13 @@ fn build_drift_alert(report: &fleet::DriftReport, profile: &str) -> Alert {
 /// Send an alert for drift found by `deploy status --strict` (issue #2267,
 /// AC-6 of #1621). This is the cron path in `docs/guide/fleet-deploys.md`.
 ///
-/// This does nothing if `[alerts]` has no channel set. The caller must call
-/// this only in `--strict` mode. A plain `deploy status` check must never
-/// page anyone.
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This does nothing if `[alerts]` has no
+/// channel set there. The caller must call this only in `--strict` mode. A
+/// plain `deploy status` check must never page anyone.
 fn emit_drift_alert(report: &fleet::DriftReport, profile: &str) {
-    deliver_alert(
-        &deploy_alert_channels(),
-        &build_drift_alert(report, profile),
-    );
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(&channels, &build_drift_alert(report, profile));
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -9489,6 +9518,7 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
                 fleet,
                 proxy: &self.proxy,
                 checks: &[],
@@ -9518,6 +9548,7 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
                 auto_rollback: false,
                 ..self.input(fleet)
             }
@@ -9672,6 +9703,42 @@ mod tests {
             degraded: vec![("web-a".to_owned(), "prune")],
             manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
         }
+    }
+
+    #[test]
+    fn alert_channels_for_respects_the_enabled_master_switch() {
+        // Review finding on #2267: `[alerts] enabled = false` must silence a
+        // deploy alert, even when a transport is still configured.
+        let mut config = AutumnConfig::default();
+        config.alerts.enabled = false;
+        config.alerts.pagerduty_routing_key = Some("R0123".to_owned());
+
+        assert!(
+            alert_channels_for(&config).is_empty(),
+            "a disabled [alerts] config must build no channel"
+        );
+    }
+
+    #[test]
+    fn alert_channels_for_builds_channels_when_active() {
+        let mut config = AutumnConfig::default();
+        config.alerts.enabled = true;
+        config.alerts.pagerduty_routing_key = Some("R0123".to_owned());
+
+        assert_eq!(
+            alert_channels_for(&config).len(),
+            1,
+            "an enabled [alerts] config with a destination must build a channel"
+        );
+    }
+
+    #[test]
+    fn deploy_alert_channels_for_profile_is_empty_without_a_configured_destination() {
+        // No fixture project directory is set up for this test, so the
+        // profile load resolves to defaults (or fails) either way — this
+        // must never panic, and with no [alerts] destination it must
+        // deliver nothing.
+        assert!(deploy_alert_channels_for_profile("prod").is_empty());
     }
 
     #[test]
@@ -10768,6 +10835,7 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
             db: FleetDatabaseFacts {
                 sqlite: true,
                 ..FleetDatabaseFacts::default()
@@ -10939,6 +11007,7 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
             configured_host_count: 3,
             db: FleetDatabaseFacts {
                 sqlite: true,
@@ -11104,6 +11173,7 @@ mod tests {
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -11141,6 +11211,7 @@ mod tests {
             .fail("web-b", "readiness-gate");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -11168,6 +11239,7 @@ mod tests {
             .script("web-b", "probe-release-dir", "present");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
             configured_host_count: 3,
             ..fixture.input(&narrowed)
         };
