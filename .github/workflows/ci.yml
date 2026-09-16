@@ -1575,7 +1575,8 @@ jobs:
             --skip remember_me_accepts_previous_token_within_grace \
             --skip remember_me_rotates_across_restart_and_detects_theft
           cargo test -p teams -- --ignored --test-threads=1 --exact \
-            signup_and_login_failures_redisplay_the_form_with_email_preserved
+            signup_and_login_failures_redisplay_the_form_with_email_preserved \
+            create_invitation_redisplays_members_page_on_rejected_submission
           # `examples/cms` — the WordPress-parity CMS starter. Same story as
           # `saas` and `teams` above: example apps are not auto-swept, so
           # without this line its Docker-gated `tests/integration_test.rs`

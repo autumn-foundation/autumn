@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: redisplay the "Send Invitation" form on failure in
+  `examples/teams` (error-path 0/2 → 2/2, email/role preserved):**
+  `POST /invitations` — the admin-facing invite form embedded at the top of
+  `/members` — discarded the submission and dropped the admin onto a
+  generic `application/problem+json`/error-page dead end on both of its
+  recoverable failure modes (a malformed email, an unrecognized role),
+  losing the roster/pending-invitations page they were on and the
+  email/role they'd typed. This was the exact anti-pattern already fixed on
+  this app's `/signup` and `/invite/{token}/accept` forms (prior Wayfinder
+  PRs), explicitly flagged as a smaller, out-of-scope follow-up when
+  `create_invitation`'s admin form was found to share it. Unlike those two,
+  the invite form isn't its own page — it's embedded in the full `/members`
+  roster — so redisplaying it means rebuilding that whole page from live
+  data rather than re-rendering a form fragment.
+  `routes::members::list_members`'s page body is now a shared
+  `members_content` render function (roster + pending invitations + invite
+  form), and the new `redisplay_members_with_invite_error` re-fetches the
+  roster/pending invitations and calls it at 422 with the rejected
+  email/role preserved and the message shown, `role="alert"`/`aria-invalid`
+  wired the same way the other two forms already are.
+  `routes::invitations::create_invitation`'s two validation branches call it
+  instead of returning `Err`.
+
+  New unit tests cover `members_content`'s clean render, its error render
+  (message shown, email/role preserved), and that a plain `Member` never
+  sees the invite form at all. New Docker-gated integration test
+  (`create_invitation_redisplays_members_page_on_rejected_submission`)
+  drives both rejections end-to-end, confirms the roster/pending-invitations
+  content is still present on the redisplay (not replaced by a bare error
+  page), then confirms a corrected resubmission still sends the invite —
+  not run locally, no Docker available in this sandbox.
+
 - **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
   api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
   token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and

@@ -87,13 +87,18 @@ fn app_base_url() -> String {
 /// caller to already be an `Owner` — otherwise an Admin could mint a fresh
 /// Owner account of their own choosing.
 #[post("/invitations")]
+// Every argument is a distinct axum extractor; invitation_repo and csrf are
+// needed only to redisplay `/members` on a rejected submission.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_invitation(
     session: Session,
     Tenant(tenant_id): Tenant,
     mut db: Db,
     org_repo: PgOrganizationRepository,
     membership_repo: PgMembershipRepository,
+    invitation_repo: PgInvitationRepository,
     mailer: Mailer,
+    csrf: Option<CsrfToken>,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
     let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
@@ -101,14 +106,43 @@ pub async fn create_invitation(
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
 
+    // Both of these used to `Err(...)` out to the generic JSON/error-page
+    // response, dropping the admin off `/members` and losing the email/role
+    // they'd typed — the same anti-pattern already fixed on this app's
+    // `/signup` and `/invite/{token}/accept` forms. The invite form is
+    // embedded in the full `/members` roster page rather than being its own
+    // page, so redisplaying it means re-rendering that whole page with the
+    // submission preserved (Wayfinder: error-path inventory).
     let email = form.email.trim().to_lowercase();
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address",
-        ));
+        return super::members::redisplay_members_with_invite_error(
+            &mut db,
+            &membership_repo,
+            &invitation_repo,
+            caller_role,
+            &csrf,
+            super::members::InviteError {
+                email: &form.email,
+                role: &form.role,
+                message: "Enter a valid email address",
+            },
+        )
+        .await;
     }
     let Some(role) = Role::parse(&form.role) else {
-        return Err(AutumnError::unprocessable_msg("Unknown role"));
+        return super::members::redisplay_members_with_invite_error(
+            &mut db,
+            &membership_repo,
+            &invitation_repo,
+            caller_role,
+            &csrf,
+            super::members::InviteError {
+                email: &form.email,
+                role: &form.role,
+                message: "Unknown role",
+            },
+        )
+        .await;
     };
     if role == Role::Owner && caller_role != Role::Owner {
         return Err(AutumnError::forbidden_msg(
