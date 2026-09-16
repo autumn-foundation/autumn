@@ -44,11 +44,13 @@ this gate since #2795 was filed.
 
 ## 💡 Hypothesis
 
-`autumn/src/test.rs` (5,302 lines — `autumn_web::test::{TestApp, TestClient,
-TestResponse, ...}`, this crate's own first-party integration-testing
-harness) and `autumn/src/sim.rs` + `autumn/src/sim/{assert,chaos,crash,fault,
-llm,op,substrate,sweep}.rs` (7,035 lines — the deterministic simulation/chaos
-framework) are declared as plain `pub mod` in `autumn/src/lib.rs` with **no**
+`autumn/src/test.rs` + `test_html.rs` (6,478 lines combined —
+`autumn_web::test::{TestApp, TestClient, TestResponse, ...}`, this crate's
+own first-party integration-testing harness, plus the dependency-free HTML
+parser backing its structural assertions) and `autumn/src/sim.rs` + its 8
+submodules (`assert,chaos,crash,fault,llm,op,substrate,sweep` — 5,859 lines
+combined — the deterministic simulation/chaos framework) are declared as
+plain `pub mod` in `autumn/src/lib.rs` with **no**
 `#[cfg(feature = ...)]` gate at all — unlike `system_test`, `plugin_sandbox`,
 `system_info`, `seed`, `stories`, and `inbound_mail`, which already are. That
 means all 12,337 lines compile into *every* build of `autumn-web`, including a
@@ -107,42 +109,52 @@ target) and is gated only by `sim-testing`, which `.github/workflows/ci.yml`'s
 "Sim sweep (sim-testing)" job already runs **without** `test-support`. Still
 containable — `sim-testing` could be made to imply `test-support`.
 
-**Round 4 (found composing this section, not yet posted as a separate review
-round): this is where the mechanism actually breaks, not just widens.** The
-dev-dependency-unification trick only ever helps an *external consumer* of
-`autumn-web` — it does nothing for `autumn-web`'s own test suite, which
-cannot "dev-depend on itself" to get a different feature set for its own
-`cargo test` than its own `cargo build`. And `autumn-web`'s own test suite is
-not a small thing to lose: `grep -rl 'autumn_web::test\b' autumn/tests/`
-turns up **123** files under `autumn/tests/integration/` alone (the
-consolidated `integration_tests` binary), plus `crate::test::TestApp` inside
-`#[cfg(test)]` unit-test modules scattered through the crate's own source
-(e.g. `webhook_outbound.rs:1388`). `.github/workflows/ci.yml`'s `test` job —
-the one that runs on all three OSes and gates every PR — invokes exactly
-`cargo test --workspace -- --skip compile_fail:: --skip sim_` (line 786), with
-**no `--features` at all**, i.e. default features only, which do not include
-`test-support`. So does `AGENTS.md`'s own documented `cargo test -p <pkg>`.
-Gating `test`/`sim` behind `test-support` as proposed would fail to compile
-the consolidated integration binary — and the crate's own unit tests — on
-this repo's primary CI gate and its documented standard developer command,
-full stop, not as a "things to also update" footnote. There is no clean fix
-available inside Cargo's feature model: making `test-support` a default
-feature defeats the entire premise (it would be on for `cargo build` too, so
-production builds pay the cost this whole report exists to question);
-leaving it non-default breaks the base job outright. Making every one of the
-123+ call sites, plus CI's own invocation, pass `--features test-support`
-explicitly is a real option, but it stops being "the smallest change that
-moves the counter" once the smallest change also has to touch CI's primary
-gate and 100+ test files.
+**Round 4 (found composing this section; corrected again below after
+review): `autumn-web`'s own test suite is a much bigger consumer than the
+templates or `sim-sweep`.** The dev-dependency-unification trick only ever
+helps an *external consumer* of `autumn-web` — it does nothing for
+`autumn-web`'s own test suite, which cannot "dev-depend on itself" to get a
+different feature set for its own `cargo test` than its own `cargo build`.
+`grep -rl 'autumn_web::test\b' autumn/tests/` turns up **123** files under
+`autumn/tests/integration/` alone (the consolidated `integration_tests`
+binary), plus `crate::test::TestApp` inside `#[cfg(test)]` unit-test modules
+scattered through the crate's own source (e.g. `webhook_outbound.rs:1388`).
+`.github/workflows/ci.yml`'s `test` job — the one that runs on all three OSes
+and gates every PR — invokes exactly `cargo test --workspace -- --skip
+compile_fail:: --skip sim_` (line 786), with **no `--features` at all**, i.e.
+default features only, which do not include `test-support`. So does
+`AGENTS.md`'s own documented `cargo test -p <pkg>`.
+
+**Round 5 (review correction): that's a real gap, but not the 123-file one
+this report first claimed.** `--features <crate>/<feature>` (e.g. `cargo test
+--workspace --features autumn-web/test-support`) activates a feature for
+every target that single invocation builds — none of the 123 importing files
+would need editing individually; Cargo features are activated at the
+invocation/manifest level, not per call site. So the real remaining work is
+narrower than "100+ test files": update `ci.yml`'s `test` job invocation
+(line 786) and `AGENTS.md`'s documented `cargo test -p <pkg>`/`cargo test
+--workspace` commands to add `--features autumn-web/test-support` (or
+equivalent), on top of the two generator templates (Round 2) and the
+`sim-sweep` bin's `sim-testing` gate (Round 3) already found. That is a real,
+coordinated, multi-file change across CI config, a contributor-facing doc,
+and generator templates — not something to fold into this report as a
+side-effect — but it is *not* the "no clean fix exists" claim an earlier
+draft of this paragraph made.
 
 **Bottom line on the mechanism**, independent of the verdict below: what
 looked, at first read of `test.rs`'s module doc and one existing feature
-flag, like an obviously-available and already-proven fix is not proven at
-all once you count where the modules are actually used — three rounds of
-review each surfaced a strictly larger and eventually structural gap. Moot
-either way given the timing verdict below (there is no compile-time win to
-chase), but recorded in full because the mechanism itself, not just this
-report's numbers, is worth knowing to be broken before anyone tries it.
+flag, like an obviously-available and already-proven fix is not that either —
+five rounds of review (three from outside, two self-corrections while
+drafting this section) kept finding real, previously-uncounted places the
+proposed gate would need to reach: two generator templates, one CI bin
+target's feature gate, and the primary CI job's own test invocation plus
+this repo's documented standard test command. None of those individually is
+a blocker — each has a known fix — but together they add up to a real,
+scoped follow-up change, not the one-line, purely-additive gate this report
+first described. Moot either way given the timing verdict below (there is no
+compile-time win to chase), but recorded in full because the mechanism's
+actual scope, not just this report's numbers, is worth getting right before
+anyone tries it.
 
 **Falsifiable question:** does removing these 12,337 always-on lines produce
 a measurable compile-time reduction for the no-DB daemon feature set
@@ -236,7 +248,7 @@ than the swing either condition shows on its own across runs.
 
 ## 🏁 Verdict: negative result
 
-Removing all 12,337 lines of `test.rs`/`sim.rs` (and its 7 submodules) —
+Removing all 12,337 lines of `test.rs`/`test_html.rs`/`sim.rs` (and its 8 submodules) —
 currently the largest **unconditionally-compiled, unambiguously test-only**
 source in `autumn-web`, confirmed compile-clean to remove **for the `--lib`
 target** (the measurement's own build target, so the timing numbers below are
@@ -248,20 +260,24 @@ interleaved specifically to rule out ordering/drift effects. The hypothesis
 that these modules are a meaningful contributor to the ~43-55s issue #2795
 measured is **not supported**.
 
-Caveat on precision, not a hedge on the conclusion: this sandbox's own
-measured run-to-run noise (up to ~20s on a single sample) is far coarser than
-the GitHub Actions noise floor an earlier draft of this report mistakenly
-borrowed, and at roughly 4-5% of `autumn-web`'s line count, even a perfectly
-line-proportional contribution from these modules would be invisible under
-noise this size. This result rules out a **large** contributor (the median
-comparison shows no directional effect at all, let alone one of the
-magnitude issue #2795's numbers would require) but cannot rule out a small
-one. It does not change the recommendation: this is not where the next round
-of #2795 should spend its time, and — per the correction above — nor is a
-same-box wall-clock/`--timings` comparison on this particular sandbox a
-precise-enough instrument to chase a small effect further; CI's own gate
-(with its established, smaller noise floor) or a lower-noise box would be
-needed for that.
+**Correction, second round (review):** an earlier draft of this paragraph
+claimed the result "rules out a large contributor." On reflection (and per
+review) that overstates what 3 samples per condition, one of them a
+~15-20s outlier, can support: a standard deviation or a median is not a hard
+exclusion bound, and this apparatus's own noise is large enough that a real
+effect of several seconds — which is smaller than the swing either condition
+showed on its own across runs — could not be reliably distinguished from
+that noise at this sample size, in either direction. The honest statement is
+narrower: **this apparatus did not detect an effect**, the medians show no
+consistent direction (if anything, slightly opposite the hypothesis), and
+resolving whether a smaller real effect exists needs a lower-noise
+environment (CI's own gate, with its established and much smaller noise
+floor, or a dedicated non-shared box) and more than 3 samples per condition
+— not a stronger claim from the data already in hand. It does not change the
+recommendation: this is not where the next round of #2795 should spend its
+time chasing a *large* effect (issue #2795's own numbers, 43-55s attributed
+to `autumn-web`'s hand-written source, would require one), but this specific
+apparatus is the wrong tool to go looking for a small one here.
 
 This does **not** ship a code change — reverted the local experiment,
 nothing committed to `autumn/src/lib.rs`. Per Onramp's impact floor, a change
