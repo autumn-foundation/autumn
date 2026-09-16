@@ -1313,27 +1313,41 @@ impl JobRegistry {
     /// so every entry it inserts would otherwise sit here until capacity
     /// eviction, regardless of whether some other replica has long since
     /// claimed and finished the job. Eviction therefore prefers an entry
-    /// whose `ready_at_ms` has already passed: Postgres never hands a row to
-    /// a claimer before its own `run_at`, so an entry still in the future is
-    /// *guaranteed* to be a live, uncontested "enqueued but not yet
-    /// claimable" mark, while an already-due one may well have been claimed
-    /// by this process or another already. This protects exactly the
-    /// scenario that otherwise degrades worst — an older, still genuinely
-    /// delayed job's entry evicted by a burst of newer immediate enqueues —
-    /// without needing to know this process's worker/web role or query the
-    /// database. Falls back to the oldest-inserted entry only when every
-    /// tracked entry is still in the future (evicting one then is
-    /// unavoidable, and no candidate is more "used up" than another).
+    /// that is already due: Postgres never hands a row to a claimer before
+    /// its own `run_at`, so an entry still in the future is *guaranteed* to
+    /// be a live, uncontested "enqueued but not yet claimable" mark, while
+    /// an already-due one may well have been claimed by this process or
+    /// another already.
+    ///
+    /// "Already due" has to be judged carefully: values in this table sit on
+    /// two different timelines depending on how they were enqueued — an
+    /// absolute (`enqueue_at`) or relative-delay (`enqueue_in`) mark is real
+    /// time (`JobClient::due_origin`'s Postgres convention), while an
+    /// immediate one is this registry's own (possibly injected/virtual)
+    /// clock (see [`Self::record_pg_enqueue`]) — and a single entry here
+    /// carries no tag saying which. Comparing every entry against only one
+    /// of those two clocks can misjudge the other kind whenever they
+    /// disagree (a `FixedClock`/`TickingClock` pinned away from wall time):
+    /// judging a real-time relative-delay mark against a far-future
+    /// registry clock alone would call it "due" long before it actually is,
+    /// evicting exactly the still-genuinely-delayed entry this is meant to
+    /// protect. An entry only counts as due here when it is due on *both*
+    /// clocks — never wrongly evicting a genuinely-still-delayed entry, at
+    /// the cost of only falling back to oldest-inserted (matching this
+    /// method's pre-existing behavior) instead of discriminating further
+    /// when the two clocks disagree.
     pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64) {
         if let Ok(mut guard) = self.queues.write() {
             if guard.pg_marks_by_job_id.len() >= PG_MARKS_BY_JOB_ID_CAP
                 && !guard.pg_marks_by_job_id.contains_key(id)
             {
-                let now = self.now_ms();
+                let registry_now = self.now_ms();
+                let real_now =
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
                 let evict_idx = guard
                     .pg_marks_by_job_id
                     .iter()
-                    .position(|(_, mark)| *mark <= now)
+                    .position(|(_, mark)| *mark <= registry_now && *mark <= real_now)
                     .unwrap_or(0);
                 guard.pg_marks_by_job_id.shift_remove_index(evict_idx);
             }
@@ -5099,6 +5113,54 @@ mod tests {
             registry.pg_mark_contains_id_for_test("still-delayed"),
             "an entry still in the future must never be evicted while an already-due \
              entry is available to evict instead"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit a460209: comparing every
+    /// mark against a single clock misjudges the other kind whenever the
+    /// registry's own (possibly injected/virtual) clock and real time
+    /// disagree. Pins the registry's clock far in the future — as an app
+    /// injecting a `FixedClock`/`TickingClock` ahead of wall time would —
+    /// and confirms a genuinely-still-delayed real-time mark is never
+    /// mistaken for "due" just because it looks small next to the
+    /// registry's far-future reading.
+    #[test]
+    fn note_pg_job_mark_eviction_requires_both_clocks_to_agree_it_is_due() {
+        use chrono::{TimeZone, Utc};
+
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
+        ));
+        registry.register_on_queue("skewed", "mail");
+
+        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        // 5 real-world minutes out — genuinely not due yet — but a "small"
+        // number next to the registry's year-2100 reading, which is exactly
+        // what made the single-clock check call it due in error.
+        let genuinely_delayed = real_now + 300_000;
+
+        // Inserted first, so plain FIFO (and the single-clock check) would
+        // pick it first.
+        registry.record_pg_enqueue("skewed", "still-delayed", Some(genuinely_delayed));
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            // Genuinely due under both clocks (epoch 0 is in the past on any
+            // clock), so these are always legitimate eviction candidates.
+            registry.record_pg_enqueue("skewed", &format!("filler-{i}"), Some(0));
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("skewed", "one-more", Some(0));
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "a mark that is not yet due in real time must never be evicted just because \
+             the registry's own (far-future) clock alone would call it due"
         );
     }
 
