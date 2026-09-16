@@ -18,9 +18,11 @@ pub fn has_attr(field: &Field, name: &str) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-/// Whether a field is declared `#[translatable]` (issue #1384): its column
-/// holds an `autumn_web::i18n::Translated` container — an independent value
-/// per locale tag — instead of a single monolingual string.
+/// Whether a field is declared `#[translatable]` (issue #1384).
+///
+/// Its column holds an `autumn_web::i18n::Translated` container — an
+/// independent value per locale tag — instead of a single monolingual
+/// string.
 #[must_use]
 pub fn field_is_translatable(field: &syn::Field) -> bool {
     has_attr(field, "translatable")

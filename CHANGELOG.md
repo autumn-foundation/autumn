@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macro crate split follow-up: `autumn_web::prelude::service` compiles
+  again, and `autumn plugin list` no longer flags itself.** The split moved
+  `#[service]` into `autumn-macros-model` (gated behind the `db` feature) but
+  `autumn/src/prelude.rs` still re-exported it unconditionally from
+  `autumn_macros`, breaking every build (`error[E0432]: unresolved import
+  autumn_macros::service`); the prelude now re-exports it from
+  `autumn_macros_model` under `#[cfg(feature = "db")]`, matching the
+  already-correct top-level `autumn_web::service` re-export. Also: the
+  `autumn-cli` plugin catalog's workspace-coverage self-test didn't know the
+  three new macro crates (`autumn-macros-model`, `autumn-macros-repository`,
+  `autumn-macros-support`) are core, not installable plugins; two
+  `clippy::too_long_first_doc_paragraph` failures newly reachable in the
+  freshly-created `autumn-macros-support` are split with a blank doc-comment
+  line; and two pre-existing `-D warnings` clippy failures elsewhere in the
+  workspace (a stray `Duration::from_millis(3000)` instead of
+  `from_secs(3)`, a missing doc-markdown backtick around `SQLite`) are fixed
+  alongside so the workspace lints clean again.
 - **the Cold-Start Onboarding Gate stops failing every scheduled run (#2309):**
   the gate (issue #977) checks the no-DB `hello` app against a p95 60s / max
   90s budget. It failed all 9+ scheduled runs since it was created.

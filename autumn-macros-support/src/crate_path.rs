@@ -257,6 +257,7 @@ pub fn current_target() -> String {
 }
 
 /// Rewrite every macro-generated `::autumn_web` path to [`current_target`].
+///
 /// A no-op whenever that target is the unrenamed default — the overwhelming
 /// majority of expansions, since a rename or override is rare.
 #[must_use]
