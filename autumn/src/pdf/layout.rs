@@ -103,17 +103,21 @@ fn nodes_contain_an_li(nodes: &[Node]) -> bool {
         .any(|node| matches!(node, Node::Element { tag, .. } if tag == "li"))
 }
 
-/// True if `nodes`, or anything nested inside them, holds non-empty text —
-/// skipping [`is_non_rendered`] subtrees, same as [`subtree_has_visible_content`].
+/// True if `nodes`, or anything nested inside them, would leave a mark in
+/// a fresh, empty `Vec<Span>` run through `inline_spans` — skipping
+/// [`is_non_rendered`] subtrees, same as [`subtree_has_visible_content`].
 ///
 /// Unlike that function, a structural tag (`<div>`, `<p>`, ...) does *not*
 /// count on its own here: `extract_table_rows`'s catch-all arm builds this
-/// exact `children` list into a fresh, empty `Vec<Span>` via `inline_spans`,
-/// so `push_block_break`'s "skip a leading/trailing break" rule empties out
-/// any break a content-free structural tag would otherwise add (unlike
-/// `inline_spans`'s *other* callers, which hand it a buffer that already
-/// has real siblings' text in it). Only actual text survives that, so only
-/// actual text should count here.
+/// exact `children` list into a fresh, empty buffer, so `push_block_break`'s
+/// "skip a leading/trailing break" rule empties out any break a
+/// content-free structural tag would otherwise add (unlike `inline_spans`'s
+/// *other* callers, which hand it a buffer that already has real siblings'
+/// text in it). Only two things survive that: actual text, and a `<li>`'s
+/// marker — [`inline_list_items`] pushes that as a real `Span::Run`, not a
+/// `Span::Break`, for any `<li>` that is a direct child of a `<ul>`/`<ol>`,
+/// even a completely empty one (see
+/// `empty_li_past_the_depth_cap_still_warns`), so it is never trimmed away.
 fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
     while let Some(node) = stack.pop() {
@@ -124,6 +128,9 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
                 }
             }
             Node::Element { tag, children } => {
+                if (tag == "ul" || tag == "ol") && nodes_contain_an_li(children) {
+                    return true;
+                }
                 if !is_non_rendered(tag) {
                     stack.extend(children);
                 }
@@ -2889,6 +2896,27 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "a <tr> with a real <td> cell draws a row, so this must warn"
+        );
+    }
+
+    #[test]
+    fn table_caption_with_an_empty_list_item_past_the_depth_cap_still_warns() {
+        // A <li> inside a <ul> always draws a marker, even empty (see
+        // empty_li_past_the_depth_cap_still_warns) — including one reached
+        // through extract_table_rows's catch-all arm, which hands a
+        // <caption>'s children to inline_spans same as anywhere else.
+        // subtree_has_nonempty_text alone can't see this: the marker isn't
+        // a literal Text node in the source HTML, it's synthesized by
+        // inline_list_items.
+        let html = format!(
+            "{}<table><caption><ul><li></li></ul></caption></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a real <li>'s marker draws even when the <li> itself is empty, so this must warn"
         );
     }
 
