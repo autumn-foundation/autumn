@@ -3669,6 +3669,11 @@ exits non-zero under `--strict`.
 never rewrites it, so it is never a verdict on the last rollout, and it is
 reported, not drift.
 
+A halted `deploy up` and drift found by `deploy status --strict` each raise a
+`ScheduledTaskFailure` operator alert through the same outbound-HTTP `[alerts]`
+channel used by the offsite-upload alert above — email is not notified, same
+rule as issue #1743 (issue #2267).
+
 The **maintenance cell is three-valued** — `maintenance ON` / `maintenance off` /
 `maintenance ?` — and reports the flag file the host's RUNNING slot unit polls,
 resolved on the host from that unit's `Environment=AUTUMN_MAINTENANCE_FLAG_FILE`

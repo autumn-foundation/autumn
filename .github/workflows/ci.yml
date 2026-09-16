@@ -1365,6 +1365,14 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
             || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          # Issue #2108: the same AdminModel cover as token_admin_db, for the
+          # two models that read a `timestamptz` column. Both assert the audit
+          # timestamp stays UTC after the Timestamptz -> Timestamp change.
+          cargo test -p autumn-admin-plugin --test experiment_admin_db -- --ignored
+          cargo test -p autumn-admin-plugin --test feature_flag_admin_db -- --ignored
+          # The Postgres half of the cross-backend proof. The SQLite half runs
+          # in the `sqlite-runtime` job, from the same test body.
+          cargo test -p autumn-admin-plugin --test custom_admin_model -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test experiment_admin_bulk_delete_batch_profile -- --ignored
@@ -1812,6 +1820,11 @@ jobs:
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
+          # the cross-backend model suite. Without this lane Codecov reads them
+          # as a new uncovered surface. No Docker, ~0.01s of runtime.
+          cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
+            --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
@@ -1828,6 +1841,12 @@ jobs:
             --test scoped_tokens_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test experiment_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test feature_flag_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test custom_admin_model -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -1946,6 +1965,37 @@ jobs:
         # newly-added module rot the same way the pool tests did — silently,
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
+      - name: Build autumn-admin-plugin under the sqlite backend
+        # Issue #2108. The plugin has no `sqlite` feature of its own — a
+        # manifest edge would flip the backend for the whole workspace, and
+        # `scripts/check-sqlite-unification.sh` rejects one — so the flip is an
+        # EXPLICIT `--features autumn-web/sqlite` here, and nowhere else.
+        #
+        # `--all-targets`, not `--lib`: every test binary of this crate also
+        # compiles under the flip, so the gate covers the dev surface too. Keep
+        # it that way. A test target that hardcodes `AsyncPgConnection` again
+        # fails here.
+        run: cargo clippy -p autumn-admin-plugin --features autumn-web/sqlite --all-targets -- -D warnings
+      - name: Run the admin-plugin model suite under sqlite
+        # The SAME test body the `Test (Docker)` job runs on Postgres: an
+        # application model driven through the whole `AdminModel` surface.
+        # Green here means a SQLite app can register its own admin models.
+        # No Docker: the fixture is an in-memory SQLite database.
+        #
+        # `scripts/pre-push-check.sh` skips this lane, so this step and the one
+        # above are the only gate on the plugin's SQLite build.
+        #
+        # The pass count is checked, because `-- --ignored` exits 0 when NO
+        # test matches. Drop the `#[ignore]` and this step would report green
+        # with nothing run — and it is the only place the SQLite arms execute.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-admin-plugin --features autumn-web/sqlite \
+            --test custom_admin_model -- --ignored \
+            | tee "${RUNNER_TEMP}/admin-plugin-sqlite.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
+            || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -1977,6 +2027,7 @@ jobs:
             --test sqlite_dependent_destroy \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
+            --test sqlite_framework_migrations \
             --test sim_chaos \
             --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \

@@ -163,6 +163,7 @@ pub mod consent;
 // `classify` carry one: an outer `///` here is merged with the module's own
 // `//!` docs, and the whole block then resolves its intra-doc links in *this*
 // scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
 pub mod credentials;

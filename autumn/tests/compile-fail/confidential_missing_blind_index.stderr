@@ -1,0 +1,6 @@
+error: `#[confidential(blind_index)]` needs a companion column `body_bidx: autumn_web::confidential::BlindIndex` on this model. The client computes the token; the server only compares it.
+  --> tests/compile-fail/confidential_missing_blind_index.rs:18:5
+   |
+18 | /     #[confidential(blind_index)]
+19 | |     pub body: autumn_web::confidential::Sealed,
+   | |______________________________________________^
