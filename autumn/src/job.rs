@@ -746,6 +746,10 @@ struct BatchEnqueueRow {
     /// back to the right slot, no matter what order rows insert in.
     result_index: usize,
     id: String,
+    /// Kept alongside `payload_json` (the pre-serialized bind value) so a
+    /// batch that fails as a whole can retry this row through the
+    /// ordinary single-item path, which takes a [`Value`], not a string.
+    payload: Value,
     payload_json: String,
     due_at: Option<chrono::DateTime<chrono::Utc>>,
     unique_key: Option<String>,
@@ -3734,6 +3738,13 @@ impl JobClient {
     /// sorted by that index before return. This avoids writing into a
     /// pre-sized slot by index, which this module's panic-free gate does
     /// not allow.
+    ///
+    /// If the one batched `INSERT` call itself fails, every row retries
+    /// through the ordinary single-item path instead of failing together.
+    /// One statement has no per-row failure of its own, so a single bad
+    /// row (say, a unique key too long for the index) would otherwise take
+    /// its batch-mates down with it — breaking this method's promise that
+    /// one item's failure does not affect the others.
     #[cfg(feature = "db")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_many_pg(
@@ -3833,6 +3844,7 @@ impl JobClient {
             batch.push(BatchEnqueueRow {
                 result_index,
                 id,
+                payload,
                 payload_json,
                 due_at,
                 unique_key: constraints.unique_key,
@@ -3932,6 +3944,21 @@ impl JobClient {
                                 }
                             }
                             Err(error) => {
+                                // The batched `INSERT` is one statement, so
+                                // one row with a genuine data problem (say,
+                                // a unique key too long for the index) fails
+                                // the whole statement, not just that row.
+                                // Retrying every row through the ordinary
+                                // single-item path keeps this method's
+                                // per-item isolation promise: an unrelated
+                                // row that would have succeeded on its own
+                                // still gets to. A real outage fails the
+                                // same way it would have without this
+                                // retry — every row's own `before_call`
+                                // check below sees the breaker this batch
+                                // just tripped and fails fast, not once
+                                // per row against a dead database. Caught
+                                // by Codex review on PR #2816.
                                 let message = error.to_string();
                                 for row in batch {
                                     if row.due_at.is_some() {
@@ -3949,7 +3976,10 @@ impl JobClient {
                                         row.now,
                                         Some(&row_error),
                                     );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                    let retry_result = self
+                                        .enqueue_with_outcome_due(name, row.payload, row.due_at)
+                                        .await;
+                                    resolved.push((row.result_index, retry_result));
                                 }
                             }
                         }
@@ -11342,6 +11372,61 @@ mod tests {
         assert!(
             error.to_string().contains("__autumn_tracked"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Codex review finding on PR #2816: `pg_insert_jobs_many` is one SQL
+    /// statement, so one row's genuine data problem (say, a unique key too
+    /// long for the index) would otherwise fail every other row in the
+    /// same batch too — breaking `enqueue_many_due`'s promise that one
+    /// item's failure does not affect the others. When the batch call
+    /// itself fails, every row must retry independently instead of
+    /// sharing one blanket failure.
+    ///
+    /// Drives this with a pool that can never connect, so both the batch
+    /// call and its per-row retries fail the same way — no live Postgres
+    /// needed to prove every item still gets resolved on its own, keyed to
+    /// its own original position, rather than being dropped or merged.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn enqueue_many_due_retries_each_row_independently_when_the_batch_insert_fails() {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+
+        let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+            "postgres://bogus-host-never-dialed/db",
+        );
+        let pool = Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builder never dials a connection");
+
+        let mut client = JobClient::bare_for_test(Arc::new(crate::time::SystemClock));
+        client.pg_pool = Some(pool);
+        client
+            .per_job_settings
+            .insert("plain_job".to_string(), JobRuntimeSettings::basic(3, 250));
+
+        let items = vec![
+            (serde_json::json!({"n": 1}), None),
+            (serde_json::json!({"n": 2}), None),
+            (serde_json::json!({"n": 3}), None),
+        ];
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.enqueue_many_due("plain_job", items),
+        )
+        .await
+        .expect("an unreachable host must fail fast, not hang");
+
+        assert_eq!(
+            results.len(),
+            3,
+            "one result per item, even after the batch call fails and retries"
+        );
+        assert!(
+            results.iter().all(std::result::Result::is_err),
+            "an unreachable pool must fail every item, not silently succeed: {results:?}"
         );
     }
 
