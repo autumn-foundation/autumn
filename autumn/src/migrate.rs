@@ -3233,22 +3233,40 @@ fn sqlite_collision_history_moves(
             // never ran, so the plain version still belongs to whichever
             // other side won the collision.
             false
-        } else if sets
-            .iter()
-            .flatten()
-            .any(|(v, name)| v == version && new_framework_names.contains(name.as_str()))
-        {
-            // A different full name at this version IS a framework migration
-            // new to `SQLite`. It never ran, so this plain-version record can
-            // only be `full_name`'s.
-            true
         } else {
-            // Neither side is a framework migration this fork made new to
-            // `SQLite` — an ordinary collision between two other registered
-            // sources (e.g. the app's own migrations and a plugin's). Which
-            // side ran is genuinely ambiguous from names alone; leave it for
-            // an operator, as before this fork existed.
-            continue;
+            let names_at_version: Vec<&str> = sets
+                .iter()
+                .flatten()
+                .filter(|(v, _)| v == version)
+                .map(|(_, name)| name.as_str())
+                .collect();
+            let has_new_framework_participant = names_at_version
+                .iter()
+                .any(|name| new_framework_names.contains(*name));
+            let non_framework_participants = names_at_version
+                .iter()
+                .filter(|name| !new_framework_names.contains(**name))
+                .count();
+            if has_new_framework_participant && non_framework_participants == 1 {
+                // Exactly one non-framework name shares this version (the
+                // migration new to `SQLite` proven never to have run, plus
+                // `full_name` alone) — the pre-existing record can only be
+                // `full_name`'s, winner or not.
+                true
+            } else {
+                // Either no framework migration new to `SQLite` shares this
+                // version (an ordinary collision between two other
+                // registered sources, e.g. the app's own migrations and a
+                // plugin's — which side ran is genuinely ambiguous from
+                // names alone), or more than one does (a three-or-more-way
+                // collision, where a second non-framework participant, such
+                // as the winner that keeps the plain version, could be the
+                // true owner instead). Generating a move for every
+                // remapped name here would risk marking more than one
+                // migration applied against a single database row. Leave
+                // it for an operator, as before this fork existed.
+                continue;
+            }
         };
         if remapped_ran {
             moves.push(SqliteCollisionMove {
@@ -4273,6 +4291,70 @@ mod tests {
         assert!(
             moves.is_empty(),
             "a collision with the legacy shim must not be guessed at: {moves:?}"
+        );
+    }
+
+    /// A three-way version collision — a framework migration new to
+    /// `SQLite` plus TWO other registered sources (e.g. the app's own
+    /// migrations and a plugin's) — is left unresolved for the
+    /// non-framework side too (issue #2699 review finding). There is only
+    /// one row in `__diesel_schema_migrations` for the shared version;
+    /// generating a move for every remapped non-framework name would claim
+    /// more than one migration is that row's owner, marking a migration
+    /// applied that never actually ran.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_three_way_collision_with_a_new_framework_migration_is_left_unresolved() {
+        let (migrations_dir, url) = sqlite_scratch("three-way-collision");
+        let older = migrations_dir.join("20260512000000_aaa_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE aaa (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE aaa;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // An older release, before either the plugin or this fork existed:
+        // only the app's migration applied, under its plain version.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        // A newer release adds both a plugin and this fork's framework
+        // migration at the same version. The app's name sorts first (wins,
+        // keeps the plain version); the plugin's name sorts between the
+        // app's and the framework's (per the review finding) and is
+        // remapped, same as the framework migration.
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "20260512000000".to_owned(),
+                "20260512000000_bbb_plugin".to_owned(),
+            )],
+            vec![(
+                "20260512000000".to_owned(),
+                "20260512000000_create_api_tokens".to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "20260512000000_bbb_plugin".to_owned(),
+            "20260512000000+deadbeef".to_owned(),
+        );
+        disambiguated.insert(
+            "20260512000000_create_api_tokens".to_owned(),
+            "20260512000000+cafef00d".to_owned(),
+        );
+
+        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect("resolve moves");
+        assert!(
+            moves.is_empty(),
+            "a three-way collision must not be guessed at: {moves:?}"
         );
     }
 
