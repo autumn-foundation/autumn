@@ -72,7 +72,9 @@ fn run_simulation(
         let ops = match edit {
             Edit::Insert { index, text } => {
                 let at = index % (replicas[replica].len() + 1);
-                replicas[replica].insert(&actor, at, text)
+                replicas[replica]
+                    .insert(&actor, at, text)
+                    .expect("collab edit refused")
             }
             Edit::Delete { index, count } => {
                 let live = replicas[replica].len();
@@ -105,16 +107,20 @@ fn run_simulation(
 #[test]
 fn sim_collab_every_interleaving_of_a_fixed_op_set_converges() {
     // Six operations from three replicas branching off one base.
-    let base = CollabText::from_text("seed", "abc");
+    let base = CollabText::from_text("seed", "abc").expect("collab edit refused");
     let mut ops = Vec::new();
     for (actor, index, text) in [("x", 0, "1"), ("y", 3, "2"), ("z", 2, "3")] {
         let mut replica = base.clone();
-        ops.extend(replica.insert(actor, index, text));
+        ops.extend(
+            replica
+                .insert(actor, index, text)
+                .expect("collab edit refused"),
+        );
     }
     let mut deleter = base.clone();
     ops.extend(deleter.remove(1, 1)); // tombstone 'b'
     let mut appender = base.clone();
-    ops.extend(appender.insert("w", 3, "45")); // two more characters
+    ops.extend(appender.insert("w", 3, "45").expect("collab edit refused")); // two more characters
     assert_eq!(ops.len(), 6, "the fixed op set is six operations");
 
     let orders = permutations_of(ops.len());
@@ -169,7 +175,7 @@ fn permutations_of(n: usize) -> Vec<Vec<usize>> {
 /// the seed, which is what makes the property test above actionable.
 #[test]
 fn sim_collab_replays_byte_identically_under_a_fixed_seed() {
-    let base = CollabText::from_text("seed", "hello");
+    let base = CollabText::from_text("seed", "hello").expect("collab edit refused");
     let edits = vec![
         (
             0,
@@ -225,7 +231,7 @@ proptest! {
         edits in proptest::collection::vec((0usize..5, edit_strategy()), 1..14),
         seed in any::<u64>(),
     ) {
-        let base = CollabText::from_text("seed", "start");
+        let base = CollabText::from_text("seed", "start").expect("collab edit refused");
         let replicas = run_simulation(&base, replica_count, &edits, seed);
 
         let distinct: HashSet<String> = replicas.iter().map(bytes).collect();
@@ -248,7 +254,7 @@ proptest! {
         edits in proptest::collection::vec((0usize..3, edit_strategy()), 1..10),
         seed in any::<u64>(),
     ) {
-        let base = CollabText::from_text("seed", "abc");
+        let base = CollabText::from_text("seed", "abc").expect("collab edit refused");
         let replicas = run_simulation(&base, 3, &edits, seed);
 
         // Every operation any replica produced is present in every replica.
@@ -276,7 +282,7 @@ proptest! {
 /// path was exercised.
 #[test]
 fn sim_collab_the_stored_form_round_trips_and_re_canonicalizes() {
-    let mut doc = CollabText::from_text("seed", "abc");
+    let mut doc = CollabText::from_text("seed", "abc").expect("collab edit refused");
     // An operation whose cause will never arrive: it must survive the trip.
     doc.apply(CollabOp::Insert {
         id: autumn_web::collab::OpId::new(900, "ghost"),
@@ -314,17 +320,17 @@ fn sim_collab_the_stored_form_round_trips_and_re_canonicalizes() {
 /// concurrent with another insert.
 #[test]
 fn sim_collab_a_deep_causal_chain_converges_in_any_order() {
-    let base = CollabText::from_text("seed", "ab");
+    let base = CollabText::from_text("seed", "ab").expect("collab edit refused");
 
     // Replica x builds a three-character chain; replica y branches off the
     // middle of it, which it can only do after receiving part of the chain.
     let mut x = base.clone();
-    let chain = x.insert("x", 1, "123");
+    let chain = x.insert("x", 1, "123").expect("collab edit refused");
     let mut y = base.clone();
     y.apply_all(chain.clone());
-    let branch = y.insert("y", 2, "-");
+    let branch = y.insert("y", 2, "-").expect("collab edit refused");
     let mut z = base.clone();
-    let tail = z.insert("z", 2, "!");
+    let tail = z.insert("z", 2, "!").expect("collab edit refused");
 
     let mut ops = chain;
     ops.extend(branch);

@@ -56,8 +56,8 @@ pub use registry::{
     registered_collaborative_columns,
 };
 pub use text::{
-    CollabElement, CollabOp, CollabText, EMPTY_DOCUMENT, IMPORT_ACTOR, MAX_COUNTER,
-    MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId, OpIdParseError,
+    CollabEditError, CollabElement, CollabOp, CollabText, EMPTY_DOCUMENT, IMPORT_ACTOR,
+    MAX_COUNTER, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId, OpIdParseError,
 };
 
 #[cfg(feature = "presence")]

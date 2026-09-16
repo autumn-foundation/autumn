@@ -48,7 +48,7 @@ pub trait NoteRepository {
 fn seeded() -> Note {
     Note {
         id: 1,
-        body: CollabText::from_text("seed", "hello world"),
+        body: CollabText::from_text("seed", "hello world").expect("collab edit refused"),
         scratch: CollabText::new(),
         title: "greeting".to_owned(),
     }
@@ -81,7 +81,8 @@ fn the_field_keyed_accessors_resolve_documents() {
 
     note.collaborative_mut("scratch")
         .expect("scratch is collaborative")
-        .insert("a", 0, "todo");
+        .insert("a", 0, "todo")
+        .expect("collab edit refused");
     assert_eq!(note.scratch_text(), "todo");
     assert!(note.collaborative_mut("title").is_none());
 }
@@ -92,8 +93,10 @@ fn generated_helpers_merge_concurrent_edits_character_by_character() {
     let mut ada = seeded();
     let mut linus = seeded();
 
-    let from_ada = ada.body_insert("ada", 5, ",");
-    let from_linus = linus.body_insert("linus", 11, "!");
+    let from_ada = ada.body_insert("ada", 5, ",").expect("collab edit refused");
+    let from_linus = linus
+        .body_insert("linus", 11, "!")
+        .expect("collab edit refused");
 
     for op in from_linus {
         ada.body.apply(op);
@@ -113,8 +116,12 @@ fn set_text_does_not_clobber_a_concurrent_edit() {
     let mut ada = seeded();
     let mut linus = seeded();
 
-    let from_ada = ada.body_set_text("ada", "hello cruel world");
-    let from_linus = linus.body_insert("linus", 11, "!");
+    let from_ada = ada
+        .body_set_text("ada", "hello cruel world")
+        .expect("collab edit refused");
+    let from_linus = linus
+        .body_insert("linus", 11, "!")
+        .expect("collab edit refused");
 
     for op in from_linus {
         ada.body.apply(op);
@@ -133,7 +140,9 @@ fn generated_remove_converges_with_a_concurrent_insert() {
     let mut linus = seeded();
 
     let from_ada = ada.body_remove(0, 6); // "world"
-    let from_linus = linus.body_insert("linus", 11, "!");
+    let from_linus = linus
+        .body_insert("linus", 11, "!")
+        .expect("collab edit refused");
 
     for op in from_linus {
         ada.body.apply(op);
@@ -211,7 +220,7 @@ async fn documents_round_trip_and_merge_without_losing_characters() {
 
     let saved = repo
         .save(&NewNote {
-            body: CollabText::from_text("seed", "hello world"),
+            body: CollabText::from_text("seed", "hello world").expect("collab edit refused"),
             scratch: CollabText::new(),
             title: "greeting".to_owned(),
         })
@@ -229,8 +238,10 @@ async fn documents_round_trip_and_merge_without_losing_characters() {
     // Two editors load the same record and edit different spans.
     let mut ada = loaded.clone();
     let mut linus = loaded;
-    ada.body_insert("ada", 5, ",");
-    linus.body_insert("linus", 11, "!");
+    ada.body_insert("ada", 5, ",").expect("collab edit refused");
+    linus
+        .body_insert("linus", 11, "!")
+        .expect("collab edit refused");
 
     // Both write back; the second write merges rather than overwriting.
     repo.update(

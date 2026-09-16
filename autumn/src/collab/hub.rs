@@ -77,7 +77,9 @@ use serde::{Deserialize, Serialize};
 use crate::channels::{Channels, Subscriber};
 use crate::presence::{Presence, PresenceHandle};
 
-use super::text::{CollabElement, CollabOp, CollabText, MAX_WIRE_ELEMENTS, OpId};
+use super::text::{
+    CollabEditError, CollabElement, CollabOp, CollabText, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId,
+};
 
 /// Channel and presence topic for a document key.
 #[must_use]
@@ -186,6 +188,26 @@ pub enum CollabError {
         /// Configured limit.
         limit: usize,
     },
+    /// The batch would leave the causal buffer past [`MAX_WIRE_PENDING`].
+    ///
+    /// Separate from [`DocumentFull`](Self::DocumentFull) because it is a
+    /// separate limit: `max_document_chars` bounds what the document *holds*,
+    /// this bounds what is *waiting for a cause*. A batch of distinct inserts
+    /// whose anchors never arrive passes the first — a thousand of them are
+    /// far below ten thousand characters — while leaving every one of them in
+    /// the buffer, which is the shape `MAX_WIRE_PENDING` was measured against.
+    /// Accepting it builds a document this crate's own decoder refuses, so
+    /// the row round-trips out of the database and back as unreadable.
+    #[error("the causal buffer holds {got} operations, at the limit of {limit}")]
+    CausalBufferFull {
+        /// Operations the buffer would hold.
+        got: usize,
+        /// The wire limit.
+        limit: usize,
+    },
+    /// An edit could not be minted — see [`CollabEditError`].
+    #[error(transparent)]
+    Edit(#[from] CollabEditError),
     /// A message named a character the document has never seen.
     ///
     /// The hub is the authority, so a live editor can only anchor to an id the
@@ -323,6 +345,22 @@ impl DocState {
         let out = change(&mut self.doc);
         self.revision = self.revision.wrapping_add(1);
         out
+    }
+
+    /// [`edit`](Self::edit) for a change that can refuse.
+    ///
+    /// Bumps the revision only when the change took. A refused edit mutates
+    /// nothing, and the revision is what tells a close guard the document
+    /// moved on — bumping it for a refusal would keep a document from ever
+    /// being released by an editor that only ever sends edits the authority
+    /// rejects.
+    fn try_edit<T, E>(
+        &mut self,
+        change: impl FnOnce(&mut CollabText) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let out = change(&mut self.doc)?;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(out)
     }
 }
 
@@ -995,7 +1033,7 @@ impl CollabDoc {
                             limit: self.limits.max_document_chars,
                         });
                     }
-                    state.edit(|doc| doc.insert_after(actor, after.as_ref(), &text))
+                    state.try_edit(|doc| doc.insert_after(actor, after.as_ref(), &text))?
                 };
                 self.broadcast_ops(&ops);
                 Ok(ops)
@@ -1041,7 +1079,10 @@ impl CollabDoc {
     /// # Errors
     ///
     /// Returns [`CollabError::DocumentFull`] when the batch would take the
-    /// document past [`CollabLimits::max_document_chars`]. Nothing is applied.
+    /// document past [`CollabLimits::max_document_chars`], or
+    /// [`CollabError::CausalBufferFull`] when it would leave more than
+    /// [`MAX_WIRE_PENDING`] operations waiting for a cause. Nothing is
+    /// applied either way.
     ///
     /// # Panics
     ///
@@ -1060,6 +1101,7 @@ impl CollabDoc {
                     limit: self.limits.max_document_chars,
                 });
             }
+            Self::check_pending(&state.doc, ops, novel)?;
             // Keep only what the authority took, and only the first time it
             // takes it. `apply` refuses an id past `MAX_COUNTER` outright, and
             // a browser replica has no such check — broadcasting a refused
@@ -1109,7 +1151,9 @@ impl CollabDoc {
     /// # Errors
     ///
     /// Returns [`CollabError::DocumentFull`] when the batch would take the
-    /// document past [`CollabLimits::max_document_chars`]. Nothing is
+    /// document past [`CollabLimits::max_document_chars`], or
+    /// [`CollabError::CausalBufferFull`] when it would leave more than
+    /// [`MAX_WIRE_PENDING`] operations waiting for a cause. Nothing is
     /// applied. Refusing here means this replica falls behind whichever one
     /// accepted the batch — see the module docs on deployment: one process
     /// owns a document in this slice.
@@ -1129,8 +1173,42 @@ impl CollabDoc {
                 limit: self.limits.max_document_chars,
             });
         }
+        Self::check_pending(&state.doc, ops, novel)?;
         state.edit(|doc| doc.apply_all(ops.iter().cloned()));
         drop(state);
+        Ok(())
+    }
+
+    /// Refuse a batch that would leave the causal buffer past
+    /// [`MAX_WIRE_PENDING`].
+    ///
+    /// `max_document_chars` does not cover this. It bounds what the document
+    /// holds, and a batch of distinct inserts whose anchors never arrive is
+    /// far below it while leaving every operation waiting for a cause — the
+    /// expensive shape `MAX_WIRE_PENDING` exists to bound, and one this
+    /// crate's own decoder refuses on the way back in.
+    ///
+    /// The cheap case answers without copying: the buffer can only grow by
+    /// the operations that are new to this document, so a batch that could
+    /// not reach the limit even if every one of them buffered needs no trial
+    /// merge. That is all ordinary traffic, including the long in-order
+    /// replay a reconnecting peer sends — which integrates as it goes and
+    /// buffers nothing, and which a worst-case bound would wrongly refuse.
+    /// Only a batch that could cross the bound pays for a trial, and it pays
+    /// once.
+    fn check_pending(doc: &CollabText, ops: &[CollabOp], novel: usize) -> Result<(), CollabError> {
+        if doc.pending_len() + novel <= MAX_WIRE_PENDING {
+            return Ok(());
+        }
+        let mut trial = doc.clone();
+        trial.apply_all(ops.iter().cloned());
+        let got = trial.pending_len();
+        if got > MAX_WIRE_PENDING {
+            return Err(CollabError::CausalBufferFull {
+                got,
+                limit: MAX_WIRE_PENDING,
+            });
+        }
         Ok(())
     }
 

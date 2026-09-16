@@ -60,7 +60,7 @@ impl Notes {
             store.put(Note {
                 id,
                 title: title.to_owned(),
-                body: CollabText::from_text("seed", body),
+                body: CollabText::from_text("seed", body).expect("collab edit refused"),
             });
         }
         store

@@ -25,13 +25,13 @@
 //! use autumn_web::collab::CollabText;
 //!
 //! let mut server = CollabText::new();
-//! server.insert("server", 0, "hello world");
+//! server.insert("server", 0, "hello world").expect("collab edit refused");
 //!
 //! // Two editors branch from the same state.
 //! let mut ada = server.clone();
 //! let mut linus = server.clone();
-//! let from_ada = ada.insert("ada", 5, ",");        // "hello, world"
-//! let from_linus = linus.insert("linus", 11, "!"); // "hello world!"
+//! let from_ada = ada.insert("ada", 5, ",").expect("collab edit refused");        // "hello, world"
+//! let from_linus = linus.insert("linus", 11, "!").expect("collab edit refused"); // "hello world!"
 //!
 //! // Each side receives the other's operations, in either order.
 //! for op in from_linus { ada.apply(op); }
@@ -132,6 +132,44 @@ impl fmt::Display for OpId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.counter, self.actor)
     }
+}
+
+/// Error returned when an edit cannot be minted.
+///
+/// Both variants mean the edit was refused **whole**. Nothing is applied and
+/// nothing is returned to broadcast: a partially-applied edit is worse than a
+/// refused one, because the editor that sent it keeps a provisional character
+/// the authority does not hold and every later edit anchored to it comes back
+/// unknown.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CollabEditError {
+    /// The actor was empty.
+    ///
+    /// [`OpId::from_str`] rejects an empty actor, so an id minted with one
+    /// formats as `"1@"` and cannot be parsed back: the document encodes but
+    /// its own decoder refuses it, and
+    /// [`decode_column`](CollabText::decode_column) then reads the encoded
+    /// JSON as legacy plain text and shows it as the document's content.
+    /// Refusing at the mint keeps every id the safe API produces parseable.
+    ///
+    /// [`OpId::from_str`]: std::str::FromStr
+    #[error("actor must not be empty: an id minted with an empty actor cannot be parsed back")]
+    EmptyActor,
+    /// The counter space is exhausted.
+    ///
+    /// Reachable without 2^53 local keystrokes: [`CollabText::apply`] accepts
+    /// a peer id of `MAX_COUNTER - 1`, which pins the clock one step below
+    /// the ceiling, so a single hostile operation can put a document here.
+    #[error(
+        "the counter space is exhausted: {wanted} more character(s) would pass the ceiling, \
+         with only {available} left"
+    )]
+    CounterExhausted {
+        /// Characters the edit asked to mint.
+        wanted: usize,
+        /// Characters the counter space still has room for.
+        available: u64,
+    },
 }
 
 /// Error returned when an [`OpId`] string is malformed.
@@ -279,11 +317,16 @@ impl CollabText {
     }
 
     /// A document that holds `text`, authored by `actor`.
-    #[must_use]
-    pub fn from_text(actor: &str, text: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabEditError::EmptyActor`] when `actor` is empty. A fresh
+    /// document starts at counter zero, so the ceiling is out of reach here
+    /// for any `text` that fits in memory.
+    pub fn from_text(actor: &str, text: &str) -> Result<Self, CollabEditError> {
         let mut doc = Self::new();
-        doc.insert(actor, 0, text);
-        doc
+        doc.insert(actor, 0, text)?;
+        Ok(doc)
     }
 
     /// The visible text.
@@ -505,7 +548,17 @@ impl CollabText {
     /// dedups by id — then drops one side's text. A session hub takes care of
     /// this (see [`CollabDoc::join`](crate::collab::CollabDoc::join)); code
     /// calling this directly must not reuse an actor across replicas.
-    pub fn insert(&mut self, actor: &str, index: usize, text: &str) -> Vec<CollabOp> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabEditError`] when `actor` is empty or the counter space
+    /// cannot seat the whole of `text`. Nothing is applied either way.
+    pub fn insert(
+        &mut self,
+        actor: &str,
+        index: usize,
+        text: &str,
+    ) -> Result<Vec<CollabOp>, CollabEditError> {
         let anchor = self.anchor_for(index);
         self.insert_after(actor, anchor.as_ref(), text)
     }
@@ -517,14 +570,45 @@ impl CollabText {
     /// view sends this, and the edit lands next to the intended neighbour
     /// even if the document changed in flight. An unknown `after` buffers the
     /// operations rather than dropping them.
-    pub fn insert_after(&mut self, actor: &str, after: Option<&OpId>, text: &str) -> Vec<CollabOp> {
-        let mut ops = Vec::with_capacity(text.chars().count());
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabEditError`] when `actor` is empty or the counter space
+    /// cannot seat the whole of `text`. Nothing is applied either way.
+    pub fn insert_after(
+        &mut self,
+        actor: &str,
+        after: Option<&OpId>,
+        text: &str,
+    ) -> Result<Vec<CollabOp>, CollabEditError> {
+        let wanted = text.chars().count();
+        Self::preflight(actor, self.clock, wanted)?;
+        Ok(self.mint(actor, after, text))
+    }
+
+    /// Mint one operation per character of `text`, without the preflight.
+    ///
+    /// Private, and every caller proves the preconditions itself:
+    /// [`insert_after`](Self::insert_after) by the preflight it just ran, and
+    /// [`seeded`](Self::seeded) because it builds a fresh document under an
+    /// actor this module generates. Keeping it separate is what lets the
+    /// import paths — the Diesel decode among them — seed a document without
+    /// a validation they cannot fail and would have to unwrap.
+    fn mint(&mut self, actor: &str, after: Option<&OpId>, text: &str) -> Vec<CollabOp> {
+        let wanted = text.chars().count();
+        let mut ops = Vec::with_capacity(wanted);
         let mut left = after.cloned();
         for ch in text.chars() {
             // Stop below the reserved ceiling, not at it. `apply` refuses a
             // counter of `MAX_COUNTER` or more, so minting one would return
             // an operation this very replica rejects — and the hub would
             // broadcast a character the authority does not hold.
+            //
+            // Unreachable after the preflight above, which is the point: this
+            // loop used to `break` here and hand back a *prefix* of the
+            // requested insert, silently. The editor kept a provisional
+            // character the authority never took and went read-only for good,
+            // because its next edit anchored to one the hub had refused.
             let next = self.clock.saturating_add(1);
             if next >= MAX_COUNTER {
                 break;
@@ -541,6 +625,35 @@ impl CollabText {
             left = Some(id);
         }
         ops
+    }
+
+    /// A fresh document holding `text`, under an actor this module generated.
+    ///
+    /// The import path. It cannot refuse, which is the point: it runs from
+    /// `From<&str>` and from the Diesel decode, neither of which has anywhere
+    /// to put an error.
+    fn seeded(actor: &str, text: &str) -> Self {
+        let mut doc = Self::new();
+        doc.mint(actor, None, text);
+        doc
+    }
+
+    /// Refuse an edit that cannot be minted whole.
+    ///
+    /// Called before anything is mutated — `set_text` in particular removes
+    /// the replaced span before inserting its replacement, so a mid-edit
+    /// refusal there would tombstone text and put back only part of it.
+    const fn preflight(actor: &str, clock: u64, wanted: usize) -> Result<(), CollabEditError> {
+        if actor.is_empty() {
+            return Err(CollabEditError::EmptyActor);
+        }
+        // `insert_after` mints `wanted` counters above `clock` and `apply`
+        // refuses `MAX_COUNTER` or more, so the last one must land below it.
+        let available = MAX_COUNTER.saturating_sub(clock).saturating_sub(1);
+        if wanted as u64 > available {
+            return Err(CollabEditError::CounterExhausted { wanted, available });
+        }
+        Ok(())
     }
 
     /// Delete `count` visible characters starting at `index`.
@@ -594,7 +707,17 @@ impl CollabText {
     /// This is what a plain form post needs — it turns "here is the whole
     /// field" into character-level operations, so a concurrent edit outside
     /// the changed span survives.
-    pub fn set_text(&mut self, actor: &str, new_text: &str) -> Vec<CollabOp> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabEditError`] when `actor` is empty or the counter space
+    /// cannot seat the replacement. Nothing is applied either way — in
+    /// particular the replaced span is not tombstoned.
+    pub fn set_text(
+        &mut self,
+        actor: &str,
+        new_text: &str,
+    ) -> Result<Vec<CollabOp>, CollabEditError> {
         let old: Vec<char> = self.text().chars().collect();
         let new: Vec<char> = new_text.chars().collect();
 
@@ -610,12 +733,18 @@ impl CollabText {
             suffix += 1;
         }
 
-        let mut ops = self.remove(prefix, old.len() - prefix - suffix);
         let added: String = new[prefix..new.len() - suffix].iter().collect();
+        // Before the remove below, not after it. The remove tombstones the
+        // replaced span, so refusing between the two would delete the old
+        // text and put back only as much of the new as the counter space
+        // happened to seat.
+        Self::preflight(actor, self.clock, added.chars().count())?;
+
+        let mut ops = self.remove(prefix, old.len() - prefix - suffix);
         if !added.is_empty() {
-            ops.extend(self.insert(actor, prefix, &added));
+            ops.extend(self.insert(actor, prefix, &added)?);
         }
-        ops
+        Ok(ops)
     }
 
     /// Integrate one operation.
@@ -870,7 +999,7 @@ impl From<&str> for CollabText {
     /// two of them merged together interleave rather than converge. Load the
     /// record and call [`set_text`](CollabText::set_text) instead.
     fn from(text: &str) -> Self {
-        Self::from_text(&import_actor_for(text), text)
+        Self::seeded(&import_actor_for(text), text)
     }
 }
 
@@ -1155,7 +1284,7 @@ impl CollabText {
             return Self::new();
         }
         serde_json::from_str::<Wire>(raw).map_or_else(
-            |_| Self::from_text(&import_actor_for(raw), raw),
+            |_| Self::seeded(&import_actor_for(raw), raw),
             Self::from_wire,
         )
     }
@@ -1209,9 +1338,9 @@ mod tests {
     #[test]
     fn opposite_delivery_orders_converge() {
         let mut a = CollabText::new();
-        let a_ops = a.insert("a", 0, "hello");
+        let a_ops = a.insert("a", 0, "hello").expect("collab edit refused");
         let mut b = CollabText::new();
-        let b_ops = b.insert("b", 0, "world");
+        let b_ops = b.insert("b", 0, "world").expect("collab edit refused");
 
         for op in b_ops {
             a.apply(op);
@@ -1228,7 +1357,7 @@ mod tests {
     #[test]
     fn out_of_order_ops_are_buffered_not_dropped() {
         let mut source = CollabText::new();
-        let ops = source.insert("a", 0, "abc");
+        let ops = source.insert("a", 0, "abc").expect("collab edit refused");
 
         let mut target = CollabText::new();
         // Deliver last-to-first: each op's left neighbour is still missing.
@@ -1242,7 +1371,7 @@ mod tests {
     #[test]
     fn duplicate_ops_are_idempotent() {
         let mut source = CollabText::new();
-        let ops = source.insert("a", 0, "hi");
+        let ops = source.insert("a", 0, "hi").expect("collab edit refused");
 
         let mut target = CollabText::new();
         for op in ops.clone() {
@@ -1472,7 +1601,7 @@ mod tests {
     #[test]
     fn a_scrambled_store_within_the_buffer_still_re_canonicalizes() {
         let mut doc = CollabText::new();
-        doc.insert("ada", 0, "hello");
+        doc.insert("ada", 0, "hello").expect("collab edit refused");
         let encoded = serde_json::to_string(&doc).expect("encode");
 
         let scrambled = {
@@ -1486,6 +1615,102 @@ mod tests {
             repaired.text(),
             "hello",
             "put back in the order the merge rule says"
+        );
+    }
+
+    /// An empty actor mints `"1@"`, which the id parser refuses — so the
+    /// document would encode and then fail to decode, and `decode_column`
+    /// would show its own JSON as the text. Refuse at the mint instead.
+    #[test]
+    fn an_empty_actor_is_refused_before_it_mints_an_unparseable_id() {
+        assert_eq!(
+            CollabText::from_text("", "x").expect_err("empty actor"),
+            CollabEditError::EmptyActor,
+        );
+
+        let mut doc = CollabText::new();
+        assert_eq!(
+            doc.insert("", 0, "x").expect_err("empty actor"),
+            CollabEditError::EmptyActor,
+        );
+        assert_eq!(
+            doc.set_text("", "x").expect_err("empty actor"),
+            CollabEditError::EmptyActor,
+        );
+        assert_eq!(doc.text(), "", "a refused edit changes nothing");
+
+        // The invariant the refusal protects: everything the safe API mints
+        // parses back, so the document round-trips instead of decoding as
+        // its own JSON.
+        let good = CollabText::from_text("ada", "hi").expect("non-empty actor");
+        let encoded = serde_json::to_string(&good).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<CollabText>(&encoded)
+                .expect("decode")
+                .text(),
+            "hi",
+        );
+    }
+
+    /// A peer id of `MAX_COUNTER - 1` pins the clock one step below the
+    /// ceiling. The insert that follows must be refused whole, not committed
+    /// as a prefix: a half-applied insert leaves the editor holding a
+    /// provisional character the authority never took.
+    #[test]
+    fn an_insert_that_would_cross_the_ceiling_is_refused_whole() {
+        let mut doc = CollabText::new();
+        doc.insert("ada", 0, "seed").expect("collab edit refused");
+        doc.apply(CollabOp::Insert {
+            id: OpId::new(MAX_COUNTER - 2, "peer"),
+            after: None,
+            ch: 'x',
+        });
+        let before = doc.text();
+
+        let refused = doc.insert("ada", 0, "ab").expect_err("counter exhausted");
+        assert!(
+            matches!(
+                refused,
+                CollabEditError::CounterExhausted {
+                    wanted: 2,
+                    available: 1
+                }
+            ),
+            "the refusal says what was asked and what was left: {refused}"
+        );
+        assert_eq!(doc.text(), before, "nothing of the refused insert landed");
+
+        // One character still fits, so the bound is exact rather than
+        // conservative.
+        assert_eq!(
+            doc.insert("ada", 0, "a")
+                .expect("the last counter is usable")
+                .len(),
+            1,
+        );
+    }
+
+    /// `set_text` removes the replaced span before inserting the
+    /// replacement, so a refusal between the two would delete text and put
+    /// back only part of it. It must refuse before the remove.
+    #[test]
+    fn a_refused_set_text_does_not_tombstone_the_replaced_span() {
+        let mut doc = CollabText::new();
+        doc.insert("ada", 0, "hello").expect("collab edit refused");
+        doc.apply(CollabOp::Insert {
+            id: OpId::new(MAX_COUNTER - 2, "peer"),
+            after: None,
+            ch: 'x',
+        });
+
+        let refused = doc
+            .set_text("ada", "goodbye world")
+            .expect_err("counter exhausted");
+        assert!(matches!(refused, CollabEditError::CounterExhausted { .. }));
+        assert!(
+            doc.text().contains("hello"),
+            "the old text survives a refused replacement: {:?}",
+            doc.text()
         );
     }
 
@@ -1598,7 +1823,8 @@ mod tests {
     #[test]
     fn a_document_at_the_ceiling_still_decodes() {
         let mut doc = CollabText::new();
-        doc.insert("ada", 0, &"x".repeat(MAX_WIRE_ELEMENTS));
+        doc.insert("ada", 0, &"x".repeat(MAX_WIRE_ELEMENTS))
+            .expect("collab edit refused");
         let json = serde_json::to_string(&doc).expect("encode");
 
         let back: CollabText = serde_json::from_str(&json).expect("at the ceiling, not over it");
@@ -1635,11 +1861,11 @@ mod tests {
     #[test]
     fn concurrent_delete_and_insert_both_apply() {
         let mut a = CollabText::new();
-        a.insert("a", 0, "abc");
+        a.insert("a", 0, "abc").expect("collab edit refused");
         let mut b = a.clone();
 
         let del = a.remove(1, 1); // "ac"
-        let ins = b.insert("b", 3, "!"); // "abc!"
+        let ins = b.insert("b", 3, "!").expect("collab edit refused"); // "abc!"
 
         for op in ins {
             a.apply(op);
@@ -1655,7 +1881,7 @@ mod tests {
     #[test]
     fn ops_reproduce_the_document() {
         let mut a = CollabText::new();
-        a.insert("a", 0, "abcd");
+        a.insert("a", 0, "abcd").expect("collab edit refused");
         a.remove(1, 2);
 
         let mut b = CollabText::new();
@@ -1670,8 +1896,8 @@ mod tests {
     #[test]
     fn insert_at_index_preserves_intent() {
         let mut doc = CollabText::new();
-        doc.insert("a", 0, "ac");
-        doc.insert("a", 1, "b");
+        doc.insert("a", 0, "ac").expect("collab edit refused");
+        doc.insert("a", 1, "b").expect("collab edit refused");
         assert_eq!(doc.text(), "abc");
         assert!(!doc.is_empty());
     }
@@ -1680,7 +1906,7 @@ mod tests {
     #[test]
     fn serde_round_trip_is_lossless() {
         let mut doc = CollabText::new();
-        doc.insert("a", 0, "abc");
+        doc.insert("a", 0, "abc").expect("collab edit refused");
         doc.remove(1, 1);
         let json = serde_json::to_string(&doc).expect("encode");
         let back: CollabText = serde_json::from_str(&json).expect("decode");
@@ -1720,9 +1946,9 @@ mod tests {
     #[test]
     fn convergent_replicas_encode_identical_bytes() {
         let mut a = CollabText::new();
-        let a_ops = a.insert("a", 0, "left");
+        let a_ops = a.insert("a", 0, "left").expect("collab edit refused");
         let mut b = CollabText::new();
-        let b_ops = b.insert("b", 0, "right");
+        let b_ops = b.insert("b", 0, "right").expect("collab edit refused");
         for op in b_ops {
             a.apply(op);
         }
@@ -1739,11 +1965,15 @@ mod tests {
     /// survives a whole-field form post.
     #[test]
     fn set_text_edits_only_the_changed_span() {
-        let mut a = CollabText::from_text("seed", "the quick fox");
+        let mut a = CollabText::from_text("seed", "the quick fox").expect("collab edit refused");
         let mut b = a.clone();
 
-        let a_ops = a.set_text("a", "the quick brown fox"); // insert mid-string
-        let b_ops = b.set_text("b", "THE quick fox"); // rewrite the head
+        let a_ops = a
+            .set_text("a", "the quick brown fox")
+            .expect("collab edit refused"); // insert mid-string
+        let b_ops = b
+            .set_text("b", "THE quick fox")
+            .expect("collab edit refused"); // rewrite the head
 
         for op in b_ops {
             a.apply(op);
@@ -1759,13 +1989,17 @@ mod tests {
     /// document moved under it.
     #[test]
     fn id_anchored_insert_preserves_intent_against_a_stale_index() {
-        let mut server = CollabText::from_text("seed", "world");
+        let mut server = CollabText::from_text("seed", "world").expect("collab edit refused");
         // A client resolved "after the 'w'" before anyone else typed.
         let anchor = server.id_at(0).expect("first character");
         // Meanwhile another editor prepends.
-        server.insert("other", 0, "hello ");
+        server
+            .insert("other", 0, "hello ")
+            .expect("collab edit refused");
         // The stale client's edit still lands after the 'w', not at index 1.
-        server.insert_after("client", Some(&anchor), "-");
+        server
+            .insert_after("client", Some(&anchor), "-")
+            .expect("collab edit refused");
         assert_eq!(server.text(), "hello w-orld");
     }
 
@@ -1782,11 +2016,11 @@ mod tests {
     /// Merging is commutative, associative and idempotent.
     #[test]
     fn merge_is_order_independent_and_idempotent() {
-        let base = CollabText::from_text("seed", "base");
+        let base = CollabText::from_text("seed", "base").expect("collab edit refused");
         let mut a = base.clone();
-        a.insert("a", 0, "A");
+        a.insert("a", 0, "A").expect("collab edit refused");
         let mut b = base.clone();
-        b.insert("b", 4, "B");
+        b.insert("b", 4, "B").expect("collab edit refused");
         let mut c = base;
         c.remove(0, 1);
 
@@ -1806,7 +2040,7 @@ mod tests {
     #[test]
     fn a_delete_for_an_unknown_character_waits() {
         let mut source = CollabText::new();
-        let ins = source.insert("a", 0, "x");
+        let ins = source.insert("a", 0, "x").expect("collab edit refused");
         let del = source.remove(0, 1);
 
         let mut target = CollabText::new();
@@ -1824,7 +2058,7 @@ mod tests {
     /// that already exists and is silently dropped.
     #[test]
     fn a_referenced_id_from_the_future_does_not_move_the_clock() {
-        let mut doc = CollabText::from_text("seed", "hi");
+        let mut doc = CollabText::from_text("seed", "hi").expect("collab edit refused");
         let before = doc.clock();
 
         doc.apply(CollabOp::Insert {
@@ -1842,7 +2076,7 @@ mod tests {
             "only the operation's own id advances the clock"
         );
         // And the document keeps working.
-        doc.insert("seed", 2, "!");
+        doc.insert("seed", 2, "!").expect("collab edit refused");
         assert_eq!(doc.text(), "hi!");
     }
 
@@ -1918,7 +2152,7 @@ mod tests {
     /// another's future characters.
     #[test]
     fn remove_known_refuses_a_character_that_does_not_exist_yet() {
-        let mut doc = CollabText::from_text("seed", "ab");
+        let mut doc = CollabText::from_text("seed", "ab").expect("collab edit refused");
         let future = OpId::new(doc.clock() + 50, "victim");
 
         assert!(doc.remove_known(std::slice::from_ref(&future)).is_empty());

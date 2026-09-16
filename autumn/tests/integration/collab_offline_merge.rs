@@ -43,11 +43,15 @@ fn server_row(payload: Value, updated_at: chrono::DateTime<Utc>) -> RemoteRow {
 
 /// Two documents branched from one base, each with its own edit.
 fn branched() -> (CollabText, CollabText) {
-    let base = CollabText::from_text("seed", "hello world");
+    let base = CollabText::from_text("seed", "hello world").expect("collab edit refused");
     let mut offline = base.clone();
-    offline.insert("phone", 5, ",");
+    offline
+        .insert("phone", 5, ",")
+        .expect("collab edit refused");
     let mut online = base;
-    online.insert("laptop", 11, "!");
+    online
+        .insert("laptop", 11, "!")
+        .expect("collab edit refused");
     (offline, online)
 }
 
@@ -299,7 +303,7 @@ fn an_offline_edit_merges_through_the_real_push_path() {
     let scope = SyncScope::GLOBAL;
 
     // The row both devices last saw.
-    let base = CollabText::from_text("seed", "hello world");
+    let base = CollabText::from_text("seed", "hello world").expect("collab edit refused");
     backend
         .apply_push(
             scope,
@@ -313,7 +317,9 @@ fn an_offline_edit_merges_through_the_real_push_path() {
 
     // The laptop edits and pushes first.
     let mut online = base.clone();
-    online.insert("laptop", 11, "!");
+    online
+        .insert("laptop", 11, "!")
+        .expect("collab edit refused");
     backend
         .apply_push(
             scope,
@@ -329,7 +335,9 @@ fn an_offline_edit_merges_through_the_real_push_path() {
     // version 1, which is exactly the conflict LWW would resolve by discarding
     // one side.
     let mut offline = base;
-    offline.insert("phone", 5, ",");
+    offline
+        .insert("phone", 5, ",")
+        .expect("collab edit refused");
     backend
         .apply_push(
             scope,
@@ -370,7 +378,7 @@ fn the_same_script_under_last_write_wins_loses_the_offline_edit() {
     let resolver = LwwResolver;
     let scope = SyncScope::GLOBAL;
 
-    let base = CollabText::from_text("seed", "hello world");
+    let base = CollabText::from_text("seed", "hello world").expect("collab edit refused");
     backend
         .apply_push(
             scope,
@@ -383,7 +391,9 @@ fn the_same_script_under_last_write_wins_loses_the_offline_edit() {
         .expect("seed push");
 
     let mut online = base.clone();
-    online.insert("laptop", 11, "!");
+    online
+        .insert("laptop", 11, "!")
+        .expect("collab edit refused");
     let mut online_change = upsert("00000000-0000-4000-8000-000000000012", 1, &online);
     online_change.updated_at = Utc::now() + Duration::seconds(60);
     backend
@@ -391,7 +401,9 @@ fn the_same_script_under_last_write_wins_loses_the_offline_edit() {
         .expect("online push");
 
     let mut offline = base;
-    offline.insert("phone", 5, ",");
+    offline
+        .insert("phone", 5, ",")
+        .expect("collab edit refused");
     backend
         .apply_push(
             scope,

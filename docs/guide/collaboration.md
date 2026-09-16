@@ -59,6 +59,14 @@ The macro generates, for a field named `body`:
 | `body_insert(actor, index, text)` | insert, returning the operations to send |
 | `body_remove(index, count)` | delete a span |
 | `body_set_text(actor, text)` | rewrite with the smallest edit that gets there |
+
+`body_insert` and `body_set_text` return `Result<_, CollabEditError>`. They
+refuse an empty `actor` — an id minted with one cannot be parsed back, so the
+document would encode and then fail to decode — and refuse an edit the counter
+space cannot seat whole. Both refuse *before* applying anything: a half-applied
+insert leaves the editor holding a character the document never took, and
+`set_text` would otherwise tombstone the replaced span and put back only part
+of the replacement.
 | `body_merge(&other)` | merge another replica's document |
 
 Plus `Note::collaborative_fields()` and the field-name-keyed

@@ -19,7 +19,7 @@ use autumn_web::channels::Channels;
 use autumn_web::collab::hub::{doc_key, serve_socket};
 use autumn_web::collab::{
     CollabClientMessage, CollabError, CollabHub, CollabLimits, CollabServerMessage, CollabText,
-    OpId,
+    MAX_WIRE_PENDING, OpId,
 };
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
@@ -44,7 +44,9 @@ fn hub() -> CollabHub {
 fn a_document_is_seeded_once_and_shared() {
     let hub = hub();
     let first = hub
-        .open_with("notes:1:body", || CollabText::from_text("seed", "hello"))
+        .open_with("notes:1:body", || {
+            CollabText::from_text("seed", "hello").expect("collab edit refused")
+        })
         .expect("open the document");
     let second = hub
         .open_with("notes:1:body", || {
@@ -71,7 +73,7 @@ fn two_sessions_converge_over_the_channel() {
     let hub = hub();
     let doc = hub
         .open_with(&doc_key("notes", 1, "body"), || {
-            CollabText::from_text("seed", "hello world")
+            CollabText::from_text("seed", "hello world").expect("collab edit refused")
         })
         .expect("open the document");
     let mut watcher = doc.subscribe();
@@ -169,7 +171,9 @@ fn a_cursor_move_is_broadcast() {
 fn the_snapshot_carries_the_document_and_the_participants() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:4:body", || CollabText::from_text("seed", "hi"))
+        .open_with("notes:4:body", || {
+            CollabText::from_text("seed", "hi").expect("collab edit refused")
+        })
         .expect("open the document");
     let _ada = doc.join("ada", "Ada");
 
@@ -244,13 +248,17 @@ fn oversized_messages_are_refused() {
 fn remote_operations_merge_and_broadcast() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:6:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:6:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
     let mut watcher = doc.subscribe();
 
     // An offline replica branched from the same base and edited.
     let mut offline = doc.document();
-    let ops = offline.insert("offline", 1, "-");
+    let ops = offline
+        .insert("offline", 1, "-")
+        .expect("collab edit refused");
 
     let waiting = doc.apply_remote(&ops).expect("within the limits");
     assert_eq!(waiting, 0, "the peer sent a complete history");
@@ -266,7 +274,9 @@ fn remote_operations_merge_and_broadcast() {
 fn closing_a_document_returns_its_final_state() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:7:body", || CollabText::from_text("seed", "draft"))
+        .open_with("notes:7:body", || {
+            CollabText::from_text("seed", "draft").expect("collab edit refused")
+        })
         .expect("open the document");
     doc.handle(
         "ada",
@@ -302,7 +312,9 @@ fn closing_a_document_returns_its_final_state() {
 fn a_reconnect_during_the_write_window_finds_the_live_document() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:20:body", || CollabText::from_text("seed", "draft"))
+        .open_with("notes:20:body", || {
+            CollabText::from_text("seed", "draft").expect("collab edit refused")
+        })
         .expect("open the document");
 
     // The last editor has gone and the handler is closing up.
@@ -354,7 +366,9 @@ fn a_reconnect_during_the_write_window_finds_the_live_document() {
 async fn collaborate(hub: CollabHub, path: Path<(String, String)>) -> impl WsHandler {
     let (key, actor) = &path.0;
     let doc = hub
-        .open_with(key, || CollabText::from_text("seed", "hello world"))
+        .open_with(key, || {
+            CollabText::from_text("seed", "hello world").expect("collab edit refused")
+        })
         .expect("open the document");
     let actor = actor.clone();
     move |socket: WebSocket| async move {
@@ -539,7 +553,9 @@ async fn a_malformed_message_is_answered_with_an_error() {
 fn an_anchor_the_hub_never_minted_is_refused() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:11:body", || CollabText::from_text("seed", "hi"))
+        .open_with("notes:11:body", || {
+            CollabText::from_text("seed", "hi").expect("collab edit refused")
+        })
         .expect("open the document");
 
     let refused = doc.handle(
@@ -570,7 +586,9 @@ fn an_anchor_the_hub_never_minted_is_refused() {
 fn a_delete_cannot_pre_empt_a_character_that_does_not_exist() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:12:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:12:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
     let victim = doc.join("victim", "Victim");
 
@@ -622,7 +640,9 @@ fn a_document_lives_as_long_as_its_handles() {
     let hub = hub();
     {
         let doc = hub
-            .open_with("notes:14:body", || CollabText::from_text("seed", "x"))
+            .open_with("notes:14:body", || {
+                CollabText::from_text("seed", "x").expect("collab edit refused")
+            })
             .expect("open the document");
         {
             let _first = doc.join("ada", "Ada");
@@ -655,7 +675,9 @@ fn a_reconnect_before_persistence_finds_the_same_document() {
     let hub = hub();
     // The handler's handle, held across the whole save window.
     let doc = hub
-        .open_with("notes:17:body", || CollabText::from_text("seed", "base"))
+        .open_with("notes:17:body", || {
+            CollabText::from_text("seed", "base").expect("collab edit refused")
+        })
         .expect("open the document");
     {
         let editor = doc.join("ada", "Ada");
@@ -689,7 +711,9 @@ fn a_reconnect_before_persistence_finds_the_same_document() {
 fn a_refused_remote_operation_is_not_broadcast() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:18:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:18:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
     let mut watcher = doc.subscribe();
 
@@ -717,7 +741,9 @@ fn a_refused_remote_operation_is_not_broadcast() {
 fn an_edit_made_and_ended_inside_the_write_window_survives() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:21:body", || CollabText::from_text("seed", "draft"))
+        .open_with("notes:21:body", || {
+            CollabText::from_text("seed", "draft").expect("collab edit refused")
+        })
         .expect("open the document");
 
     let closing = hub.close("notes:21:body").expect("the document was live");
@@ -818,7 +844,9 @@ async fn a_failed_publish_still_reaches_this_node() {
     let presence = Presence::new(channels.clone());
     let hub = CollabHub::new(channels, presence);
     let doc = hub
-        .open_with("notes:25:body", || CollabText::from_text("seed", "hi"))
+        .open_with("notes:25:body", || {
+            CollabText::from_text("seed", "hi").expect("collab edit refused")
+        })
         .expect("open the document");
     let mut watcher = doc.subscribe();
 
@@ -854,7 +882,9 @@ async fn a_failed_publish_still_reaches_this_node() {
 fn an_already_buffered_replay_is_not_broadcast_again() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:28:body", || CollabText::from_text("seed", "hi"))
+        .open_with("notes:28:body", || {
+            CollabText::from_text("seed", "hi").expect("collab edit refused")
+        })
         .expect("open the document");
     let mut watcher = doc.subscribe();
 
@@ -894,7 +924,9 @@ fn an_already_buffered_replay_is_not_broadcast_again() {
 fn a_replay_of_integrated_history_is_not_broadcast_again() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:29:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:29:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
 
     // Everything the document already holds, replayed exactly as a
@@ -934,7 +966,9 @@ fn a_replay_of_integrated_history_is_not_broadcast_again() {
 fn a_second_close_is_refused_while_one_is_outstanding() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:26:body", || CollabText::from_text("seed", "draft"))
+        .open_with("notes:26:body", || {
+            CollabText::from_text("seed", "draft").expect("collab edit refused")
+        })
         .expect("open the document");
 
     let first = hub.close("notes:26:body").expect("the document was live");
@@ -951,7 +985,9 @@ fn a_second_close_is_refused_while_one_is_outstanding() {
 
     // A guard that is dropped rather than finalized releases the claim too.
     let doc = hub
-        .open_with("notes:27:body", || CollabText::from_text("seed", "x"))
+        .open_with("notes:27:body", || {
+            CollabText::from_text("seed", "x").expect("collab edit refused")
+        })
         .expect("open the document");
     drop(hub.close("notes:27:body").expect("live"));
     assert!(
@@ -976,7 +1012,7 @@ fn a_seed_past_the_document_limit_is_refused() {
 
     let refused = hub
         .open_with("notes:23:body", || {
-            CollabText::from_text("import", "far too long")
+            CollabText::from_text("import", "far too long").expect("collab edit refused")
         })
         .expect_err("the row does not fit");
     assert!(
@@ -991,7 +1027,9 @@ fn a_seed_past_the_document_limit_is_refused() {
 
     // One that fits still opens.
     let ok = hub
-        .open_with("notes:24:body", || CollabText::from_text("import", "fits"))
+        .open_with("notes:24:body", || {
+            CollabText::from_text("import", "fits").expect("collab edit refused")
+        })
         .expect("within the limit");
     assert_eq!(ok.text(), "fits");
 }
@@ -1098,7 +1136,9 @@ fn the_document_registry_refuses_at_its_limit() {
 fn a_snapshot_carries_the_buffered_operations() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:19:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:19:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
 
     // A peer's operation arrives before the character it is anchored to.
@@ -1218,7 +1258,9 @@ fn replaying_a_history_is_not_charged_against_the_limit() {
         ..CollabLimits::default()
     });
     let doc = hub
-        .open_with("notes:19:body", || CollabText::from_text("seed", "abcd"))
+        .open_with("notes:19:body", || {
+            CollabText::from_text("seed", "abcd").expect("collab edit refused")
+        })
         .expect("open the document");
     assert_eq!(doc.document().element_count(), 4, "the document is full");
 
@@ -1247,7 +1289,9 @@ fn replaying_a_history_is_not_charged_against_the_limit() {
 fn a_peer_id_at_the_ceiling_cannot_exhaust_local_minting() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:20:body", || CollabText::from_text("seed", "a"))
+        .open_with("notes:20:body", || {
+            CollabText::from_text("seed", "a").expect("collab edit refused")
+        })
         .expect("open the document");
 
     doc.apply_remote(&[autumn_web::collab::CollabOp::Insert {
@@ -1280,12 +1324,16 @@ fn a_peer_id_at_the_ceiling_cannot_exhaust_local_minting() {
 fn operations_delivered_on_the_channel_reach_the_local_authority() {
     let hub = hub();
     let doc = hub
-        .open_with("notes:21:body", || CollabText::from_text("seed", "ab"))
+        .open_with("notes:21:body", || {
+            CollabText::from_text("seed", "ab").expect("collab edit refused")
+        })
         .expect("open the document");
 
     // Another replica's edit, as it would arrive off the channel.
     let mut elsewhere = doc.document();
-    let ops = elsewhere.insert("other-replica", 2, "!");
+    let ops = elsewhere
+        .insert("other-replica", 2, "!")
+        .expect("collab edit refused");
 
     doc.merge_delivered(&ops).expect("within the budget");
     assert_eq!(doc.text(), "ab!", "the local authority has it");
@@ -1301,4 +1349,86 @@ fn operations_delivered_on_the_channel_reach_the_local_authority() {
     )
     .expect("anchoring to a replicated character is accepted");
     assert_eq!(doc.text(), "ab!?");
+}
+
+/// The hub must not build a document its own decoder refuses.
+///
+/// `max_document_chars` does not cover this: a thousand-odd distinct inserts
+/// whose anchors never arrive are far below the ten-thousand character limit,
+/// yet every one of them stays in the causal buffer — past `MAX_WIRE_PENDING`,
+/// the bound `CollabText`'s `Deserialize` enforces. Accepting the batch would
+/// leave a row that cannot be read back: the offline resolver skips the value
+/// and `decode_column` shows the raw JSON.
+#[tokio::test]
+async fn a_remote_batch_that_would_overfill_the_causal_buffer_is_refused() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:16:body", CollabText::new)
+        .expect("open the document");
+
+    // Each op anchors to a character nobody will ever send, so each one
+    // buffers. One past the wire limit is one too many.
+    let orphans: Vec<autumn_web::collab::CollabOp> = (1..=(MAX_WIRE_PENDING + 1) as u64)
+        .map(|n| autumn_web::collab::CollabOp::Insert {
+            id: OpId::new(n, "peer"),
+            after: Some(OpId::new(9_000_000 + n, "ghost")),
+            ch: 'x',
+        })
+        .collect();
+
+    let refused = doc
+        .apply_remote(&orphans)
+        .expect_err("past the causal buffer limit");
+    assert!(
+        matches!(
+            refused,
+            CollabError::CausalBufferFull {
+                limit: MAX_WIRE_PENDING,
+                ..
+            }
+        ),
+        "refused for the buffer, not the character count: {refused}"
+    );
+    assert_eq!(
+        doc.document().pending_len(),
+        0,
+        "a refused batch leaves nothing behind"
+    );
+
+    // The same bound on the replica-delivery path.
+    let delivered = doc
+        .merge_delivered(&orphans)
+        .expect_err("past the causal buffer limit");
+    assert!(matches!(delivered, CollabError::CausalBufferFull { .. }));
+
+    // What the limit protects: a batch that fits is accepted, and the
+    // document it produces round-trips through its own decoder.
+    let fits: Vec<autumn_web::collab::CollabOp> = orphans[..MAX_WIRE_PENDING].to_vec();
+    doc.apply_remote(&fits).expect("within the buffer limit");
+    let encoded = serde_json::to_string(&doc.document()).expect("encode");
+    assert!(
+        serde_json::from_str::<CollabText>(&encoded).is_ok(),
+        "the hub only builds documents its own decoder accepts"
+    );
+}
+
+/// A long in-order replay buffers nothing, so it must not be refused for a
+/// buffer it never fills — the reason the bound is measured on the real
+/// outcome rather than on the batch length.
+#[tokio::test]
+async fn a_long_in_order_replay_is_not_refused_by_the_buffer_bound() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:17:body", CollabText::new)
+        .expect("open the document");
+
+    let mut source = CollabText::new();
+    let text = "x".repeat(MAX_WIRE_PENDING + 50);
+    let ops = source.insert("peer", 0, &text).expect("seed the replay");
+    assert!(ops.len() > MAX_WIRE_PENDING, "longer than the buffer bound");
+
+    doc.apply_remote(&ops)
+        .expect("an in-order replay integrates as it goes and buffers nothing");
+    assert_eq!(doc.document().pending_len(), 0);
+    assert_eq!(doc.text().chars().count(), ops.len());
 }

@@ -5190,6 +5190,41 @@ fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
 ///
 /// Returns an empty token stream when the model has no collaborative field, so
 /// a model that never opts in expands byte-for-byte as before.
+/// The rustdoc for one collaborative field's generated accessors.
+struct CollaborativeDocs {
+    text: String,
+    insert: String,
+    remove: String,
+    set: String,
+    merge: String,
+}
+
+/// Written out here rather than inline so `emit_collaborative_items` stays
+/// about the code it emits.
+fn collaborative_docs(name: &str) -> CollaborativeDocs {
+    CollaborativeDocs {
+        text: format!("`{name}` as visible text."),
+        insert: format!(
+            "Insert `text` into `{name}` before visible character `index`, as `actor`. \
+             Returns the operations to send to the other editors.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the whole of `text`. \
+             Nothing is applied either way."
+        ),
+        remove: format!("Delete `count` visible characters from `{name}`, starting at `index`."),
+        set: format!(
+            "Rewrite `{name}` to `text` with the smallest edit that gets there, so a \
+             concurrent edit outside the changed span survives.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the replacement. Nothing \
+             is applied either way — in particular the replaced span is not tombstoned."
+        ),
+        merge: format!("Merge another replica's `{name}` in. Order does not matter."),
+    }
+}
+
 fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
     if fields.is_empty() {
         return quote! {};
@@ -5204,18 +5239,13 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
         let remove = format_ident!("{}_remove", ident);
         let set_text = format_ident!("{}_set_text", ident);
         let merge = format_ident!("{}_merge", ident);
-        let doc_text = format!("`{name}` as visible text.");
-        let doc_insert = format!(
-            "Insert `text` into `{name}` before visible character `index`, as `actor`. \
-             Returns the operations to send to the other editors."
-        );
-        let doc_remove =
-            format!("Delete `count` visible characters from `{name}`, starting at `index`.");
-        let doc_set = format!(
-            "Rewrite `{name}` to `text` with the smallest edit that gets there, so a \
-             concurrent edit outside the changed span survives."
-        );
-        let doc_merge = format!("Merge another replica's `{name}` in. Order does not matter.");
+        let CollaborativeDocs {
+            text: doc_text,
+            insert: doc_insert,
+            remove: doc_remove,
+            set: doc_set,
+            merge: doc_merge,
+        } = collaborative_docs(&name);
         quote! {
             #[doc = #doc_text]
             #[must_use]
@@ -5229,7 +5259,10 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
                 actor: &str,
                 index: usize,
                 text: &str,
-            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
                 self.#ident.insert(actor, index, text)
             }
 
@@ -5247,7 +5280,10 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
                 &mut self,
                 actor: &str,
                 text: &str,
-            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
                 self.#ident.set_text(actor, text)
             }
 
