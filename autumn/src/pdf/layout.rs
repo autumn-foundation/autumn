@@ -22,22 +22,26 @@ use super::metrics::{char_width_1000em, text_width_pt};
 const MAX_DEPTH: u32 = 512;
 
 thread_local! {
-    /// Set when a walker drops a subtree with real text in it because it
-    /// passed [`MAX_DEPTH`] — a capped subtree of empty wrapper tags drops
-    /// nothing, so that case leaves this unset (see
-    /// [`subtree_has_text`]). [`render_pages`] clears the flag at the
-    /// start of every call and reads it at the end, so one deep document
-    /// logs one warning, not one per node.
+    /// Set when a walker drops a subtree with a visible mark in it because
+    /// it passed [`MAX_DEPTH`] — a capped subtree of transparent wrapper
+    /// tags with nothing inside drops nothing, so that case leaves this
+    /// unset (see [`subtree_has_visible_content`]). [`render_pages`] clears
+    /// the flag at the start of every call and reads it at the end, so one
+    /// deep document logs one warning, not one per node.
     static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// True if `nodes`, or anything nested inside them, holds non-empty text.
+/// True if `nodes`, or anything nested inside them, would draw a visible
+/// mark: text, an `<hr>` rule, or an `<li>` marker (an `<li>` always draws
+/// one, even when empty — see `empty_list_item_still_reserves_a_full_line`).
+/// Does not look inside [`is_non_rendered`] tags (`<script>`, `<style>`,
+/// ...), whose content the renderer never draws regardless of depth.
 ///
 /// Walks with an explicit stack, not recursion: a capped subtree can be
 /// arbitrarily deep (that is the whole reason it got capped), so this must
 /// stay stack-safe the same way [`super::html`]'s parser and `Node`'s own
 /// `Drop` do.
-fn subtree_has_text(nodes: &[Node]) -> bool {
+fn subtree_has_visible_content(nodes: &[Node]) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
     while let Some(node) = stack.pop() {
         match node {
@@ -46,7 +50,14 @@ fn subtree_has_text(nodes: &[Node]) -> bool {
                     return true;
                 }
             }
-            Node::Element { children, .. } => stack.extend(children),
+            Node::Element { tag, children } => {
+                if tag == "hr" || tag == "li" {
+                    return true;
+                }
+                if !is_non_rendered(tag) {
+                    stack.extend(children);
+                }
+            }
         }
     }
     false
@@ -225,7 +236,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -295,7 +306,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -339,7 +350,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -397,7 +408,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -429,7 +440,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -554,7 +565,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_text(nodes) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -2709,6 +2720,53 @@ mod tests {
                 "{n} empty nested wrappers drop no content, so this must not warn"
             );
         }
+    }
+
+    #[test]
+    fn hr_past_the_depth_cap_still_warns() {
+        // A dropped <hr> has no text, but it still draws a visible rule
+        // (or, in an inline context, a line break) — losing it is a real
+        // content loss, so "no text" must not mean "nothing to warn about".
+        let html = format!("{}<hr>{}", "<span>".repeat(513), "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped <hr> is dropped visible content, so this must warn"
+        );
+    }
+
+    #[test]
+    fn empty_li_past_the_depth_cap_still_warns() {
+        // An empty <li> still draws a marker and reserves a line (see
+        // empty_list_item_still_reserves_a_full_line) even with no text of
+        // its own, so dropping it is a real content loss too.
+        let html = format!(
+            "{}<ul><li></li></ul>{}",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped empty <li> still draws a marker, so this must warn"
+        );
+    }
+
+    #[test]
+    fn script_text_past_the_depth_cap_does_not_warn() {
+        // <script>'s text is never rendered, capped or not (see
+        // script_and_style_content_is_never_rendered), so losing it to the
+        // depth cap is not a real content loss.
+        let html = format!(
+            "{}<script>alert('x')</script>{}",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "script text was never going to render, so this must not warn"
+        );
     }
 
     #[test]
