@@ -62,8 +62,15 @@ thread_local! {
 /// arbitrarily deep (that is the whole reason it got capped), so this must
 /// stay stack-safe the same way [`super::html`]'s parser and `Node`'s own
 /// `Drop` do.
-fn subtree_has_visible_content(nodes: &[Node]) -> bool {
+/// `glue_risk` is true when the buffer this subtree would have appended
+/// to already ends in a real word with nothing separating it yet (see
+/// [`ends_with_glueable_word`]) — in that case, even whitespace-only text
+/// counts as visible, because dropping it is what would let `words_of`
+/// glue that word to whatever comes after. Pass `false` when no such
+/// buffer exists yet (a fresh, empty one has nothing to glue to).
+fn subtree_has_visible_content(nodes: &[Node], glue_risk: bool) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
+    let mut has_whitespace_only_text = false;
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
@@ -74,12 +81,12 @@ fn subtree_has_visible_content(nodes: &[Node]) -> bool {
                 // char that survives that split (an ordinary character, or
                 // a non-breaking space, which is whitespace by Unicode's
                 // definition but still renders as its own word) means this
-                // text is really visible.
-                if text
-                    .chars()
-                    .any(|c| !c.is_whitespace() || is_non_breaking_space(c))
-                {
+                // text is really visible on its own.
+                if text.chars().any(|c| !is_breakable_whitespace(c)) {
                     return true;
+                }
+                if !text.is_empty() {
+                    has_whitespace_only_text = true;
                 }
             }
             Node::Element { tag, children } => {
@@ -96,7 +103,7 @@ fn subtree_has_visible_content(nodes: &[Node]) -> bool {
             }
         }
     }
-    false
+    glue_risk && has_whitespace_only_text
 }
 
 /// True if `nodes` has a direct `<li>` child.
@@ -375,7 +382,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        if subtree_has_visible_content(nodes, ends_with_glueable_word(out)) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -579,7 +586,10 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        // No glue risk here: `pending` (below) doesn't exist yet at this
+        // point, so there's no accumulated word this call could ever glue
+        // a dropped whitespace-only span onto.
+        if subtree_has_visible_content(nodes, false) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -704,7 +714,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        if subtree_has_visible_content(nodes, ends_with_glueable_word(pending)) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -781,6 +791,24 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
 /// emoji, ...) — unaffected by this.
 const fn is_non_breaking_space(c: char) -> bool {
     matches!(c, '\u{00A0}' | '\u{2007}' | '\u{202F}')
+}
+
+/// A whitespace char [`words_of`] actually splits words on — plain spaces,
+/// tabs, newlines, but not a non-breaking space variant (see
+/// [`is_non_breaking_space`]), which stays glued to its word instead of
+/// separating it.
+const fn is_breakable_whitespace(c: char) -> bool {
+    c.is_whitespace() && !is_non_breaking_space(c)
+}
+
+/// True if `out`'s last span is a real word with nothing yet separating
+/// it from whatever comes next — the same condition [`words_of`] tracks
+/// internally as `glue_next`. A depth-cap guard past this point in `out`
+/// must treat even whitespace-only text in the capped subtree as visible,
+/// because dropping it is what would let `words_of` glue that word to the
+/// next one instead of keeping a space between them.
+fn ends_with_glueable_word(out: &[Span]) -> bool {
+    matches!(out.last(), Some(Span::Run { text, .. }) if !text.ends_with(is_breakable_whitespace))
 }
 
 /// Flatten `spans` into words, splitting each run's text on whitespace and
@@ -3033,6 +3061,21 @@ mod tests {
                 "{content:?} draws nothing, so this must not warn"
             );
         }
+    }
+
+    #[test]
+    fn whitespace_only_text_sandwiched_between_real_words_past_the_depth_cap_still_warns() {
+        // Unlike the isolated case above, a dropped whitespace-only span
+        // here sits right after real text ("A") that the surrounding
+        // buffer already holds — so dropping it removes the one thing
+        // stopping words_of from gluing "A" and "B" into "AB". (Codex
+        // review on PR #2810.)
+        let html = format!("A{}{}{}B", "<span>".repeat(513), " ", "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "dropping this space would glue \"A\" and \"B\" together, so this must warn"
+        );
     }
 
     #[test]
