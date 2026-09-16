@@ -205,16 +205,205 @@ cd autumn  # repo root
 AUTUMN_DATABASE__URL="postgres://autumn:autumn@127.0.0.1:5432/reddit" cargo build -p reddit-clone
 AUTUMN_DATABASE__URL="postgres://autumn:autumn@127.0.0.1:5432/reddit" AUTUMN_PROFILE=dev \
   ./target/debug/reddit-clone &
+sleep 3   # wait for it to finish migrating and bind :3000
 
-# Harness: register a user, create a subreddit, fire 10 truly concurrent
-# identical POST /submit at a thread barrier, then re-run the same pattern
-# against POST /comments/Post/{id}. Full script used this session is in the
-# report's accompanying scratch harness (register -> /r/create -> /submit
-# x10 concurrent; register a second user -> GET the post -> POST
-# /comments/Post/{id} x10 concurrent). Verify via:
-psql "postgres://autumn:autumn@127.0.0.1:5432/reddit" \
-  -c "SELECT count(*) FROM posts WHERE title = '<the race title>';"
-psql "postgres://autumn:autumn@127.0.0.1:5432/reddit" \
-  -c "SELECT count(*) FROM comments WHERE body = '<the race comment body>';"
-# expect (before any SubmitToken fix): 10 and 10.
+python3 snag_double_submit_race.py http://127.0.0.1:3000 10
+# it prints the exact SELECTs to run afterward; expect 10 and 10.
 ```
+
+`snag_double_submit_race.py` (requires `pip install requests`; save as-is):
+
+```python
+#!/usr/bin/env python3
+"""Snag repro harness: double-submit race on reddit-clone's /submit and
+comment forms. Fires N byte-identical, thread-barrier-synchronized concurrent
+requests against a live reddit-clone instance and reports how many rows each
+produced.
+
+Usage: python3 snag_double_submit_race.py [BASE_URL] [N]
+Requires: `requests`, a running reddit-clone at BASE_URL (default
+http://127.0.0.1:3000) with `registration_open = true` (the shipped default).
+"""
+import re
+import sys
+import threading
+import time
+
+import requests
+
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:3000"
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+
+# `requests`' cookie jar correctly refuses to send a `Secure`-flagged cookie
+# back over plain http (this app sets `Secure` on `autumn.sid` even on
+# 127.0.0.1 by config default; browsers special-case the loopback address,
+# curl/requests do not). Track cookies by hand and send them as a raw header
+# on every request instead of relying on the jar's scheme filtering.
+cookies = {}
+
+
+def update_cookies(resp):
+    for h in (resp.raw.headers.get_all("Set-Cookie") if resp.raw else []):
+        name_val = h.split(";", 1)[0]
+        if "=" in name_val:
+            k, v = name_val.split("=", 1)
+            cookies[k.strip()] = v.strip()
+
+
+def cookie_header():
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def get(path):
+    r = requests.get(BASE + path, headers={"Cookie": cookie_header()}, allow_redirects=False)
+    update_cookies(r)
+    return r
+
+
+def post(path, data):
+    r = requests.post(
+        BASE + path, data=data, headers={"Cookie": cookie_header()}, allow_redirects=False
+    )
+    update_cookies(r)
+    return r
+
+
+def extract(html, name):
+    m = re.search(r'name="' + re.escape(name) + r'"\s+value="([^"]*)"', html)
+    if not m:
+        raise RuntimeError(f"could not find field {name!r} in html:\n{html[:2000]}")
+    return m.group(1)
+
+
+def register(username_prefix):
+    uname = f"{username_prefix}_{int(time.time() * 1000)}"
+    r = get("/register")
+    csrf = extract(r.text, "_csrf")
+    r = post(
+        "/register",
+        {
+            "_csrf": csrf,
+            "username": uname,
+            "email": f"{uname}@example.com",
+            "password": "hunter22",
+        },
+    )
+    assert r.status_code == 303, f"register failed: {r.status_code} {r.text[:500]}"
+    return uname
+
+
+def fire_concurrently(build_request, n):
+    """Run `build_request()` (a zero-arg callable issuing one POST) on `n`
+    threads released simultaneously by a barrier, and collect their statuses.
+    """
+    barrier = threading.Barrier(n)
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        status = build_request()
+        with lock:
+            results.append(status)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def race_post_submission():
+    print(f"\n=== Racing {N} concurrent identical POST /submit ===")
+    register("snag_post")
+
+    r = get("/r/create")
+    csrf = extract(r.text, "_csrf")
+    sub_name = f"snagsub{int(time.time() * 1000)}"
+    r = post("/r/create", {"_csrf": csrf, "name": sub_name, "description": "race test community"})
+    assert r.status_code == 303, f"subreddit create failed: {r.status_code} {r.text[:500]}"
+
+    r = get("/submit")
+    csrf = extract(r.text, "_csrf")
+    sub_id_match = re.search(r'<option value="(\d+)"[^>]*>\s*r/' + re.escape(sub_name), r.text)
+    assert sub_id_match, f"could not find subreddit option for {sub_name} in submit form"
+    sub_id = sub_id_match.group(1)
+
+    title = f"Race test post {int(time.time() * 1000)}"
+    cookie_hdr = cookie_header()
+
+    def one_submit():
+        resp = requests.post(
+            f"{BASE}/submit",
+            data={"_csrf": csrf, "title": title, "body": "double-click race probe", "subreddit_id": sub_id},
+            headers={"Cookie": cookie_hdr},
+            allow_redirects=False,
+        )
+        return resp.status_code
+
+    statuses = fire_concurrently(one_submit, N)
+    print("statuses:", statuses)
+    return title
+
+
+def race_comment_submission(post_title):
+    print(f"\n=== Racing {N} concurrent identical POST /comments/Post/{{id}} ===")
+    # Need the post's own page to read its comment-form csrf + discover its
+    # commentable id; find it by grepping the front page for the slug this
+    # session's title produces (session-unique, so unambiguous).
+    r = get("/")
+    slug_match = re.search(r'href="(/r/[^"]+/posts/[^"]+)"[^>]*>\s*' + re.escape(post_title), r.text)
+    assert slug_match, f"could not find post {post_title!r} on the front page"
+    post_path = slug_match.group(1)
+
+    register("snag_comment")
+    r = get(post_path)
+    csrf = extract(r.text, "_csrf")
+    action_match = re.search(r'action="(/comments/[^"]+)"', r.text)
+    assert action_match, "could not find comment form action on post page"
+    comment_action = action_match.group(1)
+
+    body_text = f"Race comment {int(time.time() * 1000)}"
+    cookie_hdr = cookie_header()
+
+    def one_comment():
+        resp = requests.post(
+            f"{BASE}{comment_action}",
+            data={"_csrf": csrf, "body": body_text, "return_to": ""},
+            headers={"Cookie": cookie_hdr},
+            allow_redirects=False,
+        )
+        return resp.status_code
+
+    statuses = fire_concurrently(one_comment, N)
+    print("statuses:", statuses)
+    return body_text
+
+
+if __name__ == "__main__":
+    title = race_post_submission()
+    body = race_comment_submission(title)
+    print(f"\nNow verify row counts against the app's own database, e.g.:")
+    print(f"  SELECT count(*) FROM posts WHERE title = '{title}';   -- expect {N}")
+    print(f"  SELECT count(*) FROM comments WHERE body = '{body}';  -- expect {N}")
+```
+
+**Re-verified against a clean checkout while responding to review on this
+report** (this exact script, freshly restarted app + freshly recreated
+database): a **clean 10/10 on both races** — `[303]*10` /
+`[200]*10`, confirmed with the `SELECT count(*)` queries the script prints
+(`10` and `10`). One earlier re-run against an app instance that had been
+running for a while and had accumulated other concurrent load from this same
+session's testing produced `[303, 303, 303, 303, 303, 303, 303, 303, 303,
+303]` → `[303]*5 + [503]*5`: five requests lost the race for this app's own
+documented 10-connection pool ceiling
+(`examples/reddit-clone/src/routes/posts.rs`'s own comment: *"this app runs
+the default pool (10 connections, no read replica)"*) and got a `503` after
+a ~13s checkout timeout instead of a row — a capacity artifact of this
+sandbox's shared Postgres under a second load source, not a different
+finding. Every request that *did* get a connection still created its own
+duplicate row (5 distinct posts from the 5 successes) — the pool-exhaustion
+variance changes how many of the N duplicates land, never whether a
+duplicate lands. Run it against a freshly started instance for the clean
+10/10.
