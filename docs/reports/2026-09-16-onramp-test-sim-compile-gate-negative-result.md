@@ -31,9 +31,13 @@ Reproduce: see **🔬 Reproduce** below.
   `CARGO_INCREMENTAL=0`, deps left warm, multiple repeats, same-box
   comparison — never a cross-machine percentage).
 - `docs/reports/2026-09-03-prospect-cold-start-post-fix-bisect.md`: an
-  extensive bisection that ended **undetermined**, and flagged this repo's
-  measurement noise floor at σ≈1,080-1,527ms per checkpoint — the number this
-  report's verdict is judged against.
+  extensive bisection that ended **undetermined**, and flagged a
+  σ≈1,080-1,527ms per-checkpoint noise floor — measured on GitHub Actions'
+  `ubuntu-latest` runner, for the full end-to-end cold-start build. This
+  report initially (wrongly) treated that figure as its own verdict's
+  threshold too; per the correction in **📊 Assay**, this sandbox's own noise
+  turned out far coarser, and this report's verdict is judged against noise
+  actually measured on this box, not that borrowed figure.
 - Issue #2795 (2026-09-14, still open): names `autumn-web`'s own source as the
   new largest unit (43-55s) and explicitly suggests looking for internally
   modular-but-ungated subsystems (job scheduling, ledger, admin panel,
@@ -51,10 +55,22 @@ parser backing its structural assertions) and `autumn/src/sim.rs` + its 8
 submodules (`assert,chaos,crash,fault,llm,op,substrate,sweep` — 5,859 lines
 combined — the deterministic simulation/chaos framework) are declared as
 plain `pub mod` in `autumn/src/lib.rs` with **no**
-`#[cfg(feature = ...)]` gate at all — unlike `system_test`, `plugin_sandbox`,
-`system_info`, `seed`, `stories`, and `inbound_mail`, which already are. That
-means all 12,337 lines compile into *every* build of `autumn-web`, including a
-production binary that runs no tests and drives no `Sim`. `test.rs`'s own
+`#[cfg(feature = ...)]` gate at the `lib.rs` level — unlike `system_test`,
+`plugin_sandbox`, `system_info`, `seed`, `stories`, and `inbound_mail`, which
+already are gated there. That means the full 12,337-line pair compiles into
+every build that enables every one of *their own internal* features too
+(`sqlite`, `sim-testing`) — but three of the eight sim submodules gate
+themselves individually, one level down, inside `sim.rs`: `substrate.rs`
+(336 lines) needs `sqlite`, `op.rs` (454) and `sweep.rs` (396) need
+`sim-testing` — 1,186 lines neither the no-DB daemon build measured below
+nor its default-feature counterpart enables. So the amount that actually
+compiles into *this report's measured build* (`maud,htmx,tailwind,reporting`,
+no `sqlite`/`sim-testing`) is **11,151 lines**, not the full 12,337 — a
+correction from an earlier draft, which claimed the full combined total
+compiles into every build without checking those three submodules' own
+gates. The remaining 11,151 lines still compile into a production binary
+that runs no tests and drives no `Sim`, which is the substantive point this
+paragraph is making; the number was just wrong. `test.rs`'s own
 module doc says exactly what it is ("First-party integration-testing
 utilities for Autumn applications... Import it in your integration tests").
 
@@ -185,10 +201,10 @@ timing verdict below (there is no compile-time win to chase), but recorded
 in full because the mechanism's actual scope, not just this report's
 numbers, is worth getting right before anyone tries it.
 
-**Falsifiable question:** does removing these 12,337 always-on lines produce
-a measurable compile-time reduction for the no-DB daemon feature set
-(`maud,htmx,tailwind,reporting` — `DAEMON_NO_DB_FEATURES`,
-`autumn-cli/src/new.rs`)?
+**Falsifiable question:** does removing the 11,151 lines that actually
+compile under the no-DB daemon feature set (`maud,htmx,tailwind,reporting` —
+`DAEMON_NO_DB_FEATURES`, `autumn-cli/src/new.rs`) produce a measurable
+compile-time reduction for that build?
 
 ## 🧪 Apparatus
 
@@ -277,9 +293,12 @@ than the swing either condition shows on its own across runs.
 
 ## 🏁 Verdict: negative result
 
-Removing all 12,337 lines of `test.rs`/`test_html.rs`/`sim.rs` (and its 8 submodules) —
-currently the largest **unconditionally-compiled, unambiguously test-only**
-source in `autumn-web`, confirmed compile-clean to remove **for the `--lib`
+Removing the 11,151 lines of `test.rs`/`test_html.rs`/`sim.rs` (and its 8
+submodules, 3 of which — `substrate`/`op`/`sweep`, 1,186 lines — were never
+compiled into this particular build to begin with, per the correction in
+**💡 Hypothesis**) — currently the largest **unconditionally-compiled,
+unambiguously test-only** source in `autumn-web` for this feature set,
+confirmed compile-clean to remove **for the `--lib`
 target** (the measurement's own build target, so the timing numbers below are
 unaffected — but see the `sim-sweep` `[[bin]]` gap noted in 🧪 Apparatus,
 which means the *module itself* isn't as cleanly severable as this report
