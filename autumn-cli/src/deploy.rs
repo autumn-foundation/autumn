@@ -4863,6 +4863,11 @@ fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
 /// two different apps' `prod` halts, even when they share a `PagerDuty`
 /// routing key (review findings on #2267 — matches [`build_drift_alert`]'s
 /// existing scoping, extended with the app name).
+///
+/// Sets its own `where_to_look` (review finding on #2267): the
+/// `ScheduledTaskFailure` default is `/actuator/tasks`, an app runtime
+/// endpoint with no fleet or rollout data. `autumn deploy status` is the
+/// command that shows the fleet's actual state.
 fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
     Alert::trigger(
         AlertCondition::ScheduledTaskFailure,
@@ -4870,6 +4875,7 @@ fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> 
     )
     .title("Fleet rollout halted")
     .summary(halt.to_string())
+    .where_to_look("autumn deploy status")
     .detail("app_name", app_name)
     .detail("profile", profile)
     .detail("failed_host", halt.failed_host.clone())
@@ -4926,6 +4932,9 @@ fn drift_alert_summary(report: &fleet::DriftReport) -> String {
 /// It carries the same reason strings `fleet::fleet_drift` already prints —
 /// never a raw driver error. So it needs no secrets check beyond what
 /// `DriftReport` already gives.
+///
+/// Sets its own `where_to_look`, same reason as [`build_fleet_halted_alert`]
+/// (review finding on #2267).
 fn build_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) -> Alert {
     Alert::trigger(
         AlertCondition::ScheduledTaskFailure,
@@ -4933,6 +4942,7 @@ fn build_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str)
     )
     .title("Fleet drift detected")
     .summary(drift_alert_summary(report))
+    .where_to_look("autumn deploy status")
     .detail("app_name", app_name)
     .detail("profile", profile)
     .detail("version_drift", report.version_drift.to_string())
@@ -9961,6 +9971,10 @@ mod tests {
             "the alert must name the failing host and step: {}",
             alert.summary
         );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
     }
 
     #[test]
@@ -10054,6 +10068,10 @@ mod tests {
             alert.summary.contains("release"),
             "version drift must be named in the summary: {}",
             alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
         );
     }
 
