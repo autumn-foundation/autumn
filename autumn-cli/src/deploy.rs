@@ -4758,12 +4758,18 @@ fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>
     // `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides, or a destination
     // set only via env var (the documented, recommended way to supply a
     // secret) gets nothing here, and an `AUTUMN_ALERTS__ENABLED=false`
-    // meant to silence a TOML-configured destination is ignored. A failure
-    // building the profile's env overlay is not fatal — the TOML-only
-    // values found above still apply.
+    // meant to silence a TOML-configured destination is ignored.
+    //
+    // If the `.env.<profile>` overlay itself fails to build (unreadable or
+    // malformed), fall back to bare OS env rather than skipping the env
+    // layer outright (review finding on #2267): real OS env vars are the
+    // HIGHEST-priority layer regardless of `.env.<profile>`, so an
+    // `AUTUMN_ALERTS__ENABLED=false` set directly in the process
+    // environment must still apply even when the dotenv file can not be
+    // read. Only the lower-priority `.env.<profile>` layer is lost here.
     let (alerts, http) = match deploy_profile_env_overlay(profile) {
         Ok(env) => apply_alert_env_overrides(alerts, http, &env),
-        Err(_) => (alerts, http),
+        Err(_) => apply_alert_env_overrides(alerts, http, &autumn_web::config::OsEnv),
     };
     alert_channels_for(&alerts, &http)
 }
