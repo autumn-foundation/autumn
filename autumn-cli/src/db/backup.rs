@@ -3411,6 +3411,80 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ── Operator-blind columns in a backup artifact (issue #1771) ────────────
+
+    /// A real `autumn db backup` run over a database holding a
+    /// `#[confidential]` column must produce an artifact with no plaintext in
+    /// it.
+    ///
+    /// `autumn/tests/integration/confidential_red_team.rs` sweeps the same sink
+    /// with the `VACUUM INTO` statement this path runs. This test closes the
+    /// gap between "the statement" and "the command", through `backup_into`
+    /// itself — artifact naming, verification and manifest included.
+    #[test]
+    fn a_backup_artifact_holds_no_confidential_plaintext() {
+        use autumn_web::confidential::{FieldContext, RootKey};
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, SqliteConnection};
+
+        const MARKER: &str = "AUTUMN-REDTEAM-MARKER-backup-artifact-lab-result";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("app.db");
+
+        // The key exists only in this test, standing in for the client.
+        let key = RootKey::generate();
+        let ctx = FieldContext::new("sealed_notes", "body", "user-42");
+        let sealed = key.seal(&ctx, MARKER).expect("seal");
+        let token = key.blind_index(&ctx, MARKER);
+
+        let mut conn = SqliteConnection::establish(db_path.to_str().unwrap()).expect("open");
+        conn.batch_execute(&format!(
+            "CREATE TABLE sealed_notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+             body_bidx TEXT NOT NULL); \
+             INSERT INTO sealed_notes VALUES (1, '{}', '{}');",
+            sealed.as_envelope(),
+            token.as_token(),
+        ))
+        .expect("seed");
+        drop(conn);
+
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let targets = vec![ResolvedTarget {
+            label: "control".to_owned(),
+            url: format!("sqlite://{}", db_path.display()),
+            backend: TargetBackend::Sqlite,
+        }];
+        backup_into(
+            &run_dir,
+            &targets,
+            BackupFormat::default(),
+            None,
+            &PgTools::locate(),
+            "test",
+        )
+        .expect("a SQLite backup needs no external tool");
+
+        let artifact = run_dir.join(artifact_file_name(
+            "control",
+            TargetBackend::Sqlite,
+            BackupFormat::default(),
+        ));
+        let bytes = std::fs::read(&artifact).expect("read artifact");
+        assert!(
+            !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the backup artifact leaked the confidential plaintext"
+        );
+        // The sweep looked at a real dump: the envelope is in there.
+        assert!(
+            bytes
+                .windows(sealed.as_envelope().len())
+                .any(|w| w == sealed.as_envelope().as_bytes()),
+            "the backup artifact must hold the sealed column"
+        );
+    }
+
     // ── SQLite backend dispatch (issue #1909) ──────────────────────────────
 
     #[test]
