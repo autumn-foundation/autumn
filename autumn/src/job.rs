@@ -2821,8 +2821,8 @@ fn due_origin_for(
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
 ///
 /// The single home of the overflow clamp: every enqueue-side due-time
-/// computation reaches it through [`JobClient::delay_to_when`], so a
-/// pathological delay can never panic on one path and clamp on another.
+/// computation reaches it, so a pathological delay can never panic on one
+/// path and clamp on another.
 pub(crate) fn due_at_from(
     now: chrono::DateTime<chrono::Utc>,
     delay: std::time::Duration,
@@ -2874,8 +2874,10 @@ pub async fn enqueue_in(
         return answer;
     }
     let client = require_job_client()?;
-    let when = client.delay_to_when(delay);
-    client.enqueue_due(name, payload, Some(when)).await
+    client
+        .enqueue_relative(name, payload, delay)
+        .await
+        .map(|_| ())
 }
 
 /// Enqueue a one-shot job to run once at the absolute instant `when`.
@@ -2976,9 +2978,8 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
         return answer;
     }
     let client = require_job_client()?;
-    let when = client.delay_to_when(delay);
     client
-        .enqueue_on_conn_due(name, payload, conn, Some(when))
+        .enqueue_on_conn_relative_due(name, payload, conn, delay)
         .await
 }
 
@@ -3189,15 +3190,6 @@ impl JobClient {
 }
 
 impl JobClient {
-    /// Convert a relative delay into an absolute due instant, measured from
-    /// the clock the **serving backend** will later compare it against.
-    ///
-    /// See [`Self::due_origin`] for why that is not unconditionally this
-    /// client's injected clock.
-    fn delay_to_when(&self, delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
-        due_at_from(self.due_origin(), delay)
-    }
-
     /// The instant a relative delay is measured from.
     ///
     /// A due instant is only meaningful against the clock that decides whether
@@ -3221,21 +3213,24 @@ impl JobClient {
     /// Mirrors the backend precedence in `enqueue_with_outcome_due` /
     /// `enqueue_durable_inner`: local, then redis, then Postgres.
     ///
-    /// **Every** decision about a due instant must come from this one function
-    /// — both the stamping in [`Self::delay_to_when`] and the "is it actually in
-    /// the future" filters in `enqueue_with_outcome_due` /
-    /// `enqueue_on_conn_due`. A deadline is only in the future relative to the
-    /// clock that produced it; stamping from one origin and filtering against
-    /// another silently converts a delayed job into an immediate one.
+    /// **Every** decision about a due instant must come from this one
+    /// function — both the stamping at each `enqueue_in`/`enqueue_at` entry
+    /// point and the "is it actually in the future" filters in
+    /// `enqueue_with_outcome_due` / `enqueue_on_conn_due`. A deadline is only
+    /// in the future relative to the clock that produced it; stamping from
+    /// one origin and filtering against another silently converts a delayed
+    /// job into an immediate one.
     ///
-    /// The residual app-vs-database clock skew on the Postgres path is the
-    /// ordinary NTP-scale condition this queue has always run under, unchanged
-    /// by the migration. Computing the deadline in the database itself
-    /// (`run_at = NOW() + $delay * INTERVAL '1 millisecond'`, as the backoff
-    /// path at the nack UPDATE already does) would remove even that, and is the
-    /// natural follow-up; it needs the relative/absolute distinction threaded
-    /// down to `pg_insert_job`, which is more surgery than this migration
-    /// should carry.
+    /// This function still governs *whether* a job is in the future and how
+    /// the durable backends other than Postgres compare against it. On
+    /// Postgres itself, a **relative** delay (`enqueue_in`) no longer binds
+    /// the real-time instant this reads: `pg_due_from` carries the raw delay
+    /// to the INSERT instead, and `run_at = clock_timestamp() + $delay *
+    /// INTERVAL '1 millisecond'` computes the deadline on the database's own
+    /// clock — removing the app-vs-database NTP skew this real-time read used
+    /// to carry into `run_at`. An **absolute** instant (`enqueue_at`) still
+    /// passes through unchanged: it is a real-world deadline the caller
+    /// chose, not one measured from this read.
     fn due_origin(&self) -> chrono::DateTime<chrono::Utc> {
         due_origin_for(self.durable_is_pg(), self.clock.as_ref())
     }
@@ -3346,7 +3341,41 @@ impl JobClient {
         // as the failure the handler actually saw.
         let slot = reserve_enqueue(&payload);
         let result = self
-            .enqueue_with_outcome_due_inner(name, payload, due_at, now)
+            .enqueue_with_outcome_due_inner(name, payload, due_at, now, None)
+            .await;
+        fill_enqueue(slot, name, due_at, now, result.as_ref().err());
+        result
+    }
+
+    /// [`Self::enqueue_with_outcome_due`] for a **relative** delay.
+    ///
+    /// Keeps the delay distinct from an absolute instant, all the way down to
+    /// the Postgres INSERT, so that backend can compute `run_at` on its own
+    /// clock (`NOW() + delay`) instead of binding a value this host's real
+    /// clock produced — see [`Self::due_origin`] and [`PgDueAt`]. Backs
+    /// `enqueue_in` and the after-commit `AfterCommitDue::After` arm.
+    pub(crate) async fn enqueue_relative(
+        &self,
+        name: &str,
+        payload: Value,
+        delay: std::time::Duration,
+    ) -> AutumnResult<EnqueueOutcome> {
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
+        // Single real-clock read, reused for both the due instant and the
+        // future-filter/admin bookkeeping below — see the capture-once note
+        // on `enqueue_with_outcome_due`.
+        let now = self.due_origin();
+        let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
+        if let Some(answer) = replayed_enqueue(
+            name,
+            &payload,
+            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+        ) {
+            return answer.map(|()| EnqueueOutcome::Queued);
+        }
+        let slot = reserve_enqueue(&payload);
+        let result = self
+            .enqueue_with_outcome_due_inner(name, payload, due_at, now, Some(delay))
             .await;
         fill_enqueue(slot, name, due_at, now, result.as_ref().err());
         result
@@ -3358,7 +3387,10 @@ impl JobClient {
     /// Takes the reference instant rather than reading the clock itself: the
     /// wrapper already read it, and a second read would land an extra entry on
     /// the capsule's clock tape that replay — which never reaches this method —
-    /// could not consume.
+    /// could not consume. `relative_delay` is the original delay a relative
+    /// caller (`enqueue_relative`) was given, kept distinct from `due_at` so
+    /// only the Postgres arm — the one backend that cannot share the caller's
+    /// clock — can measure it from the database's own `NOW()` instead.
     #[allow(clippy::too_many_lines)]
     async fn enqueue_with_outcome_due_inner(
         &self,
@@ -3366,13 +3398,14 @@ impl JobClient {
         payload: Value,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
+        relative_delay: Option<std::time::Duration>,
     ) -> AutumnResult<EnqueueOutcome> {
         // Capture the reference instant once, so every downstream decision — filter,
         // admin record status, local-backend sleep — uses one clock reading and near-due
         // jobs cannot be misclassified.
         //
         // It must be [`Self::due_origin`], not `self.clock.now()`: that is the instant
-        // `delay_to_when` measured the deadline from, and a deadline is only "in the
+        // a relative delay was measured from, and a deadline is only "in the
         // future" relative to the clock that stamped it. Reading the injected clock here
         // while the Postgres path stamps from real time would make a `TestApp` pinned
         // ahead of real time discard every durable deadline as already past and insert an
@@ -3544,6 +3577,7 @@ impl JobClient {
                     job_max_attempts,
                     job_backoff_ms,
                     due_at,
+                    relative_delay,
                     &constraints,
                 )
                 .await
@@ -3750,17 +3784,23 @@ impl JobClient {
             let name = name.clone();
             let payload = payload.clone();
             // Resolve the due instant here, inside the callback, so that an
-            // AfterCommitDue::After delay is measured from commit time.
-            let due_at = match due {
-                AfterCommitDue::At(at) => at,
-                // This client's own clock, not the process-global one: an
-                // after-commit enqueue belongs to the app whose transaction just
-                // committed, and resolving the global handle again here would
-                // both take a second `RwLock` round-trip and read a different
-                // app's clock in a multi-app test process.
-                AfterCommitDue::After(d) => Some(client.delay_to_when(d)),
-            };
-            async move { client.enqueue_due(&name, payload, due_at).await }
+            // AfterCommitDue::After delay is measured from commit time — using
+            // this client's own clock, not the process-global one: an
+            // after-commit enqueue belongs to the app whose transaction just
+            // committed, and resolving the global handle again here would both
+            // take a second `RwLock` round-trip and read a different app's
+            // clock in a multi-app test process.
+            async move {
+                match due {
+                    AfterCommitDue::At(at) => client.enqueue_due(&name, payload, at).await,
+                    // Kept relative rather than resolved to an absolute instant
+                    // here, so the Postgres arm can still measure it from the
+                    // database's own clock — see `enqueue_relative`.
+                    AfterCommitDue::After(d) => {
+                        client.enqueue_relative(&name, payload, d).await.map(|_| ())
+                    }
+                }
+            }
         });
 
         #[cfg(feature = "db")]
@@ -3831,6 +3871,7 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
+        relative_delay: Option<std::time::Duration>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.resilience_config.as_ref().map_or_else(
@@ -3864,6 +3905,7 @@ impl JobClient {
                 max_attempts,
                 backoff_ms,
                 due_at,
+                relative_delay,
                 constraints,
             )
             .await;
@@ -3885,8 +3927,13 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
+        relative_delay: Option<std::time::Duration>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
+        // Only the Postgres arm below consumes this; keep the compiler quiet
+        // on redis/sqlite-only builds where that arm does not compile in.
+        #[cfg(not(feature = "db"))]
+        let _ = &relative_delay;
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
             let due_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
@@ -3929,7 +3976,7 @@ impl JobClient {
                 payload,
                 max_attempts,
                 backoff_ms,
-                due_at,
+                pg_due_from(relative_delay, due_at),
                 constraints,
             )
             .await;
@@ -3992,6 +4039,41 @@ impl JobClient {
         // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
         let now = self.due_origin();
         let due_at = due_at.filter(|due| *due > now);
+        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, None)
+            .await
+    }
+
+    /// [`Self::enqueue_on_conn_due`] for a **relative** delay — the
+    /// transactional counterpart of [`Self::enqueue_relative`]. Keeps the
+    /// delay distinct from an absolute instant so the Postgres arm can
+    /// compute `run_at` on the database's own clock. Backs `enqueue_in_on_conn`.
+    #[cfg(feature = "db")]
+    pub(crate) async fn enqueue_on_conn_relative_due(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+        delay: std::time::Duration,
+    ) -> AutumnResult<()> {
+        let now = self.due_origin();
+        let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
+        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(delay))
+            .await
+    }
+
+    /// Shared body of [`Self::enqueue_on_conn_due`] and
+    /// [`Self::enqueue_on_conn_relative_due`] — only `due_at`/`relative_delay`
+    /// resolution differs between the two.
+    #[cfg(feature = "db")]
+    async fn enqueue_on_conn_due_dispatch(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+        relative_delay: Option<std::time::Duration>,
+    ) -> AutumnResult<()> {
         // Failure-capsule seam (#1634). This is the transactional chokepoint —
         // it never funnels through `enqueue_with_outcome_due`, so without its
         // own seam an `enqueue_on_conn` would be missing from the capsule and
@@ -4014,7 +4096,7 @@ impl JobClient {
         }
         let slot = reserve_enqueue(&payload);
         let result = self
-            .enqueue_on_conn_due_inner(name, payload, conn, due_at)
+            .enqueue_on_conn_due_inner(name, payload, conn, due_at, relative_delay)
             .await;
         fill_enqueue(slot, name, due_at, now, result.as_ref().err());
         result
@@ -4036,6 +4118,7 @@ impl JobClient {
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
+        relative_delay: Option<std::time::Duration>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let Some(settings) = self.per_job_settings.get(name) else {
@@ -4108,7 +4191,7 @@ impl JobClient {
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
-                    due_at,
+                    pg_due_from(relative_delay, due_at),
                     constraints_ref,
                 )
                 .await;
@@ -8409,6 +8492,64 @@ async fn pg_evict_expired_unique_key(
     .await;
 }
 
+/// A job's due time as it reaches the Postgres INSERT.
+///
+/// `RelativeMs` keeps a relative delay distinct from an absolute instant so
+/// the database computes `run_at` on its own clock (`NOW() + delay`) — the
+/// "natural follow-up" named in [`JobClient::due_origin`], closing the
+/// app-vs-database clock skew that stamping from `chrono::Utc::now()` and
+/// binding the result would carry. `Absolute` is a real-world deadline the
+/// caller chose (`enqueue_at`); it is inserted unchanged, exactly as before.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgDueAt {
+    /// Run as soon as possible.
+    Immediate,
+    /// Run at this absolute instant.
+    Absolute(chrono::DateTime<chrono::Utc>),
+    /// Run this many milliseconds after the database's own `NOW()`.
+    RelativeMs(i64),
+}
+
+/// A safe upper bound for a relative delay bound to Postgres as milliseconds.
+///
+/// `run_at_delay_ms * 1000` must fit inside Postgres's own `INTERVAL`/
+/// `timestamptz` range or the INSERT errors instead of saturating — and that
+/// range is narrower than a raw `i64` millisecond count in two ways: the
+/// `bigint * interval` multiply runs through a `float8` cast, and
+/// `timestamptz`'s own ceiling (294276 AD) is closer to "now" every day this
+/// binary runs. Rather than chase either boundary, this stays a fixed 292
+/// years — far more delay than any real caller requests, and far short of
+/// both limits for as long as this code exists.
+#[cfg(feature = "db")]
+const PG_MAX_RELATIVE_DELAY_MS: i64 = i64::MAX / 1_000_000;
+
+/// Resolves the [`PgDueAt`] a Postgres enqueue should use.
+///
+/// `relative_delay` wins when present: it is the original delay `enqueue_in`
+/// (or a transactional/after-commit sibling) was called with, so it is
+/// measured from the database's clock. Otherwise `due_at` is either an
+/// explicit `enqueue_at` instant or `None` (immediate).
+#[cfg(feature = "db")]
+fn pg_due_from(
+    relative_delay: Option<std::time::Duration>,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> PgDueAt {
+    relative_delay.map_or_else(
+        || due_at.map_or(PgDueAt::Immediate, PgDueAt::Absolute),
+        |delay| {
+            let ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            if ms > PG_MAX_RELATIVE_DELAY_MS {
+                // Matches `due_at_from`'s own overflow fallback so both paths
+                // clamp to the same, representable instant.
+                PgDueAt::Absolute(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            } else {
+                PgDueAt::RelativeMs(ms)
+            }
+        },
+    )
+}
+
 /// Shared INSERT for new job rows, with uniqueness dedup applied in SQL.
 ///
 /// The `WHERE ... NOT EXISTS` guard handles the common dedup paths (an
@@ -8427,7 +8568,7 @@ async fn pg_insert_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pg_due: PgDueAt,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
@@ -8446,6 +8587,11 @@ async fn pg_insert_job(
     const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
 
+    let (run_at, run_at_delay_ms) = match pg_due {
+        PgDueAt::Immediate => (None, None),
+        PgDueAt::Absolute(at) => (Some(at), None),
+        PgDueAt::RelativeMs(ms) => (None, Some(ms)),
+    };
     let queue = normalize_queue_name(queue);
     #[cfg(feature = "telemetry-otlp")]
     let (traceparent, tracestate) = capture_job_trace_context();
@@ -8476,12 +8622,28 @@ async fn pg_insert_job(
         pg_evict_expired_unique_key(conn, name, key.as_str(), ttl).await;
     }
 
+    // `run_at` picks its value in this order: an explicit absolute instant
+    // ($11/$13, `enqueue_at`), else a relative delay measured from the
+    // database's own clock ($13/$15, `enqueue_in`), else now. Computing the
+    // delay case in SQL (`clock_timestamp() + delay`) rather than binding a
+    // Rust-computed `chrono::Utc::now() + delay` removes app-vs-database
+    // clock skew — see [`PgDueAt`].
+    //
+    // The delay term reads `clock_timestamp()`, not `NOW()`: `NOW()` is fixed
+    // for the whole transaction, so on `pg_enqueue_on_conn_at` — which runs
+    // inside the *caller's* already-open transaction — a `NOW()`-based delay
+    // would be measured from when that transaction began, not from this
+    // enqueue call, silently shrinking the delay by however long the
+    // transaction had already been open. `enqueued_at` keeps `NOW()`: it
+    // records this row's place in the transaction, not a deadline.
     #[cfg(not(feature = "telemetry-otlp"))]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
-         SELECT $1, $2, $12, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($11, NOW()), $6, $7, $9, $10 \
+         SELECT $1, $2, $12, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), \
+                COALESCE($11, clock_timestamp() + (COALESCE($13, 0)::BIGINT * INTERVAL '1 millisecond')), \
+                $6, $7, $9, $10 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -8498,14 +8660,17 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at)
-    .bind::<diesel::sql_types::Text, _>(queue.clone());
+    .bind::<diesel::sql_types::Text, _>(queue.clone())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(run_at_delay_ms);
     #[cfg(feature = "telemetry-otlp")]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
           traceparent, tracestate) \
-         SELECT $1, $2, $14, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($13, NOW()), $6, $7, $9, $10, $11, $12 \
+         SELECT $1, $2, $14, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), \
+                COALESCE($13, clock_timestamp() + (COALESCE($15, 0)::BIGINT * INTERVAL '1 millisecond')), \
+                $6, $7, $9, $10, $11, $12 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -8524,7 +8689,8 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at)
-    .bind::<diesel::sql_types::Text, _>(queue.clone());
+    .bind::<diesel::sql_types::Text, _>(queue.clone())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(run_at_delay_ms);
 
     let inserted = query.execute(conn).await.map_err(|e| {
         AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
@@ -8559,16 +8725,17 @@ async fn pg_enqueue_job(
         payload,
         max_attempts,
         initial_backoff_ms,
-        None,
+        PgDueAt::Immediate,
         constraints,
     )
     .await
 }
 
-/// Insert a new job row into `autumn_jobs` with an explicit `run_at` due time.
+/// Insert a new job row into `autumn_jobs` with an explicit due time.
 ///
-/// When `run_at` is in the future the row is durable but invisible to the claim
-/// query (`WHERE run_at <= NOW()`) until then — a crash-safe delayed enqueue.
+/// When `run_at` lands in the future the row is durable but invisible to the
+/// claim query (`WHERE run_at <= NOW()`) until then — a crash-safe delayed
+/// enqueue.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job_at(
@@ -8579,7 +8746,7 @@ async fn pg_enqueue_job_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pg_due: PgDueAt,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     let mut conn = pool
@@ -8594,7 +8761,7 @@ async fn pg_enqueue_job_at(
         payload,
         max_attempts,
         initial_backoff_ms,
-        run_at,
+        pg_due,
         constraints,
     )
     .await
@@ -8618,7 +8785,7 @@ async fn pg_enqueue_on_conn_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pg_due: PgDueAt,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     pg_insert_job(
@@ -8629,7 +8796,7 @@ async fn pg_enqueue_on_conn_at(
         payload,
         max_attempts,
         initial_backoff_ms,
-        run_at,
+        pg_due,
         constraints,
     )
     .await
@@ -10703,9 +10870,9 @@ mod tests {
     /// A relative-delay enqueue must compute its due instant and submit it
     /// through the **same** client handle.
     ///
-    /// `enqueue_in` used to call the free `delay_to_when` (one global lookup,
-    /// to read the clock) and then `enqueue_at` (a second global lookup, to
-    /// submit). The global is a swappable `RwLock`, so a concurrent
+    /// `enqueue_in` used to read the clock (one global lookup) and then call
+    /// `enqueue_at` (a second global lookup) to submit. The global is a
+    /// swappable `RwLock`, so a concurrent
     /// `TestApp::build` landing between the two lookups stamped the due instant
     /// from app A's virtual clock and handed it to app B — whose runtime filters
     /// due-at against *its own* clock, leaving the job years off B's timeline
@@ -10754,7 +10921,7 @@ mod tests {
         let held = require_job_client().expect("client A is installed");
         init_global_job_client(client_at(epoch_b));
 
-        let when = held.delay_to_when(std::time::Duration::from_secs(60));
+        let when = due_at_from(held.due_origin(), std::time::Duration::from_secs(60));
         assert_eq!(
             when,
             epoch_a + chrono::Duration::seconds(60),
@@ -10765,9 +10932,12 @@ mod tests {
         // The swap really did land: a fresh resolution returns B, so the
         // assertion above is about the handle we held, not a no-op.
         assert_eq!(
-            require_job_client()
-                .expect("client B is installed")
-                .delay_to_when(std::time::Duration::from_secs(60)),
+            due_at_from(
+                require_job_client()
+                    .expect("client B is installed")
+                    .due_origin(),
+                std::time::Duration::from_secs(60)
+            ),
             epoch_b + chrono::Duration::seconds(60),
             "a fresh resolution sees B, confirming the global was swapped"
         );
@@ -15462,6 +15632,43 @@ mod tests {
             assert_eq!(pg_retry_delay_ms(250, 4), 2_000);
         }
 
+        /// `enqueue_in` (a relative delay) must reach the INSERT as
+        /// `RelativeMs`, never as a Rust-computed absolute instant, so the
+        /// database — not this host's clock — measures the deadline
+        /// (issue #2111 follow-up). `enqueue_at` (an explicit instant) must
+        /// pass through unchanged. A relative delay wins when both are given:
+        /// `due_at` alongside it is only the future-filter/admin/replay
+        /// bookkeeping instant, never the source of truth for the INSERT.
+        #[test]
+        fn pg_due_from_prefers_a_relative_delay_over_an_absolute_due_at() {
+            use chrono::{TimeZone, Utc};
+
+            let at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+
+            assert_eq!(pg_due_from(None, None), PgDueAt::Immediate);
+            assert_eq!(pg_due_from(None, Some(at)), PgDueAt::Absolute(at));
+            assert_eq!(
+                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                PgDueAt::RelativeMs(2_000)
+            );
+            assert_eq!(
+                pg_due_from(Some(Duration::from_millis(2_000)), Some(at)),
+                PgDueAt::RelativeMs(2_000)
+            );
+        }
+
+        /// A pathological delay must clamp the same way `due_at_from` already
+        /// does, rather than let Postgres overflow computing
+        /// `NOW() + delay INTERVAL` (its own `INTERVAL` is microseconds in an
+        /// `i64`, a tighter bound than `i64::MAX` milliseconds).
+        #[test]
+        fn pg_due_from_clamps_an_overflowing_delay_instead_of_overflowing_postgres() {
+            assert_eq!(
+                pg_due_from(Some(Duration::from_secs(u64::MAX)), None),
+                PgDueAt::Absolute(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            );
+        }
+
         fn pg_test_row(id: &str, name: &str, attempt: i32, max_attempts: i32) -> PgJobRow {
             PgJobRow {
                 id: id.to_owned(),
@@ -16172,32 +16379,25 @@ mod tests {
         }
 
         async fn pg_run_migration(pool: &PgPool) {
+            use diesel_async::SimpleAsyncConnection as _;
+
             let mut conn = pool.get().await.unwrap();
 
+            // `batch_execute` runs the whole file through Postgres's simple
+            // query protocol in one round trip, so a `;` inside a `--`
+            // comment (as in the `add_queue_to_jobs` migration below) stays
+            // part of that comment. A naive `.split(';')` cuts mid-comment
+            // instead, feeding the back half of the sentence to Postgres as
+            // if it were SQL and failing with a syntax error.
             let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
-            for stmt in sql1.split(';') {
-                let stmt = stmt.trim();
-                if !stmt.is_empty() {
-                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
-                }
-            }
+            conn.batch_execute(sql1).await.unwrap();
 
             let sql2 =
                 include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
-            for stmt in sql2.split(';') {
-                let stmt = stmt.trim();
-                if !stmt.is_empty() {
-                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
-                }
-            }
+            conn.batch_execute(sql2).await.unwrap();
 
             let sql3 = include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql");
-            for stmt in sql3.split(';') {
-                let stmt = stmt.trim();
-                if !stmt.is_empty() {
-                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
-                }
-            }
+            conn.batch_execute(sql3).await.unwrap();
         }
 
         fn unique_constraints(key: &str, window: JobUniquenessWindow) -> ResolvedJobConstraints {
@@ -16288,7 +16488,8 @@ mod tests {
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
-            // Enqueue due ~2s in the future.
+            // Enqueue due ~2s in the future, at an explicit absolute instant
+            // (the `enqueue_at` shape): inserted unchanged, exactly as before.
             let job_id = uuid::Uuid::new_v4().to_string();
             let due = chrono::Utc::now() + chrono::TimeDelta::seconds(2);
             pg_enqueue_job_at(
@@ -16299,7 +16500,7 @@ mod tests {
                 serde_json::json!({ "user_id": 7 }),
                 5,
                 250,
-                Some(due),
+                PgDueAt::Absolute(due),
                 &ResolvedJobConstraints::default(),
             )
             .await
@@ -16343,6 +16544,111 @@ mod tests {
                 .expect("ack should succeed");
             let finished = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
             assert_eq!(finished.status, PG_STATUS_COMPLETED);
+        }
+
+        // Regression for issue #2111's follow-up: a relative delay
+        // (`enqueue_in`'s shape) must compute `run_at` on the database's own
+        // clock, not this host's. `run_at` reads `clock_timestamp()`, not
+        // `NOW()` (see `pg_insert_job`'s comment on why), so it is not the
+        // exact same reading as `enqueued_at`'s `NOW()` — allow a generous
+        // tolerance rather than assert exact equality.
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_relative_delay_computes_run_at_on_the_database_clock() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let job_id = uuid::Uuid::new_v4().to_string();
+            pg_enqueue_job_at(
+                &pool,
+                job_id.clone(),
+                "send_email",
+                "default",
+                serde_json::json!({ "user_id": 7 }),
+                5,
+                250,
+                PgDueAt::RelativeMs(2_000),
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("relative-delay enqueue should succeed");
+
+            let row = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
+            let enqueued_at = row.enqueued_at.expect("enqueued_at is set");
+            let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
+            let bound_delay = run_at.signed_duration_since(enqueued_at);
+            assert!(
+                bound_delay >= chrono::TimeDelta::milliseconds(2_000)
+                    && bound_delay < chrono::TimeDelta::milliseconds(2_500),
+                "run_at must be ~2s after enqueued_at (got {bound_delay}), computed by the \
+                 database, not stamped from a Rust-side clock read"
+            );
+        }
+
+        // Regression for the P1 the SQL bind-order audit raised while
+        // reviewing this fix: `pg_enqueue_on_conn_at` runs inside the
+        // *caller's* already-open transaction, where `NOW()` is fixed at
+        // transaction start. A `NOW()`-based relative delay would measure
+        // from there, silently swallowing however long the transaction had
+        // already been open. `run_at` must instead reflect the delay from
+        // this call, however old the surrounding transaction already is.
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_on_conn_relative_delay_ignores_how_long_the_transaction_was_already_open() {
+            use diesel_async::AsyncConnection as _;
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let job_id_for_insert = job_id.clone();
+            let mut conn = pool.get().await.unwrap();
+            let before_enqueue = std::time::Instant::now();
+            conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+                // Hold the transaction open for 3s before the relative
+                // enqueue: long enough that a `NOW()`-based delay would make
+                // a 2s-delayed job already due by commit time.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                pg_enqueue_on_conn_at(
+                    conn,
+                    job_id_for_insert,
+                    "send_email",
+                    "default",
+                    serde_json::json!({ "user_id": 7 }),
+                    5,
+                    250,
+                    PgDueAt::RelativeMs(2_000),
+                    &ResolvedJobConstraints::default(),
+                )
+                .await
+                .expect("relative-delay on-conn enqueue should succeed");
+                Ok(())
+            })
+            .await
+            .expect("transaction should commit");
+
+            let row = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
+            let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
+            assert!(
+                run_at > chrono::Utc::now(),
+                "a 2s relative delay must still be in the future after commit, even though \
+                 the transaction had already been open ~3s before the enqueue call (elapsed \
+                 since the call: {:?})",
+                before_enqueue.elapsed()
+            );
         }
 
         #[tokio::test]
@@ -18097,6 +18403,7 @@ mod tests {
                     1,
                     1000,
                     None,
+                    None,
                     &ResolvedJobConstraints::default(),
                 )
                 .await;
@@ -18115,6 +18422,7 @@ mod tests {
                 1,
                 1000,
                 None,
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await;
@@ -18131,8 +18439,8 @@ mod tests {
 
     // ── due-time math unit tests ──────────────────────────────────────────────
     //
-    // These target `due_at_from`, the single home of the overflow clamp that
-    // `JobClient::delay_to_when` reaches through. They pass an explicit `now`
+    // These target `due_at_from`, the single home of the overflow clamp every
+    // relative-delay enqueue reaches through. They pass an explicit `now`
     // rather than reading a clock, so they assert exact equality instead of
     // bracketing a real-time read.
 
