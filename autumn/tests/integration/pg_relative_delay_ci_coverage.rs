@@ -19,9 +19,10 @@
 use std::path::{Path, PathBuf};
 
 /// Full test paths ci.yml's Docker step passes as libtest filters.
-const CI_FILTERS: [&str; 2] = [
+const CI_FILTERS: [&str; 3] = [
     "job::tests::pg::pg_relative_delay_computes_run_at_on_the_database_clock",
     "job::tests::pg::pg_on_conn_relative_delay_ignores_how_long_the_transaction_was_already_open",
+    "job::tests::pg::pg_cancel_classification_uses_the_database_clock_not_the_app_clock",
 ];
 
 fn workspace_root() -> PathBuf {

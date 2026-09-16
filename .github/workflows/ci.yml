@@ -1364,13 +1364,17 @@ jobs:
           # above does. Named by full test path, not a shared `pg_` prefix:
           # job.rs carries ~30 other ignored `pg_*` tests this filter must not
           # revive. `pg_relative_delay_ci_coverage` (in the consolidated
-          # binary) is the other half of this guard.
+          # binary) is the other half of this guard. The admin-cancel
+          # classification test joins the same filter list: it is the same
+          # app-vs-database clock-skew concern applied to
+          # `pg_cancel_enqueued`'s ready/scheduled routing.
           (
             set -o pipefail
             cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
               --ignored --test-threads=1 \
               job::tests::pg::pg_relative_delay_computes_run_at_on_the_database_clock \
               job::tests::pg::pg_on_conn_relative_delay_ignores_how_long_the_transaction_was_already_open \
+              job::tests::pg::pg_cancel_classification_uses_the_database_clock_not_the_app_clock \
               | tee "${RUNNER_TEMP}/pg-relative-delay.log"
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
