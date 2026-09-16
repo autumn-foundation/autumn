@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
+  api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
+  token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
+  nowhere told them where the token comes from or how to take it back. All
+  four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
+  `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
+  reached readers only through the agent skill tree and `list` / `rotate` /
+  `revoke` reached them nowhere: searching all 160 guide pages for "revoke
+  api token" returned **zero results**, and `issue_scoped_api_token` /
+  `IssueTokenSpec` appeared on none of them. A reader holding a leaked
+  credential had no path from the page that raised the question to the
+  command that answers it. This is a findability defect, not a coverage
+  one — the answer existed and was correct — so the fix is a crosslink at
+  the point the question arises rather than a new page: a section under
+  "Protecting routes" in `docs/guide/authentication.md` naming all four
+  commands and linking the Rust equivalents, and a pointer from
+  `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token. The
+  worked block captures what `issue` and `rotate` print (they write the token to
+  stdout and the confirmation to stderr, so a `$(…)` capture gets the secret and
+  nothing else), and says plainly that `rotate` and `revoke` are alternatives
+  rather than steps: rotating already revokes the token passed to it, so a
+  following `revoke "$TOKEN"` would retire a dead token and strand the live
+  replacement with its secret lost. The Rust pointers name one helper per
+  subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
+  `revoke_api_token` — rather than omitting list and rotate and listing the
+  `IssueTokenSpec` data type as though it were an operation.
+
+  Found by running the docs corpus against the CLI surface in the direction
+  no existing gate runs: the eleven docs gates all ask "is what we wrote
+  still true?" (drift), and none asks "is what we shipped written down
+  anywhere?" (coverage), so a command can ship documented nowhere and the
+  whole tree stays green. That measurement found 26 of 194 command paths
+  absent from all 212 reader-facing pages; most were benign (13 `destroy`
+  subcommands covered by the rule `generators.md` states over the family,
+  one `#[command(hide = true)]` internal), and the `autumn token` family was
+  the defect worth fixing. A gate to hold that line is NOT included here —
+  see the note in the PR: a correct one has to reuse
+  `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
+  its own change.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the

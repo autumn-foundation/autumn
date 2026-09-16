@@ -445,6 +445,74 @@ grants.
 See [macro transparency](./macro-transparency.md#securedrole) for the exact
 expansion.
 
+### Issuing, listing, rotating and revoking API tokens
+
+The scopes in `#[secured(scopes = [...])]` above come from the bearer token the
+client presents, and that token is minted by the CLI rather than by a signup
+flow. Manage them with `autumn token` — run any of these with `--help` for the
+full argument list.
+
+**This lifecycle is PostgreSQL-only.** Every `autumn token` subcommand shells
+out to `psql`, and [`DbApiTokenStore`](../../autumn/src/auth.rs) is backed by a
+Postgres pool. On a [SQLite](./sqlite-in-production.md) app neither is
+available: use `InMemoryApiTokenStore` for local work, or implement the
+[`ApiTokenStore`](../../autumn/src/auth.rs) trait against your own table and
+manage tokens through it.
+
+```bash
+# `issue` and `rotate` print the new token on stdout — and only its hash is
+# stored, so capture it now or it is unrecoverable. (The "✓ …" confirmation
+# goes to stderr, so it stays out of the captured value.)
+TOKEN=$(autumn token issue service:ci --name ci --scope posts:write)
+
+autumn token list service:ci        # name, scopes, expiry, last-used, revoked — never the secret
+
+# Then EITHER rotate — the old token stops working and this is the new one:
+TOKEN=$(autumn token rotate "$TOKEN")
+
+# …OR revoke, to stop it working with no replacement:
+autumn token revoke "$TOKEN"
+```
+
+`rotate` and `revoke` are alternatives, not steps. Rotating already revokes the
+token you passed it, so running `revoke "$TOKEN"` afterwards without
+re-capturing would retire a token that is already dead and leave the live
+replacement in the database with its secret lost.
+
+`--expires-at <ISO-8601>` makes a token expire; omit it for a non-expiring one.
+
+On Postgres, these commands read and write the managed `api_tokens` table, so
+they reach your app only when it mounts `DbApiTokenStore` and has that table —
+pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run `autumn migrate`. An app
+wired to `InMemoryApiTokenStore` keeps its tokens in the process and seeds them
+in code: a token issued by the CLI is invisible to it, and verification answers
+`401`.
+
+**To revoke a leaked API token**, run `autumn token revoke "$TOKEN"`: it sets
+`revoked_at`, and `RequireApiToken` answers `401` for every later request
+presenting it.
+
+**To rotate an API token** — a CI credential that must keep working — run
+`autumn token rotate "$TOKEN"` instead. It revokes the old row and **inserts a
+new one** carrying the same principal, name, scopes and expiry, then prints the
+new secret. The replacement is a distinct token: new id, new `created_at`, and
+no `last_used_at` until it is used. The retired row stays in the table with
+`revoked_at` set, so `autumn token list` shows both — expect one live row and
+one revoked row per rotation.
+
+Nothing on the row survives a rotation as an identifier, and `name` is not a
+substitute: the column is `TEXT NOT NULL DEFAULT ''` with no unique
+constraint, and `--name` defaults to the empty string, so it is a label that
+several tokens — including every unnamed one — can share. Tooling should
+filter on `revoked_at IS NULL` to find the live token rather than treating
+either the id or the name as a stable handle across rotations.
+
+In Rust, the same four operations are
+[`issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token` and
+`revoke_api_token`](../../autumn/src/auth.rs) — one per CLI subcommand.
+`issue_scoped_api_token` takes its name, scopes and expiry as an
+[`IssueTokenSpec`](../../autumn/src/auth.rs).
+
 ### `RequireAuth` and `Auth<T>`
 
 `#[secured]` is per-handler. To gate a whole subtree, layer `RequireAuth`, which
@@ -887,6 +955,9 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.
+- [API tokens](#issuing-listing-rotating-and-revoking-api-tokens) — `autumn
+  token issue | list | rotate | revoke` for the bearer tokens that carry
+  `#[secured(scopes = [...])]` grants.
 - [Signing secrets](./signing-secrets.md) — the key behind session cookies, CSRF
   tokens, and flash state.
 - [Middleware](./middleware.md) — where the session, CSRF, and security-header
