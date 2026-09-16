@@ -447,3 +447,48 @@ fn for_table_does_not_merge_another_collections_field() {
     );
     assert!(matches!(verdict, Resolution::Merge(_)));
 }
+
+/// A device cannot make the resolver replay an unbounded document.
+///
+/// `mine` is client-supplied, and decoding it replays every operation —
+/// quadratically. A causal chain sent in reverse costs a drain pass per
+/// operation, so a payload well inside any body limit could occupy a blocking
+/// worker for tens of seconds. The bound sits in `CollabText`'s `Deserialize`,
+/// before the replay, so the resolver skips the field instead of replaying it.
+#[test]
+fn an_oversized_collaborative_field_is_skipped_not_replayed() {
+    let now = Utc::now();
+    let resolver = CollabResolver::new(["body"]);
+
+    // The adversarial shape: every operation blocks until the last arrives.
+    let pending: Vec<serde_json::Value> = (1..=autumn_web::collab::MAX_WIRE_PENDING + 1)
+        .map(|n| {
+            json!({
+                "op": "insert",
+                "id": format!("{n}@evil"),
+                "after": "99999@ghost",
+                "ch": "x",
+            })
+        })
+        .collect();
+    let hostile = json!({ "elems": [], "pending": pending });
+
+    let (_offline, online) = branched();
+    let started = std::time::Instant::now();
+    let verdict = resolver.resolve(
+        "phone",
+        &client_change(json!({ "body": hostile }), now),
+        &server_row(json!({ "body": online }), now),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        verdict,
+        Resolution::KeepServer,
+        "the field is not a document this server will replay, so it is not merged"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "refused before the replay, not after: took {elapsed:?}"
+    );
+}

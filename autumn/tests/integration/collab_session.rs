@@ -277,13 +277,73 @@ fn closing_a_document_returns_its_final_state() {
     )
     .expect("insert");
 
-    let final_state = hub.close("notes:7:body").expect("the document was live");
-    assert_eq!(final_state.text(), "a draft");
-    assert!(hub.open_keys().is_empty());
+    let closing = hub.close("notes:7:body").expect("the document was live");
+    assert_eq!(closing.text().text(), "a draft");
+    // Still discoverable: the row has not been written yet, so a reconnecting
+    // editor must find this document rather than seed a second one from the
+    // stale row and overwrite it.
+    assert_eq!(hub.open_keys(), vec!["notes:7:body".to_owned()]);
+
+    closing.finalize();
+    assert!(hub.open_keys().is_empty(), "the write committed");
     assert!(
         hub.close("notes:7:body").is_none(),
         "closing twice is quiet"
     );
+}
+
+/// An editor who reconnects while the row is being written joins the document
+/// that is on its way out, and keeps it alive.
+///
+/// Evicting on `close` rather than on `finalize` put a second authority on the
+/// same record: this editor would have seeded from a row the write had not
+/// reached, and the two copies would have overwritten each other.
+#[test]
+fn a_reconnect_during_the_write_window_finds_the_live_document() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:20:body", || CollabText::from_text("seed", "draft"))
+        .expect("open the document");
+
+    // The last editor has gone and the handler is closing up.
+    let closing = hub.close("notes:20:body").expect("the document was live");
+    assert_eq!(closing.text().text(), "draft");
+
+    // The handler lets its handle go while the write runs. Only the guard
+    // keeps the document discoverable now — which is the whole point of it.
+    drop(doc);
+
+    // The write is in flight. A reconnect arrives.
+    let rejoined = hub
+        .open_with("notes:20:body", || {
+            panic!("seeding here would be the second authority")
+        })
+        .expect("open the document");
+    let editor = rejoined.join("ada", "Ada");
+    rejoined
+        .handle(
+            "ada",
+            CollabClientMessage::Insert {
+                after: rejoined.document().id_at(4),
+                text: "ed".to_owned(),
+            },
+        )
+        .expect("insert");
+    assert_eq!(rejoined.text(), "drafted");
+
+    // The write commits. The document is occupied now, so it is not evicted.
+    closing.finalize();
+    assert_eq!(
+        hub.open_keys(),
+        vec!["notes:20:body".to_owned()],
+        "an editor is on it: evicting would strand them"
+    );
+    assert_eq!(
+        hub.document("notes:20:body").expect("still live").text(),
+        "drafted",
+        "and it is the same document, with the reconnect's edit"
+    );
+    drop(editor);
 }
 
 // ── Socket level ─────────────────────────────────────────────────────────────

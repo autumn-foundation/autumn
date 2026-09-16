@@ -56,14 +56,14 @@ pub use registry::{
     registered_collaborative_columns,
 };
 pub use text::{
-    CollabElement, CollabOp, CollabText, EMPTY_DOCUMENT, IMPORT_ACTOR, MAX_COUNTER, OpId,
-    OpIdParseError,
+    CollabElement, CollabOp, CollabText, EMPTY_DOCUMENT, IMPORT_ACTOR, MAX_COUNTER,
+    MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId, OpIdParseError,
 };
 
 #[cfg(feature = "presence")]
 pub use hub::{
-    CollabClientMessage, CollabDoc, CollabError, CollabHub, CollabLimits, CollabParticipant,
-    CollabServerMessage, CollabSession,
+    CollabClientMessage, CollabClose, CollabDoc, CollabError, CollabHub, CollabLimits,
+    CollabParticipant, CollabServerMessage, CollabSession,
 };
 
 #[cfg(feature = "offline-sync")]

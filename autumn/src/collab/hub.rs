@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use crate::channels::{Channels, Subscriber};
 use crate::presence::{Presence, PresenceHandle};
 
-use super::text::{CollabElement, CollabOp, CollabText, OpId};
+use super::text::{CollabElement, CollabOp, CollabText, MAX_WIRE_ELEMENTS, OpId};
 
 /// Channel and presence topic for a document key.
 #[must_use]
@@ -104,6 +104,12 @@ pub struct CollabLimits {
     pub max_insert_chars: usize,
     /// Characters one document may hold, tombstones and buffered operations
     /// included — what the document costs, not what it shows.
+    ///
+    /// Capped at [`MAX_WIRE_ELEMENTS`] however it is set. Past that a
+    /// document stops surviving a round trip through an untrusted door — a
+    /// sync payload, a request body — because [`CollabText`]'s `Deserialize`
+    /// refuses to replay it. A hub that could build one would be writing
+    /// documents its own resolver must skip.
     pub max_document_chars: usize,
     /// Ids one delete message may name.
     pub max_delete_ids: usize,
@@ -111,11 +117,28 @@ pub struct CollabLimits {
     pub max_documents: usize,
 }
 
+impl CollabLimits {
+    /// Hold `max_document_chars` to what an untrusted door will replay.
+    ///
+    /// A hub configured past [`MAX_WIRE_ELEMENTS`] would build documents that
+    /// its own resolver, and any handler deserializing a request body, must
+    /// then refuse — the document would be trapped in the hub, unable to
+    /// round trip. Clamping is quieter than that and loses nothing a caller
+    /// could have used.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            max_document_chars: self.max_document_chars.min(MAX_WIRE_ELEMENTS),
+            ..self
+        }
+    }
+}
+
 impl Default for CollabLimits {
     fn default() -> Self {
         Self {
             max_insert_chars: 10_000,
-            max_document_chars: 200_000,
+            max_document_chars: MAX_WIRE_ELEMENTS,
             max_delete_ids: 10_000,
             max_documents: 10_000,
         }
@@ -353,7 +376,7 @@ impl CollabHub {
                 docs: Arc::clone(&self.inner.docs),
                 channels: self.inner.channels.clone(),
                 presence: self.inner.presence.clone(),
-                limits,
+                limits: limits.clamped(),
             }),
         }
     }
@@ -475,34 +498,42 @@ impl CollabHub {
         }
     }
 
-    /// Evict `key`, returning its final state so the app can persist it.
+    /// Begin evicting `key`, handing back its final state to persist.
     ///
     /// Returns `None` when `key` is not live **or** when an editor is still
     /// on it — an occupied document is not the app's to evict.
     ///
+    /// The document stays **discoverable** until the returned
+    /// [`CollabClose`] is finalized or dropped, which is what makes the
+    /// close-then-persist flow safe. See that type for why.
+    ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
-    pub fn close(&self, key: &str) -> Option<CollabText> {
-        let mut docs = self
+    pub fn close(&self, key: &str) -> Option<CollabClose> {
+        let docs = self
             .inner
             .docs
             .lock()
             .expect("collab registry lock poisoned");
         let state = docs.get(key).and_then(Weak::upgrade)?;
         let guard = state.lock().expect("collab document lock poisoned");
-        // Refuse while an editor is still here. Removing the entry would not
-        // stop them: they hold the same `Arc` and keep editing a document
-        // nobody can find, while the next joiner re-seeds from the row and
-        // starts a second, divergent copy. The last editor to leave evicts it.
+        // Refuse while an editor is still here. Evicting would not stop them:
+        // they hold the same `Arc` and keep editing a document nobody can
+        // find, while the next joiner re-seeds from the row and starts a
+        // second, divergent copy. The last editor to leave evicts it.
         if guard.sessions > 0 {
             return None;
         }
-        let doc = guard.doc.clone();
+        let text = guard.doc.clone();
         drop(guard);
-        docs.remove(key);
         drop(docs);
-        Some(doc)
+        Some(CollabClose {
+            hub: self.clone(),
+            key: key.to_owned(),
+            state,
+            text,
+        })
     }
 
     /// Keys of every live document, in sorted order.
@@ -522,6 +553,95 @@ impl CollabHub {
         drop(docs);
         keys.sort();
         keys
+    }
+}
+
+/// A document on its way out, still discoverable until the write commits.
+///
+/// [`CollabHub::close`] hands back the final state so the app can persist it,
+/// and that write is not instant. Removing the registry entry first opens a
+/// window: an editor reconnecting inside it finds no live document, seeds a
+/// second authority from the row the write has not reached yet, and the two
+/// copies then overwrite each other. It is the same divergence `close`
+/// already refuses to cause while an editor is on the document, one step
+/// later in the document's life.
+///
+/// So the entry stays until this guard goes. An editor who reconnects inside
+/// the window joins the **live** document and keeps every character;
+/// [`finalize`](Self::finalize) then finds them there and leaves the document
+/// alone, because it is no longer the app's to evict.
+///
+/// ```ignore
+/// if let Some(closing) = hub.close(&key) {
+///     repo.update(id, body(closing.text())).await?;
+///     closing.finalize(); // the row is written; the next editor may re-seed
+/// }
+/// ```
+///
+/// Dropping it without finalizing is safe: nothing holds the document after
+/// that, so the registry's weak reference dies and the next open re-seeds.
+/// Finalizing is how the app says the row is written, and releases the slot
+/// against [`CollabLimits::max_documents`] promptly rather than eventually.
+#[must_use = "the document stays open until this guard is finalized or dropped"]
+pub struct CollabClose {
+    hub: CollabHub,
+    key: String,
+    /// Keeps the registry's `Weak` upgradeable while the write is in flight.
+    /// Without it the entry is already dead and the next open re-seeds from
+    /// the stale row, which is the whole hazard.
+    state: Arc<Mutex<DocState>>,
+    text: CollabText,
+}
+
+impl CollabClose {
+    /// The final state to persist.
+    #[must_use]
+    pub const fn text(&self) -> &CollabText {
+        &self.text
+    }
+
+    /// The key being closed.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Release the document: the write has committed.
+    ///
+    /// Leaves it alone if an editor joined while the write was in flight, or
+    /// if the key now names a different document. Either way the live
+    /// document is the authority and evicting it would strand its editors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    pub fn finalize(self) {
+        let mut docs = self
+            .hub
+            .inner
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned");
+        // Only this document, and only if it is still empty of editors.
+        let Some(live) = docs.get(&self.key).and_then(Weak::upgrade) else {
+            return;
+        };
+        if !Arc::ptr_eq(&live, &self.state) {
+            return;
+        }
+        if live.lock().expect("collab document lock poisoned").sessions > 0 {
+            return;
+        }
+        docs.remove(&self.key);
+    }
+}
+
+impl std::fmt::Debug for CollabClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollabClose")
+            .field("key", &self.key)
+            .field("chars", &self.text.len())
+            .finish_non_exhaustive()
     }
 }
 

@@ -138,7 +138,21 @@ let doc = hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?;
 `open_with` runs the seed only when the document is not already live, so the
 second editor joins the document the first is editing rather than a stale
 copy of the row. Write it back with `doc.document()`, and evict it with
-`hub.close(key)`, which hands you the final state.
+`hub.close(key)`, which hands you the final state to persist:
+
+```rust
+if let Some(closing) = hub.close(&key) {
+    repo.update(id, UpdateNote { body: Some(closing.text().clone()), ..Default::default() }).await?;
+    closing.finalize();
+}
+```
+
+The document stays discoverable until you `finalize`. That window is the
+write: an editor who reconnects inside it joins the document on its way out
+rather than seeding a second authority from a row the write has not reached,
+and `finalize` then finds them there and leaves the document alone. Dropping
+the guard without finalizing is safe — the next open re-seeds — but finalizing
+is how you say the row is written.
 
 It returns `CollabError::RegistryFull` when the registry is at
 `CollabLimits::max_documents` and the key is not already live. The hub

@@ -827,6 +827,43 @@ impl Serialize for CollabText {
     }
 }
 
+/// Elements one **untrusted** wire document may carry.
+///
+/// [`CollabText::from_wire`] replays rather than trusts, and that replay is
+/// quadratic. Measured on this machine, in release:
+///
+/// | elements | decode |
+/// | --- | --- |
+/// | 1 000 | 1.4 ms |
+/// | 5 000 | 10.7 ms |
+/// | 10 000 | 35.8 ms |
+/// | 20 000 | 220 ms |
+///
+/// 10 000 keeps the worst case inside a few tens of milliseconds. It is the
+/// ceiling on what [`Deserialize`] will accept, and therefore what a request
+/// body or a sync payload can make the server replay.
+pub const MAX_WIRE_ELEMENTS: usize = 10_000;
+
+/// Buffered operations one **untrusted** wire document may carry.
+///
+/// Much lower than [`MAX_WIRE_ELEMENTS`], because a buffered operation is far
+/// more expensive than an element: [`CollabText::drain_pending`] retries the
+/// whole buffer every time one integrates, so a causal chain sent in reverse
+/// costs a pass per operation. Measured on this machine, in release:
+///
+/// | pending | bytes | decode |
+/// | --- | --- | --- |
+/// | 250 | 15 KB | 2.7 ms |
+/// | 1 000 | 60 KB | 30 ms |
+/// | 2 000 | 122 KB | 117 ms |
+/// | 4 000 | 246 KB | 463 ms |
+///
+/// That is ~12× the cost per byte of the ordinary shape, and it is the shape
+/// an attacker sends: a 2 MB body extrapolates to roughly half a minute of
+/// blocking CPU. A legitimate payload carries a handful — the buffer holds
+/// only what is waiting for a cause still in flight.
+pub const MAX_WIRE_PENDING: usize = 1_000;
+
 /// The exact inverse of [`Serialize`].
 ///
 /// A bare string is deliberately refused. Accepting one would let
@@ -836,6 +873,22 @@ impl Serialize for CollabText {
 impl<'de> Deserialize<'de> for CollabText {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = Wire::deserialize(deserializer)?;
+        // Refuse before replaying, not after: the replay is the cost. This is
+        // the untrusted door — a request body, a sync payload — so the
+        // bounds apply here rather than in `from_wire`, which also serves
+        // `decode_column` reading a column this crate wrote.
+        if wire.elems.len() > MAX_WIRE_ELEMENTS {
+            return Err(serde::de::Error::custom(format!(
+                "collaborative document carries {} elements, over the limit of {MAX_WIRE_ELEMENTS}",
+                wire.elems.len(),
+            )));
+        }
+        if wire.pending.len() > MAX_WIRE_PENDING {
+            return Err(serde::de::Error::custom(format!(
+                "collaborative document carries {} buffered operations, over the limit of {MAX_WIRE_PENDING}",
+                wire.pending.len(),
+            )));
+        }
         Ok(Self::from_wire(wire))
     }
 }
@@ -852,7 +905,11 @@ impl CollabText {
     /// so a document is canonical the moment it is read.
     ///
     /// The cost is the documented full-replay cost: quadratic in length, which
-    /// is the bound this slice accepts for note-sized fields.
+    /// is the bound this slice accepts for note-sized fields. Untrusted input
+    /// is held to [`MAX_WIRE_ELEMENTS`] and [`MAX_WIRE_PENDING`] by
+    /// [`Deserialize`] before it reaches here; this function itself is
+    /// unbounded, because [`CollabText::decode_column`] reads a column this
+    /// crate wrote and capped on the way in.
     fn from_wire(wire: Wire) -> Self {
         let mut doc = Self::new();
         for elem in &wire.elems {
@@ -1032,6 +1089,58 @@ mod tests {
             target: OpId::new(9, "bob"),
         }];
         assert_eq!(doc.novel_count(orphan.iter()), 1);
+    }
+
+    /// An untrusted document past the element ceiling is refused, not
+    /// replayed. The replay is quadratic, so the refusal has to come first.
+    #[test]
+    fn an_oversized_wire_document_is_refused() {
+        let elems: Vec<serde_json::Value> = (1..=MAX_WIRE_ELEMENTS + 1)
+            .map(|n| serde_json::json!({ "id": format!("{n}@evil"), "ch": "x" }))
+            .collect();
+        let json = serde_json::json!({ "elems": elems, "pending": [] }).to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("over the limit");
+        assert!(
+            refused.to_string().contains("over the limit"),
+            "the refusal says why: {refused}"
+        );
+    }
+
+    /// The buffer ceiling is separate and much lower: a causal chain sent in
+    /// reverse costs a drain pass per operation, which is what makes a small
+    /// payload expensive.
+    #[test]
+    fn an_oversized_pending_buffer_is_refused() {
+        let pending: Vec<serde_json::Value> = (1..=MAX_WIRE_PENDING + 1)
+            .map(|n| {
+                serde_json::json!({
+                    "op": "insert",
+                    "id": format!("{n}@evil"),
+                    "after": "99999@ghost",
+                    "ch": "x",
+                })
+            })
+            .collect();
+        let json = serde_json::json!({ "elems": [], "pending": pending }).to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("over the limit");
+        assert!(
+            refused.to_string().contains("buffered operations"),
+            "the refusal names the buffer: {refused}"
+        );
+    }
+
+    /// A document at the ceiling still round trips, so the bound cannot be
+    /// reached by anything the hub itself produces.
+    #[test]
+    fn a_document_at_the_ceiling_still_decodes() {
+        let mut doc = CollabText::new();
+        doc.insert("ada", 0, &"x".repeat(MAX_WIRE_ELEMENTS));
+        let json = serde_json::to_string(&doc).expect("encode");
+
+        let back: CollabText = serde_json::from_str(&json).expect("at the ceiling, not over it");
+        assert_eq!(back.len(), MAX_WIRE_ELEMENTS);
     }
 
     /// One id with many unknown anchors costs what it really occupies.

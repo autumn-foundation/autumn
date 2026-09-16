@@ -297,7 +297,10 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   a `Channels` topic, membership comes from `Presence`, cursors ride a message
   merged into the participant list. Authorize the **record** before opening the
   document: the hub applies no ownership check. The last editor to leave evicts
-  the document; `hub.close(key)` hands back the final state to persist.
+  the document; `hub.close(key)` hands back a `CollabClose` whose `text()` is
+  the final state to persist. The document stays discoverable until
+  `finalize()`, so a reconnect during the write joins it instead of seeding a
+  second authority from the stale row.
   **Offline**: `collab::CollabResolver::for_table("notes")` replaces
   last-write-wins for the marked columns of that collection in the
   offline-sync engine (`sync::server::router`), leaving every other column and
