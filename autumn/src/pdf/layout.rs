@@ -380,14 +380,29 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// and treating any other tag (including unrecognized ones) as a transparent
 /// container — so a scaffold view's wrapper `<div>`/`<span>` markup degrades
 /// to its text content instead of being dropped.
-fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
+/// `has_more_after` is true if `out` will get more content, from this call
+/// or an ancestor's remaining siblings, once this call returns — see
+/// [`ends_with_glueable_word`]. A depth-cap guard needs both ends: a real
+/// word already in `out` with nothing separating it yet (before), and
+/// something still to come that could glue onto it (after). Pass `false`
+/// for a call that starts a fresh buffer (a heading, table cell, or list
+/// item's own `spans`) — nothing outside it can ever glue to its content.
+fn inline_spans(
+    nodes: &[Node],
+    bold: bool,
+    italic: bool,
+    depth: u32,
+    has_more_after: bool,
+    out: &mut Vec<Span>,
+) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, ends_with_glueable_word(out)) {
+        if subtree_has_visible_content(nodes, has_more_after && ends_with_glueable_word(out)) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
     }
-    for node in nodes {
+    for (i, node) in nodes.iter().enumerate() {
+        let more_after = i + 1 < nodes.len() || has_more_after;
         match node {
             Node::Text(text) => {
                 if !text.is_empty() {
@@ -400,8 +415,8 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
             }
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
-                "strong" | "b" => inline_spans(children, true, italic, depth + 1, out),
-                "em" | "i" => inline_spans(children, bold, true, depth + 1, out),
+                "strong" | "b" => inline_spans(children, true, italic, depth + 1, more_after, out),
+                "em" | "i" => inline_spans(children, bold, true, depth + 1, more_after, out),
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
                     push_block_break(out);
@@ -415,10 +430,10 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 }
                 _ if is_block_boundary_in_inline_context(tag) => {
                     push_block_break(out);
-                    inline_spans(children, bold, italic, depth + 1, out);
+                    inline_spans(children, bold, italic, depth + 1, more_after, out);
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, out),
+                _ => inline_spans(children, bold, italic, depth + 1, more_after, out),
             },
         }
     }
@@ -487,7 +502,7 @@ fn inline_list_items(
         // Strip exactly that one leading break, never more: anything after it is
         // legitimate inter-block spacing within the item's own content.
         let content_start = out.len();
-        inline_spans(children, bold, italic, depth + 1, out);
+        inline_spans(children, bold, italic, depth + 1, false, out);
         if out.get(content_start) == Some(&Span::Break) {
             out.remove(content_start);
         }
@@ -521,7 +536,14 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
                         let mut spans = Vec::new();
                         // `cell_children` is two levels below `tr`'s `depth`
                         // (tr -> td/th -> cell_children).
-                        inline_spans(cell_children, is_header, false, depth + 2, &mut spans);
+                        inline_spans(
+                            cell_children,
+                            is_header,
+                            false,
+                            depth + 2,
+                            false,
+                            &mut spans,
+                        );
                         trim_trailing_break(&mut spans);
                         cells.push((spans, is_header));
                     }
@@ -540,7 +562,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
             // dedicated non-tabular-content block type.
             _ => {
                 let mut spans = Vec::new();
-                inline_spans(children, false, false, depth + 1, &mut spans);
+                inline_spans(children, false, false, depth + 1, false, &mut spans);
                 trim_trailing_break(&mut spans);
                 if !spans.is_empty() {
                     out.push(TableRow {
@@ -574,7 +596,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
             "\u{2022}".to_owned()
         };
         let mut spans = Vec::new();
-        inline_spans(children, false, false, depth + 1, &mut spans);
+        inline_spans(children, false, false, depth + 1, false, &mut spans);
         trim_trailing_break(&mut spans);
         out.push(Block::ListItem { marker, spans });
     }
@@ -601,7 +623,8 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         }
     };
 
-    for node in nodes {
+    for (i, node) in nodes.iter().enumerate() {
+        let more_after = i + 1 < nodes.len();
         match node {
             Node::Text(text) => {
                 // Pushed even when whitespace-only: a text node between two
@@ -624,7 +647,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                 if let Some(level) = heading_level(tag) {
                     flush(&mut pending, out);
                     let mut spans = Vec::new();
-                    inline_spans(children, true, false, depth + 1, &mut spans);
+                    inline_spans(children, true, false, depth + 1, false, &mut spans);
                     trim_trailing_break(&mut spans);
                     out.push(Block::Heading(level, spans));
                     continue;
@@ -646,7 +669,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     "p" | "li" | "dt" | "dd" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
-                        inline_spans(children, false, false, depth + 1, &mut spans);
+                        inline_spans(children, false, false, depth + 1, false, &mut spans);
                         trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
@@ -695,13 +718,17 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         extract_list_items(children, true, depth + 1, out);
                     }
                     "br" => pending.push(Span::Break),
-                    "strong" | "b" => inline_spans(children, true, false, depth + 1, &mut pending),
-                    "em" | "i" => inline_spans(children, false, true, depth + 1, &mut pending),
+                    "strong" | "b" => {
+                        inline_spans(children, true, false, depth + 1, more_after, &mut pending);
+                    }
+                    "em" | "i" => {
+                        inline_spans(children, false, true, depth + 1, more_after, &mut pending);
+                    }
                     _ if is_non_rendered(tag) => {}
                     // Transparent passthrough: unknown/inline wrapper tags
                     // (span, a, ...) flow their children into the current
                     // implicit paragraph rather than being dropped.
-                    _ => flatten_into_pending(children, depth + 1, &mut pending, out),
+                    _ => flatten_into_pending(children, depth + 1, more_after, &mut pending, out),
                 }
             }
         }
@@ -712,9 +739,15 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// Like [`flatten_blocks`], but for a transparent inline wrapper: nested
 /// block tags still start real blocks (flushing `pending` first), while
 /// inline content keeps accumulating into the caller's `pending` buffer.
-fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
+fn flatten_into_pending(
+    nodes: &[Node],
+    depth: u32,
+    has_more_after: bool,
+    pending: &mut Vec<Span>,
+    out: &mut Vec<Block>,
+) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, ends_with_glueable_word(pending)) {
+        if subtree_has_visible_content(nodes, has_more_after && ends_with_glueable_word(pending)) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -723,7 +756,8 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
     // it only ever produced inline text (no nested block tags fired), that
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
-    for node in nodes {
+    for (i, node) in nodes.iter().enumerate() {
+        let more_after = i + 1 < nodes.len() || has_more_after;
         match node {
             Node::Text(text) => {
                 // See the matching comment in `flatten_blocks` — a
@@ -767,10 +801,14 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
                 } else {
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
-                        "strong" | "b" => inline_spans(children, true, false, depth + 1, pending),
-                        "em" | "i" => inline_spans(children, false, true, depth + 1, pending),
+                        "strong" | "b" => {
+                            inline_spans(children, true, false, depth + 1, more_after, pending);
+                        }
+                        "em" | "i" => {
+                            inline_spans(children, false, true, depth + 1, more_after, pending);
+                        }
                         _ if is_non_rendered(tag) => {}
-                        _ => flatten_into_pending(children, depth + 1, pending, out),
+                        _ => flatten_into_pending(children, depth + 1, more_after, pending, out),
                     }
                 }
             }
@@ -3075,6 +3113,21 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "dropping this space would glue \"A\" and \"B\" together, so this must warn"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_at_end_of_document_past_the_depth_cap_does_not_warn() {
+        // A dropped whitespace-only span right after real text ("A") looks
+        // exactly like the sandwiched case above from `out`'s trailing
+        // content alone — but with nothing after it, there is no following
+        // word for the space to separate: the rendered text is "A" either
+        // way. (Codex review on PR #2810.)
+        let html = format!("A{}{}{}", "<span>".repeat(513), " ", "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "nothing follows this space, so dropping it changes nothing"
         );
     }
 
