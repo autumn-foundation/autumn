@@ -3656,7 +3656,20 @@ impl JobClient {
     ///
     /// Returns one result per item in `items`, in the same order. A
     /// coalesced duplicate counts as success, same as [`Self::enqueue_due`].
-    /// One item's dedup or backend failure does not affect the others.
+    /// On the sequential fallback path, one item's dedup or backend
+    /// failure never affects the others — the same as calling
+    /// [`Self::enqueue_due`] once per item.
+    ///
+    /// The batched path shares that guarantee only while its one `INSERT`
+    /// statement succeeds: each row still dedupes on its own. If that one
+    /// statement itself fails — a dropped connection, a row-specific data
+    /// problem — every item in the batch fails together, since they are
+    /// one SQL statement, not many. This method does not retry that
+    /// failure on its own: whether the statement actually committed before
+    /// the failure was seen cannot be told apart from the error alone, and
+    /// a blind retry could insert every row a second time under a fresh
+    /// id. A caller that needs every item attempted despite one bad row
+    /// should call [`Self::enqueue_due`] once per item instead.
     ///
     /// If two items in the same batch share a unique key, only one of them
     /// gets stored on the batched path; the other is treated as a
