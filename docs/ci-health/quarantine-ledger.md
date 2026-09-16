@@ -850,7 +850,7 @@ without also filling in the intake form above.
   2026-09-15T~09:5xZ — unchanged for a 7th straight pass since it became
   dispatchable 2026-09-08T15:07:44Z (now ~162.5 hours idle, a full week).
 - **2026-09-16 update — 8th consecutive pass, harness still undispatched;
-  TWO organic hits in a single ~24h window, breaking a six-pass zero-hit
+  TWO organic hits in a single ~24h window, breaking a three-pass zero-hit
   streak, one of them a brand-new signature.** Sampled `ci.yml`
   `pull_request` runs from the 2026-09-15 report's own cutoff
   (2026-09-15T09:39:00Z, exclusive) to 2026-09-16T09:40:05Z (~24h, two

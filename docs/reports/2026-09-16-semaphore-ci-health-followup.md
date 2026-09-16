@@ -3,7 +3,7 @@
 Follow-up to `docs/reports/2026-09-15-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. No fix PR from
 this pass — neither hit below clears this role's own rerun-campaign bar for a
-determinism PR — but the day's sampling broke a six-pass streak of zero
+determinism PR — but the day's sampling broke a three-pass streak of zero
 organic `live_upgrade` hits, and one of the two hits is a signature this
 ledger has never recorded before.
 
