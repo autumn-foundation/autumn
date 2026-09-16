@@ -291,6 +291,12 @@ struct DocState {
     /// an app that never calls [`CollabHub::close`] still does not leak one
     /// per record it ever opened.
     sessions: usize,
+    /// Live [`CollabClose`] for this document, if one is out.
+    ///
+    /// A `Weak` so it needs no cleanup: however the guard goes — finalized,
+    /// dropped, or lost to a panic — this stops upgrading and the next close
+    /// may proceed.
+    close_claim: Weak<()>,
     /// Bumped on every change to `doc`.
     ///
     /// [`CollabClose`] records it and refuses to evict a document that moved
@@ -307,6 +313,7 @@ impl DocState {
             doc,
             cursors: BTreeMap::new(),
             sessions: 0,
+            close_claim: Weak::new(),
             revision: 0,
         }
     }
@@ -559,8 +566,10 @@ impl CollabHub {
 
     /// Begin evicting `key`, handing back its final state to persist.
     ///
-    /// Returns `None` when `key` is not live **or** when an editor is still
-    /// on it — an occupied document is not the app's to evict.
+    /// Returns `None` when `key` is not live, when an editor is still on it —
+    /// an occupied document is not the app's to evict — or when another
+    /// [`CollabClose`] for it is already outstanding, because two writers
+    /// each holding a copy of one document is how the older copy wins.
     ///
     /// The document stays **discoverable** until the returned
     /// [`CollabClose`] is finalized or dropped, which is what makes the
@@ -576,7 +585,7 @@ impl CollabHub {
             .lock()
             .expect("collab registry lock poisoned");
         let state = docs.get(key).and_then(Weak::upgrade)?;
-        let guard = state.lock().expect("collab document lock poisoned");
+        let mut guard = state.lock().expect("collab document lock poisoned");
         // Refuse while an editor is still here. Evicting would not stop them:
         // they hold the same `Arc` and keep editing a document nobody can
         // find, while the next joiner re-seeds from the row and starts a
@@ -584,6 +593,17 @@ impl CollabHub {
         if guard.sessions > 0 {
             return None;
         }
+        // One close at a time. Two persistence paths racing here — an idle
+        // sweep against a disconnect hook — would each get a guard over the
+        // same state and each start a write. The first to finalize releases
+        // the document; an editor reopens and edits a fresh authority; the
+        // second write then lands on top of it with the older text, and its
+        // `finalize` sees a different `Arc` and says nothing.
+        if guard.close_claim.upgrade().is_some() {
+            return None;
+        }
+        let claim = Arc::new(());
+        guard.close_claim = Arc::downgrade(&claim);
         let text = guard.doc.clone();
         let revision = guard.revision;
         drop(guard);
@@ -594,6 +614,7 @@ impl CollabHub {
             state,
             text,
             revision,
+            claim,
         })
     }
 
@@ -660,6 +681,12 @@ pub struct CollabClose {
     text: CollabText,
     /// The document's revision when `text` was taken.
     revision: u64,
+    /// Proof that this is the only close in flight for the key.
+    ///
+    /// [`CollabHub::close`] refuses while one of these is alive, so two
+    /// writers cannot each hold a copy of the same document and overwrite one
+    /// another. Dropping the guard releases the claim, whatever the path.
+    claim: Arc<()>,
 }
 
 impl CollabClose {
@@ -733,6 +760,8 @@ impl CollabClose {
                 state: self.state,
                 text,
                 revision,
+                // Carried on: this is the same close, still the only one.
+                claim: self.claim,
             });
         }
         drop(state);

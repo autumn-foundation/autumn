@@ -844,6 +844,44 @@ async fn a_failed_publish_still_reaches_this_node() {
     assert_eq!(doc.text(), "hi!");
 }
 
+/// Only one close is outstanding for a document at a time.
+///
+/// Two persistence paths can reach `close` together — an idle sweep against a
+/// disconnect hook. Handing each a guard over the same state let both start a
+/// write: the first finalizes and releases the document, an editor reopens
+/// and edits a fresh authority, and the second write lands on top with the
+/// older text while its `finalize` sees a different `Arc` and says nothing.
+#[test]
+fn a_second_close_is_refused_while_one_is_outstanding() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:26:body", || CollabText::from_text("seed", "draft"))
+        .expect("open the document");
+
+    let first = hub.close("notes:26:body").expect("the document was live");
+    assert!(
+        hub.close("notes:26:body").is_none(),
+        "a second writer would hold its own copy of the same document"
+    );
+    drop(doc);
+
+    // Once the outstanding close is done, the key is closable again — though
+    // here it was released, so there is nothing left to close.
+    assert!(first.finalize().is_none(), "nothing changed since");
+    assert!(hub.open_keys().is_empty());
+
+    // A guard that is dropped rather than finalized releases the claim too.
+    let doc = hub
+        .open_with("notes:27:body", || CollabText::from_text("seed", "x"))
+        .expect("open the document");
+    drop(hub.close("notes:27:body").expect("live"));
+    assert!(
+        hub.close("notes:27:body").is_some(),
+        "the dropped guard did not leave the key permanently unclosable"
+    );
+    drop(doc);
+}
+
 /// A seed already past the document limit is refused, not installed.
 ///
 /// Nobody has to type for this: a row written before the limit was lowered,

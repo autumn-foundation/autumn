@@ -583,6 +583,10 @@ fn emit_collaborative_schema_tokens() -> TokenStream {
                     "type": "array",
                     "description": "Every character, in document order. A deleted \
         character stays as a tombstone, so concurrent edits keep their anchor.",
+                    // Named, not hardcoded: a generated validator that accepts
+                    // more than the endpoint does sends clients into a
+                    // deterministic rejection they were told was fine.
+                    "maxItems": ::autumn_web::collab::MAX_WIRE_ELEMENTS,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -598,6 +602,7 @@ fn emit_collaborative_schema_tokens() -> TokenStream {
                     "type": "array",
                     "description": "Operations that wait for the character they \
         name. Each applies when that character arrives.",
+                    "maxItems": ::autumn_web::collab::MAX_WIRE_PENDING,
                     "items": { "oneOf": [
                         {
                             "type": "object",

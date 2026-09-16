@@ -908,6 +908,33 @@ impl<'de> Deserialize<'de> for CollabText {
                 wire.pending.len(),
             )));
         }
+        // An id at or past the ceiling is one `apply` drops on the floor. The
+        // replay ignores that, so the document would deserialize "fine" minus
+        // those characters — the server quietly deleting text from a document
+        // it accepted. Refuse the whole thing instead.
+        if let Some(id) = wire
+            .elems
+            .iter()
+            .map(|elem| &elem.id)
+            .find(|id| id.counter >= MAX_COUNTER)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "collaborative document carries the unusable id {id}: \
+                 counter {} is at or past the ceiling of {MAX_COUNTER}",
+                id.counter,
+            )));
+        }
+        if let Some(op) = wire
+            .pending
+            .iter()
+            .find(|op| op.minted_counter() >= MAX_COUNTER)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "collaborative document buffers an unusable operation: counter {} \
+                 is at or past the ceiling of {MAX_COUNTER}",
+                op.minted_counter(),
+            )));
+        }
         Ok(Self::from_wire(wire))
     }
 }
@@ -1179,6 +1206,53 @@ mod tests {
         assert!(
             refused.to_string().contains("buffered operations"),
             "the refusal names the buffer: {refused}"
+        );
+    }
+
+    /// A document carrying an id past the counter ceiling is refused whole.
+    ///
+    /// `apply` drops such an id on the floor, and the replay ignores what it
+    /// returns — so without this the document deserialized "successfully"
+    /// minus those characters, the server quietly deleting text from a
+    /// document it had just accepted.
+    #[test]
+    fn a_document_with_an_unusable_counter_is_refused() {
+        let json = serde_json::json!({
+            "elems": [
+                { "id": "1@ada", "ch": "a" },
+                { "id": format!("{MAX_COUNTER}@evil"), "after": "1@ada", "ch": "b" },
+            ],
+            "pending": [],
+        })
+        .to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("unusable id");
+        assert!(
+            refused.to_string().contains("at or past the ceiling"),
+            "the refusal says why: {refused}"
+        );
+    }
+
+    /// The same for a buffered operation, which takes the other path in.
+    #[test]
+    fn a_buffered_operation_with_an_unusable_counter_is_refused() {
+        let json = serde_json::json!({
+            "elems": [],
+            "pending": [
+                {
+                    "op": "insert",
+                    "id": format!("{}@evil", MAX_COUNTER + 5),
+                    "after": "1@ada",
+                    "ch": "x",
+                }
+            ],
+        })
+        .to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("unusable id");
+        assert!(
+            refused.to_string().contains("at or past the ceiling"),
+            "the refusal says why: {refused}"
         );
     }
 
