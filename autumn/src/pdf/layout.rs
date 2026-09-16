@@ -7,6 +7,8 @@
 //! scaffold-shaped documents (headings, paragraphs, tables, lists) — not for
 //! arbitrary CSS layouts.
 
+use std::cell::Cell;
+
 use printpdf::{
     BuiltinFont, Color, Line, LinePoint, Op, PdfFontHandle, PdfPage, Point, Pt, Rgb, TextItem,
 };
@@ -487,9 +489,12 @@ fn inline_spans(
         }
         return;
     }
+    let cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
-            siblings: &nodes[i + 1..],
+            nodes,
+            start: i + 1,
+            cache: &cache,
             ancestor: has_more_after,
         };
         match node {
@@ -762,9 +767,12 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         }
     };
 
+    let cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
-            siblings: &nodes[i + 1..],
+            nodes,
+            start: i + 1,
+            cache: &cache,
             ancestor: &GlueContext::Resolved(false),
         };
         match node {
@@ -917,9 +925,12 @@ fn flatten_into_pending(
     // it only ever produced inline text (no nested block tags fired), that
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
+    let cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
-            siblings: &nodes[i + 1..],
+            nodes,
+            start: i + 1,
+            cache: &cache,
             ancestor: has_more_after,
         };
         match node {
@@ -1095,32 +1106,61 @@ fn node_glue_lookahead(node: &Node) -> GlueLookahead {
 enum GlueContext<'a> {
     Resolved(bool),
     LaterSiblings {
-        siblings: &'a [Node],
+        nodes: &'a [Node],
+        start: usize,
+        cache: &'a [Cell<Option<bool>>],
         ancestor: &'a Self,
     },
 }
 
 impl GlueContext<'_> {
-    /// A caller builds this with `siblings` set to *only* the nodes after
-    /// the one it is about to recurse into — never that node itself, since
+    /// A caller builds this with `start` set to the index *after* the node
+    /// it is about to recurse into — never that node itself, since
     /// whatever is inside it gets discovered by that recursion's own
     /// eventual depth-cap guard, and pre-scanning it here too would be
-    /// pure duplicated work. Every sibling actually in `siblings` has
-    /// *not* been (and, from this call's perspective, may never be)
-    /// visited any other way, so those are the only nodes this walk
-    /// touches.
+    /// pure duplicated work. `cache` is one slot per entry in `nodes`,
+    /// shared by every sibling's own `GlueContext` at this level: a
+    /// document can have many capped siblings in a row (e.g. a run of
+    /// empty wrapper tags) that each build a `LaterSiblings` overlapping
+    /// almost the entire same remaining suffix, and without this cache
+    /// each one's `resolve()` would rescan that suffix from scratch —
+    /// O(n) work per capped sibling, O(n^2) overall. `cache[i]` answers
+    /// "does resolving starting at position i return true", filled in
+    /// (at most once each) as `resolve()` walks past `Exhausted` nodes
+    /// looking for a `Confirmed`/`Stopped` one, so a later call starting
+    /// at or before an already-filled index short-circuits in O(1).
     fn resolve(&self) -> bool {
         match self {
             GlueContext::Resolved(b) => *b,
-            GlueContext::LaterSiblings { siblings, ancestor } => {
-                for node in *siblings {
-                    match node_glue_lookahead(node) {
-                        GlueLookahead::Confirmed => return true,
-                        GlueLookahead::Stopped => return false,
-                        GlueLookahead::Exhausted => {}
+            GlueContext::LaterSiblings {
+                nodes,
+                start,
+                cache,
+                ancestor,
+            } => {
+                let mut i = *start;
+                let result = loop {
+                    if i >= nodes.len() {
+                        break ancestor.resolve();
+                    }
+                    if let Some(cached) = cache[i].get() {
+                        break cached;
+                    }
+                    match node_glue_lookahead(&nodes[i]) {
+                        GlueLookahead::Confirmed => break true,
+                        GlueLookahead::Stopped => break false,
+                        GlueLookahead::Exhausted => i += 1,
+                    }
+                };
+                for cell in &cache[*start..i.min(nodes.len())] {
+                    if cell.get().is_none() {
+                        cell.set(Some(result));
                     }
                 }
-                ancestor.resolve()
+                if i < nodes.len() {
+                    cache[i].set(Some(result));
+                }
+                result
             }
         }
     }
@@ -3665,6 +3705,36 @@ mod tests {
         assert!(!pages.is_empty());
         assert!(
             start.elapsed() < std::time::Duration::from_secs(3),
+            "render_pages took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn glue_lookahead_over_many_capped_siblings_is_linear_not_quadratic() {
+        // Regression: `A`, many empty `<span></span>` siblings, then `B`,
+        // all sitting exactly at the depth cap boundary. Each empty
+        // `<span>` recurses one level past MAX_DEPTH, so each one hits the
+        // depth-cap guard separately — and each guard call resolves
+        // `more_after` fresh: `node_glue_lookahead` on an empty transparent
+        // element is `Exhausted` (undecided), so every one of these
+        // siblings makes the scan walk past it and rescan the *entire*
+        // remaining suffix looking for `B`. That is O(n) work per capped
+        // sibling, O(n^2) for n of them, even though the lazy `GlueContext`
+        // fix already made a single resolve() itself cheap. (Codex review
+        // on PR #2810.)
+        let n = 20_000;
+        let html = format!(
+            "{}A{}B{}",
+            "<span>".repeat(MAX_DEPTH as usize),
+            "<span></span>".repeat(n),
+            "</span>".repeat(MAX_DEPTH as usize)
+        );
+        let start = std::time::Instant::now();
+        let pages = render_pages(&html);
+        assert!(!pages.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
             "render_pages took {:?} — looks quadratic again",
             start.elapsed()
         );
