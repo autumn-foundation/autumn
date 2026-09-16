@@ -3423,6 +3423,15 @@ impl JobClient {
         // on `enqueue_with_outcome_due`.
         let now = self.due_origin();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
+        // Capture the monotonic origin here, before `replayed_enqueue` /
+        // `reserve_enqueue` run — the latter can block on the capsule's
+        // capture mutex and clones the whole payload, and any time that
+        // takes must still count against `delay` when `pg_insert_job` later
+        // subtracts elapsed time from it (see `RelativeDelay`). Reading it
+        // after those calls instead would silently drop that elapsed time,
+        // making the job run later than requested — `enqueue_on_conn_relative_due`
+        // already captures its origin this early, ahead of its own reservation.
+        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
@@ -3431,7 +3440,6 @@ impl JobClient {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         let slot = reserve_enqueue(&payload);
-        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
         let result = self
             .enqueue_with_outcome_due_inner(name, payload, due_at, now, Some(relative_delay))
             .await;
