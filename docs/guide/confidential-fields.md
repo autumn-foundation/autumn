@@ -38,7 +38,10 @@ so the model does not declare a type that suggests it does.
 ```rust
 use autumn_web::confidential::{FieldContext, RootKey};
 
-let key = RootKey::generate();           // held by the client, never sent
+// Adopted from the client's own keystore. `RootKey::generate()` draws a key
+// that cannot be exported, so it suits tests and throwaway sessions — not data
+// the client must read back after a restart. See "Key custody is yours" below.
+let key = RootKey::from_hex(&keystore.read("autumn.root_key")?)?;
 // `note_uid` is a client-chosen id the row also carries: it binds the envelope
 // to this row. `FieldContext::new` omits it and binds only the column.
 let ctx = FieldContext::for_record("notes", "body", &owner_id, &note_uid);
@@ -61,9 +64,30 @@ credentials store, so a server build cannot acquire one by accident.
 
 ### Key custody is yours
 
+`RootKey` has no accessor for its bytes, so the key cannot be read back out of
+one. **Draw the material first, store it, and adopt it second:**
+
+```rust
+// First run: the client draws 32 bytes and puts them somewhere it trusts —
+// an OS keychain, a hardware token, a passphrase-derived wrapper.
+let mut material = [0u8; 32];
+getrandom::getrandom(&mut material)?;
+keystore.write("autumn.root_key", &hex::encode(material))?;
+
+// Every run, including the first: adopt the stored material.
+let key = RootKey::from_hex(&keystore.read("autumn.root_key")?)?;
+```
+
+`RootKey::generate()` is the ephemeral counterpart: it draws a key the client
+can use but can never write down, so anything it seals is unreadable after the
+process exits. That is correct for tests and for sessions whose data goes away
+with them, and wrong for anything durable.
+
 This release assumes a single client-held key. Recovery, multi-device sync and
 social recovery are out of scope — if the user loses the key, the data is gone.
-That is the guarantee working, not a defect.
+That is the guarantee working, not a defect. Losing it by calling `generate()`
+and never storing the bytes is *not* the guarantee working, which is why the
+durable path above is the one the examples use.
 
 Key **rotation** is out of scope too. The envelope carries no key id, so a client
 with more than one key must try each one. Rotating means re-sealing every value

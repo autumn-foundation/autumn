@@ -280,6 +280,19 @@ pub struct RootKey {
 impl RootKey {
     /// Draw a fresh root key from the operating system RNG.
     ///
+    /// **The bytes exist only inside the returned value, and this type has no
+    /// way to export them.** That is deliberate — an accessor is what would let
+    /// a server build acquire a key — but it means a key from `generate` cannot
+    /// outlive the process that drew it, and every envelope sealed under it dies
+    /// with it.
+    ///
+    /// So `generate` is for keys that are *meant* to be ephemeral: tests, and
+    /// sessions whose data is discarded with them. A client that must read its
+    /// data back after a restart draws the material itself, stores it in
+    /// whatever keystore it already trusts, and adopts it with
+    /// [`RootKey::from_hex`] or [`RootKey::from_bytes`] on each run. See
+    /// "Key custody is yours" in `docs/guide/confidential-fields.md`.
+    ///
     /// # Panics
     ///
     /// Panics if the operating system's random number generator is unavailable.
