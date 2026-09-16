@@ -815,7 +815,23 @@ struct QueueGaugeState {
     /// injected clock for exactly this reason, while the redis survey already
     /// stamps from that clock and passes its marks through unchanged.
     surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
+    /// Postgres-backed jobs' own waiting mark, by job id, so an admin-cancel
+    /// (`JobRegistry::record_cancel_at_backend_offset`) can remove precisely
+    /// the mark it pushed instead of guessing which of several co-queued
+    /// marks belongs to it — a guess that can land on the wrong job when two
+    /// marks happen to sit at (or near) the same instant. Bounded by
+    /// [`PG_MARKS_BY_JOB_ID_CAP`]: a job that starts or completes normally
+    /// never looks itself up here, so without a cap this would leak one
+    /// entry per Postgres enqueue forever.
+    pg_marks_by_job_id: indexmap::IndexMap<String, u64>,
 }
+
+/// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
+/// realistic count of Postgres jobs sitting `enqueued` at once — enough that
+/// a job an operator wants to cancel is essentially always still tracked —
+/// while keeping the map's memory bounded regardless of how long the process
+/// has been running.
+const PG_MARKS_BY_JOB_ID_CAP: usize = 10_000;
 
 /// Rebase a surveyed age onto the registry's timeline.
 ///
@@ -1058,6 +1074,21 @@ impl JobRegistry {
         self.record_enqueue_at(name, ready_at_ms);
     }
 
+    /// [`Self::record_enqueue`]/[`Self::record_enqueue_scheduled`] for a
+    /// Postgres-backed job, additionally remembering the exact mark pushed
+    /// under `id` (`note_pg_job_mark`) for a later
+    /// [`Self::record_cancel_at_backend_offset`]'s exact lookup.
+    ///
+    /// `ready_at_ms` is `Some` for a scheduled enqueue (its mark, stamped
+    /// from `JobClient::due_origin`'s real time) or `None` for an immediate
+    /// one (this registry's own clock, read once here rather than inside
+    /// [`Self::record_enqueue`] so the exact same value can be remembered).
+    pub(crate) fn record_pg_enqueue(&self, name: &str, id: &str, ready_at_ms: Option<u64>) {
+        let ready_at_ms = ready_at_ms.unwrap_or_else(|| self.now_ms());
+        self.record_enqueue_at(name, ready_at_ms);
+        self.note_pg_job_mark(id, ready_at_ms);
+    }
+
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
     /// per-queue waiting mark stamped with the job's ready-at time.
     fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
@@ -1211,10 +1242,38 @@ impl JobRegistry {
         self.pop_waiting(name, false);
     }
 
+    /// Remember the exact per-queue waiting mark a Postgres-backed enqueue
+    /// pushed, keyed by job id, so a later [`Self::record_cancel_at_backend_offset`]
+    /// can remove precisely that mark instead of guessing which of several
+    /// co-queued marks belongs to it.
+    ///
+    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`], evicting the oldest-inserted
+    /// entry first: a job that falls out (or was never entered — see that
+    /// method's fallback) is not lost, it just falls back to
+    /// candidate-based matching there.
+    pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64) {
+        if let Ok(mut guard) = self.queues.write() {
+            if guard.pg_marks_by_job_id.len() >= PG_MARKS_BY_JOB_ID_CAP
+                && !guard.pg_marks_by_job_id.contains_key(id)
+            {
+                guard.pg_marks_by_job_id.shift_remove_index(0);
+            }
+            guard.pg_marks_by_job_id.insert(id.to_string(), ready_at_ms);
+        }
+    }
+
     /// Record that an enqueued Postgres-backed job was canceled, given the
-    /// database's own measurement of its due time, and remove whichever
-    /// waiting mark that job actually pushed — without knowing, from the
-    /// offset alone, which of three timelines that mark lives on:
+    /// database's own measurement of its due time, and remove precisely the
+    /// waiting mark that job pushed.
+    ///
+    /// Looks up `id` in the exact-mark table `note_pg_job_mark` populated
+    /// at enqueue time first — this is unambiguous by
+    /// construction, immune to two co-queued marks coincidentally landing at
+    /// (or near) the same instant. Falls back to nearest-match over three
+    /// candidate timelines only when no exact entry exists (evicted for
+    /// capacity, or never recorded — the transactional `enqueue_on_conn`
+    /// path skips registry bookkeeping entirely, by design, until its
+    /// surrounding transaction commits):
     ///
     /// * an **absolute** enqueue (`enqueue_at`) stamps the registry mark with
     ///   the caller's own instant verbatim, byte-identical to `absolute_ms`
@@ -1229,16 +1288,19 @@ impl JobRegistry {
     ///   injected clock (`record_enqueue`), so `self.now_ms() + offset_ms`
     ///   reconstructs it instead.
     ///
-    /// Mirrors [`ready_at_from_age`]'s translate-onto-a-known-timeline
-    /// approach, tried against all three candidates rather than one: the
-    /// nearest existing mark to *any* candidate is removed, instead of
-    /// deciding a ready/scheduled category from the offset and asking this
-    /// registry's internal category search to find any mark sharing it,
-    /// which is only correct when every mark in the queue shares one
-    /// timeline with the offset.
+    /// The fallback mirrors [`ready_at_from_age`]'s translate-onto-a-known-timeline
+    /// approach, tried against all three candidates: the nearest existing
+    /// mark to *any* candidate is removed, instead of deciding a
+    /// ready/scheduled category from the offset and asking this registry's
+    /// internal category search to find any mark sharing it, which is only
+    /// correct when every mark in the queue shares one timeline with the
+    /// offset. It can still, rarely, pick an unrelated co-queued job's mark
+    /// (the reason the exact lookup exists at all) — that mismatch corrects
+    /// itself at the next durable-backend survey tick.
     pub fn record_cancel_at_backend_offset(
         &self,
         name: &str,
+        id: &str,
         absolute_ms: Option<u64>,
         real_reference_ms: u64,
         offset_ms: i64,
@@ -1247,6 +1309,15 @@ impl JobRegistry {
             && let Some(status) = guard.get_mut(name)
         {
             status.queued = status.queued.saturating_sub(1);
+        }
+        let exact_ms = self
+            .queues
+            .write()
+            .ok()
+            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id));
+        if let Some(exact_ms) = exact_ms {
+            self.pop_waiting_exact(name, exact_ms);
+            return;
         }
         let mut candidates: Vec<u64> = Vec::with_capacity(3);
         candidates.extend(absolute_ms);
@@ -1302,6 +1373,19 @@ impl JobRegistry {
         }
     }
 
+    /// Drop the waiting mark equal to `exact_ms`. A no-op if it is not
+    /// present — e.g. something else already removed it — rather than
+    /// falling back to a guess, which would risk removing an unrelated mark.
+    fn pop_waiting_exact(&self, name: &str, exact_ms: u64) {
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
+        {
+            waiting.remove(idx);
+        }
+    }
+
     /// The raw waiting marks (epoch ms) for `name`'s queue, in push order.
     ///
     /// Test-only: asserting on this instead of [`Self::queue_snapshot`]'s
@@ -1316,6 +1400,17 @@ impl JobRegistry {
             .ok()
             .and_then(|g| g.waiting.get(&queue).map(|w| w.iter().copied().collect()))
             .unwrap_or_default()
+    }
+
+    /// The number of entries currently held in `pg_marks_by_job_id`.
+    /// Test-only: proves the bound in [`PG_MARKS_BY_JOB_ID_CAP`] actually
+    /// holds without exposing the table itself.
+    #[cfg(test)]
+    pub(crate) fn pg_marks_len_for_test(&self) -> usize {
+        self.queues
+            .read()
+            .map(|g| g.pg_marks_by_job_id.len())
+            .unwrap_or(0)
     }
 
     /// Record a successful execution.
@@ -4689,10 +4784,13 @@ mod tests {
         }
     }
 
-    /// An admin-cancel must find the correct waiting mark whichever of the
-    /// three timelines it lives on: an absolute `enqueue_at` mark (matched
-    /// exactly by `run_at`'s own value), a relative-delay `enqueue_in` mark
-    /// (stamped from real time via `due_origin()`, reconstructed from
+    /// When no exact mark was recorded for a job's id (the fallback path —
+    /// e.g. it was never noted, or was evicted from
+    /// [`JobRegistry::note_pg_job_mark`]'s bounded table), an admin-cancel
+    /// must still find the correct waiting mark whichever of three
+    /// timelines it lives on: an absolute `enqueue_at` mark (matched exactly
+    /// by `run_at`'s own value), a relative-delay `enqueue_in` mark (stamped
+    /// from real time via `due_origin()`, reconstructed from
     /// `real_reference_ms + offset_ms`), or an immediate-enqueue mark
     /// (stamped from this registry's own clock, reconstructed from
     /// `self.now_ms() + offset_ms`) — regardless of what this registry's own
@@ -4705,7 +4803,7 @@ mod tests {
     /// registry's own *separate* clock (`pop_waiting`) can disagree about a
     /// boundary; trying each mark's own plausible timeline directly cannot.
     #[test]
-    fn cancel_at_backend_offset_finds_the_matching_mark_on_any_of_its_three_timelines() {
+    fn cancel_at_backend_offset_falls_back_to_the_nearest_of_its_three_timelines() {
         use chrono::{TimeZone, Utc};
 
         // An arbitrary "backend now" reference, unrelated to either pinned
@@ -4727,11 +4825,14 @@ mod tests {
 
             // Three marks, three timelines — mirroring how the three enqueue
             // shapes actually stamp a Postgres-backed job's registry mark.
-            // Asserted via `waiting_marks_for_test` rather than
-            // `queue_snapshot`'s depth: that method buckets marks against its
-            // own `now_ms()` (the registry's pinned clock here), which —
-            // unrelated to the fix under test — would itself misjudge a mark
-            // stamped on a wildly different timeline as "not yet ready".
+            // Pushed via the plain (non-`_pg_`) enqueue methods, so no exact
+            // mark is noted under any id: every cancel below must resolve
+            // through the candidate fallback, not the exact lookup. Asserted
+            // via `waiting_marks_for_test` rather than `queue_snapshot`'s
+            // depth: that method buckets marks against its own `now_ms()`
+            // (the registry's pinned clock here), which — unrelated to the
+            // fix under test — would itself misjudge a mark stamped on a
+            // wildly different timeline as "not yet ready".
             registry.record_enqueue("immediate_job");
             registry.record_enqueue_scheduled("relative_job", BACKEND_NOW_MS + 3_600_000);
             registry.record_enqueue_scheduled("absolute_job", ABSOLUTE_MARK_MS);
@@ -4743,8 +4844,10 @@ mod tests {
 
             // Cancel the relative-delay job: offset ~+1h from BACKEND_NOW_MS
             // (real time). No `run_at` supplied (irrelevant to this branch).
+            // "no-exact-mark" is an unregistered id, forcing the fallback.
             registry.record_cancel_at_backend_offset(
                 "relative_job",
+                "no-exact-mark",
                 None,
                 BACKEND_NOW_MS,
                 3_600_000,
@@ -4759,7 +4862,13 @@ mod tests {
             // Cancel the immediate job: offset ~0, no `run_at`. The only
             // candidate that can match is `self.now_ms() + 0` — this
             // registry's own (pinned) clock.
-            registry.record_cancel_at_backend_offset("immediate_job", None, BACKEND_NOW_MS, 0);
+            registry.record_cancel_at_backend_offset(
+                "immediate_job",
+                "no-exact-mark",
+                None,
+                BACKEND_NOW_MS,
+                0,
+            );
             assert_eq!(
                 registry.waiting_marks_for_test("immediate_job"),
                 vec![ABSOLUTE_MARK_MS],
@@ -4772,6 +4881,7 @@ mod tests {
             // here deliberately wrong) offset/real-reference pair.
             registry.record_cancel_at_backend_offset(
                 "absolute_job",
+                "no-exact-mark",
                 Some(ABSOLUTE_MARK_MS),
                 BACKEND_NOW_MS,
                 0,
@@ -4783,6 +4893,70 @@ mod tests {
                  its own mark via the exact run_at match and drain the queue to zero"
             );
         }
+    }
+
+    /// A coincidental collision between two co-queued jobs' candidate
+    /// targets — one job's true mark landing exactly on a *different* job's
+    /// fallback candidate — must not make the wrong mark the "nearest" one.
+    ///
+    /// `record_pg_enqueue` remembers each job's own exact mark by id
+    /// (`note_pg_job_mark`), and `record_cancel_at_backend_offset` looks that
+    /// up before ever computing a candidate, so this can't happen for a job
+    /// enqueued that way: the exact lookup is unambiguous by construction,
+    /// unlike nearest-match over candidates that only approximate a mark's
+    /// true timeline.
+    #[test]
+    fn cancel_at_backend_offset_prefers_the_exact_mark_over_a_coincidental_candidate_collision() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("relative_job", "mail");
+        registry.register_on_queue("absolute_job", "mail");
+
+        // job-a's own real-time mark; job-b's own absolute mark, chosen so
+        // that job-a's *fallback* candidate (computed below) would land
+        // exactly on job-b's mark instead of job-a's own.
+        registry.record_pg_enqueue("relative_job", "job-a-id", Some(5_000));
+        registry.record_pg_enqueue("absolute_job", "job-b-id", Some(9_999));
+        assert_eq!(
+            registry.waiting_marks_for_test("relative_job"),
+            vec![5_000, 9_999],
+            "both marks pushed onto the shared queue"
+        );
+
+        // Cancel job-a: its offset/real-reference pair is deliberately
+        // chosen so the *fallback* candidate (9_999 + 0 = 9_999) collides
+        // exactly with job-b's mark, not job-a's own (5_000). Without the
+        // exact-by-id lookup, nearest-match would remove job-b's mark
+        // instead (distance 0 beats 5_000's distance of 4_999).
+        registry.record_cancel_at_backend_offset("relative_job", "job-a-id", None, 9_999, 0);
+        assert_eq!(
+            registry.waiting_marks_for_test("relative_job"),
+            vec![9_999],
+            "canceling job-a must remove its own exact mark (5_000), not job-b's mark that \
+             its fallback candidate coincidentally collides with"
+        );
+    }
+
+    /// A job that starts or completes normally never looks its own exact
+    /// mark up again — `record_cancel_at_backend_offset` is the only reader
+    /// — so without a cap, `note_pg_job_mark` would grow by one entry per
+    /// Postgres enqueue for the lifetime of the process.
+    #[test]
+    fn note_pg_job_mark_is_bounded_so_uncancelled_jobs_cannot_leak_memory_forever() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("never_canceled", "mail");
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP + 5) {
+            registry.record_pg_enqueue(
+                "never_canceled",
+                &format!("job-{i}"),
+                Some(u64::try_from(i).unwrap()),
+            );
+        }
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the exact-mark table must never grow past its cap, even when every job it \
+             tracks starts or completes normally and is never looked up again"
+        );
     }
 
     #[test]

@@ -3488,23 +3488,24 @@ impl JobClient {
         let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = self.entropy.uuid_v4().to_string();
-        if let Some(due) = due_at {
-            // A future due time only becomes claimable later (local timer /
-            // durable `run_at`), so record it as scheduled: it must not count
-            // toward ready per-queue depth until its ready time arrives. For
-            // a Postgres-backed job this mark lives on `due_origin()`'s real
-            // time (see `JobClient::due_origin`), not this registry's own
-            // injected clock — `record_cancel_at_backend_offset` knows to
-            // look for it there.
+        if self.durable_is_pg() {
+            // A Postgres-backed job's own mark is worth remembering by id
+            // (`record_pg_enqueue`) so a later admin-cancel
+            // (`pg_cancel_enqueued`) can remove it exactly, rather than
+            // guessing which of several co-queued marks — on up to three
+            // different timelines, since a scheduled mark lives on
+            // `due_origin()`'s real time (see `JobClient::due_origin`) while
+            // an immediate one stays on this registry's own injected clock —
+            // belongs to it.
+            let ready_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
+            self.registry.record_pg_enqueue(name, &id, ready_at_ms);
+        } else if let Some(due) = due_at {
+            // A future due time only becomes claimable later (local timer),
+            // so record it as scheduled: it must not count toward ready
+            // per-queue depth until its ready time arrives.
             let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
             self.registry.record_enqueue_scheduled(name, ready_at_ms);
         } else {
-            // An immediate enqueue's mark stays on this registry's own
-            // injected clock (never `due_origin()`'s real time): it is what
-            // `JobRegistry::queue_snapshot`'s own depth/age reporting
-            // compares marks against, so moving it to another timeline would
-            // make that reporting wrong for every immediate Postgres job
-            // whenever the registry runs a virtual clock.
             self.registry.record_enqueue(name);
         }
         self.job_admin.record_enqueue_due(
@@ -10094,6 +10095,7 @@ impl PgJobAdminBackend {
             .and_then(|dt| u64::try_from(dt.timestamp_millis()).ok());
         self.registry.record_cancel_at_backend_offset(
             &row.name,
+            id,
             absolute_ms,
             real_reference_ms,
             row.offset_ms,
@@ -17365,19 +17367,25 @@ mod tests {
             registry.register_on_queue("send_email", "mail");
             registry.register_on_queue("nightly_report", "mail");
             registry.register_on_queue("midnight_digest", "mail");
+            // Seeded via `record_pg_enqueue` (not the plain `record_enqueue`/
+            // `record_enqueue_scheduled`), matching what the fixed
+            // `enqueue_with_outcome_due_inner` actually does for a
+            // Postgres-backed job: it also remembers each mark under the
+            // job's own id, so `pg_cancel_enqueued` below exercises the
+            // exact-by-id lookup end to end, not just its fallback.
+            //
             // An immediate job's mark stays on the registry's own (here,
-            // 2100-pinned) clock, matching `enqueue_with_outcome_due_inner`'s
-            // immediate branch.
-            registry.record_enqueue("send_email");
+            // 2100-pinned) clock.
+            registry.record_pg_enqueue("send_email", "ready-job", None);
             // A relative-delay job's mark lives on real time, matching that
             // same function's scheduled branch for a Postgres-backed job.
             let real_now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap();
             let real_far_future_ms = real_now_ms + 3_600_000;
-            registry.record_enqueue_scheduled("nightly_report", real_far_future_ms);
+            registry.record_pg_enqueue("nightly_report", "scheduled-job", Some(real_far_future_ms));
             // An absolute `enqueue_at` job's mark is the caller's own
             // instant, unrelated to either clock above.
             let absolute_due_ms = real_now_ms + 7_200_000;
-            registry.record_enqueue_scheduled("midnight_digest", absolute_due_ms);
+            registry.record_pg_enqueue("midnight_digest", "absolute-job", Some(absolute_due_ms));
 
             pg_enqueue_job(
                 &pool,
