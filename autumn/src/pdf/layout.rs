@@ -103,6 +103,31 @@ fn nodes_contain_an_li(nodes: &[Node]) -> bool {
         .any(|node| matches!(node, Node::Element { tag, .. } if tag == "li"))
 }
 
+/// True if `nodes` has something [`extract_table_rows`] would act on: a
+/// `<tr>` (always emits a row, even an empty one — see its own
+/// unconditional `out.push`), a `<thead>`/`<tbody>`/`<tfoot>` with such a
+/// child inside it, or any other non-[`is_non_rendered`] tag (its text, if
+/// any, becomes a one-cell row via the catch-all arm).
+///
+/// For `extract_table_rows`'s own depth-cap guard, not
+/// [`subtree_has_visible_content`]: that walker's loop skips every bare
+/// text node outright (`let Node::Element { .. } = node else { continue
+/// };`), so whitespace between `<table>` and `</table>` never produces a
+/// row on its own — same shape of gap as [`nodes_contain_an_li`] fixes for
+/// the list walkers.
+fn nodes_contain_table_output(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| {
+        let Node::Element { tag, children } = node else {
+            return false;
+        };
+        match tag.as_str() {
+            "thead" | "tbody" | "tfoot" => nodes_contain_table_output(children),
+            _ if is_non_rendered(tag) => false,
+            _ => true,
+        }
+    })
+}
+
 /// A4 portrait, matching the default most other frameworks in this space
 /// (Rails' `wicked_pdf`, `WeasyPrint`) ship.
 const PAGE_WIDTH_PT: f32 = 595.28;
@@ -390,7 +415,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        if nodes_contain_table_output(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -2761,6 +2786,24 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "a <ul> with no real <li> draws nothing, whitespace or not, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_table_past_the_depth_cap_does_not_warn() {
+        // Same shape as the <ul> case: extract_table_rows's loop skips any
+        // node that isn't an Element (`let Node::Element { .. } = node else
+        // { continue };`), so a <table> with only a newline between its
+        // tags produces no row.
+        let html = format!(
+            "{}<table>\n</table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a <table> with no real row content draws nothing, so this must not warn"
         );
     }
 
