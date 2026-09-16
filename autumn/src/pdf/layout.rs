@@ -21,6 +21,73 @@ use super::metrics::{char_width_1000em, text_width_pt};
 /// element tree it receives.
 const MAX_DEPTH: u32 = 512;
 
+thread_local! {
+    /// Set when a walker drops a subtree with a visible mark in it because
+    /// it passed [`MAX_DEPTH`] — a capped subtree of transparent wrapper
+    /// tags with nothing inside drops nothing, so that case leaves this
+    /// unset (see [`subtree_has_visible_content`]). [`render_pages`] clears
+    /// the flag at the start of every call and reads it at the end, so one
+    /// deep document logs one warning, not one per node.
+    static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True if `nodes`, or anything nested inside them, would visibly affect
+/// the rendered page: real text, or a tag that acts as a structural break
+/// point purely by being present, regardless of its own content — `<br>`,
+/// `<ul>`, `<ol>`, and every [`is_block_boundary_in_inline_context`] tag
+/// (`<hr>`, `<li>`, `<div>`, `<p>`, ...).
+///
+/// Each of those forces a split even when it is completely empty:
+/// `flatten_into_pending` flushes whatever text came before it into its
+/// own paragraph the instant it sees one (before handing the tag itself
+/// to [`flatten_blocks`], which adds nothing further for a childless one),
+/// and `inline_spans` pushes a `Span::Break` around it. So an empty
+/// `<li>`/`<div>`/... sitting between two runs of real text keeps them on
+/// separate lines instead of gluing them together — dropping it is a real
+/// rendering difference even though it drops no content of its own.
+///
+/// This can warn even in the rarer case where a content-free tag like
+/// this has no real siblings around it to separate, so dropping it truly
+/// changes nothing — telling those two cases apart would need this check
+/// to see outside `nodes` (the siblings around wherever the tag would
+/// have gone), which it deliberately does not do. That trade-off is
+/// intentional: an occasional extra warning on an edge case that turns
+/// out to be harmless costs far less than silently missing a real one,
+/// which is the whole reason this signal exists (issue #2801).
+///
+/// Does not look inside [`is_non_rendered`] tags (`<script>`, `<style>`,
+/// ...), whose content the renderer never draws regardless of depth.
+///
+/// Walks with an explicit stack, not recursion: a capped subtree can be
+/// arbitrarily deep (that is the whole reason it got capped), so this must
+/// stay stack-safe the same way [`super::html`]'s parser and `Node`'s own
+/// `Drop` do.
+fn subtree_has_visible_content(nodes: &[Node]) -> bool {
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(text) => {
+                if !text.is_empty() {
+                    return true;
+                }
+            }
+            Node::Element { tag, children } => {
+                if tag == "br"
+                    || tag == "ul"
+                    || tag == "ol"
+                    || is_block_boundary_in_inline_context(tag)
+                {
+                    return true;
+                }
+                if !is_non_rendered(tag) {
+                    stack.extend(children);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// A4 portrait, matching the default most other frameworks in this space
 /// (Rails' `wicked_pdf`, `WeasyPrint`) ship.
 const PAGE_WIDTH_PT: f32 = 595.28;
@@ -194,6 +261,9 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     for node in nodes {
@@ -261,6 +331,9 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut index = 0u32;
@@ -302,6 +375,9 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     for node in nodes {
@@ -357,6 +433,9 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut index = 0u32;
@@ -386,6 +465,9 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     let mut pending: Vec<Span> = Vec::new();
@@ -508,6 +590,9 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
+        if subtree_has_visible_content(nodes) {
+            DEPTH_CAP_HIT.with(|hit| hit.set(true));
+        }
         return;
     }
     // Reuse `flatten_blocks` by giving it a scratch buffer, then splice: if
@@ -1300,7 +1385,13 @@ impl Writer {
 }
 
 /// Render a parsed HTML-subset document as one or more [`PdfPage`]s.
+///
+/// If the input nests past [`MAX_DEPTH`], the excess content is dropped and
+/// this logs one `tracing::warn!` at target `autumn::pdf` — see the
+/// [module docs](crate::pdf)'s "Nesting depth limit" section.
 pub(super) fn render_pages(html: &str) -> Vec<PdfPage> {
+    DEPTH_CAP_HIT.with(|hit| hit.set(false));
+
     let nodes = super::html::parse(html);
     let mut blocks = Vec::new();
     flatten_blocks(&nodes, 0, &mut blocks);
@@ -1309,6 +1400,15 @@ pub(super) fn render_pages(html: &str) -> Vec<PdfPage> {
     for block in &blocks {
         writer.draw_block(block);
     }
+
+    if DEPTH_CAP_HIT.with(std::cell::Cell::get) {
+        tracing::warn!(
+            target: "autumn::pdf",
+            max_depth = MAX_DEPTH,
+            "pdf layout: nesting depth cap reached; content past this depth was dropped",
+        );
+    }
+
     writer.finish()
 }
 
@@ -2561,6 +2661,200 @@ mod tests {
         // asserts it completes and still produces at least one page.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
+    }
+
+    // ── Depth-cap truncation must be visible, not silent (issue #2801) ──
+
+    /// Counts `WARN` events at `target` seen while it is the default
+    /// subscriber. Scoped to one thread by [`tracing::subscriber::set_default`],
+    /// so parallel tests do not see each other's events.
+    #[derive(Clone, Default)]
+    struct WarnCounter {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if meta.target() == "autumn::pdf" && *meta.level() == tracing::Level::WARN {
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Render `html` under a capture subscriber and return how many
+    /// `autumn::pdf` warnings it emitted.
+    fn count_pdf_depth_warnings(html: &str) -> usize {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let counter = WarnCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        render_pages(html);
+        counter.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `n` levels of `<span>` wrapped around `MARKER` — the exact shape
+    /// issue #2801 used to find the 512/513 cutover.
+    fn nested_span_html(n: usize) -> String {
+        let mut html = "<span>".repeat(n);
+        html.push_str("MARKER");
+        html.push_str(&"</span>".repeat(n));
+        html
+    }
+
+    #[test]
+    fn exactly_at_the_depth_cap_emits_no_warning() {
+        assert_eq!(
+            count_pdf_depth_warnings(&nested_span_html(512)),
+            0,
+            "512 levels is the documented cap, not past it — must not warn \
+             (issue #2801's own n=512 case)"
+        );
+    }
+
+    #[test]
+    fn one_level_past_the_depth_cap_emits_one_warning() {
+        assert_eq!(
+            count_pdf_depth_warnings(&nested_span_html(513)),
+            1,
+            "513 levels is one past the cap — must log exactly one warning, \
+             not zero (silent) and not one per truncated node \
+             (issue #2801's own n=513 case)"
+        );
+    }
+
+    #[test]
+    fn empty_span_past_the_depth_cap_does_not_warn() {
+        // N empty <span> wrappers around nothing, for several N past the
+        // cap: every level is checked, not just the first one past it,
+        // because a shallow "is this one slice empty" check only catches
+        // the exact depth where the wrapper chain runs out — one level
+        // deeper, that slice holds one more (still empty) wrapper element
+        // and looks non-empty by slice length alone. (Codex review on PR
+        // #2810, first at 513 levels, then again at 514.)
+        for n in 513..=520 {
+            let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
+            assert_eq!(
+                count_pdf_depth_warnings(&html),
+                0,
+                "{n} empty nested wrappers drop no content, so this must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn hr_past_the_depth_cap_still_warns() {
+        // A dropped <hr> has no text, but it still draws a visible rule
+        // (or, in an inline context, a line break) — losing it is a real
+        // content loss, so "no text" must not mean "nothing to warn about".
+        let html = format!("{}<hr>{}", "<span>".repeat(513), "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped <hr> is dropped visible content, so this must warn"
+        );
+    }
+
+    #[test]
+    fn empty_li_past_the_depth_cap_still_warns() {
+        // An empty <li> still draws a marker and reserves a line (see
+        // empty_list_item_still_reserves_a_full_line) even with no text of
+        // its own, so dropping it is a real content loss too.
+        let html = format!(
+            "{}<ul><li></li></ul>{}",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped empty <li> still draws a marker, so this must warn"
+        );
+    }
+
+    #[test]
+    fn script_text_past_the_depth_cap_does_not_warn() {
+        // <script>'s text is never rendered, capped or not (see
+        // script_and_style_content_is_never_rendered), so losing it to the
+        // depth cap is not a real content loss.
+        let html = format!(
+            "{}<script>alert('x')</script>{}",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "script text was never going to render, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn br_past_the_depth_cap_still_warns() {
+        // <br>, like <hr>, draws no text but still becomes a Span::Break —
+        // a real (if small) piece of output, so it must warn like <hr>
+        // does, not stay silent because it has no text of its own.
+        let html = format!("{}<br>{}", "<span>".repeat(513), "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped <br> is dropped output (a line break), so this must warn"
+        );
+    }
+
+    #[test]
+    fn bare_li_outside_a_list_past_the_depth_cap_still_warns() {
+        // A stray <li> with no enclosing <ul>/<ol> isn't a list item, but
+        // it is still a "flush point": flatten_into_pending closes off
+        // whatever text came before it into its own paragraph the moment
+        // it sees a <li> (same as <div>, <p>, ...), so an <li> sitting
+        // between two runs of real text keeps them on separate lines
+        // instead of gluing them — even though the <li> itself is empty.
+        // Dropping it changes the output, so this must warn.
+        let html = format!("{}<li></li>{}", "<span>".repeat(513), "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a stray <li> is still a structural flush point, so this must warn"
+        );
+    }
+
+    #[test]
+    fn empty_div_sandwiched_between_text_past_the_depth_cap_still_warns() {
+        // An empty <div> between "A" and "B", buried past the cap, is a
+        // real (if easy to miss) rendering difference: uncapped, it forces
+        // "A" and "B" into separate paragraphs (flatten_into_pending flushes
+        // pending text into its own Block::Paragraph the instant it sees a
+        // <div>, then hands the (empty) <div> to flatten_blocks, which adds
+        // nothing further); dropped, "A" and "B" merge into one paragraph.
+        // Same story inline: inline_spans always pushes a Span::Break
+        // around a <div> (see is_block_boundary_in_inline_context's doc
+        // comment), empty or not.
+        let html = format!(
+            "A{}<div></div>{}B",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped empty <div> still separates its neighbors, so this must warn"
+        );
+    }
+
+    #[test]
+    fn shallow_nesting_emits_no_warning() {
+        let html = "<p>Hello <strong>world</strong></p>";
+        assert_eq!(
+            count_pdf_depth_warnings(html),
+            0,
+            "ordinary shallow content must never log a depth-cap warning"
+        );
     }
 
     #[test]
