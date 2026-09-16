@@ -9,10 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **📖 Folio: make the `autumn token` lifecycle findable, and gate the
-  direction that hid it (coverage 168/194 → 171/194, retrieval 0 hits → 1
-  hit):** the guide taught readers to *gate* a route on a token scope —
-  `#[secured(scopes = ["posts:write"])]`, on three separate pages — and
+- **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
+  api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
+  token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
   nowhere told them where the token comes from or how to take it back. All
   four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
   `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
@@ -37,74 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
   `revoke_api_token` — rather than omitting list and rotate and listing the
   `IssueTokenSpec` data type as though it were an operation.
-- **📖 Folio: add `check-docs-cli-coverage.sh`, the first docs gate that
-  runs code → docs:** the corpus had eleven docs gates and every one ran
-  docs → code — "is what we wrote still true?", which is drift. None asked
-  "is what we shipped written down anywhere?", so a command could ship
-  documented nowhere and the whole tree stayed green; the defect is
-  invisible by construction, because a gate that only reads the docs can
-  never notice a command the docs never mention. The first run of the
-  reverse direction found 26 of 194 command paths absent from all 212
-  reader-facing pages — 26 rather than 25 because the first matcher let a
-  longer command satisfy a shorter one as a suffix, so `autumn openapi
-  export` (documented in openapi.md) masked the runnable top-level `export`
-  command; caught in review, with a regression test. Three were the real
-  defect above; the rest are
-  classified rather than listed as failures — `serve run-service` is
-  `#[command(hide = true)]` (read out of the clap derive input, so hiding a
-  command exempts it with no edit to the gate), and 13 `destroy`
-  subcommands are covered by the rule `generators.md` states over the whole
-  family, which the gate *verifies the page still states* rather than
-  trusting. The remaining 9 are a triaged backlog carrying a reason each, so
-  they are a number someone can work down; a newly added undocumented
-  command fails the gate rather than joining them. Surface and corpus are
-  both read from `check-docs-cli.sh` instead of respelled, so the two cannot
-  drift apart the way the four gates `check-docs-scope.sh` exists to
-  reconcile once did. A page that names a command only to say it does NOT
-  exist is not coverage, and reading it as such would have inverted the gate
-  on exactly the commands most likely to ship next: three pages carry the
-  sibling's `cli-surface-allow` waiver for `autumn generate seed` (tracked in
-  #493), `autumn generate island` and `autumn system-test`, and the waiver
-  comment itself contains the command it waives, so it satisfied coverage on
-  its own. HTML comments are now stripped before extraction — a comment
-  renders as nothing, so it documents nothing, the same line
-  `check-docs-orphans.sh` draws — and a page's waived commands do not count as
-  mentioned on that page. When one of those ships, the gate fails and names
-  the page still denying it, so the stale passage is deleted rather than the
-  waiver widened — and that check runs over the whole surface rather than over
-  the failing rows, since a command that ships WITH docs on a new page is
-  classified `documented`, and a defect-only check would go quiet on the old
-  denial at exactly the moment it became false. Hidden commands are likewise
-  tracked by full path, resolved through the enclosing enum (`RunService` in
-  `enum ServeCommands` is `serve run-service`): matching the last component
-  alone would hand a later visible `deploy run-service` this one's exemption,
-  and the guard that came with it meant a hidden top-level command was never
-  exempted at all. One rule turned out to sit behind all of these: invisible
-  text is never authoritative, in either language. Everything the gate reads it
-  now reads comment-stripped — the docs corpus, the page a generic rule is
-  verified against, and the clap derive input behind `hide = true`. A rule moved
-  into an HTML comment would otherwise keep exempting all 13 `destroy` paths,
-  and a command unhidden by commenting its attribute out
-  (`// #[command(hide = true)]`, the usual way to unhide) would keep its
-  exemption — each leaving the gate green over documentation no reader sees and
-  behaviour the binary does not have. Relatedly, nothing may sit between
-  `autumn` and the command path at all: the root `Cli` carries no global
-  options, and clap's own builtins are terminal (the sibling gate models the
-  same `{--help, -h, --version, -V}` set and stops its parse on them), so
-  `autumn --help db reset` prints root help and never runs or shows
-  `db reset`. An earlier cut skipped those flags and kept matching, turning a
-  non-invocation into coverage — and the self-test asserted that behaviour, so
-  the mistake was pinned in place by a test claiming it was intended. Strictness
-  applies to what precedes the path, not to what separates it: a parent's own
-  option may sit between components — `autumn migrate --with-maintenance down`
-  is documented at generators.md:684 and is an accepted invocation of
-  `migrate down` — so recognized parent options are stepped over, read from the
-  sibling's `--list-options` table rather than guessed. The two directions of
-  error are not symmetric: too permissive manufactures coverage that does not
-  exist and fails silent, which is the defect this gate exists to find; too
-  strict reports a documented command as undocumented and fails loud, which is
-  only noise.
 
+  Found by running the docs corpus against the CLI surface in the direction
+  no existing gate runs: the eleven docs gates all ask "is what we wrote
+  still true?" (drift), and none asks "is what we shipped written down
+  anywhere?" (coverage), so a command can ship documented nowhere and the
+  whole tree stays green. That measurement found 26 of 194 command paths
+  absent from all 212 reader-facing pages; most were benign (13 `destroy`
+  subcommands covered by the rule `generators.md` states over the family,
+  one `#[command(hide = true)]` internal), and the `autumn token` family was
+  the defect worth fixing. A gate to hold that line is NOT included here —
+  see the note in the PR: a correct one has to reuse
+  `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
+  its own change.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the
