@@ -186,7 +186,18 @@ Clients send:
 |---|---|
 | `{"type":"insert","after":"12@ada","text":"hi"}` | add text after a character id (`after` absent means the start) |
 | `{"type":"delete","ids":["12@ada"]}` | tombstone characters |
+| `{"type":"replace","ids":["12@ada"],"after":"11@ada","text":"hi"}` | tombstone characters **and** add text, as one edit |
 | `{"type":"cursor","index":7}` | report the caret |
+
+Send `replace` — not a `delete` and an `insert` — whenever one edit does both,
+which is what typing over a selection is. A tombstone costs what a character
+costs, so a document at `max_document_chars` frees nothing by deleting: the
+delete is accepted, the insert is refused for size, and the selection is gone
+with nothing in its place. Sending them in the other order does not help
+either, because both are in flight before either answer comes back. `replace`
+is checked in full before anything is applied, so a refusal leaves the text as
+it was. Its `after` is the character *before* the replaced span, which the
+removal does not touch.
 
 The hub sends `snapshot`, `ops`, `presence` and `error`. A browser keeps a
 flat list of characters — tombstones included — in the server's order, so it
@@ -246,12 +257,21 @@ use autumn_web::collab::CollabLimits;
 
 let hub = CollabHub::new(channels, presence).with_limits(CollabLimits {
     max_insert_chars: 4_000,
-    max_document_chars: 50_000,
+    max_document_chars: 4_000,
     max_delete_ids: 4_000,
+    ..CollabLimits::default()
 });
 ```
 
-The defaults are 10 000 / 200 000 / 10 000.
+`CollabLimits` gains fields as the hub learns to bound more, so set the ones
+you care about over `..CollabLimits::default()` rather than naming all of
+them — `max_documents` is the fourth today.
+
+Every default is 10 000, and `max_document_chars` is held there however you
+set it: `with_limits` caps it at `MAX_WIRE_ELEMENTS`, because a hub that built
+documents past what `CollabText`'s own `Deserialize` accepts would write rows
+it could not read back. Asking for more is not an error and not honoured, so
+configure below the cap rather than above it.
 
 ## Cost, and what is not here yet
 
