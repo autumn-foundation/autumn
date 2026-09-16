@@ -134,7 +134,7 @@ house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontai
 **no workflow edit**. Do not add a per-test allowlist line.
 
 This sweep compiles the consolidated binary with `--features
-"test-support,offline-sync,ws,mail,redis,i18n"` (db + maud are already defaults), so
+"test-support,offline-sync,ws,mail,redis,i18n,collab"` (db + maud are already defaults), so
 a new Postgres/DB testcontainer test — and now also the previously-unreachable
 `ws`/`mail`/`redis` testcontainer Docker tests — runs automatically. As of
 #1945 the feature set folds in the `ws` `live_broadcast` OOB-fragment suite, the
@@ -143,7 +143,13 @@ a new Postgres/DB testcontainer test — and now also the previously-unreachable
 each is testcontainer-managed (Postgres/Redis in-process), so no CI `services:`
 block is required. As of #1384 the set also folds in `i18n`, so the
 `#[translatable]` per-locale column round-trip suite (`translatable_model`) is
-swept too.
+swept too. As of #1806 it also folds in `collab`, for both halves of the same
+reason: the `#[collaborative]` round-trip suite (`collab_model`) is gated
+`db + collab` and would not otherwise compile into this binary, and
+`collab_offline_merge` is gated `collab + offline-sync` — a pair **no
+workspace member enables**, so `cargo test --workspace` compiles it out and
+this step is the only place it runs. Its non-Docker tests are therefore named
+explicitly in the step, not left to the `--ignored` sweep.
 
 Only **`system-tests`-gated** (browser/Chromium) Docker tests remain excluded —
 they need a Chromium binary this runner does not provide. Consequently, a new

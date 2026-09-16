@@ -24,6 +24,14 @@ pub fn field_is_translatable(field: &syn::Field) -> bool {
     has_attr(field, "translatable")
 }
 
+/// Whether a field is declared `#[collaborative]` (issue #1806): its column
+/// holds an `autumn_web::collab::CollabText` document — a text CRDT that
+/// merges concurrent edits — instead of a plain string that the last writer
+/// overwrites.
+pub fn field_is_collaborative(field: &syn::Field) -> bool {
+    has_attr(field, "collaborative")
+}
+
 /// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
 /// to *serialization*, if any. Handles both the plain form and the split
 /// `rename_all(serialize = "...", deserialize = "...")` form (taking the
@@ -548,16 +556,31 @@ pub fn type_name_str(ty: &syn::Type) -> String {
 /// Emit the JSON-Schema `TokenStream` for one model field.
 ///
 /// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
-/// field (issue #1384) is described inline as a locale-tag→string map, which is
-/// exactly what its lossless `Serialize` emits. Without that, the field would
-/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
-/// referencing a component nothing registers.
+/// field (issue #1384) is described inline as a locale-tag→string map, and a
+/// `#[collaborative]` field (issue #1806) as its CRDT document — which is
+/// exactly what each one's lossless `Serialize` emits. Without that, the field
+/// would fall through to the `$ref` branch and `autumn openapi` would ship a
+/// spec referencing a component nothing registers.
 ///
 /// Keyed on the **attribute**, never on the type's name: an application type
 /// that merely happens to be called `Translated` (`domain::Translated`) keeps
 /// its ordinary `$ref`, so the advertised contract cannot silently disagree
 /// with what that type actually serializes to.
 pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_collaborative(field) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": "object",
+                "description": "Collaborative text document (issue #1806). Read \
+        `elems` for the characters; send operations to change the text. A bare string \
+        is refused: it would discard concurrent edits.",
+                "properties": {
+                    "elems": { "type": "array", "items": { "type": "object" } },
+                    "pending": { "type": "array", "items": { "type": "object" } }
+                }
+            })
+        };
+    }
     if field_is_translatable(field) {
         return quote! {
             ::autumn_web::reexports::serde_json::json!({

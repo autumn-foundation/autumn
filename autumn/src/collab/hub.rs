@@ -1,0 +1,971 @@
+//! Live collaborative sessions over the existing channel and presence seams.
+//!
+//! [`CollabHub`] keeps one live [`CollabText`] per collaborative field
+//! instance — one note's body, one row's column. Editors join a document,
+//! send operations, and receive every other editor's operations plus the
+//! participant list and their cursors.
+//!
+//! # Where each part comes from
+//!
+//! | Concern | Seam |
+//! |---|---|
+//! | Operation fan-out | [`Channels`] topic `collab:{key}` |
+//! | Who is editing | [`Presence`] topic `collab:{key}` |
+//! | Cursor position | a `Cursor` message, merged into the participant list |
+//!
+//! The hub adds no transport of its own, so an app already serving
+//! `#[ws]` routes gets collaboration on the socket it has.
+//!
+//! # Authority
+//!
+//! The hub is the authority. A client sends an edit anchored to a **character
+//! id**, never an index, so the hub places it correctly even when the document
+//! changed in flight. The hub then broadcasts the resulting operations, and
+//! every client applies them in the order they arrive.
+//!
+//! # Lifetime and persistence
+//!
+//! Nothing evicts a document on its own: once opened it stays in memory until
+//! [`CollabHub::close`], which hands back the final state to persist. An app
+//! that opens a document per record closes it when the last editor leaves.
+//! Seed one from the database with [`CollabHub::open_with`] and write it back
+//! with [`CollabDoc::document`].
+//!
+//! ```rust,no_run
+//! use autumn_web::collab::{CollabHub, CollabText};
+//! use autumn_web::prelude::*;
+//!
+//! # fn wire(state: AppState, stored: String) {
+//! let hub = state.collab().clone();
+//! let doc = hub.open_with("notes:42:body", || CollabText::decode_column(&stored));
+//! let session = doc.join("session-1", "Ada");
+//!
+//! // ... apply client messages, broadcast operations ...
+//!
+//! // Persist whenever it suits the app (on idle, on leave, on a timer).
+//! let column = doc.document().encode_column();
+//! drop(session);
+//! # let _ = column;
+//! # }
+//! ```
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+use crate::channels::{Channels, Subscriber};
+use crate::presence::{Presence, PresenceHandle};
+
+use super::text::{CollabElement, CollabOp, CollabText, OpId};
+
+/// Channel and presence topic for a document key.
+#[must_use]
+pub fn topic_for(key: &str) -> String {
+    format!("collab:{key}")
+}
+
+/// Document key for one field instance: `{table}:{pk}:{column}`.
+///
+/// Any stable string works; this is the convention the framework's own
+/// surfaces use, so an app that follows it stays legible to them.
+#[must_use]
+pub fn doc_key(table: &str, pk: impl std::fmt::Display, column: &str) -> String {
+    format!("{table}:{pk}:{column}")
+}
+
+/// Bounds on what one client may send.
+///
+/// The hub is a shared, long-lived authority: without a bound, one client
+/// could grow a document until the process runs out of memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollabLimits {
+    /// Characters one insert message may carry.
+    pub max_insert_chars: usize,
+    /// Characters one document may hold, tombstones and buffered operations
+    /// included — what the document costs, not what it shows.
+    pub max_document_chars: usize,
+    /// Ids one delete message may name.
+    pub max_delete_ids: usize,
+    /// Live documents the hub may hold at once.
+    pub max_documents: usize,
+}
+
+impl Default for CollabLimits {
+    fn default() -> Self {
+        Self {
+            max_insert_chars: 10_000,
+            max_document_chars: 200_000,
+            max_delete_ids: 10_000,
+            max_documents: 10_000,
+        }
+    }
+}
+
+/// A client message the hub refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CollabError {
+    /// An insert exceeded [`CollabLimits::max_insert_chars`].
+    #[error("insert of {got} characters exceeds the limit of {limit}")]
+    InsertTooLarge {
+        /// Characters the message carried.
+        got: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+    /// The document is at [`CollabLimits::max_document_chars`].
+    #[error("document holds {got} characters, at the limit of {limit}")]
+    DocumentFull {
+        /// Characters the document holds.
+        got: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+    /// A delete named more ids than [`CollabLimits::max_delete_ids`].
+    #[error("delete of {got} ids exceeds the limit of {limit}")]
+    DeleteTooLarge {
+        /// Ids the message named.
+        got: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+    /// A message named a character the document has never seen.
+    ///
+    /// The hub is the authority, so a live editor can only anchor to an id the
+    /// hub minted. An id from the future is a client fault, and accepting it
+    /// would let one message tombstone characters nobody has typed yet.
+    #[error("unknown character id {id}")]
+    UnknownCharacter {
+        /// The id the message named.
+        id: String,
+    },
+}
+
+/// What an editor sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CollabClientMessage {
+    /// Add `text` directly after the character `after` names, or at the start
+    /// when `after` is absent.
+    Insert {
+        /// Left neighbour, resolved by the client against its own view.
+        #[serde(default)]
+        after: Option<OpId>,
+        /// Text to add.
+        text: String,
+    },
+    /// Remove the characters `ids` names.
+    Delete {
+        /// Characters to remove.
+        ids: Vec<OpId>,
+    },
+    /// Report where this editor's caret is, as a visible character index.
+    Cursor {
+        /// Caret position.
+        index: usize,
+    },
+}
+
+/// What the hub sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CollabServerMessage {
+    /// The whole document, sent once when an editor joins.
+    Snapshot {
+        /// Every character, tombstones included, in document order.
+        elems: Vec<CollabElement>,
+        /// Who else is editing.
+        participants: Vec<CollabParticipant>,
+        /// The receiving editor's own actor id, when the snapshot was built
+        /// for one ([`CollabSession::snapshot`]).
+        ///
+        /// A client needs it to recognise its own operations coming back. It
+        /// sends an edit and waits for the echo before diffing again; without
+        /// a way to tell "my edit landed" from "somebody else typed", a second
+        /// keystroke inside one round trip would re-send the first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+    /// Operations to apply, in order.
+    Ops {
+        /// The operations.
+        ops: Vec<CollabOp>,
+    },
+    /// The participant list changed, or somebody moved their cursor.
+    Presence {
+        /// Who is editing, and where.
+        participants: Vec<CollabParticipant>,
+    },
+    /// The hub refused a message. Sent only to the editor that sent it.
+    Error {
+        /// Why it was refused.
+        message: String,
+    },
+}
+
+/// One editor of a document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabParticipant {
+    /// The editor's actor id, which is also the id its characters carry.
+    pub actor: String,
+    /// Display name.
+    pub label: String,
+    /// Caret position as a visible character index, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<usize>,
+}
+
+/// Live state for one document.
+struct DocState {
+    doc: CollabText,
+    /// `actor -> caret`. `BTreeMap` so the participant list is ordered and
+    /// two replicas render the same thing.
+    cursors: BTreeMap<String, usize>,
+    /// Live [`CollabSession`]s. The last one to leave evicts the document, so
+    /// an app that never calls [`CollabHub::close`] still does not leak one
+    /// per record it ever opened.
+    sessions: usize,
+}
+
+impl DocState {
+    fn new(doc: CollabText) -> Self {
+        Self {
+            doc,
+            cursors: BTreeMap::new(),
+            sessions: 0,
+        }
+    }
+}
+
+/// Per-connection discriminator, so two connections that pass the same actor
+/// id still get distinct presence keys, cursors and character ids.
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How often [`serve_socket`] renews an editor's presence lease. Comfortably
+/// inside the 30-second default TTL, so one missed tick costs nothing.
+const PRESENCE_REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many full resends one editor gets before [`serve_socket`] gives up on
+/// it. See the `Lagged` arm for why this is bounded.
+const MAX_LAG_RESENDS: u32 = 3;
+
+/// Registry of live collaborative documents.
+///
+/// Available from a handler as `state.collab()`, or as the [`CollabHub`]
+/// extractor. Cloning is cheap and shares the same documents.
+#[derive(Clone)]
+pub struct CollabHub {
+    docs: Arc<Mutex<HashMap<String, Arc<Mutex<DocState>>>>>,
+    channels: Channels,
+    presence: Presence,
+    limits: CollabLimits,
+}
+
+impl CollabHub {
+    /// Build a hub over a channel registry and a presence tracker.
+    #[must_use]
+    pub fn new(channels: Channels, presence: Presence) -> Self {
+        Self {
+            docs: Arc::new(Mutex::new(HashMap::new())),
+            channels,
+            presence,
+            limits: CollabLimits::default(),
+        }
+    }
+
+    /// Replace the per-message bounds.
+    #[must_use]
+    pub fn with_limits(mut self, limits: CollabLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The bounds in effect.
+    #[must_use]
+    pub const fn limits(&self) -> CollabLimits {
+        self.limits
+    }
+
+    /// Open `key`, starting from an empty document if it is not live yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    #[must_use]
+    pub fn document(&self, key: &str) -> CollabDoc {
+        self.open_with(key, CollabText::new)
+    }
+
+    /// Open `key`, calling `seed` only if it is not live yet.
+    ///
+    /// This is where a document comes back from the database: `seed` runs at
+    /// most once per key, so a second editor joins the document the first one
+    /// is already editing rather than a stale copy of the row.
+    ///
+    /// `seed` runs while the registry is locked, so keep it cheap — load the
+    /// row first and hand the closure the value, as `examples/collab-notes`
+    /// does. It must not block on I/O.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    #[must_use]
+    pub fn open_with(&self, key: &str, seed: impl FnOnce() -> CollabText) -> CollabDoc {
+        // Already live: hand back the shared document and never call the seed.
+        if let Some(state) = self
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned")
+            .get(key)
+            .map(Arc::clone)
+        {
+            return self.handle_for(key, state);
+        }
+
+        // Not live: build the seed with the registry UNLOCKED. Under the lock
+        // it would block every other document's joins, a panic in it would
+        // poison the registry for the whole process, and a seed that touched
+        // the hub again would deadlock on a non-reentrant mutex. A race builds
+        // the value twice and discards the loser, which nothing observes.
+        let seeded = seed();
+
+        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        // Bound the registry: a route that opens a document from a
+        // client-supplied key would otherwise hold one per key ever seen.
+        if !docs.contains_key(key) && docs.len() >= self.limits.max_documents {
+            tracing::warn!(
+                key,
+                open = docs.len(),
+                limit = self.limits.max_documents,
+                "collab: document registry is full; serving a detached document"
+            );
+            drop(docs);
+            return self.handle_for(key, Arc::new(Mutex::new(DocState::new(seeded))));
+        }
+        let state = Arc::clone(
+            docs.entry(key.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(DocState::new(seeded)))),
+        );
+        drop(docs);
+        self.handle_for(key, state)
+    }
+
+    /// Wrap one document's state in a handle.
+    fn handle_for(&self, key: &str, state: Arc<Mutex<DocState>>) -> CollabDoc {
+        CollabDoc {
+            key: key.to_owned(),
+            state,
+            docs: Arc::clone(&self.docs),
+            channels: self.channels.clone(),
+            presence: self.presence.clone(),
+            limits: self.limits,
+        }
+    }
+
+    /// Evict `key`, returning its final state so the app can persist it.
+    ///
+    /// Returns `None` when `key` is not live **or** when an editor is still
+    /// on it — an occupied document is not the app's to evict.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    pub fn close(&self, key: &str) -> Option<CollabText> {
+        let mut docs = self.docs.lock().expect("collab registry lock poisoned");
+        let state = docs.get(key).map(Arc::clone)?;
+        let guard = state.lock().expect("collab document lock poisoned");
+        // Refuse while an editor is still here. Removing the entry would not
+        // stop them: they hold the same `Arc` and keep editing a document
+        // nobody can find, while the next joiner re-seeds from the row and
+        // starts a second, divergent copy. The last editor to leave evicts it.
+        if guard.sessions > 0 {
+            return None;
+        }
+        let doc = guard.doc.clone();
+        drop(guard);
+        docs.remove(key);
+        Some(doc)
+    }
+
+    /// Keys of every live document, in sorted order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document registry mutex is poisoned.
+    #[must_use]
+    pub fn open_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .docs
+            .lock()
+            .expect("collab registry lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+}
+
+impl std::fmt::Debug for CollabHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollabHub")
+            .field("open", &self.open_keys().len())
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl axum::extract::FromRequestParts<crate::state::AppState> for CollabHub {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut http::request::Parts,
+        state: &crate::state::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(state.collab().clone())
+    }
+}
+
+/// A handle to one live document.
+#[derive(Clone)]
+pub struct CollabDoc {
+    key: String,
+    state: Arc<Mutex<DocState>>,
+    /// The registry this document lives in, so the last session to leave can
+    /// evict it. A detached document (registry full) is simply absent here.
+    docs: Arc<Mutex<HashMap<String, Arc<Mutex<DocState>>>>>,
+    channels: Channels,
+    presence: Presence,
+    limits: CollabLimits,
+}
+
+impl CollabDoc {
+    /// The document key.
+    #[must_use]
+    pub const fn key(&self) -> &str {
+        self.key.as_str()
+    }
+
+    /// The channel and presence topic this document broadcasts on.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        topic_for(&self.key)
+    }
+
+    /// The visible text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.with_doc(CollabText::text)
+    }
+
+    /// A copy of the document — what the app persists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use]
+    pub fn document(&self) -> CollabText {
+        self.with_doc(Clone::clone)
+    }
+
+    /// Subscribe to this document's server messages.
+    #[must_use]
+    pub fn subscribe(&self) -> Subscriber {
+        self.channels.subscribe(&self.topic())
+    }
+
+    /// The opening message for a joining editor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use]
+    pub fn snapshot(&self) -> CollabServerMessage {
+        CollabServerMessage::Snapshot {
+            elems: self.with_doc(CollabText::elements),
+            participants: self.participants(),
+            actor: None,
+        }
+    }
+
+    /// Register `actor` as an editor and announce the join.
+    ///
+    /// The returned [`CollabSession`] holds the presence lease: drop it and
+    /// the editor leaves, its cursor disappears, and the remaining editors
+    /// are told.
+    ///
+    /// `actor` is a **prefix**: the hub appends a per-connection number and
+    /// uses the result as the presence key, the cursor key, and the actor id
+    /// every character this editor types carries. Two tabs that pass the same
+    /// name therefore keep their own caret and their own row in the
+    /// participant list instead of silently collapsing into one.
+    /// [`CollabSession::actor`] returns the id that was minted.
+    ///
+    /// Keep `actor` ASCII. Character ids break ties on the actor, and a
+    /// browser replica compares those as UTF-16 while the server compares
+    /// UTF-8 bytes; the two agree on ASCII and can disagree outside the basic
+    /// multilingual plane.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use = "dropping the session immediately ends the editor's presence lease"]
+    pub fn join(&self, actor: impl Into<String>, label: impl Into<String>) -> CollabSession {
+        let seat = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let actor = format!("{}#{seat}", actor.into());
+        let label = label.into();
+        {
+            let mut state = self.state.lock().expect("collab document lock poisoned");
+            state.sessions += 1;
+        }
+        let presence = self.presence.track(
+            self.topic(),
+            actor.clone(),
+            serde_json::json!({ "label": label }),
+        );
+        self.broadcast_presence();
+        CollabSession {
+            doc: self.clone(),
+            actor,
+            presence: Some(presence),
+        }
+    }
+
+    /// Who is editing, and where their carets are.
+    ///
+    /// Membership comes from [`Presence`]; the caret comes from the last
+    /// `Cursor` message each editor sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use]
+    pub fn participants(&self) -> Vec<CollabParticipant> {
+        let cursors = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cursors.clone()
+        };
+        self.presence
+            .list(&self.topic())
+            .into_iter()
+            .map(|entry| {
+                let label = entry
+                    .metas
+                    .first()
+                    .and_then(|m| m.get("label"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(entry.key.as_str())
+                    .to_owned();
+                CollabParticipant {
+                    cursor: cursors.get(&entry.key).copied(),
+                    actor: entry.key,
+                    label,
+                }
+            })
+            .collect()
+    }
+
+    /// Apply one client message as `actor` and broadcast the result.
+    ///
+    /// Returns the operations the message produced — empty for a cursor
+    /// move, which changes the participant list instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError`] when the message exceeds the hub's limits: an
+    /// oversized insert or delete, or a document already at its maximum size.
+    /// Nothing is applied and nothing is broadcast.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    pub fn handle(
+        &self,
+        actor: &str,
+        message: CollabClientMessage,
+    ) -> Result<Vec<CollabOp>, CollabError> {
+        match message {
+            CollabClientMessage::Insert { after, text } => {
+                let added = text.chars().count();
+                if added > self.limits.max_insert_chars {
+                    return Err(CollabError::InsertTooLarge {
+                        got: added,
+                        limit: self.limits.max_insert_chars,
+                    });
+                }
+                let ops = {
+                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    // The hub minted every id in this document, so an anchor
+                    // it has never seen is a client fault. Refusing it here
+                    // stops two things at once: an anchor from the future
+                    // would drag the Lamport clock up with it, and an
+                    // unintegrable insert would sit in the buffer forever.
+                    if let Some(anchor) = after.as_ref()
+                        && !state.doc.knows(anchor)
+                    {
+                        return Err(CollabError::UnknownCharacter {
+                            id: anchor.to_string(),
+                        });
+                    }
+                    // Tombstones and buffered operations count too: they are
+                    // what the document costs, not what it shows.
+                    let held = state.doc.element_count() + state.doc.pending_len();
+                    if held + added > self.limits.max_document_chars {
+                        return Err(CollabError::DocumentFull {
+                            got: held,
+                            limit: self.limits.max_document_chars,
+                        });
+                    }
+                    state.doc.insert_after(actor, after.as_ref(), &text)
+                };
+                self.broadcast_ops(&ops);
+                Ok(ops)
+            }
+            CollabClientMessage::Delete { ids } => {
+                if ids.len() > self.limits.max_delete_ids {
+                    return Err(CollabError::DeleteTooLarge {
+                        got: ids.len(),
+                        limit: self.limits.max_delete_ids,
+                    });
+                }
+                let ops = {
+                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    // `remove_known`, not `remove_ids`: a delete for a
+                    // character the hub has never seen must be dropped, not
+                    // buffered. Buffered, it would tombstone that character
+                    // the moment somebody typed it — one message could
+                    // pre-delete another editor's next thousand keystrokes.
+                    state.doc.remove_known(&ids)
+                };
+                self.broadcast_ops(&ops);
+                Ok(ops)
+            }
+            CollabClientMessage::Cursor { index } => {
+                {
+                    let mut state = self.state.lock().expect("collab document lock poisoned");
+                    state.cursors.insert(actor.to_owned(), index);
+                }
+                self.broadcast_presence();
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Merge operations that arrived from somewhere other than a live editor
+    /// — an offline client reconnecting, another replica, a background job —
+    /// and broadcast them.
+    ///
+    /// Returns how many operations are still waiting for their cause. A
+    /// non-zero count means the peer sent an incomplete history; the
+    /// operations are kept, not dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError::DocumentFull`] when the batch would take the
+    /// document past [`CollabLimits::max_document_chars`]. Nothing is applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    pub fn apply_remote(&self, ops: Vec<CollabOp>) -> Result<usize, CollabError> {
+        let waiting = {
+            let mut state = self.state.lock().expect("collab document lock poisoned");
+            let held = state.doc.element_count() + state.doc.pending_len();
+            if held + ops.len() > self.limits.max_document_chars {
+                return Err(CollabError::DocumentFull {
+                    got: held,
+                    limit: self.limits.max_document_chars,
+                });
+            }
+            state.doc.apply_all(ops.iter().cloned());
+            state.doc.pending_len()
+        };
+        self.broadcast_ops(&ops);
+        Ok(waiting)
+    }
+
+    fn with_doc<T>(&self, f: impl FnOnce(&CollabText) -> T) -> T {
+        let state = self.state.lock().expect("collab document lock poisoned");
+        f(&state.doc)
+    }
+
+    fn broadcast_ops(&self, ops: &[CollabOp]) {
+        if ops.is_empty() {
+            return;
+        }
+        self.publish(&CollabServerMessage::Ops { ops: ops.to_vec() });
+    }
+
+    fn broadcast_presence(&self) {
+        self.publish(&CollabServerMessage::Presence {
+            participants: self.participants(),
+        });
+    }
+
+    /// Publish a server message. A failed publish is logged, never returned:
+    /// the operation is already in the document, and the editors that missed
+    /// it resynchronize from the next snapshot.
+    fn publish(&self, message: &CollabServerMessage) {
+        let Ok(json) = serde_json::to_string(message) else {
+            tracing::warn!(key = %self.key, "collab: failed to encode server message");
+            return;
+        };
+        if let Err(error) = self.channels.publish(&self.topic(), json) {
+            tracing::warn!(key = %self.key, ?error, "collab: failed to publish server message");
+        }
+    }
+}
+
+impl std::fmt::Debug for CollabDoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollabDoc")
+            .field("key", &self.key)
+            .field("text", &self.text())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One editor's membership of a document.
+///
+/// Holds the presence lease. Dropping it removes the editor, clears its
+/// cursor, and tells the remaining editors.
+pub struct CollabSession {
+    doc: CollabDoc,
+    actor: String,
+    /// `Some` until the session drops. [`Drop`] takes it so the presence
+    /// lease ends *before* the departure is announced.
+    presence: Option<PresenceHandle>,
+}
+
+impl CollabSession {
+    /// The actor id every character this editor types carries.
+    #[must_use]
+    pub const fn actor(&self) -> &str {
+        self.actor.as_str()
+    }
+
+    /// The document this session edits.
+    #[must_use]
+    pub const fn document(&self) -> &CollabDoc {
+        &self.doc
+    }
+
+    /// Apply a client message as this editor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError`] when the message exceeds the hub's limits.
+    pub fn handle(&self, message: CollabClientMessage) -> Result<Vec<CollabOp>, CollabError> {
+        self.doc.handle(&self.actor, message)
+    }
+
+    /// The opening message for this editor, naming its own actor id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal document mutex is poisoned.
+    #[must_use]
+    pub fn snapshot(&self) -> CollabServerMessage {
+        match self.doc.snapshot() {
+            CollabServerMessage::Snapshot {
+                elems,
+                participants,
+                ..
+            } => CollabServerMessage::Snapshot {
+                elems,
+                participants,
+                actor: Some(self.actor.clone()),
+            },
+            other => other,
+        }
+    }
+
+    /// Extend the presence lease. Call it from the socket's ping loop.
+    pub fn refresh(&self) {
+        if let Some(presence) = &self.presence {
+            presence.refresh();
+        }
+    }
+}
+
+impl Drop for CollabSession {
+    /// Ends the lease first, then announces the departure: the remaining
+    /// editors must receive a participant list that no longer holds this one.
+    ///
+    /// Never panics. A `Drop` that unwrapped a poisoned lock would panic
+    /// during another panic's unwind, and a panic while panicking aborts the
+    /// process — one bad document would take the whole server down.
+    fn drop(&mut self) {
+        let last_editor = {
+            let mut state = self
+                .doc
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cursors.remove(&self.actor);
+            state.sessions = state.sessions.saturating_sub(1);
+            state.sessions == 0
+        };
+        drop(self.presence.take());
+        self.doc.broadcast_presence();
+
+        // The last editor evicts the document. Without this, an app that
+        // never calls `close` holds one live document per record it ever
+        // opened. The caller's `CollabDoc` keeps working — it holds the same
+        // `Arc` — so a handler can still read `document()` to persist after
+        // the socket ends, which is what `examples/collab-notes` does.
+        if last_editor {
+            let mut docs = self
+                .doc
+                .docs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if docs
+                .get(&self.doc.key)
+                .is_some_and(|live| Arc::ptr_eq(live, &self.doc.state))
+            {
+                docs.remove(&self.doc.key);
+            }
+        }
+    }
+}
+
+/// Drive one editor's WebSocket against `doc` until the socket closes.
+///
+/// This is the whole client protocol: join, send the snapshot, then forward
+/// every broadcast to the socket and every socket message to the hub. An app
+/// wires collaboration in one line of its `#[ws]` handler.
+///
+/// `actor` must be unique per connection — it is the id every character this
+/// editor types carries.
+///
+/// ```rust,ignore
+/// #[ws("/notes/{id}/collab")]
+/// async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsHandler {
+///     let doc = hub.document(&doc_key("notes", *id, "body"));
+///     // Through the injected entropy, never `Uuid::new_v4` (#1797).
+///     let actor = state.entropy().uuid_v4().to_string();
+///     move |socket| async move { serve_socket(&doc, actor, "Guest", socket).await }
+/// }
+/// ```
+///
+/// The snapshot is sent after the subscription opens, so an operation that
+/// lands in between is delivered twice: once inside the snapshot and once as
+/// an operation. Both the hub and a client that keys characters by id treat
+/// the repeat as a no-op — the same idempotence a reconnect relies on.
+pub async fn serve_socket(
+    doc: &CollabDoc,
+    actor: impl Into<String>,
+    label: impl Into<String>,
+    mut socket: crate::ws::WebSocket,
+) {
+    use crate::ws::Message;
+
+    let mut updates = doc.subscribe();
+    let session = doc.join(actor, label);
+
+    if send_json(&mut socket, &session.snapshot()).await.is_err() {
+        return;
+    }
+
+    // Presence entries expire on a TTL (30 s by default) and a background
+    // sweep evicts them. Without a heartbeat every editor would vanish from
+    // the participant list while still connected and typing.
+    let mut heartbeat = tokio::time::interval(PRESENCE_REFRESH);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // A client that keeps falling behind the broadcast buffer costs a full
+    // document resend each time. Give it a few chances, then let it reconnect.
+    let mut lags = 0u32;
+
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                session.refresh();
+            }
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else { break };
+                let Message::Text(text) = message else {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                    continue;
+                };
+                match serde_json::from_str::<CollabClientMessage>(&text) {
+                    Ok(client_message) => {
+                        if let Err(error) = session.handle(client_message) {
+                            let refusal = CollabServerMessage::Error {
+                                message: error.to_string(),
+                            };
+                            if send_json(&mut socket, &refusal).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let refusal = CollabServerMessage::Error {
+                            message: format!("unreadable message: {error}"),
+                        };
+                        if send_json(&mut socket, &refusal).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            update = updates.recv() => {
+                match update {
+                    Ok(update) => {
+                        if socket
+                            .send(Message::Text(update.into_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Lagged: this editor fell behind the broadcast buffer,
+                    // so it has missed operations. Resend the whole document
+                    // rather than let it drift — but a resend is larger than
+                    // the backlog it replaces, so a client that cannot keep
+                    // up would lag again on every pass, taking the shared
+                    // document lock each time. After a few tries, close and
+                    // let it reconnect on a fresh subscription.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        lags += 1;
+                        if lags > MAX_LAG_RESENDS {
+                            tracing::warn!(
+                                key = %doc.key(),
+                                "collab: editor cannot keep up; closing the socket"
+                            );
+                            break;
+                        }
+                        if send_json(&mut socket, &session.snapshot()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    drop(session);
+}
+
+/// Send one server message, or report that the socket is gone.
+async fn send_json(
+    socket: &mut crate::ws::WebSocket,
+    message: &CollabServerMessage,
+) -> Result<(), ()> {
+    let json = serde_json::to_string(message).map_err(|_| ())?;
+    socket
+        .send(crate::ws::Message::Text(json.into()))
+        .await
+        .map_err(|_| ())
+}

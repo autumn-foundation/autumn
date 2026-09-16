@@ -20,9 +20,9 @@ use syn::{DeriveInput, Field, LitStr};
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 use crate::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
-    is_option_type, serde_bare_word, serde_rename_all_serialize_rule, serde_valued_key,
-    type_name_str,
+    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
+    field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
+    serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -4494,6 +4494,10 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                // #1806: `#[collaborative]` is a marker the model macro reads;
+                // the behaviour lives in the field's `CollabText` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("collaborative")
         })
         .collect()
 }
@@ -5047,6 +5051,248 @@ fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ── #1806: `#[collaborative]` field attribute ────────────────────────────────
+
+/// Validate a `#[collaborative]` field.
+///
+/// The attribute is a marker: the *type* carries the merge, so the type has to
+/// be right. Everything else rejected here is a combination whose two halves
+/// disagree about what the column contains — a CRDT document is not a string
+/// to encrypt, index, normalize, or full-text search.
+fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_collaborative(field) {
+        return Ok(());
+    }
+    // The type must be `CollabText` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<CollabText>` is rejected on purpose
+    // — an empty document already models "no text", and a nullable column
+    // would give two spellings for one state.
+    let is_collab_text = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "CollabText")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_collab_text {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[collaborative]` requires the field type `autumn_web::collab::CollabText` \
+             (a text CRDT), not a plain string. Change the field to \
+             `pub <name>: autumn_web::collab::CollabText`; it renders through \
+             `Display` and merges concurrent edits character by character \
+             instead of letting the last writer overwrite them. The check is \
+             syntactic — a type alias for `CollabText` is not recognised, and \
+             conversely any type whose last path segment is `CollabText` is \
+             accepted, so spell the real type here.",
+        ));
+    }
+    // Combinations whose two halves disagree about the column's contents.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column stores one opaque ciphertext envelope, which the \
+             merge cannot read the characters out of",
+        ),
+        (
+            "classified",
+            "a classification tier applies to one value; a CRDT document is a JSON \
+             container of characters, and the merge would move them across the \
+             boundary the tier records",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which for a collaborative \
+             field is a JSON container — the index would match character ids and \
+             JSON punctuation, not the prose",
+        ),
+        (
+            "translatable",
+            "both markers own the column's representation, and one column cannot \
+             hold a per-locale container and a CRDT document at once. Keep one \
+             collaborative column per locale",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite a single string; they cannot see inside the \
+             document, and a rewrite behind the merge's back would drop characters \
+             other editors still hold",
+        ),
+        (
+            "unique",
+            "uniqueness would compare whole documents, so two records with identical \
+             text but different edit histories would never collide",
+        ),
+        (
+            "indexed",
+            "an equality index over a CRDT document matches whole documents, never \
+             the text",
+        ),
+        ("id", "a primary key must be a single scalar value"),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, not a document",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[collaborative]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-collaborative column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry
+    // and the generated field-name-keyed accessors match against. A
+    // `#[serde(rename)]` would desync them.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[collaborative]` fields cannot use `#[serde(rename = ...)]`: the column is \
+             registered under its Rust name, which must match the field name passed to \
+             `collaborative(..)` and used as the session key.",
+        ));
+    }
+    // `#[diesel(column_name = ...)]` renames the *database* column, so it
+    // desyncs the registry harder than a serde rename: the descriptor would
+    // name a column that does not exist on the table.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[collaborative]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `impl` block a model's `#[collaborative]` fields contribute:
+/// per-field edit helpers plus the field-name-keyed surface a session hub
+/// resolves a document from (issue #1806).
+///
+/// Returns an empty token stream when the model has no collaborative field, so
+/// a model that never opts in expands byte-for-byte as before.
+fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the key
+    // must be the real column name, not `r#type`.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = unraw_ident(ident);
+        let text = format_ident!("{}_text", ident);
+        let insert = format_ident!("{}_insert", ident);
+        let remove = format_ident!("{}_remove", ident);
+        let set_text = format_ident!("{}_set_text", ident);
+        let merge = format_ident!("{}_merge", ident);
+        let doc_text = format!("`{name}` as visible text.");
+        let doc_insert = format!(
+            "Insert `text` into `{name}` before visible character `index`, as `actor`. \
+             Returns the operations to send to the other editors."
+        );
+        let doc_remove =
+            format!("Delete `count` visible characters from `{name}`, starting at `index`.");
+        let doc_set = format!(
+            "Rewrite `{name}` to `text` with the smallest edit that gets there, so a \
+             concurrent edit outside the changed span survives."
+        );
+        let doc_merge = format!("Merge another replica's `{name}` in. Order does not matter.");
+        quote! {
+            #[doc = #doc_text]
+            #[must_use]
+            pub fn #text(&self) -> ::std::string::String {
+                self.#ident.text()
+            }
+
+            #[doc = #doc_insert]
+            pub fn #insert(
+                &mut self,
+                actor: &str,
+                index: usize,
+                text: &str,
+            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+                self.#ident.insert(actor, index, text)
+            }
+
+            #[doc = #doc_remove]
+            pub fn #remove(
+                &mut self,
+                index: usize,
+                count: usize,
+            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+                self.#ident.remove(index, count)
+            }
+
+            #[doc = #doc_set]
+            pub fn #set_text(
+                &mut self,
+                actor: &str,
+                text: &str,
+            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+                self.#ident.set_text(actor, text)
+            }
+
+            #[doc = #doc_merge]
+            pub fn #merge(&mut self, other: &::autumn_web::collab::CollabText) {
+                self.#ident.merge(other);
+            }
+        }
+    });
+    let read_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    let write_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&mut self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[collaborative]`.
+            #[must_use]
+            pub const fn collaborative_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_COLLABORATIVE_COLUMNS
+            }
+
+            /// The document for `field`, or `None` when the model has no
+            /// collaborative field by that name.
+            #[must_use]
+            pub fn collaborative(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::collab::CollabText> {
+                match field {
+                    #(#read_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// The document for `field`, mutably — how a session hub applies
+            /// an incoming operation to the record it loaded.
+            pub fn collaborative_mut(
+                &mut self,
+                field: &str,
+            ) -> ::core::option::Option<&mut ::autumn_web::collab::CollabText> {
+                match field {
+                    #(#write_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    }
 }
 
 /// An identifier's name with any raw-identifier prefix removed (`r#type` ->
@@ -7579,6 +7825,42 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
     let translatable_items = emit_translatable_items(name, &translatable_columns);
 
+    // Collect `#[collaborative]` columns (issue #1806, validated to be
+    // non-null `CollabText`). Same keying rule as `#[translatable]`: the
+    // column name is the Rust field name, which is also the key the
+    // field-name-driven `collaborative` / `collaborative_mut` accessors and
+    // the session hub match on.
+    let mut collaborative_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_collaborative_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_collaborative(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            collaborative_columns.push(ident);
+        }
+    }
+    let collaborative_column_names: Vec<String> = collaborative_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let collaborative_inventory: Vec<TokenStream> = collaborative_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::collab::CollaborativeColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let collaborative_items = emit_collaborative_items(name, &collaborative_columns);
+
     // Collect `#[normalize]` columns (validated to be non-null `String`).
     // Each entry: (field ident, lookup key, normalizer chain).
     // The lookup key is the *Rust* field name (the diesel column), because the
@@ -9852,12 +10134,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
                 &[#(#translatable_column_names),*];
+
+            /// Column names on this model declared `#[collaborative]` (#1806).
+            ///
+            /// Emitted for every model (empty when none are collaborative) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a CRDT document.
+            #[doc(hidden)]
+            pub const __AUTUMN_COLLABORATIVE_COLUMNS: &'static [&'static str] =
+                &[#(#collaborative_column_names),*];
         }
 
         #(#encrypted_inventory)*
 
         #translatable_items
         #(#translatable_inventory)*
+
+        #collaborative_items
+        #(#collaborative_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -14069,6 +14363,159 @@ mod tests {
         assert!(
             !generated.contains("additionalProperties"),
             "no `#[translatable]` field means no locale-map schema"
+        );
+    }
+
+    // ── #1806: `#[collaborative]` field attribute ───────────────────────────
+
+    #[test]
+    fn collaborative_field_is_accepted_on_a_collab_text_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: ::autumn_web::collab::CollabText
+        };
+        assert!(validate_collaborative_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn collaborative_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: String
+        };
+        let msg = validate_collaborative_field(&field)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("CollabText"), "{msg}");
+    }
+
+    #[test]
+    fn collaborative_option_is_rejected() {
+        // An empty document already models "no text", so a nullable column
+        // would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: Option<CollabText>
+        };
+        assert!(validate_collaborative_field(&field).is_err());
+    }
+
+    #[test]
+    fn collaborative_conflicting_markers_are_rejected_by_name() {
+        for marker in [
+            "encrypted",
+            "classified",
+            "searchable",
+            "translatable",
+            "normalize",
+            "unique",
+            "indexed",
+            "id",
+            "lock_version",
+            "position",
+            "state_machine",
+        ] {
+            let attr: syn::Attribute = syn::parse_quote! { #[collaborative] };
+            let other: syn::Attribute =
+                syn::parse_str(&format!("#[{marker}]")).expect("marker parses");
+            let mut field: syn::Field = syn::parse_quote! { pub body: CollabText };
+            field.attrs = vec![attr, other];
+            let msg = validate_collaborative_field(&field)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(marker),
+                "the error must name the conflicting marker `{marker}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn collaborative_renames_are_rejected_because_they_desync_the_registry() {
+        let serde_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[serde(rename = "text")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&serde_renamed).is_err());
+
+        let column_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[diesel(column_name = "content")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&column_renamed).is_err());
+    }
+
+    /// The marker never reaches the Diesel derives, and the generated surface
+    /// is keyed on the Rust field name.
+    #[test]
+    fn collaborative_emits_the_field_surface_and_strips_the_marker() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        for expected in [
+            "__AUTUMN_COLLABORATIVE_COLUMNS",
+            "collaborative_fields",
+            "fn collaborative",
+            "fn collaborative_mut",
+            "fn body_text",
+            "fn body_insert",
+            "fn body_remove",
+            "fn body_set_text",
+            "fn body_merge",
+            "CollaborativeColumnDescriptor",
+        ] {
+            assert!(
+                generated.contains(expected),
+                "expected the generated model to carry `{expected}`"
+            );
+        }
+        assert!(
+            !generated.contains("# [collaborative]"),
+            "the marker must be stripped before the Diesel derives see it"
+        );
+    }
+
+    /// A model with no collaborative field expands as before: no const with a
+    /// name, no registry entry, no accessors.
+    #[test]
+    fn a_model_without_the_marker_registers_no_collaborative_column() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub body: domain::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("CollaborativeColumnDescriptor"),
+            "an unmarked look-alike must register nothing"
+        );
+        assert!(
+            !generated.contains("fn body_text"),
+            "an unmarked look-alike must gain no accessors"
         );
     }
 

@@ -1,0 +1,33 @@
+[package]
+name = "collab-notes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Enable headless-browser system tests. Requires Chromium on the host.
+#   cargo test -p collab-notes --features system-tests -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[dependencies]
+autumn-web = { path = "../../autumn", features = ["collab", "ws", "presence"] }
+diesel = { version = "2", features = ["postgres", "chrono"] }
+maud = { version = "0.27", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+example-e2e = { path = "../../example-e2e" }
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Determinism seam gate (autumn #1797): this package is outside the gate's
+# manifest, so grandfather the lint the same way the other examples do.
+[lints.clippy]
+disallowed_methods = "allow"

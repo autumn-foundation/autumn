@@ -56,6 +56,12 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(all(feature = "db", feature = "collab"))]
+mod collab_model;
+#[cfg(all(feature = "collab", feature = "offline-sync"))]
+mod collab_offline_merge;
+#[cfg(all(feature = "collab", feature = "presence"))]
+mod collab_session;
 #[cfg(feature = "db")]
 mod commentable;
 mod commit_hook_drain;
@@ -358,6 +364,8 @@ mod signed_webhooks;
 mod sim_advance_to;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
+#[cfg(feature = "collab")]
+mod sim_collab_convergence;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;

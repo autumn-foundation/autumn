@@ -315,7 +315,7 @@ for crate in "${CRATES[@]}"; do
       die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge/plugin-sandbox) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,collab,embed-assets,tls,acme"
     # The SQLite backend surface: the SAME list plus `sqlite`.
     #
     # It was `sqlite` alone at first, on the theory that a minimal set is the
