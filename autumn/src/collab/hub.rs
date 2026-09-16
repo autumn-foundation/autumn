@@ -550,6 +550,12 @@ impl CollabHub {
     /// before the limit was lowered, or one whose elements and buffered
     /// operations are each within the wire bounds but together are not.
     ///
+    /// Returns [`CollabError::CausalBufferFull`] when `seed` produces a
+    /// document holding more than [`MAX_WIRE_PENDING`] operations waiting for
+    /// a cause. That is well under the character limit and still past what
+    /// [`CollabText`]'s `Deserialize` accepts, so serving it would persist a
+    /// row this crate cannot read back.
+    ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
@@ -598,13 +604,13 @@ impl CollabHub {
                 limit: self.inner.limits.max_documents,
             });
         }
-        // The seed is measured like anything else the document holds. A row
-        // can be over budget without anyone having typed a character into
-        // this hub: a limit lowered since it was written, or a document that
-        // is wire-valid at 10 000 elements *plus* 1 000 buffered operations,
-        // because `Deserialize` bounds those two separately. Installing it
-        // would put the authority over its own advertised bound and leave it
-        // refusing edits to a document it served.
+        // The seed is measured like anything else the document holds, against
+        // both bounds. A row can be over either without anyone having typed a
+        // character into this hub: a limit lowered since it was written, or a
+        // document that is wire-valid at 10 000 elements *plus* 1 000 buffered
+        // operations, because `Deserialize` bounds those two separately.
+        // Installing it would put the authority over its own advertised bound
+        // and leave it refusing edits to a document it served.
         let held = seeded.element_count() + seeded.pending_len();
         if held > self.inner.limits.max_document_chars {
             drop(docs);
@@ -617,6 +623,28 @@ impl CollabHub {
             return Err(CollabError::DocumentFull {
                 got: held,
                 limit: self.inner.limits.max_document_chars,
+            });
+        }
+        // And the buffer on its own, which the total above does not cover: a
+        // thousand-odd unresolved operations are far below
+        // `max_document_chars` while being past what the decoder accepts. The
+        // merge paths have refused this since they learned to; the seed is the
+        // third door into the same document and was still open. A caller can
+        // reach it without a hub at all — build the value through `apply` and
+        // `encode_column`, store it, and seed from the row later — and the hub
+        // would then serve and persist a document that offline sync and every
+        // other serde consumer refuse to read.
+        if seeded.pending_len() > MAX_WIRE_PENDING {
+            drop(docs);
+            tracing::warn!(
+                key,
+                pending = seeded.pending_len(),
+                limit = MAX_WIRE_PENDING,
+                "collab: seed is past the causal buffer limit; refusing to open"
+            );
+            return Err(CollabError::CausalBufferFull {
+                got: seeded.pending_len(),
+                limit: MAX_WIRE_PENDING,
             });
         }
         let state = Arc::new(Mutex::new(DocState::new(seeded)));

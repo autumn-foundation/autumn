@@ -1552,3 +1552,61 @@ async fn a_long_session_name_still_mints_ids() {
     .expect("a joined session can type");
     assert_eq!(doc.text(), "hi");
 }
+
+/// The seed is the third door into a document the decoder refuses.
+///
+/// A thousand-odd unresolved operations are far below `max_document_chars`
+/// and past `MAX_WIRE_PENDING`, and a caller can build such a value without a
+/// hub at all — `apply` and `encode_column` are public — then seed from the
+/// stored row later. Serving it would persist something offline sync and
+/// every other serde consumer refuse to read.
+#[tokio::test]
+async fn a_seed_past_the_causal_buffer_limit_is_refused() {
+    let hub = hub();
+
+    let mut seed = CollabText::new();
+    for n in 1..=(MAX_WIRE_PENDING + 1) as u64 {
+        seed.apply(autumn_web::collab::CollabOp::Insert {
+            id: OpId::new(n, "peer"),
+            after: Some(OpId::new(8_000_000 + n, "ghost")),
+            ch: 'x',
+        });
+    }
+    assert_eq!(seed.pending_len(), MAX_WIRE_PENDING + 1);
+    assert!(
+        seed.element_count() < CollabLimits::default().max_document_chars,
+        "well inside the character limit, which is the point"
+    );
+
+    let refused = hub
+        .open_with("notes:21:body", || seed.clone())
+        .expect_err("past the causal buffer limit");
+    assert!(
+        matches!(
+            refused,
+            CollabError::CausalBufferFull {
+                limit: MAX_WIRE_PENDING,
+                ..
+            }
+        ),
+        "refused for the buffer, not the character count: {refused}"
+    );
+
+    // One fewer is served, so the bound is exact rather than conservative.
+    let mut fits = CollabText::new();
+    for n in 1..=MAX_WIRE_PENDING as u64 {
+        fits.apply(autumn_web::collab::CollabOp::Insert {
+            id: OpId::new(n, "peer"),
+            after: Some(OpId::new(8_000_000 + n, "ghost")),
+            ch: 'x',
+        });
+    }
+    let doc = hub
+        .open_with("notes:22:body", || fits.clone())
+        .expect("within the buffer limit");
+    let encoded = serde_json::to_string(&doc.document()).expect("encode");
+    assert!(
+        serde_json::from_str::<CollabText>(&encoded).is_ok(),
+        "the hub only serves documents its own decoder accepts"
+    );
+}
