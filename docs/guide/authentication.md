@@ -445,6 +445,36 @@ grants.
 See [macro transparency](./macro-transparency.md#securedrole) for the exact
 expansion.
 
+### Issuing, listing, rotating and revoking API tokens
+
+The scopes in `#[secured(scopes = [...])]` above come from the bearer token the
+client presents, and that token is minted by the CLI rather than by a signup
+flow. Manage them with `autumn token` — run any of these with `--help` for the
+full argument list:
+
+```bash
+autumn token issue service:ci --name ci --scope posts:write   # prints the raw token once
+autumn token list service:ci                                  # name, scopes, expiry, last-used
+autumn token rotate <RAW_TOKEN>                               # revoke + reissue, same name and scopes
+autumn token revoke <RAW_TOKEN>                               # 401 for every later request
+```
+
+`issue` prints the raw token **once** — only its SHA-256 hash is stored, so
+there is no way to recover it later. `--expires-at <ISO-8601>` makes the token
+expire; omit it for a non-expiring one.
+
+**To revoke a leaked API token**, run `autumn token revoke <RAW_TOKEN>`: it sets
+`revoked_at`, and `RequireApiToken` answers `401` for every later request
+presenting it.
+
+**To rotate an API token** — a CI credential that must keep working — run
+`autumn token rotate <RAW_TOKEN>` instead. It revokes the old token and prints a
+replacement carrying the same name and scopes, so only the stored secret
+changes.
+
+In Rust, the same operations are
+[`issue_scoped_api_token`, `IssueTokenSpec` and `revoke_api_token`](../../autumn/src/auth.rs).
+
 ### `RequireAuth` and `Auth<T>`
 
 `#[secured]` is per-handler. To gate a whole subtree, layer `RequireAuth`, which
@@ -887,6 +917,9 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.
+- [API tokens](#issuing-listing-rotating-and-revoking-api-tokens) — `autumn
+  token issue | list | rotate | revoke` for the bearer tokens that carry
+  `#[secured(scopes = [...])]` grants.
 - [Signing secrets](./signing-secrets.md) — the key behind session cookies, CSRF
   tokens, and flash state.
 - [Middleware](./middleware.md) — where the session, CSRF, and security-header

@@ -415,6 +415,11 @@ so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
 headers are forwarded too, so session-based `#[secured]` routes and
 CSRF-protected writes behave identically to a direct call.
 
+Mint the token an agent presents with `autumn token issue <principal> --scope
+<scope>`, and take it back with `autumn token revoke` (or `autumn token rotate`
+to reissue the same grants under a new secret) — see
+[API tokens](authentication.md#issuing-listing-rotating-and-revoking-api-tokens).
+
 To put a tool behind token auth, register the route inside a `scoped` group
 carrying the `RequireApiToken` layer. The scope keeps the route in the
 registry (so MCP can derive the tool) *and* applies the layer (so every call —

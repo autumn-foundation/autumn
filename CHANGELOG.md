@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **📖 Folio: make the `autumn token` lifecycle findable, and gate the
+  direction that hid it (coverage 169/194 → 172/194, retrieval 0 hits → 1
+  hit):** the guide taught readers to *gate* a route on a token scope —
+  `#[secured(scopes = ["posts:write"])]`, on three separate pages — and
+  nowhere told them where the token comes from or how to take it back. All
+  four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
+  `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
+  reached readers only through the agent skill tree and `list` / `rotate` /
+  `revoke` reached them nowhere: searching all 160 guide pages for "revoke
+  api token" returned **zero results**, and `issue_scoped_api_token` /
+  `IssueTokenSpec` appeared on none of them. A reader holding a leaked
+  credential had no path from the page that raised the question to the
+  command that answers it. This is a findability defect, not a coverage
+  one — the answer existed and was correct — so the fix is a crosslink at
+  the point the question arises rather than a new page: a section under
+  "Protecting routes" in `docs/guide/authentication.md` naming all four
+  commands and linking the Rust equivalents, and a pointer from
+  `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token.
+- **📖 Folio: add `check-docs-cli-coverage.sh`, the first docs gate that
+  runs code → docs:** the corpus had eleven docs gates and every one ran
+  docs → code — "is what we wrote still true?", which is drift. None asked
+  "is what we shipped written down anywhere?", so a command could ship
+  documented nowhere and the whole tree stayed green; the defect is
+  invisible by construction, because a gate that only reads the docs can
+  never notice a command the docs never mention. The first run of the
+  reverse direction found 25 of 195 command paths absent from all 212
+  reader-facing pages. Three were the real defect above; the rest are
+  classified rather than listed as failures — `serve run-service` is
+  `#[command(hide = true)]` (read out of the clap derive input, so hiding a
+  command exempts it with no edit to the gate), and 13 `destroy`
+  subcommands are covered by the rule `generators.md` states over the whole
+  family, which the gate *verifies the page still states* rather than
+  trusting. The remaining 8 are a triaged backlog carrying a reason each, so
+  they are a number someone can work down; a newly added undocumented
+  command fails the gate rather than joining them. Surface and corpus are
+  both read from `check-docs-cli.sh` instead of respelled, so the two cannot
+  drift apart the way the four gates `check-docs-scope.sh` exists to
+  reconcile once did.
+
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the

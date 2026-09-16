@@ -271,6 +271,33 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
+      - name: CLI coverage gate
+        # The gate above runs docs -> code: every command the docs NAME must
+        # exist. This one runs code -> docs: every command a reader can RUN
+        # must be findable. Every other docs gate in this job answers the first
+        # question, so a command could ship documented nowhere and the whole
+        # tree would stay green — a coverage defect no docs-reading gate can
+        # see, because it is about a page that was never written.
+        #
+        # The baseline run found 25 of 195 command paths absent from all 212
+        # reader-facing pages. Most were benign and are classified in the
+        # script: `serve run-service` is `#[command(hide = true)]`, and 13
+        # `destroy` subcommands are covered by the rule generators.md states
+        # over the whole family. The one that mattered was `autumn token`:
+        # `issue` reached readers only through the agent skill tree, and
+        # `list` / `rotate` / `revoke` reached them nowhere, so a reader whose
+        # API token had leaked got zero results from all 160 guide pages for
+        # "revoke api token" while `autumn token revoke` had shipped since
+        # 0.5.x. The answer existed in `--help` and rustdoc; no page a reader
+        # browses pointed at it.
+        #
+        # Surface and corpus are both read from `check-docs-cli.sh` rather than
+        # respelled, so this gate cannot drift from its sibling the way the
+        # four gates `check-docs-scope.sh` exists to reconcile once did.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Config key gate
         # The two gates above cover the link a reader clicks and the command
         # they run. This covers the third thing they copy off a page — an
