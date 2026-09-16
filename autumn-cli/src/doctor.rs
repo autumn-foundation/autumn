@@ -688,7 +688,8 @@ pub fn check_deprecated_keys_impl(found: &[DoctorDeprecation]) -> CheckResult {
 /// Check signing-secret readiness (pure, injectable for tests).
 ///
 /// - **Dev/test** (`is_production = false`): warns when no secret is configured
-///   (an ephemeral per-process key is in use) and passes when a secret is set.
+///   — sessions and CSRF tokens ride unsigned, and local-storage signed URLs
+///   use an ephemeral per-process key — and passes when a secret is set.
 /// - **Production** (`is_production = true`): fails when the secret is missing,
 ///   below the minimum entropy floor, or matches a known demo/template value.
 pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> CheckResult {
@@ -705,8 +706,9 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
             name: "signing_secret",
             status: CheckStatus::Warn,
             detail: Some(
-                "using an ephemeral per-process signing secret (dev/test only; \
-                 sessions and signed URLs will not survive restarts or be shared across replicas)"
+                "no signing secret configured (dev/test only): sessions and \
+                 CSRF tokens ride unsigned; local-storage signed URLs use an \
+                 ephemeral per-process key instead"
                     .into(),
             ),
             hint: Some("Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production"),
@@ -19838,9 +19840,14 @@ foo = "bar"
 
     #[test]
     fn check_signing_secret_impl_dev_no_secret_warns() {
+        // #2152: sessions and CSRF tokens ride UNSIGNED with no configured
+        // secret (see docs/guide/signing-secrets.md) — they are not signed
+        // with an ephemeral key. Only local-storage signed URLs get one.
         let r = check_signing_secret_impl(None, false);
         assert_eq!(r.status, CheckStatus::Warn);
-        assert!(r.detail.as_deref().unwrap_or("").contains("ephemeral"));
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(detail.contains("unsigned"), "{detail}");
+        assert!(detail.contains("local-storage"), "{detail}");
     }
 
     #[test]
