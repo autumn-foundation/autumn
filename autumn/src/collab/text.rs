@@ -1009,7 +1009,7 @@ mod tests {
                 after: None,
                 ch: 'x',
             },
-            CollabOp::Delete { target: id.clone() },
+            CollabOp::Delete { target: id },
         ];
         assert_eq!(doc.novel_count(batch.iter()), 1);
 
@@ -1020,7 +1020,7 @@ mod tests {
 
         // A delete the batch does NOT satisfy still costs: it holds the
         // causal buffer until its target arrives.
-        let orphan = vec![CollabOp::Delete {
+        let orphan = [CollabOp::Delete {
             target: OpId::new(9, "bob"),
         }];
         assert_eq!(doc.novel_count(orphan.iter()), 1);
