@@ -266,9 +266,10 @@ fn node_contains_a_populated_row(node: &Node) -> bool {
 
 /// For every position in `nodes`, whether a later `<tr>` — at this level,
 /// or inherited from an ancestor's remaining siblings via `has_more_after`
-/// — has a real cell. Same one-backward-pass shape as [`glue_after_each`],
-/// and for the same O(n)-not-O(n²) reason: [`extract_table_rows`] threads
-/// this through its own thead/tbody/tfoot recursion once per node list
+/// — has a real cell. One backward pass builds the whole array, for the
+/// same O(n)-not-O(n²) reason [`GlueContext`] exists:
+/// [`extract_table_rows`] threads this through its own thead/tbody/tfoot
+/// recursion once per node list
 /// instead of rescanning the remaining siblings on every iteration.
 fn populated_row_after_each(nodes: &[Node], has_more_after: bool) -> Vec<bool> {
     let mut after = vec![has_more_after; nodes.len() + 1];
@@ -449,11 +450,14 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// and treating any other tag (including unrecognized ones) as a transparent
 /// container — so a scaffold view's wrapper `<div>`/`<span>` markup degrades
 /// to its text content instead of being dropped.
-/// `has_more_after` is true if `out` will get more content, from this call
-/// or an ancestor's remaining siblings, once this call returns — see
-/// [`ends_with_glueable_word`]. A depth-cap guard needs both ends: a real
-/// word already in `out` with nothing separating it yet (before), and
-/// something still to come that could glue onto it (after). Pass `false`
+///
+/// `has_more_after` resolves to true if `out` will get more content, from
+/// this call or an ancestor's remaining siblings, once this call returns —
+/// see [`ends_with_glueable_word`]. A depth-cap guard needs both ends: a
+/// real word already in `out` with nothing separating it yet (before), and
+/// something still to come that could glue onto it (after) — checked
+/// before-first, since resolving `has_more_after` can require a scan and
+/// `ends_with_glueable_word` never does. Pass `&GlueContext::Resolved(false)`
 /// for a call that starts a fresh buffer (a heading, table cell, or list
 /// item's own `spans`) — nothing outside it can ever glue to its content.
 fn inline_spans(
@@ -461,17 +465,23 @@ fn inline_spans(
     bold: bool,
     italic: bool,
     depth: u32,
-    has_more_after: bool,
+    has_more_after: &GlueContext,
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, has_more_after && ends_with_glueable_word(out)) {
+        if subtree_has_visible_content(
+            nodes,
+            ends_with_glueable_word(out) && has_more_after.resolve(),
+        ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
     }
-    let more_after = glue_after_each(nodes, has_more_after);
     for (i, node) in nodes.iter().enumerate() {
+        let more_after = GlueContext::LaterSiblings {
+            siblings: &nodes[i + 1..],
+            ancestor: has_more_after,
+        };
         match node {
             Node::Text(text) => {
                 if !text.is_empty() {
@@ -485,10 +495,10 @@ fn inline_spans(
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
                 "strong" | "b" => {
-                    inline_spans(children, true, italic, depth + 1, more_after[i], out);
+                    inline_spans(children, true, italic, depth + 1, &more_after, out);
                 }
                 "em" | "i" => {
-                    inline_spans(children, bold, true, depth + 1, more_after[i], out);
+                    inline_spans(children, bold, true, depth + 1, &more_after, out);
                 }
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
@@ -506,13 +516,19 @@ fn inline_spans(
                     // trailing push_block_break (right below) unconditionally
                     // separates its content from whatever follows it out
                     // here — so that later content can never glue to
-                    // anything inside, regardless of what more_after[i]
-                    // says.
+                    // anything inside, regardless of what more_after says.
                     push_block_break(out);
-                    inline_spans(children, bold, italic, depth + 1, false, out);
+                    inline_spans(
+                        children,
+                        bold,
+                        italic,
+                        depth + 1,
+                        &GlueContext::Resolved(false),
+                        out,
+                    );
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, more_after[i], out),
+                _ => inline_spans(children, bold, italic, depth + 1, &more_after, out),
             },
         }
     }
@@ -581,7 +597,14 @@ fn inline_list_items(
         // Strip exactly that one leading break, never more: anything after it is
         // legitimate inter-block spacing within the item's own content.
         let content_start = out.len();
-        inline_spans(children, bold, italic, depth + 1, false, out);
+        inline_spans(
+            children,
+            bold,
+            italic,
+            depth + 1,
+            &GlueContext::Resolved(false),
+            out,
+        );
         if out.get(content_start) == Some(&Span::Break) {
             out.remove(content_start);
         }
@@ -631,7 +654,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                             is_header,
                             false,
                             depth + 2,
-                            false,
+                            &GlueContext::Resolved(false),
                             &mut spans,
                         );
                         trim_trailing_break(&mut spans);
@@ -654,7 +677,14 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
             // dedicated non-tabular-content block type.
             _ => {
                 let mut spans = Vec::new();
-                inline_spans(children, false, false, depth + 1, false, &mut spans);
+                inline_spans(
+                    children,
+                    false,
+                    false,
+                    depth + 1,
+                    &GlueContext::Resolved(false),
+                    &mut spans,
+                );
                 trim_trailing_break(&mut spans);
                 if !spans.is_empty() {
                     out.push(TableRow {
@@ -688,7 +718,14 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
             "\u{2022}".to_owned()
         };
         let mut spans = Vec::new();
-        inline_spans(children, false, false, depth + 1, false, &mut spans);
+        inline_spans(
+            children,
+            false,
+            false,
+            depth + 1,
+            &GlueContext::Resolved(false),
+            &mut spans,
+        );
         trim_trailing_break(&mut spans);
         out.push(Block::ListItem { marker, spans });
     }
@@ -715,8 +752,11 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         }
     };
 
-    let more_after = glue_after_each(nodes, false);
     for (i, node) in nodes.iter().enumerate() {
+        let more_after = GlueContext::LaterSiblings {
+            siblings: &nodes[i + 1..],
+            ancestor: &GlueContext::Resolved(false),
+        };
         match node {
             Node::Text(text) => {
                 // Pushed even when whitespace-only: a text node between two
@@ -739,7 +779,14 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                 if let Some(level) = heading_level(tag) {
                     flush(&mut pending, out);
                     let mut spans = Vec::new();
-                    inline_spans(children, true, false, depth + 1, false, &mut spans);
+                    inline_spans(
+                        children,
+                        true,
+                        false,
+                        depth + 1,
+                        &GlueContext::Resolved(false),
+                        &mut spans,
+                    );
                     trim_trailing_break(&mut spans);
                     out.push(Block::Heading(level, spans));
                     continue;
@@ -761,7 +808,14 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     "p" | "li" | "dt" | "dd" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
-                        inline_spans(children, false, false, depth + 1, false, &mut spans);
+                        inline_spans(
+                            children,
+                            false,
+                            false,
+                            depth + 1,
+                            &GlueContext::Resolved(false),
+                            &mut spans,
+                        );
                         trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
@@ -811,31 +865,17 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     }
                     "br" => pending.push(Span::Break),
                     "strong" | "b" => {
-                        inline_spans(
-                            children,
-                            true,
-                            false,
-                            depth + 1,
-                            more_after[i],
-                            &mut pending,
-                        );
+                        inline_spans(children, true, false, depth + 1, &more_after, &mut pending);
                     }
                     "em" | "i" => {
-                        inline_spans(
-                            children,
-                            false,
-                            true,
-                            depth + 1,
-                            more_after[i],
-                            &mut pending,
-                        );
+                        inline_spans(children, false, true, depth + 1, &more_after, &mut pending);
                     }
                     _ if is_non_rendered(tag) => {}
                     // Transparent passthrough: unknown/inline wrapper tags
                     // (span, a, ...) flow their children into the current
                     // implicit paragraph rather than being dropped.
                     _ => {
-                        flatten_into_pending(children, depth + 1, more_after[i], &mut pending, out);
+                        flatten_into_pending(children, depth + 1, &more_after, &mut pending, out);
                     }
                 }
             }
@@ -850,12 +890,15 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 fn flatten_into_pending(
     nodes: &[Node],
     depth: u32,
-    has_more_after: bool,
+    has_more_after: &GlueContext,
     pending: &mut Vec<Span>,
     out: &mut Vec<Block>,
 ) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, has_more_after && ends_with_glueable_word(pending)) {
+        if subtree_has_visible_content(
+            nodes,
+            ends_with_glueable_word(pending) && has_more_after.resolve(),
+        ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -864,8 +907,11 @@ fn flatten_into_pending(
     // it only ever produced inline text (no nested block tags fired), that
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
-    let more_after = glue_after_each(nodes, has_more_after);
     for (i, node) in nodes.iter().enumerate() {
+        let more_after = GlueContext::LaterSiblings {
+            siblings: &nodes[i + 1..],
+            ancestor: has_more_after,
+        };
         match node {
             Node::Text(text) => {
                 // See the matching comment in `flatten_blocks` — a
@@ -910,14 +956,14 @@ fn flatten_into_pending(
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => {
-                            inline_spans(children, true, false, depth + 1, more_after[i], pending);
+                            inline_spans(children, true, false, depth + 1, &more_after, pending);
                         }
                         "em" | "i" => {
-                            inline_spans(children, false, true, depth + 1, more_after[i], pending);
+                            inline_spans(children, false, true, depth + 1, &more_after, pending);
                         }
                         _ if is_non_rendered(tag) => {}
                         _ => {
-                            flatten_into_pending(children, depth + 1, more_after[i], pending, out);
+                            flatten_into_pending(children, depth + 1, &more_after, pending, out);
                         }
                     }
                 }
@@ -1021,33 +1067,53 @@ fn node_glue_lookahead(node: &Node) -> GlueLookahead {
     GlueLookahead::Exhausted
 }
 
-/// For every position `i` in `nodes`, whether the siblings *after* it
-/// (`nodes[i + 1..]`, plus `has_more_after` once those run out) could
-/// glue — this is exactly `more_after[i]` each loop iteration needs, for
-/// the sibling it is *currently* about to recurse into.
+/// A lazily-resolved "does something after this position glue" signal.
+/// Building one never scans anything — it only borrows the later siblings
+/// (if any) at this level, plus whatever an ancestor level already
+/// deferred. The scan happens, at most once per value, inside
+/// [`resolve`](Self::resolve), and only when a caller actually asks.
 ///
-/// Deliberately never calls [`node_glue_lookahead`] on `nodes[i]` to
-/// compute `result[i]` itself — only on `nodes[i + 1]` and later. Node `i`
-/// is the one the caller is about to recurse into natively, so whatever is
-/// inside it gets discovered by that recursion's own eventual depth-cap
-/// guard; pre-scanning it here too would be pure duplicated work. For a
-/// long chain of single-child transparent wrappers this is the difference
-/// between one scan of the whole chain and one fresh scan of the whole
-/// remaining chain at *every* one of the ~[`MAX_DEPTH`] levels the depth
-/// cap allows before native recursion stops — O(n) instead of O(depth × n).
-fn glue_after_each(nodes: &[Node], has_more_after: bool) -> Vec<bool> {
-    let mut after = vec![false; nodes.len()];
-    if let Some(last) = after.last_mut() {
-        *last = has_more_after;
+/// This laziness is load-bearing, not an optimization for its own sake:
+/// every recursive call builds one of these for its *current* sibling, and
+/// most of them are never resolved at all, because the depth-cap guard
+/// that would consume it never fires, or [`ends_with_glueable_word`]
+/// (checked first, since it is O(1)) is already false. An eager version —
+/// scan `nodes[i + 1..]` up front, for every `i`, at every one of the
+/// ~[`MAX_DEPTH`] levels the depth cap allows before native recursion
+/// stops — is what made a wide sibling list (or, worse, a long chain where
+/// each level has more than one child) cost O(depth × n) instead of O(n).
+enum GlueContext<'a> {
+    Resolved(bool),
+    LaterSiblings {
+        siblings: &'a [Node],
+        ancestor: &'a Self,
+    },
+}
+
+impl GlueContext<'_> {
+    /// A caller builds this with `siblings` set to *only* the nodes after
+    /// the one it is about to recurse into — never that node itself, since
+    /// whatever is inside it gets discovered by that recursion's own
+    /// eventual depth-cap guard, and pre-scanning it here too would be
+    /// pure duplicated work. Every sibling actually in `siblings` has
+    /// *not* been (and, from this call's perspective, may never be)
+    /// visited any other way, so those are the only nodes this walk
+    /// touches.
+    fn resolve(&self) -> bool {
+        match self {
+            GlueContext::Resolved(b) => *b,
+            GlueContext::LaterSiblings { siblings, ancestor } => {
+                for node in *siblings {
+                    match node_glue_lookahead(node) {
+                        GlueLookahead::Confirmed => return true,
+                        GlueLookahead::Stopped => return false,
+                        GlueLookahead::Exhausted => {}
+                    }
+                }
+                ancestor.resolve()
+            }
+        }
     }
-    for i in (0..nodes.len().saturating_sub(1)).rev() {
-        after[i] = match node_glue_lookahead(&nodes[i + 1]) {
-            GlueLookahead::Confirmed => true,
-            GlueLookahead::Stopped => false,
-            GlueLookahead::Exhausted => after[i + 1],
-        };
-    }
-    after
 }
 
 /// Flatten `spans` into words, splitting each run's text on whitespace and
@@ -3518,6 +3584,33 @@ mod tests {
         // #2810.)
         let n = 200_000;
         let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
+        let start = std::time::Instant::now();
+        let pages = render_pages(&html);
+        assert!(!pages.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "render_pages took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn glue_lookahead_over_a_deep_two_child_chain_is_linear_not_quadratic() {
+        // Regression: the prior fix only stopped glue_after_each from
+        // scanning nodes[0]'s own subtree — but with 2 siblings per level
+        // (an empty tag plus the deep chain), nodes[1] is scanned in full
+        // via node_glue_lookahead to build after[0], and that still
+        // happens fresh at every one of the ~512 levels the depth cap
+        // allows: O(depth) calls, each O(chain length), same blowup in a
+        // shape the single-child test doesn't cover. (Codex review on PR
+        // #2810.)
+        let n = 200_000;
+        let html = format!(
+            "{}{}{}",
+            "<span><i></i>".repeat(n),
+            "x",
+            "</span>".repeat(n)
+        );
         let start = std::time::Instant::now();
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
