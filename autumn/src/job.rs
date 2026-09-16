@@ -2836,6 +2836,39 @@ pub(crate) fn due_at_from(
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
+/// A relative delay, paired with the monotonic instant it was captured at.
+///
+/// The Postgres arm computes its deadline from *its own* read of the
+/// database's clock, taken right before the INSERT — not from the instant
+/// this delay was captured. Anything that runs between those two points (an
+/// enqueue interceptor doing async work, a saturated connection pool making
+/// `pool.get()` wait) must not silently extend the caller's requested delay
+/// by however long that wait took. Carrying the capture instant lets that
+/// arm subtract the elapsed time and bind only what is left, the same way
+/// the local backend already recomputes its remaining sleep after an
+/// interceptor runs.
+#[derive(Debug, Clone, Copy)]
+struct RelativeDelay {
+    duration: std::time::Duration,
+    captured_at: crate::time::MonotonicInstant,
+}
+
+impl RelativeDelay {
+    fn new(duration: std::time::Duration, clock: &dyn crate::time::ClockSource) -> Self {
+        Self {
+            duration,
+            captured_at: clock.monotonic(),
+        }
+    }
+
+    /// The delay still owed as of `now`, saturating at zero once `now` is
+    /// far enough past the capture instant to have already consumed it.
+    const fn remaining(self, now: crate::time::MonotonicInstant) -> std::time::Duration {
+        self.duration
+            .saturating_sub(self.captured_at.elapsed_at(now))
+    }
+}
+
 /// Enqueue a one-shot job to run once after `delay` elapses.
 ///
 /// This is the deferred-execution companion to [`enqueue`]: the job is recorded
@@ -3374,8 +3407,9 @@ impl JobClient {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         let slot = reserve_enqueue(&payload);
+        let relative_delay = RelativeDelay::new(delay, self.clock.as_ref());
         let result = self
-            .enqueue_with_outcome_due_inner(name, payload, due_at, now, Some(delay))
+            .enqueue_with_outcome_due_inner(name, payload, due_at, now, Some(relative_delay))
             .await;
         fill_enqueue(slot, name, due_at, now, result.as_ref().err());
         result
@@ -3398,7 +3432,7 @@ impl JobClient {
         payload: Value,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
-        relative_delay: Option<std::time::Duration>,
+        relative_delay: Option<RelativeDelay>,
     ) -> AutumnResult<EnqueueOutcome> {
         // Capture the reference instant once, so every downstream decision — filter,
         // admin record status, local-backend sleep — uses one clock reading and near-due
@@ -3871,7 +3905,7 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
-        relative_delay: Option<std::time::Duration>,
+        relative_delay: Option<RelativeDelay>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.resilience_config.as_ref().map_or_else(
@@ -3927,7 +3961,7 @@ impl JobClient {
         max_attempts: u32,
         backoff_ms: u64,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
-        relative_delay: Option<std::time::Duration>,
+        relative_delay: Option<RelativeDelay>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         // Only the Postgres arm below consumes this; keep the compiler quiet
@@ -3968,6 +4002,12 @@ impl JobClient {
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
+            // Subtract whatever ran between capturing `relative_delay` and
+            // here (pool checkout, an enqueue interceptor) so that wait
+            // never silently extends the caller's requested delay — see
+            // `RelativeDelay`.
+            let remaining_delay =
+                relative_delay.map(|delay| delay.remaining(self.clock.monotonic()));
             return pg_enqueue_job_at(
                 pool,
                 id,
@@ -3976,7 +4016,7 @@ impl JobClient {
                 payload,
                 max_attempts,
                 backoff_ms,
-                pg_due_from(relative_delay, due_at),
+                pg_due_from(remaining_delay, due_at),
                 constraints,
             )
             .await;
@@ -4057,7 +4097,8 @@ impl JobClient {
     ) -> AutumnResult<()> {
         let now = self.due_origin();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
-        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(delay))
+        let relative_delay = RelativeDelay::new(delay, self.clock.as_ref());
+        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(relative_delay))
             .await
     }
 
@@ -4072,7 +4113,7 @@ impl JobClient {
         conn: &mut diesel_async::AsyncPgConnection,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
-        relative_delay: Option<std::time::Duration>,
+        relative_delay: Option<RelativeDelay>,
     ) -> AutumnResult<()> {
         // Failure-capsule seam (#1634). This is the transactional chokepoint —
         // it never funnels through `enqueue_with_outcome_due`, so without its
@@ -4118,7 +4159,7 @@ impl JobClient {
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
-        relative_delay: Option<std::time::Duration>,
+        relative_delay: Option<RelativeDelay>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let Some(settings) = self.per_job_settings.get(name) else {
@@ -4183,6 +4224,12 @@ impl JobClient {
             let payload_for_enqueue = payload.clone();
             let constraints_ref = &constraints;
             let actual_enqueue = async move {
+                // Subtract whatever ran between capturing `relative_delay`
+                // and here (an enqueue interceptor) so that wait never
+                // silently extends the caller's requested delay — see
+                // `RelativeDelay`.
+                let remaining_delay =
+                    relative_delay.map(|delay| delay.remaining(self.clock.monotonic()));
                 let outcome = pg_enqueue_on_conn_at(
                     conn,
                     id_for_enqueue.clone(),
@@ -4191,7 +4238,7 @@ impl JobClient {
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
-                    pg_due_from(relative_delay, due_at),
+                    pg_due_from(remaining_delay, due_at),
                     constraints_ref,
                 )
                 .await;
@@ -18474,6 +18521,45 @@ mod tests {
     // relative-delay enqueue reaches through. They pass an explicit `now`
     // rather than reading a clock, so they assert exact equality instead of
     // bracketing a real-time read.
+
+    /// `RelativeDelay::remaining` must subtract exactly the elapsed time
+    /// between capture and the read passed in, saturating at zero rather
+    /// than going negative once that elapsed time exceeds the delay —
+    /// otherwise time spent between capturing the delay and binding it to
+    /// Postgres (a saturated pool, a slow enqueue interceptor) would
+    /// silently extend the caller's requested delay instead of being
+    /// subtracted from it.
+    #[test]
+    fn relative_delay_remaining_subtracts_elapsed_time() {
+        use crate::time::MonotonicInstant;
+        use std::time::Duration;
+
+        let captured_at = MonotonicInstant::from_origin_elapsed(Duration::from_secs(10));
+        let delay = RelativeDelay {
+            duration: Duration::from_secs(5),
+            captured_at,
+        };
+
+        assert_eq!(
+            delay.remaining(captured_at),
+            Duration::from_secs(5),
+            "no elapsed time means the full delay is still owed"
+        );
+        assert_eq!(
+            delay.remaining(MonotonicInstant::from_origin_elapsed(Duration::from_secs(
+                12
+            ))),
+            Duration::from_secs(3),
+            "2s elapsed must reduce the remaining delay by exactly 2s"
+        );
+        assert_eq!(
+            delay.remaining(MonotonicInstant::from_origin_elapsed(Duration::from_secs(
+                20
+            ))),
+            Duration::ZERO,
+            "elapsed time past the delay must saturate at zero, never go negative"
+        );
+    }
 
     #[test]
     fn due_at_from_zero_delay_is_now() {
