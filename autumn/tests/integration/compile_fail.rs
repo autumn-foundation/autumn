@@ -306,6 +306,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/confidential_plain_string.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/confidential_missing_blind_index.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_or_create_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_cursor_key.rs");
 
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
@@ -700,6 +704,12 @@ fn compile_pass_tests_a() {
     // caller that reads only produced fields and supplies every required one
     // compiles, including across a serde rename and a `skip_serializing_if`.
     t.pass("tests/compile-pass/wire_contract_holds.rs");
+
+    // #1771: the escape hatch the confidential build failure names. A finder
+    // over the blind-index companion column has to compile, or the diagnostic
+    // sends authors somewhere that does not work.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_blind_index_finder.rs");
 }
 
 // The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.

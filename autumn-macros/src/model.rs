@@ -4676,12 +4676,6 @@ fn parse_field_confidential(field: &syn::Field) -> syn::Result<ConfidentialSpec>
     Ok(spec)
 }
 
-/// Whether a type path ends in `name`, so both `Sealed` and
-/// `autumn_web::confidential::Sealed` are accepted.
-fn type_last_segment_is(ty: &syn::Type, name: &str) -> bool {
-    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == name))
-}
-
 /// Reject every marker that would make the operator read, index, order or join
 /// a sealed column. Split out of [`validate_confidential_field`] so the table
 /// of reasons stays one readable list.
@@ -4774,7 +4768,7 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
 
     reject_confidential_marker_conflicts(field)?;
 
-    if !type_last_segment_is(&field.ty, "Sealed") {
+    if ty_last_ident(&field.ty).as_deref() != Some("Sealed") {
         return Err(syn::Error::new_spanned(
             &field.ty,
             "`#[confidential]` requires the field type \
@@ -4799,6 +4793,17 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
     }
 
     // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A Diesel rename would desync the two.
+    if diesel_column_name(field).is_some() {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` fields cannot use `#[diesel(column_name = ...)]`: the \
+             column is registered under its Rust name, which the build-time query \
+             guard, the log filter, version history and admin redaction all key off.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
     // lookup keys off. A serde rename would desync the two.
     if field_has_serde_rename(field) {
         return Err(syn::Error::new_spanned(
@@ -4815,7 +4820,7 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
             .iter()
             .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
         match companion {
-            Some(f) if type_last_segment_is(&f.ty, "BlindIndex") => {}
+            Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {}
             Some(f) => {
                 return Err(syn::Error::new_spanned(
                     &f.ty,
@@ -7759,6 +7764,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Collect `#[confidential]` columns (issue #1771, validated to be `Sealed`).
     // Each entry: (column name, blind-index companion column).
     let mut confidential_columns: Vec<(String, Option<String>)> = Vec::new();
+    // One type assertion per confidential field. The attribute checks the field's
+    // type by name, which is a friendly diagnostic but not a proof: an app type
+    // that happens to be called `Sealed` would otherwise earn every guarantee the
+    // registry then claims, over a column holding plaintext. This is the proof.
+    let mut confidential_type_assertions: Vec<TokenStream> = Vec::new();
     for f in &all_fields {
         if let Err(err) = validate_confidential_field(f, &all_fields) {
             return err.to_compile_error();
@@ -7771,10 +7781,31 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         }
         let ident = f.ident.as_ref().unwrap();
-        confidential_columns.push((
-            unraw_ident(ident),
-            spec.blind_index.then(|| blind_index_column(ident)),
-        ));
+        let bidx = spec.blind_index.then(|| blind_index_column(ident));
+        confidential_type_assertions.push(quote! {
+            const _: () = {
+                #[allow(dead_code)]
+                fn __autumn_confidential_column_is_sealed(
+                    m: &#name,
+                ) -> &::autumn_web::confidential::Sealed {
+                    &m.#ident
+                }
+            };
+        });
+        if let Some(ref bidx_name) = bidx {
+            let bidx_ident = format_ident!("{bidx_name}");
+            confidential_type_assertions.push(quote! {
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __autumn_blind_index_column_is_a_token(
+                        m: &#name,
+                    ) -> &::autumn_web::confidential::BlindIndex {
+                        &m.#bidx_ident
+                    }
+                };
+            });
+        }
+        confidential_columns.push((unraw_ident(ident), bidx));
     }
     // A struct-level `#[serde(rename_all = ...)]` desyncs the registered column
     // name from the wire name, exactly as it does for encrypted columns.
@@ -7791,6 +7822,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|(col, _)| col.as_str())
         .collect();
+    // A shard key routes a write by reading the column, which a sealed value
+    // cannot answer.
+    if let Ok(Some(shard_key)) = parse_model_shard_key(outer_attrs)
+        && confidential_column_names.contains(&shard_key.as_str())
+    {
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`{shard_key}` is this model's shard key, so it cannot be \
+                 `#[confidential]`: the router reads the column to pick a shard, and \
+                 a sealed value is opaque to the server."
+            ),
+        )
+        .to_compile_error();
+    }
     let confidential_inventory: Vec<TokenStream> = confidential_columns
         .iter()
         .map(|(col, bidx)| {
@@ -9899,6 +9945,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if classified_columns.iter().any(|(cid, ..)| *cid == ident) {
             continue;
         }
+        // #1771: the same reasoning for a confidential column and its
+        // blind-index companion. Neither is orderable or filterable today (the
+        // type lists below hold no `Sealed` or `BlindIndex`), but the exclusion
+        // is explicit so a later edit to those lists cannot open a client-driven
+        // equality oracle over a sealed value.
+        let name = unraw_ident(ident);
+        if confidential_columns
+            .iter()
+            .any(|(col, bidx)| *col == name || bidx.as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
         let is_option = option_inner_type(&field.ty).is_some();
@@ -10134,6 +10192,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #(#encrypted_inventory)*
+        #(#confidential_type_assertions)*
         #(#confidential_inventory)*
 
         #translatable_items

@@ -1,7 +1,7 @@
 //! The documented threat model, asserted in CI (#1771 AC5).
 //!
 //! `docs/guide/confidential-fields.md` states what the operator can and cannot
-//! see. A doc is drift the moment the code moves, so this test pins the two
+//! see. A doc drifts the moment the code moves, so this test pins the two
 //! together: every sink the code claims blindness for has a row in the guide,
 //! every row in the guide is a sink the code claims, and the mechanism behind
 //! each claim is exercised here rather than asserted in prose.
@@ -61,9 +61,18 @@ fn the_guide_and_the_code_agree_on_the_cannot_see_set() {
              table: {documented:?}",
             sink.id
         );
+        // The `why` text is the half that actually drifts, so pin its opening
+        // clause to the guide row as well as the sink id.
+        let head: String = sink
+            .why
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
         assert!(
-            !sink.why.is_empty(),
-            "`{}` must say why it holds only ciphertext",
+            GUIDE.to_lowercase().contains(&head),
+            "the guide row for `{}` must state why: `{head}` is missing",
             sink.id
         );
     }
@@ -83,7 +92,7 @@ fn the_guide_and_the_code_agree_on_the_cannot_see_set() {
 
 #[test]
 fn the_cannot_see_set_names_every_sink_the_acceptance_criteria_do() {
-    // The four sinks #1771 requires, plus the two this slice also covers.
+    // The four sinks #1771 requires, plus the three this slice also covers.
     for required in [
         "database",
         "access_log",
@@ -91,6 +100,7 @@ fn the_cannot_see_set_names_every_sink_the_acceptance_criteria_do() {
         "replay_capsule",
         "version_history",
         "admin_ui",
+        "admin_csv_export",
     ] {
         assert!(
             OPERATOR_BLIND_SINKS.iter().any(|s| s.id == required),
@@ -141,12 +151,17 @@ fn the_log_filter_is_fed_the_confidential_column_names() {
 fn version_history_holds_a_marker_rather_than_the_envelope() {
     let mut cols: Vec<&'static str> = Vec::new();
     confidential::merge_confidential_columns_for_table("threat_model_notes", &mut cols);
-    assert_eq!(cols, vec!["secret_note"]);
+    // The token is sensitive too: a history of tokens is a history of which
+    // values repeated, and it outlives the row that held them.
+    assert_eq!(cols, vec!["secret_note", "secret_note_bidx"]);
 }
 
 #[test]
-fn the_admin_redacts_the_column_by_name() {
+fn the_admin_redacts_the_column_and_its_token_by_name() {
     assert!(confidential::is_confidential_column_name("secret_note"));
+    assert!(confidential::is_confidential_column_name(
+        "secret_note_bidx"
+    ));
     assert!(!confidential::is_confidential_column_name("id"));
 }
 

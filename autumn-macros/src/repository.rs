@@ -1504,8 +1504,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
 struct DerivedQuery {
     prefix: String,      // "find", "count", "delete", "exists"
     fields: Vec<String>, // ["title", "published"]
-    #[allow(dead_code)] // reserved for Tier 2 OR support
-    combinator: String, // "and" or "or"
+    combinator: String,  // "and" or "or"
 }
 
 fn parse_query_name(name: &str) -> Option<DerivedQuery> {
@@ -1780,6 +1779,17 @@ struct FindOrCreateSpec {
 /// column can never satisfy the predicate, so shipping it is never correct.
 ///
 /// The message is composed here, where the method and column names are known.
+///
+/// The `const` is non-generic in every emission site (a fn body, a closure body,
+/// an `async` block), so it is always evaluated eagerly. Moving it into an
+/// associated const of a generic impl would defer it to monomorphization and
+/// silently stop refusing anything.
+///
+/// The const list is emitted for every `#[model]`, so this resolves for every
+/// repository over one. A repository over a hand-rolled Diesel struct fails with
+/// `E0599: no associated item named __AUTUMN_CONFIDENTIAL_COLUMNS` — the same
+/// class of error that struct already gets from the other `#[model]` items this
+/// macro calls.
 fn confidential_column_guard(
     model_name: &Ident,
     column: &str,
@@ -1819,7 +1829,11 @@ fn generate_derived_query_for_source(
     let table_name_str = table_ident.to_string();
 
     // #1771: refuse a WHERE over a sealed column at build time.
-    let method_name = format!("{}_by_{}", query.prefix, query.fields.join("_and_"));
+    let method_name = format!(
+        "{}_by_{}",
+        query.prefix,
+        query.fields.join(&format!("_{}_", query.combinator))
+    );
     let confidential_guards: Vec<TokenStream> = query
         .fields
         .iter()
@@ -1912,7 +1926,7 @@ fn generate_derived_query_for_source(
             if soft_delete {
                 quote! {
                     #(#confidential_guards)*
-                #(#encode_lets)*
+                    #(#encode_lets)*
                     // The derived soft-delete / timestamp write has no `AppState`
                     // in scope, so it cannot reach the injected clock. The allow is
                     // emitted into the expansion so a determinism deny-lint never
@@ -1935,7 +1949,7 @@ fn generate_derived_query_for_source(
             } else {
                 quote! {
                     #(#confidential_guards)*
-                #(#encode_lets)*
+                    #(#encode_lets)*
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
                         .execute(&mut conn)
@@ -13853,6 +13867,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.cursor_key
     {
         let cursor_key_ident = format_ident!("{ck}");
+        // #1771: the keyset paginator both orders by this column and compares it.
+        // Over randomized ciphertext the order is arbitrary and the keyset never
+        // converges, so this is a build failure rather than silent nonsense.
+        let cursor_confidential_guard = confidential_column_guard(
+            model_name,
+            ck,
+            "cursor_page",
+            "ORDER BY and keyset predicate",
+        );
         let trait_method = quote! {
             /// Fetch one page of records using keyset (cursor) pagination.
             ///
@@ -13890,6 +13913,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -13934,6 +13958,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -14888,7 +14913,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // save/update/delete; a no-op token on non-sharded repos.
                     #cross_shard_write_guard
                     #(#confidential_guards)*
-                #(#encode_lets)*
+                    #(#encode_lets)*
                     // Step 1: preliminary lookup on the read path (replica-eligible).
                     {
                         let mut __rconn = self.__autumn_acquire_read_conn().await?;

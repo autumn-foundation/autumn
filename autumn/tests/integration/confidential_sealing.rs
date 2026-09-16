@@ -9,7 +9,7 @@ use autumn_web::confidential::{BlindIndex, FieldContext, RootKey, Sealed};
 const PLAINTEXT: &str = "AUTUMN-CONFIDENTIAL-MARKER-diagnosis-hypertension";
 
 fn ctx() -> FieldContext {
-    FieldContext::new("notes", "body", "user-42")
+    FieldContext::for_record("notes", "body", "user-42", "note-1")
 }
 
 #[test]
@@ -45,21 +45,100 @@ fn another_key_cannot_unseal() {
 }
 
 #[test]
-fn an_envelope_moved_to_another_owner_or_column_fails_to_unseal() {
+fn an_envelope_moved_to_another_owner_column_table_or_row_fails_to_unseal() {
     let key = RootKey::generate();
     let sealed = key.seal(&ctx(), PLAINTEXT).expect("seal");
 
-    let other_owner = FieldContext::new("notes", "body", "user-7");
-    assert!(key.unseal(&other_owner, &sealed).is_err(), "owner is bound");
+    for (what, moved) in [
+        (
+            "owner",
+            FieldContext::for_record("notes", "body", "user-7", "note-1"),
+        ),
+        (
+            "column",
+            FieldContext::for_record("notes", "title", "user-42", "note-1"),
+        ),
+        (
+            "table",
+            FieldContext::for_record("memos", "body", "user-42", "note-1"),
+        ),
+        (
+            "row",
+            FieldContext::for_record("notes", "body", "user-42", "note-2"),
+        ),
+        (
+            "record binding",
+            FieldContext::new("notes", "body", "user-42"),
+        ),
+    ] {
+        assert!(
+            key.unseal(&moved, &sealed).is_err(),
+            "the {what} must be bound"
+        );
+    }
+}
 
-    let other_column = FieldContext::new("notes", "title", "user-42");
-    assert!(
-        key.unseal(&other_column, &sealed).is_err(),
-        "column is bound"
+#[test]
+fn a_context_without_a_record_leaves_rows_interchangeable() {
+    // Stated as a test because the guide states it: `new` binds the column, not
+    // the row, so an operator can move a value among that owner's own rows.
+    let key = RootKey::generate();
+    let column_scope = FieldContext::new("notes", "body", "user-42");
+    let sealed = key.seal(&column_scope, PLAINTEXT).expect("seal");
+    assert_eq!(
+        key.unseal(&column_scope, &sealed).expect("unseal"),
+        PLAINTEXT
     );
+}
 
-    let other_table = FieldContext::new("memos", "body", "user-42");
-    assert!(key.unseal(&other_table, &sealed).is_err(), "table is bound");
+#[test]
+fn the_context_encoding_is_injective() {
+    // Length-prefixed parts, so no two different triples collide. A separator
+    // byte would let ("notes", "bodyx", "user") and ("notes", "body", "xuser")
+    // derive one key.
+    let key = RootKey::generate();
+    let a = FieldContext::new("notes", "bodyx", "user");
+    let b = FieldContext::new("notes", "body", "xuser");
+    let sealed = key.seal(&a, PLAINTEXT).expect("seal");
+    assert!(key.unseal(&b, &sealed).is_err());
+    assert_ne!(
+        key.blind_index(&a, PLAINTEXT),
+        key.blind_index(&b, PLAINTEXT)
+    );
+}
+
+#[test]
+fn a_relabelled_envelope_header_is_refused() {
+    use base64::Engine as _;
+
+    let key = RootKey::generate();
+    let sealed = key.seal(&ctx(), PLAINTEXT).expect("seal");
+    let mut raw = sealed.to_bytes().expect("decode");
+    raw[1] = 0x02; // claim a version this build does not know
+
+    let relabelled = base64::engine::general_purpose::STANDARD.encode(&raw);
+    // Refused at the boundary, and — because the header is authenticated data —
+    // it could not have unsealed even if the parser had accepted it.
+    assert!(Sealed::from_envelope(relabelled).is_err());
+}
+
+#[test]
+fn surrounding_whitespace_does_not_make_a_second_distinct_envelope() {
+    let key = RootKey::generate();
+    let sealed = key.seal(&ctx(), PLAINTEXT).expect("seal");
+    let padded = Sealed::from_envelope(format!("  {}  ", sealed.as_envelope())).expect("parse");
+    assert_eq!(padded, sealed, "one envelope has one canonical form");
+}
+
+#[test]
+fn a_default_blind_index_is_not_a_shared_constant() {
+    // A fixed default would be a token every defaulted row holds, so one lookup
+    // would match rows across owners.
+    assert_ne!(BlindIndex::default(), BlindIndex::default());
+    assert_eq!(
+        BlindIndex::default().as_token().len(),
+        BlindIndex::TOKEN_LEN
+    );
 }
 
 #[test]
@@ -94,12 +173,11 @@ fn the_blind_index_token_does_not_reveal_the_plaintext() {
     let token = key.blind_index(&ctx(), PLAINTEXT);
     let t = token.as_token();
 
-    // 1. The token is hex, so it can hold no fragment of the plaintext.
+    // 1. The token is hex only, so it cannot carry the marker.
     assert!(
         t.chars().all(|c| c.is_ascii_hexdigit()),
         "token is hex: {t}"
     );
-    assert!(!t.contains(PLAINTEXT));
 
     // 2. Its length is fixed, so it leaks no plaintext length.
     let short = key.blind_index(&ctx(), "a");
@@ -125,6 +203,11 @@ fn the_blind_index_is_bound_to_its_field_context() {
     assert_ne!(here, elsewhere, "the token is per column");
     let other_owner = key.blind_index(&FieldContext::new("notes", "body", "user-7"), PLAINTEXT);
     assert_ne!(here, other_owner, "the token is per owner");
+
+    // The record is deliberately NOT in key derivation: the token has to stay
+    // comparable across the rows of one owner, or the equality lookup breaks.
+    let other_row = FieldContext::for_record("notes", "body", "user-42", "note-2");
+    assert_eq!(here, key.blind_index(&other_row, PLAINTEXT));
 }
 
 // ── Wire shape ──────────────────────────────────────────────────────────────
@@ -154,6 +237,10 @@ fn a_malformed_envelope_is_refused_at_the_boundary() {
     assert!(Sealed::from_envelope("AAAAAAAAAAAAAAAAAAAAAAAA".to_owned()).is_err());
     assert!(serde_json::from_str::<Sealed>("\"oops\"").is_err());
     assert!(serde_json::from_str::<BlindIndex>("\"nothex\"").is_err());
+    assert!(
+        serde_json::from_str::<BlindIndex>("\"ABCDEF\"").is_err(),
+        "uppercase hex is not the canonical token form"
+    );
 }
 
 #[test]

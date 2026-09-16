@@ -427,7 +427,10 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+# `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
+# drops. It matters on the client side of `#[confidential]` (#1771), where a
+# crash dump would otherwise expose material the field key is derived from.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 # Deterministic wipe of the client root key used by `#[confidential]` (#1771).
 # Adds NO new crate to the graph: `aes-gcm` and `secrecy` already resolve it.
 zeroize = "1"

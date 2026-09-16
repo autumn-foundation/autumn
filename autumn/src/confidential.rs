@@ -8,10 +8,9 @@
 //! A confidential value is sealed **on the client**, under a [`RootKey`] the
 //! server never receives. The server's only representation of the value is
 //! [`Sealed`] — an opaque envelope with no accessor that yields plaintext, no
-//! `Display`, and a redacted `Debug`. Ciphertext is therefore what flows into
-//! every operator-reachable sink by construction: the database, the access log,
-//! `autumn db backup` output, a replay capsule, record version history and the
-//! admin UI. Equality lookups still work, through a client-computed
+//! `Display`, and a redacted `Debug`. Every operator-reachable sink therefore
+//! holds ciphertext by construction: the database, the access log, `autumn db
+//! backup` output, a replay capsule, record version history and the admin UI. Equality lookups still work, through a client-computed
 //! [`BlindIndex`] token.
 //!
 //! ```ignore
@@ -25,7 +24,7 @@
 //! }
 //!
 //! // Client side (never on the server):
-//! let ctx = FieldContext::new("notes", "body", &owner_id);
+//! let ctx = FieldContext::for_record("notes", "body", &owner_id, &note_uid);
 //! let sealed = key.seal(&ctx, "my diagnosis")?;
 //! let token = key.blind_index(&ctx, "my diagnosis");
 //! ```
@@ -52,15 +51,18 @@
 //! [`FieldContext`] (table, column, owner):
 //!
 //! ```text
-//! context    = table || 0x1F || column || 0x1F || owner
-//! seal_key   = HMAC-SHA256(root, "autumn:confidential:seal:v1:"  || context)
-//! index_key  = HMAC-SHA256(root, "autumn:confidential:index:v1:" || context)
+//! scope      = len(table) || table || len(column) || column || len(owner) || owner
+//! seal_key   = HMAC-SHA256(root, "autumn:confidential:seal:v1:"  || scope)
+//! index_key  = HMAC-SHA256(root, "autumn:confidential:index:v1:" || scope)
 //! token      = hex(HMAC-SHA256(index_key, "autumn:confidential:bidx:v1:" || plaintext)[0..16])
+//! aad        = magic || version || alg || scope || [len(record) || record]
 //! ```
 //!
-//! The same `context` is the AES-GCM associated data, so an envelope moved to
-//! another row, column, table or owner fails to authenticate. That is what makes
-//! a sealed value un-replayable by whoever can write the database.
+//! The scope, the envelope header and an optional record identifier are the
+//! AES-GCM associated data, so an envelope moved to another column, table or
+//! owner fails to authenticate. Pass a record identifier
+//! ([`FieldContext::for_record`]) to bind the row as well; without one, an
+//! operator can still move a value among that owner's own rows.
 //!
 //! # What the operator can still see
 //!
@@ -71,7 +73,7 @@
 use std::fmt;
 
 use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::KeyInit;
+use aes_gcm::KeyInit;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
@@ -88,10 +90,6 @@ const HEADER_LEN: usize = 3 + NONCE_LEN;
 /// AES-GCM authentication tag length. An envelope shorter than header + tag
 /// cannot hold a valid ciphertext.
 const TAG_LEN: usize = 16;
-/// Separator between the parts of a field context. `0x1F` (ASCII unit
-/// separator) cannot appear in a table or column name, so the context is
-/// unambiguous: `("ab", "c")` and `("a", "bc")` derive different keys.
-const SEP: u8 = 0x1F;
 /// Bytes of HMAC output kept in a blind-index token: 128 bits, which makes an
 /// accidental collision negligible while keeping the token short.
 const TOKEN_BYTES: usize = 16;
@@ -127,6 +125,11 @@ pub enum ConfidentialError {
         alg: u8,
     },
 
+    /// The AEAD refused the plaintext. AES-GCM caps one message at about
+    /// 64 GiB, which is the only way to reach this.
+    #[error("seal failed: the value is too large for one AES-GCM message")]
+    SealFailed,
+
     /// AEAD authentication failed: the wrong key, the wrong field context, or
     /// corrupted ciphertext.
     #[error("unseal failed: wrong key, wrong field context, or corrupted ciphertext")]
@@ -148,34 +151,94 @@ pub enum ConfidentialError {
 // Field context
 // ---------------------------------------------------------------------------
 
-/// Names the field a value belongs to: its table, its column and the owner whose
-/// key seals it.
+/// Names the field a value belongs to: its table, its column, the owner whose
+/// key seals it, and optionally the record it sits in.
 ///
-/// The context does two jobs. It derives the field's keys, so one root key gives
-/// every column an independent key. And it is the AES-GCM associated data, so an
-/// envelope is bound to the exact place it was written: an operator who copies
-/// one user's ciphertext into another user's row produces a value that no longer
-/// unseals.
+/// The context does two jobs. Its **scope** — table, column and owner — derives
+/// the field's keys, so one root key gives every column of every owner an
+/// independent key. The scope, plus the optional **record** identifier, is the
+/// AES-GCM associated data, so an envelope is bound to where it was written.
+///
+/// Each part is length-prefixed, so the encoding is injective: no two different
+/// triples can produce the same bytes, whatever characters the parts hold.
+///
+/// # Bind the record where you can
+///
+/// [`FieldContext::new`] binds the column and the owner, not the row. An
+/// operator who can write the database can therefore still move, copy or roll
+/// back one owner's envelope **among that owner's own rows in the same
+/// column**, and the client cannot tell. [`FieldContext::for_record`] closes
+/// that by adding a stable record identifier to the associated data. The record
+/// is deliberately outside key derivation, so the blind index stays comparable
+/// across rows and the equality lookup keeps working.
+///
+/// Use a client-chosen identifier (a UUID the client puts in the row) rather
+/// than a server-assigned primary key, so the same context is available at
+/// insert time and at read time.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FieldContext {
-    bytes: Vec<u8>,
+    /// Length-prefixed `table`, `column`, `owner`. Derives the field keys.
+    scope: Vec<u8>,
+    /// Length-prefixed record identifier, empty when the record is not bound.
+    record: Vec<u8>,
+}
+
+/// Append `part` as a 4-byte big-endian length followed by its bytes.
+fn push_part(out: &mut Vec<u8>, part: &str) {
+    // A part longer than 4 GiB is not a table, column, owner or record id.
+    let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(part.as_bytes());
 }
 
 impl FieldContext {
-    /// Build the context for `owner`'s value in `table`.`column`.
+    /// Bind `owner`'s value in `table`.`column`, without binding the record.
+    ///
+    /// See "Bind the record where you can" above for what this leaves open.
     #[must_use]
     pub fn new(table: &str, column: &str, owner: &str) -> Self {
-        let mut bytes = Vec::with_capacity(table.len() + column.len() + owner.len() + 2);
-        bytes.extend_from_slice(table.as_bytes());
-        bytes.push(SEP);
-        bytes.extend_from_slice(column.as_bytes());
-        bytes.push(SEP);
-        bytes.extend_from_slice(owner.as_bytes());
-        Self { bytes }
+        let mut scope = Vec::with_capacity(table.len() + column.len() + owner.len() + 12);
+        push_part(&mut scope, table);
+        push_part(&mut scope, column);
+        push_part(&mut scope, owner);
+        Self {
+            scope,
+            record: Vec::new(),
+        }
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Bind the record as well, so an envelope moved to another row of the same
+    /// column no longer unseals.
+    ///
+    /// `record` is any stable identifier for the row the client can reproduce on
+    /// read.
+    #[must_use]
+    pub fn for_record(table: &str, column: &str, owner: &str, record: &str) -> Self {
+        let mut ctx = Self::new(table, column, owner);
+        push_part(&mut ctx.record, record);
+        ctx
+    }
+
+    /// The key-derivation input: scope only, so the blind index stays comparable
+    /// across the rows of one owner.
+    fn scope_bytes(&self) -> &[u8] {
+        &self.scope
+    }
+
+    /// The AES-GCM associated data: the envelope header, the scope and the
+    /// record.
+    ///
+    /// The header is in here rather than only on the wire, so the version and
+    /// algorithm bytes an unsealer reads its parser from are authenticated. A
+    /// future v2 envelope therefore cannot be re-labelled as a v1 one.
+    fn aad(&self) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(3 + self.scope.len() + self.record.len());
+        aad.push(MAGIC);
+        aad.push(VERSION);
+        aad.push(ALG_AES_256_GCM);
+        aad.extend_from_slice(&self.scope);
+        aad.extend_from_slice(&self.record);
+        aad
     }
 }
 
@@ -229,18 +292,20 @@ impl RootKey {
     /// Returns [`ConfidentialError::InvalidKeyFormat`] for anything else.
     pub fn from_hex(hex_str: &str) -> Result<Self, ConfidentialError> {
         let hex_str = hex_str.trim();
-        let decoded = hex::decode(hex_str)
-            .map_err(|_| ConfidentialError::InvalidKeyFormat { len: hex_str.len() })?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| ConfidentialError::InvalidKeyFormat { len: hex_str.len() })?;
+        // Decoded straight into the array: `hex::decode` would leave a second
+        // copy of the key in a heap block that nothing wipes.
+        let mut bytes = [0u8; 32];
+        if hex_str.len() != 64 || hex::decode_to_slice(hex_str, &mut bytes).is_err() {
+            bytes.zeroize();
+            return Err(ConfidentialError::InvalidKeyFormat { len: hex_str.len() });
+        }
         Ok(Self { bytes })
     }
 
     fn derive(&self, domain: &[u8], ctx: &FieldContext) -> [u8; 32] {
-        let mut msg = Vec::with_capacity(domain.len() + ctx.as_bytes().len());
+        let mut msg = Vec::with_capacity(domain.len() + ctx.scope_bytes().len());
         msg.extend_from_slice(domain);
-        msg.extend_from_slice(ctx.as_bytes());
+        msg.extend_from_slice(ctx.scope_bytes());
         hmac_sha256(&self.bytes, &msg)
     }
 
@@ -260,7 +325,8 @@ impl RootKey {
         use base64::Engine as _;
 
         let mut seal_key = self.derive(b"autumn:confidential:seal:v1:", ctx);
-        let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+        // Infallible: the key is always 32 bytes, which is what `Key` names.
+        let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 
         let mut nonce = [0u8; NONCE_LEN];
@@ -271,10 +337,10 @@ impl RootKey {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext.as_bytes(),
-                    aad: ctx.as_bytes(),
+                    aad: &ctx.aad(),
                 },
             )
-            .map_err(|_| ConfidentialError::UnsealFailed)?;
+            .map_err(|_| ConfidentialError::SealFailed)?;
 
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
         out.push(MAGIC);
@@ -304,7 +370,8 @@ impl RootKey {
         let ciphertext = &raw[HEADER_LEN..];
 
         let mut seal_key = self.derive(b"autumn:confidential:seal:v1:", ctx);
-        let cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
+        // Infallible: the key is always 32 bytes, which is what `Key` names.
+        let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 
         let plaintext = cipher
@@ -312,30 +379,39 @@ impl RootKey {
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: ctx.as_bytes(),
+                    aad: &ctx.aad(),
                 },
             )
             .map_err(|_| ConfidentialError::UnsealFailed)?;
-        String::from_utf8(plaintext).map_err(|_| ConfidentialError::NotUtf8)
+        String::from_utf8(plaintext).map_err(|e| {
+            // The error owns the recovered bytes; wipe them before it drops.
+            let mut recovered = e.into_bytes();
+            recovered.zeroize();
+            ConfidentialError::NotUtf8
+        })
     }
 
     /// Compute the deterministic equality token for `plaintext` in the field
     /// `ctx` names.
     ///
     /// Equal plaintexts give equal tokens under one key and context, which is
-    /// what makes `WHERE <column>_bidx = $1` work. Nothing else is derivable:
-    /// the token is a keyed MAC of fixed length, so it reveals neither the
+    /// what makes `WHERE <column>_bidx = $1` work. The token gives nothing else
+    /// away: it is a keyed MAC of fixed length, so it reveals neither the
     /// plaintext nor its length, and an operator without the key cannot confirm
     /// a guessed plaintext by recomputing it.
     #[must_use]
     pub fn blind_index(&self, ctx: &FieldContext, plaintext: &str) -> BlindIndex {
         let mut index_key = self.derive(b"autumn:confidential:index:v1:", ctx);
-        let mut msg = Vec::with_capacity(28 + plaintext.len());
-        msg.extend_from_slice(b"autumn:confidential:bidx:v1:");
-        msg.extend_from_slice(plaintext.as_bytes());
-        let mac = hmac_sha256(&index_key, &msg);
+        // Fed to the MAC in two parts rather than concatenated, so no heap block
+        // holds a copy of the plaintext. The prefix is a fixed constant, so the
+        // split adds no ambiguity.
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(&index_key).expect("HMAC accepts any key length");
+        mac.update(b"autumn:confidential:bidx:v1:");
+        mac.update(plaintext.as_bytes());
+        let tag: [u8; 32] = mac.finalize().into_bytes().into();
         index_key.zeroize();
-        BlindIndex(hex::encode(&mac[..TOKEN_BYTES]))
+        BlindIndex(hex::encode(&tag[..TOKEN_BYTES]))
     }
 }
 
@@ -377,7 +453,10 @@ impl Sealed {
     /// [`ConfidentialError::UnsupportedEnvelope`] when the header does not
     /// parse, so junk is refused at the boundary rather than stored.
     pub fn from_envelope(envelope: String) -> Result<Self, ConfidentialError> {
-        let candidate = Self(envelope);
+        // Trimmed once, here, so two `Sealed` values are equal exactly when they
+        // decode to the same envelope. An operator cannot make one row look
+        // different from another by adding a space.
+        let candidate = Self(envelope.trim().to_owned());
         candidate.to_bytes()?;
         Ok(candidate)
     }
@@ -397,7 +476,7 @@ impl Sealed {
         use base64::Engine as _;
 
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(self.0.trim())
+            .decode(&self.0)
             .map_err(|_| ConfidentialError::MalformedEnvelope("not valid base64"))?;
         if raw.len() < HEADER_LEN + TAG_LEN {
             return Err(ConfidentialError::MalformedEnvelope("truncated envelope"));
@@ -420,8 +499,8 @@ impl Sealed {
 /// The server cannot seal a value, so a confidential column has no meaningful
 /// default. This exists because the `#[model]` factory and patch structs need
 /// one. It is structurally valid, so it round-trips through the database, and
-/// [`RootKey::unseal`] always refuses it — the honest outcome for a value
-/// nobody sealed.
+/// [`RootKey::unseal`] always refuses it, which is correct for a value nobody
+/// sealed.
 impl Default for Sealed {
     fn default() -> Self {
         use base64::Engine as _;
@@ -465,10 +544,23 @@ impl<'de> Deserialize<'de> for Sealed {
 /// The client computes it with [`RootKey::blind_index`] and sends it alongside
 /// the sealed value. The server stores it in its own column and compares it,
 /// which is the only server-side predicate a confidential field supports.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Eq, Hash, Debug)]
 #[cfg_attr(feature = "db", derive(diesel::AsExpression, diesel::FromSqlRow))]
 #[cfg_attr(feature = "db", diesel(sql_type = diesel::sql_types::Text))]
 pub struct BlindIndex(String);
+
+/// Constant time, so an application that compares a submitted token against a
+/// stored one does not turn the comparison into a timing oracle. The database
+/// comparison is not constant time either, but this is the one an application
+/// writes by hand.
+impl PartialEq for BlindIndex {
+    fn eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq as _;
+        // Both are validated to `TOKEN_LEN` hex characters, so the lengths match
+        // whenever the values could.
+        self.0.len() == other.0.len() && bool::from(self.0.as_bytes().ct_eq(other.0.as_bytes()))
+    }
+}
 
 impl BlindIndex {
     /// Character length of a token: 16 bytes of HMAC, hex encoded.
@@ -501,13 +593,21 @@ impl BlindIndex {
     }
 }
 
-/// An all-zero token, which no plaintext produces.
+/// A random token, which no plaintext produces.
 ///
 /// Present for the same reason as [`Sealed`]'s: the `#[model]` factory and patch
-/// structs need a default. It matches no client-computed token.
+/// structs need a default. It is drawn fresh rather than fixed: a shared
+/// constant would be a token every defaulted row holds, so one lookup would
+/// match rows across owners.
+///
+/// # Panics
+///
+/// Panics if the operating system's random number generator is unavailable.
 impl Default for BlindIndex {
     fn default() -> Self {
-        Self("0".repeat(Self::TOKEN_LEN))
+        let mut bytes = [0u8; TOKEN_BYTES];
+        getrandom::getrandom(&mut bytes).expect("OS RNG failed");
+        Self(hex::encode(bytes))
     }
 }
 
@@ -584,15 +684,18 @@ pub fn is_confidential_column(table: &str, column: &str) -> bool {
         .any(|d| d.table == table && d.column == column)
 }
 
-/// Whether any registered confidential column has this name (table-agnostic).
+/// Whether any registered confidential column, or its blind-index companion,
+/// has this name (table-agnostic).
 ///
-/// Used by surfaces that lack table context, such as the admin cell renderer.
-/// Errs toward privacy: a same-named column on another table is also redacted.
+/// Used by surfaces that lack table context, such as the admin cell renderer and
+/// the CSV export. The token is included: it is stable per value per owner, so
+/// publishing it outside the database hands out a correlation handle. Errs
+/// toward privacy: a same-named column on another table is also redacted.
 #[must_use]
 pub fn is_confidential_column_name(column: &str) -> bool {
     registered_confidential_columns()
         .iter()
-        .any(|d| d.column == column)
+        .any(|d| d.column == column || d.blind_index == Some(column))
 }
 
 /// Confidential column names for one table.
@@ -607,13 +710,21 @@ pub fn confidential_columns_for_table(table: &str) -> Vec<&'static str> {
 
 /// Append this table's confidential columns to `columns`, de-duplicating.
 ///
+/// The blind-index companion is included: a history of tokens is a history of
+/// which values repeated, which outlives the row that held them.
+///
 /// Used by generated `VersionedRecord::version_sensitive_columns`, so record
 /// version history keeps a "changed" marker instead of copying the envelope
 /// into a second table.
 pub fn merge_confidential_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
     for d in registered_confidential_columns() {
-        if d.table == table && !columns.contains(&d.column) {
-            columns.push(d.column);
+        if d.table != table {
+            continue;
+        }
+        for column in [Some(d.column), d.blind_index].into_iter().flatten() {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
         }
     }
 }
@@ -696,16 +807,27 @@ pub const OPERATOR_BLIND_SINKS: &[OperatorSink] = &[
     },
     OperatorSink {
         id: "admin_ui",
-        why: "the admin cell renderer redacts registered confidential columns",
+        why: "the admin cell renderer redacts registered confidential columns, and \
+              never offers an editable control for one",
+    },
+    OperatorSink {
+        id: "admin_csv_export",
+        why: "the CSV export drops confidential columns and their blind-index \
+              companions, so a downloaded file carries neither",
     },
 ];
 
 /// What sealing does **not** hide. Stated so the guarantee is not overclaimed.
 pub const OPERATOR_VISIBLE: &[&str] = &[
+    "whether one value equals another, for one owner and one column, from the \
+     blind-index token. An application that lets the operator make a client seal \
+     a value of the operator's choosing turns that into a confirmation oracle \
+     for a guessed plaintext",
+    "with a `FieldContext::new` context, the operator can move, copy or roll back \
+     one owner's envelope among that owner's own rows in the same column, and the \
+     client cannot tell. `FieldContext::for_record` closes this",
     "that the row exists, and its id, timestamps and foreign keys",
     "the approximate length of the plaintext, from the length of the envelope",
-    "the blind-index token, which is stable per value per owner, so the operator \
-     can see when two of one owner's rows hold the same value",
     "every column the application did not mark `#[confidential]`",
 ];
 

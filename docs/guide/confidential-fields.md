@@ -10,7 +10,7 @@ is sealed **on the client**, under a key the server never receives. The server
 stores, backs up, replays and returns the envelope, and only the owning client
 opens it.
 
-Use it for the fields where "trust the host" is the adoption blocker: health
+Use it for fields a user should not have to trust the host with: health
 records, legal matters, private messages, financial detail.
 
 ```rust
@@ -30,9 +30,8 @@ pub struct Note {
 }
 ```
 
-The column type is `Sealed`, not `String`, on purpose. There is no point in the
-request pipeline where the server holds the plaintext, so there is no point where
-the model should pretend it does.
+The column type is `Sealed`, not `String`. The server never holds the plaintext,
+so the model does not declare a type that suggests it does.
 
 ## Sealing a value (client side)
 
@@ -40,7 +39,9 @@ the model should pretend it does.
 use autumn_web::confidential::{FieldContext, RootKey};
 
 let key = RootKey::generate();           // held by the client, never sent
-let ctx = FieldContext::new("notes", "body", &owner_id);
+// `note_uid` is a client-chosen id the row also carries: it binds the envelope
+// to this row. `FieldContext::new` omits it and binds only the column.
+let ctx = FieldContext::for_record("notes", "body", &owner_id, &note_uid);
 
 let sealed = key.seal(&ctx, "biopsy scheduled 12 May")?;
 let token  = key.blind_index(&ctx, "biopsy scheduled 12 May");
@@ -60,9 +61,13 @@ credentials store, so a server build cannot acquire one by accident.
 
 ### Key custody is yours
 
-This slice assumes a single client-held key. Recovery, multi-device sync and
+This release assumes a single client-held key. Recovery, multi-device sync and
 social recovery are out of scope — if the user loses the key, the data is gone.
 That is the guarantee working, not a defect.
+
+Key **rotation** is out of scope too. The envelope carries no key id, so a client
+with more than one key must try each one. Rotating means re-sealing every value
+the old key sealed.
 
 ## Equality lookups: the blind index
 
@@ -90,19 +95,21 @@ token = hex(HMAC-SHA256(index_key, "autumn:confidential:bidx:v1:" || plaintext)[
 - the token is a fixed 32 hex characters whatever the plaintext, so it leaks no
   length;
 - an operator cannot recompute it, so guessing the plaintext does not confirm the
-  guess;
+  guess — **unless** the application lets the operator make a client index a
+  value of the operator's choosing, which publishes the token for that exact
+  plaintext and turns the column into a confirmation oracle;
 - the token is per column and per owner, so it cannot be correlated across
   columns or across users.
 
-What the token *does* reveal is stated plainly below: two of one owner's rows
-that hold the same value have the same token.
+The token reveals one thing: two rows of one owner that hold the same value get
+the same token. See "Can see".
 
 ## What the operator can and cannot see
 
 This is the threat model. The adversary is **the operator of the server**: anyone
 who can read the database, the logs, a backup artifact, a replay capsule or the
-admin UI, and who can also read and write application memory at will is out of
-scope (that is the north star, not this slice).
+admin UI. An adversary who can also read and write the application's memory is
+out of scope for this release.
 
 ### Cannot see
 
@@ -114,6 +121,7 @@ scope (that is the north star, not this slice).
 | `replay_capsule` | A capsule copies the request body and the SQL binds, both of which carry envelopes. |
 | `version_history` | Confidential columns are version-sensitive, so a revision records that the column changed, not what it changed to. |
 | `admin_ui` | The admin cell renderer redacts registered confidential columns, and never offers an editable control for one. |
+| `admin_csv_export` | The CSV export drops confidential columns and their blind-index companions, so a downloaded file carries neither. |
 
 `autumn_web::confidential::OPERATOR_BLIND_SINKS` holds this table, and the
 `confidential_threat_model` test asserts that the code and this page agree.
@@ -123,8 +131,13 @@ scope (that is the north star, not this slice).
 - That the row exists, and its id, timestamps and foreign keys.
 - The approximate length of the plaintext, from the length of the envelope.
   AES-GCM is not length-hiding. Pad the value client side if the length matters.
-- The blind-index token, which is stable per value per owner, so the operator can
-  see when two of one owner's rows hold the same value.
+- Whether one value equals another, for one owner and one column, from the
+  blind-index token: the token is stable, so two rows of one owner that hold the
+  same value match. An application that lets the operator make a client index a
+  chosen value gets a confirmation oracle for a guessed plaintext.
+- With a `FieldContext::new` context, which values sit in which of that owner's
+  rows: the operator can move, copy or roll back an envelope among those rows and
+  the client cannot tell. `FieldContext::for_record` closes this.
 - Every column the application did not mark `#[confidential]`.
 
 ### Outside the guarantee
@@ -138,6 +151,9 @@ scope (that is the north star, not this slice).
 - **Hand-written SQL.** The build-time refusal covers the generated repository
   surface. A raw query over the sealed column compiles — and matches nothing,
   because the stored value is ciphertext.
+- **Memory on the client.** `RootKey` zeroizes on drop and the AES key schedule
+  is wiped with it, but a compiler or an allocator can still leave copies. The
+  wipe is best effort, not a guarantee against a memory dump of a live client.
 
 ## What the build refuses
 
@@ -155,7 +171,11 @@ read, compare, order or join the value:
 | `#[references]` | A foreign key is a server-side join. |
 | `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `tenant_id` | Framework-managed columns the server must be able to compare. |
 | `#[default]` | A default is a server-side value, and the server cannot seal one. |
-| `find_by_<field>`, `find_or_create_by_<field>`, a grouped aggregate over it | The database can only compare ciphertext that never repeats. |
+| `#[translatable]` | A per-locale container is a JSON document, not one sealed value. |
+| `#[serde(rename)]`, `#[serde(rename_all)]`, `#[diesel(column_name)]` | The column is registered under its Rust name, which the query guard, the log filter, version history and admin redaction all key off. |
+| the model's shard key | The router reads the column to pick a shard, and a sealed value is opaque to it. |
+| `find_by_<field>`, `find_or_create_by_<field>`, a grouped aggregate over it | Each builds a WHERE or a GROUP BY over the column, and the stored ciphertext never repeats. |
+| `cursor_key = <field>` | Keyset pagination orders by the column and compares it. Over randomized ciphertext the order is arbitrary. |
 
 ## Envelope format
 
@@ -175,15 +195,24 @@ select from.
 Keys are derived per field:
 
 ```text
-context    = table || 0x1F || column || 0x1F || owner
-seal_key   = HMAC-SHA256(root, "autumn:confidential:seal:v1:"  || context)
-index_key  = HMAC-SHA256(root, "autumn:confidential:index:v1:" || context)
+scope      = len(table) || table || len(column) || column || len(owner) || owner
+seal_key   = HMAC-SHA256(root, "autumn:confidential:seal:v1:"  || scope)
+index_key  = HMAC-SHA256(root, "autumn:confidential:index:v1:" || scope)
+aad        = magic || version || alg || scope || [len(record) || record]
 ```
 
-The same `context` is the AES-GCM associated data. An envelope copied into
-another row, column, table or user therefore fails to authenticate, so an
-operator who can write the database still cannot move one user's value into
-another user's record and have it open.
+The scope, the envelope header and the record identifier are the AES-GCM
+associated data. An envelope copied into another column, table or user therefore
+fails to authenticate, so an operator who can write the database cannot move one
+user's value into another user's record and have it open. The header is inside
+the associated data too, so a v1 envelope cannot be re-labelled as a later
+version to steer the parser.
+
+Each part is length-prefixed, so the encoding is injective whatever characters
+the parts hold.
+
+Pass a record identifier to bind the row as well. Without one, an operator can
+still move an envelope among that owner's own rows in the same column.
 
 ## How this differs from `#[encrypted]`
 

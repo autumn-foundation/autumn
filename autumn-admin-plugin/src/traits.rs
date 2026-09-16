@@ -614,7 +614,13 @@ pub trait AdminModel: Send + Sync + 'static {
         self.fields()
             .into_iter()
             .filter(|f| {
-                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+                // #1771: a confidential column, and its blind-index companion,
+                // leave the database in a file built for sharing. The envelope
+                // and the token are both per-owner values, so an exported file
+                // is a portable correlation handle.
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+                    && !f.encrypted
+                    && !::autumn_web::confidential::is_confidential_column_name(f.name)
             })
             .map(|f| f.name)
             .collect()
