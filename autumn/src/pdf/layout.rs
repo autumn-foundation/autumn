@@ -129,8 +129,16 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
                 }
             }
             Node::Element { tag, children } => {
-                if (tag == "ul" || tag == "ol") && nodes_contain_an_li(children) {
-                    return true;
+                if tag == "ul" || tag == "ol" {
+                    // inline_list_items scans only direct <li> children
+                    // and ignores everything else without recursing into
+                    // it, so a listless <ul>/<ol>'s descendants (stray
+                    // text, nested elements) never reach the page —
+                    // don't scan past this node either way.
+                    if nodes_contain_an_li(children) {
+                        return true;
+                    }
+                    continue;
                 }
                 // Two or more <br> tags survive trim_trailing_break (it
                 // pops only the last one), leaving a real Span::Break that
@@ -2931,6 +2939,27 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "a real <li>'s marker draws even when the <li> itself is empty, so this must warn"
+        );
+    }
+
+    #[test]
+    fn table_caption_with_a_listless_ul_past_the_depth_cap_does_not_warn() {
+        // A <ul> with no direct <li> child renders nothing: inline_spans
+        // hands ul/ol to inline_list_items, which scans only direct <li>
+        // children and ignores everything else without recursing into it
+        // — so bare text inside the <ul> (not wrapped in an <li>) never
+        // reaches the page. subtree_has_nonempty_text must not keep
+        // scanning a listless <ul>'s descendants either. (Codex review on
+        // PR #2810.)
+        let html = format!(
+            "{}<table><caption><ul>ignored</ul></caption></table>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a <ul> with no direct <li> draws nothing, so this must not warn"
         );
     }
 
