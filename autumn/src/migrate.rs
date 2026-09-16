@@ -3142,6 +3142,70 @@ struct SqliteCollisionMove {
 #[cfg(feature = "sqlite")]
 const SQLITE_LEGACY_SHIM_MIGRATION: &str = "00000000000000_create_api_tokens";
 
+/// Resolves whether a collision's non-framework side ran, for a `version`
+/// where the framework participant (if any) is not one of the five
+/// [`SQLITE_FRAMEWORK_MIGRATION_TABLES`] ambiguous ones. `Ok(None)` means no
+/// `FRAMEWORK_MIGRATIONS` name shares this version at all — an ordinary
+/// collision between two other registered sources, left for the caller to
+/// leave alone. `Ok(Some(true))` means exactly one non-framework name shares
+/// the version alongside a migration new to `SQLite` (proven never to have
+/// run): the pre-existing record can only be that one name's. Anything else
+/// — [`SQLITE_LEGACY_SHIM_MIGRATION`] (whose own history is itself
+/// unresolvable) or more than one non-framework name — is an error: silently
+/// leaving it is not safe, since [`sqlite_collision_history_moves`]'s caller
+/// still applies the disambiguated migrations regardless, which would record
+/// the framework migration as already applied (skipping its real DDL) while
+/// a non-framework migration re-runs under its substitute and hard-errors on
+/// non-idempotent DDL.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] when which side ran cannot be
+/// determined automatically.
+#[cfg(feature = "sqlite")]
+fn sqlite_non_framework_collision_owner(
+    sets: &[Vec<(String, String)>],
+    version: &str,
+    new_framework_names: &std::collections::HashSet<String>,
+) -> Result<Option<bool>, MigrationError> {
+    let names_at_version: Vec<&str> = sets
+        .iter()
+        .flatten()
+        .filter(|(v, _)| v == version)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let has_shim_participant = names_at_version.contains(&SQLITE_LEGACY_SHIM_MIGRATION);
+    let has_new_framework_participant = names_at_version
+        .iter()
+        .any(|name| new_framework_names.contains(*name));
+    if !has_shim_participant && !has_new_framework_participant {
+        return Ok(None);
+    }
+    let non_framework_participants = names_at_version
+        .iter()
+        .filter(|name| {
+            **name != SQLITE_LEGACY_SHIM_MIGRATION && !new_framework_names.contains(**name)
+        })
+        .count();
+    if !has_shim_participant && non_framework_participants == 1 {
+        return Ok(Some(true));
+    }
+    Err(MigrationError::Migration(format!(
+        "SQLite migration version {version} is claimed by more than one \
+         registered migration ({names_at_version:?}), including one this \
+         SQLite fork introduces (issue #2699), and which side already \
+         applied cannot be determined automatically. Renaming the \
+         conflicting migration to a fresh version is not enough on its own: \
+         __diesel_schema_migrations still has the old row under `{version}`, \
+         and Diesel treats whichever migration keeps that version as already \
+         applied. Determine which registered migration actually produced \
+         that row, then rename the OTHER one(s) to a fresh version and move \
+         or delete the row accordingly: UPDATE __diesel_schema_migrations \
+         SET version = '<fresh version>' WHERE version = '{version}' — or \
+         DELETE it if nothing at this version ever actually ran."
+    )))
+}
+
 /// The records [`adopt_sqlite_collision_history`] would move, decided on
 /// `conn` without changing anything.
 ///
@@ -3243,59 +3307,14 @@ fn sqlite_collision_history_moves(
             // other side won the collision.
             false
         } else {
-            let names_at_version: Vec<&str> = sets
-                .iter()
-                .flatten()
-                .filter(|(v, _)| v == version)
-                .map(|(_, name)| name.as_str())
-                .collect();
-            let has_shim_participant = names_at_version.contains(&SQLITE_LEGACY_SHIM_MIGRATION);
-            let has_new_framework_participant = names_at_version
-                .iter()
-                .any(|name| new_framework_names.contains(*name));
-            if !has_shim_participant && !has_new_framework_participant {
+            match sqlite_non_framework_collision_owner(sets, version, &new_framework_names)? {
+                Some(ran) => ran,
                 // No `FRAMEWORK_MIGRATIONS` name shares this version at all —
                 // an ordinary collision between two other registered sources
                 // (e.g. the app's own migrations and a plugin's). Which side
                 // ran is genuinely ambiguous from names alone; leave it for
                 // an operator, exactly as before this fork existed.
-                continue;
-            }
-            let non_framework_participants = names_at_version
-                .iter()
-                .filter(|name| {
-                    **name != SQLITE_LEGACY_SHIM_MIGRATION && !new_framework_names.contains(**name)
-                })
-                .count();
-            if !has_shim_participant && non_framework_participants == 1 {
-                // Exactly one non-framework name shares this version (the
-                // migration new to `SQLite` proven never to have run, plus
-                // `full_name` alone) — the pre-existing record can only be
-                // `full_name`'s, winner or not.
-                true
-            } else {
-                // A `FRAMEWORK_MIGRATIONS` name shares this version, but
-                // which side actually holds the plain-version record is
-                // still ambiguous: either the shim (whose own history is
-                // itself unresolvable, see [`SQLITE_LEGACY_SHIM_MIGRATION`])
-                // is one of the participants, or more than one non-framework
-                // source is. Silently leaving this unresolved is not safe
-                // the way the fully unrelated case above is: the caller
-                // still goes on to apply the disambiguated migrations
-                // regardless, which would record the framework migration as
-                // already applied (skipping its real DDL) while a
-                // non-framework migration re-runs under its substitute and
-                // hard-errors on non-idempotent DDL. Fail loudly instead, so
-                // an operator resolves the naming collision by hand before
-                // anything is applied.
-                return Err(MigrationError::Migration(format!(
-                    "SQLite migration version {version} is claimed by more than \
-                     one registered migration ({names_at_version:?}), including \
-                     one this SQLite fork introduces (issue #2699), and which \
-                     side already applied cannot be determined automatically. \
-                     Rename the conflicting migration to a fresh version so its \
-                     history can be resolved unambiguously."
-                )));
+                None => continue,
             }
         };
         if remapped_ran {
