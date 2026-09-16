@@ -957,6 +957,32 @@ impl CollabText {
     /// unbounded, because [`CollabText::decode_column`] reads a column this
     /// crate wrote and capped on the way in.
     fn from_wire(wire: Wire) -> Self {
+        // `apply` drops an id at or past the ceiling and says so only in a
+        // return value this replay ignores, so a document carrying one comes
+        // back short of those characters. `Deserialize` refuses such a
+        // document outright, but `decode_column` reads a column rather than a
+        // request and has no such door to close: refusing would strand the
+        // row, and reading it as prose would be worse. So it is read, and the
+        // loss is said out loud — silence here would let the next
+        // `encode_column` write the truncated version back as canonical.
+        let unusable = wire
+            .elems
+            .iter()
+            .filter(|elem| elem.id.counter >= MAX_COUNTER)
+            .count()
+            + wire
+                .pending
+                .iter()
+                .filter(|op| op.minted_counter() >= MAX_COUNTER)
+                .count();
+        if unusable > 0 {
+            tracing::warn!(
+                unusable,
+                ceiling = MAX_COUNTER,
+                "collab: stored document carries ids past the counter ceiling; \
+                 they cannot be replayed and are dropped"
+            );
+        }
         let mut doc = Self::new();
         for elem in &wire.elems {
             doc.apply(CollabOp::Insert {
@@ -1207,6 +1233,28 @@ mod tests {
             refused.to_string().contains("buffered operations"),
             "the refusal names the buffer: {refused}"
         );
+    }
+
+    /// A stored column with an unusable id still reads, and says what it lost.
+    ///
+    /// The request door refuses such a document; this one cannot — refusing
+    /// would strand the row and reading it as prose would be worse. What it
+    /// must not do is lose the characters quietly, because the next
+    /// `encode_column` writes the shortened document back as canonical.
+    #[test]
+    fn a_stored_document_with_an_unusable_counter_reads_without_it() {
+        let raw = serde_json::json!({
+            "elems": [
+                { "id": "1@ada", "ch": "a" },
+                { "id": format!("{MAX_COUNTER}@broken"), "after": "1@ada", "ch": "b" },
+            ],
+            "pending": [],
+        })
+        .to_string();
+
+        let doc = CollabText::decode_column(&raw);
+        assert_eq!(doc.text(), "a", "the usable character survives");
+        assert_eq!(doc.pending_len(), 0, "and the unusable one is not buffered");
     }
 
     /// A document carrying an id past the counter ceiling is refused whole.
