@@ -194,19 +194,35 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
 /// row on its own — same shape of gap as [`nodes_contain_an_li`] fixes for
 /// the list walkers.
 fn nodes_contain_table_output(nodes: &[Node]) -> bool {
-    nodes.iter().any(|node| {
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
         let Node::Element { tag, children } = node else {
-            return false;
+            continue;
         };
         match tag.as_str() {
-            "tr" => children.iter().any(
-                |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
-            ),
-            "thead" | "tbody" | "tfoot" => nodes_contain_table_output(children),
-            _ if is_non_rendered(tag) => false,
-            _ => subtree_has_nonempty_text(children),
+            "tr" => {
+                if children.iter().any(
+                    |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
+                ) {
+                    return true;
+                }
+            }
+            // The HTML parser auto-closes a <thead>/<tbody>/<tfoot> when
+            // another one of the three opens (see html::implicitly_closes),
+            // so real markup can never nest them — pushed onto the same
+            // stack as everything else purely for defense in depth, the
+            // same reason the whole walk is iterative rather than
+            // recursive.
+            "thead" | "tbody" | "tfoot" => stack.extend(children),
+            _ if is_non_rendered(tag) => {}
+            _ => {
+                if subtree_has_nonempty_text(children) {
+                    return true;
+                }
+            }
         }
-    })
+    }
+    false
 }
 
 /// A4 portrait, matching the default most other frameworks in this space
@@ -401,8 +417,8 @@ fn inline_spans(
         }
         return;
     }
+    let more_after = glue_after_each(nodes, has_more_after);
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = later_content_could_glue(&nodes[i + 1..]) || has_more_after;
         match node {
             Node::Text(text) => {
                 if !text.is_empty() {
@@ -415,8 +431,12 @@ fn inline_spans(
             }
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
-                "strong" | "b" => inline_spans(children, true, italic, depth + 1, more_after, out),
-                "em" | "i" => inline_spans(children, bold, true, depth + 1, more_after, out),
+                "strong" | "b" => {
+                    inline_spans(children, true, italic, depth + 1, more_after[i + 1], out);
+                }
+                "em" | "i" => {
+                    inline_spans(children, bold, true, depth + 1, more_after[i + 1], out);
+                }
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
                     push_block_break(out);
@@ -429,11 +449,17 @@ fn inline_spans(
                     push_block_break(out);
                 }
                 _ if is_block_boundary_in_inline_context(tag) => {
+                    // Unlike the transparent cases above, this tag's own
+                    // trailing push_block_break (right below) unconditionally
+                    // separates its content from whatever follows it out
+                    // here — so that later content can never glue to
+                    // anything inside, regardless of what more_after[i + 1]
+                    // says.
                     push_block_break(out);
-                    inline_spans(children, bold, italic, depth + 1, more_after, out);
+                    inline_spans(children, bold, italic, depth + 1, false, out);
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, more_after, out),
+                _ => inline_spans(children, bold, italic, depth + 1, more_after[i + 1], out),
             },
         }
     }
@@ -623,8 +649,8 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         }
     };
 
+    let more_after = glue_after_each(nodes, false);
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = later_content_could_glue(&nodes[i + 1..]);
         match node {
             Node::Text(text) => {
                 // Pushed even when whitespace-only: a text node between two
@@ -719,16 +745,38 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     }
                     "br" => pending.push(Span::Break),
                     "strong" | "b" => {
-                        inline_spans(children, true, false, depth + 1, more_after, &mut pending);
+                        inline_spans(
+                            children,
+                            true,
+                            false,
+                            depth + 1,
+                            more_after[i + 1],
+                            &mut pending,
+                        );
                     }
                     "em" | "i" => {
-                        inline_spans(children, false, true, depth + 1, more_after, &mut pending);
+                        inline_spans(
+                            children,
+                            false,
+                            true,
+                            depth + 1,
+                            more_after[i + 1],
+                            &mut pending,
+                        );
                     }
                     _ if is_non_rendered(tag) => {}
                     // Transparent passthrough: unknown/inline wrapper tags
                     // (span, a, ...) flow their children into the current
                     // implicit paragraph rather than being dropped.
-                    _ => flatten_into_pending(children, depth + 1, more_after, &mut pending, out),
+                    _ => {
+                        flatten_into_pending(
+                            children,
+                            depth + 1,
+                            more_after[i + 1],
+                            &mut pending,
+                            out,
+                        );
+                    }
                 }
             }
         }
@@ -756,8 +804,8 @@ fn flatten_into_pending(
     // it only ever produced inline text (no nested block tags fired), that
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
+    let more_after = glue_after_each(nodes, has_more_after);
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = later_content_could_glue(&nodes[i + 1..]) || has_more_after;
         match node {
             Node::Text(text) => {
                 // See the matching comment in `flatten_blocks` — a
@@ -802,13 +850,35 @@ fn flatten_into_pending(
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => {
-                            inline_spans(children, true, false, depth + 1, more_after, pending);
+                            inline_spans(
+                                children,
+                                true,
+                                false,
+                                depth + 1,
+                                more_after[i + 1],
+                                pending,
+                            );
                         }
                         "em" | "i" => {
-                            inline_spans(children, false, true, depth + 1, more_after, pending);
+                            inline_spans(
+                                children,
+                                false,
+                                true,
+                                depth + 1,
+                                more_after[i + 1],
+                                pending,
+                            );
                         }
                         _ if is_non_rendered(tag) => {}
-                        _ => flatten_into_pending(children, depth + 1, more_after, pending, out),
+                        _ => {
+                            flatten_into_pending(
+                                children,
+                                depth + 1,
+                                more_after[i + 1],
+                                pending,
+                                out,
+                            );
+                        }
                     }
                 }
             }
@@ -849,33 +919,40 @@ fn ends_with_glueable_word(out: &[Span]) -> bool {
     matches!(out.last(), Some(Span::Run { text, .. }) if !text.ends_with(is_breakable_whitespace))
 }
 
-/// The other half of [`ends_with_glueable_word`]: true if processing
-/// `nodes` in document order — the way [`inline_spans`]/[`flatten_into_pending`]
-/// actually would — could ever push a real (non-whitespace) word into the
-/// buffer they share, before anything interposes a break of its own.
-///
-/// A `<br>`, a `<ul>`/`<ol>` (always wrapped in a break by
-/// [`push_block_break`], regardless of whether it has a real `<li>`), or an
-/// [`is_block_boundary_in_inline_context`] tag stops the search outright —
-/// each one already separates whatever comes after it from whatever came
-/// before, so nothing beyond it can retroactively matter to a glue risk
-/// found earlier. A non-rendered tag (`<script>`, ...) contributes nothing
-/// but doesn't stop the search either — a real sibling after it still
-/// counts. Whitespace-only text doesn't stop the search or confirm it —
-/// same as [`words_of`], it's a non-event on its own.
-///
-/// Walks in document order with an explicit stack (children pushed in
-/// reverse, so popping yields left-to-right) for the same stack-safety
-/// reason as [`subtree_has_visible_content`]: a later sibling can itself be
-/// arbitrarily deep.
-fn later_content_could_glue(nodes: &[Node]) -> bool {
-    let mut stack: Vec<&Node> = Vec::new();
-    stack.extend(nodes.iter().rev());
+/// The other half of [`ends_with_glueable_word`]: whether processing a
+/// sequence of nodes in document order — the way
+/// [`inline_spans`]/[`flatten_into_pending`] actually would — pushes a real
+/// (non-whitespace) word into the buffer they share, stops that from ever
+/// happening, or leaves it undecided.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlueLookahead {
+    /// Found real (non-whitespace) text: a later word really could glue.
+    Confirmed,
+    /// Hit a `<br>`, a `<ul>`/`<ol>` (always wrapped in a break by
+    /// [`push_block_break`], regardless of whether it has a real `<li>`), or
+    /// an [`is_block_boundary_in_inline_context`] tag — each one already
+    /// separates whatever comes after it from whatever came before, so
+    /// nothing beyond it, inside this list or outside it, can retroactively
+    /// glue across that point.
+    Stopped,
+    /// Nothing in this list decided either way (empty, all whitespace, all
+    /// skipped non-rendered tags): defer to whatever follows it.
+    Exhausted,
+}
+
+/// [`GlueLookahead`] for one node's own subtree, treating its children the
+/// way [`inline_spans`]/[`flatten_into_pending`] would recurse into them.
+/// Walks with an explicit stack (children pushed in reverse, so popping
+/// yields left-to-right) for the same stack-safety reason as
+/// [`subtree_has_visible_content`]: a transparent wrapper's content can
+/// itself be arbitrarily deep.
+fn node_glue_lookahead(node: &Node) -> GlueLookahead {
+    let mut stack: Vec<&Node> = vec![node];
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
                 if text.chars().any(|c| !is_breakable_whitespace(c)) {
-                    return true;
+                    return GlueLookahead::Confirmed;
                 }
             }
             Node::Element { tag, children } => {
@@ -884,7 +961,7 @@ fn later_content_could_glue(nodes: &[Node]) -> bool {
                     || tag == "ol"
                     || is_block_boundary_in_inline_context(tag)
                 {
-                    return false;
+                    return GlueLookahead::Stopped;
                 }
                 if !is_non_rendered(tag) {
                     stack.extend(children.iter().rev());
@@ -892,7 +969,28 @@ fn later_content_could_glue(nodes: &[Node]) -> bool {
             }
         }
     }
-    false
+    GlueLookahead::Exhausted
+}
+
+/// For every position in `nodes`, whether the *remaining* siblings after it
+/// (plus `has_more_after` once those run out) could glue — the
+/// `more_after` each loop iteration needs, computed once per list instead
+/// of rescanning the shrinking suffix on every iteration (that rescan is
+/// O(n) per node, O(n²) overall for n flat siblings).
+///
+/// One backward pass: computing the verdict for `nodes[i..]` only needs
+/// node `i`'s own [`node_glue_lookahead`] (visited once, however deep its
+/// own subtree is) plus the already-computed verdict for `nodes[i+1..]`.
+fn glue_after_each(nodes: &[Node], has_more_after: bool) -> Vec<bool> {
+    let mut after = vec![has_more_after; nodes.len() + 1];
+    for i in (0..nodes.len()).rev() {
+        after[i] = match node_glue_lookahead(&nodes[i]) {
+            GlueLookahead::Confirmed => true,
+            GlueLookahead::Stopped => false,
+            GlueLookahead::Exhausted => after[i + 1],
+        };
+    }
+    after
 }
 
 /// Flatten `spans` into words, splitting each run's text on whitespace and
@@ -2889,6 +2987,32 @@ mod tests {
         assert!(!pages.is_empty());
     }
 
+    #[test]
+    fn deeply_nested_table_sections_do_not_overflow_the_stack() {
+        // nodes_contain_table_output (the depth-cap guard's own truncation
+        // check) must stay stack-safe for an arbitrarily deep subtree, the
+        // same way the renderer itself does — a naive recursive walk
+        // through thead/tbody/tfoot would crash right where the cap was
+        // supposed to protect against exactly this. The HTML parser
+        // auto-closes a <thead>/<tbody>/<tfoot> when another one of the
+        // three opens (see html::implicitly_closes), so real markup can
+        // never actually nest them — this builds the Node tree directly
+        // to test the function's own stack safety regardless of what the
+        // current parser happens to allow. (Codex review on PR #2810.)
+        let mut node = Node::Element {
+            tag: "thead".to_owned(),
+            children: Vec::new(),
+        };
+        for _ in 0..2_000_000 {
+            node = Node::Element {
+                tag: "thead".to_owned(),
+                children: vec![node],
+            };
+        }
+        // Must not panic/overflow.
+        assert!(!nodes_contain_table_output(std::slice::from_ref(&node)));
+    }
+
     // ── Depth-cap truncation must be visible, not silent (issue #2801) ──
 
     /// Counts `WARN` events at `target` seen while it is the default
@@ -3192,6 +3316,46 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "a <script> sibling never renders, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn glue_lookahead_does_not_cross_an_enclosing_block_boundary() {
+        // inline_spans always wraps a <div> in push_block_break before AND
+        // after recursing into its children — so whatever the div's own
+        // deeply-capped content does, "B" outside it can never glue to
+        // "A" inside it: the trailing break already separates them either
+        // way. The lookahead passed into the div's own children must not
+        // inherit "B follows the div" as a reason to warn. (Codex review
+        // on PR #2810.)
+        let html = format!(
+            "<table><tr><td><div>A{}{}{}</div>B</td></tr></table>",
+            "<span>".repeat(513),
+            " ",
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "push_block_break already separates the div from \"B\" regardless, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn glue_lookahead_over_many_siblings_is_linear_not_quadratic() {
+        // Regression: computing more_after fresh for every sibling
+        // (later_content_could_glue(&nodes[i+1..]) inside the loop) scans
+        // the whole remaining suffix on every iteration — O(n) per node,
+        // O(n^2) overall for n flat top-level siblings, even nowhere near
+        // the depth cap. (Codex review on PR #2810.)
+        let html = "<span>x</span>".repeat(20_000);
+        let start = std::time::Instant::now();
+        let pages = render_pages(&html);
+        assert!(!pages.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "render_pages took {:?} — looks quadratic again",
+            start.elapsed()
         );
     }
 
