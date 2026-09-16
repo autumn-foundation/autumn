@@ -26,11 +26,13 @@ runs: 88 cancelled, 18 success, 13 failure.
 
 All 13 run-level failures triaged by job/log inspection:
 
-- **11 were a WIP branch's own `Clippy`/`Lint` failure** — ordinary
+- **9 were a WIP branch's own `Clippy`/`Lint` failure** — ordinary
   in-progress work, not a CI health issue.
   `claude/determined-bardeen-unefhv` alone accounts for 4 (iterating on the
-  same fix across pushes); `claude/eager-turing-gqo7ng` and
-  `claude/inspiring-ramanujan-95ccd6` 2 each; three more single-branch hits.
+  same fix across pushes); `claude/eager-turing-gqo7ng` 2; three more
+  single-branch hits (`claude/inspiring-ramanujan-95ccd6` once,
+  `vesper/bugbash-2801-pdf-depth-warn` once,
+  `vesper/bugbash-2370-dump-cache-coherence-env` once).
 - **1 was `vesper/macro-crate-split`'s own multi-job break** — `Lint`,
   `MSRV`, `Plugin API contract`, `SQLite runtime`, `Edge capsule
   conformance`, `Sim sweep`, `Supply chain`, and `Migration guide
@@ -54,12 +56,20 @@ both organic** (neither triggering branch touches hot-upgrade code):
    accept writes after the cutover"` — **a signature not previously recorded
    in this ledger.** The connection-failure counter line printed immediately
    above the panic reads `refused=0 hard_failures_after_retry=0
-   mid_flight_resets_retried=0 startup_barrier_hits_retried=0` — all four
-   counters PR #2645 added are clean, so none of that fix's three named
-   retry mechanisms (startup-barrier wait, adaptive cutover window,
-   startup-barrier retry) fired. Whatever rejected the write did so without
-   tripping any of them. `test result: FAILED. 5 passed; 1 failed`, same
-   shape as every other hit on this test.
+   mid_flight_resets_retried=0 startup_barrier_hits_retried=0`. **Correction
+   (post-review, via a Codex review comment on this PR): these four counters
+   do not rule out all three of PR #2645's named mechanisms.** `refused` and
+   `hard_failures_after_retry` are connection-outcome counters this ledger
+   already attributes to PR #2510, not #2645; `mid_flight_resets_retried`
+   predates #2645 too (the pre-existing `with_reset_retry` path). Of #2645's
+   own three mechanisms, only the third (the startup-barrier retry) has a
+   dedicated counter — `startup_barrier_hits_retried`, which reads 0 here,
+   ruling that one out for this occurrence. The other two (the
+   `wait_until_ready` startup-barrier poll, and the adaptive post-cutover
+   wait replacing the old fixed 3.5s window) have no counter at all, so
+   whether either was active when this write was rejected is unknown from
+   this log alone. `test result: FAILED. 5 passed; 1 failed`, same shape as
+   every other hit on this test.
 2. **Run 35069353632** (branch `claude/friendly-ritchie-wol314`, completed
    2026-09-16T09:15:56Z): panic at `./tests/live_upgrade.rs:686:5`, `test
    result: FAILED. 5 passed; 1 failed` — same line number and same
@@ -79,14 +89,15 @@ though neither hit alone clears the rerun-rate bar.
 
 Verdict not rendered for either hit — both remain hypotheses pending a rerun
 campaign, per this role's own bar. The line-714 signature is genuinely new:
-it doesn't match any of the three mechanisms PR #2645 named and fixed, nor
-either of the other two open signatures this ledger already tracks
-(line-567 "new build never served," line-686 `status: 0`). Whether it's a
-fourth independent timing sensitivity in the test's own load-window design,
-or a real product-side race in the write path specifically (as opposed to
-the read path the other signatures concern), is unknown from a single
-occurrence — exactly the ambiguity a rerun campaign exists to resolve before
-anyone touches code.
+it doesn't match either of the other two open signatures this ledger already
+tracks (line-567 "new build never served," line-686 `status: 0`), and its
+counters rule out one of PR #2645's three named mechanisms (the
+startup-barrier retry) but not the other two, which have no counter to check
+against (see the correction above). Whether it's a fourth independent timing
+sensitivity in the test's own load-window design, or a real product-side
+race in the write path specifically (as opposed to the read path the other
+signatures concern), is unknown from a single occurrence — exactly the
+ambiguity a rerun campaign exists to resolve before anyone touches code.
 
 ## 🔧 Treatment
 

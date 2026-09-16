@@ -857,11 +857,16 @@ without also filling in the intake form above.
   `perPage=100` pages: page 1 covered 2026-09-15T16:38:14Z–09:40:05Z, page 2
   covered back to 2026-09-14T07:25:10Z with margin past the window's near
   edge) — 119 runs: 88 cancelled/18 success/13 failure. All 13 run-level
-  failures triaged by job/log inspection: 11 were a WIP branch's own
-  `Clippy`/`Lint` failure (`claude/determined-bardeen-unefhv` alone
-  accounts for 4 of these, iterating on the same fix across pushes;
-  `claude/eager-turing-gqo7ng` and `claude/inspiring-ramanujan-95ccd6` 2
-  each), 1 was `vesper/macro-crate-split`'s own multi-job break (Lint, MSRV,
+  failures triaged by job/log inspection: **correction (post-review, via a
+  Codex review comment on PR #2823): the original pass of this ledger entry
+  said 11 `Clippy`/`Lint` failures, which double-counted one run and made
+  the categories sum to 15 against a 13-run total — it is 9.** 9 were a WIP
+  branch's own `Clippy`/`Lint` failure (`claude/determined-bardeen-unefhv`
+  alone accounts for 4 of these, iterating on the same fix across pushes;
+  `claude/eager-turing-gqo7ng` 2; `claude/inspiring-ramanujan-95ccd6`,
+  `vesper/bugbash-2801-pdf-depth-warn`, and
+  `vesper/bugbash-2370-dump-cache-coherence-env` 1 each), 1 was
+  `vesper/macro-crate-split`'s own multi-job break (Lint, MSRV,
   Plugin API contract, SQLite runtime, Edge capsule conformance, Sim sweep,
   Supply chain, and a `Markdown link gate` failure all on the same run,
   consistent with an in-progress crate-split refactor rather than a CI
@@ -882,9 +887,20 @@ without also filling in the intake form above.
      recorded in this entry.** The counter line printed immediately above
      it reads `"connection failures across cutover: refused=0
      hard_failures_after_retry=0 mid_flight_resets_retried=0
-     startup_barrier_hits_retried=0"` — all four counters PR #2645 added
-     are clean, so none of that fix's three named retry mechanisms fired;
-     whatever rejected the write did so without tripping any of them.
+     startup_barrier_hits_retried=0"`. **Correction (post-review, via a
+     Codex review comment on PR #2823): these four counters do not clear
+     all three of PR #2645's named mechanisms.** `refused` and
+     `hard_failures_after_retry` are connection-outcome counters this
+     ledger already attributes to PR #2510, not #2645 (see that entry's
+     "refused == 0 / hard == 0 split" note above); `mid_flight_resets_retried`
+     predates #2645 too, via the pre-existing `with_reset_retry` path. Of
+     #2645's own three mechanisms, only the third (the startup-barrier
+     retry) has a dedicated counter — `startup_barrier_hits_retried`,
+     clean here, ruling that one out for this occurrence. The other two
+     (the `wait_until_ready` startup-barrier poll, and the adaptive
+     post-cutover wait that replaced the old fixed 3.5s window) have no
+     counter at all, so whether either was active when this write was
+     rejected is unknown from this log alone.
      `test result: FAILED. 5 passed; 1 failed`, same as every other hit
      on this test. Undiagnosed — a fourth distinct assertion on this test
      (after the macOS connection-error cluster, the Linux line-567
