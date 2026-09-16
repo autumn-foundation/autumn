@@ -764,6 +764,121 @@ fn an_edit_made_and_ended_inside_the_write_window_survives() {
     assert!(hub.open_keys().is_empty());
 }
 
+/// A backend that refuses every publish, exactly as the Redis one does when
+/// its publisher queue is full or closed: it returns before its own local
+/// fan-out, so the editors on this node lose the message too.
+struct RefusingBackend {
+    local: autumn_web::channels::LocalChannelsBackend,
+}
+
+impl autumn_web::channels::ChannelsBackend for RefusingBackend {
+    fn publish(
+        &self,
+        _topic: &str,
+        _msg: autumn_web::channels::ChannelMessage,
+    ) -> Result<usize, autumn_web::channels::ChannelPublishError> {
+        Err(autumn_web::channels::ChannelPublishError::QueueFull)
+    }
+
+    fn ensure_topic(
+        &self,
+        topic: &str,
+    ) -> std::sync::Arc<tokio::sync::broadcast::Sender<autumn_web::channels::ChannelMessage>> {
+        self.local.ensure_topic(topic)
+    }
+
+    fn subscribe(&self, topic: &str) -> autumn_web::channels::Subscriber {
+        self.local.subscribe(topic)
+    }
+
+    fn channel_count(&self) -> usize {
+        self.local.channel_count()
+    }
+
+    fn gc(&self) {
+        self.local.gc();
+    }
+
+    fn snapshot(&self) -> std::collections::HashMap<String, autumn_web::channels::ChannelStats> {
+        self.local.snapshot()
+    }
+}
+
+/// An operation still reaches this node's editors when the publish fails.
+///
+/// The Redis backend returns before its own local fan-out when its publisher
+/// queue is full, so logging and moving on cost the editors here the
+/// operation too — including the one who sent it, whose editor waits forever
+/// for an echo, because a snapshot is only ever sent on join.
+#[tokio::test]
+async fn a_failed_publish_still_reaches_this_node() {
+    let channels = Channels::with_backend(RefusingBackend {
+        local: autumn_web::channels::LocalChannelsBackend::new(16),
+    });
+    let presence = Presence::new(channels.clone());
+    let hub = CollabHub::new(channels, presence);
+    let doc = hub
+        .open_with("notes:25:body", || CollabText::from_text("seed", "hi"))
+        .expect("open the document");
+    let mut watcher = doc.subscribe();
+
+    doc.handle(
+        "ada",
+        CollabClientMessage::Insert {
+            after: doc.document().id_at(1),
+            text: "!".to_owned(),
+        },
+    )
+    .expect("insert");
+
+    let delivered = watcher.try_recv().expect(
+        "the publish failed, but the editors on this node must still see the \
+         operation the document already applied",
+    );
+    let message: CollabServerMessage =
+        serde_json::from_str(delivered.as_str()).expect("a server message");
+    assert!(
+        matches!(message, CollabServerMessage::Ops { .. }),
+        "and it is the operation, not something else: {message:?}"
+    );
+    assert_eq!(doc.text(), "hi!");
+}
+
+/// A seed already past the document limit is refused, not installed.
+///
+/// Nobody has to type for this: a row written before the limit was lowered,
+/// or one whose elements and buffered operations are each inside the wire
+/// bounds but together are not. Installing it would start the authority over
+/// its own advertised bound, serving a document it then refuses edits to.
+#[test]
+fn a_seed_past_the_document_limit_is_refused() {
+    let hub = hub().with_limits(CollabLimits {
+        max_document_chars: 4,
+        ..CollabLimits::default()
+    });
+
+    let refused = hub
+        .open_with("notes:23:body", || {
+            CollabText::from_text("import", "far too long")
+        })
+        .expect_err("the row does not fit");
+    assert!(
+        matches!(refused, CollabError::DocumentFull { limit: 4, .. }),
+        "the refusal names the limit: {refused:?}"
+    );
+    assert!(
+        hub.open_keys().is_empty(),
+        "and nothing was registered, so the next open is not handed an \
+         over-budget document"
+    );
+
+    // One that fits still opens.
+    let ok = hub
+        .open_with("notes:24:body", || CollabText::from_text("import", "fits"))
+        .expect("within the limit");
+    assert_eq!(ok.text(), "fits");
+}
+
 /// `with_limits` binds the handles taken after it, not the ones already out.
 #[test]
 fn with_limits_binds_the_next_handle_not_the_last_one() {

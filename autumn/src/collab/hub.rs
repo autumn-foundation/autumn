@@ -452,6 +452,11 @@ impl CollabHub {
     /// editor already on `key` always gets the live document, whatever the
     /// limit says: refusing them would split a document that is open.
     ///
+    /// Returns [`CollabError::DocumentFull`] when `seed` produces a document
+    /// already past [`CollabLimits::max_document_chars`] — a row written
+    /// before the limit was lowered, or one whose elements and buffered
+    /// operations are each within the wire bounds but together are not.
+    ///
     /// # Panics
     ///
     /// Panics if the internal document registry mutex is poisoned.
@@ -498,6 +503,27 @@ impl CollabHub {
             return Err(CollabError::RegistryFull {
                 open,
                 limit: self.inner.limits.max_documents,
+            });
+        }
+        // The seed is measured like anything else the document holds. A row
+        // can be over budget without anyone having typed a character into
+        // this hub: a limit lowered since it was written, or a document that
+        // is wire-valid at 10 000 elements *plus* 1 000 buffered operations,
+        // because `Deserialize` bounds those two separately. Installing it
+        // would put the authority over its own advertised bound and leave it
+        // refusing edits to a document it served.
+        let held = seeded.element_count() + seeded.pending_len();
+        if held > self.inner.limits.max_document_chars {
+            drop(docs);
+            tracing::warn!(
+                key,
+                held,
+                limit = self.inner.limits.max_document_chars,
+                "collab: seed is past the document limit; refusing to open"
+            );
+            return Err(CollabError::DocumentFull {
+                got: held,
+                limit: self.inner.limits.max_document_chars,
             });
         }
         let state = Arc::new(Mutex::new(DocState::new(seeded)));
@@ -1079,16 +1105,39 @@ impl CollabDoc {
         });
     }
 
-    /// Publish a server message. A failed publish is logged, never returned:
-    /// the operation is already in the document, and the editors that missed
-    /// it resynchronize from the next snapshot.
+    /// Publish a server message.
+    ///
+    /// A failed publish is logged, never returned: the operation is already in
+    /// the document, and refusing it here would leave the authority and its
+    /// editors disagreeing about whether it happened.
+    ///
+    /// But it is not simply dropped. The Redis backend returns before its own
+    /// local fan-out when its publisher queue is full or closed, so a failure
+    /// there costs the editors **on this node** the operation too — including
+    /// the one who sent it, whose editor stays locked waiting for an echo that
+    /// never comes, because a snapshot is only ever sent on join. So a failed
+    /// publish falls back to the local topic directly. Editors on other nodes
+    /// still miss it until they reconnect, which is what a broken Redis
+    /// means; the node that applied the operation at least agrees with itself.
     fn publish(&self, message: &CollabServerMessage) {
         let Ok(json) = serde_json::to_string(message) else {
             tracing::warn!(key = %self.key, "collab: failed to encode server message");
             return;
         };
-        if let Err(error) = self.channels.publish(&self.topic(), json) {
-            tracing::warn!(key = %self.key, ?error, "collab: failed to publish server message");
+        let topic = self.topic();
+        if let Err(error) = self.channels.publish(&topic, json.clone()) {
+            let delivered = self
+                .channels
+                .backend()
+                .ensure_topic(&topic)
+                .send(json.into())
+                .unwrap_or(0);
+            tracing::warn!(
+                key = %self.key,
+                ?error,
+                delivered,
+                "collab: publish failed; delivered to this node's editors only"
+            );
         }
     }
 }
