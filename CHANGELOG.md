@@ -1677,6 +1677,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **⚡ Bolt: `MemorySearchBackend::keyword_search` sorts only the requested
+  page instead of the whole match set (instructions -15.4%, DHAT bytes
+  -24.9%):** `keyword_search` (`autumn-search/src/memory.rs`) collected every
+  matching document into `hits`, ran a full `sort_hits` (stable `sort_by`)
+  over the entire match set, then handed the sorted `Vec` to `paginate`,
+  which only ever keeps one `size`-row page (20 rows in
+  `benches/keyword_search.rs`, the shape `SearchClient::search` exposes). An
+  AND query over a shared vocabulary routinely matches a large fraction of
+  the corpus — profiling the committed 5,000-document/2-field bench found
+  the sort (`quicksort`/`quicksort'2`) costing ~13.5% of the bench's own
+  instructions to serve a 20-row page out of matches numbering in the
+  thousands. `keyword_search` now computes the page's `offset + size` window
+  up front and calls a new `sort_top_k`, which uses
+  `select_nth_unstable_by` to partition the match set around the last
+  needed index in O(n), then runs the same canonical-order `sort_by` (now
+  `hit_order`, factored out of `sort_hits`) over only that prefix — falling
+  back to a full `sort_hits` when the requested window covers the whole
+  match set. `vector_search`'s own `sort_hits` + `truncate` is untouched:
+  this fix only changes what `keyword_search` measurably pays for, per its
+  committed benchmark.
+  Measured on `autumn-search/benches/keyword_search.rs` (2,000 queries):
+  `valgrind --tool=callgrind` instructions 23,551,537,844 → 19,919,821,513
+  (**-15.4%** overall, **-16.2%** on the per-query marginal after
+  subtracting the shared 0-iteration fixed cost); `valgrind --tool=dhat`
+  total allocated bytes 1,158,185,947 → 870,024,907 (**-24.9%**, block count
+  unchanged at ~18.45M — Rust's stable sort allocates a merge buffer sized
+  to the slice being sorted, so sorting ~20 elements instead of the whole
+  match set shrinks that buffer's size, not the number of allocations).
+  Behavior is unchanged: all 128 `autumn-search` lib tests pass unmodified,
+  including the pagination-total and tie-break-by-id cases.
+
 - **⚡ Bolt: cache the AES-256-GCM cipher on `DataKey` instead of rebuilding
   it on every `encrypt`/`decrypt` call (instructions -25.5%):**
   `KeyRing::encrypt`/`KeyRing::decrypt` (`autumn/src/encryption.rs`, the
