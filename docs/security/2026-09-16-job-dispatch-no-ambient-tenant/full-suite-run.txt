@@ -1,0 +1,42 @@
+  16: std::thread::local::LocalKey<T>::with
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:477:20
+  17: tokio::runtime::context::set_scheduler
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:17
+  18: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:27
+  19: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:817:24
+  20: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:218:33
+  21: tokio::runtime::context::runtime::enter_runtime
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65:16
+  22: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:206:9
+  23: tokio::runtime::runtime::Runtime::block_on_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:374:52
+  24: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:343:18
+  25: assert_no_jobs_enqueued_fails_when_present
+             at ./tests/integration/job_recorder_integration.rs:269:35
+  26: integration_tests::integration::job_recorder_integration::assert_no_jobs_enqueued_fails_when_present::{{closure}}
+             at ./tests/integration/job_recorder_integration.rs:256:54
+  27: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+  28: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test integration::job_recorder_integration::assert_no_jobs_enqueued_fails_when_present - should panic ... ok
+test integration::job_recorder_integration::assert_no_jobs_enqueued_passes_on_fresh_app ... ok
+test integration::job_recorder_integration::captures_enqueues_in_order_with_name_and_payload ... ok
+test integration::job_recorder_integration::full_flow_enqueue_assert_perform_effect ... ok
+test integration::job_recorder_integration::perform_enqueued_jobs_runs_handler_and_drains ... ok
+test integration::job_recorder_integration::perform_enqueued_jobs_surfaces_deserialization_failure ... ok
+test integration::job_recorder_integration::perform_enqueued_jobs_surfaces_handler_error ... ok
+test integration::job_recorder_integration::recorders_are_isolated_between_apps ... ok
+test integration::job_recorder_integration::user_job_interceptor_composes_with_recorder ... ok
+test integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2028 filtered out; finished in 0.31s
+
+
+[exited with code 0]

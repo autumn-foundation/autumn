@@ -1,0 +1,37 @@
+Non-vacuousness check for job_dispatch_carries_no_ambient_tenant
+==================================================================
+
+Temporarily edited autumn/src/test.rs's TestApp::perform_enqueued_jobs to
+wrap the handler invocation in a fake tenant scope, simulating exactly the
+leak the hypothesis worried about:
+
+    let result = match handler {
+        Some(handler) => {
+            crate::tenancy::CURRENT_TENANT
+                .scope(
+                    Some("fake-leaked-tenant".to_string()),
+                    (handler)(self.state.clone(), job.payload),
+                )
+                .await
+        }
+        None => Err(crate::AutumnError::internal_server_error(
+        ...
+
+Reran:
+  cargo test -p autumn-web --test integration_tests --features test-support \
+    -- job_tenant_scope --nocapture
+
+Result: FAILED, on exactly the intended assertion:
+
+running 1 test
+
+thread 'integration::job_tenant_scope::job_dispatch_carries_no_ambient_tenant' (8724) panicked at autumn/src/test.rs:590:9:
+expected all performed jobs to succeed, but 1 failed:
+  - tenant_leak_probe: AutumnError { status: 500, inner: StringError("job dispatch observed ambient tenant \"fake-leaked-tenant\"; CURRENT_TENANT leaked from the enqueuing request into job execution"), details: None, problem_type: None, cache_idempotency_response: false, .. }
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2041 filtered out; finished in 0.28s
+
+The synthetic leak was caught immediately and precisely (naming the leaked
+tenant id). The production code was restored immediately after (verified
+`git diff -- autumn/src/test.rs` is empty); only the new test file and the
+mod.rs registration are committed.
