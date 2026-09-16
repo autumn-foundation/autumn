@@ -9559,7 +9559,7 @@ async fn pg_execute_job(
         }
         return;
     }
-    state.job_registry.record_start(&row.name);
+    state.job_registry.record_pg_start(&row.name, &row.id);
 
     let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
     let job_info_snapshot = jobs_by_name
@@ -16138,7 +16138,7 @@ mod tests {
             state
                 .job_registry()
                 .record_pg_enqueue("racer", "job-b", Some(SHARED_MARK));
-            state.job_registry().record_start("racer");
+            state.job_registry().record_pg_start("racer", &job_id);
 
             assert!(record_pg_lifecycle_ack_result(
                 Ok(true),

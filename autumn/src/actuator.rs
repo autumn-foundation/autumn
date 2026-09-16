@@ -819,18 +819,21 @@ struct QueueGaugeState {
     /// (`JobRegistry::record_cancel_at_backend_offset`) can remove precisely
     /// the mark it pushed instead of guessing which of several co-queued
     /// marks belongs to it — a guess that can land on the wrong job when two
-    /// marks happen to sit at (or near) the same instant. Bounded by
-    /// [`PG_MARKS_BY_JOB_ID_CAP`]: a job that starts or completes normally
-    /// never looks itself up here, so without a cap this would leak one
-    /// entry per Postgres enqueue forever.
+    /// marks happen to sit at (or near) the same instant. `Self::record_pg_start`
+    /// removes a job's entry the moment its mark is popped from the waiting
+    /// queue (a non-terminal retry re-adds it with the retry's own mark), so
+    /// growth tracks live queue residency, not lifetime enqueue count.
+    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`] regardless, as a backstop for
+    /// jobs enqueued but never claimed (a crashed worker, a queue with no
+    /// consumer) — without it those would still leak one entry each forever.
     pg_marks_by_job_id: indexmap::IndexMap<String, u64>,
 }
 
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
 /// realistic count of Postgres jobs sitting `enqueued` at once — enough that
 /// a job an operator wants to cancel is essentially always still tracked —
-/// while keeping the map's memory bounded regardless of how long the process
-/// has been running.
+/// while keeping the map's memory bounded no matter how large an unclaimed
+/// backlog grows.
 const PG_MARKS_BY_JOB_ID_CAP: usize = 10_000;
 
 /// Rebase a surveyed age onto the registry's timeline.
@@ -1218,6 +1221,22 @@ impl JobRegistry {
         self.pop_waiting(name, true);
     }
 
+    /// [`Self::record_start`] for a Postgres-backed job, additionally
+    /// forgetting `id`'s `pg_marks_by_job_id` entry: the mark it pointed at
+    /// was just popped from the waiting queue above, so keeping the entry
+    /// around would only let it go stale (a later cancel-during-retry racing
+    /// a fresh, different waiting mark) rather than bounding
+    /// [`PG_MARKS_BY_JOB_ID_CAP`] by actual queue residency. A non-terminal
+    /// retry re-adds the entry with the retry's own mark via
+    /// [`Self::record_pg_enqueue`]; a job that succeeds or terminally fails
+    /// never needs it again.
+    pub(crate) fn record_pg_start(&self, name: &str, id: &str) {
+        self.record_start(name);
+        if let Ok(mut guard) = self.queues.write() {
+            guard.pg_marks_by_job_id.shift_remove(id);
+        }
+    }
+
     /// Record that a queued job was canceled before execution.
     pub fn record_cancel(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
@@ -1298,15 +1317,16 @@ impl JobRegistry {
     /// (the reason the exact lookup exists at all) — that mismatch corrects
     /// itself at the next durable-backend survey tick.
     ///
-    /// An exact entry can itself be stale: `record_start` pops a job's
-    /// original waiting mark without clearing its `pg_marks_by_job_id`
-    /// entry, and a non-terminal retry then pushes a *new* mark without
-    /// updating that entry either, so a cancel racing a retry can find a
-    /// value that is no longer in the queue at all. The exact removal
-    /// reports whether it actually removed something, and this only trusts
-    /// the exact lookup when it did — a stale entry falls through to the
-    /// same candidate fallback as no entry at all, rather than silently
-    /// leaving the job's real (retried) mark in place.
+    /// An exact entry can still, in principle, be stale — a caller that
+    /// pushes a waiting mark without going through `record_pg_start`/
+    /// `record_pg_enqueue`'s matched clear-then-reset pair (`Self::record_start`
+    /// itself, used directly by the local/redis backends, never touches
+    /// `pg_marks_by_job_id` at all) could leave an entry pointing at a value
+    /// no longer in the queue. The exact removal reports whether it actually
+    /// removed something, and this only trusts the exact lookup when it did
+    /// — a stale entry falls through to the same candidate fallback as no
+    /// entry at all, rather than silently leaving the job's real mark in
+    /// place.
     pub fn record_cancel_at_backend_offset(
         &self,
         name: &str,
@@ -4948,10 +4968,11 @@ mod tests {
         );
     }
 
-    /// A job that starts or completes normally never looks its own exact
-    /// mark up again — `record_cancel_at_backend_offset` is the only reader
-    /// — so without a cap, `note_pg_job_mark` would grow by one entry per
-    /// Postgres enqueue for the lifetime of the process.
+    /// `record_pg_start` removes a job's entry once it actually starts (see
+    /// below), but a job enqueued and never claimed at all — a crashed
+    /// worker, a queue with no consumer — never reaches that call, so
+    /// without a cap `note_pg_job_mark` would grow by one entry per such
+    /// enqueue for the lifetime of the process.
     #[test]
     fn note_pg_job_mark_is_bounded_so_uncancelled_jobs_cannot_leak_memory_forever() {
         let registry = JobRegistry::new();
@@ -4967,7 +4988,36 @@ mod tests {
             registry.pg_marks_len_for_test(),
             PG_MARKS_BY_JOB_ID_CAP,
             "the exact-mark table must never grow past its cap, even when every job it \
-             tracks starts or completes normally and is never looked up again"
+             tracks is enqueued and never claimed at all"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit c0cbfd3: before
+    /// `record_pg_start` existed, an entry stuck around until evicted by
+    /// [`PG_MARKS_BY_JOB_ID_CAP`] regardless of whether its job had long
+    /// since started and completed, so a busy queue's finished jobs could
+    /// push out a still-genuinely-queued long-delay job's entry well before
+    /// the cap's raw count would suggest — degrading that cancel to the
+    /// (weaker) candidate-nearest-match fallback. `record_pg_start` removing
+    /// the entry the instant its mark is consumed means the table tracks
+    /// live queue residency instead of lifetime enqueue count: churning far
+    /// more jobs through start than the cap must never make the table grow
+    /// at all, since none of them are still waiting.
+    #[test]
+    fn record_pg_start_keeps_the_exact_mark_table_bounded_by_live_residency_not_lifetime_enqueues()
+    {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("churn", "mail");
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP * 3) {
+            let id = format!("job-{i}");
+            registry.record_pg_enqueue("churn", &id, Some(u64::try_from(i).unwrap()));
+            registry.record_pg_start("churn", &id);
+        }
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            0,
+            "a job whose mark was consumed by record_pg_start must not linger in the \
+             exact-mark table just because the cap has not been reached"
         );
     }
 
@@ -4991,9 +5041,12 @@ mod tests {
         // Original enqueue: pushes mark_a and notes it under "job-id".
         registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A));
 
-        // The job starts: `record_start` pops mark_a from the queue, but
-        // has no way to know about (and so cannot clear) "job-id"'s exact
-        // entry, which now stales at mark_a.
+        // The job starts: use plain `record_start` (not `record_pg_start`)
+        // to pop mark_a from the queue while deliberately leaving "job-id"'s
+        // exact entry in place, simulating a caller that pushed a waiting
+        // mark outside the `record_pg_start`/`record_pg_enqueue` pair — the
+        // one way an entry can still go stale — so this test exercises the
+        // fallback in isolation from that pair's own bookkeeping.
         registry.record_start("flaky_job");
         assert_eq!(
             registry.waiting_marks_for_test("flaky_job"),
