@@ -259,6 +259,52 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
+- **(0.7.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+  stores a **text CRDT** instead of a plain string, so two people editing the
+  same field merge character by character rather than overwriting each other.
+  The field type becomes `autumn_web::collab::CollabText`, a Replicated
+  Growable Array persisted as JSON in the field's own `TEXT` column (portable
+  Postgres + `SQLite`, the same storage shape `#[translatable]` uses). Give the
+  column `DEFAULT '{"elems":[]}'` (`collab::EMPTY_DOCUMENT`); a bare `'{}'`
+  reads as prose, not as an empty document. Guarantees: replicas holding the
+  same operations render the same text **in any delivery order**; an operation
+  arriving before the character it refers to waits in a buffer rather than
+  being dropped; applying one twice is a no-op, so a reconnect is safe; and an
+  edit anchors to a neighbouring character rather than an index, so it lands
+  where the author meant even when the document changed in flight.
+  Generated: per-field `<f>_text()` / `<f>_insert(actor, index, text)` /
+  `<f>_remove(index, count)` / `<f>_set_text(actor, text)` /
+  `<f>_merge(&other)`, plus field-name-keyed `collaborative(field)` /
+  `collaborative_mut(field)` / `Model::collaborative_fields()`, and a
+  `collab::CollaborativeColumnDescriptor` inventory registration.
+  **Write semantics matter**: use `<f>_set_text` for a whole-field form post —
+  it emits the smallest edit, so a concurrent edit outside the changed span
+  survives. Assigning a fresh `CollabText::from(str)` throws the merge history
+  away. `Serialize` is lossless; `Deserialize` refuses a bare string, so
+  `PUT {"body": "hi"}` is a 422 rather than a silent wipe of everyone else's
+  characters. Refused in combination with `#[encrypted]`, `#[classified]`,
+  `#[searchable]`, `#[translatable]`, `#[normalize]`, `unique`/`indexed`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`,
+  `#[serde(rename)]` and `#[diesel(column_name)]`. `Option<CollabText>` is a
+  compile error — an empty document already means "no text". A pre-existing
+  plain-text column can be declared `#[collaborative]` with **no data
+  migration** (it must be `NOT NULL`; back-fill `''` first).
+  **Live sessions** (needs `presence` too): `state.collab()` is a
+  `collab::CollabHub` holding one live document per field instance.
+  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())` seeds it
+  from the row once, and `collab::hub::serve_socket(&doc, actor, label, socket)`
+  is the whole client protocol from a `#[ws]` handler — operations fan out over
+  a `Channels` topic, membership comes from `Presence`, cursors ride a message
+  merged into the participant list. Authorize the **record** before opening the
+  document: the hub applies no ownership check. The last editor to leave evicts
+  the document; `hub.close(key)` hands back the final state to persist.
+  **Offline**: `collab::CollabResolver::for_table("notes")` replaces
+  last-write-wins for the marked columns of that collection in the
+  offline-sync engine (`sync::server::router`), leaving every other column and
+  every row-level delete to the wrapped resolver. Cost: the merge scans the
+  character list, so it suits note-sized and comment-sized fields. See
+  [collaboration](../../../docs/guide/collaboration.md) and
+  `examples/collab-notes`.
 - **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes

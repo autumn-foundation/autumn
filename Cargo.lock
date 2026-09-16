@@ -2131,6 +2131,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "collab-notes"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "diesel",
+ "example-e2e",
+ "maud",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

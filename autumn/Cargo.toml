@@ -16,6 +16,13 @@ autotests = false
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
+# Conflict-free collaborative editing (issue #1806). Adds
+# `autumn_web::collab`: an in-tree RGA text CRDT (`CollabText`), the
+# `#[collaborative]` model field marker, and the session hub that streams ops
+# and cursors over the existing channel/presence seams. Zero new dependencies.
+# The hub half additionally needs `presence`; the CRDT, the marker and the
+# offline-sync resolver compile without it.
+collab = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
