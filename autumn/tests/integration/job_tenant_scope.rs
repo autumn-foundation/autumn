@@ -133,10 +133,24 @@ fn tenancy_config() -> AutumnConfig {
     config
 }
 
+/// Requires the tenant extractor, not just a bare handler: if
+/// `tenancy_middleware` ever stopped applying to this route (a config
+/// regression, or the route becoming exempt), extraction itself would fail
+/// closed rather than let the enqueue happen with no tenant context — which
+/// would make this whole test's precondition silently vacuous (the job would
+/// then correctly observe `NoTenant`, but only because there never was one).
 #[post("/enqueue-probe")]
-async fn enqueue_probe() -> &'static str {
+async fn enqueue_probe(tenant: autumn_web::tenancy::Tenant) -> AutumnResult<&'static str> {
+    if tenant.0 != "tenant-a-sentinel" {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "enqueue route resolved tenant {:?}, not the expected tenant-a-sentinel; \
+             this test's precondition (enqueuing under an established tenant context) \
+             did not hold",
+            tenant.0
+        )));
+    }
     TenantLeakProbeJob::enqueue(ProbeArgs {}).await.unwrap();
-    "queued"
+    Ok("queued")
 }
 
 /// Poll until `f` returns true or ~2s elapse, yielding to let the in-process

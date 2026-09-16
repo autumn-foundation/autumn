@@ -56,8 +56,11 @@ Added `autumn/tests/integration/job_tenant_scope.rs`,
    `CURRENT_TENANT.try_with(Clone::clone)` and records what it saw; it
    returns `Err` (naming the leaked value) if it observes *any* tenant, `Ok`
    only if it observes none.
-3. POSTs to a route that calls `TenantLeakProbeJob::enqueue(...)` while the
-   request is scoped to `tenant-a-sentinel`.
+3. POSTs to a route that takes the `Tenant` extractor, asserts (500s if not)
+   that it resolved exactly `tenant-a-sentinel`, and only then calls
+   `TenantLeakProbeJob::enqueue(...)` — so the test's own precondition
+   (enqueuing under an actually-established tenant context) is self-checking
+   rather than assumed.
 4. **Phase 1**: waits (`wait_until`, polling) for `TestApp::build`'s
    in-process worker — started by default, the real production dispatch
    path — to actually run the probe, then asserts what it observed.
@@ -85,6 +88,15 @@ assertion ever read it, passing green while proving nothing about the path
 a production deployment actually uses. Restructured into the two
 sequenced, individually-asserted phases above, each verified non-vacuous
 against the specific code path it targets (see `non-vacuous-check.txt`).
+
+A second Codex round then caught that the test never verified its own
+precondition — if tenancy middleware ever stopped applying to the enqueue
+route, the request would still succeed and both phases would correctly
+(but vacuously) observe `NoTenant`, since there was never a tenant to leak
+in the first place. Added the explicit `Tenant`-extractor check in item 3
+above, verified non-vacuous by sending no tenant header (caught earlier,
+by `tenancy_middleware` itself, 400) and by sending the *wrong* tenant
+header (caught only by the new check, 500) — see `non-vacuous-check.txt`.
 
 ## 🔎 Root cause of the fail-safe behavior
 

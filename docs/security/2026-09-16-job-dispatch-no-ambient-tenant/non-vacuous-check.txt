@@ -78,3 +78,39 @@ leaked tenant id), each on the phase whose real dispatch path it was
 injected into, with no cross-phase masking. Only the test file itself
 (autumn/tests/integration/job_tenant_scope.rs) is committed; both
 production-code edits above were reverted after use.
+
+Precondition check — the enqueue route actually resolves the expected tenant
+--------------------------------------------------------------------------
+
+A second Codex review round correctly noted that the test never verified
+its own precondition: if tenancy middleware ever stopped applying to
+/enqueue-probe (config regression, route exemption), the route would still
+enqueue and both phases would correctly observe NoTenant — passing green
+while never actually exercising an enqueue performed under ambient tenant
+context.
+
+Added an explicit check in enqueue_probe() via the Tenant extractor: the
+route now 500s with a named message if the resolved tenant isn't exactly
+"tenant-a-sentinel", rather than silently enqueuing anyway.
+
+Verified non-vacuous two ways:
+
+1. Omitted the x-tenant-id header entirely. Result: tenancy_middleware
+   itself already fails closed —
+
+     assertion `left == right` failed: expected 200 OK, got 400 Bad Request.
+     Body: {...,"detail":"Missing required tenant header: x-tenant-id",...}
+
+2. Sent a different tenant ("wrong-tenant") so extraction succeeds but
+   resolves to the wrong tenant — only this new explicit check catches it:
+
+     assertion `left == right` failed: expected 200 OK, got 500 Internal Server Error.
+     Body: {...,"detail":"Internal server error",...}
+
+   (the 500 is enqueue_probe()'s own guard firing; without it this case
+   would have proceeded to enqueue and the test would have passed for the
+   wrong reason.)
+
+Both temporary header changes were reverted immediately after
+(git diff -- autumn/tests/integration/job_tenant_scope.rs shows only the
+permanent Tenant-extractor guard as a real change, not a header edit).
