@@ -3682,6 +3682,9 @@ impl JobClient {
                 } else {
                     self.registry.record_cancel(name);
                 }
+                // The backend never inserted a row under this id; forget its
+                // provisional exact-mark entry (see `record_deduplicated_enqueue`).
+                self.registry.forget_pg_job_mark(&id_for_enqueue);
                 self.job_admin.record_cancelled(&id_for_enqueue);
             }
             result
@@ -3716,6 +3719,10 @@ impl JobClient {
             } else {
                 self.registry.record_cancel(name);
             }
+            // An interceptor that skips `next` means `actual_enqueue` never
+            // ran, so no row was ever inserted under this id (see
+            // `record_deduplicated_enqueue`).
+            self.registry.forget_pg_job_mark(&id);
             self.job_admin.record_cancelled(&id);
         }
         res.map(|()| {
@@ -3935,6 +3942,11 @@ impl JobClient {
         // This path always follows a real `record_enqueue(_scheduled)` for the
         // coalesced job, so its per-queue waiting mark must be removed.
         self.registry.record_deduplicated(name, true, was_scheduled);
+        // A Postgres-backed attempt also registered `id` provisionally
+        // (`record_pg_enqueue`) before knowing it would coalesce rather than
+        // insert its own row; forget that dead entry so it cannot crowd out
+        // a genuinely queued job's mapping under the exact-mark cap.
+        self.registry.forget_pg_job_mark(id);
         self.job_admin.record_deduplicated(id);
     }
 
@@ -11015,6 +11027,54 @@ mod tests {
         );
 
         clear_global_job_client();
+    }
+
+    /// Regression for the Codex P2 raised on commit 608a3b8: a Postgres-backed
+    /// enqueue registers its id in `pg_marks_by_job_id` provisionally, before
+    /// knowing whether the attempt will actually insert its own row or
+    /// coalesce into an existing unique job. A coalesced attempt's id can
+    /// never be looked up by an admin-cancel — no row was ever inserted under
+    /// it — so its provisional entry has to be forgotten explicitly, or it
+    /// would only ever clear via `PG_MARKS_BY_JOB_ID_CAP`'s eviction, crowding
+    /// out genuinely queued jobs' mappings under high dedup churn.
+    #[test]
+    fn record_deduplicated_enqueue_forgets_the_provisional_exact_mark() {
+        fn minimal_client() -> JobClient {
+            JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: HashMap::new(),
+                interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+                resilience_config: None,
+            }
+        }
+
+        let client = minimal_client();
+        client
+            .registry
+            .record_pg_enqueue("send_email", "dead-id", Some(1_000));
+        assert_eq!(client.registry.pg_marks_len_for_test(), 1);
+
+        client.record_deduplicated_enqueue("send_email", "dead-id", false);
+
+        assert_eq!(
+            client.registry.pg_marks_len_for_test(),
+            0,
+            "a coalesced enqueue's provisional exact-mark entry must not linger \
+             forever just because its id will never be looked up again"
+        );
     }
 
     #[tokio::test]

@@ -1258,6 +1258,22 @@ impl JobRegistry {
         }
     }
 
+    /// Forget `id`'s `pg_marks_by_job_id` entry without touching any waiting
+    /// mark — for an enqueue attempt that [`Self::record_pg_enqueue`]
+    /// registered provisionally but that never became a real queued row: a
+    /// dedup coalesce into an existing unique job, a backend error, or an
+    /// interceptor that skipped the actual enqueue. That `id` will never be
+    /// looked up by an admin-cancel — no row was ever inserted under it — so
+    /// leaving the entry in place would only crowd out a genuinely
+    /// still-queued job's mapping under [`PG_MARKS_BY_JOB_ID_CAP`] for no
+    /// benefit. A no-op if `id` was never entered (a non-Postgres backend,
+    /// or an entry already removed).
+    pub(crate) fn forget_pg_job_mark(&self, id: &str) {
+        if let Ok(mut guard) = self.queues.write() {
+            guard.pg_marks_by_job_id.shift_remove(id);
+        }
+    }
+
     /// Record that a queued job was canceled before execution.
     pub fn record_cancel(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
