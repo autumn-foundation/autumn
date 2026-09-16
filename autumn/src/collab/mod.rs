@@ -57,7 +57,7 @@ pub use registry::{
 };
 pub use text::{
     CollabEditError, CollabElement, CollabOp, CollabText, EMPTY_DOCUMENT, IMPORT_ACTOR,
-    MAX_COUNTER, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId, OpIdParseError,
+    MAX_ACTOR_LEN, MAX_COUNTER, MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING, OpId, OpIdParseError,
 };
 
 #[cfg(feature = "presence")]

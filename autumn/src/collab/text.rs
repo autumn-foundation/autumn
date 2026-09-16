@@ -67,6 +67,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// identically) while making different prose mint different ids.
 pub const IMPORT_ACTOR: &str = "import";
 
+/// The longest actor an id may name.
+///
+/// [`MAX_WIRE_ELEMENTS`] bounds how many elements a payload carries, and the
+/// decode cost measured against it assumed ids of ordinary length. Nothing
+/// bounded the ids themselves: ten thousand elements sharing one counter and
+/// a long common actor prefix fit inside a request body, and then every
+/// comparison the quadratic RGA insertion makes walks that prefix before it
+/// can break the tie. The element count is held while the per-comparison cost
+/// is not, so the measured bound stops meaning anything.
+///
+/// Sixty-four bytes is far more than what this crate mints — `import:` plus a
+/// 16-hex digest is 23, and a session actor is a name plus `#` and a seat —
+/// while keeping a comparison to a handful of words.
+pub const MAX_ACTOR_LEN: usize = 64;
+
 /// The seed actor for one piece of imported prose: [`IMPORT_ACTOR`] plus a
 /// digest of the text.
 ///
@@ -155,6 +170,18 @@ pub enum CollabEditError {
     /// [`OpId::from_str`]: std::str::FromStr
     #[error("actor must not be empty: an id minted with an empty actor cannot be parsed back")]
     EmptyActor,
+    /// The actor was longer than [`MAX_ACTOR_LEN`].
+    ///
+    /// The parser refuses it, so an id minted with it could not be read back —
+    /// and a document full of long ids costs far more to replay than the
+    /// element bound was measured against.
+    #[error("actor is {got} bytes, over the limit of {limit}")]
+    ActorTooLong {
+        /// Bytes the actor carried.
+        got: usize,
+        /// The limit, [`MAX_ACTOR_LEN`].
+        limit: usize,
+    },
     /// The counter space is exhausted.
     ///
     /// Reachable without 2^53 local keystrokes: [`CollabText::apply`] accepts
@@ -185,7 +212,7 @@ impl FromStr for OpId {
         let (counter, actor) = s
             .split_once('@')
             .ok_or_else(|| OpIdParseError(s.to_owned()))?;
-        if actor.is_empty() {
+        if actor.is_empty() || actor.len() > MAX_ACTOR_LEN {
             return Err(OpIdParseError(s.to_owned()));
         }
         let counter = counter.parse().map_err(|_| OpIdParseError(s.to_owned()))?;
@@ -261,27 +288,47 @@ impl CollabOp {
         }
     }
 
-    /// Whether every id this operation carries can be written and read back.
+    /// Every id this operation carries: the one it mints, and the one it
+    /// refers to.
+    fn ids(&self) -> impl Iterator<Item = &OpId> {
+        let (minted, referenced) = match self {
+            Self::Insert { id, after, .. } => (id, after.as_ref()),
+            Self::Delete { target } => (target, None),
+        };
+        std::iter::once(minted).chain(referenced)
+    }
+
+    /// Whether every id this operation carries is one a replica could
+    /// actually hold.
     ///
-    /// [`OpId::from_str`] refuses an empty actor, so an id minted with one
-    /// formats as `"1@"` and cannot be parsed again: a document holding it
-    /// encodes and then fails its own decode, and
-    /// [`decode_column`](CollabText::decode_column) reads that JSON as legacy
-    /// prose and shows it as the text. The minting API refuses an empty actor,
-    /// but an operation can also arrive already built — over `apply`,
-    /// `apply_remote` or `remove_ids` — so the check belongs here too.
+    /// Three ways it is not, and the same answer to each — drop it, because
+    /// no later arrival can make it valid:
     ///
-    /// The references count, not just the minted id: an insert anchored to an
-    /// id no well-formed operation can ever mint would wait in the causal
-    /// buffer for a cause that cannot arrive.
+    /// - **An empty actor.** [`OpId::from_str`] refuses one, so an id minted
+    ///   with it formats as `"1@"` and cannot be parsed again: the document
+    ///   encodes and then fails its own decode, and
+    ///   [`decode_column`](CollabText::decode_column) reads that JSON as
+    ///   legacy prose and shows it as the text.
+    /// - **An actor past [`MAX_ACTOR_LEN`].** Same round-trip failure, and it
+    ///   is also what keeps [`MAX_WIRE_ELEMENTS`] meaning what it measured.
+    /// - **A counter at or past [`MAX_COUNTER`].** [`CollabText::apply`]
+    ///   refuses to mint one, so no insert can ever satisfy a reference to it.
+    ///
+    /// The references count, not only the minted id — `minted_counter`
+    /// deliberately ignores them, because they must not move the clock, and
+    /// that is a separate question from whether they can ever be satisfied.
+    /// An operation naming an unreachable cause would otherwise wait in the
+    /// causal buffer forever, taking up the room the bound allows.
+    ///
+    /// The minting API already refuses the first two, but an operation can
+    /// arrive already built — over `apply`, `apply_remote` or `remove_ids` —
+    /// so the check belongs here too.
     ///
     /// [`OpId::from_str`]: std::str::FromStr
     fn well_formed(&self) -> bool {
-        let usable = |id: &OpId| !id.actor.is_empty();
-        match self {
-            Self::Insert { id, after, .. } => usable(id) && after.as_ref().is_none_or(usable),
-            Self::Delete { target } => usable(target),
-        }
+        self.ids().all(|id| {
+            !id.actor.is_empty() && id.actor.len() <= MAX_ACTOR_LEN && id.counter < MAX_COUNTER
+        })
     }
 
     /// The `(after, ch)` an insert claims for its id, if it is an insert.
@@ -686,6 +733,12 @@ impl CollabText {
         if actor.is_empty() {
             return Err(CollabEditError::EmptyActor);
         }
+        if actor.len() > MAX_ACTOR_LEN {
+            return Err(CollabEditError::ActorTooLong {
+                got: actor.len(),
+                limit: MAX_ACTOR_LEN,
+            });
+        }
         // `insert_after` mints `wanted` counters above `clock` and `apply`
         // refuses `MAX_COUNTER` or more, so the last one must land below it.
         let available = MAX_COUNTER.saturating_sub(clock).saturating_sub(1);
@@ -804,13 +857,14 @@ impl CollabText {
         if op.minted_counter() >= MAX_COUNTER {
             return false;
         }
-        // Drop for the same reason as the ceiling above: an id that cannot be
-        // parsed back can never become valid, so buffering it would only park
-        // an unwritable document in memory.
+        // Drop for the same reason as the ceiling above: an id no replica
+        // could hold can never become valid, so buffering it would only park
+        // an unusable operation in memory — and a reference to an unmintable
+        // id would wait there for a cause that cannot arrive.
         if !op.well_formed() {
             tracing::warn!(
-                "collab: refused an operation carrying an id with an empty actor; \
-                 it could not be read back"
+                "collab: refused an operation carrying an id no replica can hold \
+                 (empty or overlong actor, or a counter past the ceiling)"
             );
             return false;
         }
@@ -1230,15 +1284,20 @@ impl<'de> Deserialize<'de> for CollabText {
                 )));
             }
         }
-        if let Some(op) = wire
+        // Every id the operation carries, not just the one it mints: an
+        // insert anchored past the ceiling, or a delete naming a target
+        // there, can never be satisfied — `apply` refuses to mint such an id —
+        // so it would sit in the buffer for good, holding room the bound
+        // above is meant to ration.
+        if let Some(id) = wire
             .pending
             .iter()
-            .find(|op| op.minted_counter() >= MAX_COUNTER)
+            .find_map(|op| op.ids().find(|id| id.counter >= MAX_COUNTER))
         {
             return Err(serde::de::Error::custom(format!(
                 "collaborative document buffers an unusable operation: counter {} \
                  is at or past the ceiling of {MAX_COUNTER}",
-                op.minted_counter(),
+                id.counter,
             )));
         }
         // Replay under a cap. The order is not the problem — a scrambled
@@ -1935,6 +1994,92 @@ mod tests {
         );
     }
 
+    /// `MAX_WIRE_ELEMENTS` bounds how many elements arrive, not how big their
+    /// ids are. Ten thousand elements sharing a long common actor prefix fit
+    /// in a request body, and then every comparison the RGA insertion makes
+    /// walks that prefix — the count is held while the cost per comparison is
+    /// not. The parser is the door every id comes through.
+    #[test]
+    fn an_overlong_actor_is_refused_at_every_door() {
+        let long = "a".repeat(MAX_ACTOR_LEN + 1);
+        assert!(
+            format!("1@{long}").parse::<OpId>().is_err(),
+            "the parser refuses it"
+        );
+        assert!(
+            format!("1@{}", "a".repeat(MAX_ACTOR_LEN))
+                .parse::<OpId>()
+                .is_ok(),
+            "the bound is inclusive"
+        );
+
+        // Minting, so that what this crate writes can always be read back.
+        let mut doc = CollabText::new();
+        assert!(matches!(
+            doc.insert(&long, 0, "x").expect_err("overlong actor"),
+            CollabEditError::ActorTooLong {
+                limit: MAX_ACTOR_LEN,
+                ..
+            }
+        ));
+
+        // And an operation handed straight to `apply`, which the parser never
+        // sees.
+        assert!(!doc.apply(CollabOp::Insert {
+            id: OpId::new(1, long.clone()),
+            after: None,
+            ch: 'x',
+        }));
+        assert_eq!(doc.pending_len(), 0);
+
+        // A whole document of them never gets as far as the replay.
+        let json = serde_json::json!({
+            "elems": [{ "id": format!("1@{long}"), "ch": "x" }],
+            "pending": [],
+        })
+        .to_string();
+        assert!(serde_json::from_str::<CollabText>(&json).is_err());
+    }
+
+    /// A reference past the ceiling names a character no replica can ever
+    /// mint, so the operation would wait in the buffer for good — holding
+    /// room the bound is there to ration. `minted_counter` ignores references
+    /// on purpose (they must not move the clock), which is a different
+    /// question from whether they can ever be satisfied.
+    #[test]
+    fn a_reference_past_the_ceiling_is_refused_rather_than_buffered() {
+        let unreachable = OpId::new(MAX_COUNTER, "ghost");
+        let mut doc = CollabText::new();
+
+        assert!(!doc.apply(CollabOp::Insert {
+            id: OpId::new(1, "ada"),
+            after: Some(unreachable.clone()),
+            ch: 'x',
+        }));
+        assert!(!doc.apply(CollabOp::Delete {
+            target: unreachable.clone(),
+        }));
+        assert_eq!(
+            doc.pending_len(),
+            0,
+            "nothing waits on a cause that cannot arrive"
+        );
+
+        // Refused at the door too, rather than silently dropped on replay.
+        let json = serde_json::json!({
+            "elems": [],
+            "pending": [
+                { "op": "insert", "id": "1@ada", "after": unreachable.to_string(), "ch": "x" },
+            ],
+        })
+        .to_string();
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("unreachable anchor");
+        assert!(
+            refused.to_string().contains("ceiling"),
+            "the refusal names the ceiling: {refused}"
+        );
+    }
+
     /// A document that reuses one id for two different characters is refused.
     ///
     /// Its own text would depend on the order it was read in, and a merge with
@@ -2284,22 +2429,27 @@ mod tests {
 
     /// A reference a sender supplies must never move the Lamport clock.
     ///
-    /// Trusting one lets a single message push the clock to `u64::MAX`, after
-    /// which the next character either panics the mint or wraps into an id
-    /// that already exists and is silently dropped.
+    /// Trusting one lets a single message push the clock to the ceiling, after
+    /// which the next character either mints nothing or wraps into an id that
+    /// already exists and is silently dropped.
+    ///
+    /// The reference here is as far ahead as one may legally be — a counter
+    /// *at* the ceiling is refused outright, along with the whole operation
+    /// carrying it, which
+    /// `a_reference_past_the_ceiling_is_refused_rather_than_buffered` covers.
+    /// This is the accepted case, where the clock must still ignore it.
     #[test]
     fn a_referenced_id_from_the_future_does_not_move_the_clock() {
         let mut doc = CollabText::from_text("seed", "hi").expect("collab edit refused");
         let before = doc.clock();
+        let far_ahead = OpId::new(MAX_COUNTER - 1, "x");
 
         doc.apply(CollabOp::Insert {
             id: OpId::new(before + 1, "x"),
-            after: Some(OpId::new(u64::MAX, "x")),
+            after: Some(far_ahead.clone()),
             ch: 'z',
         });
-        doc.apply(CollabOp::Delete {
-            target: OpId::new(u64::MAX, "x"),
-        });
+        doc.apply(CollabOp::Delete { target: far_ahead });
 
         assert_eq!(
             doc.clock(),
