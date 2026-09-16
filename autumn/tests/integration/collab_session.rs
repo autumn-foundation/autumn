@@ -882,6 +882,47 @@ fn an_already_buffered_replay_is_not_broadcast_again() {
     assert_eq!(doc.document().pending_len(), 1, "still the one copy");
 }
 
+/// A replay of history the document already integrated is not broadcast
+/// either — and does not pretend the document changed.
+///
+/// `apply` answers `true` for an idempotent replay exactly as it does for a
+/// first arrival, so a reconnecting peer could fan its whole history out to
+/// every socket, again on every reconnect. The revision it bumped on the way
+/// is what tells a close guard the document moved on, so the same replay
+/// could keep a document from ever being released.
+#[test]
+fn a_replay_of_integrated_history_is_not_broadcast_again() {
+    let hub = hub();
+    let doc = hub
+        .open_with("notes:29:body", || CollabText::from_text("seed", "ab"))
+        .expect("open the document");
+
+    // Everything the document already holds, replayed exactly as a
+    // reconnecting peer would send it.
+    let history = doc.document().ops();
+    assert!(!history.is_empty());
+
+    let mut watcher = doc.subscribe();
+    doc.apply_remote(&history).expect("a replay costs nothing");
+
+    assert!(
+        watcher.try_recv().is_err(),
+        "none of it is news, so none of it goes out"
+    );
+    assert_eq!(doc.text(), "ab", "and the document is untouched");
+
+    // The document did not move, so a close still releases it. Close first,
+    // while the handler still holds its handle: dropping it would take the
+    // last strong reference and leave nothing to close.
+    let closing = hub.close("notes:29:body").expect("live");
+    drop(doc);
+    assert!(
+        closing.finalize().is_none(),
+        "a replay that changed nothing must not look like a change"
+    );
+    assert!(hub.open_keys().is_empty());
+}
+
 /// Only one close is outstanding for a document at a time.
 ///
 /// Two persistence paths can reach `close` together — an idle sweep against a

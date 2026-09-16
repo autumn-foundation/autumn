@@ -437,6 +437,25 @@ impl CollabText {
         charged.len().saturating_sub(freed)
     }
 
+    /// Whether this operation would change nothing: the character is already
+    /// here, or the tombstone is already set.
+    ///
+    /// [`apply`](Self::apply) cannot say — it answers `true` for an
+    /// idempotent replay exactly as it does for a first arrival, because from
+    /// the document's side both leave it correct. A caller deciding what to
+    /// forward needs the difference: a reconnecting peer replays its whole
+    /// history, and passing that on is a fan-out of everything to everyone,
+    /// every time.
+    #[must_use]
+    pub fn already_applied(&self, op: &CollabOp) -> bool {
+        match op {
+            CollabOp::Insert { id, .. } => self.index.contains(id),
+            CollabOp::Delete { target } => self
+                .position_of(target)
+                .is_some_and(|at| self.elems[at].deleted),
+        }
+    }
+
     /// The operations still waiting for the character they name.
     ///
     /// A snapshot must carry these: an editor who joins while one waits would
@@ -1001,7 +1020,21 @@ impl<'de> Deserialize<'de> for CollabText {
                 op.minted_counter(),
             )));
         }
-        Ok(Self::from_wire(wire))
+        // Replay under a cap. The order is not the problem — a scrambled
+        // store replaying back to canonical is a guarantee this type makes —
+        // but the buffer it passes through is. Ten thousand elements in
+        // reverse causal order all land in the causal buffer, ten times what
+        // `MAX_WIRE_PENDING` allows a document to be read with, and the drain
+        // rescans that buffer every time one integrates. Bounding the buffer
+        // during the replay bounds both the memory and that quadratic cost,
+        // and it refuses exactly the documents that could not be read back
+        // afterwards anyway.
+        Self::replay_bounded(wire, MAX_WIRE_PENDING).map_err(|held| {
+            serde::de::Error::custom(format!(
+                "collaborative document needs {held} buffered operations to replay, \
+                 over the limit of {MAX_WIRE_PENDING}"
+            ))
+        })
     }
 }
 
@@ -1023,6 +1056,23 @@ impl CollabText {
     /// unbounded, because [`CollabText::decode_column`] reads a column this
     /// crate wrote and capped on the way in.
     fn from_wire(wire: Wire) -> Self {
+        Self::replay(wire, None)
+    }
+
+    /// [`from_wire`](Self::from_wire), refusing once the causal buffer passes
+    /// `max_pending`.
+    ///
+    /// Returns the size the buffer reached. Used by [`Deserialize`], where the
+    /// document is untrusted and the replay is the cost.
+    fn replay_bounded(wire: Wire, max_pending: usize) -> Result<Self, usize> {
+        let doc = Self::replay(wire, Some(max_pending));
+        if doc.pending.len() > max_pending {
+            return Err(doc.pending.len());
+        }
+        Ok(doc)
+    }
+
+    fn replay(wire: Wire, max_pending: Option<usize>) -> Self {
         // `apply` drops an id at or past the ceiling and says so only in a
         // return value this replay ignores, so a document carrying one comes
         // back short of those characters. `Deserialize` refuses such a
@@ -1050,7 +1100,14 @@ impl CollabText {
             );
         }
         let mut doc = Self::new();
+        // Stop early when a cap is set: a replay that has already blown the
+        // buffer is refused whatever the rest of the array holds, and every
+        // further element makes the drain scan more.
+        let over = |doc: &Self| max_pending.is_some_and(|max| doc.pending.len() > max);
         for elem in &wire.elems {
+            if over(&doc) {
+                return doc;
+            }
             doc.apply(CollabOp::Insert {
                 id: elem.id.clone(),
                 after: elem.after.clone(),
@@ -1065,7 +1122,12 @@ impl CollabText {
         }
         // The buffered operations last: one may have become integrable while
         // the document was at rest.
-        doc.apply_all(wire.pending);
+        for op in wire.pending {
+            if over(&doc) {
+                return doc;
+            }
+            doc.apply(op);
+        }
         doc
     }
 
@@ -1371,6 +1433,60 @@ mod tests {
         assert_eq!(doc.element_count(), 2);
         assert_eq!(doc.pending_len(), 0);
         assert_eq!(doc.text(), "a");
+    }
+
+    /// A document that would need too large a causal buffer to replay is
+    /// refused, however its elements are ordered.
+    ///
+    /// The element bound alone did not cover this: ten thousand elements with
+    /// anchors that never arrive pass it, then all land in a buffer allowed a
+    /// thousand — and the drain rescans that buffer every time one
+    /// integrates, which is the quadratic shape the lower bound was measured
+    /// against. Such a document could not have been read back afterwards
+    /// either: its own `pending` would be over the limit.
+    #[test]
+    fn a_document_that_would_overflow_the_replay_buffer_is_refused() {
+        let elems: Vec<serde_json::Value> = (1..=MAX_WIRE_PENDING + 1)
+            .map(|n| {
+                serde_json::json!({
+                    "id": format!("{n}@evil"),
+                    // An anchor that is in no document anywhere.
+                    "after": format!("{}@ghost", 900_000 + n),
+                    "ch": "x",
+                })
+            })
+            .collect();
+        let json = serde_json::json!({ "elems": elems, "pending": [] }).to_string();
+
+        let refused = serde_json::from_str::<CollabText>(&json).expect_err("over the limit");
+        assert!(
+            refused
+                .to_string()
+                .contains("buffered operations to replay"),
+            "the refusal says what it would have cost: {refused}"
+        );
+    }
+
+    /// A scrambled store still replays back to canonical, so long as the
+    /// buffer it passes through fits. That is a guarantee, not an accident.
+    #[test]
+    fn a_scrambled_store_within_the_buffer_still_re_canonicalizes() {
+        let mut doc = CollabText::new();
+        doc.insert("ada", 0, "hello");
+        let encoded = serde_json::to_string(&doc).expect("encode");
+
+        let scrambled = {
+            let mut value: serde_json::Value = serde_json::from_str(&encoded).expect("parse");
+            value["elems"].as_array_mut().expect("elems").reverse();
+            serde_json::to_string(&value).expect("re-encode")
+        };
+
+        let repaired: CollabText = serde_json::from_str(&scrambled).expect("decode");
+        assert_eq!(
+            repaired.text(),
+            "hello",
+            "put back in the order the merge rule says"
+        );
     }
 
     /// A document that reuses one id for two different characters is refused.

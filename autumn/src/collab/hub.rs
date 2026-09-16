@@ -1076,9 +1076,18 @@ impl CollabDoc {
             let accepted: Vec<CollabOp> = ops
                 .iter()
                 .filter(|op| {
-                    let held_before = state.doc.holds_pending(op);
+                    // Nothing new: already integrated, or already waiting.
+                    // `apply` answers `true` for an idempotent replay of an
+                    // integrated operation just as it does for a first
+                    // arrival, so asking it alone re-broadcast a reconnecting
+                    // peer's entire history to every socket — and bumped the
+                    // revision each time, which is what tells a close guard
+                    // the document moved on.
+                    if state.doc.already_applied(op) || state.doc.holds_pending(op) {
+                        return false;
+                    }
                     let integrated = state.edit(|doc| doc.apply((*op).clone()));
-                    integrated || (!held_before && state.doc.holds_pending(op))
+                    integrated || state.doc.holds_pending(op)
                 })
                 .cloned()
                 .collect();
@@ -1377,15 +1386,33 @@ pub async fn serve_socket(
                         // Locally-produced operations arrive here too and
                         // re-apply as no-ops, which is what idempotence is
                         // for.
-                        if let Ok(CollabServerMessage::Ops { ops }) =
+                        let refused = if let Ok(CollabServerMessage::Ops { ops }) =
                             serde_json::from_str::<CollabServerMessage>(&text)
-                            && let Err(error) = doc.merge_delivered(&ops)
                         {
-                            tracing::warn!(
-                                key = %doc.key(),
-                                ?error,
-                                "collab: refused a delivered batch; this replica is behind"
-                            );
+                            doc.merge_delivered(&ops)
+                                .inspect_err(|error| {
+                                    tracing::warn!(
+                                        key = %doc.key(),
+                                        ?error,
+                                        "collab: refused a delivered batch; \
+                                         this replica is behind"
+                                    );
+                                })
+                                .is_err()
+                        } else {
+                            false
+                        };
+                        if refused {
+                            // Forwarding anyway would put characters in this
+                            // editor that the replica it is talking to does
+                            // not have. Its next edit would anchor to one of
+                            // them and come back refused as unknown — the
+                            // editor punished for the replica's shortfall.
+                            // Hand it what this replica actually holds.
+                            if send_json(&mut socket, &session.snapshot()).await.is_err() {
+                                break;
+                            }
+                            continue;
                         }
                         if socket.send(Message::Text(text.into())).await.is_err() {
                             break;
