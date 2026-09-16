@@ -181,11 +181,21 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
 }
 
 /// True if `nodes` has something [`extract_table_rows`] would act on: a
-/// `<tr>` with at least one `<td>`/`<th>` cell (an empty `<tr>` pushes a
-/// zero-cell row too, but [`Writer::draw_table`] draws nothing once every
-/// row's cell count is 0), a `<thead>`/`<tbody>`/`<tfoot>` with such a
-/// `<tr>` inside it, or any other non-[`is_non_rendered`] tag with real
-/// text in it (the catch-all arm turns that into a one-cell row).
+/// `<tr>` with at least one `<td>`/`<th>` cell, a `<thead>`/`<tbody>`/`<tfoot>`
+/// with such a `<tr>` inside it, any other non-[`is_non_rendered`] tag with
+/// real text in it (the catch-all arm turns that into a one-cell row) — or,
+/// when `table_has_other_populated_row` is true, *any* `<tr>` at all, even
+/// an empty one.
+///
+/// A cell-less `<tr>` pushes a zero-cell row, and on its own
+/// [`Writer::draw_table`] draws nothing for it (every row's cell count is
+/// 0, so the table is empty end to end) — but once some *other* row in the
+/// same table has a real cell, `draw_table`'s `n_cols` is already nonzero,
+/// and every row from then on, including a zero-cell one, still consumes a
+/// line and shifts everything after it. `table_has_other_populated_row`
+/// carries that fact in from [`extract_table_rows`]'s own depth-cap guard,
+/// which is the only caller — this predicate has no way to see the rest of
+/// the table itself.
 ///
 /// For `extract_table_rows`'s own depth-cap guard, not
 /// [`subtree_has_visible_content`]: that walker's loop skips every bare
@@ -193,7 +203,7 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
 /// };`), so whitespace between `<table>` and `</table>` never produces a
 /// row on its own — same shape of gap as [`nodes_contain_an_li`] fixes for
 /// the list walkers.
-fn nodes_contain_table_output(nodes: &[Node]) -> bool {
+fn nodes_contain_table_output(nodes: &[Node], table_has_other_populated_row: bool) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
     while let Some(node) = stack.pop() {
         let Node::Element { tag, children } = node else {
@@ -201,9 +211,11 @@ fn nodes_contain_table_output(nodes: &[Node]) -> bool {
         };
         match tag.as_str() {
             "tr" => {
-                if children.iter().any(
-                    |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
-                ) {
+                if table_has_other_populated_row
+                    || children.iter().any(
+                        |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
+                    )
+                {
                     return true;
                 }
             }
@@ -223,6 +235,47 @@ fn nodes_contain_table_output(nodes: &[Node]) -> bool {
         }
     }
     false
+}
+
+/// True if `node`, recursively through `<thead>`/`<tbody>`/`<tfoot>` (the
+/// only tags [`extract_table_rows`] descends into without emitting a row of
+/// its own), contains a `<tr>` with at least one `<td>`/`<th>` cell — i.e.
+/// a row that would push [`Writer::draw_table`]'s `n_cols` above zero.
+/// Walks with an explicit stack for the same stack-safety reason as
+/// [`subtree_has_visible_content`].
+fn node_contains_a_populated_row(node: &Node) -> bool {
+    let mut stack: Vec<&Node> = vec![node];
+    while let Some(node) = stack.pop() {
+        let Node::Element { tag, children } = node else {
+            continue;
+        };
+        match tag.as_str() {
+            "tr" => {
+                if children.iter().any(
+                    |cell| matches!(cell, Node::Element { tag, .. } if tag == "td" || tag == "th"),
+                ) {
+                    return true;
+                }
+            }
+            "thead" | "tbody" | "tfoot" => stack.extend(children),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// For every position in `nodes`, whether a later `<tr>` — at this level,
+/// or inherited from an ancestor's remaining siblings via `has_more_after`
+/// — has a real cell. Same one-backward-pass shape as [`glue_after_each`],
+/// and for the same O(n)-not-O(n²) reason: [`extract_table_rows`] threads
+/// this through its own thead/tbody/tfoot recursion once per node list
+/// instead of rescanning the remaining siblings on every iteration.
+fn populated_row_after_each(nodes: &[Node], has_more_after: bool) -> Vec<bool> {
+    let mut after = vec![has_more_after; nodes.len() + 1];
+    for i in (0..nodes.len()).rev() {
+        after[i] = node_contains_a_populated_row(&nodes[i]) || after[i + 1];
+    }
+    after
 }
 
 /// A4 portrait, matching the default most other frameworks in this space
@@ -535,14 +588,25 @@ fn inline_list_items(
     }
 }
 
-fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
+/// `has_more_after` is true if a later `<tr>` — an ancestor's remaining
+/// siblings, once this call returns — has a real cell. Needed alongside
+/// `out`'s already-collected rows so the depth-cap guard can tell whether
+/// the *whole* table (not just this capped subtree) ever gets a nonzero
+/// `Writer::draw_table` column count — see
+/// [`nodes_contain_table_output`]'s doc comment. Pass `false` for the
+/// initial call from a fresh `<table>`: `Writer::draw_table`'s `n_cols` is
+/// scoped to one table, so nothing outside this one is relevant.
+fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        if nodes_contain_table_output(nodes) {
+        let table_has_other_populated_row =
+            has_more_after || out.iter().any(|row| !row.cells.is_empty());
+        if nodes_contain_table_output(nodes, table_has_other_populated_row) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
     }
-    for node in nodes {
+    let more_after = populated_row_after_each(nodes, has_more_after);
+    for (i, node) in nodes.iter().enumerate() {
         let Node::Element { tag, children } = node else {
             continue;
         };
@@ -578,7 +642,9 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
             }
             // Structural wrappers (thead/tbody/tfoot) — descend without
             // emitting a row themselves.
-            "thead" | "tbody" | "tfoot" => extract_table_rows(children, depth + 1, out),
+            "thead" | "tbody" | "tfoot" => {
+                extract_table_rows(children, depth + 1, more_after[i + 1], out);
+            }
             _ if is_non_rendered(tag) => {}
             // Anything else inside a <table> (most commonly <caption>, or a
             // stray text-bearing tag) isn't a row — but its text must still
@@ -732,7 +798,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     "table" => {
                         flush(&mut pending, out);
                         let mut rows = Vec::new();
-                        extract_table_rows(children, depth + 1, &mut rows);
+                        extract_table_rows(children, depth + 1, false, &mut rows);
                         out.push(Block::Table(rows));
                     }
                     "ul" => {
@@ -3010,7 +3076,10 @@ mod tests {
             };
         }
         // Must not panic/overflow.
-        assert!(!nodes_contain_table_output(std::slice::from_ref(&node)));
+        assert!(!nodes_contain_table_output(
+            std::slice::from_ref(&node),
+            false
+        ));
     }
 
     // ── Depth-cap truncation must be visible, not silent (issue #2801) ──
@@ -3165,6 +3234,52 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "a <tr> with a real <td> cell draws a row, so this must warn"
+        );
+    }
+
+    #[test]
+    fn empty_tr_past_the_depth_cap_still_warns_when_the_table_has_other_rows() {
+        // Unlike the fully-empty-table case (empty_tr_past_the_depth_cap_does_not_warn),
+        // a table with an earlier real-celled row already has a nonzero
+        // Writer::draw_table n_cols — every row from then on, including a
+        // later zero-cell one, still consumes a 14pt line and shifts
+        // everything after it. Dropping a capped empty <tr> is therefore a
+        // real layout change even though the row itself draws no visible
+        // mark, once some other row in the table has a real cell.
+        //
+        // Calls extract_table_rows directly at an already-past-cap depth,
+        // rather than building enough real HTML nesting to reach it: a
+        // <tr>'s own cell content is checked 2 levels deeper than the row
+        // itself (see the `depth + 2` in the "tr" arm below), so any HTML
+        // deep enough to push a *sibling* row's own recursion past the cap
+        // already drops this row's cell text too, at a shallower depth —
+        // there's no depth where "the other row's content survives intact"
+        // and "this row's recursion is capped" are both true at once.
+        // (Codex review on PR #2810.)
+        DEPTH_CAP_HIT.with(|hit| hit.set(false));
+        let mut out = vec![TableRow {
+            cells: vec![(
+                vec![Span::Run {
+                    text: "X".to_owned(),
+                    bold: false,
+                    italic: false,
+                }],
+                false,
+            )],
+        }];
+        let empty_tr = Node::Element {
+            tag: "tr".to_owned(),
+            children: Vec::new(),
+        };
+        extract_table_rows(
+            std::slice::from_ref(&empty_tr),
+            MAX_DEPTH + 1,
+            false,
+            &mut out,
+        );
+        assert!(
+            DEPTH_CAP_HIT.with(std::cell::Cell::get),
+            "the table already has a real row, so the dropped empty <tr> still shifts layout"
         );
     }
 
