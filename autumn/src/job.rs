@@ -16745,47 +16745,56 @@ mod tests {
             let job_id = uuid::Uuid::new_v4().to_string();
             let job_id_for_insert = job_id.clone();
             let mut conn = pool.get().await.unwrap();
-            let before_enqueue = std::time::Instant::now();
-            conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
-                // Hold the transaction open for 3s *before* the relative
-                // enqueue call: long enough that a `NOW()`-based delay would
-                // make a 2s-delayed job already due by commit time. The
-                // delay is captured after this sleep, exactly as
-                // `enqueue_in_on_conn` captures it at the call site — this
-                // test is about the transaction's age at the *call*, not
-                // about a wait between the call and the INSERT (that is
-                // `pg_relative_delay_computes_run_at_on_the_database_clock`'s
-                // sibling concern).
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let relative_delay =
-                    RelativeDelay::new(Duration::from_millis(2_000), crate::time::monotonic_now());
-                pg_enqueue_on_conn_at(
-                    conn,
-                    job_id_for_insert,
-                    "send_email",
-                    "default",
-                    serde_json::json!({ "user_id": 7 }),
-                    5,
-                    250,
-                    None,
-                    Some(relative_delay),
-                    &ResolvedJobConstraints::default(),
+            // `enqueued_at` is `NOW()` — fixed at *transaction start* — so it
+            // cannot serve as "the enqueue call's own time" the way it does
+            // in the non-transactional sibling test: comparing `run_at`
+            // against it here would count this 3s sleep as part of the bound
+            // delay too. Anchor on a real clock reading taken at the same
+            // point the call itself happens (after the sleep, right before
+            // capturing `relative_delay`) instead — unlike a reading taken
+            // after `pg_fetch_by_id` returns, this one is not exposed to
+            // commit/checkout/fetch latency after the INSERT.
+            let call_time = conn
+                .transaction::<chrono::DateTime<chrono::Utc>, diesel::result::Error, _>(
+                    async move |conn| {
+                        // Hold the transaction open for 3s *before* the
+                        // relative enqueue call: long enough that a
+                        // `NOW()`-based delay would make a 2s-delayed job
+                        // already due by commit time.
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        let call_time = chrono::Utc::now();
+                        let relative_delay = RelativeDelay::new(
+                            Duration::from_millis(2_000),
+                            crate::time::monotonic_now(),
+                        );
+                        pg_enqueue_on_conn_at(
+                            conn,
+                            job_id_for_insert,
+                            "send_email",
+                            "default",
+                            serde_json::json!({ "user_id": 7 }),
+                            5,
+                            250,
+                            None,
+                            Some(relative_delay),
+                            &ResolvedJobConstraints::default(),
+                        )
+                        .await
+                        .expect("relative-delay on-conn enqueue should succeed");
+                        Ok(call_time)
+                    },
                 )
                 .await
-                .expect("relative-delay on-conn enqueue should succeed");
-                Ok(())
-            })
-            .await
-            .expect("transaction should commit");
+                .expect("transaction should commit");
 
             let row = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
             let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
+            let bound_delay = run_at.signed_duration_since(call_time);
             assert!(
-                run_at > chrono::Utc::now(),
-                "a 2s relative delay must still be in the future after commit, even though \
-                 the transaction had already been open ~3s before the enqueue call (elapsed \
-                 since the call: {:?})",
-                before_enqueue.elapsed()
+                bound_delay >= chrono::TimeDelta::milliseconds(1_000)
+                    && bound_delay < chrono::TimeDelta::milliseconds(2_500),
+                "run_at must be ~2s after the enqueue call (got {bound_delay}), not shrunk by \
+                 the 3s the transaction was already open before that call"
             );
         }
 
