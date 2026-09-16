@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **📖 Folio: make the `autumn token` lifecycle findable, and gate the
-  direction that hid it (coverage 169/194 → 172/194, retrieval 0 hits → 1
+  direction that hid it (coverage 168/194 → 171/194, retrieval 0 hits → 1
   hit):** the guide taught readers to *gate* a route on a token scope —
   `#[secured(scopes = ["posts:write"])]`, on three separate pages — and
   nowhere told them where the token comes from or how to take it back. All
@@ -35,14 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented nowhere and the whole tree stayed green; the defect is
   invisible by construction, because a gate that only reads the docs can
   never notice a command the docs never mention. The first run of the
-  reverse direction found 25 of 195 command paths absent from all 212
-  reader-facing pages. Three were the real defect above; the rest are
+  reverse direction found 26 of 194 command paths absent from all 212
+  reader-facing pages — 26 rather than 25 because the first matcher let a
+  longer command satisfy a shorter one as a suffix, so `autumn openapi
+  export` (documented in openapi.md) masked the runnable top-level `export`
+  command; caught in review, with a regression test. Three were the real
+  defect above; the rest are
   classified rather than listed as failures — `serve run-service` is
   `#[command(hide = true)]` (read out of the clap derive input, so hiding a
   command exempts it with no edit to the gate), and 13 `destroy`
   subcommands are covered by the rule `generators.md` states over the whole
   family, which the gate *verifies the page still states* rather than
-  trusting. The remaining 8 are a triaged backlog carrying a reason each, so
+  trusting. The remaining 9 are a triaged backlog carrying a reason each, so
   they are a number someone can work down; a newly added undocumented
   command fails the gate rather than joining them. Surface and corpus are
   both read from `check-docs-cli.sh` instead of respelled, so the two cannot

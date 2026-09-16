@@ -415,9 +415,14 @@ so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
 headers are forwarded too, so session-based `#[secured]` routes and
 CSRF-protected writes behave identically to a direct call.
 
-Mint the token an agent presents with `autumn token issue <principal> --scope
-<scope>`, and take it back with `autumn token revoke` (or `autumn token rotate`
-to reissue the same grants under a new secret) — see
+The example below uses `InMemoryApiTokenStore`, which keeps tokens in the
+process and seeds them in code. To manage an agent's token from the CLI
+instead — `autumn token issue <principal> --scope <scope>`, and `revoke` /
+`rotate` to take it back — the app must read the same `api_tokens` table the
+CLI writes, which means mounting
+[`DbApiTokenStore`](../../autumn/src/auth.rs) in place of the in-memory one.
+A token issued by the CLI is invisible to an in-memory store, so verification
+answers `401`. See
 [API tokens](authentication.md#issuing-listing-rotating-and-revoking-api-tokens).
 
 To put a tool behind token auth, register the route inside a `scoped` group

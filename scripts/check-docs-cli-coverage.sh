@@ -153,6 +153,7 @@ BACKLOG = {
     'assets update': 'ditto',
     'assets verify': 'ditto',
     'db reset':      'dev-only drop/create/migrate/seed; 13 of 14 `db` subcommands are documented',
+    'export':        'offline diagnostic snapshot; a top-level command named on no page, and the one this gate found only once the matcher stopped letting `autumn openapi export` satisfy it',
     'schema parse':  'schema-tooling internal; the other 5 `schema` subcommands are documented',
     'generate inbound-mail': 'generator with no guide section; 19 of 21 are documented',
     'generate policy':       'generator with no guide section; 19 of 21 are documented',
@@ -172,9 +173,40 @@ def rule_exempt(cmd, root, failures):
     return False
 
 
+# Everything a reader may type between `autumn` and the command path. The `Cli`
+# struct carries no global options — it is `#[command(subcommand)] command` and
+# nothing else — so this is only clap's builtins, and on the current corpus
+# skipping them changes nothing (23 undocumented either way). It is here so a
+# global option added later does not start hiding commands.
+#
+# The first cut allowed ARBITRARY text here (`autumn[^\n`]{0,80}?\bcmd\b`) and
+# that was wrong in the direction that matters: a longer command satisfied a
+# shorter one as a suffix. `autumn openapi export`, documented in openapi.md,
+# made the runnable TOP-LEVEL `export` command report as documented, so the gate
+# was green while missing a real undocumented command — the exact failure it
+# exists to catch. Match the path as a token PREFIX of what follows `autumn`.
+GLOBAL_OPTS = ('--help', '-h', '--version', '-V')
+
+# Stop at a newline or a backtick: a command does not span either, and running
+# past a closing backtick is how a code span's neighbour gets read as arguments.
+INVOCATION = re.compile(r'\bautumn[ \t]+([^\n`]{0,120})')
+
+
 def mentioned(cmd, text):
-    """`autumn … <cmd>`, allowing global flags between the exe and the path."""
-    return re.search(r'autumn[^\n`]{0,80}?\b' + re.escape(cmd) + r'\b', text) is not None
+    """True when some `autumn …` invocation names `cmd` as its command path.
+
+    The path must be a token prefix of what follows `autumn`, so `openapi
+    export` matches `openapi export` and never bare `export`.
+    """
+    want = cmd.split()
+    for m in INVOCATION.finditer(text):
+        toks = m.group(1).split()
+        while toks and (toks[0] in GLOBAL_OPTS
+                        or (toks[0].startswith('--') and '=' in toks[0])):
+            toks.pop(0)
+        if toks[:len(want)] == want:
+            return True
+    return False
 
 
 def analyse(root):
@@ -273,11 +305,24 @@ def self_test():
 
     # mention matching
     check('bare command', mentioned('token revoke', 'run `autumn token revoke`'), True)
-    check('global flag between', mentioned('db reset', 'autumn --quiet db reset'), True)
+    check('trailing args ignored', mentioned('db reset', 'autumn db reset --force'), True)
+    check('builtin global flag skipped',
+          mentioned('db reset', 'autumn --help db reset'), True)
     check('absent', mentioned('token revoke', 'autumn token issue'), False)
     check('not a substring match',
           mentioned('db reset', 'autumn db resetting-is-not-a-command'), False)
     check('needs the exe', mentioned('token revoke', 'the token revoke flow'), False)
+
+    # REGRESSION: a longer command must not satisfy a shorter one as a suffix.
+    # `autumn openapi export` is in openapi.md and the top-level `export`
+    # command is documented nowhere; the first matcher reported it covered.
+    check('suffix collision', mentioned('export', 'autumn openapi export'), False)
+    check('the real path still matches',
+          mentioned('openapi export', 'autumn openapi export'), True)
+    check('does not run past a backtick',
+          mentioned('db reset', '`autumn db` reset'), False)
+    check('hyphenated exe is not the exe',
+          mentioned('token issue', 'autumn-cli token issue'), False)
 
     # the summary line must never be read as a command
     check('summary dropped', bool(SUMMARY.match('53 top-level commands, 194 command paths')), True)

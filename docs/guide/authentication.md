@@ -463,6 +463,13 @@ autumn token revoke <RAW_TOKEN>                               # 401 for every la
 there is no way to recover it later. `--expires-at <ISO-8601>` makes the token
 expire; omit it for a non-expiring one.
 
+These commands read and write the managed `api_tokens` table, so they reach
+your app only when it mounts [`DbApiTokenStore`](../../autumn/src/auth.rs) and
+has that table — pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run
+`autumn migrate`. An app wired to `InMemoryApiTokenStore` keeps its tokens in
+the process and seeds them in code: a token issued by the CLI is invisible to
+it, and verification answers `401`.
+
 **To revoke a leaked API token**, run `autumn token revoke <RAW_TOKEN>`: it sets
 `revoked_at`, and `RequireApiToken` answers `401` for every later request
 presenting it.
