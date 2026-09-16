@@ -1123,16 +1123,30 @@ impl JobRegistry {
     /// [`Self::record_cancel_at_backend_offset`]'s exact lookup.
     ///
     /// `ready_at_ms` is `Some` for a scheduled enqueue (its mark, stamped
-    /// from `JobClient::due_origin`'s real time) or `None` for an immediate
-    /// one (this registry's own clock, read once here rather than inside
-    /// [`Self::record_enqueue`] so the exact same value can be remembered).
-    pub(crate) fn record_pg_enqueue(&self, name: &str, id: &str, ready_at_ms: Option<u64>) {
-        let timeline = if ready_at_ms.is_some() {
-            PgMarkTimeline::Real
-        } else {
-            PgMarkTimeline::Registry
-        };
-        let ready_at_ms = ready_at_ms.unwrap_or_else(|| self.now_ms());
+    /// from whichever clock `timeline` names) or `None` for an immediate
+    /// one (always this registry's own clock, read once here rather than
+    /// inside [`Self::record_enqueue`] so the exact same value can be
+    /// remembered — `timeline` is ignored in this case).
+    ///
+    /// `timeline` must name the clock `ready_at_ms` was actually measured
+    /// on — the caller's job, not something this method can infer from
+    /// `ready_at_ms` being present. A Postgres retry mirroring the nack
+    /// UPDATE's `run_at = NOW() + backoff` locally, for instance, still
+    /// reads `state.clock()` (the registry's own, [`PgMarkTimeline::Registry`])
+    /// even though it always supplies `Some`, unlike an `enqueue_at`/
+    /// `enqueue_in` mark, which is real time ([`PgMarkTimeline::Real`]) —
+    /// `Some`-ness alone does not say which.
+    pub(crate) fn record_pg_enqueue(
+        &self,
+        name: &str,
+        id: &str,
+        ready_at_ms: Option<u64>,
+        timeline: PgMarkTimeline,
+    ) {
+        let (ready_at_ms, timeline) = ready_at_ms.map_or_else(
+            || (self.now_ms(), PgMarkTimeline::Registry),
+            |ms| (ms, timeline),
+        );
         self.record_enqueue_at(name, ready_at_ms);
         self.note_pg_job_mark(id, ready_at_ms, timeline);
     }
@@ -1586,6 +1600,14 @@ impl JobRegistry {
         self.queues
             .read()
             .is_ok_and(|g| g.pg_marks_by_job_id.contains_key(id))
+    }
+
+    /// [`PG_MARKS_BY_JOB_ID_CAP`], for a test in another module (e.g.
+    /// `job.rs`) that needs to force capacity eviction without duplicating
+    /// the constant. Test-only.
+    #[cfg(test)]
+    pub(crate) const fn pg_marks_cap_for_test() -> usize {
+        PG_MARKS_BY_JOB_ID_CAP
     }
 
     /// Record a successful execution.
@@ -5089,8 +5111,18 @@ mod tests {
         // job-a's own real-time mark; job-b's own absolute mark, chosen so
         // that job-a's *fallback* candidate (computed below) would land
         // exactly on job-b's mark instead of job-a's own.
-        registry.record_pg_enqueue("relative_job", "job-a-id", Some(5_000));
-        registry.record_pg_enqueue("absolute_job", "job-b-id", Some(9_999));
+        registry.record_pg_enqueue(
+            "relative_job",
+            "job-a-id",
+            Some(5_000),
+            PgMarkTimeline::Real,
+        );
+        registry.record_pg_enqueue(
+            "absolute_job",
+            "job-b-id",
+            Some(9_999),
+            PgMarkTimeline::Real,
+        );
         assert_eq!(
             registry.waiting_marks_for_test("relative_job"),
             vec![5_000, 9_999],
@@ -5125,6 +5157,7 @@ mod tests {
                 "never_canceled",
                 &format!("job-{i}"),
                 Some(u64::try_from(i).unwrap()),
+                PgMarkTimeline::Real,
             );
         }
         assert_eq!(
@@ -5155,14 +5188,24 @@ mod tests {
 
         // Inserted first, so plain FIFO eviction would pick it first — but
         // it is still genuinely delayed.
-        registry.record_pg_enqueue("mixed_cap", "still-delayed", Some(far_future));
+        registry.record_pg_enqueue(
+            "mixed_cap",
+            "still-delayed",
+            Some(far_future),
+            PgMarkTimeline::Real,
+        );
         for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
-            registry.record_pg_enqueue("mixed_cap", &format!("already-due-{i}"), Some(0));
+            registry.record_pg_enqueue(
+                "mixed_cap",
+                &format!("already-due-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
         }
         assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
 
         // One more enqueue forces an eviction.
-        registry.record_pg_enqueue("mixed_cap", "one-more", Some(0));
+        registry.record_pg_enqueue("mixed_cap", "one-more", Some(0), PgMarkTimeline::Real);
 
         assert_eq!(
             registry.pg_marks_len_for_test(),
@@ -5203,16 +5246,26 @@ mod tests {
 
         // Inserted first, so plain FIFO (and the single-clock check) would
         // pick it first.
-        registry.record_pg_enqueue("skewed", "still-delayed", Some(genuinely_delayed));
+        registry.record_pg_enqueue(
+            "skewed",
+            "still-delayed",
+            Some(genuinely_delayed),
+            PgMarkTimeline::Real,
+        );
         for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
             // Genuinely due under both clocks (epoch 0 is in the past on any
             // clock), so these are always legitimate eviction candidates.
-            registry.record_pg_enqueue("skewed", &format!("filler-{i}"), Some(0));
+            registry.record_pg_enqueue(
+                "skewed",
+                &format!("filler-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
         }
         assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
 
         // One more enqueue forces an eviction.
-        registry.record_pg_enqueue("skewed", "one-more", Some(0));
+        registry.record_pg_enqueue("skewed", "one-more", Some(0), PgMarkTimeline::Real);
 
         assert_eq!(
             registry.pg_marks_len_for_test(),
@@ -5252,17 +5305,27 @@ mod tests {
         // first, so plain FIFO would evict it first.
         let far_future = real_now + 3_600_000;
 
-        registry.record_pg_enqueue("lagging", "still-delayed", Some(far_future));
+        registry.record_pg_enqueue(
+            "lagging",
+            "still-delayed",
+            Some(far_future),
+            PgMarkTimeline::Real,
+        );
         for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
             // Real-timeline marks already due in real time (epoch 0), but a
             // registry clock stuck at year 2000 would never call these
             // "due" if compared against it too.
-            registry.record_pg_enqueue("lagging", &format!("filler-{i}"), Some(0));
+            registry.record_pg_enqueue(
+                "lagging",
+                &format!("filler-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
         }
         assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
 
         // One more enqueue forces an eviction.
-        registry.record_pg_enqueue("lagging", "one-more", Some(0));
+        registry.record_pg_enqueue("lagging", "one-more", Some(0), PgMarkTimeline::Real);
 
         assert_eq!(
             registry.pg_marks_len_for_test(),
@@ -5296,7 +5359,12 @@ mod tests {
         registry.register_on_queue("churn", "mail");
         for i in 0..(PG_MARKS_BY_JOB_ID_CAP * 3) {
             let id = format!("job-{i}");
-            registry.record_pg_enqueue("churn", &id, Some(u64::try_from(i).unwrap()));
+            registry.record_pg_enqueue(
+                "churn",
+                &id,
+                Some(u64::try_from(i).unwrap()),
+                PgMarkTimeline::Real,
+            );
             registry.record_pg_start("churn", &id);
         }
         assert_eq!(
@@ -5327,8 +5395,8 @@ mod tests {
 
         // job-a enqueued first (older, still queued/concurrency-blocked);
         // job-b enqueued second but starts first.
-        registry.record_pg_enqueue("mixed", "job-a", Some(OLDER_MARK));
-        registry.record_pg_enqueue("mixed", "job-b", Some(NEWER_MARK));
+        registry.record_pg_enqueue("mixed", "job-a", Some(OLDER_MARK), PgMarkTimeline::Real);
+        registry.record_pg_enqueue("mixed", "job-b", Some(NEWER_MARK), PgMarkTimeline::Real);
 
         registry.record_pg_start("mixed", "job-b");
 
@@ -5364,7 +5432,7 @@ mod tests {
         registry.register_on_queue("flaky_job", "mail");
 
         // Original enqueue: pushes mark_a and notes it under "job-id".
-        registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A));
+        registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A), PgMarkTimeline::Real);
 
         // The job starts: use plain `record_start` (not `record_pg_start`)
         // to pop mark_a from the queue while deliberately leaving "job-id"'s

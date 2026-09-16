@@ -3527,7 +3527,12 @@ impl JobClient {
             // an immediate one stays on this registry's own injected clock —
             // belongs to it.
             let ready_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
-            self.registry.record_pg_enqueue(name, &id, ready_at_ms);
+            self.registry.record_pg_enqueue(
+                name,
+                &id,
+                ready_at_ms,
+                crate::actuator::PgMarkTimeline::Real,
+            );
         } else if let Some(due) = due_at {
             // A future due time only becomes claimable later (local timer),
             // so record it as scheduled: it must not count toward ready
@@ -8705,9 +8710,19 @@ fn record_pg_lifecycle_after_ack(
             // and, if that stale value happened to equal a different co-queued
             // job's real mark, remove that unrelated mark instead of this job's
             // actual retry mark.
-            state
-                .job_registry
-                .record_pg_enqueue(job_name, job_id, ready_at_ms);
+            //
+            // Tagged `Registry`, not `Real`: unlike an `enqueue_at`/`enqueue_in`
+            // mark, `ready_at_ms` here (when `Some`) is `state.clock().now() +
+            // backoff` above — this registry's own clock, only mirroring what
+            // the nack UPDATE's real `NOW() + backoff` computed in the
+            // database — so eviction must judge it against that same clock,
+            // not real time.
+            state.job_registry.record_pg_enqueue(
+                job_name,
+                job_id,
+                ready_at_ms,
+                crate::actuator::PgMarkTimeline::Registry,
+            );
             job_admin.record_requeued(job_id, attempt.saturating_add(1));
         }
         PgLifecycleRecord::Failure { error } => {
@@ -11750,9 +11765,12 @@ mod tests {
         }
 
         let client = minimal_client();
-        client
-            .registry
-            .record_pg_enqueue("send_email", "dead-id", Some(1_000));
+        client.registry.record_pg_enqueue(
+            "send_email",
+            "dead-id",
+            Some(1_000),
+            crate::actuator::PgMarkTimeline::Real,
+        );
         assert_eq!(client.registry.pg_marks_len_for_test(), 1);
 
         client.record_deduplicated_enqueue("send_email", "dead-id", false);
@@ -16880,12 +16898,18 @@ mod tests {
             job_admin.record_start_for_test(&job_id, 1);
 
             // Two jobs happen to share one due millisecond.
-            state
-                .job_registry()
-                .record_pg_enqueue("racer", &job_id, Some(SHARED_MARK));
-            state
-                .job_registry()
-                .record_pg_enqueue("racer", "job-b", Some(SHARED_MARK));
+            state.job_registry().record_pg_enqueue(
+                "racer",
+                &job_id,
+                Some(SHARED_MARK),
+                crate::actuator::PgMarkTimeline::Real,
+            );
+            state.job_registry().record_pg_enqueue(
+                "racer",
+                "job-b",
+                Some(SHARED_MARK),
+                crate::actuator::PgMarkTimeline::Real,
+            );
             state.job_registry().record_pg_start("racer", &job_id);
 
             assert!(record_pg_lifecycle_ack_result(
@@ -16912,6 +16936,76 @@ mod tests {
                 "canceling the retried job must remove only its own refreshed retry \
                  mark, leaving the co-queued job's coincidentally-identical mark \
                  untouched"
+            );
+        }
+
+        /// Regression for the Codex P2 raised on commit f3ef2ad: a backed-off
+        /// retry's `ready_at_ms` (when `Some`) is `state.clock().now() + backoff`
+        /// — this registry's own clock, only mirroring the nack UPDATE's real
+        /// `NOW() + backoff` — not a real-time instant like an `enqueue_at`/
+        /// `enqueue_in` mark. Tagging it [`crate::actuator::PgMarkTimeline::Real`]
+        /// (as `record_pg_enqueue`'s old `Some`-implies-real-time heuristic did)
+        /// makes eviction judge it against real time instead of the clock that
+        /// actually governs it: with the registry clock pinned behind real time,
+        /// enough real time can pass for a still-in-its-own-backoff-window retry
+        /// mark to look "due" and become evictable, when the clock that actually
+        /// measures it has not moved at all.
+        #[test]
+        fn pg_retry_with_backoff_mark_is_judged_on_the_registry_clock_not_real_time() {
+            use chrono::{TimeZone, Utc};
+
+            let state = AppState::for_test()
+                .with_profile("dev")
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+                    Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap(),
+                )));
+            state.job_registry().register_on_queue("slow_retry", "work");
+            state.job_registry().record_enqueue("slow_retry");
+            state.job_registry().record_start("slow_retry");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_retry", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            // Mirrors `state.clock().now() + backoff` at job.rs's retry site: a
+            // registry-clock instant a minute past the (frozen, year-2000)
+            // registry now — genuinely real-world-stale, but still within its
+            // own backoff window on the clock that actually governs it.
+            let registry_now_ms =
+                u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
+            let retry_mark = registry_now_ms + 60_000;
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "slow_retry",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Retry {
+                    error: "try again",
+                    attempt: 1,
+                    ready_at_ms: Some(retry_mark),
+                },
+                &state,
+                &job_admin
+            ));
+
+            // Force the exact-mark table's cap eviction with genuinely-due
+            // (immediate, registry-clock) fillers — real candidates whichever
+            // way the retry mark above is tagged.
+            for i in 0..crate::actuator::JobRegistry::pg_marks_cap_for_test() {
+                state.job_registry().record_pg_enqueue(
+                    "slow_retry",
+                    &format!("filler-{i}"),
+                    None,
+                    crate::actuator::PgMarkTimeline::Registry,
+                );
+            }
+
+            assert!(
+                state.job_registry().pg_mark_contains_id_for_test(&job_id),
+                "a backed-off retry mark must never be evicted as 'due' just because \
+                 real time has passed it, when the clock that actually governs it \
+                 (the registry's own, frozen here) has not"
             );
         }
 
@@ -18199,16 +18293,31 @@ mod tests {
             //
             // An immediate job's mark stays on the registry's own (here,
             // 2100-pinned) clock.
-            registry.record_pg_enqueue("send_email", "ready-job", None);
+            registry.record_pg_enqueue(
+                "send_email",
+                "ready-job",
+                None,
+                crate::actuator::PgMarkTimeline::Registry,
+            );
             // A relative-delay job's mark lives on real time, matching that
             // same function's scheduled branch for a Postgres-backed job.
             let real_now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap();
             let real_far_future_ms = real_now_ms + 3_600_000;
-            registry.record_pg_enqueue("nightly_report", "scheduled-job", Some(real_far_future_ms));
+            registry.record_pg_enqueue(
+                "nightly_report",
+                "scheduled-job",
+                Some(real_far_future_ms),
+                crate::actuator::PgMarkTimeline::Real,
+            );
             // An absolute `enqueue_at` job's mark is the caller's own
             // instant, unrelated to either clock above.
             let absolute_due_ms = real_now_ms + 7_200_000;
-            registry.record_pg_enqueue("midnight_digest", "absolute-job", Some(absolute_due_ms));
+            registry.record_pg_enqueue(
+                "midnight_digest",
+                "absolute-job",
+                Some(absolute_due_ms),
+                crate::actuator::PgMarkTimeline::Real,
+            );
 
             pg_enqueue_job(
                 &pool,
