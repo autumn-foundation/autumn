@@ -38,7 +38,7 @@ fn workspace_root() -> PathBuf {
 /// 4-space-per-level indent) its own `mod pg {` / closing `}` lines sit at
 /// exactly 4 spaces, and everything inside sits at 8+. Bounding on that
 /// avoids matching a same-named function some other module might define.
-fn pg_tests_module(source: &str) -> &str {
+fn pg_tests_module(source: &str) -> String {
     let open = "\n    mod pg {\n";
     let start = source
         .find(open)
@@ -48,14 +48,21 @@ fn pg_tests_module(source: &str) -> &str {
     let end = body
         .find(close)
         .expect("could not find the end of job.rs's `mod pg` block");
-    &body[..end]
+    body[..end].to_string()
 }
 
 #[test]
 fn pg_relative_delay_tests_are_named_in_ci() {
     let root = workspace_root();
-    let source = std::fs::read_to_string(root.join("autumn/src/job.rs")).expect("read job.rs");
-    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    // Normalize CRLF to LF: Windows checkouts (`.gitattributes`' `* text=auto`
+    // with no override for these files) give `\r\n` line endings, which would
+    // never match `pg_tests_module`'s hardcoded `\n`-terminated boundaries.
+    let source = std::fs::read_to_string(root.join("autumn/src/job.rs"))
+        .expect("read job.rs")
+        .replace("\r\n", "\n");
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
     let pg_mod = pg_tests_module(&source);
 
     for filter in CI_FILTERS {
