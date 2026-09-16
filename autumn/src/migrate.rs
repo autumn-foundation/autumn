@@ -44,7 +44,24 @@ pub use diesel_migrations::embed_migrations;
 ///
 /// These are applied by `autumn migrate` and are also registered
 /// automatically at startup when a framework feature requires its own table.
+///
+/// Backend-forked, like [`derivation::DERIVATION_MIGRATIONS`](crate::derivation::DERIVATION_MIGRATIONS).
+/// The Postgres DDL (`BIGSERIAL`/`JSONB`/`TIMESTAMPTZ`/`NOW()`) is not valid
+/// `SQLite`. The `SQLite` build embeds a parallel migration set under the
+/// same version dir names. This keeps `__diesel_schema_migrations`
+/// bookkeeping identical across backends (issue #2699).
+#[cfg(not(feature = "sqlite"))]
 pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+/// `SQLite` variant of [`FRAMEWORK_MIGRATIONS`]. See that item for the
+/// backend-fork rationale.
+///
+/// Some tables get a no-op shim here instead of real DDL: a table another
+/// module already manages outside Diesel (the job queue, job tracking), and
+/// a feature `SQLite` does not support (sharding). See
+/// `autumn/migrations_sqlite`.
+#[cfg(feature = "sqlite")]
+pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations_sqlite");
 
 /// Result of running pending migrations.
 #[derive(Debug)]
@@ -2343,13 +2360,15 @@ pub fn applied_user_migrations_sqlite(
     )
 }
 
-/// The identity map the `SQLite` apply path
-/// ([`run_pending_sqlite_with_framework_migrations`]) records under: the app
-/// set and the shard-required framework sets enumerated together, every
-/// version collision resolved. Rollback has to plan and revert under the
-/// same identities, or a migration tracked under a substitute reads as
-/// applied with no local `down.sql`, and its plain version as the other
-/// side's.
+/// The identity map for the `SQLite` apply path
+/// ([`run_pending_sqlite_with_framework_migrations`]). It covers the app
+/// set, [`FRAMEWORK_MIGRATIONS`], and the shard-required framework sets,
+/// enumerated together, with every version collision resolved.
+///
+/// Rollback must plan and revert under the same identities. Otherwise a
+/// migration tracked under a substitute name reads as applied with no local
+/// `down.sql`, while its plain version reads as applied under the other
+/// migration instead.
 ///
 /// # Errors
 ///
@@ -2362,6 +2381,9 @@ fn sqlite_app_identity_map(
 
     let mut sets: MigrationPairSets =
         vec![migration_versions_and_names::<Sqlite, _>(app_migrations)?];
+    sets.push(migration_versions_and_names::<Sqlite, _>(
+        &FRAMEWORK_MIGRATIONS,
+    )?);
     for set in shard_framework_migration_sets() {
         sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
     }
@@ -2955,14 +2977,26 @@ pub fn run_pending_shard_framework_migrations(
 /// Apply an app's own migrations and then the framework sets a `SQLite`
 /// database requires, under one version-collision map.
 ///
-/// The framework sets are the `SQLite` variants of the version-history,
-/// commit-hook queue and derivation-state tables, the same three
+/// The framework sets are [`FRAMEWORK_MIGRATIONS`] plus three more sets.
+///
+/// [`FRAMEWORK_MIGRATIONS`] is the `SQLite` variant of the control-plane
+/// schema: `api_tokens`, runtime config, feature flags, experiments, and
+/// migration checksums (issue #2699).
+///
+/// The three more sets are the `SQLite` variants of the version-history,
+/// commit-hook queue, and derivation-state tables — the same three
 /// [`run_pending_shard_framework_migrations`] applies to a Postgres shard.
-/// The Postgres control-plane schema (`FRAMEWORK_MIGRATIONS`) has no `SQLite`
-/// variant and is never applied here. This is what gives `autumn migrate` an
-/// apply path for these tables on a `sqlite://` target when startup
-/// auto-migration is off; without it the boot only reports them pending and
-/// a `#[derivation]` reconciliation fails on the missing state table.
+///
+/// [`FRAMEWORK_MIGRATIONS`] also embeds those same three tables, under the
+/// same version dir names. The control-plane Postgres set already
+/// duplicates them this way, so applying both sets here is redundant, not
+/// conflicting: whichever set runs first records the version, and the other
+/// then sees it as already applied.
+///
+/// This gives `autumn migrate` an apply path for these tables on a
+/// `sqlite://` target when startup auto-migration is off. Without it, boot
+/// only reports the tables as pending, and `#[derivation]` reconciliation
+/// fails on the missing state table.
 ///
 /// Diesel tracks applied migrations by version alone, so an app migration
 /// that happens to share a version with one of these framework migrations
@@ -2992,6 +3026,9 @@ where
 
     let mut sets: Vec<Vec<(String, String)>> =
         vec![migration_versions_and_names::<Sqlite, S>(app_migrations)?];
+    sets.push(migration_versions_and_names::<Sqlite, _>(
+        &FRAMEWORK_MIGRATIONS,
+    )?);
     for set in shard_framework_migration_sets() {
         sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
     }
@@ -3002,6 +3039,11 @@ where
         DisambiguatedMigrations::new(app_migrations, &disambiguated),
     )?
     .applied;
+    let framework_result = run_pending_sqlite(
+        database_url,
+        DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &disambiguated),
+    )?;
+    applied.extend(framework_result.applied);
     for set in shard_framework_migration_sets() {
         let result = run_pending_sqlite(
             database_url,
@@ -3088,13 +3130,105 @@ struct SqliteCollisionMove {
     to: String,
 }
 
+/// The one `FRAMEWORK_MIGRATIONS` full name that is NOT new to `SQLite` even
+/// though it is absent from [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]: the legacy
+/// compatibility shim's `SELECT 1;` is plain, portable SQL, so it could
+/// already have recorded this version on `SQLite` before `FRAMEWORK_MIGRATIONS`
+/// had a real `SQLite` variant (issue #2699) — unlike every other pre-fork
+/// migration in the set, whose Postgres-only DDL would have failed outright.
+/// It creates no table, so [`sqlite_collision_history_moves`] cannot probe it
+/// either; treat it like an ordinary ambiguous collision instead of assuming
+/// it never ran.
+#[cfg(feature = "sqlite")]
+const SQLITE_LEGACY_SHIM_MIGRATION: &str = "00000000000000_create_api_tokens";
+
+/// Resolves whether a collision's non-framework side ran, for a `version`
+/// where the framework participant (if any) is not one of the five
+/// [`SQLITE_FRAMEWORK_MIGRATION_TABLES`] ambiguous ones. `Ok(None)` means no
+/// `FRAMEWORK_MIGRATIONS` name shares this version at all — an ordinary
+/// collision between two other registered sources, left for the caller to
+/// leave alone. `Ok(Some(true))` means exactly one non-framework name shares
+/// the version alongside a migration new to `SQLite` (proven never to have
+/// run): the pre-existing record can only be that one name's. Anything else
+/// — [`SQLITE_LEGACY_SHIM_MIGRATION`] (whose own history is itself
+/// unresolvable) or more than one non-framework name — is an error: silently
+/// leaving it is not safe, since [`sqlite_collision_history_moves`]'s caller
+/// still applies the disambiguated migrations regardless, which would record
+/// the framework migration as already applied (skipping its real DDL) while
+/// a non-framework migration re-runs under its substitute and hard-errors on
+/// non-idempotent DDL.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] when which side ran cannot be
+/// determined automatically.
+#[cfg(feature = "sqlite")]
+fn sqlite_non_framework_collision_owner(
+    sets: &[Vec<(String, String)>],
+    version: &str,
+    new_framework_names: &std::collections::HashSet<String>,
+) -> Result<Option<bool>, MigrationError> {
+    let names_at_version: Vec<&str> = sets
+        .iter()
+        .flatten()
+        .filter(|(v, _)| v == version)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let has_shim_participant = names_at_version.contains(&SQLITE_LEGACY_SHIM_MIGRATION);
+    let has_new_framework_participant = names_at_version
+        .iter()
+        .any(|name| new_framework_names.contains(*name));
+    if !has_shim_participant && !has_new_framework_participant {
+        return Ok(None);
+    }
+    let non_framework_participants = names_at_version
+        .iter()
+        .filter(|name| {
+            **name != SQLITE_LEGACY_SHIM_MIGRATION && !new_framework_names.contains(**name)
+        })
+        .count();
+    if !has_shim_participant && non_framework_participants == 1 {
+        return Ok(Some(true));
+    }
+    Err(MigrationError::Migration(format!(
+        "SQLite migration version {version} is claimed by more than one \
+         registered migration ({names_at_version:?}), including one this \
+         SQLite fork introduces (issue #2699), and which side already \
+         applied cannot be determined automatically. Renaming the \
+         conflicting migration to a fresh version is not enough on its own: \
+         __diesel_schema_migrations still has the old row under `{version}`, \
+         and Diesel treats whichever migration keeps that version as already \
+         applied. Determine which registered migration actually produced \
+         that row, then rename the OTHER one(s) to a fresh version and move \
+         or delete the row accordingly: UPDATE __diesel_schema_migrations \
+         SET version = '<fresh version>' WHERE version = '{version}' — or \
+         DELETE it if nothing at this version ever actually ran."
+    )))
+}
+
 /// The records [`adopt_sqlite_collision_history`] would move, decided on
 /// `conn` without changing anything.
 ///
 /// For every remapped migration whose plain version is applied and whose
-/// substitute is not, the framework migration's table says which side ran,
-/// and the remapped side's record moves if it did. The listing path resolves
-/// these virtually and the write paths apply them.
+/// substitute is not, the colliding framework migration says which side ran.
+/// [`SQLITE_FRAMEWORK_MIGRATION_TABLES`] lists the five migrations that
+/// already applied on `SQLite` before `FRAMEWORK_MIGRATIONS` gained a
+/// `SQLite` variant (issue #2699): for those, either side could hold the
+/// plain-version record, so a table probe decides. Every other framework
+/// migration except [`SQLITE_LEGACY_SHIM_MIGRATION`] is new to `SQLite` as of
+/// that fork — it never had a chance to apply here before, so a pre-existing
+/// plain-version record can only be the app's own migration, and no probe is
+/// needed, PROVIDED it is the only other registered migration claiming that
+/// version. When a `FRAMEWORK_MIGRATIONS` name shares a version with more
+/// than one other source, or with [`SQLITE_LEGACY_SHIM_MIGRATION`] (whose own
+/// history is itself unresolvable), which side ran cannot be determined —
+/// this returns an error rather than silently leaving it, since the caller
+/// would otherwise still apply the disambiguated migrations and hit a hard
+/// error or a silently-skipped framework migration downstream. A collision
+/// between two registered sources that never involves any
+/// `FRAMEWORK_MIGRATIONS` name is left alone, exactly as before this fork
+/// existed. The listing path resolves these virtually and the write paths
+/// apply them.
 #[cfg(feature = "sqlite")]
 fn sqlite_collision_history_moves(
     conn: &mut diesel::SqliteConnection,
@@ -3110,6 +3244,29 @@ fn sqlite_collision_history_moves(
         .flatten()
         .map(|(version, name)| (name.as_str(), version.as_str()))
         .collect();
+    // Every `FRAMEWORK_MIGRATIONS` full name new to `SQLite` as of this fork
+    // (issue #2699) — every one except the five [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]
+    // already lists. Derived from `FRAMEWORK_MIGRATIONS` itself, never from
+    // `sets`'s shape: a caller's `sets` can hold plugin-registered sources at
+    // any position (`AppBuilder::plugin_migrations`), and a plugin migration
+    // is not unambiguous the way a migration new to `SQLite` is — it may
+    // have applied in an earlier release, so guessing "not the app's own
+    // single set" as "never ran" would silently drop its history.
+    let new_framework_names: std::collections::HashSet<String> =
+        migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&FRAMEWORK_MIGRATIONS)
+            .map(|pairs| {
+                pairs
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .filter(|name| {
+                        name != SQLITE_LEGACY_SHIM_MIGRATION
+                            && !SQLITE_FRAMEWORK_MIGRATION_TABLES
+                                .iter()
+                                .any(|(migration, _)| *migration == name)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     let applied: std::collections::HashSet<String> = conn
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?
@@ -3125,7 +3282,8 @@ fn sqlite_collision_history_moves(
         if !applied.contains(*version) || applied.contains(substitute) {
             continue;
         }
-        // The framework migration in this collision, and its table.
+        // The pre-#2699 framework migration in this collision, and its
+        // table, if this version is one of the five ambiguous ones.
         let framework = sets
             .iter()
             .flatten()
@@ -3136,14 +3294,28 @@ fn sqlite_collision_history_moves(
                     .find(|(migration, _)| migration == name)
                     .map(|(migration, table)| (*migration, *table))
             });
-        let Some((framework_name, table)) = framework else {
-            continue;
-        };
-        let framework_ran = sqlite_table_exists(conn, table)?;
-        let remapped_ran = if framework_name == full_name {
-            framework_ran
+        let remapped_ran = if let Some((framework_name, table)) = framework {
+            let framework_ran = sqlite_table_exists(conn, table)?;
+            if framework_name == full_name {
+                framework_ran
+            } else {
+                !framework_ran
+            }
+        } else if new_framework_names.contains(full_name.as_str()) {
+            // `full_name` itself is a framework migration new to `SQLite`. It
+            // never ran, so the plain version still belongs to whichever
+            // other side won the collision.
+            false
         } else {
-            !framework_ran
+            match sqlite_non_framework_collision_owner(sets, version, &new_framework_names)? {
+                Some(ran) => ran,
+                // No `FRAMEWORK_MIGRATIONS` name shares this version at all —
+                // an ordinary collision between two other registered sources
+                // (e.g. the app's own migrations and a plugin's). Which side
+                // ran is genuinely ambiguous from names alone; leave it for
+                // an operator, exactly as before this fork existed.
+                None => continue,
+            }
         };
         if remapped_ran {
             moves.push(SqliteCollisionMove {
@@ -3978,6 +4150,268 @@ mod tests {
             again.applied.is_empty(),
             "nothing is applied twice: {:?}",
             again.applied
+        );
+    }
+
+    /// The same history-adoption case as
+    /// [`a_sqlite_app_migration_already_applied_under_a_framework_version_keeps_its_history`],
+    /// but colliding with a `FRAMEWORK_MIGRATIONS`-only migration
+    /// (`create_api_tokens`) rather than one of the five pre-existing
+    /// shard-required ones. Before this fork existed, `create_api_tokens`
+    /// never ran on `SQLite`: any release predating it could only have
+    /// applied the app's own migration under the plain version. Confirms
+    /// [`sqlite_collision_history_moves`] moves that record without needing
+    /// a table probe (issue #2699 review finding).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_sqlite_app_migration_predating_a_new_framework_migration_keeps_its_history() {
+        use diesel::RunQueryDsl as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        let (migrations_dir, url) = sqlite_scratch("new-framework-history");
+        let older = migrations_dir.join("20260512000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // A release predating this fork: the app set alone, under its plain
+        // version. `create_api_tokens` did not exist on `SQLite` yet.
+        let before = run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app set");
+        assert_eq!(before.applied, vec!["20260512000000".to_owned()]);
+
+        let now = run_pending_sqlite_with_framework_migrations(&url, &app)
+            .expect("create_api_tokens applies without re-running the app migration");
+        assert!(
+            now.applied
+                .iter()
+                .any(|version| version == "20260512000000"),
+            "create_api_tokens takes the plain version: {:?}",
+            now.applied
+        );
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        diesel::sql_query("SELECT 1 FROM zzz LIMIT 1")
+            .execute(&mut conn)
+            .expect("the app table is still there");
+        diesel::sql_query("SELECT 1 FROM api_tokens LIMIT 1")
+            .execute(&mut conn)
+            .expect("api_tokens now exists");
+        let moved = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations \
+             WHERE version LIKE '20260512000000+%'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count the moved record")
+        .n;
+        assert_eq!(
+            moved, 1,
+            "the app migration's record moved to its substitute"
+        );
+
+        let again = run_pending_sqlite_with_framework_migrations(&url, &app).expect("third run");
+        assert!(
+            again.applied.is_empty(),
+            "nothing is applied twice: {:?}",
+            again.applied
+        );
+    }
+
+    /// A collision between two NON-framework sources (e.g. the app's own
+    /// migrations and a plugin's, `AppBuilder::plugin_migrations`) is left
+    /// unresolved, exactly as it was before this fork gave
+    /// `FRAMEWORK_MIGRATIONS` a `SQLite` variant (issue #2699 review
+    /// finding). `sqlite_collision_history_moves` must not guess which side
+    /// ran from `sets`'s shape alone: a plugin set can sit at any position,
+    /// and — unlike a framework migration new to `SQLite` — it may
+    /// genuinely have applied in an earlier release, so treating "not at
+    /// index 0" as "never ran" would silently drop its history.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_collision_between_two_non_framework_sources_is_left_unresolved() {
+        let (migrations_dir, url) = sqlite_scratch("plugin-collision");
+        let older = migrations_dir.join("20260101000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // An older release applied the app's migration alone, under its
+        // plain version — no plugin collided with it yet.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        // A newer release adds a plugin migration that collides with the
+        // app's version; the plugin's name sorts first, so the APP's own
+        // migration is remapped to a substitute — mirroring how
+        // `migration_sets_for_disambiguation` and `sqlite_collision_pairs`
+        // build `sets` at app boot: the app's own migrations (`sets[0]`)
+        // plus every plugin set, in registration order, with no framework
+        // set folded in at all. A heuristic that reads "not `sets[0]`" as
+        // "framework, never ran" gets this backwards: here it is the app's
+        // own migration — not the plugin's — that is remapped, and it did
+        // run.
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "20260101000000".to_owned(),
+                "20260101000000_aaa_plugin".to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "20260101000000_zzz_app".to_owned(),
+            "20260101000000+deadbeef".to_owned(),
+        );
+
+        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect("resolve moves");
+        assert!(
+            moves.is_empty(),
+            "a non-framework collision must not be guessed at: {moves:?}"
+        );
+    }
+
+    /// A collision with [`SQLITE_LEGACY_SHIM_MIGRATION`] is left unresolved
+    /// too, as a hard error rather than a silent skip (issue #2699 review
+    /// finding). Its `SELECT 1;` is plain, portable SQL, so — unlike every
+    /// other pre-fork framework migration, whose Postgres-only DDL would
+    /// have failed outright on `SQLite` — an app that already tried the
+    /// old, unforked `FRAMEWORK_MIGRATIONS` against `SQLite` could have this
+    /// version recorded from the shim, not from its own colliding
+    /// migration. It creates no table, so there is nothing to probe;
+    /// treating it as "new to `SQLite`, never ran" the way the other
+    /// fifteen are would risk silently marking the app's own migration
+    /// applied without its DDL ever running. Erroring here, rather than
+    /// leaving it for `run_pending_sqlite` to hit downstream, fails before
+    /// anything is applied.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_collision_with_the_legacy_shim_migration_is_rejected() {
+        let (migrations_dir, url) = sqlite_scratch("legacy-shim-collision");
+        let older = migrations_dir.join("00000000000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // A record under "00000000000000" from before this fork existed —
+        // either the app's own migration, or a prior partial attempt at the
+        // old, unforked FRAMEWORK_MIGRATIONS. Nothing here can tell them
+        // apart.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "00000000000000".to_owned(),
+                SQLITE_LEGACY_SHIM_MIGRATION.to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "00000000000000_zzz_app".to_owned(),
+            "00000000000000+deadbeef".to_owned(),
+        );
+
+        let error = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect_err("a collision with the legacy shim must be rejected, not guessed at");
+        let message = error.to_string();
+        assert!(
+            message.contains("00000000000000"),
+            "the error names the ambiguous version: {message}"
+        );
+    }
+
+    /// A three-way version collision — a framework migration new to
+    /// `SQLite` plus TWO other registered sources (e.g. the app's own
+    /// migrations and a plugin's) — is rejected as a hard error too, not
+    /// silently left half-resolved (issue #2699 review finding). There is
+    /// only one row in `__diesel_schema_migrations` for the shared version;
+    /// generating a move for every remapped non-framework name would claim
+    /// more than one migration is that row's owner, marking a migration
+    /// applied that never actually ran. Continuing silently is not safe
+    /// either: the caller still applies the disambiguated migrations
+    /// afterward, so an unresolved collision must fail loudly before that
+    /// happens.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_three_way_collision_with_a_new_framework_migration_is_rejected() {
+        let (migrations_dir, url) = sqlite_scratch("three-way-collision");
+        let older = migrations_dir.join("20260512000000_aaa_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE aaa (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE aaa;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // An older release, before either the plugin or this fork existed:
+        // only the app's migration applied, under its plain version.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        // A newer release adds both a plugin and this fork's framework
+        // migration at the same version. The app's name sorts first (wins,
+        // keeps the plain version); the plugin's name sorts between the
+        // app's and the framework's (per the review finding) and is
+        // remapped, same as the framework migration.
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "20260512000000".to_owned(),
+                "20260512000000_bbb_plugin".to_owned(),
+            )],
+            vec![(
+                "20260512000000".to_owned(),
+                "20260512000000_create_api_tokens".to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "20260512000000_bbb_plugin".to_owned(),
+            "20260512000000+deadbeef".to_owned(),
+        );
+        disambiguated.insert(
+            "20260512000000_create_api_tokens".to_owned(),
+            "20260512000000+cafef00d".to_owned(),
+        );
+
+        let error = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect_err("a three-way collision must be rejected, not guessed at");
+        let message = error.to_string();
+        assert!(
+            message.contains("20260512000000"),
+            "the error names the ambiguous version: {message}"
         );
     }
 

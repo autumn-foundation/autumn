@@ -922,6 +922,19 @@ path = "tests/sqlite_commit_hook_worker.rs"
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
 
+# FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
+# (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,
+# commit-hook queue, version history, runtime config, feature flags,
+# experiments, migration checksums and the ledger tables are created; tables
+# another module self-manages (jobs, job tracking, shard directory/map) are
+# not. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
+# empty (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_framework_migrations`.
+[[test]]
+name = "sqlite_framework_migrations"
+path = "tests/sqlite_framework_migrations.rs"
+
 # SQLite searchable-repository fallback proof (issue #1996). Drives
 # `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
 # are found case-insensitively, non-matches excluded, LIKE metacharacters (`%`,
