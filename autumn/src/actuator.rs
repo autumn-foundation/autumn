@@ -826,7 +826,7 @@ struct QueueGaugeState {
     /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`] regardless, as a backstop for
     /// jobs enqueued but never claimed (a crashed worker, a queue with no
     /// consumer) — without it those would still leak one entry each forever.
-    pg_marks_by_job_id: indexmap::IndexMap<String, u64>,
+    pg_marks_by_job_id: indexmap::IndexMap<String, PgMark>,
 }
 
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
@@ -835,6 +835,46 @@ struct QueueGaugeState {
 /// while keeping the map's memory bounded no matter how large an unclaimed
 /// backlog grows.
 const PG_MARKS_BY_JOB_ID_CAP: usize = 10_000;
+
+/// Which clock a [`PgMark`]'s `ms` value is measured on.
+///
+/// `note_pg_job_mark`'s eviction used to compare every entry against both
+/// the registry's own clock and real time, requiring both to agree an entry
+/// was due before evicting it — safe against wrongly evicting a
+/// still-delayed entry, but it can also make eviction blind: a `FixedClock`/
+/// `TickingClock` registry clock that has drifted *behind* real time (not
+/// just ahead, the case that motivated the both-clocks check) makes every
+/// real-timeline mark compare as "not yet due" against the registry clock
+/// forever, however far in the real past it actually is, so eviction can
+/// never recognize any of them as safe to evict and falls back to
+/// oldest-inserted — which can just as easily be the one genuinely-delayed
+/// entry sitting first among thousands of already-claimed ones. Tagging each
+/// mark with the one clock that actually measures it (known unambiguously at
+/// insertion time: [`JobRegistry::record_pg_enqueue`] passes a real instant
+/// for an absolute/relative-delay enqueue, `None` — resolved from the
+/// registry's own [`JobRegistry::now_ms`] — for an immediate one) lets
+/// eviction judge each entry correctly instead of guessing from its
+/// magnitude against a clock that may not be its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PgMarkTimeline {
+    /// A real epoch-ms instant: an `enqueue_at`/`enqueue_in` mark, forwarded
+    /// unchanged or reconstructed via [`JobClient::due_origin`]'s real-time
+    /// reading — the same timeline Postgres's own `clock_timestamp()`
+    /// measures `run_at` against.
+    Real,
+    /// The registry's own (possibly injected/virtual) clock reading at
+    /// enqueue time — an immediate enqueue's mark.
+    Registry,
+}
+
+/// A [`QueueGaugeState::pg_marks_by_job_id`] entry: the raw waiting-queue
+/// mark plus which clock ([`PgMarkTimeline`]) it is measured on, so eviction
+/// can judge "due" against the one clock that actually applies to it.
+#[derive(Clone, Copy, Debug)]
+struct PgMark {
+    ms: u64,
+    timeline: PgMarkTimeline,
+}
 
 /// Rebase a surveyed age onto the registry's timeline.
 ///
@@ -1087,9 +1127,14 @@ impl JobRegistry {
     /// one (this registry's own clock, read once here rather than inside
     /// [`Self::record_enqueue`] so the exact same value can be remembered).
     pub(crate) fn record_pg_enqueue(&self, name: &str, id: &str, ready_at_ms: Option<u64>) {
+        let timeline = if ready_at_ms.is_some() {
+            PgMarkTimeline::Real
+        } else {
+            PgMarkTimeline::Registry
+        };
         let ready_at_ms = ready_at_ms.unwrap_or_else(|| self.now_ms());
         self.record_enqueue_at(name, ready_at_ms);
-        self.note_pg_job_mark(id, ready_at_ms);
+        self.note_pg_job_mark(id, ready_at_ms, timeline);
     }
 
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
@@ -1251,7 +1296,8 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id));
+            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id))
+            .map(|mark| mark.ms);
         let removed_exact = exact_ms.is_some_and(|exact_ms| self.pop_waiting_exact(name, exact_ms));
         if !removed_exact {
             self.pop_waiting(name, true);
@@ -1324,19 +1370,23 @@ impl JobRegistry {
     /// absolute (`enqueue_at`) or relative-delay (`enqueue_in`) mark is real
     /// time (`JobClient::due_origin`'s Postgres convention), while an
     /// immediate one is this registry's own (possibly injected/virtual)
-    /// clock (see [`Self::record_pg_enqueue`]) — and a single entry here
-    /// carries no tag saying which. Comparing every entry against only one
-    /// of those two clocks can misjudge the other kind whenever they
-    /// disagree (a `FixedClock`/`TickingClock` pinned away from wall time):
-    /// judging a real-time relative-delay mark against a far-future
-    /// registry clock alone would call it "due" long before it actually is,
-    /// evicting exactly the still-genuinely-delayed entry this is meant to
-    /// protect. An entry only counts as due here when it is due on *both*
-    /// clocks — never wrongly evicting a genuinely-still-delayed entry, at
-    /// the cost of only falling back to oldest-inserted (matching this
-    /// method's pre-existing behavior) instead of discriminating further
-    /// when the two clocks disagree.
-    pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64) {
+    /// clock (see [`Self::record_pg_enqueue`]). Each entry carries a
+    /// [`PgMarkTimeline`] tag saying which, fixed unambiguously at
+    /// insertion time, so eviction judges every mark against the one clock
+    /// that actually measures it instead of guessing from its magnitude —
+    /// comparing a mark against the *other*, irrelevant clock (or requiring
+    /// both to agree, an earlier version of this check) can misjudge it
+    /// whenever the registry clock diverges from wall time in either
+    /// direction: a `FixedClock`/`TickingClock` far ahead of real time can
+    /// make a genuinely-still-delayed real-time mark look "due" against the
+    /// registry clock alone, while one far *behind* real time can make an
+    /// already-claimed real-time mark look "not yet due" against the
+    /// registry clock forever, blinding eviction to every real-timeline
+    /// entry and leaving it to fall back on oldest-inserted regardless of
+    /// which entry that happens to be. Falling back to oldest-inserted
+    /// (matching this method's pre-existing behavior) still happens when no
+    /// entry's own clock calls it due.
+    pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64, timeline: PgMarkTimeline) {
         if let Ok(mut guard) = self.queues.write() {
             if guard.pg_marks_by_job_id.len() >= PG_MARKS_BY_JOB_ID_CAP
                 && !guard.pg_marks_by_job_id.contains_key(id)
@@ -1347,11 +1397,20 @@ impl JobRegistry {
                 let evict_idx = guard
                     .pg_marks_by_job_id
                     .iter()
-                    .position(|(_, mark)| *mark <= registry_now && *mark <= real_now)
+                    .position(|(_, mark)| match mark.timeline {
+                        PgMarkTimeline::Real => mark.ms <= real_now,
+                        PgMarkTimeline::Registry => mark.ms <= registry_now,
+                    })
                     .unwrap_or(0);
                 guard.pg_marks_by_job_id.shift_remove_index(evict_idx);
             }
-            guard.pg_marks_by_job_id.insert(id.to_string(), ready_at_ms);
+            guard.pg_marks_by_job_id.insert(
+                id.to_string(),
+                PgMark {
+                    ms: ready_at_ms,
+                    timeline,
+                },
+            );
         }
     }
 
@@ -1418,7 +1477,8 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id));
+            .and_then(|mut guard| guard.pg_marks_by_job_id.shift_remove(id))
+            .map(|mark| mark.ms);
         if let Some(exact_ms) = exact_ms
             && self.pop_waiting_exact(name, exact_ms)
         {
@@ -5123,9 +5183,11 @@ mod tests {
     /// injecting a `FixedClock`/`TickingClock` ahead of wall time would —
     /// and confirms a genuinely-still-delayed real-time mark is never
     /// mistaken for "due" just because it looks small next to the
-    /// registry's far-future reading.
+    /// registry's far-future reading. (Marks are now tagged with the one
+    /// clock that actually measures them — see [`PgMarkTimeline`] — rather
+    /// than judged against both; this still exercises the same scenario.)
     #[test]
-    fn note_pg_job_mark_eviction_requires_both_clocks_to_agree_it_is_due() {
+    fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_against_real_time_only() {
         use chrono::{TimeZone, Utc};
 
         let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
@@ -5161,6 +5223,58 @@ mod tests {
             registry.pg_mark_contains_id_for_test("still-delayed"),
             "a mark that is not yet due in real time must never be evicted just because \
              the registry's own (far-future) clock alone would call it due"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit d3e86d6: requiring both
+    /// clocks to agree an entry is due protects a still-delayed entry from
+    /// being evicted, but it can equally blind eviction to every genuinely
+    /// stale entry when the registry clock has drifted *behind* real time
+    /// (the mirror image of the far-future case above) — a real-timeline
+    /// mark (large real epoch ms) then never compares as `<=` a small,
+    /// stuck-in-the-past registry clock reading, however far in the real
+    /// past it actually is. Pins the registry's clock far in the past and
+    /// confirms a pile of already-claimed real-time marks are still
+    /// eviction candidates, protecting a genuinely-future one inserted
+    /// first — each entry is now judged only against the one clock
+    /// ([`PgMarkTimeline`]) that actually measures it.
+    #[test]
+    fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_even_when_the_registry_clock_lags() {
+        use chrono::{TimeZone, Utc};
+
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap()),
+        ));
+        registry.register_on_queue("lagging", "mail");
+
+        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        // An hour out in real time — genuinely not due yet — inserted
+        // first, so plain FIFO would evict it first.
+        let far_future = real_now + 3_600_000;
+
+        registry.record_pg_enqueue("lagging", "still-delayed", Some(far_future));
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            // Real-timeline marks already due in real time (epoch 0), but a
+            // registry clock stuck at year 2000 would never call these
+            // "due" if compared against it too.
+            registry.record_pg_enqueue("lagging", &format!("filler-{i}"), Some(0));
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("lagging", "one-more", Some(0));
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "a genuinely-future real-timeline entry must never be evicted while an \
+             already-due real-timeline entry is available, even when the registry's own \
+             clock lags behind real time and would call every real-timeline mark 'not \
+             due' if it were consulted for them too"
         );
     }
 
