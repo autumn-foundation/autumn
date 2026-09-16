@@ -2854,10 +2854,13 @@ struct RelativeDelay {
 }
 
 impl RelativeDelay {
-    fn new(duration: std::time::Duration, clock: &dyn crate::time::ClockSource) -> Self {
+    const fn new(
+        duration: std::time::Duration,
+        captured_at: crate::time::MonotonicInstant,
+    ) -> Self {
         Self {
             duration,
-            captured_at: clock.monotonic(),
+            captured_at,
         }
     }
 
@@ -3268,6 +3271,27 @@ impl JobClient {
         due_origin_for(self.durable_is_pg(), self.clock.as_ref())
     }
 
+    /// The monotonic instant a relative delay's elapsed pre-INSERT wait
+    /// should be measured from — real time for Postgres, [`Self::clock`]'s
+    /// own (possibly virtual) monotonic reading otherwise.
+    ///
+    /// Mirrors [`Self::due_origin`] for the same reason: the elapsed time
+    /// this instant measures is later subtracted against a real
+    /// `crate::time::monotonic_now()` read taken inside `pg_insert_job`
+    /// (`clock_timestamp()`'s monotonic twin — Postgres's own clock, not this
+    /// app's). Capturing it from a virtual clock instead would compare two
+    /// unrelated timelines: a `FixedClock`'s pinned monotonic reading never
+    /// advances, so it would report zero elapsed time no matter how long a
+    /// real wait actually took; a `TickingClock` stepped by a test would
+    /// subtract time that never passed in Postgres at all.
+    fn monotonic_origin(&self) -> crate::time::MonotonicInstant {
+        if self.durable_is_pg() {
+            crate::time::monotonic_now()
+        } else {
+            self.clock.monotonic()
+        }
+    }
+
     /// Whether a Postgres INSERT — rather than the local channel or the redis
     /// queue — is what will serve an enqueue on this client.
     ///
@@ -3407,7 +3431,7 @@ impl JobClient {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         let slot = reserve_enqueue(&payload);
-        let relative_delay = RelativeDelay::new(delay, self.clock.as_ref());
+        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
         let result = self
             .enqueue_with_outcome_due_inner(name, payload, due_at, now, Some(relative_delay))
             .await;
@@ -4002,12 +4026,8 @@ impl JobClient {
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
-            // Subtract whatever ran between capturing `relative_delay` and
-            // here (pool checkout, an enqueue interceptor) so that wait
-            // never silently extends the caller's requested delay — see
-            // `RelativeDelay`.
-            let remaining_delay =
-                relative_delay.map(|delay| delay.remaining(self.clock.monotonic()));
+            // `due_at`/`relative_delay` are resolved inside `pg_insert_job`,
+            // after this call's own pool checkout — see its comment.
             return pg_enqueue_job_at(
                 pool,
                 id,
@@ -4016,7 +4036,8 @@ impl JobClient {
                 payload,
                 max_attempts,
                 backoff_ms,
-                pg_due_from(remaining_delay, due_at),
+                due_at,
+                relative_delay,
                 constraints,
             )
             .await;
@@ -4097,7 +4118,7 @@ impl JobClient {
     ) -> AutumnResult<()> {
         let now = self.due_origin();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
-        let relative_delay = RelativeDelay::new(delay, self.clock.as_ref());
+        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
         self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(relative_delay))
             .await
     }
@@ -4224,12 +4245,9 @@ impl JobClient {
             let payload_for_enqueue = payload.clone();
             let constraints_ref = &constraints;
             let actual_enqueue = async move {
-                // Subtract whatever ran between capturing `relative_delay`
-                // and here (an enqueue interceptor) so that wait never
-                // silently extends the caller's requested delay — see
-                // `RelativeDelay`.
-                let remaining_delay =
-                    relative_delay.map(|delay| delay.remaining(self.clock.monotonic()));
+                // `due_at`/`relative_delay` are resolved inside
+                // `pg_insert_job`, after any wait an enqueue interceptor
+                // introduced here — see that function's comment.
                 let outcome = pg_enqueue_on_conn_at(
                     conn,
                     id_for_enqueue.clone(),
@@ -4238,7 +4256,8 @@ impl JobClient {
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
-                    pg_due_from(remaining_delay, due_at),
+                    due_at,
+                    relative_delay,
                     constraints_ref,
                 )
                 .await;
@@ -8624,7 +8643,8 @@ async fn pg_insert_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    pg_due: PgDueAt,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
@@ -8643,11 +8663,6 @@ async fn pg_insert_job(
     const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
 
-    let (run_at, run_at_delay_ms) = match pg_due {
-        PgDueAt::Immediate => (None, None),
-        PgDueAt::Absolute(at) => (Some(at), None),
-        PgDueAt::RelativeMs(ms) => (None, Some(ms)),
-    };
     let queue = normalize_queue_name(queue);
     #[cfg(feature = "telemetry-otlp")]
     let (traceparent, tracestate) = capture_job_trace_context();
@@ -8677,6 +8692,25 @@ async fn pg_insert_job(
     if let (Some(ttl), Some(key)) = (unique_ttl_ms, &constraints.unique_key) {
         pg_evict_expired_unique_key(conn, name, key.as_str(), ttl).await;
     }
+
+    // Resolved here, as late as possible — after the connection is already
+    // acquired and the unique-key eviction above has run — so a relative
+    // delay's remaining time reflects only what is actually still owed. Any
+    // earlier point (before a saturated pool's `pool.get()` returns, or
+    // inside an enqueue interceptor) would count that wait as part of the
+    // job's execution instead of subtracting it from the delay. Always the
+    // real monotonic clock: this function only ever runs against Postgres,
+    // whose own `clock_timestamp()` below is real time regardless of
+    // whatever (possibly virtual) clock this app is otherwise pinned to.
+    let pg_due = pg_due_from(
+        relative_delay.map(|delay| delay.remaining(crate::time::monotonic_now())),
+        due_at,
+    );
+    let (run_at, run_at_delay_ms) = match pg_due {
+        PgDueAt::Immediate => (None, None),
+        PgDueAt::Absolute(at) => (Some(at), None),
+        PgDueAt::RelativeMs(ms) => (None, Some(ms)),
+    };
 
     // `run_at` picks its value in this order: an explicit absolute instant
     // ($11/$13, `enqueue_at`), else a relative delay measured from the
@@ -8781,7 +8815,8 @@ async fn pg_enqueue_job(
         payload,
         max_attempts,
         initial_backoff_ms,
-        PgDueAt::Immediate,
+        None,
+        None,
         constraints,
     )
     .await
@@ -8791,7 +8826,9 @@ async fn pg_enqueue_job(
 ///
 /// When `run_at` lands in the future the row is durable but invisible to the
 /// claim query (`WHERE run_at <= NOW()`) until then — a crash-safe delayed
-/// enqueue.
+/// enqueue. `due_at`/`relative_delay` are resolved into a [`PgDueAt`] inside
+/// [`pg_insert_job`], after this function's own `pool.get()` wait — see that
+/// function's comment on why a relative delay must be resolved that late.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job_at(
@@ -8802,7 +8839,8 @@ async fn pg_enqueue_job_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    pg_due: PgDueAt,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     let mut conn = pool
@@ -8817,7 +8855,8 @@ async fn pg_enqueue_job_at(
         payload,
         max_attempts,
         initial_backoff_ms,
-        pg_due,
+        due_at,
+        relative_delay,
         constraints,
     )
     .await
@@ -8841,7 +8880,8 @@ async fn pg_enqueue_on_conn_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    pg_due: PgDueAt,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     pg_insert_job(
@@ -8852,7 +8892,8 @@ async fn pg_enqueue_on_conn_at(
         payload,
         max_attempts,
         initial_backoff_ms,
-        pg_due,
+        due_at,
+        relative_delay,
         constraints,
     )
     .await
@@ -16578,7 +16619,8 @@ mod tests {
                 serde_json::json!({ "user_id": 7 }),
                 5,
                 250,
-                PgDueAt::Absolute(due),
+                Some(due),
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await
@@ -16644,6 +16686,8 @@ mod tests {
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
+            let relative_delay =
+                RelativeDelay::new(Duration::from_millis(2_000), crate::time::monotonic_now());
             pg_enqueue_job_at(
                 &pool,
                 job_id.clone(),
@@ -16652,7 +16696,8 @@ mod tests {
                 serde_json::json!({ "user_id": 7 }),
                 5,
                 250,
-                PgDueAt::RelativeMs(2_000),
+                None,
+                Some(relative_delay),
                 &ResolvedJobConstraints::default(),
             )
             .await
@@ -16696,10 +16741,18 @@ mod tests {
             let mut conn = pool.get().await.unwrap();
             let before_enqueue = std::time::Instant::now();
             conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
-                // Hold the transaction open for 3s before the relative
-                // enqueue: long enough that a `NOW()`-based delay would make
-                // a 2s-delayed job already due by commit time.
+                // Hold the transaction open for 3s *before* the relative
+                // enqueue call: long enough that a `NOW()`-based delay would
+                // make a 2s-delayed job already due by commit time. The
+                // delay is captured after this sleep, exactly as
+                // `enqueue_in_on_conn` captures it at the call site — this
+                // test is about the transaction's age at the *call*, not
+                // about a wait between the call and the INSERT (that is
+                // `pg_relative_delay_computes_run_at_on_the_database_clock`'s
+                // sibling concern).
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                let relative_delay =
+                    RelativeDelay::new(Duration::from_millis(2_000), crate::time::monotonic_now());
                 pg_enqueue_on_conn_at(
                     conn,
                     job_id_for_insert,
@@ -16708,7 +16761,8 @@ mod tests {
                     serde_json::json!({ "user_id": 7 }),
                     5,
                     250,
-                    PgDueAt::RelativeMs(2_000),
+                    None,
+                    Some(relative_delay),
                     &ResolvedJobConstraints::default(),
                 )
                 .await
