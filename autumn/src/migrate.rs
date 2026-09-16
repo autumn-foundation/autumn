@@ -3158,17 +3158,28 @@ fn sqlite_collision_history_moves(
         .flatten()
         .map(|(version, name)| (name.as_str(), version.as_str()))
         .collect();
-    // Every full name a framework set (not the app's own migrations, always
-    // `sets[0]`) claims. Used to tell a framework migration new to `SQLite`
-    // (never ran here, so any collision is unambiguously the app's) from the
-    // app's own migration.
-    let framework_names: std::collections::HashSet<&str> = sets
-        .get(1..)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|(_, name)| name.as_str())
-        .collect();
+    // Every `FRAMEWORK_MIGRATIONS` full name new to `SQLite` as of this fork
+    // (issue #2699) — every one except the five [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]
+    // already lists. Derived from `FRAMEWORK_MIGRATIONS` itself, never from
+    // `sets`'s shape: a caller's `sets` can hold plugin-registered sources at
+    // any position (`AppBuilder::plugin_migrations`), and a plugin migration
+    // is not unambiguous the way a migration new to `SQLite` is — it may
+    // have applied in an earlier release, so guessing "not the app's own
+    // single set" as "never ran" would silently drop its history.
+    let new_framework_names: std::collections::HashSet<String> =
+        migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&FRAMEWORK_MIGRATIONS)
+            .map(|pairs| {
+                pairs
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .filter(|name| {
+                        !SQLITE_FRAMEWORK_MIGRATION_TABLES
+                            .iter()
+                            .any(|(migration, _)| *migration == name)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     let applied: std::collections::HashSet<String> = conn
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?
@@ -3203,14 +3214,27 @@ fn sqlite_collision_history_moves(
             } else {
                 !framework_ran
             }
+        } else if new_framework_names.contains(full_name.as_str()) {
+            // `full_name` itself is a framework migration new to `SQLite`. It
+            // never ran, so the plain version still belongs to whichever
+            // other side won the collision.
+            false
+        } else if sets
+            .iter()
+            .flatten()
+            .any(|(v, name)| v == version && new_framework_names.contains(name.as_str()))
+        {
+            // A different full name at this version IS a framework migration
+            // new to `SQLite`. It never ran, so this plain-version record can
+            // only be `full_name`'s.
+            true
         } else {
-            // No ambiguous framework migration shares this version. If
-            // `full_name` itself is a framework migration, it is the one new
-            // to `SQLite` — it never ran, so the plain version still belongs
-            // to whichever app migration won the collision. Otherwise
-            // `full_name` is the app's own migration, and it is unambiguously
-            // the one that ran.
-            !framework_names.contains(full_name.as_str())
+            // Neither side is a framework migration this fork made new to
+            // `SQLite` — an ordinary collision between two other registered
+            // sources (e.g. the app's own migrations and a plugin's). Which
+            // side ran is genuinely ambiguous from names alone; leave it for
+            // an operator, as before this fork existed.
+            continue;
         };
         if remapped_ran {
             moves.push(SqliteCollisionMove {
@@ -4118,6 +4142,68 @@ mod tests {
             again.applied.is_empty(),
             "nothing is applied twice: {:?}",
             again.applied
+        );
+    }
+
+    /// A collision between two NON-framework sources (e.g. the app's own
+    /// migrations and a plugin's, `AppBuilder::plugin_migrations`) is left
+    /// unresolved, exactly as it was before this fork gave
+    /// `FRAMEWORK_MIGRATIONS` a `SQLite` variant (issue #2699 review
+    /// finding). `sqlite_collision_history_moves` must not guess which side
+    /// ran from `sets`'s shape alone: a plugin set can sit at any position,
+    /// and — unlike a framework migration new to `SQLite` — it may
+    /// genuinely have applied in an earlier release, so treating "not at
+    /// index 0" as "never ran" would silently drop its history.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_collision_between_two_non_framework_sources_is_left_unresolved() {
+        let (migrations_dir, url) = sqlite_scratch("plugin-collision");
+        let older = migrations_dir.join("20260101000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // An older release applied the app's migration alone, under its
+        // plain version — no plugin collided with it yet.
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app's migration");
+
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let app_pairs =
+            migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
+        // A newer release adds a plugin migration that collides with the
+        // app's version; the plugin's name sorts first, so the APP's own
+        // migration is remapped to a substitute — mirroring how
+        // `migration_sets_for_disambiguation` and `sqlite_collision_pairs`
+        // build `sets` at app boot: the app's own migrations (`sets[0]`)
+        // plus every plugin set, in registration order, with no framework
+        // set folded in at all. A heuristic that reads "not `sets[0]`" as
+        // "framework, never ran" gets this backwards: here it is the app's
+        // own migration — not the plugin's — that is remapped, and it did
+        // run.
+        let sets: Vec<Vec<(String, String)>> = vec![
+            app_pairs,
+            vec![(
+                "20260101000000".to_owned(),
+                "20260101000000_aaa_plugin".to_owned(),
+            )],
+        ];
+        let mut disambiguated = HashMap::new();
+        disambiguated.insert(
+            "20260101000000_zzz_app".to_owned(),
+            "20260101000000+deadbeef".to_owned(),
+        );
+
+        let moves = sqlite_collision_history_moves(&mut conn, &sets, &disambiguated)
+            .expect("resolve moves");
+        assert!(
+            moves.is_empty(),
+            "a non-framework collision must not be guessed at: {moves:?}"
         );
     }
 
