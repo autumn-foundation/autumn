@@ -3683,6 +3683,14 @@ impl JobClient {
         }
         let mut results = Vec::with_capacity(items.len());
         for (payload, due_at) in items {
+            // `enqueue_with_outcome_due` is the crate-private inner
+            // method — unlike the public `enqueue_due`, it does not check
+            // this itself. Check it here so the fallback path validates
+            // exactly like `enqueue_due` does.
+            if let Err(error) = crate::job_tracking::reject_reserved_envelope_marker(&payload) {
+                results.push(Err(error));
+                continue;
+            }
             results.push(self.enqueue_with_outcome_due(name, payload, due_at).await);
         }
         results
@@ -11297,6 +11305,36 @@ mod tests {
         assert!(
             !local_backed.can_batch_enqueue("plain_job"),
             "the local in-process backend must fall back to the sequential path"
+        );
+    }
+
+    /// `enqueue_many_due`'s sequential fallback path (used for a local
+    /// backend, a registered interceptor, an unregistered job, or a TTL
+    /// job) must reject a top-level `__autumn_tracked` key, the same as
+    /// the public `enqueue_due` does. That check lives in `enqueue_due`,
+    /// not in the crate-private `enqueue_with_outcome_due` the fallback
+    /// calls, so the fallback loop must run the check itself. Regression
+    /// test for a finding on PR #2816.
+    #[tokio::test]
+    async fn enqueue_many_due_rejects_reserved_envelope_marker_on_the_fallback_path() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let mut client = JobClient::bare_for_test(Arc::new(crate::time::SystemClock));
+        client.local_sender = Some(tx);
+
+        let payload = serde_json::json!({"__autumn_tracked": {"k": "v"}, "other": 1});
+        let results = client
+            .enqueue_many_due("some_unregistered_job", vec![(payload, None)])
+            .await;
+
+        assert_eq!(results.len(), 1, "one result per item");
+        let error = results
+            .first()
+            .expect("one result")
+            .as_ref()
+            .expect_err("a reserved envelope marker must be rejected");
+        assert!(
+            error.to_string().contains("__autumn_tracked"),
+            "unexpected error: {error}"
         );
     }
 
