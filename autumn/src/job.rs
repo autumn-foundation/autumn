@@ -8319,10 +8319,18 @@ fn record_pg_lifecycle_after_ack(
             // ready time — recording it as immediately ready would inflate
             // `queues.<name>.depth` and `oldest_waiting_age_ms` for work no
             // worker can pick up yet. An immediate (backoff==0) retry is due now.
-            match ready_at_ms {
-                Some(ready) => state.job_registry.record_enqueue_scheduled(job_name, ready),
-                None => state.job_registry.record_enqueue(job_name),
-            }
+            //
+            // Goes through `record_pg_enqueue`, not `record_enqueue_scheduled`/
+            // `record_enqueue` directly, so the retry's *new* mark also
+            // overwrites this job id's entry in `pg_marks_by_job_id`. Without
+            // that refresh, a cancel racing this retry would look up the
+            // *original* enqueue's now-consumed mark (popped by `record_start`)
+            // and, if that stale value happened to equal a different co-queued
+            // job's real mark, remove that unrelated mark instead of this job's
+            // actual retry mark.
+            state
+                .job_registry
+                .record_pg_enqueue(job_name, job_id, ready_at_ms);
             job_admin.record_requeued(job_id, attempt.saturating_add(1));
         }
         PgLifecycleRecord::Failure { error } => {
@@ -16097,6 +16105,65 @@ mod tests {
             assert_eq!(
                 work.depth, 1,
                 "an immediate retry is due now and counts as ready backlog"
+            );
+        }
+
+        #[test]
+        fn pg_retry_refreshes_the_exact_mark_so_a_racing_cancel_does_not_hit_a_coincidental_collision()
+         {
+            // Regression for the Codex P2 raised on commit 9add7ed:
+            // `record_pg_lifecycle_after_ack`'s Retry arm used to push the
+            // retry's new mark via `record_enqueue_scheduled`/`record_enqueue`
+            // directly, leaving the job's `pg_marks_by_job_id` entry stale at
+            // its original (already-consumed-by-`record_start`) mark. If
+            // another co-queued job happens to share that exact timestamp —
+            // two `enqueue_at` jobs due at the same millisecond, say — a
+            // cancel racing the retry would find and remove the OTHER job's
+            // real mark via the stale exact lookup, leaving the retried
+            // job's actual mark behind, uncancelled.
+            const SHARED_MARK: u64 = 5_000;
+            const RETRY_MARK: u64 = 9_000;
+
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register_on_queue("racer", "work");
+
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id = job_admin.record_enqueue_for_test("racer", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            // Two jobs happen to share one due millisecond.
+            state
+                .job_registry()
+                .record_pg_enqueue("racer", &job_id, Some(SHARED_MARK));
+            state
+                .job_registry()
+                .record_pg_enqueue("racer", "job-b", Some(SHARED_MARK));
+            state.job_registry().record_start("racer");
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "racer",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Retry {
+                    error: "try again",
+                    attempt: 1,
+                    ready_at_ms: Some(RETRY_MARK),
+                },
+                &state,
+                &job_admin
+            ));
+
+            state
+                .job_registry()
+                .record_cancel_at_backend_offset("racer", &job_id, None, RETRY_MARK, 0);
+
+            assert_eq!(
+                state.job_registry().waiting_marks_for_test("racer"),
+                vec![SHARED_MARK],
+                "canceling the retried job must remove only its own refreshed retry \
+                 mark, leaving the co-queued job's coincidentally-identical mark \
+                 untouched"
             );
         }
 

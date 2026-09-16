@@ -5002,9 +5002,12 @@ mod tests {
         );
 
         // The job fails non-terminally and is requeued as a retry: a new
-        // mark is pushed under the same job name, but — mirroring the real
-        // retry-lifecycle code, which predates `record_pg_enqueue` and does
-        // not call it — without updating "job-id"'s exact entry.
+        // mark is pushed under the same job name via the plain
+        // `record_enqueue_scheduled` primitive, without updating "job-id"'s
+        // exact entry — exercising the fallback directly, for whichever
+        // caller pushes a retry mark this way rather than through
+        // `record_pg_enqueue` (see `pg_retry_refreshes_the_exact_mark_so_a_racing_cancel_does_not_hit_a_coincidental_collision`
+        // in job.rs for the production retry-lifecycle path, which now does).
         registry.record_enqueue_scheduled("flaky_job", MARK_B);
 
         // Cancel "job-id": the exact lookup finds the stale mark_a, which
