@@ -849,6 +849,78 @@ without also filling in the intake form above.
   `total_count: 0` against `workflow_dispatch` runs, checked
   2026-09-15T~09:5xZ — unchanged for a 7th straight pass since it became
   dispatchable 2026-09-08T15:07:44Z (now ~162.5 hours idle, a full week).
+- **2026-09-16 update — 8th consecutive pass, harness still undispatched;
+  TWO organic hits in a single ~24h window, breaking a six-pass zero-hit
+  streak, one of them a brand-new signature.** Sampled `ci.yml`
+  `pull_request` runs from the 2026-09-15 report's own cutoff
+  (2026-09-15T09:39:00Z, exclusive) to 2026-09-16T09:40:05Z (~24h, two
+  `perPage=100` pages: page 1 covered 2026-09-15T16:38:14Z–09:40:05Z, page 2
+  covered back to 2026-09-14T07:25:10Z with margin past the window's near
+  edge) — 119 runs: 88 cancelled/18 success/13 failure. All 13 run-level
+  failures triaged by job/log inspection: 11 were a WIP branch's own
+  `Clippy`/`Lint` failure (`claude/determined-bardeen-unefhv` alone
+  accounts for 4 of these, iterating on the same fix across pushes;
+  `claude/eager-turing-gqo7ng` and `claude/inspiring-ramanujan-95ccd6` 2
+  each), 1 was `vesper/macro-crate-split`'s own multi-job break (Lint, MSRV,
+  Plugin API contract, SQLite runtime, Edge capsule conformance, Sim sweep,
+  Supply chain, and a `Markdown link gate` failure all on the same run,
+  consistent with an in-progress crate-split refactor rather than a CI
+  health issue), and 1 was `claude/inspiring-ramanujan-95ccd6`'s own
+  `pg_relative_delay_ci_coverage::pg_relative_delay_tests_are_named_in_ci`
+  repo-hygiene self-check failing on `Test (windows-latest)`
+  (`"job.rs no longer has a \`mod pg\` block inside \`mod tests\`"` —
+  the same shape as this ledger's own repo-hygiene self-checks
+  elsewhere, and clearly this branch's own in-progress `job.rs` edit, not
+  a CI infra issue).
+
+  **The remaining 2 are both `live_upgrade`, both on `Coverage (workspace)`,
+  both organic (neither triggering branch touches hot-upgrade code):**
+  1. Run 35044877808 (branch `claude/charming-planck-ag3glz`, completed
+     2026-09-16T03:36:41Z): panic at
+     `examples/hot-upgrade/tests/live_upgrade.rs:714:5`: `"the new build
+     must accept writes after the cutover"` — **a signature not previously
+     recorded in this entry.** The counter line printed immediately above
+     it reads `"connection failures across cutover: refused=0
+     hard_failures_after_retry=0 mid_flight_resets_retried=0
+     startup_barrier_hits_retried=0"` — all four counters PR #2645 added
+     are clean, so none of that fix's three named retry mechanisms fired;
+     whatever rejected the write did so without tripping any of them.
+     `test result: FAILED. 5 passed; 1 failed`, same as every other hit
+     on this test. Undiagnosed — a fourth distinct assertion on this test
+     (after the macOS connection-error cluster, the Linux line-567
+     "new build never served," and the line-686 `status: 0`/empty-body
+     signature below), not yet folded into any existing hypothesis.
+  2. Run 35069353632 (branch `claude/friendly-ritchie-wol314`, completed
+     2026-09-16T09:15:56Z): panic at `./tests/live_upgrade.rs:686:5`,
+     `test result: FAILED. 5 passed; 1 failed` — same line number and same
+     pass/fail shape as the 2026-09-11 `status: 0` hit (run 34591670807)
+     already logged above. The tail fetched for this run's log (220 lines)
+     captured the backtrace and the preceding request-log spam but not the
+     `thread '...' panicked at ...:686:5: <message>` banner line itself —
+     it fell outside even that window, so the exact assertion text is
+     **not independently re-confirmed this pass**; recorded as "consistent
+     with, not confirmed as" the same `status: 0` signature, on line number
+     and result shape alone. A wider tail or the raw log blob URL would be
+     needed to confirm the message text exactly, per the same truncation
+     caveat the 2026-09-11 entry already flagged for this job type.
+
+  Two hits in one day, after six straight passes (2026-09-09 through
+  2026-09-15) of zero organic `live_upgrade` hits in the sampled windows,
+  is itself worth noting even though neither hit alone clears this role's
+  own rerun-rate bar. Still not campaigned — n counts per signature now
+  stand at line-552 (n=1), line-567 (n=1, fixed by #2645's mechanism 2),
+  line-686/`status: 0` (n=2-3 depending on whether hit 2 above confirms),
+  and line-714 (n=1, new). `manual-macos-contention-check.yml`: still
+  `total_count: 0` against `workflow_dispatch` runs, checked
+  2026-09-16T~09:5xZ — unchanged for an 8th straight pass since it became
+  dispatchable 2026-09-08T15:07:44Z (now ~186.5 hours idle, well over a
+  week). The recommendation to dispatch it is now materially more urgent
+  than a restatement: this pass found a brand-new failure mode (write
+  rejection post-cutover, not merely a read/connection issue) on a test
+  covering exactly the hot-upgrade handoff path, and the harness that could
+  start separating "timing-sensitive test" from "product race" has sat
+  unexercised for over a week while the signature count on this one test
+  keeps growing.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
