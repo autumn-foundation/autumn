@@ -67,7 +67,18 @@ fn subtree_has_visible_content(nodes: &[Node]) -> bool {
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
-                if !text.is_empty() {
+                // words_of splits on breakable whitespace and drops the
+                // pieces it produces, so a run of nothing but breakable
+                // whitespace (plain spaces, newlines) never becomes a word
+                // and draw_spans never draws or advances for it — only a
+                // char that survives that split (an ordinary character, or
+                // a non-breaking space, which is whitespace by Unicode's
+                // definition but still renders as its own word) means this
+                // text is really visible.
+                if text
+                    .chars()
+                    .any(|c| !c.is_whitespace() || is_non_breaking_space(c))
+                {
                     return true;
                 }
             }
@@ -2999,6 +3010,27 @@ mod tests {
                 count_pdf_depth_warnings(&html),
                 0,
                 "{n} empty nested wrappers drop no content, so this must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_only_text_past_the_depth_cap_does_not_warn() {
+        // A lone space or newline is nonempty text, but words_of splits on
+        // breakable whitespace and drops it, so draw_spans never draws or
+        // advances for it — nothing is actually lost by truncating it.
+        // (Codex review on PR #2810.)
+        for content in ["\n", " ", "  \n  "] {
+            let html = format!(
+                "{}{}{}",
+                "<span>".repeat(513),
+                content,
+                "</span>".repeat(513)
+            );
+            assert_eq!(
+                count_pdf_depth_warnings(&html),
+                0,
+                "{content:?} draws nothing, so this must not warn"
             );
         }
     }
