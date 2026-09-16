@@ -13,7 +13,7 @@
 # is invisible by construction: a gate that only reads the docs can never notice
 # a command the docs never mention.
 #
-# The first run of this direction found 25 of 195 command paths (12.8%) absent
+# The first run of this direction found 26 of 194 command paths (13.4%) absent
 # from all 212 reader-facing pages. Most were benign and are classified below;
 # the one that mattered was the `autumn token` family. `issue` reached readers
 # only through the agent skill tree, and `list` / `rotate` / `revoke` reached
@@ -58,6 +58,24 @@
 #      count is a number someone can work down rather than a silence. Adding a
 #      NEW command without documenting it fails the gate; it does not get to
 #      join the backlog by default.
+#
+# AND ONE THING THAT LOOKS LIKE COVERAGE AND IS ITS OPPOSITE: a page that names
+# a command only to say it DOES NOT EXIST. Three do — `autumn generate seed`
+# ("out of scope", tracked in #493), `autumn generate island` ("there is no…")
+# and `autumn system-test` ("planned but does not exist yet") — each carrying
+# the sibling gate's `cli-surface-allow` waiver. None is in the surface today,
+# so nothing is miscounted yet; the bug is what happens when one SHIPS. The
+# denial would read as documentation, the gate would go green, and the page
+# would keep telling readers a shipped feature is unavailable — wrong docs, with
+# the gate certifying them. Worse, the waiver comment CONTAINS the command it
+# waives, so it satisfied coverage on its own.
+#
+# So: HTML comments are stripped before extraction (a comment renders as
+# nothing, so it documents nothing — the line `check-docs-orphans.sh` draws,
+# for the same reason), and a page's waived commands do not count as mentioned
+# ON THAT PAGE. When such a command ships, the gate fails and names the page
+# still denying it, so the stale passage is deleted rather than the waiver
+# widened.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - Whether the mention is any GOOD. A command named once in a table is
@@ -191,28 +209,86 @@ GLOBAL_OPTS = ('--help', '-h', '--version', '-V')
 # past a closing backtick is how a code span's neighbour gets read as arguments.
 INVOCATION = re.compile(r'\bautumn[ \t]+([^\n`]{0,120})')
 
+# An HTML comment renders as nothing, so it can document nothing. Strip before
+# extraction — the same line `check-docs-orphans.sh` draws, and for the same
+# reason: the rule is VISIBLE vs INVISIBLE, not clickable vs not. A fenced
+# command still counts (the reader can see and paste it); a commented one
+# cannot.
+#
+# This is load-bearing rather than tidy. The waiver below is itself an HTML
+# comment CONTAINING the command it waives, so without this strip
+# `<!-- cli-surface-allow: autumn generate seed — … does not exist -->` would
+# satisfy coverage for `autumn generate seed` all by itself.
+COMMENT = re.compile(r'<!--.*?-->', re.S)
 
-def mentioned(cmd, text):
-    """True when some `autumn …` invocation names `cmd` as its command path.
+# The sibling gate's waiver, same grammar (scripts/check-docs-cli.sh). It marks
+# a command named on a page ONLY to say it does not exist — "planned", "out of
+# scope", "no such command". For the drift gate that means "do not fail on this
+# spelling"; here it means the opposite of coverage, and it must be read or the
+# gate inverts on exactly the commands most likely to ship next.
+#
+# Matched against the command path EXACTLY, and an OPTION waiver waives nothing
+# here: `cli-surface-allow: autumn build --release` says that flag spelling does
+# not exist, while `build` itself ships and is documented. Reading it as a
+# command waiver would delete a real command's coverage.
+#
+# The separator is read by splitting the body rather than by a non-greedy
+# capture. `([a-z0-9 -]+?)\s*(?:—|--|:)` — the sibling's pattern, which answers
+# a different question — stops at the `--` of `--release` and captures `build`,
+# which is exactly the misread above. Found by this gate's own self-test.
+WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+(.*?)-->', re.S)
+REASON = re.compile(r'—|(?<=\s)--(?=\s)|:')
+
+
+def waived_commands(raw):
+    """Command paths a page names only to deny. Option waivers are not these."""
+    out = set()
+    for m in WAIVER.finditer(raw):
+        spec = REASON.split(m.group(1), maxsplit=1)[0]
+        toks = spec.split()
+        if toks and not any(t.startswith('-') for t in toks):
+            out.add(' '.join(toks))
+    return out
+
+
+def read_pages(root, pages):
+    """(visible text, commands this page waives as nonexistent) per page.
+
+    Waivers are read from the RAW page, before comments are stripped — they
+    live in comments, which is the point.
+    """
+    out = []
+    for p in pages:
+        raw = (root / p).read_text(errors='replace')
+        out.append((p, COMMENT.sub('', raw), waived_commands(raw)))
+    return out
+
+
+def mentioned(cmd, pages):
+    """True when some page NAMES `cmd` as a command path a reader can run.
 
     The path must be a token prefix of what follows `autumn`, so `openapi
-    export` matches `openapi export` and never bare `export`.
+    export` matches `openapi export` and never bare `export`. A page that
+    waives `cmd` does not count: it names the command to deny it.
     """
     want = cmd.split()
-    for m in INVOCATION.finditer(text):
-        toks = m.group(1).split()
-        while toks and (toks[0] in GLOBAL_OPTS
-                        or (toks[0].startswith('--') and '=' in toks[0])):
-            toks.pop(0)
-        if toks[:len(want)] == want:
-            return True
+    for _path, text, waived in pages:
+        if cmd in waived:
+            continue
+        for m in INVOCATION.finditer(text):
+            toks = m.group(1).split()
+            while toks and (toks[0] in GLOBAL_OPTS
+                            or (toks[0].startswith('--') and '=' in toks[0])):
+                toks.pop(0)
+            if toks[:len(want)] == want:
+                return True
     return False
 
 
 def analyse(root):
     cmds = command_paths()
-    pages = corpus_pages()
-    text = "\n".join((root / p).read_text(errors='replace') for p in pages)
+    paths = corpus_pages()
+    pages = read_pages(root, paths)
     hidden = hidden_variants(root)
 
     rows, rule_failures = [], []
@@ -220,18 +296,24 @@ def analyse(root):
         last = c.split()[-1]
         if last in hidden and len(c.split()) > 1:
             rows.append((c, 'hidden')); continue
-        if mentioned(c, text):
+        if mentioned(c, pages):
             rows.append((c, 'documented')); continue
         if rule_exempt(c, root, rule_failures):
             rows.append((c, 'rule')); continue
         if c in BACKLOG:
             rows.append((c, 'backlog')); continue
         rows.append((c, 'DEFECT'))
-    return rows, rule_failures, len(pages)
+    # A command that SHIPPED while a page still waives it as nonexistent is the
+    # worst case this gate has: the docs actively deny a feature the reader can
+    # run. Name those pages in the failure so the stale passage gets deleted
+    # rather than the waiver being widened.
+    stale = [(c, p) for c, k in rows if k == 'DEFECT'
+             for p, _t, w in pages if c in w]
+    return rows, rule_failures, len(paths), stale
 
 
 def report(root):
-    rows, rule_failures, npages = analyse(root)
+    rows, rule_failures, npages, stale = analyse(root)
     counts = {}
     for _, k in rows:
         counts[k] = counts.get(k, 0) + 1
@@ -264,6 +346,11 @@ def report(root):
     for c in defects:
         print(f"\n  `autumn {c}` is documented on none of the "
               f"{npages} reader-facing pages.")
+    for c, p in stale:
+        print(f"\n  …and {p} still carries a `cli-surface-allow` waiver saying "
+              f"`autumn {c}` does not exist. It SHIPPED. Delete that passage and "
+              f"its waiver — the page is now telling readers a feature they can "
+              f"run is unavailable, which is worse than the missing docs.")
     print("""
 A command a reader can run and cannot find is a coverage defect: the answer does
 not exist where they look, so they conclude the feature does not exist. Fix it at
@@ -284,7 +371,7 @@ Inspect what the gate read:  scripts/check-docs-cli-coverage.sh --list""")
 
 
 def show(root):
-    rows, rule_failures, npages = analyse(root)
+    rows, rule_failures, npages, _stale = analyse(root)
     for c, k in sorted(rows):
         print(f"{k:11} autumn {c}")
     for f in rule_failures:
@@ -303,26 +390,50 @@ def self_test():
         if got != want:
             fails.append(f"{name}: got {got!r}, want {want!r}")
 
-    # mention matching
-    check('bare command', mentioned('token revoke', 'run `autumn token revoke`'), True)
-    check('trailing args ignored', mentioned('db reset', 'autumn db reset --force'), True)
+    # mention matching. `page(text)` is the one-page corpus `mentioned` reads,
+    # comments stripped and waivers extracted, exactly as read_pages builds it.
+    def page(text):
+        return [('p.md', COMMENT.sub('', text), waived_commands(text))]
+
+    check('bare command', mentioned('token revoke', page('run `autumn token revoke`')), True)
+    check('trailing args ignored', mentioned('db reset', page('autumn db reset --force')), True)
     check('builtin global flag skipped',
-          mentioned('db reset', 'autumn --help db reset'), True)
-    check('absent', mentioned('token revoke', 'autumn token issue'), False)
+          mentioned('db reset', page('autumn --help db reset')), True)
+    check('absent', mentioned('token revoke', page('autumn token issue')), False)
     check('not a substring match',
-          mentioned('db reset', 'autumn db resetting-is-not-a-command'), False)
-    check('needs the exe', mentioned('token revoke', 'the token revoke flow'), False)
+          mentioned('db reset', page('autumn db resetting-is-not-a-command')), False)
+    check('needs the exe', mentioned('token revoke', page('the token revoke flow')), False)
 
     # REGRESSION: a longer command must not satisfy a shorter one as a suffix.
     # `autumn openapi export` is in openapi.md and the top-level `export`
     # command is documented nowhere; the first matcher reported it covered.
-    check('suffix collision', mentioned('export', 'autumn openapi export'), False)
+    check('suffix collision', mentioned('export', page('autumn openapi export')), False)
     check('the real path still matches',
-          mentioned('openapi export', 'autumn openapi export'), True)
+          mentioned('openapi export', page('autumn openapi export')), True)
     check('does not run past a backtick',
-          mentioned('db reset', '`autumn db` reset'), False)
+          mentioned('db reset', page('`autumn db` reset')), False)
     check('hyphenated exe is not the exe',
-          mentioned('token issue', 'autumn-cli token issue'), False)
+          mentioned('token issue', page('autumn-cli token issue')), False)
+
+    # REGRESSION: a NEGATIVE mention is not coverage. These pages name a command
+    # only to say it does not exist; when one ships, the gate must still demand
+    # real docs rather than accept the denial as documentation.
+    denial = ('- **`autumn generate seed`** — tracked in #493 follow-up work.\n'
+              '<!-- cli-surface-allow: autumn generate seed — listed under "Out '
+              'of scope" precisely because it does not exist -->\n')
+    check('waiver comment alone is not coverage',
+          mentioned('generate seed', page(
+              '<!-- cli-surface-allow: autumn generate seed — does not exist -->')), False)
+    check('waived prose is not coverage',
+          mentioned('generate seed', page(denial)), False)
+    check('an unwaived command on the same page still counts',
+          mentioned('generate model', page(denial + '\nRun `autumn generate model Post`.')), True)
+    check('an option waiver does not waive its command',
+          mentioned('build', page('Run `autumn build`.\n'
+                                  '<!-- cli-surface-allow: autumn build --release '
+                                  '— release is the default -->')), True)
+    check('a plain HTML comment documents nothing',
+          mentioned('db reset', page('<!-- autumn db reset -->')), False)
 
     # the summary line must never be read as a command
     check('summary dropped', bool(SUMMARY.match('53 top-level commands, 194 command paths')), True)

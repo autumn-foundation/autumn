@@ -51,7 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command fails the gate rather than joining them. Surface and corpus are
   both read from `check-docs-cli.sh` instead of respelled, so the two cannot
   drift apart the way the four gates `check-docs-scope.sh` exists to
-  reconcile once did.
+  reconcile once did. A page that names a command only to say it does NOT
+  exist is not coverage, and reading it as such would have inverted the gate
+  on exactly the commands most likely to ship next: three pages carry the
+  sibling's `cli-surface-allow` waiver for `autumn generate seed` (tracked in
+  #493), `autumn generate island` and `autumn system-test`, and the waiver
+  comment itself contains the command it waives, so it satisfied coverage on
+  its own. HTML comments are now stripped before extraction — a comment
+  renders as nothing, so it documents nothing, the same line
+  `check-docs-orphans.sh` draws — and a page's waived commands do not count as
+  mentioned on that page. When one of those ships, the gate fails and names
+  the page still denying it, so the stale passage is deleted rather than the
+  waiver widened.
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
