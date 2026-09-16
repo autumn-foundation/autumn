@@ -303,7 +303,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   offline-sync engine (`sync::server::router`), leaving every other column and
   every row-level delete to the wrapped resolver. Cost: the merge scans the
   character list, so it suits note-sized and comment-sized fields. See
-  [collaboration](../../docs/guide/collaboration.md) and
+  [collaboration](../../../docs/guide/collaboration.md) and
   `examples/collab-notes`.
 - **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
