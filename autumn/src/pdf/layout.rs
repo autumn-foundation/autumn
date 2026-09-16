@@ -3132,11 +3132,17 @@ mod tests {
         // never actually nest them — this builds the Node tree directly
         // to test the function's own stack safety regardless of what the
         // current parser happens to allow. (Codex review on PR #2810.)
+        //
+        // 100,000 levels, not 2,000,000: a naive recursive walk overflows
+        // well before this depth on any plausible native stack, and the
+        // smaller tree avoids a ~190 MiB allocation spike that could make
+        // this test OOM or stall on a memory-constrained CI worker running
+        // tests in parallel. (Codex review on PR #2810.)
         let mut node = Node::Element {
             tag: "thead".to_owned(),
             children: Vec::new(),
         };
-        for _ in 0..2_000_000 {
+        for _ in 0..100_000 {
             node = Node::Element {
                 tag: "thead".to_owned(),
                 children: vec![node],
