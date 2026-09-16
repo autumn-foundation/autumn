@@ -536,12 +536,16 @@ fn inline_spans(
         }
         return;
     }
-    let cache = vec![Cell::new(None); nodes.len()];
+    let raw_cache = vec![Cell::new(None); nodes.len()];
+    let resolve_cache = vec![Cell::new(None); nodes.len()];
+    let nothing_follows_cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
             nodes,
             start: i + 1,
-            cache: &cache,
+            raw_cache: &raw_cache,
+            resolve_cache: &resolve_cache,
+            nothing_follows_cache: &nothing_follows_cache,
             table_children_are_boundaries: true,
             ancestor: has_more_after,
         };
@@ -580,17 +584,18 @@ fn inline_spans(
                     // separates its content from whatever follows it out
                     // here — so that later content can never glue to
                     // anything inside, regardless of what more_after says.
-                    // `BlockBoundary` still remembers the real `has_more_after`
-                    // underneath the override, for `nothing_follows`'s sake.
+                    // `BlockBoundary` still remembers the real context
+                    // underneath the override, for `nothing_follows`'s sake
+                    // — `more_after` (this position's own later-siblings
+                    // context), not `has_more_after` (the caller's, which
+                    // omits siblings following this tag at *this* level).
                     push_block_break(out);
                     inline_spans(
                         children,
                         bold,
                         italic,
                         depth + 1,
-                        &GlueContext::BlockBoundary {
-                            outer: has_more_after,
-                        },
+                        &GlueContext::BlockBoundary { outer: &more_after },
                         trimmed,
                         out,
                     );
@@ -837,12 +842,16 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         }
     };
 
-    let cache = vec![Cell::new(None); nodes.len()];
+    let raw_cache = vec![Cell::new(None); nodes.len()];
+    let resolve_cache = vec![Cell::new(None); nodes.len()];
+    let nothing_follows_cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
             nodes,
             start: i + 1,
-            cache: &cache,
+            raw_cache: &raw_cache,
+            resolve_cache: &resolve_cache,
+            nothing_follows_cache: &nothing_follows_cache,
             table_children_are_boundaries: false,
             ancestor: &GlueContext::Resolved(false),
         };
@@ -1021,12 +1030,16 @@ fn flatten_into_pending(
     // it only ever produced inline text (no nested block tags fired), that
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
-    let cache = vec![Cell::new(None); nodes.len()];
+    let raw_cache = vec![Cell::new(None); nodes.len()];
+    let resolve_cache = vec![Cell::new(None); nodes.len()];
+    let nothing_follows_cache = vec![Cell::new(None); nodes.len()];
     for (i, node) in nodes.iter().enumerate() {
         let more_after = GlueContext::LaterSiblings {
             nodes,
             start: i + 1,
-            cache: &cache,
+            raw_cache: &raw_cache,
+            resolve_cache: &resolve_cache,
+            nothing_follows_cache: &nothing_follows_cache,
             table_children_are_boundaries: false,
             ancestor: has_more_after,
         };
@@ -1243,9 +1256,22 @@ enum GlueContext<'a> {
         // Caches each node's own raw `node_glue_lookahead` result (not an
         // already-interpreted bool): `resolve` and `nothing_follows` read
         // the *same* three-state answer for the same node, they just map
-        // it to a bool differently, so a single shared cache serves both
-        // — see each method's own doc comment for why the cache matters.
-        cache: &'a [Cell<Option<GlueLookahead>>],
+        // it to a bool differently, so both reuse it instead of paying
+        // for `node_glue_lookahead` twice.
+        raw_cache: &'a [Cell<Option<GlueLookahead>>],
+        // Caches `resolve`'s and `nothing_follows`'s own *folded* answer
+        // per starting position — "if I start scanning at index i, what do
+        // I end up returning" — each filled in (with backfill across every
+        // `Exhausted` position skipped to reach it) the first time either
+        // method is asked to resolve starting there. Without this, a
+        // capped sibling run still costs O(distance-to-the-answer) *loop
+        // iterations* per sibling even with `raw_cache` alone — each
+        // iteration becomes an O(1) `Cell` read instead of an O(1)
+        // `node_glue_lookahead` call, but there are still O(n) of them per
+        // capped sibling, O(n^2) overall. This is what actually collapses
+        // that to O(1) amortized per sibling.
+        resolve_cache: &'a [Cell<Option<bool>>],
+        nothing_follows_cache: &'a [Cell<Option<bool>>],
         table_children_are_boundaries: bool,
         ancestor: &'a Self,
     },
@@ -1265,37 +1291,64 @@ enum GlueContext<'a> {
 }
 
 impl GlueContext<'_> {
-    /// A caller builds this with `start` set to the index *after* the node
-    /// it is about to recurse into — never that node itself, since
-    /// whatever is inside it gets discovered by that recursion's own
-    /// eventual depth-cap guard, and pre-scanning it here too would be
-    /// pure duplicated work. `cache` is one slot per entry in `nodes`,
-    /// shared by every sibling's own `GlueContext` at this level: a
-    /// document can have many capped siblings in a row (e.g. a run of
-    /// empty wrapper tags) that each build a `LaterSiblings` overlapping
-    /// almost the entire same remaining suffix, and without this cache
-    /// each one's `resolve()` would rescan that suffix from scratch —
-    /// O(n) work per capped sibling, O(n^2) overall. `cache[i]` answers
-    /// "does resolving starting at position i return true", filled in
-    /// (at most once each) as `resolve()` walks past `Exhausted` nodes
-    /// looking for a `Confirmed`/`Stopped` one, so a later call starting
-    /// at or before an already-filled index short-circuits in O(1).
     /// Returns node `i`'s cached [`GlueLookahead`], computing and caching
     /// it first if this is the first time anything has asked about this
     /// position. Shared by [`resolve`](Self::resolve) and
-    /// [`nothing_follows`](Self::nothing_follows) — see the `cache` field's
-    /// own doc comment for why one cache safely serves both.
+    /// [`nothing_follows`](Self::nothing_follows) — see `raw_cache`'s own
+    /// doc comment for why one cache safely serves both.
     fn lookahead_at(
         nodes: &[Node],
-        cache: &[Cell<Option<GlueLookahead>>],
+        raw_cache: &[Cell<Option<GlueLookahead>>],
         table_children_are_boundaries: bool,
         i: usize,
     ) -> GlueLookahead {
-        if let Some(cached) = cache[i].get() {
+        if let Some(cached) = raw_cache[i].get() {
             return cached;
         }
         let result = node_glue_lookahead(&nodes[i], table_children_are_boundaries);
-        cache[i].set(Some(result));
+        raw_cache[i].set(Some(result));
+        result
+    }
+
+    /// Shared engine for [`resolve`](Self::resolve) and
+    /// [`nothing_follows`](Self::nothing_follows): scans forward from
+    /// `start`, consulting/backfilling `folded_cache` (each method's own —
+    /// see that field's doc comment for why the backfill, not just
+    /// per-node caching, is what actually makes this O(1) amortized), and
+    /// asks `stop_at` to classify each node's raw lookahead as `Some(_)`
+    /// (a decisive answer for this starting position) or `None` (defer to
+    /// the next node).
+    fn resolve_via(
+        nodes: &[Node],
+        start: usize,
+        raw_cache: &[Cell<Option<GlueLookahead>>],
+        folded_cache: &[Cell<Option<bool>>],
+        table_children_are_boundaries: bool,
+        stop_at: impl Fn(GlueLookahead) -> Option<bool>,
+        on_exhausted: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut i = start;
+        let result = loop {
+            if i >= nodes.len() {
+                break on_exhausted();
+            }
+            if let Some(cached) = folded_cache[i].get() {
+                break cached;
+            }
+            let lookahead = Self::lookahead_at(nodes, raw_cache, table_children_are_boundaries, i);
+            match stop_at(lookahead) {
+                Some(v) => break v,
+                None => i += 1,
+            }
+        };
+        for cell in &folded_cache[start..i.min(nodes.len())] {
+            if cell.get().is_none() {
+                cell.set(Some(result));
+            }
+        }
+        if i < nodes.len() {
+            folded_cache[i].set(Some(result));
+        }
         result
     }
 
@@ -1306,20 +1359,24 @@ impl GlueContext<'_> {
             GlueContext::LaterSiblings {
                 nodes,
                 start,
-                cache,
+                raw_cache,
+                resolve_cache,
                 table_children_are_boundaries,
                 ancestor,
-            } => {
-                let mut i = *start;
-                while i < nodes.len() {
-                    match Self::lookahead_at(nodes, cache, *table_children_are_boundaries, i) {
-                        GlueLookahead::Confirmed => return true,
-                        GlueLookahead::Stopped => return false,
-                        GlueLookahead::Exhausted => i += 1,
-                    }
-                }
-                ancestor.resolve()
-            }
+                ..
+            } => Self::resolve_via(
+                nodes,
+                *start,
+                raw_cache,
+                resolve_cache,
+                *table_children_are_boundaries,
+                |lookahead| match lookahead {
+                    GlueLookahead::Confirmed => Some(true),
+                    GlueLookahead::Stopped => Some(false),
+                    GlueLookahead::Exhausted => None,
+                },
+                || ancestor.resolve(),
+            ),
         }
     }
 
@@ -1337,11 +1394,6 @@ impl GlueContext<'_> {
     /// that has nothing beyond it by construction — so `Resolved` always
     /// means "nothing follows" here, unlike `resolve`, which also reads
     /// `Resolved(false)` sitting *underneath* a `BlockBoundary` override.
-    ///
-    /// Reads the same shared `cache` `resolve` does (see `lookahead_at`),
-    /// so a capped subtree with many later siblings still costs O(1)
-    /// amortized per sibling instead of rescanning the whole suffix again
-    /// for every one of them.
     fn nothing_follows(&self) -> bool {
         match self {
             GlueContext::Resolved(_) => true,
@@ -1349,22 +1401,23 @@ impl GlueContext<'_> {
             GlueContext::LaterSiblings {
                 nodes,
                 start,
-                cache,
+                raw_cache,
+                nothing_follows_cache,
                 table_children_are_boundaries,
                 ancestor,
-            } => {
-                let mut i = *start;
-                while i < nodes.len() {
-                    if !matches!(
-                        Self::lookahead_at(nodes, cache, *table_children_are_boundaries, i),
-                        GlueLookahead::Exhausted
-                    ) {
-                        return false;
-                    }
-                    i += 1;
-                }
-                ancestor.nothing_follows()
-            }
+                ..
+            } => Self::resolve_via(
+                nodes,
+                *start,
+                raw_cache,
+                nothing_follows_cache,
+                *table_children_are_boundaries,
+                |lookahead| match lookahead {
+                    GlueLookahead::Exhausted => None,
+                    GlueLookahead::Confirmed | GlueLookahead::Stopped => Some(false),
+                },
+                || ancestor.nothing_follows(),
+            ),
         }
     }
 }
@@ -4081,6 +4134,31 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "trailing whitespace after the <br> keeps it from ever being trimmed, so this must warn"
+        );
+    }
+
+    #[test]
+    fn br_capped_alone_then_a_whitespace_sibling_outside_it_still_warns() {
+        // Unlike the previous case (whitespace *inside* the same capped
+        // subtree as the <br>), here the <br> is the capped subtree's
+        // *entire* content, and the whitespace is a separate sibling text
+        // node outside the whole wrapper chain, at the heading's own top
+        // level. This still must warn, for the same reason: the whitespace
+        // becomes the buffer's actual trailing span, so trim_trailing_break
+        // never reaches the break. node_glue_lookahead already gets this
+        // right — a Text node whose first char is breakable whitespace
+        // resolves to Stopped, not Exhausted, regardless of how deep it's
+        // nested to get there — verified directly here as a regression
+        // guard. (Codex review on PR #2810.)
+        let html = format!(
+            "<h1>{}<br>{} </h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "the whitespace sibling outside the capped subtree still keeps the <br> from being trimmed"
         );
     }
 
