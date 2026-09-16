@@ -3313,6 +3313,28 @@ impl JobClient {
         }
     }
 
+    /// [`Self::monotonic_origin`] and [`Self::due_origin`], captured together
+    /// for a relative-delay enqueue — in this order, which must not change.
+    ///
+    /// A relative delay's elapsed pre-INSERT wait is measured as
+    /// `monotonic_now() - monotonic_origin` (see [`RelativeDelay`]), so any
+    /// pause between capturing these two origins — the task descheduled, the
+    /// VM itself paused (live migration, CPU steal) — only still counts
+    /// against the delay if the monotonic origin is captured *before* the
+    /// pause. Capturing [`Self::due_origin`] first instead would let that
+    /// pause slip between the two reads uncounted by either: not shortening
+    /// the remaining delay (the monotonic origin starts after the pause) and
+    /// not stretching `due_at`/`now` either (`due_origin` runs after the
+    /// pause too) — silently adding the pause's length on top of the
+    /// requested delay instead of counting it as part of the wait.
+    fn relative_delay_origins(
+        &self,
+    ) -> (crate::time::MonotonicInstant, chrono::DateTime<chrono::Utc>) {
+        let monotonic = self.monotonic_origin();
+        let now = self.due_origin();
+        (monotonic, now)
+    }
+
     /// Whether a Postgres INSERT — rather than the local channel or the redis
     /// queue — is what will serve an enqueue on this client.
     ///
@@ -3439,20 +3461,19 @@ impl JobClient {
         delay: std::time::Duration,
     ) -> AutumnResult<EnqueueOutcome> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
-        // Single real-clock read, reused for both the due instant and the
-        // future-filter/admin bookkeeping below — see the capture-once note
-        // on `enqueue_with_outcome_due`.
-        let now = self.due_origin();
+        // Both origins captured together, monotonic first — see
+        // `relative_delay_origins`'s doc comment for why the order matters.
+        // Also captured here, ahead of `replayed_enqueue` / `reserve_enqueue`
+        // below — the latter can block on the capsule's capture mutex and
+        // clones the whole payload, and any time that takes must still count
+        // against `delay` when `pg_insert_job` later subtracts elapsed time
+        // from it (see `RelativeDelay`). Reading it after those calls instead
+        // would silently drop that elapsed time, making the job run later
+        // than requested — `enqueue_on_conn_relative_due` already captures
+        // its origin this early, ahead of its own reservation.
+        let (monotonic_origin, now) = self.relative_delay_origins();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
-        // Capture the monotonic origin here, before `replayed_enqueue` /
-        // `reserve_enqueue` run — the latter can block on the capsule's
-        // capture mutex and clones the whole payload, and any time that
-        // takes must still count against `delay` when `pg_insert_job` later
-        // subtracts elapsed time from it (see `RelativeDelay`). Reading it
-        // after those calls instead would silently drop that elapsed time,
-        // making the job run later than requested — `enqueue_on_conn_relative_due`
-        // already captures its origin this early, ahead of its own reservation.
-        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
+        let relative_delay = RelativeDelay::new(delay, monotonic_origin);
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
@@ -4531,9 +4552,9 @@ impl JobClient {
         conn: &mut diesel_async::AsyncPgConnection,
         delay: std::time::Duration,
     ) -> AutumnResult<()> {
-        let now = self.due_origin();
+        let (monotonic_origin, now) = self.relative_delay_origins();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
-        let relative_delay = RelativeDelay::new(delay, self.monotonic_origin());
+        let relative_delay = RelativeDelay::new(delay, monotonic_origin);
         self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(relative_delay))
             .await
     }
@@ -19701,6 +19722,80 @@ mod tests {
             ))),
             Duration::ZERO,
             "elapsed time past the delay must saturate at zero, never go negative"
+        );
+    }
+
+    /// A clock that records the order `now()`/`monotonic()` are called in,
+    /// for asserting on read order rather than on the (fixed, arbitrary)
+    /// values it returns.
+    struct OrderSpyClock {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl crate::time::ClockSource for OrderSpyClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("now");
+            chrono::Utc::now()
+        }
+
+        fn monotonic(&self) -> crate::time::MonotonicInstant {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("monotonic");
+            crate::time::monotonic_now()
+        }
+    }
+
+    /// Regression for the Codex P2 raised on commit 870af15: a relative
+    /// delay's elapsed pre-INSERT wait is measured as `monotonic_now() -
+    /// monotonic_origin`, so a pause between capturing the monotonic origin
+    /// and capturing `due_origin`/`now` only still counts against the delay
+    /// when the monotonic origin is the one captured *first* — reading
+    /// `due_origin` first (as `enqueue_relative`/`enqueue_on_conn_relative_due`
+    /// both originally did) lets such a pause slip between the two reads
+    /// uncounted by either, silently adding its length on top of the
+    /// requested delay. `relative_delay_origins` exists specifically to fix
+    /// the order in one place; this proves it actually reads them in that
+    /// order rather than just documenting it.
+    #[test]
+    fn relative_delay_origins_reads_the_monotonic_origin_before_due_origin() {
+        let spy = std::sync::Arc::new(OrderSpyClock {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = JobClient {
+            local_sender: None,
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 250,
+            per_job_settings: HashMap::new(),
+            interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: spy.clone(),
+            resilience_config: None,
+        };
+
+        let _ = client.relative_delay_origins();
+
+        assert_eq!(
+            *spy.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["monotonic", "now"],
+            "the monotonic origin must be captured before due_origin's wall-clock \
+             read, so a pause between the two is still counted as elapsed time \
+             against the delay instead of silently added on top of it"
         );
     }
 
