@@ -93,6 +93,19 @@
 # keep its exemption. Both leave the gate green over documentation no reader
 # sees and behaviour the binary does not have.
 #
+# STRICT ABOUT WHAT PRECEDES THE PATH, NOT ABOUT WHAT SEPARATES IT. Nothing may
+# come before the first component — the root `Cli` has no global options and
+# clap's builtins are terminal — but a PARENT's own option may sit between
+# components: `autumn migrate --with-maintenance down` is documented at
+# generators.md:684 and is an accepted invocation of `migrate down`. Only
+# RECOGNIZED options are stepped over, read from the sibling's
+# `--list-options` table, because skipping unknown flags blindly is how a
+# strict matcher drifts back into inventing coverage. The two directions of
+# error are not symmetric and both have been made here: too permissive
+# manufactures coverage that does not exist and fails SILENT, which is the
+# defect this gate exists to find; too strict reports a documented command as
+# undocumented and fails LOUD, which is merely noise. Prefer loud.
+#
 # The stale-denial check runs over the whole SURFACE, not over the failing
 # rows, and fails on its own. Coverage and staleness are independent questions:
 # a command that ships WITH proper docs on a new page is classified
@@ -153,6 +166,23 @@ def command_paths():
 
 def corpus_pages():
     return sibling('--corpus')
+
+
+def command_options():
+    """path -> the option spellings that path accepts, from the sibling gate.
+
+    `--list-options` prints `path    --a --b`, with the options omitted when a
+    command takes none. Needed because a PARENT's option may sit between it and
+    a nested subcommand: `autumn migrate --with-maintenance down` is a real,
+    documented, accepted invocation of `migrate down`.
+    """
+    out = {}
+    for line in sibling('--list-options'):
+        if SUMMARY.match(line):
+            continue
+        path, _, opts = line.partition('    ')
+        out[path.strip()] = set(opts.split())
+    return out
 
 
 # Commands a reader cannot discover are not commands a reader can miss. Read
@@ -358,20 +388,58 @@ def read_pages(root, pages):
     return out
 
 
-def mentioned(cmd, pages):
+def _walks(toks, want, options):
+    """Does this `autumn …` token list invoke exactly the path `want`?
+
+    The FIRST token must be `want[0]`: the root `Cli` has no global options, and
+    clap's builtins are terminal, so nothing legitimately precedes the command.
+    Between later components a PARENT's own option may appear — `autumn migrate
+    --with-maintenance down` is documented at generators.md:684 and accepted by
+    the CLI — so recognized options of the path walked so far are stepped over.
+
+    Only RECOGNIZED options, read from the sibling's table: an unknown flag
+    means this line is not the invocation we are looking for, and skipping it
+    blindly is how a strict matcher drifts back into inventing coverage.
+
+    `--list-options` does not carry value arity, so a space-separated value is
+    identified by lookahead: after an option, a token that is not an option and
+    not the component being sought is that option's value. `--opt=value` is
+    self-contained and needs none of this.
+    """
+    if not toks or toks[0] != want[0]:
+        return False
+    i, walked = 1, want[0]
+    for w in want[1:]:
+        while i < len(toks) and toks[i].startswith('-'):
+            name = toks[i].split('=', 1)[0]
+            if name in TERMINAL_OPTIONS:
+                return False          # clap stops here; the command never runs
+            if name not in options.get(walked, ()):
+                return False          # not this command's flag — wrong line
+            attached = '=' in toks[i]
+            i += 1
+            if (not attached and i < len(toks)
+                    and not toks[i].startswith('-') and toks[i] != w):
+                i += 1                # that option took a value
+        if i >= len(toks) or toks[i] != w:
+            return False
+        walked = f"{walked} {toks[i]}"
+        i += 1
+    return True
+
+
+def mentioned(cmd, pages, options):
     """True when some page NAMES `cmd` as a command path a reader can run.
 
-    The path must be a token prefix of what follows `autumn`, so `openapi
-    export` matches `openapi export` and never bare `export`. A page that
-    waives `cmd` does not count: it names the command to deny it.
+    `openapi export` matches `openapi export` and never bare `export`. A page
+    that waives `cmd` does not count: it names the command to deny it.
     """
     want = cmd.split()
     for _path, text, waived in pages:
         if cmd in waived:
             continue
         for m in INVOCATION.finditer(text):
-            toks = m.group(1).split()
-            if toks[:len(want)] == want:
+            if _walks(m.group(1).split(), want, options):
                 return True
     return False
 
@@ -380,13 +448,14 @@ def analyse(root):
     cmds = command_paths()
     paths = corpus_pages()
     pages = read_pages(root, paths)
+    options = command_options()
     hidden, unplaced = hidden_paths(root, cmds)
 
     rows, rule_failures = [], []
     for c in cmds:
         if c in hidden:
             rows.append((c, 'hidden')); continue
-        if mentioned(c, pages):
+        if mentioned(c, pages, options):
             rows.append((c, 'documented')); continue
         if rule_exempt(c, root, rule_failures):
             rows.append((c, 'rule')); continue
@@ -495,30 +564,33 @@ def self_test():
     def page(text):
         return [('p.md', COMMENT.sub('', text), waived_commands(text))]
 
-    check('bare command', mentioned('token revoke', page('run `autumn token revoke`')), True)
-    check('trailing args ignored', mentioned('db reset', page('autumn db reset --force')), True)
+    # the option table `mentioned` consults; only these flags are walkable
+    OPTS = {'migrate': {'--with-maintenance', '--profile'}, 'db': set()}
+
+    check('bare command', mentioned('token revoke', page('run `autumn token revoke`'), OPTS), True)
+    check('trailing args ignored', mentioned('db reset', page('autumn db reset --force'), OPTS), True)
     # REGRESSION: clap's builtins are TERMINAL, not skippable. `autumn --help db
     # reset` prints root help and exits — `db reset` never runs and is never
     # shown, so the line documents nothing. A previous cut skipped these flags
     # and kept matching, and this assertion asserted the wrong answer.
     for flag in sorted(TERMINAL_OPTIONS):
         check(f'{flag} is terminal, not skipped',
-              mentioned('db reset', page(f'autumn {flag} db reset')), False)
-    check('absent', mentioned('token revoke', page('autumn token issue')), False)
+              mentioned('db reset', page(f'autumn {flag} db reset'), OPTS), False)
+    check('absent', mentioned('token revoke', page('autumn token issue'), OPTS), False)
     check('not a substring match',
-          mentioned('db reset', page('autumn db resetting-is-not-a-command')), False)
-    check('needs the exe', mentioned('token revoke', page('the token revoke flow')), False)
+          mentioned('db reset', page('autumn db resetting-is-not-a-command'), OPTS), False)
+    check('needs the exe', mentioned('token revoke', page('the token revoke flow'), OPTS), False)
 
     # REGRESSION: a longer command must not satisfy a shorter one as a suffix.
     # `autumn openapi export` is in openapi.md and the top-level `export`
     # command is documented nowhere; the first matcher reported it covered.
-    check('suffix collision', mentioned('export', page('autumn openapi export')), False)
+    check('suffix collision', mentioned('export', page('autumn openapi export'), OPTS), False)
     check('the real path still matches',
-          mentioned('openapi export', page('autumn openapi export')), True)
+          mentioned('openapi export', page('autumn openapi export'), OPTS), True)
     check('does not run past a backtick',
-          mentioned('db reset', page('`autumn db` reset')), False)
+          mentioned('db reset', page('`autumn db` reset'), OPTS), False)
     check('hyphenated exe is not the exe',
-          mentioned('token issue', page('autumn-cli token issue')), False)
+          mentioned('token issue', page('autumn-cli token issue'), OPTS), False)
 
     # REGRESSION: a NEGATIVE mention is not coverage. These pages name a command
     # only to say it does not exist; when one ships, the gate must still demand
@@ -528,17 +600,35 @@ def self_test():
               'of scope" precisely because it does not exist -->\n')
     check('waiver comment alone is not coverage',
           mentioned('generate seed', page(
-              '<!-- cli-surface-allow: autumn generate seed — does not exist -->')), False)
+              '<!-- cli-surface-allow: autumn generate seed — does not exist -->'), OPTS), False)
     check('waived prose is not coverage',
-          mentioned('generate seed', page(denial)), False)
+          mentioned('generate seed', page(denial), OPTS), False)
     check('an unwaived command on the same page still counts',
-          mentioned('generate model', page(denial + '\nRun `autumn generate model Post`.')), True)
+          mentioned('generate model', page(denial + '\nRun `autumn generate model Post`.'), OPTS), True)
     check('an option waiver does not waive its command',
           mentioned('build', page('Run `autumn build`.\n'
                                   '<!-- cli-surface-allow: autumn build --release '
-                                  '— release is the default -->')), True)
+                                  '— release is the default -->'), OPTS), True)
     check('a plain HTML comment documents nothing',
-          mentioned('db reset', page('<!-- autumn db reset -->')), False)
+          mentioned('db reset', page('<!-- autumn db reset -->'), OPTS), False)
+
+    # REGRESSION: a PARENT's option may sit before a nested subcommand.
+    # `autumn migrate --with-maintenance down` is documented at
+    # generators.md:684 and accepted by the CLI; the strict contiguous-prefix
+    # matcher rejected it, which would report a documented command undocumented.
+    check('parent flag before a nested command',
+          mentioned('migrate down', page('autumn migrate --with-maintenance down'), OPTS), True)
+    check('parent option with a value',
+          mentioned('migrate down', page('autumn migrate --profile prod down'), OPTS), True)
+    check('attached value needs no lookahead',
+          mentioned('migrate down', page('autumn migrate --profile=prod down'), OPTS), True)
+    # …but only RECOGNIZED options are walked, or strictness leaks away again
+    check('an unknown flag is not walked',
+          mentioned('migrate down', page('autumn migrate --nope down'), OPTS), False)
+    check('a terminal flag still stops the parse',
+          mentioned('migrate down', page('autumn migrate --help down'), OPTS), False)
+    check('an option cannot stand in for the first component',
+          mentioned('migrate down', page('autumn --with-maintenance migrate down'), OPTS), False)
 
     # the summary line must never be read as a command
     check('summary dropped', bool(SUMMARY.match('53 top-level commands, 194 command paths')), True)

@@ -94,7 +94,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn --help db reset` prints root help and never runs or shows
   `db reset`. An earlier cut skipped those flags and kept matching, turning a
   non-invocation into coverage — and the self-test asserted that behaviour, so
-  the mistake was pinned in place by a test claiming it was intended.
+  the mistake was pinned in place by a test claiming it was intended. Strictness
+  applies to what precedes the path, not to what separates it: a parent's own
+  option may sit between components — `autumn migrate --with-maintenance down`
+  is documented at generators.md:684 and is an accepted invocation of
+  `migrate down` — so recognized parent options are stepped over, read from the
+  sibling's `--list-options` table rather than guessed. The two directions of
+  error are not symmetric: too permissive manufactures coverage that does not
+  exist and fails silent, which is the defect this gate exists to find; too
+  strict reports a documented command as undocumented and fails loud, which is
+  only noise.
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
