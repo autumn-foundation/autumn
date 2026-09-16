@@ -553,6 +553,83 @@ pub fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Emit the JSON-Schema `TokenStream` for a `#[collaborative]` field.
+///
+/// Describes both wire shapes a client must build: the element records in
+/// `elems`, and the tagged operations in `pending`. An `object` with no
+/// properties is not enough — a client cannot tell that an id is the string
+/// `"<counter>@<actor>"` rather than a two-field object, and a request built
+/// on that guess is refused.
+fn emit_collaborative_schema_tokens() -> TokenStream {
+    quote! {{
+        // Bound once: the shape appears five times below.
+        let id = ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "pattern": "^[0-9]+@.+$",
+            "description": "Character id, \"<counter>@<actor>\"."
+        });
+        let ch = ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1
+        });
+        ::autumn_web::reexports::serde_json::json!({
+            "type": "object",
+            "description": "Collaborative text document (issue #1806). Read \
+        `elems` for the characters; send operations to change the text. A bare string \
+        is refused: it would discard concurrent edits.",
+            "properties": {
+                "elems": {
+                    "type": "array",
+                    "description": "Every character, in document order. A deleted \
+        character stays as a tombstone, so concurrent edits keep their anchor.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": id.clone(),
+                            "after": id.clone(),
+                            "ch": ch.clone(),
+                            "deleted": { "type": "boolean", "default": false }
+                        },
+                        "required": ["id", "ch"]
+                    }
+                },
+                "pending": {
+                    "type": "array",
+                    "description": "Operations that wait for the character they \
+        name. Each applies when that character arrives.",
+                    "items": { "oneOf": [
+                        {
+                            "type": "object",
+                            "title": "insert",
+                            "properties": {
+                                "op": { "const": "insert" },
+                                "id": id.clone(),
+                                "after": id.clone(),
+                                "ch": ch
+                            },
+                            "required": ["op", "id", "ch"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "delete",
+                            "properties": {
+                                "op": { "const": "delete" },
+                                "target": id
+                            },
+                            "required": ["op", "target"]
+                        }
+                    ] }
+                }
+            },
+            // `elems` is required on the wire, so the advertised contract
+            // has to say so — otherwise a generated client treats `{}` as
+            // a valid document and the endpoint rejects it.
+            "required": ["elems"]
+        })
+    }}
+}
+
 /// Emit the JSON-Schema `TokenStream` for one model field.
 ///
 /// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
@@ -568,22 +645,7 @@ pub fn type_name_str(ty: &syn::Type) -> String {
 /// with what that type actually serializes to.
 pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
     if field_is_collaborative(field) {
-        return quote! {
-            ::autumn_web::reexports::serde_json::json!({
-                "type": "object",
-                "description": "Collaborative text document (issue #1806). Read \
-        `elems` for the characters; send operations to change the text. A bare string \
-        is refused: it would discard concurrent edits.",
-                "properties": {
-                    "elems": { "type": "array", "items": { "type": "object" } },
-                    "pending": { "type": "array", "items": { "type": "object" } }
-                },
-                // `elems` is required on the wire, so the advertised contract
-                // has to say so — otherwise a generated client treats `{}` as
-                // a valid document and the endpoint rejects it.
-                "required": ["elems"]
-            })
-        };
+        return emit_collaborative_schema_tokens();
     }
     if field_is_translatable(field) {
         return quote! {

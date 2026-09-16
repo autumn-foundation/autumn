@@ -349,20 +349,51 @@ impl CollabText {
     /// replays the whole history, and charging a document for operations it
     /// already has would refuse an idempotent replay that adds nothing.
     ///
-    /// A delete counts only when its target is unknown, because that is the
-    /// case the replica must buffer — and a buffer entry is memory.
+    /// The batch is weighed as a whole, in two passes, because an operation's
+    /// cost depends on what the rest of the batch brings. An insert costs one
+    /// element, once, however many times it is repeated. A delete costs
+    /// nothing when its target is already here **or arrives in the same
+    /// batch** — only a delete left with nothing to tombstone occupies the
+    /// buffer. Judging each operation against the pre-batch state alone would
+    /// charge an insert and its own delete twice over and refuse a history
+    /// that fits.
     #[must_use]
     pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
-        ops.into_iter()
-            .filter(|op| match op {
-                // A delete of a character this replica HAS costs nothing: it
-                // tombstones an element already counted. A delete of one it
-                // has never seen is buffered, and a buffer entry is memory a
-                // peer can grow without bound — so that one is charged.
-                CollabOp::Delete { target } => !self.index.contains(target),
-                CollabOp::Insert { id, .. } => !self.index.contains(id),
+        let ops: Vec<&CollabOp> = ops.into_iter().collect();
+
+        // Pass one: the characters this batch brings that are not here yet.
+        let introduced: HashSet<&OpId> = ops
+            .iter()
+            .filter_map(|op| match op {
+                CollabOp::Insert { id, .. } if !self.index.contains(id) => Some(id),
+                _ => None,
             })
-            .filter(|op| !self.buffered.contains(*op))
+            .collect();
+
+        // Pass two: deletes that will find no target, even after pass one.
+        let stranded: HashSet<&OpId> = ops
+            .iter()
+            .filter_map(|op| match op {
+                CollabOp::Delete { target }
+                    if !self.index.contains(target) && !introduced.contains(target) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Anything already buffered is paid for.
+        introduced
+            .iter()
+            .chain(stranded.iter())
+            .filter(|id| {
+                !self.pending.iter().any(|op| match op {
+                    CollabOp::Insert { id: pending, .. } | CollabOp::Delete { target: pending } => {
+                        pending == **id
+                    }
+                })
+            })
             .count()
     }
 
@@ -956,6 +987,43 @@ mod tests {
             target.apply(op);
         }
         assert_eq!(target.text(), "hi");
+    }
+
+    /// A batch pays once for a character it also deletes.
+    ///
+    /// A reconnecting replica replays characters it typed and then removed.
+    /// Weighing each operation against the pre-batch state charged the insert
+    /// and the delete separately, and refused a history that fits.
+    #[test]
+    fn a_batch_pays_once_for_a_character_it_also_deletes() {
+        let mut doc = CollabText::new();
+        let id = OpId::new(1, "ada");
+        let batch = vec![
+            CollabOp::Insert {
+                id: id.clone(),
+                after: None,
+                ch: 'x',
+            },
+            CollabOp::Insert {
+                id: id.clone(),
+                after: None,
+                ch: 'x',
+            },
+            CollabOp::Delete { target: id.clone() },
+        ];
+        assert_eq!(doc.novel_count(batch.iter()), 1);
+
+        // The count is what the batch really costs.
+        doc.apply_all(batch);
+        assert_eq!(doc.element_count(), 1);
+        assert_eq!(doc.pending_len(), 0);
+
+        // A delete the batch does NOT satisfy still costs: it holds the
+        // causal buffer until its target arrives.
+        let orphan = vec![CollabOp::Delete {
+            target: OpId::new(9, "bob"),
+        }];
+        assert_eq!(doc.novel_count(orphan.iter()), 1);
     }
 
     /// A delete on one replica and an insert on another both survive.

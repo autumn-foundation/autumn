@@ -14560,6 +14560,15 @@ mod tests {
             generated.contains("\"required\""),
             "the collaborative field's schema must mark `elems` required"
         );
+        // An element record described as a bare object tells a client
+        // nothing: it cannot tell that an id is a string, not an object.
+        for part in ["\"deleted\"", "\"minLength\"", "\"oneOf\""] {
+            assert!(
+                generated.contains(part),
+                "the collaborative field's schema must describe its elements and \
+                 its pending operations; {part} is missing"
+            );
+        }
     }
 
     /// A model with no collaborative field expands as before: no const with a
