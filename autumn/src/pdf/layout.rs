@@ -485,10 +485,10 @@ fn inline_spans(
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
                 "strong" | "b" => {
-                    inline_spans(children, true, italic, depth + 1, more_after[i + 1], out);
+                    inline_spans(children, true, italic, depth + 1, more_after[i], out);
                 }
                 "em" | "i" => {
-                    inline_spans(children, bold, true, depth + 1, more_after[i + 1], out);
+                    inline_spans(children, bold, true, depth + 1, more_after[i], out);
                 }
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
@@ -506,13 +506,13 @@ fn inline_spans(
                     // trailing push_block_break (right below) unconditionally
                     // separates its content from whatever follows it out
                     // here — so that later content can never glue to
-                    // anything inside, regardless of what more_after[i + 1]
+                    // anything inside, regardless of what more_after[i]
                     // says.
                     push_block_break(out);
                     inline_spans(children, bold, italic, depth + 1, false, out);
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, more_after[i + 1], out),
+                _ => inline_spans(children, bold, italic, depth + 1, more_after[i], out),
             },
         }
     }
@@ -643,7 +643,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
             // Structural wrappers (thead/tbody/tfoot) — descend without
             // emitting a row themselves.
             "thead" | "tbody" | "tfoot" => {
-                extract_table_rows(children, depth + 1, more_after[i + 1], out);
+                extract_table_rows(children, depth + 1, more_after[i], out);
             }
             _ if is_non_rendered(tag) => {}
             // Anything else inside a <table> (most commonly <caption>, or a
@@ -816,7 +816,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             true,
                             false,
                             depth + 1,
-                            more_after[i + 1],
+                            more_after[i],
                             &mut pending,
                         );
                     }
@@ -826,7 +826,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             false,
                             true,
                             depth + 1,
-                            more_after[i + 1],
+                            more_after[i],
                             &mut pending,
                         );
                     }
@@ -835,13 +835,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     // (span, a, ...) flow their children into the current
                     // implicit paragraph rather than being dropped.
                     _ => {
-                        flatten_into_pending(
-                            children,
-                            depth + 1,
-                            more_after[i + 1],
-                            &mut pending,
-                            out,
-                        );
+                        flatten_into_pending(children, depth + 1, more_after[i], &mut pending, out);
                     }
                 }
             }
@@ -916,34 +910,14 @@ fn flatten_into_pending(
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => {
-                            inline_spans(
-                                children,
-                                true,
-                                false,
-                                depth + 1,
-                                more_after[i + 1],
-                                pending,
-                            );
+                            inline_spans(children, true, false, depth + 1, more_after[i], pending);
                         }
                         "em" | "i" => {
-                            inline_spans(
-                                children,
-                                false,
-                                true,
-                                depth + 1,
-                                more_after[i + 1],
-                                pending,
-                            );
+                            inline_spans(children, false, true, depth + 1, more_after[i], pending);
                         }
                         _ if is_non_rendered(tag) => {}
                         _ => {
-                            flatten_into_pending(
-                                children,
-                                depth + 1,
-                                more_after[i + 1],
-                                pending,
-                                out,
-                            );
+                            flatten_into_pending(children, depth + 1, more_after[i], pending, out);
                         }
                     }
                 }
@@ -1038,19 +1012,27 @@ fn node_glue_lookahead(node: &Node) -> GlueLookahead {
     GlueLookahead::Exhausted
 }
 
-/// For every position in `nodes`, whether the *remaining* siblings after it
-/// (plus `has_more_after` once those run out) could glue — the
-/// `more_after` each loop iteration needs, computed once per list instead
-/// of rescanning the shrinking suffix on every iteration (that rescan is
-/// O(n) per node, O(n²) overall for n flat siblings).
+/// For every position `i` in `nodes`, whether the siblings *after* it
+/// (`nodes[i + 1..]`, plus `has_more_after` once those run out) could
+/// glue — this is exactly `more_after[i]` each loop iteration needs, for
+/// the sibling it is *currently* about to recurse into.
 ///
-/// One backward pass: computing the verdict for `nodes[i..]` only needs
-/// node `i`'s own [`node_glue_lookahead`] (visited once, however deep its
-/// own subtree is) plus the already-computed verdict for `nodes[i+1..]`.
+/// Deliberately never calls [`node_glue_lookahead`] on `nodes[i]` to
+/// compute `result[i]` itself — only on `nodes[i + 1]` and later. Node `i`
+/// is the one the caller is about to recurse into natively, so whatever is
+/// inside it gets discovered by that recursion's own eventual depth-cap
+/// guard; pre-scanning it here too would be pure duplicated work. For a
+/// long chain of single-child transparent wrappers this is the difference
+/// between one scan of the whole chain and one fresh scan of the whole
+/// remaining chain at *every* one of the ~[`MAX_DEPTH`] levels the depth
+/// cap allows before native recursion stops — O(n) instead of O(depth × n).
 fn glue_after_each(nodes: &[Node], has_more_after: bool) -> Vec<bool> {
-    let mut after = vec![has_more_after; nodes.len() + 1];
-    for i in (0..nodes.len()).rev() {
-        after[i] = match node_glue_lookahead(&nodes[i]) {
+    let mut after = vec![false; nodes.len()];
+    if let Some(last) = after.last_mut() {
+        *last = has_more_after;
+    }
+    for i in (0..nodes.len().saturating_sub(1)).rev() {
+        after[i] = match node_glue_lookahead(&nodes[i + 1]) {
             GlueLookahead::Confirmed => true,
             GlueLookahead::Stopped => false,
             GlueLookahead::Exhausted => after[i + 1],
@@ -3469,6 +3451,29 @@ mod tests {
         assert!(!pages.is_empty());
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
+            "render_pages took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn glue_lookahead_over_a_deep_chain_is_linear_not_quadratic() {
+        // Regression: glue_after_each(nodes, ...) scans nodes[0]'s entire
+        // subtree via node_glue_lookahead even though the caller only ever
+        // reads more_after[i + 1..] — never more_after[i] — so that scan is
+        // wasted. For a single-child wrapper chain, nodes[0]'s subtree IS
+        // the rest of the (possibly huge) chain, and this call happens
+        // fresh at every one of the ~512 levels the depth cap allows
+        // before it stops native recursion: O(depth) calls, each O(chain
+        // length), instead of O(chain length) total. (Codex review on PR
+        // #2810.)
+        let n = 200_000;
+        let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
+        let start = std::time::Instant::now();
+        let pages = render_pages(&html);
+        assert!(!pages.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
             "render_pages took {:?} — looks quadratic again",
             start.elapsed()
         );
