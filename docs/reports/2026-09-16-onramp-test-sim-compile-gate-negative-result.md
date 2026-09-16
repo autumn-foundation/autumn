@@ -57,22 +57,28 @@ combined — the deterministic simulation/chaos framework) are declared as
 plain `pub mod` in `autumn/src/lib.rs` with **no**
 `#[cfg(feature = ...)]` gate at the `lib.rs` level — unlike `system_test`,
 `plugin_sandbox`, `system_info`, `seed`, `stories`, and `inbound_mail`, which
-already are gated there. That means the full 12,337-line pair compiles into
+already are gated there. That means the full 12,337-line pair is part of
 every build that enables every one of *their own internal* features too
 (`sqlite`, `sim-testing`) — but three of the eight sim submodules gate
 themselves individually, one level down, inside `sim.rs`: `substrate.rs`
 (336 lines) needs `sqlite`, `op.rs` (454) and `sweep.rs` (396) need
-`sim-testing` — 1,186 lines neither the no-DB daemon build measured below
-nor its default-feature counterpart enables. So the amount that actually
-compiles into *this report's measured build* (`maud,htmx,tailwind,reporting`,
-no `sqlite`/`sim-testing`) is **11,151 lines**, not the full 12,337 — a
-correction from an earlier draft, which claimed the full combined total
-compiles into every build without checking those three submodules' own
-gates. The remaining 11,151 lines still compile into a production binary
-that runs no tests and drives no `Sim`, which is the substantive point this
-paragraph is making; the number was just wrong. `test.rs`'s own
-module doc says exactly what it is ("First-party integration-testing
-utilities for Autumn applications... Import it in your integration tests").
+`sim-testing` — 1,186 whole-file lines neither the no-DB daemon build
+measured below nor its default-feature counterpart pulls in at all. Three
+files' worth of that gating was checked and subtracted; **11,151 lines is
+that subtraction, not a claim that every remaining line compiles** — both
+`test.rs` and the sim submodules that remain (`sim.rs` itself, `chaos`,
+`fault`, `llm`, `crash`, `assert`) contain their own further internal
+`#[cfg(test)]` sections and feature-gated branches (on `db`/`mail`/`ws`/etc.)
+that this whole-file `wc -l` count does not exclude either — getting the
+exact configured-source figure would need a real per-line cfg resolution
+(effectively asking rustc, not `wc -l`), which this report does not attempt.
+Read every line count in this report as a **whole-file physical-line total,
+an upper bound on what's compiled, not an exact compiled-line count** — the
+qualitative point (a lot of unconditionally-reachable test-only source with
+no top-level feature gate) holds regardless of exactly how many of those
+lines a real preprocessor would keep. `test.rs`'s own module doc says
+exactly what it is ("First-party integration-testing utilities for Autumn
+applications... Import it in your integration tests").
 
 The two files are mutually and directly coupled through real (non-doc) code —
 not just intra-doc links — e.g. `sim.rs`:
@@ -201,8 +207,8 @@ timing verdict below (there is no compile-time win to chase), but recorded
 in full because the mechanism's actual scope, not just this report's
 numbers, is worth getting right before anyone tries it.
 
-**Falsifiable question:** does removing the 11,151 lines that actually
-compile under the no-DB daemon feature set (`maud,htmx,tailwind,reporting` —
+**Falsifiable question:** does removing the ~11,151 whole-file lines that
+apply under the no-DB daemon feature set (`maud,htmx,tailwind,reporting` —
 `DAEMON_NO_DB_FEATURES`, `autumn-cli/src/new.rs`) produce a measurable
 compile-time reduction for that build?
 
@@ -293,12 +299,14 @@ than the swing either condition shows on its own across runs.
 
 ## 🏁 Verdict: negative result
 
-Removing the 11,151 lines of `test.rs`/`test_html.rs`/`sim.rs` (and its 8
-submodules, 3 of which — `substrate`/`op`/`sweep`, 1,186 lines — were never
-compiled into this particular build to begin with, per the correction in
-**💡 Hypothesis**) — currently the largest **unconditionally-compiled,
-unambiguously test-only** source in `autumn-web` for this feature set,
-confirmed compile-clean to remove **for the `--lib`
+Removing the ~11,151 whole-file lines of `test.rs`/`test_html.rs`/`sim.rs`
+(and its 8 submodules, 3 of which — `substrate`/`op`/`sweep`, 1,186 lines —
+were never compiled into this particular build to begin with, and the
+remainder still an upper-bound whole-file count, not an exact configured-
+source figure — see the correction in **💡 Hypothesis**) — the largest
+whole-file, unambiguously test-only source with no top-level feature gate in
+`autumn-web` for this feature set, confirmed compile-clean to remove **for
+the `--lib`
 target** (the measurement's own build target, so the timing numbers below are
 unaffected — but see the `sim-sweep` `[[bin]]` gap noted in 🧪 Apparatus,
 which means the *module itself* isn't as cleanly severable as this report
