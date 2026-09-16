@@ -4833,61 +4833,68 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
     }
 
     if spec.blind_index {
-        let expected = blind_index_column(ident);
-        let companion = siblings
-            .iter()
-            .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
-        match companion {
-            Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {
-                // The companion is registered under its Rust name too, and every
-                // protection it gets is keyed off that name: version-history
-                // redaction, the log parameter filter and the CSV export. A
-                // rename on the companion would leave the token unprotected
-                // under a name none of them look for, which is worse than a
-                // rename on the sealed column: the token is what tells an
-                // operator which of an owner's rows hold the same value.
-                if field_serde_wire_name_override(f).is_some()
-                    || diesel_column_name(f).is_some()
-                    || has_attr(f, "private")
-                    || field_already_skips_serialization(f)
-                {
-                    return Err(syn::Error::new_spanned(
-                        f,
-                        format!(
-                            "`{expected}` is a blind-index companion, so it cannot use \
-                             `#[serde(rename/alias = ...)]`, `#[diesel(column_name = ...)]`, \
-                             `#[private]` or `#[serde(skip_serializing)]`: the token is \
-                             registered under its Rust name, which version history, the log \
-                             filter and the CSV export all key off."
-                        ),
-                    ));
-                }
-            }
-            Some(f) => {
-                return Err(syn::Error::new_spanned(
-                    &f.ty,
-                    format!(
-                        "`{expected}` is the blind-index companion of a \
-                         `#[confidential(blind_index)]` field, so it must be typed \
-                         `autumn_web::confidential::BlindIndex`."
-                    ),
-                ));
-            }
-            None => {
-                return Err(syn::Error::new_spanned(
-                    field,
-                    format!(
-                        "`#[confidential(blind_index)]` needs a companion column \
-                         `{expected}: autumn_web::confidential::BlindIndex` on this \
-                         model. The client computes the token; the server only \
-                         compares it."
-                    ),
-                ));
-            }
-        }
+        validate_blind_index_companion(field, ident, siblings)?;
     }
 
     Ok(())
+}
+
+/// Validate the `<field>_bidx` companion of a `#[confidential(blind_index)]`
+/// field: it must exist, be a `BlindIndex`, and keep its Rust name.
+fn validate_blind_index_companion(
+    field: &syn::Field,
+    ident: &syn::Ident,
+    siblings: &[&Field],
+) -> syn::Result<()> {
+    let expected = blind_index_column(ident);
+    let companion = siblings
+        .iter()
+        .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
+    match companion {
+        Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {
+            // The companion is registered under its Rust name too, and every
+            // protection it gets is keyed off that name: version-history
+            // redaction, the log parameter filter and the CSV export. A rename
+            // on the companion would leave the token unprotected under a name
+            // none of them look for, which is worse than a rename on the sealed
+            // column: the token is what tells an operator which of an owner's
+            // rows hold the same value.
+            if field_serde_wire_name_override(f).is_some()
+                || diesel_column_name(f).is_some()
+                || has_attr(f, "private")
+                || field_already_skips_serialization(f)
+            {
+                return Err(syn::Error::new_spanned(
+                    f,
+                    format!(
+                        "`{expected}` is a blind-index companion, so it cannot use \
+                         `#[serde(rename/alias = ...)]`, `#[diesel(column_name = ...)]`, \
+                         `#[private]` or `#[serde(skip_serializing)]`: the token is \
+                         registered under its Rust name, which version history, the log \
+                         filter and the CSV export all key off."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Some(f) => Err(syn::Error::new_spanned(
+            &f.ty,
+            format!(
+                "`{expected}` is the blind-index companion of a \
+                 `#[confidential(blind_index)]` field, so it must be typed \
+                 `autumn_web::confidential::BlindIndex`."
+            ),
+        )),
+        None => Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential(blind_index)]` needs a companion column \
+                 `{expected}: autumn_web::confidential::BlindIndex` on this \
+                 model. The client computes the token; the server only \
+                 compares it."
+            ),
+        )),
+    }
 }
 
 // ── #1654: `#[classified]` field attribute ───────────────────────────────────
