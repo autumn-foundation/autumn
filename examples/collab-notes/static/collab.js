@@ -20,8 +20,15 @@
   const known = new Set();
   /** This editor's own actor id, from the snapshot. */
   let myActor = null;
-  /** Characters sent but not yet echoed back by the server. */
-  let unsentChars = 0;
+  /**
+   * Characters this editor typed and spliced in locally, waiting for the
+   * server to mint their real ids. One entry per sent insert, oldest first;
+   * the server answers our messages in order, so the oldest entry matches the
+   * next echo. Holding them in `elems` is what lets a remote character land
+   * beside them instead of appearing to replace them.
+   */
+  let provisional = [];
+  let provisionalSeq = 0;
   /** Delete ids sent but not yet echoed back. */
   const unsentDeletes = new Set();
   // Operations whose left neighbour has not arrived. The server buffers the
@@ -105,21 +112,46 @@
     return elems.filter((e) => !e.deleted);
   }
 
-  // True when the server has echoed everything this editor sent, so the
-  // textarea and the document agree about the past.
+  // True when the server has echoed everything this editor sent.
   function settled() {
-    return unsentChars === 0 && unsentDeletes.size === 0;
+    return provisional.length === 0 && unsentDeletes.size === 0;
   }
 
-  // Tick off one of our own operations coming back.
+  // Our own operation coming back. Drop the placeholder it replaces so the
+  // real, server-ordered character can take its place.
   function acknowledge(op) {
     if (op.op === "insert") {
       if (myActor !== null && op.id.slice(op.id.indexOf("@") + 1) === myActor) {
-        unsentChars = Math.max(0, unsentChars - 1);
+        const placeholder = provisional.shift();
+        if (placeholder !== undefined) {
+          const at = indexOfId(placeholder);
+          if (at >= 0) {
+            elems.splice(at, 1);
+            known.delete(placeholder);
+          }
+        }
       }
-    } else if (unsentDeletes.delete(op.target)) {
-      // counted by removal
+    } else {
+      unsentDeletes.delete(op.target);
     }
+  }
+
+  // Drop every placeholder and un-delete anything the server refused. Used
+  // when the server rejects an edit, and when a snapshot resets the world.
+  function discardProvisional() {
+    for (const id of provisional) {
+      const at = indexOfId(id);
+      if (at >= 0) {
+        elems.splice(at, 1);
+        known.delete(id);
+      }
+    }
+    provisional = [];
+    for (const id of unsentDeletes) {
+      const at = indexOfId(id);
+      if (at >= 0) elems[at].deleted = false;
+    }
+    unsentDeletes.clear();
   }
 
   function text() {
@@ -160,11 +192,25 @@
     editor.setSelectionRange(caret, caret);
   }
 
-  // Redraw from the document. Only safe once everything this editor sent has
-  // come back: before that the textarea holds characters the document does
-  // not have yet, and overwriting it would delete them.
+  // The textarea is closed while an edit is in flight.
+  //
+  // The server mints the character ids, so between sending an edit and seeing
+  // its echo this client cannot give a new keystroke an id — it would live in
+  // the textarea only, and the next redraw would drop it. Rather than guess,
+  // the example waits: one round trip, and the box opens again.
+  //
+  // A production client does not wait. It runs the same RGA, mints its own
+  // ids, and applies its edits locally the moment they are typed; the server
+  // then merges rather than numbers. That is a client-side CRDT, which is
+  // more than this example is for.
+  function updateWritability() {
+    editor.readOnly = !settled();
+  }
+
+  // Redraw from the local view, which includes this editor's own pending
+  // characters as placeholders. Safe at any time: a remote character merges
+  // in beside them rather than appearing to replace them.
   function render() {
-    if (!settled()) return;
     const anchor = caretAnchor();
     const next = text();
     if (editor.value !== next) {
@@ -209,7 +255,7 @@
       waiting = [];
       // The snapshot is authoritative and already holds anything the server
       // accepted from us, so nothing is outstanding after it.
-      unsentChars = 0;
+      provisional = [];
       unsentDeletes.clear();
       if (message.actor) myActor = message.actor;
       for (const element of message.elems) {
@@ -218,18 +264,17 @@
       }
       editor.disabled = false;
       render();
-      flush();
+      updateWritability();
       renderRoster(message.participants);
     } else if (message.type === "ops") {
       for (const op of message.ops) {
         acknowledge(op);
         integrate(op);
       }
-      // Send anything typed while the last edit was in flight, THEN redraw.
-      // `flush` makes us unsettled again when it sends, so `render` correctly
-      // leaves those newer characters alone.
-      flush();
       render();
+      updateWritability();
+      flush();
+      updateWritability();
     } else if (message.type === "presence") {
       renderRoster(message.participants);
     } else if (message.type === "error") {
@@ -238,9 +283,9 @@
       // would never come back true and the editor would freeze, sending
       // nothing and showing nobody else's changes again. The refused text is
       // dropped, so redraw from the authority to show what really happened.
-      unsentChars = 0;
-      unsentDeletes.clear();
+      discardProvisional();
       render();
+      updateWritability();
       if (status) status.textContent = message.message;
     }
   });
@@ -281,26 +326,58 @@
     const shown = visible();
     const removed = shown.slice(prefix, before.length - suffix);
     if (removed.length > 0) {
-      const ids = removed.map((e) => e.id);
-      for (const id of ids) unsentDeletes.add(id);
-      send({ type: "delete", ids });
+      // Only real, server-known characters can be deleted. A placeholder has
+      // no server id yet, so it is simply dropped locally.
+      const ids = [];
+      for (const element of removed) {
+        if (element.provisional) {
+          const at = indexOfId(element.id);
+          if (at >= 0) {
+            elems.splice(at, 1);
+            known.delete(element.id);
+          }
+          provisional = provisional.filter((id) => id !== element.id);
+        } else {
+          element.deleted = true; // optimistic
+          unsentDeletes.add(element.id);
+          ids.push(element.id);
+        }
+      }
+      if (ids.length > 0) send({ type: "delete", ids });
     }
 
     const added = after.slice(prefix, after.length - suffix);
     if (added.length > 0) {
       // Anchor to the element left of the insertion point in the full list,
-      // tombstones included — that is the neighbour the server knows.
-      const slot = prefix === 0 ? 0 : elems.indexOf(shown[prefix - 1]) + 1;
-      unsentChars += added.length;
-      send({
-        type: "insert",
-        after: slot === 0 ? null : elems[slot - 1].id,
-        text: added.join(""),
-      });
+      // tombstones included — that is the neighbour the server knows. A
+      // placeholder cannot be an anchor: the server has never heard of it.
+      let slot = prefix === 0 ? 0 : elems.indexOf(shown[prefix - 1]) + 1;
+      let anchor = null;
+      for (let i = slot - 1; i >= 0; i--) {
+        if (!elems[i].provisional) {
+          anchor = elems[i].id;
+          break;
+        }
+      }
+      send({ type: "insert", after: anchor, text: added.join("") });
+
+      // Splice the characters in locally so the textarea and `elems` agree.
+      // A remote character arriving before the echo then merges in beside
+      // them, rather than looking like the user deleted it.
+      for (const ch of added) {
+        const id = `local-${(provisionalSeq += 1)}`;
+        elems.splice(slot, 0, { id, ch, deleted: false, provisional: true });
+        known.add(id);
+        provisional.push(id);
+        slot += 1;
+      }
     }
   }
 
-  editor.addEventListener("input", flush);
+  editor.addEventListener("input", () => {
+    flush();
+    updateWritability();
+  });
 
   const reportCaret = () =>
     send({ type: "cursor", index: caretToCodePoints(editor.selectionStart) });

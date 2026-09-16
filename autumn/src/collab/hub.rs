@@ -16,6 +16,23 @@
 //! The hub adds no transport of its own, so an app already serving
 //! `#[ws]` routes gets collaboration on the socket it has.
 //!
+//! # Deployment: one process owns a document
+//!
+//! A document is owned by the process holding it. Run collaboration on a
+//! single replica in this slice, or route every editor of one record to the
+//! same replica.
+//!
+//! Two replicas sharing a Redis channel backend converge on the *text* —
+//! operations flow both ways and the merge is order-independent — but three
+//! things do not work:
+//!
+//! - **The participant list is per-replica.** [`Presence`] tracks membership
+//!   in-process, so each replica broadcasts only its own editors and a client
+//!   sees the roster flip between them.
+//! - **The size limit is per-replica.** Two replicas can each accept a batch
+//!   within [`CollabLimits`] and then merge the other's.
+//! - **Persistence races.** Each replica writes the row from its own copy.
+//!
 //! # Authority
 //!
 //! The hub is the authority. A client sends an edit anchored to a **character
@@ -731,12 +748,31 @@ impl CollabDoc {
     /// [`apply_remote`](Self::apply_remote): these operations are already on
     /// the channel, so publishing them once more would loop.
     ///
+    /// # Errors
+    ///
+    /// Returns [`CollabError::DocumentFull`] when the batch would take the
+    /// document past [`CollabLimits::max_document_chars`]. Nothing is
+    /// applied. Refusing here means this replica falls behind whichever one
+    /// accepted the batch — see the module docs on deployment: one process
+    /// owns a document in this slice.
+    ///
     /// # Panics
     ///
     /// Panics if the internal document mutex is poisoned.
-    pub fn merge_delivered(&self, ops: &[CollabOp]) {
+    pub fn merge_delivered(&self, ops: &[CollabOp]) -> Result<(), CollabError> {
         let mut state = self.state.lock().expect("collab document lock poisoned");
+        let held = state.doc.element_count() + state.doc.pending_len();
+        let novel = state.doc.novel_count(ops.iter());
+        // The same bound `handle` and `apply_remote` enforce. Without it a
+        // delivered batch is a way around the limit entirely.
+        if held + novel > self.limits.max_document_chars {
+            return Err(CollabError::DocumentFull {
+                got: held,
+                limit: self.limits.max_document_chars,
+            });
+        }
         state.doc.apply_all(ops.iter().cloned());
+        Ok(())
     }
 
     fn with_doc<T>(&self, f: impl FnOnce(&CollabText) -> T) -> T {
@@ -968,8 +1004,13 @@ pub async fn serve_socket(
                         // for.
                         if let Ok(CollabServerMessage::Ops { ops }) =
                             serde_json::from_str::<CollabServerMessage>(&text)
+                            && let Err(error) = doc.merge_delivered(&ops)
                         {
-                            doc.merge_delivered(&ops);
+                            tracing::warn!(
+                                key = %doc.key(),
+                                ?error,
+                                "collab: refused a delivered batch; this replica is behind"
+                            );
                         }
                         if socket.send(Message::Text(text.into())).await.is_err() {
                             break;

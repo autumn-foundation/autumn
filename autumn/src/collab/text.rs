@@ -348,13 +348,18 @@ impl CollabText {
     /// A capacity preflight counts this, not the batch length: a reconnect
     /// replays the whole history, and charging a document for operations it
     /// already has would refuse an idempotent replay that adds nothing.
+    ///
+    /// A delete counts only when its target is unknown, because that is the
+    /// case the replica must buffer — and a buffer entry is memory.
     #[must_use]
     pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
         ops.into_iter()
             .filter(|op| match op {
-                // A delete consumes no room: it tombstones a character that
-                // is already counted.
-                CollabOp::Delete { .. } => false,
+                // A delete of a character this replica HAS costs nothing: it
+                // tombstones an element already counted. A delete of one it
+                // has never seen is buffered, and a buffer entry is memory a
+                // peer can grow without bound — so that one is charged.
+                CollabOp::Delete { target } => !self.index.contains(target),
                 CollabOp::Insert { id, .. } => !self.index.contains(id),
             })
             .filter(|op| !self.buffered.contains(*op))
@@ -416,10 +421,12 @@ impl CollabText {
         let mut ops = Vec::with_capacity(text.chars().count());
         let mut left = after.cloned();
         for ch in text.chars() {
-            // A replica at the ceiling cannot mint another id in range.
-            // Stop rather than wrap onto an id that already exists.
+            // Stop below the reserved ceiling, not at it. `apply` refuses a
+            // counter of `MAX_COUNTER` or more, so minting one would return
+            // an operation this very replica rejects — and the hub would
+            // broadcast a character the authority does not hold.
             let next = self.clock.saturating_add(1);
-            if next > MAX_COUNTER {
+            if next >= MAX_COUNTER {
                 break;
             }
             self.clock = next;
