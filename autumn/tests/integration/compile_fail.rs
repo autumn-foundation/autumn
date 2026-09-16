@@ -294,6 +294,19 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
 
+    // Operator-blind confidential fields (#1771). A `#[confidential]` column is
+    // sealed under a key the server never holds, so anything that would make the
+    // operator read, index or compare the value is a build failure rather than a
+    // query that silently matches nothing.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_searchable.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_plain_string.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_missing_blind_index.rs");
+
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
     #[cfg(feature = "maud")]

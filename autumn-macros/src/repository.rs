@@ -1769,6 +1769,42 @@ struct FindOrCreateSpec {
     error: Option<String>,
 }
 
+/// A build-time refusal of a server-side predicate over a `#[confidential]`
+/// column (issue #1771).
+///
+/// `#[model]` publishes every model's confidential columns as
+/// `__AUTUMN_CONFIDENTIAL_COLUMNS`. This macro cannot see the model's fields, so
+/// it emits a `const` that reads that list and fails const evaluation when the
+/// column is sealed. Unlike the at-rest encryption guard above, which can only
+/// be a runtime check, this one stops the build — which is the point: a sealed
+/// column can never satisfy the predicate, so shipping it is never correct.
+///
+/// The message is composed here, where the method and column names are known.
+fn confidential_column_guard(
+    model_name: &Ident,
+    column: &str,
+    method: &str,
+    clause: &str,
+) -> TokenStream {
+    let msg = format!(
+        "`{method}` puts `{model_name}::{column}` in a server-side {clause}, but that column \
+         is `#[confidential]`: it is sealed under a key the server never holds, so the \
+         database only ever compares ciphertext. Declare the field \
+         `#[confidential(blind_index)]` and query its companion column `{column}_bidx`, \
+         whose token the client computes and the server can compare."
+    );
+    quote! {
+        const _: () = {
+            if ::autumn_web::confidential::__column_is_confidential(
+                #model_name::__AUTUMN_CONFIDENTIAL_COLUMNS,
+                #column,
+            ) {
+                ::core::panic!(#msg);
+            }
+        };
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -1781,6 +1817,14 @@ fn generate_derived_query_for_source(
     let field_idents: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let param_names: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let table_name_str = table_ident.to_string();
+
+    // #1771: refuse a WHERE over a sealed column at build time.
+    let method_name = format!("{}_by_{}", query.prefix, query.fields.join("_and_"));
+    let confidential_guards: Vec<TokenStream> = query
+        .fields
+        .iter()
+        .map(|f| confidential_column_guard(model_name, f, &method_name, "WHERE clause"))
+        .collect();
 
     // Build the filter chain. For `String`-typed parameters we route the value
     // through the encrypted-column registry at runtime: a deterministic-encrypted
@@ -1839,6 +1883,7 @@ fn generate_derived_query_for_source(
     match query.prefix.as_str() {
         "find" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -1851,6 +1896,7 @@ fn generate_derived_query_for_source(
         }
         "count" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -1865,7 +1911,8 @@ fn generate_derived_query_for_source(
         "delete" => {
             if soft_delete {
                 quote! {
-                    #(#encode_lets)*
+                    #(#confidential_guards)*
+                #(#encode_lets)*
                     // The derived soft-delete / timestamp write has no `AppState`
                     // in scope, so it cannot reach the injected clock. The allow is
                     // emitted into the expansion so a determinism deny-lint never
@@ -1887,7 +1934,8 @@ fn generate_derived_query_for_source(
                 }
             } else {
                 quote! {
-                    #(#encode_lets)*
+                    #(#confidential_guards)*
+                #(#encode_lets)*
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
                         .execute(&mut conn)
@@ -1899,6 +1947,7 @@ fn generate_derived_query_for_source(
         }
         "exists" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 ::autumn_web::reexports::diesel::select(
@@ -14150,6 +14199,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // a runtime guard against the same registry `find_by` consults, not a
             // `compile_error!`. It rejects only genuinely encrypted columns, so
             // grouping a plain `String` is unchanged. The escape hatch is a raw query.
+            // #1771: a sealed column cannot be a GROUP BY key or an aggregated
+            // value, so this one is refused at build time rather than at runtime.
+            let confidential_guards: Vec<TokenStream> = ::core::iter::once(&spec.group_col)
+                .chain(spec.value_col.as_ref())
+                .map(|col| {
+                    confidential_column_guard(
+                        model_name,
+                        col,
+                        &spec.fn_ident.to_string(),
+                        "GROUP BY / aggregate",
+                    )
+                })
+                .collect();
+
             let enc_guard = {
                 let fn_name_str = spec.fn_ident.to_string();
                 let group_col_raw = spec.group_col.as_str();
@@ -14185,7 +14248,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     });
                 }
-                quote! { #(#checks)* }
+                quote! { #(#confidential_guards)* #(#checks)* }
             };
             // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
             // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
@@ -14521,6 +14584,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map(|(name, ty)| quote! { #name: #ty })
                 .collect();
 
+            // #1771: a get-or-insert looks the row up first, so a sealed
+            // column is refused here on the same terms as `find_by`.
+            let foc_name = fn_ident.to_string();
+            let confidential_guards: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, _)| {
+                    confidential_column_guard(
+                        model_name,
+                        &name.to_string(),
+                        &foc_name,
+                        "WHERE clause",
+                    )
+                })
+                .collect();
+
             // Encrypted-column encoding (string fields) + boxed-query filters,
             // matching the `find_by` derived-query surface (#805).
             let table_name_str = table_ident.to_string();
@@ -14808,7 +14887,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // matching rows on other shards go unseen. Same guard used by
                     // save/update/delete; a no-op token on non-sharded repos.
                     #cross_shard_write_guard
-                    #(#encode_lets)*
+                    #(#confidential_guards)*
+                #(#encode_lets)*
                     // Step 1: preliminary lookup on the read path (replica-eligible).
                     {
                         let mut __rconn = self.__autumn_acquire_read_conn().await?;
@@ -17986,6 +18066,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let declared: &[&'static str] = #sensitive_ts;
                             let mut cols: ::std::vec::Vec<&'static str> = declared.to_vec();
                             ::autumn_web::encryption::merge_encrypted_columns_for_table(
+                                #table_name,
+                                &mut cols,
+                            );
+                            // #1771: a confidential column is sensitive too, so a
+                            // revision records that it changed, never the envelope.
+                            ::autumn_web::confidential::merge_confidential_columns_for_table(
                                 #table_name,
                                 &mut cols,
                             );

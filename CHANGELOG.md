@@ -189,6 +189,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **🔒 `#[confidential]` — operator-blind fields sealed under a key the server
+  never holds (#1771).** `#[encrypted]` protects a column at rest under keys
+  *the operator holds*: it stops a stolen disk, not a rogue admin, a subpoena or
+  a leaked backup. A `#[confidential]` field removes the operator from the trust
+  boundary. The value is sealed client side with `autumn_web::confidential`
+  (AES-256-GCM, per-field keys derived from a client-held `RootKey` and the
+  table/column/owner context, which is also the AEAD associated data, so an
+  envelope copied into another user's row no longer opens). The column is
+  declared as the opaque `Sealed` type rather than `String`, so the only value
+  the server can bind is the envelope — and the database, `autumn db backup`
+  output, the access and error log, replay capsules, record version history and
+  the admin UI carry ciphertext by construction rather than by scrubbing.
+  Equality still works, through a client-computed `BlindIndex` token in a
+  `<field>_bidx` companion column: a fixed-length keyed MAC that leaks neither
+  the plaintext nor its length, and that an operator cannot recompute.
+  Everything that would make the operator read, index, order or join the value
+  is a **build failure**: `#[searchable]`, `#[unique]`, `#[indexed]`,
+  `#[references]`, `#[normalize]`, `#[encrypted]`, `#[classified]`, a non-`Sealed`
+  field type, and — across the macro boundary, through the column list `#[model]`
+  publishes — a derived `find_by_<field>`, `find_or_create_by_<field>` or grouped
+  aggregate in `#[repository]`. `RootKey` has no `Serialize`, no `Display` and no
+  byte accessor, is never built from configuration or the credentials store, and
+  zeroizes on drop. `docs/guide/confidential-fields.md` states the threat model —
+  including what sealing does *not* hide — and `confidential_threat_model` asserts
+  in CI that the guide and the code agree on the "cannot see" set, while
+  `confidential_red_team` dumps the database, a `VACUUM INTO` backup artifact,
+  the full log and a replay capsule after confidential-field CRUD and proves zero
+  plaintext occurrences in all four.
+
 - **`scripts/check-docs-features.sh` — feature-gate documentation gate
   [no-plugin].** Every reader-facing page that shows Rust reaching for an
   `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature

@@ -1993,6 +1993,13 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -2121,6 +2128,13 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -2204,6 +2218,14 @@ fn render_form_widget(
     // through to a normal editable input that captures the initial plaintext
     // (the wrapper encrypts it on insert). The flag is per-field, so an
     // unrelated same-named plaintext column stays editable.
+    // #1771: a confidential column is never editable from the admin, on create
+    // or on edit: sealing needs the owner's key, which the server never holds.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            input type="text" class="form-input" value="••••••••" disabled
+                title="Sealed for its owner — the server cannot read or write it";
+        };
+    }
     if field.encrypted && is_edit {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled

@@ -61,6 +61,13 @@ mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(feature = "db")]
+mod confidential_model;
+#[cfg(feature = "db")]
+mod confidential_red_team;
+mod confidential_sealing;
+#[cfg(feature = "db")]
+mod confidential_threat_model;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]

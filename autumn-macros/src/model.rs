@@ -4494,6 +4494,10 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                // #1771: `#[confidential]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Sealed` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("confidential")
         })
         .collect()
 }
@@ -4627,6 +4631,216 @@ fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedSpec> {
 /// Convenience: just the mode (used by the diesel-wrapper routing).
 fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> {
     Ok(parse_field_encrypted(field)?.mode)
+}
+
+// ── #1771: `#[confidential]` field attribute ─────────────────────
+
+/// Parsed `#[confidential(...)]` field specification (issue #1771).
+#[derive(Clone, Copy, Default)]
+struct ConfidentialSpec {
+    /// The field carries `#[confidential]`.
+    present: bool,
+    /// `blind_index` — a companion `<field>_bidx` column holds the equality
+    /// token, so the field supports `WHERE <field>_bidx = $1` lookups.
+    blind_index: bool,
+}
+
+/// The companion column name for a `#[confidential(blind_index)]` field.
+fn blind_index_column(field: &syn::Ident) -> String {
+    format!("{}_bidx", unraw_ident(field))
+}
+
+/// Parse `#[confidential]` / `#[confidential(blind_index)]`.
+fn parse_field_confidential(field: &syn::Field) -> syn::Result<ConfidentialSpec> {
+    let mut spec = ConfidentialSpec::default();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("confidential") {
+            continue;
+        }
+        spec.present = true;
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("blind_index") {
+                spec.blind_index = true;
+                return Ok(());
+            }
+            Err(meta.error(
+                "unsupported `#[confidential]` option; the first slice supports \
+                 `blind_index` only (issue #1771). Write `#[confidential]` or \
+                 `#[confidential(blind_index)]`.",
+            ))
+        })?;
+    }
+    Ok(spec)
+}
+
+/// Whether a type path ends in `name`, so both `Sealed` and
+/// `autumn_web::confidential::Sealed` are accepted.
+fn type_last_segment_is(ty: &syn::Type, name: &str) -> bool {
+    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == name))
+}
+
+/// Reject every marker that would make the operator read, index, order or join
+/// a sealed column. Split out of [`validate_confidential_field`] so the table
+/// of reasons stays one readable list.
+fn reject_confidential_marker_conflicts(field: &syn::Field) -> syn::Result<()> {
+    // Anything that makes the operator read, index, order or join the column is
+    // refused: the server holds ciphertext it cannot compare or rank.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "`#[encrypted]` seals the column under a key the operator holds, which \
+             is the trust boundary `#[confidential]` exists to remove",
+        ),
+        (
+            "classified",
+            "a classification gates where a plaintext may go; a confidential column \
+             has no server-side plaintext to gate",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, and an index over \
+             ciphertext matches nothing",
+        ),
+        (
+            "normalize",
+            "a normalizer rewrites the column in place, which needs the plaintext \
+             the server does not have",
+        ),
+        (
+            "unique",
+            "a UNIQUE constraint compares stored values, and sealing is randomized, \
+             so equal plaintexts never collide. Put the constraint on the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "indexed",
+            "an index over randomized ciphertext serves no lookup. Index the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "references",
+            "a foreign key is a server-side join, which cannot read a sealed value",
+        ),
+        (
+            "translatable",
+            "a per-locale container is a JSON document, not the single sealed value",
+        ),
+        (
+            "id",
+            "a primary key is echoed back in URLs, ETags and pagination cursors, \
+             and the server must be able to compare it",
+        ),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, which the state-machine \
+             codegen reads and writes directly",
+        ),
+        (
+            "default",
+            "a default is a server-side value, and the server cannot seal one",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("`#[confidential]` cannot be combined with `#[{marker}]`: {why}."),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a `#[confidential]` field against the whole struct.
+///
+/// `siblings` is every field of the model, needed to prove that a
+/// `blind_index` field has its companion token column.
+fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::Result<()> {
+    let spec = parse_field_confidential(field)?;
+    if !spec.present {
+        return Ok(());
+    }
+
+    reject_confidential_marker_conflicts(field)?;
+
+    if !type_last_segment_is(&field.ty, "Sealed") {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[confidential]` requires the field type \
+             `autumn_web::confidential::Sealed` (issue #1771). The server never \
+             holds the plaintext, so the column is declared as the envelope it \
+             actually stores.",
+        ));
+    }
+
+    let ident = field
+        .ident
+        .as_ref()
+        .ok_or_else(|| syn::Error::new_spanned(field, "`#[confidential]` needs a named field"))?;
+
+    if unraw_ident(ident) == "tenant_id" {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` cannot be applied to `tenant_id`: the tenancy codegen \
+             reads the column directly as its isolation key, so the server must be \
+             able to compare it.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A serde rename would desync the two.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` fields cannot use `#[serde(rename = ...)]`: the column \
+             is registered under its Rust name, which the log filter, version \
+             history and admin redaction all key off.",
+        ));
+    }
+
+    if spec.blind_index {
+        let expected = blind_index_column(ident);
+        let companion = siblings
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
+        match companion {
+            Some(f) if type_last_segment_is(&f.ty, "BlindIndex") => {}
+            Some(f) => {
+                return Err(syn::Error::new_spanned(
+                    &f.ty,
+                    format!(
+                        "`{expected}` is the blind-index companion of a \
+                         `#[confidential(blind_index)]` field, so it must be typed \
+                         `autumn_web::confidential::BlindIndex`."
+                    ),
+                ));
+            }
+            None => {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "`#[confidential(blind_index)]` needs a companion column \
+                         `{expected}: autumn_web::confidential::BlindIndex` on this \
+                         model. The client computes the token; the server only \
+                         compares it."
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── #1654: `#[classified]` field attribute ───────────────────────────────────
@@ -7542,6 +7756,61 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|(_, col, _)| col.as_str())
         .collect();
 
+    // Collect `#[confidential]` columns (issue #1771, validated to be `Sealed`).
+    // Each entry: (column name, blind-index companion column).
+    let mut confidential_columns: Vec<(String, Option<String>)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_confidential_field(f, &all_fields) {
+            return err.to_compile_error();
+        }
+        let spec = match parse_field_confidential(f) {
+            Ok(spec) => spec,
+            Err(err) => return err.to_compile_error(),
+        };
+        if !spec.present {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        confidential_columns.push((
+            unraw_ident(ident),
+            spec.blind_index.then(|| blind_index_column(ident)),
+        ));
+    }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registered column
+    // name from the wire name, exactly as it does for encrypted columns.
+    if !confidential_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): confidential columns are registered under their Rust names, \
+             which the log filter, version history and admin redaction key off.",
+        )
+        .to_compile_error();
+    }
+    let confidential_column_names: Vec<&str> = confidential_columns
+        .iter()
+        .map(|(col, _)| col.as_str())
+        .collect();
+    let confidential_inventory: Vec<TokenStream> = confidential_columns
+        .iter()
+        .map(|(col, bidx)| {
+            let bidx = bidx.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |b| quote! { ::core::option::Option::Some(#b) },
+            );
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::confidential::ConfidentialColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                        blind_index: #bidx,
+                    }
+                }
+            }
+        })
+        .collect();
+
     // Collect `#[translatable]` columns (issue #1384, validated to be
     // non-null `Translated`). Each entry is the field ident; the column name is
     // the Rust field name, which is also the key the field-name-driven
@@ -9844,6 +10113,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
                 &[#(#classified_column_names),*];
 
+            /// Column names on this model marked `#[confidential]` (#1771).
+            ///
+            /// Emitted for every model (empty when none are confidential). The
+            /// `#[repository]` macro reads this list at build time to refuse a
+            /// server-side predicate over a sealed column, and surfaces without
+            /// a compile-time view of the model read it to redact.
+            #[doc(hidden)]
+            pub const __AUTUMN_CONFIDENTIAL_COLUMNS: &'static [&'static str] =
+                &[#(#confidential_column_names),*];
+
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
             /// Emitted for every model (empty when none are translatable) so
@@ -9855,6 +10134,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #(#encrypted_inventory)*
+        #(#confidential_inventory)*
 
         #translatable_items
         #(#translatable_inventory)*
