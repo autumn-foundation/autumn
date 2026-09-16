@@ -3657,6 +3657,13 @@ impl JobClient {
     /// Returns one result per item in `items`, in the same order. A
     /// coalesced duplicate counts as success, same as [`Self::enqueue_due`].
     /// One item's dedup or backend failure does not affect the others.
+    ///
+    /// If two items in the same batch share a unique key, only one of them
+    /// gets stored on the batched path; the other is treated as a
+    /// coalesced duplicate. Which one wins is not guaranteed to follow
+    /// `items`' order the way calling [`Self::enqueue_due`] once per item,
+    /// in order, would. Give this batch method distinct unique keys, one
+    /// per item, when the caller's own uniqueness relies on order.
     pub async fn enqueue_many_due(
         &self,
         name: &str,

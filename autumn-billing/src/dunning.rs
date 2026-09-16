@@ -578,6 +578,12 @@ pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) 
 /// Returns how many rows were actually re-armed.
 async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
     let Ok(client) = job_client(state) else {
+        // `rearm_pending_now` already waited for the job client via
+        // `wait_for_job_client` before calling this, so this branch means
+        // it was lost in a race after that wait. Log once for the whole
+        // batch, not once per row like the old per-row loop did — the
+        // cause is the same for every row.
+        tracing::warn!("🍂 Autumn Billing: job client unavailable; dunning rows not re-armed");
         return 0;
     };
     let mut invoice_ids = Vec::with_capacity(rows.len());
