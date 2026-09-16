@@ -4725,11 +4725,15 @@ fn declared_alert_config_in(
         let Some(path) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) else {
             continue;
         };
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(overlay) = toml::from_str::<toml::Value>(&text)
-        {
-            deep_merge_toml(&mut merged, overlay);
-        }
+        // Review finding on #2267: an unreadable or malformed override file
+        // must fail this whole read, not be silently skipped in favor of
+        // the base/inline config. A `[profile.prod]` override exists to
+        // CHANGE or disable a destination — silently falling back to a
+        // lower-priority layer could page using a destination the override
+        // was meant to replace.
+        let text = std::fs::read_to_string(&path).ok()?;
+        let overlay: toml::Value = toml::from_str(&text).ok()?;
+        deep_merge_toml(&mut merged, overlay);
         break;
     }
 
@@ -9923,6 +9927,28 @@ mod tests {
             .expect("a bad [scheduler] value must not break the [alerts] read");
 
         assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unreadable_profile_override() {
+        // Review finding on #2267: a malformed `autumn-prod.toml` must fail
+        // this whole read, not be silently skipped in favor of the
+        // base/inline config -- that could page using a destination the
+        // profile override was meant to change or disable.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\npagerduty_routing_key = \"base-key\"\n",
+        )
+        .expect("write autumn.toml");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "not valid toml")
+            .expect("write autumn-prod.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a malformed profile override file must fail closed, not fall back to base config"
+        );
     }
 
     #[test]
