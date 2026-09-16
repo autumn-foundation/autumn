@@ -917,10 +917,10 @@ mod tests {
         let mut b = CollabText::new();
         let b_ops = b.insert("b", 0, "world");
 
-        for op in b_ops.clone() {
+        for op in b_ops {
             a.apply(op);
         }
-        for op in a_ops.clone().into_iter().rev() {
+        for op in a_ops.into_iter().rev() {
             b.apply(op);
         }
 
@@ -1114,7 +1114,7 @@ mod tests {
         a.insert("a", 0, "A");
         let mut b = base.clone();
         b.insert("b", 4, "B");
-        let mut c = base.clone();
+        let mut c = base;
         c.remove(0, 1);
 
         let mut left = a.clone();
@@ -1248,7 +1248,7 @@ mod tests {
         let mut doc = CollabText::from_text("seed", "ab");
         let future = OpId::new(doc.clock() + 50, "victim");
 
-        assert!(doc.remove_known(&[future.clone()]).is_empty());
+        assert!(doc.remove_known(std::slice::from_ref(&future)).is_empty());
         assert_eq!(doc.pending_len(), 0, "nothing was buffered");
 
         // The buffering form is still available for replica merges.

@@ -647,7 +647,7 @@ fn buffered_operations_count_toward_the_document_limit() {
         max_document_chars: 4,
         ..CollabLimits::default()
     });
-    let doc = hub.open_with("notes:15:body", || CollabText::new());
+    let doc = hub.open_with("notes:15:body", CollabText::new);
 
     // Fill the budget with operations from a peer that will never integrate.
     let orphans: Vec<autumn_web::collab::CollabOp> = (1..=4)
@@ -796,7 +796,7 @@ fn operations_delivered_on_the_channel_reach_the_local_authority() {
     let mut elsewhere = doc.document();
     let ops = elsewhere.insert("other-replica", 2, "!");
 
-    doc.merge_delivered(&ops);
+    doc.merge_delivered(&ops).expect("within the budget");
     assert_eq!(doc.text(), "ab!", "the local authority has it");
 
     // And a client can now anchor to the character it just saw.

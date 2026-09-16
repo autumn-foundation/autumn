@@ -96,11 +96,8 @@ fn the_merge_does_not_depend_on_which_side_is_newer() {
 
     let client_newer = resolver.resolve(
         "phone",
-        &client_change(
-            json!({ "body": offline.clone() }),
-            now + Duration::seconds(5),
-        ),
-        &server_row(json!({ "body": online.clone() }), now),
+        &client_change(json!({ "body": offline }), now + Duration::seconds(5)),
+        &server_row(json!({ "body": online }), now),
     );
     let server_newer = resolver.resolve(
         "phone",
@@ -182,17 +179,14 @@ fn a_delete_is_left_to_the_wrapped_resolver() {
     let now = Utc::now();
     let (offline, online) = branched();
 
-    let mut deleting = client_change(
-        json!({ "body": offline.clone() }),
-        now + Duration::seconds(5),
-    );
+    let mut deleting = client_change(json!({ "body": offline }), now + Duration::seconds(5));
     deleting.op = Op::Delete;
     deleting.payload = None;
     assert_eq!(
         CollabResolver::new(["body"]).resolve(
             "phone",
             &deleting,
-            &server_row(json!({ "body": online.clone() }), now)
+            &server_row(json!({ "body": online }), now)
         ),
         Resolution::TakeClient,
     );
@@ -246,7 +240,7 @@ fn replaying_the_same_push_is_idempotent() {
     let second = resolver.resolve(
         "phone",
         &change,
-        &server_row(as_payload(merged["body"].clone()), now),
+        &server_row(as_payload(&merged["body"]), now),
     );
     let Resolution::Merge(again) = second else {
         panic!("expected a merge");
@@ -256,7 +250,7 @@ fn replaying_the_same_push_is_idempotent() {
 }
 
 /// Wrap a merged body back into a row payload.
-fn as_payload(body: Value) -> Value {
+fn as_payload(body: &Value) -> Value {
     json!({ "body": body })
 }
 
@@ -433,13 +427,13 @@ fn for_table_does_not_merge_another_collections_field() {
     // No model registers `test_scoped_notes`, so drive the scoping directly.
     let resolver = CollabResolver::new(["body"]).in_collection("notes");
 
-    let mut elsewhere = client_change(json!({ "body": offline.clone() }), now);
+    let mut elsewhere = client_change(json!({ "body": offline }), now);
     elsewhere.collection = "templates".to_owned();
     assert_eq!(
         resolver.resolve(
             "phone",
             &elsewhere,
-            &server_row(json!({ "body": online.clone() }), now)
+            &server_row(json!({ "body": online }), now)
         ),
         Resolution::KeepServer,
         "another collection is out of scope"

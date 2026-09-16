@@ -772,6 +772,7 @@ impl CollabDoc {
             });
         }
         state.doc.apply_all(ops.iter().cloned());
+        drop(state);
         Ok(())
     }
 

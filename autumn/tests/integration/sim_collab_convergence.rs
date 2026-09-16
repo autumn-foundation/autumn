@@ -87,14 +87,14 @@ fn run_simulation(
     }
 
     // Everyone receives everyone else's operations, in their own order.
-    for target in 0..replica_count {
+    for (target, replica) in replicas.iter_mut().enumerate() {
         let incoming: Vec<CollabOp> = (0..replica_count)
             .filter(|source| *source != target)
             .flat_map(|source| produced[source].clone())
             .collect();
         let stream = u64::try_from(target).expect("a replica index fits in u64");
         for op in shuffled(incoming, seed.wrapping_add(stream)) {
-            replicas[target].apply(op);
+            replica.apply(op);
         }
     }
     replicas
@@ -152,7 +152,7 @@ fn permutations_of(n: usize) -> Vec<Vec<usize>> {
         }
         for i in 0..k {
             generate(k - 1, items, out);
-            if k % 2 == 0 {
+            if k.is_multiple_of(2) {
                 items.swap(i, k - 1);
             } else {
                 items.swap(0, k - 1);
@@ -254,7 +254,7 @@ proptest! {
         // Every operation any replica produced is present in every replica.
         let all_ops: HashSet<String> = replicas
             .iter()
-            .flat_map(|r| r.ops())
+            .flat_map(autumn_web::collab::CollabText::ops)
             .map(|op| serde_json::to_string(&op).expect("op encodes"))
             .collect();
         for replica in &replicas {
