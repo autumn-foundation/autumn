@@ -31,18 +31,29 @@ thread_local! {
     static DEPTH_CAP_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// True if `nodes`, or anything nested inside them, would draw a visible
-/// mark: text, an `<hr>` or `<br>` (each becomes at least a line break —
-/// see [`is_block_boundary_in_inline_context`]'s doc comment on `<hr>`), or
-/// a real `<li>` marker.
+/// True if `nodes`, or anything nested inside them, would visibly affect
+/// the rendered page: real text, or a tag that acts as a structural break
+/// point purely by being present, regardless of its own content — `<br>`,
+/// `<ul>`, `<ol>`, and every [`is_block_boundary_in_inline_context`] tag
+/// (`<hr>`, `<li>`, `<div>`, `<p>`, ...).
 ///
-/// A `<li>` only always draws when it is a direct child of a `<ul>`/`<ol>`
-/// (see `empty_list_item_still_reserves_a_full_line`) — a stray `<li>` with
-/// no enclosing list is just an ordinary (and possibly empty) paragraph to
-/// [`flatten_blocks`] and [`inline_spans`]. `in_list` says whether `nodes`
-/// starts out as such direct children; the walk then flips it on entering
-/// any nested `<ul>`/`<ol>` and off entering anything else, mirroring
-/// exactly which walker would have handled a `<li>` found there.
+/// Each of those forces a split even when it is completely empty:
+/// `flatten_into_pending` flushes whatever text came before it into its
+/// own paragraph the instant it sees one (before handing the tag itself
+/// to [`flatten_blocks`], which adds nothing further for a childless one),
+/// and `inline_spans` pushes a `Span::Break` around it. So an empty
+/// `<li>`/`<div>`/... sitting between two runs of real text keeps them on
+/// separate lines instead of gluing them together — dropping it is a real
+/// rendering difference even though it drops no content of its own.
+///
+/// This can warn even in the rarer case where a content-free tag like
+/// this has no real siblings around it to separate, so dropping it truly
+/// changes nothing — telling those two cases apart would need this check
+/// to see outside `nodes` (the siblings around wherever the tag would
+/// have gone), which it deliberately does not do. That trade-off is
+/// intentional: an occasional extra warning on an edge case that turns
+/// out to be harmless costs far less than silently missing a real one,
+/// which is the whole reason this signal exists (issue #2801).
 ///
 /// Does not look inside [`is_non_rendered`] tags (`<script>`, `<style>`,
 /// ...), whose content the renderer never draws regardless of depth.
@@ -51,9 +62,9 @@ thread_local! {
 /// arbitrarily deep (that is the whole reason it got capped), so this must
 /// stay stack-safe the same way [`super::html`]'s parser and `Node`'s own
 /// `Drop` do.
-fn subtree_has_visible_content(nodes: &[Node], in_list: bool) -> bool {
-    let mut stack: Vec<(&Node, bool)> = nodes.iter().map(|node| (node, in_list)).collect();
-    while let Some((node, in_list)) = stack.pop() {
+fn subtree_has_visible_content(nodes: &[Node]) -> bool {
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
                 if !text.is_empty() {
@@ -61,12 +72,15 @@ fn subtree_has_visible_content(nodes: &[Node], in_list: bool) -> bool {
                 }
             }
             Node::Element { tag, children } => {
-                if tag == "hr" || tag == "br" || (in_list && tag == "li") {
+                if tag == "br"
+                    || tag == "ul"
+                    || tag == "ol"
+                    || is_block_boundary_in_inline_context(tag)
+                {
                     return true;
                 }
-                let child_in_list = tag == "ul" || tag == "ol";
-                if child_in_list || !is_non_rendered(tag) {
-                    stack.extend(children.iter().map(|child| (child, child_in_list)));
+                if !is_non_rendered(tag) {
+                    stack.extend(children);
                 }
             }
         }
@@ -247,7 +261,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// to its text content instead of being dropped.
 fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, false) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -317,7 +331,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, true) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -361,7 +375,7 @@ fn inline_list_items(
 
 fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, false) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -419,7 +433,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, true) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -451,7 +465,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// browser would flow loose text.
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, false) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -576,7 +590,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
 /// inline content keeps accumulating into the caller's `pending` buffer.
 fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes, false) {
+        if subtree_has_visible_content(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -2794,17 +2808,42 @@ mod tests {
     }
 
     #[test]
-    fn bare_li_outside_a_list_past_the_depth_cap_does_not_warn() {
-        // A stray <li> with no enclosing <ul>/<ol> isn't a list item to
-        // flatten_blocks or inline_spans — it becomes an ordinary paragraph
-        // (see flatten_blocks's "p" | "li" | "dt" | "dd" arm), which draws
-        // nothing when it has no content. Only a real <li> inside a list
-        // (empty_li_past_the_depth_cap_still_warns) always draws a marker.
+    fn bare_li_outside_a_list_past_the_depth_cap_still_warns() {
+        // A stray <li> with no enclosing <ul>/<ol> isn't a list item, but
+        // it is still a "flush point": flatten_into_pending closes off
+        // whatever text came before it into its own paragraph the moment
+        // it sees a <li> (same as <div>, <p>, ...), so an <li> sitting
+        // between two runs of real text keeps them on separate lines
+        // instead of gluing them — even though the <li> itself is empty.
+        // Dropping it changes the output, so this must warn.
         let html = format!("{}<li></li>{}", "<span>".repeat(513), "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
-            0,
-            "a stray <li> outside a list draws nothing when empty, so this must not warn"
+            1,
+            "a stray <li> is still a structural flush point, so this must warn"
+        );
+    }
+
+    #[test]
+    fn empty_div_sandwiched_between_text_past_the_depth_cap_still_warns() {
+        // An empty <div> between "A" and "B", buried past the cap, is a
+        // real (if easy to miss) rendering difference: uncapped, it forces
+        // "A" and "B" into separate paragraphs (flatten_into_pending flushes
+        // pending text into its own Block::Paragraph the instant it sees a
+        // <div>, then hands the (empty) <div> to flatten_blocks, which adds
+        // nothing further); dropped, "A" and "B" merge into one paragraph.
+        // Same story inline: inline_spans always pushes a Span::Break
+        // around a <div> (see is_block_boundary_in_inline_context's doc
+        // comment), empty or not.
+        let html = format!(
+            "A{}<div></div>{}B",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "a dropped empty <div> still separates its neighbors, so this must warn"
         );
     }
 
