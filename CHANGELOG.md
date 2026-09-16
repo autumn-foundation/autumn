@@ -70,7 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `enum ServeCommands` is `serve run-service`): matching the last component
   alone would hand a later visible `deploy run-service` this one's exemption,
   and the guard that came with it meant a hidden top-level command was never
-  exempted at all.
+  exempted at all. One rule turned out to sit behind all of these: invisible
+  text is never authoritative, in either language. Everything the gate reads it
+  now reads comment-stripped — the docs corpus, the page a generic rule is
+  verified against, and the clap derive input behind `hide = true`. A rule moved
+  into an HTML comment would otherwise keep exempting all 13 `destroy` paths,
+  and a command unhidden by commenting its attribute out
+  (`// #[command(hide = true)]`, the usual way to unhide) would keep its
+  exemption — each leaving the gate green over documentation no reader sees and
+  behaviour the binary does not have.
 
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email

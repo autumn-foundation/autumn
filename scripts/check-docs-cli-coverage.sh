@@ -82,6 +82,17 @@
 # still denying it, so the stale passage is deleted rather than the waiver
 # widened.
 #
+# ONE RULE BEHIND ALL OF THAT: invisible text is never authoritative, in either
+# language. Everything this gate reads, it reads comment-stripped — the docs
+# corpus, the page a generic RULE is verified against, and the clap derive input
+# behind `hide = true`. Each was a separate hole found in review, and each had
+# the same shape: a claim that survives in a comment while the rendered page or
+# the compiled code says otherwise. A rule moved into an HTML comment would keep
+# exempting all 13 `destroy` paths; a command unhidden by commenting the
+# attribute out (`// #[command(hide = true)]`, the usual way to unhide) would
+# keep its exemption. Both leave the gate green over documentation no reader
+# sees and behaviour the binary does not have.
+#
 # The stale-denial check runs over the whole SURFACE, not over the failing
 # rows, and fails on its own. Coverage and staleness are independent questions:
 # a command that ships WITH proper docs on a new page is classified
@@ -152,6 +163,23 @@ HIDE = re.compile(r'#\[command\([^)]*\bhide\s*=\s*true')
 
 ENUM = re.compile(r'^(?:pub )?enum ([A-Za-z0-9_]+)', re.M)
 
+# Commented-out Rust is not Rust. The usual way to UNHIDE a command is to
+# comment the attribute out rather than delete it — `// #[command(hide = true)]`
+# — and the bare `HIDE` pattern matches that just as happily, so the now-visible
+# command would keep its exemption and the gate would stay green with no docs.
+# Same rule as the HTML comments above, one language over.
+#
+# Only whole comment LINES are dropped, not `//` anywhere on a line: everything
+# this reads (attributes, `enum` declarations, variant names) sits at the start
+# of its own line, so there is nothing to gain from parsing `//` inside a string
+# literal and a URL in a doc comment to get wrong.
+RUST_BLOCK = re.compile(r'/\*.*?\*/', re.S)
+RUST_LINE = re.compile(r'^[ \t]*//.*$', re.M)
+
+
+def strip_rust_comments(text):
+    return RUST_LINE.sub('', RUST_BLOCK.sub('', text))
+
 
 def _kebab(name):
     return re.sub(r'(?<!^)(?=[A-Z])', '-', name).lower()
@@ -175,7 +203,7 @@ def hidden_paths(root, surface):
     found, unplaced = set(), []
     known = set(surface)
     for src in sorted((root / 'autumn-cli' / 'src').rglob('*.rs')):
-        text = src.read_text(errors='replace')
+        text = strip_rust_comments(src.read_text(errors='replace'))
         enums = [(m.start(), m.group(1)) for m in ENUM.finditer(text)]
         for m in HIDE.finditer(text):
             nxt = re.search(r'\n\s*([A-Z][A-Za-z0-9_]*)\s*[{(,]', text[m.end():])
@@ -228,7 +256,13 @@ BACKLOG = {
 def rule_exempt(cmd, root, failures):
     for prefix, page, sentence in RULES:
         if cmd == prefix or cmd.startswith(prefix + ' '):
-            text = (root / page).read_text(errors='replace')
+            # Comment-stripped, for the same reason every other read here is:
+            # a rule a reader cannot see is not a rule they can follow. Checking
+            # the raw page would let the `autumn destroy` explanation be moved
+            # into an HTML comment and still exempt all 13 `destroy` paths —
+            # this gate contradicting its own coverage rule one function away.
+            text = COMMENT.sub(
+                '', (root / page).read_text(errors='replace'))
             if sentence in text:
                 return True
             failures.append(
@@ -531,6 +565,23 @@ def self_test():
     _got2, unplaced2 = hidden_paths(fake, ['serve status'])
     check('unresolvable hidden path is reported', len(unplaced2), 2)
 
+    # REGRESSION: commented-out Rust is not Rust. Unhiding a command by
+    # commenting the attribute out must return it to the gate, not keep its
+    # exemption alive in a comment.
+    check('line-commented attribute is not a hide',
+          bool(HIDE.search(strip_rust_comments('    // #[command(hide = true)]'))), False)
+    check('block-commented attribute is not a hide',
+          bool(HIDE.search(strip_rust_comments('/* #[command(hide = true)] */'))), False)
+    check('a real attribute still is',
+          bool(HIDE.search(strip_rust_comments('    #[command(hide = true)]'))), True)
+    (fake / 'autumn-cli' / 'src' / 'main.rs').write_text(
+        'enum ServeCommands {\n'
+        '    // #[command(hide = true)]\n'
+        '    RunService,\n'
+        '}\n')
+    got3, _ = hidden_paths(fake, ['serve run-service'])
+    check('unhidden command loses its exemption', got3, set())
+
     # a rule stops exempting once its page stops stating it
     missing = []
     fake = pathlib.Path(os.environ['SELFTEST_TMP'])
@@ -540,6 +591,16 @@ def self_test():
     check('deleted rule is reported', len(missing), 1)
     (fake / 'docs' / 'guide' / 'generators.md').write_text(RULES[0][2] + ' generate.\n')
     check('present rule exempts', rule_exempt('destroy job', fake, []), True)
+
+    # REGRESSION: a rule the reader cannot see is not a rule. Moving the
+    # sentence into an HTML comment must stop it exempting all 13 `destroy`
+    # paths, or the gate contradicts its own coverage rule one function away.
+    hidden_rule = []
+    (fake / 'docs' / 'guide' / 'generators.md').write_text(
+        f'<!-- {RULES[0][2]} generate. -->\n')
+    check('a rule buried in a comment does not exempt',
+          rule_exempt('destroy job', fake, hidden_rule), False)
+    check('and it is reported', len(hidden_rule), 1)
 
     # the real surface must not be empty
     real = command_paths()
