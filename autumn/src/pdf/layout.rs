@@ -508,6 +508,7 @@ fn trim_trailing_break(spans: &mut Vec<Span>) {
 /// `ends_with_glueable_word` never does. Pass `&GlueContext::Resolved(false)`
 /// for a call that starts a fresh buffer (a heading, table cell, or list
 /// item's own `spans`) — nothing outside it can ever glue to its content.
+#[allow(clippy::too_many_arguments)]
 fn inline_spans(
     nodes: &[Node],
     bold: bool,
@@ -524,13 +525,25 @@ fn inline_spans(
     // they all keep writing into the same `out`, so whether it eventually
     // gets trimmed never changes partway through one call tree.
     trimmed: bool,
+    // `Some(content_start)` only for the call `inline_list_items` makes
+    // right after a marker: it strips a leading `Span::Break` at exactly
+    // that index once this call returns (see its own comment), regardless
+    // of what a *later* sibling does — unlike `trimmed`'s "is this the
+    // buffer's actual last span" question, this one only needs "is `out`
+    // still exactly as long as it was when this position started", which
+    // stays valid as-is through every recursive call below (an earlier
+    // sibling pushing anything makes the comparison naturally false for
+    // whatever comes after it). `None` everywhere else, since only that
+    // one call site ever strips a leading break this way.
+    leading_break_strip_point: Option<usize>,
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(out) && has_more_after.resolve(),
-            trimmed && has_more_after.nothing_follows(),
+            (trimmed && has_more_after.nothing_follows())
+                || leading_break_strip_point == Some(out.len()),
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
@@ -562,10 +575,28 @@ fn inline_spans(
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
                 "strong" | "b" => {
-                    inline_spans(children, true, italic, depth + 1, &more_after, trimmed, out);
+                    inline_spans(
+                        children,
+                        true,
+                        italic,
+                        depth + 1,
+                        &more_after,
+                        trimmed,
+                        leading_break_strip_point,
+                        out,
+                    );
                 }
                 "em" | "i" => {
-                    inline_spans(children, bold, true, depth + 1, &more_after, trimmed, out);
+                    inline_spans(
+                        children,
+                        bold,
+                        true,
+                        depth + 1,
+                        &more_after,
+                        trimmed,
+                        leading_break_strip_point,
+                        out,
+                    );
                 }
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
@@ -597,11 +628,21 @@ fn inline_spans(
                         depth + 1,
                         &GlueContext::BlockBoundary { outer: &more_after },
                         trimmed,
+                        leading_break_strip_point,
                         out,
                     );
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, &more_after, trimmed, out),
+                _ => inline_spans(
+                    children,
+                    bold,
+                    italic,
+                    depth + 1,
+                    &more_after,
+                    trimmed,
+                    leading_break_strip_point,
+                    out,
+                ),
             },
         }
     }
@@ -684,6 +725,7 @@ fn inline_list_items(
             depth + 1,
             &GlueContext::Resolved(false),
             trimmed,
+            Some(content_start),
             out,
         );
         if out.get(content_start) == Some(&Span::Break) {
@@ -737,6 +779,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                             depth + 2,
                             &GlueContext::Resolved(false),
                             true,
+                            None,
                             &mut spans,
                         );
                         trim_trailing_break(&mut spans);
@@ -766,6 +809,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                     depth + 1,
                     &GlueContext::Resolved(false),
                     true,
+                    None,
                     &mut spans,
                 );
                 trim_trailing_break(&mut spans);
@@ -808,6 +852,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
             depth + 1,
             &GlueContext::Resolved(false),
             true,
+            None,
             &mut spans,
         );
         trim_trailing_break(&mut spans);
@@ -884,6 +929,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         depth + 1,
                         &GlueContext::Resolved(false),
                         true,
+                        None,
                         &mut spans,
                     );
                     trim_trailing_break(&mut spans);
@@ -914,6 +960,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             depth + 1,
                             &GlueContext::Resolved(false),
                             true,
+                            None,
                             &mut spans,
                         );
                         trim_trailing_break(&mut spans);
@@ -975,6 +1022,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             depth + 1,
                             &more_after,
                             false,
+                            None,
                             &mut pending,
                         );
                     }
@@ -986,6 +1034,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             depth + 1,
                             &more_after,
                             false,
+                            None,
                             &mut pending,
                         );
                     }
@@ -1098,6 +1147,7 @@ fn flatten_into_pending(
                                 depth + 1,
                                 &more_after,
                                 false,
+                                None,
                                 pending,
                             );
                         }
@@ -1109,6 +1159,7 @@ fn flatten_into_pending(
                                 depth + 1,
                                 &more_after,
                                 false,
+                                None,
                                 pending,
                             );
                         }
@@ -4159,6 +4210,76 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "the whitespace sibling outside the capped subtree still keeps the <br> from being trimmed"
+        );
+    }
+
+    #[test]
+    fn lone_br_capped_as_a_list_items_leading_content_does_not_warn() {
+        // inline_list_items strips a leading Span::Break unconditionally —
+        // `if out.get(content_start) == Some(&Span::Break) { out.remove(...) }`
+        // — regardless of what comes after it. So when a capped subtree's
+        // *entire* own content is one <br>, and it's the very first thing
+        // in a <li> (right after the marker), that break gets stripped
+        // either way: capped and uncapped render identically, even though
+        // real text ("B") follows as a separate sibling within the same
+        // <li>. This is independent of trim_trailing_break/nothing_follows
+        // — the removal happens unconditionally at content_start, not only
+        // when nothing else follows. (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><ul><li>{}<br>{}B</li></ul></h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a lone <br> as a list item's leading content gets stripped either way, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn two_brs_capped_as_a_list_items_leading_content_still_warn() {
+        // Unlike the lone-<br> case, inline_list_items only ever removes
+        // the *one* Span::Break sitting exactly at content_start — a
+        // second one survives and still draws a visible line break, so
+        // dropping both via the cap is a real content loss.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><ul><li>{}<br><br>{}B</li></ul></h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "only one of the two <br>s as leading content would ever be stripped, so this must warn"
+        );
+    }
+
+    #[test]
+    fn br_capped_as_a_list_items_leading_content_still_warns_when_not_actually_first() {
+        // Same shape as the lone-<br>-as-leading-content case, but this
+        // time real text precedes AND follows the capped subtree within
+        // the same <li> ("A" before, "B" after — both direct siblings of
+        // the deeply wrapped <br>, not nested inside it). "A" means the
+        // capped <br>, if rendered, would NOT land at content_start, so
+        // inline_list_items's leading-break strip would never touch it;
+        // "B" (a later sibling within the *same* nodes list, resolved by
+        // the local LaterSiblings chain regardless of
+        // inline_list_items's own has_more_after) means the *existing*
+        // trailing-trim exception (nothing_follows) doesn't separately
+        // explain away the drop either — isolating this test to the
+        // leading-strip mismatch specifically. Dropping the <br> here is
+        // a real content loss. (Codex review on PR #2810.)
+        let html = format!(
+            "<h1><ul><li>A{}<br>{}B</li></ul></h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "preceding real text means the capped <br> is not the item's leading content, so this must warn"
         );
     }
 
