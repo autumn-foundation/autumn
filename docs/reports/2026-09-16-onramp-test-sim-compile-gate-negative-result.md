@@ -254,6 +254,26 @@ every run) — isolating the crate's own recompile cost, the same technique the
 2026-09-02 report used for `autumn-macros`. `--timings` additionally captured
 the frontend/codegen split cargo attributes to the `autumn-web` unit.
 
+**Correction (review): this feature set is not a byte-for-byte match for
+what the real gate builds.** `autumn-cli/src/cold_start_driver.rs`'s
+`cold_build` runs a plain `cargo build` *inside the generated project
+directory*, with no `--no-default-features`/`--features` flags of its own —
+so the generated project's own `Cargo.toml.tmpl` default feature
+(`default = ["flash"]`, mapping to `autumn-web/flash`) is active on top of
+whatever explicit feature list `DAEMON_NO_DB_FEATURES` writes into the
+`autumn-web` dependency line, and `new.rs`'s no-DB-daemon code path only
+rewrites that one dependency line plus removing `diesel_migrations` — it
+never touches the template's `[features]` block. So the real gate's build
+also carries `flash` (730 lines, `autumn/src/flash.rs`); this report's
+apparatus (`--features maud,htmx,tailwind,reporting`, matching
+`DAEMON_NO_DB_FEATURES` literally) does not. This does not undermine the
+baseline-vs-gated *comparison* below — both conditions omit `flash`
+identically, so the relative delta this report measures is unaffected — but
+the absolute wall-clock/`--timings` numbers are not directly comparable to
+what `cold-start-latency.yml` itself would report, and a future, more
+faithful reproduction should build the actual generated project (or add
+`flash` to the feature list) rather than `-p autumn-web` directly.
+
 ## 📊 Assay
 
 **Wall clock, `cargo build -p autumn-web ...` (fully-cold `autumn-web`
@@ -377,9 +397,16 @@ CARGO_INCREMENTAL=0 cargo build -p autumn-web --no-default-features --features m
 
 # --- gated off: edit autumn/src/lib.rs, adding #[cfg(feature = "onramp-experiment")]
 #     above `pub mod sim;`, `pub mod test;`, and `mod test_html;` ---
+#     Back up the file FIRST and restore from that exact backup afterward --
+#     do NOT `git checkout -- autumn/src/lib.rs` to revert, which would
+#     silently discard any *other* unstaged edits already sitting in that
+#     file in a real working checkout, not just this experiment's own
+#     three-attribute change.
+cp autumn/src/lib.rs /tmp/lib.rs.pre-onramp-experiment
+# ... make the edit ...
 rm -rf target/debug/deps/libautumn_web* target/debug/.fingerprint/autumn-web-* target/debug/incremental/autumn_web-*
 CARGO_INCREMENTAL=0 cargo build -p autumn-web --no-default-features --features maud,htmx,tailwind,reporting --timings
-git checkout -- autumn/src/lib.rs
+cp /tmp/lib.rs.pre-onramp-experiment autumn/src/lib.rs
 
 # Compare target/cargo-timings/*.html's embedded UNIT_DATA JSON, "autumn-web" entry,
 # `duration` / `sections` (frontend vs codegen), between the two runs. Repeat
