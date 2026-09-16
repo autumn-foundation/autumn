@@ -635,6 +635,42 @@ nothing would let the reaper evict live participants.
 
 **Automation:** `manual` — the body depends on how the store holds its state.
 
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
