@@ -450,7 +450,14 @@ expansion.
 The scopes in `#[secured(scopes = [...])]` above come from the bearer token the
 client presents, and that token is minted by the CLI rather than by a signup
 flow. Manage them with `autumn token` — run any of these with `--help` for the
-full argument list:
+full argument list.
+
+**This lifecycle is PostgreSQL-only.** Every `autumn token` subcommand shells
+out to `psql`, and [`DbApiTokenStore`](../../autumn/src/auth.rs) is backed by a
+Postgres pool. On a [SQLite](./sqlite-in-production.md) app neither is
+available: use `InMemoryApiTokenStore` for local work, or implement the
+[`ApiTokenStore`](../../autumn/src/auth.rs) trait against your own table and
+manage tokens through it.
 
 ```bash
 # `issue` and `rotate` print the new token on stdout — and only its hash is
@@ -458,7 +465,7 @@ full argument list:
 # goes to stderr, so it stays out of the captured value.)
 TOKEN=$(autumn token issue service:ci --name ci --scope posts:write)
 
-autumn token list service:ci        # name, scopes, expiry, last-used — never the secret
+autumn token list service:ci        # name, scopes, expiry, last-used, revoked — never the secret
 
 # Then EITHER rotate — the old token stops working and this is the new one:
 TOKEN=$(autumn token rotate "$TOKEN")
@@ -474,21 +481,25 @@ replacement in the database with its secret lost.
 
 `--expires-at <ISO-8601>` makes a token expire; omit it for a non-expiring one.
 
-These commands read and write the managed `api_tokens` table, so they reach
-your app only when it mounts [`DbApiTokenStore`](../../autumn/src/auth.rs) and
-has that table — pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run
-`autumn migrate`. An app wired to `InMemoryApiTokenStore` keeps its tokens in
-the process and seeds them in code: a token issued by the CLI is invisible to
-it, and verification answers `401`.
+On Postgres, these commands read and write the managed `api_tokens` table, so
+they reach your app only when it mounts `DbApiTokenStore` and has that table —
+pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run `autumn migrate`. An app
+wired to `InMemoryApiTokenStore` keeps its tokens in the process and seeds them
+in code: a token issued by the CLI is invisible to it, and verification answers
+`401`.
 
 **To revoke a leaked API token**, run `autumn token revoke "$TOKEN"`: it sets
 `revoked_at`, and `RequireApiToken` answers `401` for every later request
 presenting it.
 
 **To rotate an API token** — a CI credential that must keep working — run
-`autumn token rotate "$TOKEN"` instead. It revokes the old token and prints a
-replacement carrying the same name and scopes, so only the stored secret
-changes.
+`autumn token rotate "$TOKEN"` instead. It revokes the old row and **inserts a
+new one** carrying the same principal, name, scopes and expiry, then prints the
+new secret. The replacement is a distinct token: new id, new `created_at`, and
+no `last_used_at` until it is used. The retired row stays in the table with
+`revoked_at` set, so `autumn token list` shows both — expect one live row and
+one revoked row per rotation, and key any tooling on the token's *name* rather
+than its id.
 
 In Rust, the same four operations are
 [`issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token` and
