@@ -2,8 +2,8 @@
 //!
 //! `autumn/migrations` backed `api_tokens`, the job queue, feature flags,
 //! experiments, the shard directory, and the ledger — but only for Postgres.
-//! A `SQLite` app that registered `FRAMEWORK_MIGRATIONS` could not apply it:
-//! the embedded set held Postgres-only DDL (`BIGSERIAL`, `JSONB`,
+//! A `SQLite` app that registered `FRAMEWORK_MIGRATIONS` could not apply it.
+//! The embedded set held Postgres-only DDL (`BIGSERIAL`, `JSONB`,
 //! `TIMESTAMPTZ`, `NOW()`, `pg_notify` triggers). This is the CI-backed proof
 //! that the `SQLite` fork (`autumn/migrations_sqlite`) now applies cleanly
 //! through the real `MigrationHarness`, not a hand-copied DDL string.

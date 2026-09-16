@@ -1,11 +1,13 @@
 -- A/B experiments, SQLite variant. Backend-forked from the Postgres
--- migration in `autumn/migrations/`. The version dir name is kept identical
--- so `__diesel_schema_migrations` bookkeeping does not diverge across
--- backends. Differences from the Postgres DDL:
+-- migration in `autumn/migrations/`. The version dir name matches Postgres.
+-- This keeps `__diesel_schema_migrations` bookkeeping the same across
+-- backends.
+--
+-- Differences from the Postgres DDL:
 --   * `CREATE TYPE ... AS ENUM` is dropped — SQLite has no enum type;
 --     `state` is TEXT with the same values enforced by a CHECK constraint;
---   * `id INTEGER PRIMARY KEY` — a rowid alias that autoincrements
---     (`BIGSERIAL` has mere NUMERIC affinity on SQLite);
+--   * `id INTEGER PRIMARY KEY` is a rowid alias. SQLite autoincrements it.
+--     `BIGSERIAL` only gets NUMERIC affinity on SQLite, not autoincrement;
 --   * `variants` is TEXT — SQLite has no `JSONB` type;
 --   * every `TIMESTAMPTZ` becomes TEXT, and `NOW()` becomes
 --     `CURRENT_TIMESTAMP` — neither exists on SQLite;

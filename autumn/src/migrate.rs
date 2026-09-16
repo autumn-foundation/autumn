@@ -45,20 +45,21 @@ pub use diesel_migrations::embed_migrations;
 /// These are applied by `autumn migrate` and are also registered
 /// automatically at startup when a framework feature requires its own table.
 ///
-/// Backend-forked like [`derivation::DERIVATION_MIGRATIONS`](crate::derivation::DERIVATION_MIGRATIONS):
-/// the Postgres DDL (`BIGSERIAL`/`JSONB`/`TIMESTAMPTZ`/`NOW()`) is not valid
-/// `SQLite`, so the `SQLite` build embeds a parallel set under the same
-/// version dir names, keeping `__diesel_schema_migrations` bookkeeping
-/// identical across backends (issue #2699).
+/// Backend-forked, like [`derivation::DERIVATION_MIGRATIONS`](crate::derivation::DERIVATION_MIGRATIONS).
+/// The Postgres DDL (`BIGSERIAL`/`JSONB`/`TIMESTAMPTZ`/`NOW()`) is not valid
+/// `SQLite`. The `SQLite` build embeds a parallel migration set under the
+/// same version dir names. This keeps `__diesel_schema_migrations`
+/// bookkeeping identical across backends (issue #2699).
 #[cfg(not(feature = "sqlite"))]
 pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 /// `SQLite` variant of [`FRAMEWORK_MIGRATIONS`]. See that item for the
 /// backend-fork rationale.
 ///
-/// A table another module self-manages outside Diesel (the job queue, job
-/// tracking) or a feature `SQLite` does not support (sharding) gets a no-op
-/// shim migration here instead of real DDL — see `autumn/migrations_sqlite`.
+/// Some tables get a no-op shim here instead of real DDL: a table another
+/// module already manages outside Diesel (the job queue, job tracking), and
+/// a feature `SQLite` does not support (sharding). See
+/// `autumn/migrations_sqlite`.
 #[cfg(feature = "sqlite")]
 pub const FRAMEWORK_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations_sqlite");
 
@@ -2359,13 +2360,15 @@ pub fn applied_user_migrations_sqlite(
     )
 }
 
-/// The identity map the `SQLite` apply path
-/// ([`run_pending_sqlite_with_framework_migrations`]) records under: the app
-/// set, [`FRAMEWORK_MIGRATIONS`] and the shard-required framework sets
-/// enumerated together, every version collision resolved. Rollback has to
-/// plan and revert under the same identities, or a migration tracked under a
-/// substitute reads as applied with no local `down.sql`, and its plain
-/// version as the other side's.
+/// The identity map for the `SQLite` apply path
+/// ([`run_pending_sqlite_with_framework_migrations`]). It covers the app
+/// set, [`FRAMEWORK_MIGRATIONS`], and the shard-required framework sets,
+/// enumerated together, with every version collision resolved.
+///
+/// Rollback must plan and revert under the same identities. Otherwise a
+/// migration tracked under a substitute name reads as applied with no local
+/// `down.sql`, while its plain version reads as applied under the other
+/// migration instead.
 ///
 /// # Errors
 ///
@@ -2974,18 +2977,25 @@ pub fn run_pending_shard_framework_migrations(
 /// Apply an app's own migrations and then the framework sets a `SQLite`
 /// database requires, under one version-collision map.
 ///
-/// The framework sets are [`FRAMEWORK_MIGRATIONS`] (the `SQLite` variant of
-/// the control-plane schema: `api_tokens`, runtime config, feature flags,
-/// experiments, migration checksums, issue #2699) plus the `SQLite` variants
-/// of the version-history, commit-hook queue and derivation-state tables,
-/// the same three [`run_pending_shard_framework_migrations`] applies to a
-/// Postgres shard. `FRAMEWORK_MIGRATIONS` embeds those same three under the
-/// same version dir names (the intended duplicate the control-plane Postgres
-/// set already carries), so applying both here is redundant, not conflicting:
-/// whichever runs first records the version, and the other reports it already
-/// applied. This is what gives `autumn migrate` an apply path for these
-/// tables on a `sqlite://` target when startup auto-migration is off; without
-/// it the boot only reports them pending and a `#[derivation]` reconciliation
+/// The framework sets are [`FRAMEWORK_MIGRATIONS`] plus three more sets.
+///
+/// [`FRAMEWORK_MIGRATIONS`] is the `SQLite` variant of the control-plane
+/// schema: `api_tokens`, runtime config, feature flags, experiments, and
+/// migration checksums (issue #2699).
+///
+/// The three more sets are the `SQLite` variants of the version-history,
+/// commit-hook queue, and derivation-state tables — the same three
+/// [`run_pending_shard_framework_migrations`] applies to a Postgres shard.
+///
+/// [`FRAMEWORK_MIGRATIONS`] also embeds those same three tables, under the
+/// same version dir names. The control-plane Postgres set already
+/// duplicates them this way, so applying both sets here is redundant, not
+/// conflicting: whichever set runs first records the version, and the other
+/// then sees it as already applied.
+///
+/// This gives `autumn migrate` an apply path for these tables on a
+/// `sqlite://` target when startup auto-migration is off. Without it, boot
+/// only reports the tables as pending, and `#[derivation]` reconciliation
 /// fails on the missing state table.
 ///
 /// Diesel tracks applied migrations by version alone, so an app migration
@@ -3124,8 +3134,14 @@ struct SqliteCollisionMove {
 /// `conn` without changing anything.
 ///
 /// For every remapped migration whose plain version is applied and whose
-/// substitute is not, the framework migration's table says which side ran,
-/// and the remapped side's record moves if it did. The listing path resolves
+/// substitute is not, the colliding framework migration says which side ran.
+/// [`SQLITE_FRAMEWORK_MIGRATION_TABLES`] lists the five migrations that
+/// already applied on `SQLite` before `FRAMEWORK_MIGRATIONS` gained a
+/// `SQLite` variant (issue #2699): for those, either side could hold the
+/// plain-version record, so a table probe decides. Every other framework
+/// migration is new to `SQLite` as of that fork — it never had a chance to
+/// apply here before, so a pre-existing plain-version record can only be the
+/// app's own migration, and no probe is needed. The listing path resolves
 /// these virtually and the write paths apply them.
 #[cfg(feature = "sqlite")]
 fn sqlite_collision_history_moves(
@@ -3142,6 +3158,17 @@ fn sqlite_collision_history_moves(
         .flatten()
         .map(|(version, name)| (name.as_str(), version.as_str()))
         .collect();
+    // Every full name a framework set (not the app's own migrations, always
+    // `sets[0]`) claims. Used to tell a framework migration new to `SQLite`
+    // (never ran here, so any collision is unambiguously the app's) from the
+    // app's own migration.
+    let framework_names: std::collections::HashSet<&str> = sets
+        .get(1..)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|(_, name)| name.as_str())
+        .collect();
     let applied: std::collections::HashSet<String> = conn
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?
@@ -3157,7 +3184,8 @@ fn sqlite_collision_history_moves(
         if !applied.contains(*version) || applied.contains(substitute) {
             continue;
         }
-        // The framework migration in this collision, and its table.
+        // The pre-#2699 framework migration in this collision, and its
+        // table, if this version is one of the five ambiguous ones.
         let framework = sets
             .iter()
             .flatten()
@@ -3168,14 +3196,21 @@ fn sqlite_collision_history_moves(
                     .find(|(migration, _)| migration == name)
                     .map(|(migration, table)| (*migration, *table))
             });
-        let Some((framework_name, table)) = framework else {
-            continue;
-        };
-        let framework_ran = sqlite_table_exists(conn, table)?;
-        let remapped_ran = if framework_name == full_name {
-            framework_ran
+        let remapped_ran = if let Some((framework_name, table)) = framework {
+            let framework_ran = sqlite_table_exists(conn, table)?;
+            if framework_name == full_name {
+                framework_ran
+            } else {
+                !framework_ran
+            }
         } else {
-            !framework_ran
+            // No ambiguous framework migration shares this version. If
+            // `full_name` itself is a framework migration, it is the one new
+            // to `SQLite` — it never ran, so the plain version still belongs
+            // to whichever app migration won the collision. Otherwise
+            // `full_name` is the app's own migration, and it is unambiguously
+            // the one that ran.
+            !framework_names.contains(full_name.as_str())
         };
         if remapped_ran {
             moves.push(SqliteCollisionMove {
@@ -3996,6 +4031,79 @@ mod tests {
         let moved = diesel::sql_query(
             "SELECT COUNT(*) AS n FROM __diesel_schema_migrations \
              WHERE version LIKE '20260907101530+%'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count the moved record")
+        .n;
+        assert_eq!(
+            moved, 1,
+            "the app migration's record moved to its substitute"
+        );
+
+        let again = run_pending_sqlite_with_framework_migrations(&url, &app).expect("third run");
+        assert!(
+            again.applied.is_empty(),
+            "nothing is applied twice: {:?}",
+            again.applied
+        );
+    }
+
+    /// The same history-adoption case as
+    /// [`a_sqlite_app_migration_already_applied_under_a_framework_version_keeps_its_history`],
+    /// but colliding with a `FRAMEWORK_MIGRATIONS`-only migration
+    /// (`create_api_tokens`) rather than one of the five pre-existing
+    /// shard-required ones. Before this fork existed, `create_api_tokens`
+    /// never ran on `SQLite`: any release predating it could only have
+    /// applied the app's own migration under the plain version. Confirms
+    /// [`sqlite_collision_history_moves`] moves that record without needing
+    /// a table probe (issue #2699 review finding).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_sqlite_app_migration_predating_a_new_framework_migration_keeps_its_history() {
+        use diesel::RunQueryDsl as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        let (migrations_dir, url) = sqlite_scratch("new-framework-history");
+        let older = migrations_dir.join("20260512000000_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        // A release predating this fork: the app set alone, under its plain
+        // version. `create_api_tokens` did not exist on `SQLite` yet.
+        let before = run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app set");
+        assert_eq!(before.applied, vec!["20260512000000".to_owned()]);
+
+        let now = run_pending_sqlite_with_framework_migrations(&url, &app)
+            .expect("create_api_tokens applies without re-running the app migration");
+        assert!(
+            now.applied
+                .iter()
+                .any(|version| version == "20260512000000"),
+            "create_api_tokens takes the plain version: {:?}",
+            now.applied
+        );
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        diesel::sql_query("SELECT 1 FROM zzz LIMIT 1")
+            .execute(&mut conn)
+            .expect("the app table is still there");
+        diesel::sql_query("SELECT 1 FROM api_tokens LIMIT 1")
+            .execute(&mut conn)
+            .expect("api_tokens now exists");
+        let moved = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations \
+             WHERE version LIKE '20260512000000+%'",
         )
         .get_result::<Count>(&mut conn)
         .expect("count the moved record")

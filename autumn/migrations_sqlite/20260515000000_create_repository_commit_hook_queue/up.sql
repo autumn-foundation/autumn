@@ -1,10 +1,15 @@
 -- Durable repository commit-hook queue, SQLite variant. Backend-forked from
--- the control-plane Postgres migration in `autumn/migrations/`, not from
--- `repository_commit_hook_migrations/` (that fork's own `_sqlite` sibling has
--- since diverged: its `idx_..._pending_recovery` predicate also covers
--- `after_hook_succeeded`, this control copy does not yet). The version dir
--- name is kept identical so `__diesel_schema_migrations` bookkeeping does not
--- diverge across backends. Differences from the Postgres DDL:
+-- the control-plane Postgres migration in `autumn/migrations/`.
+--
+-- Note: not forked from `repository_commit_hook_migrations/`. That fork's
+-- own `_sqlite` sibling has since drifted from this one: its
+-- `idx_..._pending_recovery` index also covers `after_hook_succeeded`; this
+-- copy does not yet.
+--
+-- The version dir name matches Postgres. This keeps
+-- `__diesel_schema_migrations` bookkeeping the same across backends.
+--
+-- Differences from the Postgres DDL:
 --   * `context`/`record` are TEXT — SQLite has no `JSONB` type;
 --   * every `TIMESTAMPTZ` becomes TEXT, and `NOW()` becomes
 --     `CURRENT_TIMESTAMP` — neither exists on SQLite;

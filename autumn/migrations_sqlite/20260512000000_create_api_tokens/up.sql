@@ -1,9 +1,10 @@
 -- API tokens, SQLite variant. Backend-forked from the Postgres migration in
--- `autumn/migrations/`. The version dir name is kept identical so
--- `__diesel_schema_migrations` bookkeeping does not diverge across backends.
+-- `autumn/migrations/`. The version dir name matches Postgres. This keeps
+-- `__diesel_schema_migrations` bookkeeping the same across backends.
+--
 -- Differences from the Postgres DDL:
---   * `id INTEGER PRIMARY KEY` — a rowid alias that autoincrements
---     (`BIGSERIAL` has mere NUMERIC affinity on SQLite);
+--   * `id INTEGER PRIMARY KEY` is a rowid alias. SQLite autoincrements it.
+--     `BIGSERIAL` only gets NUMERIC affinity on SQLite, not autoincrement;
 --   * `created_at`/`revoked_at` are TEXT — SQLite has no timestamp type, and
 --     `NOW()` is not a SQLite function; `CURRENT_TIMESTAMP` is the fallback
 --     default.
