@@ -836,6 +836,19 @@ struct QueueGaugeState {
     pg_marks_by_job_id: indexmap::IndexMap<String, PgMark>,
     /// Monotonic counter handing out each new [`PgMark`]'s [`PgMark::seq`].
     pg_marks_next_seq: u64,
+    /// `seq` → id, mirroring [`Self::pg_marks_by_job_id`]'s keys in
+    /// insertion order. Eviction walks this ascending (oldest first) and
+    /// stops at the first entry that is actually due, rather than scanning
+    /// every entry in [`Self::pg_marks_by_job_id`] to find the *provably
+    /// oldest* due one: any due entry is an equally valid eviction target
+    /// (nothing here relies on evicting the single oldest of them), and an
+    /// older entry has had more time to become due, so this walk is O(1) in
+    /// the common case — a long-lived backlog past the cap keeps its oldest
+    /// entries genuinely overdue, not its newest ones. Only a workload where
+    /// no entry is ever due (every mark carries a far-future instant) still
+    /// walks every entry, matching the fallback's own already-O(n) oldest
+    /// lookup in that case.
+    pg_marks_seq_order: std::collections::BTreeMap<u64, String>,
 }
 
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
@@ -1325,7 +1338,11 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.swap_remove(id))
+            .and_then(|mut guard| {
+                let removed = guard.pg_marks_by_job_id.swap_remove(id)?;
+                guard.pg_marks_seq_order.remove(&removed.seq);
+                Some(removed)
+            })
             .map(|mark| mark.ms);
         let removed_exact = exact_ms.is_some_and(|exact_ms| self.pop_waiting_exact(name, exact_ms));
         if !removed_exact {
@@ -1344,8 +1361,10 @@ impl JobRegistry {
     /// benefit. A no-op if `id` was never entered (a non-Postgres backend,
     /// or an entry already removed).
     pub(crate) fn forget_pg_job_mark(&self, id: &str) {
-        if let Ok(mut guard) = self.queues.write() {
-            guard.pg_marks_by_job_id.swap_remove(id);
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(removed) = guard.pg_marks_by_job_id.swap_remove(id)
+        {
+            guard.pg_marks_seq_order.remove(&removed.seq);
         }
     }
 
@@ -1423,32 +1442,33 @@ impl JobRegistry {
                 let registry_now = self.now_ms();
                 let real_now =
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
-                // Oldest (by `seq`, not physical position — `swap_remove`
-                // below does not preserve that) due entry, if any; else the
-                // oldest entry overall. One pass finds both: `seq`s are
-                // unique and only ever increase, so the running minimums
-                // never need revisiting.
-                let mut oldest_due: Option<(&str, u64)> = None;
-                let mut oldest_any: Option<(&str, u64)> = None;
-                for (key, mark) in &guard.pg_marks_by_job_id {
-                    if oldest_any.is_none_or(|(_, seq)| mark.seq < seq) {
-                        oldest_any = Some((key, mark.seq));
-                    }
-                    let due = match mark.timeline {
-                        PgMarkTimeline::Real => mark.ms <= real_now,
-                        PgMarkTimeline::Registry => mark.ms <= registry_now,
-                    };
-                    if due && oldest_due.is_none_or(|(_, seq)| mark.seq < seq) {
-                        oldest_due = Some((key, mark.seq));
-                    }
-                }
-                if let Some((evict_id, _)) = oldest_due.or(oldest_any) {
-                    let evict_id = evict_id.to_string();
-                    guard.pg_marks_by_job_id.swap_remove(&evict_id);
+                // Walk oldest-first (ascending `seq`) and stop at the first
+                // entry that is actually due; only when none is found (the
+                // loop runs to completion) fall back to the oldest entry
+                // overall (`pg_marks_seq_order`'s own first key). See
+                // `pg_marks_seq_order`'s doc comment for why this is not a
+                // full scan in the common case.
+                let evict_id = guard
+                    .pg_marks_seq_order
+                    .iter()
+                    .find_map(|(_, candidate_id)| {
+                        let mark = guard.pg_marks_by_job_id.get(candidate_id)?;
+                        let due = match mark.timeline {
+                            PgMarkTimeline::Real => mark.ms <= real_now,
+                            PgMarkTimeline::Registry => mark.ms <= registry_now,
+                        };
+                        due.then(|| candidate_id.clone())
+                    })
+                    .or_else(|| guard.pg_marks_seq_order.values().next().cloned());
+                if let Some(evict_id) = evict_id
+                    && let Some(evicted) = guard.pg_marks_by_job_id.swap_remove(&evict_id)
+                {
+                    guard.pg_marks_seq_order.remove(&evicted.seq);
                 }
             }
             let seq = guard.pg_marks_next_seq;
             guard.pg_marks_next_seq = guard.pg_marks_next_seq.wrapping_add(1);
+            guard.pg_marks_seq_order.insert(seq, id.to_string());
             guard.pg_marks_by_job_id.insert(
                 id.to_string(),
                 PgMark {
@@ -1523,7 +1543,11 @@ impl JobRegistry {
             .queues
             .write()
             .ok()
-            .and_then(|mut guard| guard.pg_marks_by_job_id.swap_remove(id))
+            .and_then(|mut guard| {
+                let removed = guard.pg_marks_by_job_id.swap_remove(id)?;
+                guard.pg_marks_seq_order.remove(&removed.seq);
+                Some(removed)
+            })
             .map(|mark| mark.ms);
         if let Some(exact_ms) = exact_ms
             && self.pop_waiting_exact(name, exact_ms)
@@ -1623,6 +1647,19 @@ impl JobRegistry {
     #[cfg(test)]
     pub(crate) fn pg_marks_len_for_test(&self) -> usize {
         self.queues.read().map_or(0, |g| g.pg_marks_by_job_id.len())
+    }
+
+    /// Whether `pg_marks_seq_order` currently mirrors `pg_marks_by_job_id`'s
+    /// keys exactly (same length, same ids) — the invariant every insert and
+    /// removal on that table must maintain. Test-only.
+    #[cfg(test)]
+    pub(crate) fn pg_marks_seq_order_is_consistent_for_test(&self) -> bool {
+        self.queues.read().is_ok_and(|g| {
+            g.pg_marks_seq_order.len() == g.pg_marks_by_job_id.len()
+                && g.pg_marks_seq_order
+                    .values()
+                    .all(|id| g.pg_marks_by_job_id.contains_key(id))
+        })
     }
 
     /// Whether `pg_marks_by_job_id` currently holds an entry for `id`.
@@ -5249,6 +5286,7 @@ mod tests {
             "an entry still in the future must never be evicted while an already-due \
              entry is available to evict instead"
         );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
     }
 
     /// Regression for the Codex P2 raised on commit a460209: comparing every
@@ -5309,6 +5347,7 @@ mod tests {
             "a mark that is not yet due in real time must never be evicted just because \
              the registry's own (far-future) clock alone would call it due"
         );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
     }
 
     /// Regression for the Codex P2 raised on commit d3e86d6: requiring both
@@ -5371,6 +5410,7 @@ mod tests {
              clock lags behind real time and would call every real-timeline mark 'not \
              due' if it were consulted for them too"
         );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
     }
 
     /// Regression for the Codex P2 raised on commit c0cbfd3: before
@@ -5404,6 +5444,12 @@ mod tests {
             0,
             "a job whose mark was consumed by record_pg_start must not linger in the \
              exact-mark table just because the cap has not been reached"
+        );
+        assert!(
+            registry.pg_marks_seq_order_is_consistent_for_test(),
+            "pg_marks_seq_order (the O(1)-eviction seq index) must mirror \
+             pg_marks_by_job_id exactly after a long run of inserts and removals, \
+             not just at a single snapshot"
         );
     }
 
