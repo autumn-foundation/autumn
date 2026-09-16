@@ -991,6 +991,15 @@ fn node_glue_lookahead(node: &Node) -> GlueLookahead {
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
+                // Leading breakable whitespace already clears words_of's
+                // glue boundary on its own — same conclusiveness as a
+                // Stopped tag, regardless of what real text follows it in
+                // this same run. Only text with a real char and no
+                // whitespace ahead of it is a genuine glue risk; pure
+                // whitespace (or an empty string) decides nothing yet.
+                if text.starts_with(is_breakable_whitespace) {
+                    return GlueLookahead::Stopped;
+                }
                 if text.chars().any(|c| !is_breakable_whitespace(c)) {
                     return GlueLookahead::Confirmed;
                 }
@@ -3380,6 +3389,46 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "dropping this space would glue \"A\" and \"B\" together, so this must warn"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_before_a_leading_space_past_the_depth_cap_does_not_warn() {
+        // Unlike the case above, the later sibling here ("B", preceded by
+        // its own literal space) already carries its own separator —
+        // words_of clears the glue boundary on that leading space
+        // regardless of whether the capped whitespace survives, so both
+        // capped and uncapped output render "A B" identically. (Codex
+        // review on PR #2810.)
+        let html = format!(
+            "A{}{}{} B",
+            "<span>".repeat(513),
+            " ",
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "\" B\"'s own leading space already separates it from \"A\", so this must not warn"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_before_a_whitespace_sibling_past_the_depth_cap_does_not_warn() {
+        // Same idea, but the separator is a distinct whitespace-only
+        // sibling ahead of "B" rather than leading whitespace within the
+        // same text node — still resolves the glue risk on its own.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "A{}{}{}<span> </span>B",
+            "<span>".repeat(513),
+            " ",
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "the whitespace-only sibling before \"B\" already separates it from \"A\", so this must not warn"
         );
     }
 
