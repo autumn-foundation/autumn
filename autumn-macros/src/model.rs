@@ -5731,6 +5731,30 @@ fn attrs_have_serde_shape_conversion(attrs: &[syn::Attribute]) -> Option<&'stati
     found
 }
 
+/// Whether a container lets serde fill a missing field from `Default`:
+/// `#[serde(default)]` or `#[serde(default = "...")]` written on the struct.
+///
+/// Serde applies it to every field the input omits, so unlike the field-level
+/// spelling it reaches the sealed column and its token without either of them
+/// carrying an attribute of its own.
+fn attrs_have_serde_container_default(attrs: &[syn::Attribute]) -> bool {
+    let mut found = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                found = true;
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
 /// Whether a field carries a `#[serde(rename = "...")]` (which would desync the
 /// encrypted-column registry from the serialized key).
 fn field_has_serde_rename(field: &syn::Field) -> bool {
@@ -8011,6 +8035,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                  history and the raw-request filters — which key off the model's own field \
                  names — cannot see the sealed column or its token through it."
             ),
+        )
+        .to_compile_error();
+    }
+
+    // The field-level rule refuses the same omission written on the field. On
+    // the container it needs no field attribute at all: serde fills every key
+    // the request leaves out, and both wrappers implement `Default`, so the row
+    // takes an envelope no key opens or a token that indexes no envelope.
+    if !confidential_columns.is_empty() && attrs_have_serde_container_default(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(default)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): it lets a request omit the sealed column or its blind-index \
+             companion, and both wrappers implement `Default`, so the row stores an \
+             envelope no key opens or a token that indexes no envelope. The client's own \
+             bytes are the only valid value for either column.",
         )
         .to_compile_error();
     }
@@ -14878,6 +14918,32 @@ mod tests {
             assert!(
                 expanded.contains("cannot be combined with `#[confidential]` fields"),
                 "a reshaped confidential model must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: the container-level counterpart of the field-level omission rule.
+    /// Written on the struct, one attribute reaches both columns without either
+    /// of them carrying an attribute of its own.
+    #[test]
+    fn a_serde_container_default_on_a_confidential_model_is_refused() {
+        for container in [
+            quote! { #[serde(default)] },
+            quote! { #[serde(default = "seed")] },
+        ] {
+            let input: TokenStream = quote! {
+                #container
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a container-level serde default must be refused: {expanded}"
             );
         }
     }
