@@ -126,16 +126,20 @@ async fn store_note(
         .await
         .ok_or_else(|| autumn_web::AutumnError::unauthorized_msg("not signed in"))?;
 
-    let mut conn = db().conn.lock().expect("db lock");
-    diesel::insert_into(redteam_notes::table)
-        .values(NewRedTeamNote {
-            uid: payload.uid,
-            owner_id: owner,
-            sealed_body: payload.sealed_body,
-            sealed_body_bidx: payload.sealed_body_bidx,
-        })
-        .execute(&mut *conn)
-        .map_err(|e| autumn_web::AutumnError::internal_server_error_msg(e.to_string()))?;
+    // The lock is scoped to the statement that needs it: a guard held across the
+    // response build would serialize requests that are not touching the database.
+    {
+        let mut conn = db().conn.lock().expect("db lock");
+        diesel::insert_into(redteam_notes::table)
+            .values(NewRedTeamNote {
+                uid: payload.uid,
+                owner_id: owner,
+                sealed_body: payload.sealed_body,
+                sealed_body_bidx: payload.sealed_body_bidx,
+            })
+            .execute(&mut *conn)
+            .map_err(|e| autumn_web::AutumnError::internal_server_error_msg(e.to_string()))?;
+    }
     Ok("stored")
 }
 
@@ -152,12 +156,14 @@ async fn read_note(
         .await
         .ok_or_else(|| autumn_web::AutumnError::unauthorized_msg("not signed in"))?;
 
-    let mut conn = db().conn.lock().expect("db lock");
-    let note: RedTeamNote = redteam_notes::table
-        .filter(redteam_notes::uid.eq(&uid))
-        .filter(redteam_notes::owner_id.eq(&owner))
-        .first(&mut *conn)
-        .map_err(|_| autumn_web::AutumnError::not_found_msg("no such note"))?;
+    let note: RedTeamNote = {
+        let mut conn = db().conn.lock().expect("db lock");
+        redteam_notes::table
+            .filter(redteam_notes::uid.eq(&uid))
+            .filter(redteam_notes::owner_id.eq(&owner))
+            .first(&mut *conn)
+            .map_err(|_| autumn_web::AutumnError::not_found_msg("no such note"))?
+    };
 
     Ok(axum::Json(NotePayload {
         uid: note.uid,
