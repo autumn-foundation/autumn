@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Seed linker qualifies a hand-written plain `mod schema;` / `mod models;`
+  instead of leaving the seed binary broken (fixes #2669):** a plain
+  `mod schema;` inside `src/bin/seed.rs` resolves to `src/bin/schema.rs`,
+  which does not exist — the seed binary failed to compile and `autumn seed
+  --model M` could not see scaffolded models, while `link_models_into_seed_bin`
+  treated the declaration as already-linked and left it untouched. The linker
+  now qualifies such declarations with the same `#[path]` attribute it injects
+  (new `qualify_plain_mod` helper): no duplicate declaration is added, and
+  visibility (`pub mod`), indentation, custom `#[path]` attributes, and other
+  attribute-carrying declarations are preserved. At destroy time the qualified
+  block is removed as one unit — a bare `mod schema;` would point at the
+  nonexistent `src/bin/schema.rs` and break `cargo check --bins` exactly like a
+  dangling `#[path]` would.
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the
