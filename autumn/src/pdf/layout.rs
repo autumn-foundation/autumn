@@ -402,7 +402,7 @@ fn inline_spans(
         return;
     }
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = i + 1 < nodes.len() || has_more_after;
+        let more_after = later_content_could_glue(&nodes[i + 1..]) || has_more_after;
         match node {
             Node::Text(text) => {
                 if !text.is_empty() {
@@ -624,7 +624,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     };
 
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = i + 1 < nodes.len();
+        let more_after = later_content_could_glue(&nodes[i + 1..]);
         match node {
             Node::Text(text) => {
                 // Pushed even when whitespace-only: a text node between two
@@ -757,7 +757,7 @@ fn flatten_into_pending(
     // text lives in blocks as trailing paragraphs — simplest correct
     // approach is to just recurse the same tag-matching logic directly.
     for (i, node) in nodes.iter().enumerate() {
-        let more_after = i + 1 < nodes.len() || has_more_after;
+        let more_after = later_content_could_glue(&nodes[i + 1..]) || has_more_after;
         match node {
             Node::Text(text) => {
                 // See the matching comment in `flatten_blocks` — a
@@ -847,6 +847,52 @@ const fn is_breakable_whitespace(c: char) -> bool {
 /// next one instead of keeping a space between them.
 fn ends_with_glueable_word(out: &[Span]) -> bool {
     matches!(out.last(), Some(Span::Run { text, .. }) if !text.ends_with(is_breakable_whitespace))
+}
+
+/// The other half of [`ends_with_glueable_word`]: true if processing
+/// `nodes` in document order — the way [`inline_spans`]/[`flatten_into_pending`]
+/// actually would — could ever push a real (non-whitespace) word into the
+/// buffer they share, before anything interposes a break of its own.
+///
+/// A `<br>`, a `<ul>`/`<ol>` (always wrapped in a break by
+/// [`push_block_break`], regardless of whether it has a real `<li>`), or an
+/// [`is_block_boundary_in_inline_context`] tag stops the search outright —
+/// each one already separates whatever comes after it from whatever came
+/// before, so nothing beyond it can retroactively matter to a glue risk
+/// found earlier. A non-rendered tag (`<script>`, ...) contributes nothing
+/// but doesn't stop the search either — a real sibling after it still
+/// counts. Whitespace-only text doesn't stop the search or confirm it —
+/// same as [`words_of`], it's a non-event on its own.
+///
+/// Walks in document order with an explicit stack (children pushed in
+/// reverse, so popping yields left-to-right) for the same stack-safety
+/// reason as [`subtree_has_visible_content`]: a later sibling can itself be
+/// arbitrarily deep.
+fn later_content_could_glue(nodes: &[Node]) -> bool {
+    let mut stack: Vec<&Node> = Vec::new();
+    stack.extend(nodes.iter().rev());
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(text) => {
+                if text.chars().any(|c| !is_breakable_whitespace(c)) {
+                    return true;
+                }
+            }
+            Node::Element { tag, children } => {
+                if tag == "br"
+                    || tag == "ul"
+                    || tag == "ol"
+                    || is_block_boundary_in_inline_context(tag)
+                {
+                    return false;
+                }
+                if !is_non_rendered(tag) {
+                    stack.extend(children.iter().rev());
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Flatten `spans` into words, splitting each run's text on whitespace and
@@ -3128,6 +3174,37 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "nothing follows this space, so dropping it changes nothing"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_followed_by_non_rendered_content_past_the_depth_cap_does_not_warn() {
+        // A later sibling exists, but a <script> never renders anything —
+        // so the capped whitespace still has no real word to separate.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "A{}{}{}<script>x</script>",
+            "<span>".repeat(513),
+            " ",
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a <script> sibling never renders, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_followed_only_by_more_whitespace_past_the_depth_cap_does_not_warn() {
+        // A later sibling exists and is even nonempty text, but it too is
+        // whitespace-only — still nothing for the capped space to glue.
+        // (Codex review on PR #2810.)
+        let html = format!("A{}{}{} ", "<span>".repeat(513), " ", "</span>".repeat(513));
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a whitespace-only sibling never renders a word, so this must not warn"
         );
     }
 
