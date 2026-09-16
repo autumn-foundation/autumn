@@ -198,21 +198,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change did not remove these errors. This change removes them. Every timestamp
   row now declares the portable `Timestamp` type with a `NaiveDateTime` field,
   and the three batched bulk deletes sit in the `pg` arm of
-  `autumn_web::backend_select!`, with a per-id fallback on the `SQLite` arm.
-  **No Postgres behaviour changes.** Postgres sends `timestamp` and
-  `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC. A
-  `Timestamp` read of a `timestamptz` column gives the same instant. The new
-  `experiment_admin_db` and `feature_flag_admin_db` suites assert this on a
-  non-UTC session. The Postgres statement text does not change, so the
-  one-statement result the `*_bulk_delete_batch_profile` harnesses measure still
-  holds; a new guard test keeps the batched fragment of each statement. An app
-  on either backend can now register its own `AdminModel`s;
+  `autumn_web::backend_select!`. `cargo clippy -p autumn-admin-plugin --features
+  autumn-web/sqlite --all-targets` is clean, and CI's `SQLite runtime` job gates
+  it. **No change to any SQL sent, or to any value read, on Postgres.** Postgres
+  sends `timestamp` and `timestamptz` in the same binary form: microseconds from
+  2000-01-01 UTC. A `Timestamp` read of a `timestamptz` column gives the same
+  instant. The new `experiment_admin_db` and `feature_flag_admin_db` suites
+  assert this on a non-UTC session, for `changed_at` and for `updated_at`. The
+  Postgres statement text does not change, so the one-statement result the
+  `*_bulk_delete_batch_profile` harnesses measure still holds; a new guard test
+  keeps the batched fragment of each statement. An app on either backend can now
+  register its own `AdminModel`s;
   `autumn-admin-plugin/tests/custom_admin_model.rs` runs one test body on both,
   from CI's `Test (Docker)` and `SQLite runtime` jobs. The three BUILT-IN models
   (`tokens`, `experiments`, `feature_flags`) stay Postgres-only, because their
-  migrations use Postgres-only DDL and the tables do not exist on `SQLite`. The
-  plugin README now says so, and lists the four rules that keep an application
-  model's SQL portable.
+  migrations use Postgres-only DDL and the tables do not exist on `SQLite`. On
+  `SQLite` each refuses every call with an error that names the model and points
+  at the README, instead of sending Postgres SQL to a `SQLite` driver — a
+  source guard keeps every method opening with that check, and a SQLite-lane
+  test drives all 23 of them. The
+  plugin README lists the four rules that keep an application model's SQL
+  portable.
 
 - **`scripts/check-docs-features.sh` — feature-gate documentation gate
   [no-plugin].** Every reader-facing page that shows Rust reaching for an
@@ -784,6 +790,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fifth unwatched spelling is how that recurs.
 
 ### Changed
+
+- **BREAKING (`autumn-admin-plugin`): `experiments::ExperimentChange::changed_at`
+  is now `chrono::NaiveDateTime`, was `chrono::DateTime<Utc>` (#2108).** The
+  field type decides the SQL type the generated DSL binds, and `DateTime<Utc>`
+  maps to the Postgres-only `Timestamptz`. Three consequences for a downstream
+  that names this public type: the field type itself; the `Serialize` output,
+  which now reads `"2024-01-15T12:34:56"` with no `Z`; and the derived OpenAPI
+  schema, which loses `"format": "date-time"`. Call `.and_utc()` to recover a
+  `DateTime<Utc>`. The column stays `timestamptz`, and the value does not move
+  — see the `Added` entry.
 
 - **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
   CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**

@@ -16,6 +16,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Return the `tests` directory of this crate.
+fn tests_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
+}
+
 /// Return the `src` directory of this crate.
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -103,10 +108,14 @@ fn every_array_bind_sits_in_the_postgres_arm_of_a_backend_fork() {
                 arm = "none";
             }
             if in_fork {
-                if code.contains("pg => {") {
-                    arm = "pg";
-                } else if code.contains("sqlite => {") {
+                // The arm name alone. rustfmt does not reformat inside a
+                // macro invocation, so `sqlite =>` and its `{{` can sit on
+                // separate lines — and then a brace-anchored marker misses the
+                // arm and leaves the tracker on `pg`.
+                if code.contains("sqlite =>") {
                     arm = "sqlite";
+                } else if code.contains("pg =>") {
+                    arm = "pg";
                 }
                 depth += i32::try_from(code.matches('{').count()).unwrap_or(0);
                 depth -= i32::try_from(code.matches('}').count()).unwrap_or(0);
@@ -148,6 +157,43 @@ fn the_experiment_change_model_uses_a_portable_timestamp_field() {
     );
 }
 
+/// Return the code of every `pg` arm in `body`, comments removed.
+///
+/// The same brace-depth walk
+/// [`every_array_bind_sits_in_the_postgres_arm_of_a_backend_fork`] uses.
+fn postgres_arm_text(body: &str) -> String {
+    let mut out = String::new();
+    let mut arm = "none";
+    let mut depth: i32 = 0;
+    let mut in_fork = false;
+    for line in body.lines() {
+        let code = code_of(line);
+        if !in_fork && code.contains("backend_select!") {
+            in_fork = true;
+            depth = 0;
+            arm = "none";
+        }
+        if in_fork {
+            if code.contains("sqlite =>") {
+                arm = "sqlite";
+            } else if code.contains("pg =>") {
+                arm = "pg";
+            }
+            depth += i32::try_from(code.matches('{').count()).unwrap_or(0);
+            depth -= i32::try_from(code.matches('}').count()).unwrap_or(0);
+            if arm == "pg" {
+                out.push_str(code);
+                out.push('\n');
+            }
+            if depth <= 0 && code.contains('}') {
+                in_fork = false;
+                arm = "none";
+            }
+        }
+    }
+    out
+}
+
 /// Three bulk actions batch every id into one Postgres statement. The
 /// `*_bulk_delete_batch_profile` harnesses measure their cost, and
 /// `docs/reports/` records the result. Do not change those statements. A
@@ -167,14 +213,93 @@ fn the_batched_postgres_bulk_statements_keep_their_shape() {
     ];
     for (file, fragment) in pinned {
         let raw = std::fs::read_to_string(src_dir().join(file)).expect("source file");
+        // Only the Postgres arm counts. The statement moving into the `SQLite`
+        // arm, or into a comment, must fail this test, not pass it.
+        let pg_arm = postgres_arm_text(&raw);
         // Compare on collapsed whitespace, so a re-wrap of the SQL literal does
         // not fail a test about the STATEMENT.
-        let body = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = pg_arm.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             body.contains(fragment),
             "{file} must keep the batched Postgres statement `{fragment}`. \
-             The `*_bulk_delete_batch_profile` harness asserts one statement per \
+             in the `pg` arm of its `backend_select!`. The \
+             `*_bulk_delete_batch_profile` harness asserts one statement per \
              bulk action (issue #2108)"
         );
     }
+}
+
+/// No target of this crate may name `AsyncPgConnection`.
+///
+/// The issue's own words: the plugin "hardcodes `diesel_async::AsyncPgConnection`
+/// … instead of the backend-agnostic `RuntimeConnection` / `RuntimeBackend`
+/// aliases". A test target that does so stops compiling under the flip, which
+/// narrows CI's `--all-targets` gate to whatever still builds.
+#[test]
+fn no_target_hardcodes_the_postgres_connection_type() {
+    let mut hits = Vec::new();
+    let mut files: Vec<PathBuf> = sources().into_iter().map(|(p, _)| p).collect();
+    for entry in std::fs::read_dir(tests_dir()).expect("read tests/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+    for path in files {
+        // This file names the type in its own assertion text.
+        if path
+            .file_name()
+            .is_some_and(|f| f == "backend_portability.rs")
+        {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("read source file");
+        for (n, line) in body.lines().enumerate() {
+            if code_of(line).contains("AsyncPgConnection") {
+                hits.push(format!("{}:{}", path.display(), n + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "these lines name `AsyncPgConnection` instead of \
+         `autumn_web::RuntimeConnection`, so they do not compile under \
+         `autumn-web/sqlite` (issue #2108):\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// Every method of a Postgres-only model must call `require_postgres` first.
+///
+/// The three built-in models compile under `autumn-web/sqlite` since issue
+/// #2108, so a missing guard is no longer a build error. It is an operator
+/// reading `near "ILIKE": syntax error` off a 500 page. Each `AdminModel`
+/// method there opens with `Box::pin(async …)`, and the guard is that block's
+/// first statement.
+#[test]
+fn every_postgres_only_model_method_opens_with_the_guard() {
+    let mut missing = Vec::new();
+    for file in ["tokens.rs", "experiments.rs", "feature_flags.rs"] {
+        let body = std::fs::read_to_string(src_dir().join(file)).expect("source file");
+        let lines: Vec<&str> = body.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let opener = line.trim();
+            if opener != "Box::pin(async move {" && opener != "Box::pin(async {" {
+                continue;
+            }
+            let guarded = lines
+                .get(n + 1)
+                .is_some_and(|next| next.contains("require_postgres("));
+            if !guarded {
+                missing.push(format!("{file}:{}", n + 1));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these async bodies in a Postgres-only admin model do not open with \
+         `crate::traits::require_postgres(..)`, so on SQLite they would send \
+         Postgres SQL to a SQLite driver (issue #2108):\n  {}",
+        missing.join("\n  ")
+    );
 }

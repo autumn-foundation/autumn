@@ -76,13 +76,6 @@ async fn experiment_admin_create_round_trips_through_get() {
     let variants = fetched["variants"].as_array().expect("variants array");
     assert_eq!(variants.len(), 2);
     assert_eq!(variants[0]["name"], "control");
-
-    // `updated_at` is an RFC 3339 UTC instant.
-    let updated_at = fetched["updated_at"].as_str().expect("updated_at");
-    assert!(
-        updated_at.ends_with('Z') || updated_at.contains("+00:00"),
-        "updated_at must be UTC, got {updated_at}"
-    );
 }
 
 #[tokio::test]
@@ -259,24 +252,15 @@ async fn experiment_admin_history_lists_the_audit_trail() {
     assert!(empty.entries.is_empty());
 }
 
-/// One row of `SELECT current_setting('TimeZone')`.
-#[derive(diesel::QueryableByName)]
-struct ZoneRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    zone: String,
-}
-
-/// Guard the timestamp behaviour for issue #2108.
+/// Guard the audit timestamp for issue #2108.
 ///
 /// `changed_at` is a `timestamptz` column. The row now reads it as the portable
 /// `Timestamp` type, because `SQLite` has no `Timestamptz`. Postgres sends both
-/// types in the same binary form — microseconds from 2000-01-01 UTC — so the
-/// value must not move.
+/// in the same binary form — microseconds from 2000-01-01 UTC — so the value
+/// must not move.
 ///
-/// The pool holds ONE connection, and this test sets its session time zone to
-/// `America/New_York`. `get_history` therefore reads on a non-UTC session. A
-/// text-format read, or a `::timestamp` cast, would return 07:34:56 here. The
-/// assertion below demands 12:34:56 UTC.
+/// The pool holds ONE connection, moved off UTC. A text-format read, or a
+/// `::timestamp` cast, would return 07:34:56 here.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers), or a URL in AUTUMN_ADMIN_TEST_PG_URL"]
 async fn experiment_admin_history_reads_utc_under_a_non_utc_session_timezone() {
@@ -293,8 +277,8 @@ async fn experiment_admin_history_reads_utc_under_a_non_utc_session_timezone() {
         .expect("create");
     let id = created["id"].as_i64().expect("id");
 
-    let mut conn = pool.get().await.expect("conn");
     // Write one audit row at a known UTC instant.
+    let mut conn = pool.get().await.expect("conn");
     diesel::sql_query(
         "INSERT INTO autumn_experiment_changes (experiment, mutation, actor, changed_at) \
          VALUES ('tz_probe', 'pinned', NULL, TIMESTAMPTZ '2024-01-15 12:34:56+00')",
@@ -302,21 +286,18 @@ async fn experiment_admin_history_reads_utc_under_a_non_utc_session_timezone() {
     .execute(&mut conn)
     .await
     .expect("insert the pinned audit row");
-    // diesel-async pins each new connection to UTC, so move this one off UTC.
-    diesel::sql_query("SET TIME ZONE 'America/New_York'")
-        .execute(&mut conn)
-        .await
-        .expect("set the session time zone");
-
-    let zone = diesel::sql_query("SELECT current_setting('TimeZone') AS zone")
-        .get_result::<ZoneRow>(&mut conn)
-        .await
-        .expect("read the session time zone")
-        .zone;
-    assert_eq!(zone, "America/New_York", "the session must not be on UTC");
     drop(conn);
 
-    let history = model.get_history(&pool, id, 1, 25).await.expect("history");
+    pg_fixture::pin_session_off_utc(&pool).await;
+
+    let history = pg_fixture::within("get_history", model.get_history(&pool, id, 1, 25))
+        .await
+        .expect("history");
+
+    // The read has happened. Prove it ran on the non-UTC session, so this test
+    // cannot pass by silently landing on a fresh UTC connection.
+    pg_fixture::assert_session_off_utc(&pool).await;
+
     let pinned = history
         .entries
         .iter()
@@ -326,5 +307,57 @@ async fn experiment_admin_history_reads_utc_under_a_non_utc_session_timezone() {
         pinned.recorded_at.to_rfc3339(),
         "2024-01-15T12:34:56+00:00",
         "the audit timestamp must stay UTC under a non-UTC session time zone"
+    );
+}
+
+/// The same guard for `updated_at`, the other flipped `timestamptz` field.
+///
+/// `get()` and `list()` read it through two different row types. An
+/// `ends_with('Z')` check would pass on a value that is five hours wrong, so
+/// this pins the instant.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers), or a URL in AUTUMN_ADMIN_TEST_PG_URL"]
+async fn experiment_admin_updated_at_reads_utc_under_a_non_utc_session_timezone() {
+    use diesel_async::RunQueryDsl;
+
+    let fixture = setup().await;
+    let pool = pg_fixture::pool_for(&fixture.url, 1);
+    let model = ExperimentAdminModel;
+
+    let created = model
+        .create(&pool, draft_payload("tz_probe"))
+        .await
+        .expect("create");
+    let id = created["id"].as_i64().expect("id");
+
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "UPDATE autumn_experiments SET updated_at = TIMESTAMPTZ '2024-01-15 12:34:56+00' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(id)
+    .execute(&mut conn)
+    .await
+    .expect("pin updated_at");
+    drop(conn);
+
+    pg_fixture::pin_session_off_utc(&pool).await;
+
+    let fetched = pg_fixture::within("get", model.get(&pool, id))
+        .await
+        .expect("get")
+        .expect("record");
+    let listed = pg_fixture::within("list", model.list(&pool, page_of(10, None)))
+        .await
+        .expect("list");
+    pg_fixture::assert_session_off_utc(&pool).await;
+
+    assert_eq!(
+        fetched["updated_at"], "2024-01-15T12:34:56+00:00",
+        "get() must report the pinned instant in UTC"
+    );
+    assert_eq!(
+        listed.records[0]["updated_at"], "2024-01-15T12:34:56+00:00",
+        "list() must report the pinned instant in UTC"
     );
 }

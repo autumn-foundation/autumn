@@ -37,12 +37,14 @@ use crate::{
 // JSON boundary. `tests/experiment_admin_db.rs` asserts this on a non-UTC
 // session.
 //
-// The write direction is safe too. This crate never writes `changed_at`
-// through the model. The audit rows come from the raw SQL below, which lets
-// the column default supply the value. If an application writes one through
-// the generated CRUD, Postgres coerces the bound `timestamp` with the session
-// time zone, and diesel-async sets every new session to UTC
-// (`set_config_options` in `diesel_async::pg`).
+// The write direction is safe too. `#[default]` keeps `changed_at` out of
+// `NewExperimentChange` and `UpdateExperimentChange`, so the generated CRUD
+// cannot write it, and every writer in the workspace is raw SQL that names
+// `(experiment, mutation, actor)` only. One vector remains: a hand-written
+// `insert_into(...).values(&ExperimentChange)` binds `changed_at` as
+// `timestamp`, and Postgres then coerces it with the SESSION time zone.
+// diesel-async sets every new connection to UTC (`set_config_options` in
+// `diesel_async::pg`), so this is correct unless the app overrides that.
 diesel::table! {
     autumn_experiment_changes (id) {
         id -> diesel::sql_types::Int8,
@@ -77,10 +79,11 @@ pub trait ExperimentChangeRepository {
 ///
 /// # Postgres only
 ///
-/// This model reads and writes `autumn_experiments`, a Postgres-only table. Its SQL uses
-/// `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does not have. The
-/// plugin itself is backend-agnostic: on `SQLite`, register your own
-/// [`AdminModel`](crate::AdminModel)s instead. See the crate README.
+/// This model reads and writes `autumn_experiments`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
 ///
 /// Register this model with the admin plugin to get an experiment management UI
 /// at `/admin/experiments/`:
@@ -182,6 +185,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -235,6 +239,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -263,6 +268,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -359,6 +365,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -488,6 +495,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -545,10 +553,9 @@ impl AdminModel for ExperimentAdminModel {
                 // other, so the array never reaches the SQLite type-checker
                 // (issue #2108).
                 //
-                // The SQLite arm exists to keep the crate compiling. It
-                // mirrors the trait's per-id loop and returns the same count.
-                // It cannot run: this model is Postgres-only, because its
-                // `delete()` uses a writable CTE. See the plugin README.
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // ExperimentAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
                 ::autumn_web::backend_select! {
                     pg => {{
                         use diesel_async::RunQueryDsl;
@@ -600,12 +607,8 @@ impl AdminModel for ExperimentAdminModel {
                         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
                     }},
                     sqlite => {{
-                        let mut count: u64 = 0;
-                        for id in ids {
-                            self.delete(&pool, id).await?;
-                            count += 1;
-                        }
-                        Ok(count)
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("ExperimentAdminModel").map(|()| 0)
                     }},
                 }
             });
@@ -614,6 +617,7 @@ impl AdminModel for ExperimentAdminModel {
         let action = action.to_owned();
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             match action.as_str() {
                 "restore" => {
                     let mut count: u64 = 0;
@@ -651,6 +655,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await

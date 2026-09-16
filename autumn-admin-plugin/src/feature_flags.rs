@@ -16,10 +16,11 @@ use crate::{
 ///
 /// # Postgres only
 ///
-/// This model reads and writes `autumn_feature_flags`, a Postgres-only table. Its SQL uses
-/// `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does not have. The
-/// plugin itself is backend-agnostic: on `SQLite`, register your own
-/// [`AdminModel`](crate::AdminModel)s instead. See the crate README.
+/// This model reads and writes `autumn_feature_flags`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
 ///
 /// Register this model with the admin plugin to get a flag management UI
 /// at `/admin/feature-flags/`:
@@ -124,6 +125,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -179,6 +181,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -207,6 +210,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -314,6 +318,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -418,6 +423,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -469,10 +475,9 @@ impl AdminModel for FeatureFlagAdminModel {
                 // other, so the array never reaches the SQLite type-checker
                 // (issue #2108).
                 //
-                // The SQLite arm exists to keep the crate compiling. It
-                // mirrors the trait's per-id loop and returns the same count.
-                // It cannot run: this model is Postgres-only, because its
-                // `delete()` uses a writable CTE. See the plugin README.
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // FeatureFlagAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
                 ::autumn_web::backend_select! {
                     pg => {{
                         use diesel_async::RunQueryDsl;
@@ -514,12 +519,8 @@ impl AdminModel for FeatureFlagAdminModel {
                         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
                     }},
                     sqlite => {{
-                        let mut count: u64 = 0;
-                        for id in ids {
-                            self.delete(&pool, id).await?;
-                            count += 1;
-                        }
-                        Ok(count)
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("FeatureFlagAdminModel").map(|()| 0)
                     }},
                 }
             });
@@ -544,6 +545,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await

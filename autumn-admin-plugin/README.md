@@ -100,6 +100,10 @@ Do not register those three on SQLite. Their migrations use Postgres-only DDL,
 so the tables do not exist on SQLite. Autumn's experiment and feature-flag
 stores also refuse a SQLite target.
 
+On SQLite each of the three refuses every call with an error that names the
+model and points here. Before issue #2108 the crate did not compile at all on
+SQLite, so this was a build error; now it is a clear run-time one.
+
 ## `AdminModel` Contract
 
 Each registered model supplies:

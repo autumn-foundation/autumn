@@ -405,8 +405,9 @@ async fn a_custom_admin_model_runs_on_the_active_backend() {
     // count() defaults to list(per_page: 0).total
     assert_eq!(model.count(&pool).await.expect("count"), 4);
 
-    // The default bulk "delete" action — the same per-id path the built-in
-    // models fall back to on SQLite (issue #2108).
+    // The trait default bulk "delete" action (traits.rs), which an application
+    // model inherits. The built-in models override it and refuse on SQLite —
+    // `every_built_in_model_method_refuses_on_sqlite` covers that.
     let ids: Vec<i64> = all
         .records
         .iter()
@@ -428,15 +429,124 @@ async fn a_custom_admin_model_runs_on_the_active_backend() {
 
 /// `AdminPlugin::register` accepts the application model.
 ///
-/// No database: this pins the public registration path, so a plugin-level
-/// change that broke an app's own model would fail here first.
+/// A COMPILE-time check, and the only test here that needs no database. A
+/// plugin-level change that broke an app's own model fails to build this.
 #[test]
 fn the_plugin_accepts_the_custom_model() {
-    let plugin = AdminPlugin::new().register(WidgetAdminModel);
-    assert_eq!(
-        WidgetAdminModel.slug(),
-        "widgets",
-        "the model keeps its slug after registration"
-    );
-    drop(plugin);
+    // `register` takes `M: AdminModel`, so this line failing to compile is the
+    // regression. Nothing here can assert more than that.
+    let _plugin = AdminPlugin::new().register(WidgetAdminModel);
+}
+
+/// A Postgres-only built-in model refuses on `SQLite`, and answers on Postgres.
+///
+/// Before issue #2108 the crate did not compile under `autumn-web/sqlite`, so
+/// registering `TokenAdminModel` there was a build error. It compiles now, so
+/// the refusal must come from the model. Without it the operator sees a raw
+/// driver message such as `near "ILIKE": syntax error`.
+#[tokio::test]
+#[ignore = "needs a database: SQLite under --features autumn-web/sqlite, else Postgres"]
+async fn a_built_in_model_refuses_on_sqlite_and_answers_on_postgres() {
+    use autumn_admin_plugin::tokens::TokenAdminModel;
+
+    let (pool, _guard) = setup().await;
+    let model = TokenAdminModel;
+    let result = model.get(&pool, 1).await;
+
+    ::autumn_web::backend_select! {
+        pg => {{
+            // `api_tokens` is absent from the widgets fixture, so Postgres
+            // answers with its own error — not the guard's.
+            let message = result
+                .expect_err("api_tokens is absent from the widgets fixture")
+                .to_string();
+            assert!(
+                !message.contains("needs the Postgres backend"),
+                "the guard must not fire on Postgres, got: {message}"
+            );
+            assert!(
+                message.contains("api_tokens"),
+                "Postgres must report the missing relation, got: {message}"
+            );
+        }},
+        sqlite => {{
+            let message = result
+                .expect_err("a Postgres-only model must refuse on SQLite")
+                .to_string();
+            assert!(
+                message.contains("TokenAdminModel needs the Postgres backend"),
+                "the refusal must name the model and the backend, got: {message}"
+            );
+            assert!(
+                message.contains("README"),
+                "the refusal must point at the README, got: {message}"
+            );
+        }},
+    }
+}
+
+/// Every method of all three built-in models refuses on `SQLite`.
+///
+/// `require_postgres` has one call site for each. A missing one is what makes
+/// an operator read `near "ILIKE": syntax error` off a 500 page, so check them
+/// all, not one.
+#[tokio::test]
+#[ignore = "needs a database: SQLite under --features autumn-web/sqlite, else Postgres"]
+async fn every_built_in_model_method_refuses_on_sqlite() {
+    ::autumn_web::backend_select! {
+        pg => {{
+            // The refusal is a SQLite-only behaviour. On Postgres these models
+            // are exercised by `token_admin_db`, `experiment_admin_db` and
+            // `feature_flag_admin_db` against their real schemas.
+        }},
+        sqlite => {{
+            use autumn_admin_plugin::experiments::ExperimentAdminModel;
+            use autumn_admin_plugin::feature_flags::FeatureFlagAdminModel;
+            use autumn_admin_plugin::tokens::TokenAdminModel;
+
+            /// Assert one result is the refusal, and name the call that gave it.
+            fn refuses<T: std::fmt::Debug>(what: &str, result: Result<T, AdminError>) {
+                let message = result
+                    .expect_err(&format!("{what} must refuse on SQLite"))
+                    .to_string();
+                assert!(
+                    message.contains("needs the Postgres backend"),
+                    "{what} must refuse with the guard's message, got: {message}"
+                );
+            }
+
+            let (pool, _guard) = setup().await;
+            let payload = serde_json::json!({ "name": "x", "key": "x", "principal_id": "x" });
+
+            macro_rules! check {
+                ($model:expr, $name:literal) => {{
+                    let m = $model;
+                    refuses(concat!($name, "::list"), m.list(&pool, page_of(10, None)).await);
+                    refuses(concat!($name, "::get"), m.get(&pool, 1).await);
+                    refuses(concat!($name, "::count"), m.count(&pool).await);
+                    refuses(concat!($name, "::create"), m.create(&pool, payload.clone()).await);
+                    refuses(concat!($name, "::update"), m.update(&pool, 1, payload.clone()).await);
+                    refuses(concat!($name, "::delete"), m.delete(&pool, 1).await);
+                    refuses(
+                        concat!($name, "::execute_action"),
+                        m.execute_action(&pool, "delete", vec![1]).await,
+                    );
+                }};
+            }
+
+            check!(TokenAdminModel, "TokenAdminModel");
+            check!(ExperimentAdminModel, "ExperimentAdminModel");
+            check!(FeatureFlagAdminModel, "FeatureFlagAdminModel");
+
+            // `get_history` is only on the two models that have an audit trail.
+            refuses(
+                "ExperimentAdminModel::get_history",
+                ExperimentAdminModel.get_history(&pool, 1, 1, 25).await,
+            );
+            refuses(
+                "FeatureFlagAdminModel::get_history",
+                FeatureFlagAdminModel.get_history(&pool, 1, 1, 25).await,
+            );
+        }},
+    }
 }

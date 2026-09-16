@@ -17,10 +17,11 @@ use crate::{
 ///
 /// # Postgres only
 ///
-/// This model reads and writes `api_tokens`, a Postgres-only table. Its SQL uses
-/// `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does not have. The
-/// plugin itself is backend-agnostic: on `SQLite`, register your own
-/// [`AdminModel`](crate::AdminModel)s instead. See the crate README.
+/// This model reads and writes `api_tokens`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
 ///
 /// Register with the admin plugin to get a token management UI at
 /// `/admin/api-tokens/`:
@@ -103,6 +104,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -156,6 +158,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -183,6 +186,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let principal_id = data
                 .get("principal_id")
                 .and_then(Value::as_str)
@@ -244,6 +248,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // A token's secret/principal are immutable; only the human-readable
             // name and granted scopes are editable after issuance.
             let name = data.get("name").and_then(Value::as_str).unwrap_or("");
@@ -279,6 +284,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // "Delete" a token means revoke it: keep the audit row, stop it
             // authenticating. Idempotent — re-revoking is a no-op.
             let mut conn = pool
@@ -320,10 +326,9 @@ impl AdminModel for TokenAdminModel {
                 // other, so the array never reaches the SQLite type-checker
                 // (issue #2108).
                 //
-                // The SQLite arm exists to keep the crate compiling. It
-                // mirrors the trait's per-id loop and returns the same count.
-                // It cannot run: this model is Postgres-only, because its
-                // `delete()` uses `NOW()`. See the plugin README.
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // TokenAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
                 ::autumn_web::backend_select! {
                     pg => {{
                         use diesel_async::RunQueryDsl;
@@ -357,12 +362,8 @@ impl AdminModel for TokenAdminModel {
                         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
                     }},
                     sqlite => {{
-                        let mut count: u64 = 0;
-                        for id in ids {
-                            self.delete(&pool, id).await?;
-                            count += 1;
-                        }
-                        Ok(count)
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("TokenAdminModel").map(|()| 0)
                     }},
                 }
             });
