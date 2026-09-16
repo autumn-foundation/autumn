@@ -88,6 +88,21 @@ fn subtree_has_visible_content(nodes: &[Node]) -> bool {
     false
 }
 
+/// True if `nodes` has a direct `<li>` child.
+///
+/// For [`extract_list_items`]/[`inline_list_items`]'s own depth-cap guard,
+/// not [`subtree_has_visible_content`]: both walkers skip every node that
+/// isn't a direct `<li>` — including whitespace text between `<ul>`/`<ol>`
+/// and its first item — so nothing else in `nodes` ever draws anything.
+/// One flat scan, no recursion: a list's items are never nested inside a
+/// wrapper tag (real HTML or not — [`extract_list_items`]'s own loop would
+/// skip a wrapper, not look inside it), so this never needs to.
+fn nodes_contain_an_li(nodes: &[Node]) -> bool {
+    nodes
+        .iter()
+        .any(|node| matches!(node, Node::Element { tag, .. } if tag == "li"))
+}
+
 /// A4 portrait, matching the default most other frameworks in this space
 /// (Rails' `wicked_pdf`, `WeasyPrint`) ship.
 const PAGE_WIDTH_PT: f32 = 595.28;
@@ -331,7 +346,7 @@ fn inline_list_items(
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        if nodes_contain_an_li(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -433,7 +448,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
 
 fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        if subtree_has_visible_content(nodes) {
+        if nodes_contain_an_li(nodes) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -2725,6 +2740,27 @@ mod tests {
             "513 levels is one past the cap — must log exactly one warning, \
              not zero (silent) and not one per truncated node \
              (issue #2801's own n=513 case)"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_ul_past_the_depth_cap_does_not_warn() {
+        // A <ul> with only whitespace between its tags (no <li> at all) has
+        // a Text("\n") child. extract_list_items/inline_list_items skip
+        // every node that isn't an <li> — including that whitespace text —
+        // so it draws nothing. subtree_has_visible_content doesn't know
+        // that: it treats non-empty text as content on its own, which is
+        // right for the 4 general-purpose walkers but wrong for these two
+        // list-only ones.
+        let html = format!(
+            "{}<ul>\n</ul>{}",
+            "<span>".repeat(512),
+            "</span>".repeat(512)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a <ul> with no real <li> draws nothing, whitespace or not, so this must not warn"
         );
     }
 
