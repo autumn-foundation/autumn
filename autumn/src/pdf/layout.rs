@@ -86,7 +86,16 @@ fn subtree_has_visible_content(
     glue_risk: bool,
     lone_trailing_break_is_trimmed: bool,
 ) -> bool {
-    let mut stack: Vec<&Node> = nodes.iter().collect();
+    // Document order matters here, not just for its own sake: telling a
+    // truly trailing `<br>` (nothing rendered after it — safe to drop
+    // under `lone_trailing_break_is_trimmed`) apart from one merely
+    // followed by whitespace (`trim_trailing_break` only pops the very
+    // last span, so that whitespace keeps the break alive) requires
+    // walking in the order those spans would actually get pushed. A plain
+    // `Vec` used as a stack pops last-in-first-out, so both this initial
+    // collect and each `children` push below are reversed to compensate —
+    // same trick `node_glue_lookahead` already uses.
+    let mut stack: Vec<&Node> = nodes.iter().rev().collect();
     let mut has_whitespace_only_text = false;
     let mut seen_break = false;
     while let Some(node) = stack.pop() {
@@ -104,6 +113,14 @@ fn subtree_has_visible_content(
                     return true;
                 }
                 if !text.is_empty() {
+                    if seen_break {
+                        // Anything, even whitespace-only text, after the
+                        // break means that break isn't trailing after
+                        // all — it survives trim_trailing_break (which
+                        // only ever pops the very last span) and still
+                        // advances layout. (Codex review on PR #2810.)
+                        return true;
+                    }
                     has_whitespace_only_text = true;
                 }
             }
@@ -119,7 +136,7 @@ fn subtree_has_visible_content(
                     return true;
                 }
                 if !is_non_rendered(tag) {
-                    stack.extend(children);
+                    stack.extend(children.iter().rev());
                 }
             }
         }
@@ -525,6 +542,7 @@ fn inline_spans(
             nodes,
             start: i + 1,
             cache: &cache,
+            table_children_are_boundaries: true,
             ancestor: has_more_after,
         };
         match node {
@@ -825,6 +843,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
             nodes,
             start: i + 1,
             cache: &cache,
+            table_children_are_boundaries: false,
             ancestor: &GlueContext::Resolved(false),
         };
         match node {
@@ -1008,6 +1027,7 @@ fn flatten_into_pending(
             nodes,
             start: i + 1,
             cache: &cache,
+            table_children_are_boundaries: false,
             ancestor: has_more_after,
         };
         match node {
@@ -1150,7 +1170,21 @@ enum GlueLookahead {
 /// yields left-to-right) for the same stack-safety reason as
 /// [`subtree_has_visible_content`]: a transparent wrapper's content can
 /// itself be arbitrarily deep.
-fn node_glue_lookahead(node: &Node) -> GlueLookahead {
+/// True for a `<table>` sub-tag (`<thead>`, `<tbody>`, `<tfoot>`, `<tr>`,
+/// `<td>`, `<th>`) — never `<table>` itself, which every walker already
+/// treats as a boundary consistently. `inline_spans` really does treat
+/// these as boundaries too (via [`is_block_boundary_in_inline_context`],
+/// so `<td>A</td><td>B</td>` doesn't glue into "AB"), but
+/// `flatten_blocks`/`flatten_into_pending`'s own block-tag dispatch only
+/// special-cases `<table>` itself — a bare one of these reached through
+/// *that* walker (outside any enclosing `<table>`) still falls through to
+/// their transparent catch-all. [`node_glue_lookahead`] needs to know
+/// which walker is asking to classify these correctly.
+fn is_table_child_tag(tag: &str) -> bool {
+    matches!(tag, "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
+}
+
+fn node_glue_lookahead(node: &Node, table_children_are_boundaries: bool) -> GlueLookahead {
     let mut stack: Vec<&Node> = vec![node];
     while let Some(node) = stack.pop() {
         match node {
@@ -1172,7 +1206,8 @@ fn node_glue_lookahead(node: &Node) -> GlueLookahead {
                 if tag == "br"
                     || tag == "ul"
                     || tag == "ol"
-                    || is_block_boundary_in_inline_context(tag)
+                    || (is_block_boundary_in_inline_context(tag)
+                        && (table_children_are_boundaries || !is_table_child_tag(tag)))
                 {
                     return GlueLookahead::Stopped;
                 }
@@ -1205,7 +1240,13 @@ enum GlueContext<'a> {
     LaterSiblings {
         nodes: &'a [Node],
         start: usize,
-        cache: &'a [Cell<Option<bool>>],
+        // Caches each node's own raw `node_glue_lookahead` result (not an
+        // already-interpreted bool): `resolve` and `nothing_follows` read
+        // the *same* three-state answer for the same node, they just map
+        // it to a bool differently, so a single shared cache serves both
+        // — see each method's own doc comment for why the cache matters.
+        cache: &'a [Cell<Option<GlueLookahead>>],
+        table_children_are_boundaries: bool,
         ancestor: &'a Self,
     },
     /// Built only by [`inline_spans`]'s `is_block_boundary_in_inline_context`
@@ -1239,6 +1280,25 @@ impl GlueContext<'_> {
     /// (at most once each) as `resolve()` walks past `Exhausted` nodes
     /// looking for a `Confirmed`/`Stopped` one, so a later call starting
     /// at or before an already-filled index short-circuits in O(1).
+    /// Returns node `i`'s cached [`GlueLookahead`], computing and caching
+    /// it first if this is the first time anything has asked about this
+    /// position. Shared by [`resolve`](Self::resolve) and
+    /// [`nothing_follows`](Self::nothing_follows) — see the `cache` field's
+    /// own doc comment for why one cache safely serves both.
+    fn lookahead_at(
+        nodes: &[Node],
+        cache: &[Cell<Option<GlueLookahead>>],
+        table_children_are_boundaries: bool,
+        i: usize,
+    ) -> GlueLookahead {
+        if let Some(cached) = cache[i].get() {
+            return cached;
+        }
+        let result = node_glue_lookahead(&nodes[i], table_children_are_boundaries);
+        cache[i].set(Some(result));
+        result
+    }
+
     fn resolve(&self) -> bool {
         match self {
             GlueContext::Resolved(b) => *b,
@@ -1247,31 +1307,18 @@ impl GlueContext<'_> {
                 nodes,
                 start,
                 cache,
+                table_children_are_boundaries,
                 ancestor,
             } => {
                 let mut i = *start;
-                let result = loop {
-                    if i >= nodes.len() {
-                        break ancestor.resolve();
-                    }
-                    if let Some(cached) = cache[i].get() {
-                        break cached;
-                    }
-                    match node_glue_lookahead(&nodes[i]) {
-                        GlueLookahead::Confirmed => break true,
-                        GlueLookahead::Stopped => break false,
+                while i < nodes.len() {
+                    match Self::lookahead_at(nodes, cache, *table_children_are_boundaries, i) {
+                        GlueLookahead::Confirmed => return true,
+                        GlueLookahead::Stopped => return false,
                         GlueLookahead::Exhausted => i += 1,
                     }
-                };
-                for cell in &cache[*start..i.min(nodes.len())] {
-                    if cell.get().is_none() {
-                        cell.set(Some(result));
-                    }
                 }
-                if i < nodes.len() {
-                    cache[i].set(Some(result));
-                }
-                result
+                ancestor.resolve()
             }
         }
     }
@@ -1290,6 +1337,11 @@ impl GlueContext<'_> {
     /// that has nothing beyond it by construction — so `Resolved` always
     /// means "nothing follows" here, unlike `resolve`, which also reads
     /// `Resolved(false)` sitting *underneath* a `BlockBoundary` override.
+    ///
+    /// Reads the same shared `cache` `resolve` does (see `lookahead_at`),
+    /// so a capped subtree with many later siblings still costs O(1)
+    /// amortized per sibling instead of rescanning the whole suffix again
+    /// for every one of them.
     fn nothing_follows(&self) -> bool {
         match self {
             GlueContext::Resolved(_) => true,
@@ -1297,13 +1349,19 @@ impl GlueContext<'_> {
             GlueContext::LaterSiblings {
                 nodes,
                 start,
+                cache,
+                table_children_are_boundaries,
                 ancestor,
-                ..
             } => {
-                for node in &nodes[*start..] {
-                    if !matches!(node_glue_lookahead(node), GlueLookahead::Exhausted) {
+                let mut i = *start;
+                while i < nodes.len() {
+                    if !matches!(
+                        Self::lookahead_at(nodes, cache, *table_children_are_boundaries, i),
+                        GlueLookahead::Exhausted
+                    ) {
                         return false;
                     }
+                    i += 1;
                 }
                 ancestor.nothing_follows()
             }
@@ -3788,6 +3846,32 @@ mod tests {
     }
 
     #[test]
+    fn glue_lookahead_recognizes_a_bare_table_cell_as_transparent() {
+        // node_glue_lookahead classifies td/th/tr/thead/tbody/tfoot as
+        // Stopped via is_block_boundary_in_inline_context — correct for
+        // inline_spans, which really does treat them as boundaries, but
+        // flatten_into_pending's own block-tag dispatch only special-cases
+        // "table" itself, so a bare <td> reached through *that* walker
+        // (outside any enclosing <table>) falls through to its transparent
+        // catch-all and flows straight into the same pending buffer. So
+        // "A" + capped whitespace + "<td>B</td>" here really does render
+        // as "A B" (the <td>'s "B" glues onto the same paragraph the
+        // capped space was meant to separate) — losing that space changes
+        // output, so this must warn. (Codex review on PR #2810.)
+        let html = format!(
+            "A{}{}{}<td>B</td>",
+            "<span>".repeat(513),
+            " ",
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "flatten_into_pending flows a bare <td> transparently, so dropping the space glues \"A\" and \"B\" together"
+        );
+    }
+
+    #[test]
     fn glue_lookahead_over_many_siblings_is_linear_not_quadratic() {
         // Regression: computing more_after fresh for every sibling
         // (later_content_could_glue(&nodes[i+1..]) inside the loop) scans
@@ -3976,6 +4060,27 @@ mod tests {
             count_pdf_depth_warnings(&html),
             0,
             "a lone trailing <br> gets trimmed away either way, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn br_followed_by_whitespace_past_the_depth_cap_inside_a_heading_still_warns() {
+        // Unlike a truly lone trailing <br>, one followed by breakable
+        // whitespace is NOT the buffer's actual trailing span: the
+        // uncapped walker pushes Span::Break then a whitespace Span::Run,
+        // and trim_trailing_break only ever pops the very last span (the
+        // whitespace run), leaving the break in place to still advance
+        // layout. Dropping both via the cap is a real content loss.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1>{}<br> {}</h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "trailing whitespace after the <br> keeps it from ever being trimmed, so this must warn"
         );
     }
 
