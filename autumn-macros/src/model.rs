@@ -4823,13 +4823,17 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
     // column is always serialized. Skipping it would also drop it out of the
     // version-history snapshot, which is built from the `Serialize` view: the
     // column would then produce no "changed" marker at all rather than the
-    // redacted one the registry promises.
-    if has_attr(field, "private") || field_may_skip_serialization(field) {
+    // redacted one the registry promises. On the way in, the client's own bytes
+    // are the only valid value, so an omission has no server-side substitute.
+    if let Some(attr) = field_serde_omission(field) {
         return Err(syn::Error::new_spanned(
             field,
-            "`#[confidential]` fields cannot be `#[private]` or `#[serde(skip_serializing)]`: \
-             the envelope is ciphertext the owning client needs back, and a skipped column \
-             leaves version history with no record that it changed.",
+            format!(
+                "`#[confidential]` fields cannot use `#[{attr}]`: the envelope is \
+                 ciphertext the owning client needs back, a skipped column leaves \
+                 version history with no record that it changed, and a defaulted one \
+                 stores an envelope no key opens."
+            ),
         ));
     }
 
@@ -4880,18 +4884,18 @@ fn validate_blind_index_companion(
             }
             if field_serde_wire_name_override(f).is_some()
                 || diesel_column_name(f).is_some()
-                || has_attr(f, "private")
-                || field_may_skip_serialization(f)
+                || field_serde_omission(f).is_some()
             {
                 return Err(syn::Error::new_spanned(
                     f,
                     format!(
                         "`{expected}` is a blind-index companion, so it cannot use \
                          `#[serde(rename/alias = ...)]`, `#[serde(flatten)]`, \
-                         `#[diesel(column_name = ...)]`, `#[private]` or \
-                         `#[serde(skip_serializing)]`: the token is registered under its \
-                         Rust name, which version history, the log filter and the CSV \
-                         export all key off."
+                         `#[diesel(column_name = ...)]`, `#[private]`, \
+                         `#[serde(skip_serializing)]`, `#[serde(default)]` or \
+                         `#[serde(skip_deserializing)]`: the token is registered under \
+                         its Rust name, which version history, the log filter and the CSV \
+                         export all key off, and a defaulted token matches no envelope."
                     ),
                 ));
             }
@@ -5662,15 +5666,34 @@ fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
     found
 }
 
-/// Whether a field is omitted from the serialized form, conditionally or not.
+/// The attribute, if any, that lets a confidential value leave or enter the
+/// model without the client's own bytes. Named as the author wrote it.
 ///
-/// Broader than [`field_already_skips_serialization`], which drives attribute
-/// injection and must not treat a conditional skip as an unconditional one.
-/// `#[confidential]` needs the broader question: a column omitted on any path
-/// is absent from the version-history snapshot, which is built from the
-/// `Serialize` view, so it produces no "changed" marker at all.
-fn field_may_skip_serialization(field: &syn::Field) -> bool {
-    field_already_skips_serialization(field) || field_has_skip_serializing_if(field)
+/// On the way out, a column omitted on any path is absent from the
+/// version-history snapshot, which is built from the `Serialize` view, so it
+/// produces no "changed" marker at all. This is broader than
+/// [`field_already_skips_serialization`], which drives attribute injection and
+/// must not treat a conditional skip as an unconditional one.
+///
+/// On the way in, both wrappers implement `Default`, so serde reads an omitted
+/// value as valid input rather than an error: a defaulted `Sealed` is an
+/// envelope no key opens, and a defaulted `BlindIndex` is a random token that
+/// matches no envelope.
+fn field_serde_omission(field: &syn::Field) -> Option<&'static str> {
+    if has_attr(field, "private") {
+        return Some("private");
+    }
+    if field_already_skips_serialization(field) {
+        return Some("serde(skip_serializing)");
+    }
+    if field_has_skip_serializing_if(field) {
+        return Some("serde(skip_serializing_if = ...)");
+    }
+    match serde_bare_word(&field.attrs, &["skip_deserializing", "default"]) {
+        Some("skip_deserializing") => Some("serde(skip_deserializing)"),
+        Some(_) => Some("serde(default)"),
+        None => None,
+    }
 }
 
 /// Render a serde key as it is written: `flatten` and `transparent` take no
@@ -14859,6 +14882,37 @@ mod tests {
         }
     }
 
+    /// #1771: both wrappers implement `Default`, so an omitted value is not an
+    /// error. The sealed field becomes an envelope no key opens; the companion
+    /// becomes a random token that matches no envelope.
+    #[test]
+    fn a_confidential_field_omitted_on_input_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(default)] }, quote! {}),
+            (quote! { #[serde(default = "seed")] }, quote! {}),
+            (quote! { #[serde(skip_deserializing)] }, quote! {}),
+            (quote! {}, quote! { #[serde(default)] }),
+            (quote! {}, quote! { #[serde(default = "seed")] }),
+            (quote! {}, quote! { #[serde(skip_deserializing)] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "a confidential column the client may omit must be refused: {expanded}"
+            );
+        }
+    }
+
     /// #1771: an alias is accepted on the way in, so a request could deliver the
     /// envelope or the token under a name no filter knows; `flatten` removes the
     /// key entirely.
@@ -14894,10 +14948,16 @@ mod tests {
     /// omits the column from both snapshots.
     #[test]
     fn a_confidential_field_that_skips_serialization_is_refused() {
-        for skip in [
-            quote! { #[private] },
-            quote! { #[serde(skip_serializing)] },
-            quote! { #[serde(skip_serializing_if = "always")] },
+        for (skip, named) in [
+            (quote! { #[private] }, "private"),
+            (
+                quote! { #[serde(skip_serializing)] },
+                "serde(skip_serializing)",
+            ),
+            (
+                quote! { #[serde(skip_serializing_if = "always")] },
+                "serde(skip_serializing_if = ...)",
+            ),
         ] {
             let input: TokenStream = quote! {
                 pub struct Note {
@@ -14909,8 +14969,8 @@ mod tests {
             };
             let expanded = model_macro(quote! { table = "notes" }, input).to_string();
             assert!(
-                expanded.contains("cannot be `#[private]`"),
-                "a skipped confidential column must be refused: {expanded}"
+                expanded.contains(&format!("cannot use `#[{named}]`")),
+                "a skipped confidential column must be refused by name: {expanded}"
             );
         }
     }

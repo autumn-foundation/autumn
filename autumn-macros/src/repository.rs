@@ -25218,10 +25218,9 @@ mod tests {
         // window breaks when the body gains a long item, such as the #1771
         // confidential-column assertion.
         let body = &generated[cursor_pos..];
-        let section = match body[1..].find("async fn ") {
-            Some(end) => &body[..=end],
-            None => body,
-        };
+        let section = body[1..]
+            .find("async fn ")
+            .map_or(body, |end| &body[..=end]);
         assert!(
             section.contains("is_null"),
             "cursor_page impl must apply deleted_at IS NULL filter in soft-delete mode: {section}"

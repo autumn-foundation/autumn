@@ -181,6 +181,7 @@ read, compare, order or join the value:
 | `#[serde(rename)]`, `#[serde(alias)]`, `#[serde(flatten)]`, `#[serde(rename_all)]`, `#[diesel(column_name)]` | The column is registered under its Rust name, which the query guard, the log filter, version history and admin redaction all key off. |
 | `#[serde(into)]`, `#[serde(from)]`, `#[serde(try_from)]`, `#[serde(transparent)]` | The container decides the serialized shape. Version history snapshots the model through `Serialize`, so a reshaped model records no change for the sealed column. |
 | `#[private]`, `#[serde(skip)]`, `#[serde(skip_serializing)]`, `#[serde(skip_serializing_if)]` | A column that leaves the snapshot records no change either. |
+| `#[serde(default)]`, `#[serde(skip_deserializing)]` | Both wrappers implement `Default`, so an omitted value is not an error. A defaulted `Sealed` is an envelope no key opens; a defaulted `BlindIndex` is a random token that matches no envelope. |
 | the model's shard key | The router reads the column to pick a shard, and a sealed value is opaque to it. |
 | `find_by_<field>`, `find_or_create_by_<field>`, a grouped aggregate over it | Each builds a WHERE or a GROUP BY over the column, and the stored ciphertext never repeats. |
 | `cursor_key = <field>` | Keyset pagination orders by the column and compares it. Over randomized ciphertext the order is arbitrary. |
