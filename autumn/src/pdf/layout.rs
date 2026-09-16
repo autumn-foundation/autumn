@@ -70,9 +70,25 @@ thread_local! {
 /// counts as visible, because dropping it is what would let `words_of`
 /// glue that word to whatever comes after. Pass `false` when no such
 /// buffer exists yet (a fresh, empty one has nothing to glue to).
-fn subtree_has_visible_content(nodes: &[Node], glue_risk: bool) -> bool {
+///
+/// `lone_trailing_break_is_trimmed` is true only when the caller's buffer
+/// is one [`trim_trailing_break`] runs on before anything else reads it,
+/// **and** nothing else would ever be appended after this subtree's own
+/// content (see [`GlueContext::nothing_follows`]). In that case a subtree
+/// whose *entire* would-be output is a single `<br>` isn't visible: an
+/// uncapped render would push one `Span::Break` and then immediately trim
+/// it right back off, so capped and uncapped output are identical. A
+/// second `<br>`, or any other content alongside it, still counts —
+/// `trim_trailing_break` only ever removes the one trailing break, so
+/// anything beyond that first one survives and must still warn.
+fn subtree_has_visible_content(
+    nodes: &[Node],
+    glue_risk: bool,
+    lone_trailing_break_is_trimmed: bool,
+) -> bool {
     let mut stack: Vec<&Node> = nodes.iter().collect();
     let mut has_whitespace_only_text = false;
+    let mut seen_break = false;
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
@@ -92,11 +108,14 @@ fn subtree_has_visible_content(nodes: &[Node], glue_risk: bool) -> bool {
                 }
             }
             Node::Element { tag, children } => {
-                if tag == "br"
-                    || tag == "ul"
-                    || tag == "ol"
-                    || is_block_boundary_in_inline_context(tag)
-                {
+                if tag == "br" {
+                    if !lone_trailing_break_is_trimmed || seen_break {
+                        return true;
+                    }
+                    seen_break = true;
+                    continue;
+                }
+                if tag == "ul" || tag == "ol" || is_block_boundary_in_inline_context(tag) {
                     return true;
                 }
                 if !is_non_rendered(tag) {
@@ -478,12 +497,23 @@ fn inline_spans(
     italic: bool,
     depth: u32,
     has_more_after: &GlueContext,
+    // True when `out` is a fresh buffer that gets `trim_trailing_break`d
+    // once this whole call (and everything it recurses into) returns —
+    // e.g. a heading's, a table cell's, or a list item's own dedicated
+    // spans — as opposed to a shared paragraph buffer nothing ever trims
+    // (`flatten_blocks`'s/`flatten_into_pending`'s own `pending`). See
+    // `subtree_has_visible_content`'s `lone_trailing_break_is_trimmed`.
+    // Every recursive call below passes this straight through unchanged:
+    // they all keep writing into the same `out`, so whether it eventually
+    // gets trimmed never changes partway through one call tree.
+    trimmed: bool,
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(out) && has_more_after.resolve(),
+            trimmed && has_more_after.nothing_follows(),
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
@@ -510,20 +540,20 @@ fn inline_spans(
             Node::Element { tag, children } => match tag.as_str() {
                 "br" => out.push(Span::Break),
                 "strong" | "b" => {
-                    inline_spans(children, true, italic, depth + 1, &more_after, out);
+                    inline_spans(children, true, italic, depth + 1, &more_after, trimmed, out);
                 }
                 "em" | "i" => {
-                    inline_spans(children, bold, true, depth + 1, &more_after, out);
+                    inline_spans(children, bold, true, depth + 1, &more_after, trimmed, out);
                 }
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
                     push_block_break(out);
-                    inline_list_items(children, false, bold, italic, depth + 1, out);
+                    inline_list_items(children, false, bold, italic, depth + 1, trimmed, out);
                     push_block_break(out);
                 }
                 "ol" => {
                     push_block_break(out);
-                    inline_list_items(children, true, bold, italic, depth + 1, out);
+                    inline_list_items(children, true, bold, italic, depth + 1, trimmed, out);
                     push_block_break(out);
                 }
                 _ if is_block_boundary_in_inline_context(tag) => {
@@ -532,18 +562,23 @@ fn inline_spans(
                     // separates its content from whatever follows it out
                     // here — so that later content can never glue to
                     // anything inside, regardless of what more_after says.
+                    // `BlockBoundary` still remembers the real `has_more_after`
+                    // underneath the override, for `nothing_follows`'s sake.
                     push_block_break(out);
                     inline_spans(
                         children,
                         bold,
                         italic,
                         depth + 1,
-                        &GlueContext::Resolved(false),
+                        &GlueContext::BlockBoundary {
+                            outer: has_more_after,
+                        },
+                        trimmed,
                         out,
                     );
                     push_block_break(out);
                 }
-                _ => inline_spans(children, bold, italic, depth + 1, &more_after, out),
+                _ => inline_spans(children, bold, italic, depth + 1, &more_after, trimmed, out),
             },
         }
     }
@@ -568,12 +603,19 @@ fn inline_spans(
 /// to both the marker and, via a plain pass-through to the recursive
 /// `inline_spans` call below, each item's own content, exactly like
 /// `inline_spans` already threads it through every other nested tag.
+// `ordered`/`bold`/`italic`/`trimmed` are four independent, unrelated
+// caller-supplied flags, not a state machine an enum would model better.
+#[allow(clippy::fn_params_excessive_bools)]
 fn inline_list_items(
     nodes: &[Node],
     ordered: bool,
     bold: bool,
     italic: bool,
     depth: u32,
+    // See `inline_spans`'s own `trimmed` parameter — threaded straight
+    // through from the caller, since every item's content still lands in
+    // that same shared `out`.
+    trimmed: bool,
     out: &mut Vec<Span>,
 ) {
     if depth > MAX_DEPTH {
@@ -618,6 +660,7 @@ fn inline_list_items(
             italic,
             depth + 1,
             &GlueContext::Resolved(false),
+            trimmed,
             out,
         );
         if out.get(content_start) == Some(&Span::Break) {
@@ -670,6 +713,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                             false,
                             depth + 2,
                             &GlueContext::Resolved(false),
+                            true,
                             &mut spans,
                         );
                         trim_trailing_break(&mut spans);
@@ -698,6 +742,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                     false,
                     depth + 1,
                     &GlueContext::Resolved(false),
+                    true,
                     &mut spans,
                 );
                 trim_trailing_break(&mut spans);
@@ -739,6 +784,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
             false,
             depth + 1,
             &GlueContext::Resolved(false),
+            true,
             &mut spans,
         );
         trim_trailing_break(&mut spans);
@@ -750,12 +796,18 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// content not wrapped in a block tag (bare text, `<span>`, `<strong>`, ... at
 /// the top level) is collected into an implicit paragraph, matching how a
 /// browser would flow loose text.
+// One arm per HTML tag this renderer treats specially, so its length tracks
+// the tag list, not accidental complexity — same rationale as the
+// `too_many_arguments` allows already in this file.
+#[allow(clippy::too_many_lines)]
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
         // No glue risk here: `pending` (below) doesn't exist yet at this
         // point, so there's no accumulated word this call could ever glue
-        // a dropped whitespace-only span onto.
-        if subtree_has_visible_content(nodes, false) {
+        // a dropped whitespace-only span onto. Not trimmed either: this
+        // call's own paragraph buffer never runs through
+        // `trim_trailing_break` (see `flatten_blocks`'s `flush`).
+        if subtree_has_visible_content(nodes, false, false) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
         return;
@@ -803,6 +855,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         false,
                         depth + 1,
                         &GlueContext::Resolved(false),
+                        true,
                         &mut spans,
                     );
                     trim_trailing_break(&mut spans);
@@ -832,6 +885,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                             false,
                             depth + 1,
                             &GlueContext::Resolved(false),
+                            true,
                             &mut spans,
                         );
                         trim_trailing_break(&mut spans);
@@ -882,11 +936,30 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         extract_list_items(children, true, depth + 1, out);
                     }
                     "br" => pending.push(Span::Break),
+                    // `pending` here is `flatten_blocks`'s own paragraph
+                    // buffer, flushed via `flush` above with no
+                    // `trim_trailing_break` — so `false`, never trimmed.
                     "strong" | "b" => {
-                        inline_spans(children, true, false, depth + 1, &more_after, &mut pending);
+                        inline_spans(
+                            children,
+                            true,
+                            false,
+                            depth + 1,
+                            &more_after,
+                            false,
+                            &mut pending,
+                        );
                     }
                     "em" | "i" => {
-                        inline_spans(children, false, true, depth + 1, &more_after, &mut pending);
+                        inline_spans(
+                            children,
+                            false,
+                            true,
+                            depth + 1,
+                            &more_after,
+                            false,
+                            &mut pending,
+                        );
                     }
                     _ if is_non_rendered(tag) => {}
                     // Transparent passthrough: unknown/inline wrapper tags
@@ -913,9 +986,13 @@ fn flatten_into_pending(
     out: &mut Vec<Block>,
 ) {
     if depth > MAX_DEPTH {
+        // Not trimmed: `pending` here always traces back to
+        // `flatten_blocks`'s own paragraph buffer (see `flatten_blocks`'s
+        // `flush`), which never runs through `trim_trailing_break`.
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(pending) && has_more_after.resolve(),
+            false,
         ) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
@@ -974,13 +1051,33 @@ fn flatten_into_pending(
                     }
                     flatten_blocks(std::slice::from_ref(node), depth, out);
                 } else {
+                    // `pending` traces back to `flatten_blocks`'s own
+                    // paragraph buffer, never `trim_trailing_break`d — so
+                    // `false` here too, same as `flatten_blocks`'s own
+                    // strong/em arms.
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => {
-                            inline_spans(children, true, false, depth + 1, &more_after, pending);
+                            inline_spans(
+                                children,
+                                true,
+                                false,
+                                depth + 1,
+                                &more_after,
+                                false,
+                                pending,
+                            );
                         }
                         "em" | "i" => {
-                            inline_spans(children, false, true, depth + 1, &more_after, pending);
+                            inline_spans(
+                                children,
+                                false,
+                                true,
+                                depth + 1,
+                                &more_after,
+                                false,
+                                pending,
+                            );
                         }
                         _ if is_non_rendered(tag) => {}
                         _ => {
@@ -1111,6 +1208,19 @@ enum GlueContext<'a> {
         cache: &'a [Cell<Option<bool>>],
         ancestor: &'a Self,
     },
+    /// Built only by [`inline_spans`]'s `is_block_boundary_in_inline_context`
+    /// arm for its own recursive call: nothing inside can *glue* across
+    /// that tag's unconditional surrounding `push_block_break`s (`resolve`
+    /// below always answers `false`), but whether anything genuinely comes
+    /// *after* this position — the question [`nothing_follows`](Self::nothing_follows)
+    /// answers — is unaffected by that override, since the boundary tag's
+    /// own later siblings (if any) still land in the same buffer once this
+    /// call returns. Keeping `outer` (the real, pre-override context) lets
+    /// `nothing_follows` see past the override instead of losing that
+    /// information the way a bare `Resolved(false)` would.
+    BlockBoundary {
+        outer: &'a Self,
+    },
 }
 
 impl GlueContext<'_> {
@@ -1132,6 +1242,7 @@ impl GlueContext<'_> {
     fn resolve(&self) -> bool {
         match self {
             GlueContext::Resolved(b) => *b,
+            GlueContext::BlockBoundary { .. } => false,
             GlueContext::LaterSiblings {
                 nodes,
                 start,
@@ -1161,6 +1272,40 @@ impl GlueContext<'_> {
                     cache[i].set(Some(result));
                 }
                 result
+            }
+        }
+    }
+
+    /// True only if nothing would ever be appended to the buffer this
+    /// context guards, at this level or any later one — not just nothing
+    /// *glueable*. Unlike [`resolve`](Self::resolve), a `<br>`/`<ul>`/`<ol>`/
+    /// block-boundary sibling does **not** count as "nothing more": it
+    /// still produces its own output, it just isn't a glue risk. Used to
+    /// tell whether a capped subtree's own lone trailing `<br>` is
+    /// provably the very last thing [`trim_trailing_break`] would see —
+    /// the one case where dropping it changes nothing.
+    ///
+    /// Every real `Resolved` in this file is `Resolved(false)`, built only
+    /// at a fresh, dedicated buffer (a heading's, a table cell's, ...)
+    /// that has nothing beyond it by construction — so `Resolved` always
+    /// means "nothing follows" here, unlike `resolve`, which also reads
+    /// `Resolved(false)` sitting *underneath* a `BlockBoundary` override.
+    fn nothing_follows(&self) -> bool {
+        match self {
+            GlueContext::Resolved(_) => true,
+            GlueContext::BlockBoundary { outer } => outer.nothing_follows(),
+            GlueContext::LaterSiblings {
+                nodes,
+                start,
+                ancestor,
+                ..
+            } => {
+                for node in &nodes[*start..] {
+                    if !matches!(node_glue_lookahead(node), GlueLookahead::Exhausted) {
+                        return false;
+                    }
+                }
+                ancestor.nothing_follows()
             }
         }
     }
@@ -3810,6 +3955,64 @@ mod tests {
             count_pdf_depth_warnings(&html),
             1,
             "a dropped <br> is dropped output (a line break), so this must warn"
+        );
+    }
+
+    #[test]
+    fn lone_trailing_br_past_the_depth_cap_inside_a_heading_does_not_warn() {
+        // A heading's own spans buffer always runs through
+        // trim_trailing_break right after inline_spans builds it. If the
+        // capped subtree's *entire* would-be output is one trailing <br>
+        // with nothing else in the whole heading, an uncapped render would
+        // push one Span::Break and immediately trim it right back off —
+        // capped and uncapped output are identical, so this must not warn.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1>{}<br>{}</h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            0,
+            "a lone trailing <br> gets trimmed away either way, so this must not warn"
+        );
+    }
+
+    #[test]
+    fn br_past_the_depth_cap_inside_a_heading_still_warns_when_real_text_follows() {
+        // Same shape as the lone-trailing-<br> case, but this time the <br>
+        // is *not* trailing — real text ("B") follows it within the same
+        // heading, so trim_trailing_break's single pop never reaches it.
+        // Losing it is a real difference, so this must still warn.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1>{}<br>{}B</h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "later real text keeps this <br> from ever being trimmed, so this must warn"
+        );
+    }
+
+    #[test]
+    fn two_brs_past_the_depth_cap_inside_a_heading_still_warn() {
+        // trim_trailing_break only ever removes the single trailing break —
+        // a second one survives and still produces a visible line break, so
+        // dropping both via the depth cap is a real content loss.
+        // (Codex review on PR #2810.)
+        let html = format!(
+            "<h1>{}<br><br>{}</h1>",
+            "<span>".repeat(513),
+            "</span>".repeat(513)
+        );
+        assert_eq!(
+            count_pdf_depth_warnings(&html),
+            1,
+            "only one of the two <br>s would ever be trimmed, so this must warn"
         );
     }
 
