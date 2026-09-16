@@ -863,7 +863,9 @@ tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscribe
 
 SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
 htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
-client JS authored by the user**:
+client JS authored by the user**. `autumn_web::sse::stream` is behind the
+non-default `ws` feature (`features = ["ws"]`); see
+[WebSockets](websockets.md):
 
 ```rust
 #[get("/chat/events")]
