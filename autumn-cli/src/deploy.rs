@@ -4744,13 +4744,18 @@ fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
 /// Every field on `halt` is a host name or a fixed operation label (see
 /// [`FleetHalt`]). So this alert can never carry a shell line or a raw
 /// driver error.
-fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
+/// Its dedup key includes `profile`, so a halt on staging and a halt on
+/// production never merge into one incident, even when they share a
+/// `PagerDuty` routing key (review finding on #2267 — matches
+/// [`build_drift_alert`]'s existing profile scoping).
+fn build_fleet_halted_alert(halt: &FleetHalt, profile: &str) -> Alert {
     Alert::trigger(
         AlertCondition::ScheduledTaskFailure,
-        "scheduled_task_failure:deploy-fleet-halted",
+        format!("scheduled_task_failure:deploy-fleet-halted:{profile}"),
     )
     .title("Fleet rollout halted")
     .summary(halt.to_string())
+    .detail("profile", profile)
     .detail("failed_host", halt.failed_host.clone())
     .detail("failed_step", halt.failed_step)
     .detail("rolled_back", join_hosts(&halt.rolled_back))
@@ -4770,7 +4775,7 @@ fn build_fleet_halted_alert(halt: &FleetHalt) -> Alert {
 /// see a message and a non-zero exit.
 fn emit_fleet_halted_alert(halt: &FleetHalt, profile: &str) {
     let channels = deploy_alert_channels_for_profile(profile);
-    deliver_alert(&channels, &build_fleet_halted_alert(halt));
+    deliver_alert(&channels, &build_fleet_halted_alert(halt, profile));
 }
 
 /// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
@@ -9743,12 +9748,12 @@ mod tests {
 
     #[test]
     fn build_fleet_halted_alert_is_scheduled_task_failure() {
-        let alert = build_fleet_halted_alert(&sample_halt());
+        let alert = build_fleet_halted_alert(&sample_halt(), "production");
         assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
         assert_eq!(alert.title, "Fleet rollout halted");
         assert_eq!(
             alert.dedup_key,
-            "scheduled_task_failure:deploy-fleet-halted"
+            "scheduled_task_failure:deploy-fleet-halted:production"
         );
         assert!(
             alert.summary.contains("web-b") && alert.summary.contains("migrate"),
@@ -9758,10 +9763,21 @@ mod tests {
     }
 
     #[test]
+    fn build_fleet_halted_alert_is_scoped_to_profile_for_dedup() {
+        // Review finding on #2267: a halt on staging and a halt on
+        // production must never merge into one incident, even sharing one
+        // PagerDuty routing key.
+        let staging = build_fleet_halted_alert(&sample_halt(), "staging");
+        let production = build_fleet_halted_alert(&sample_halt(), "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
     fn build_fleet_halted_alert_carries_only_host_names_and_static_labels() {
         // This check matches `FleetHalted`'s own secrets check. This
         // alert comes only from its fields, so it can carry no more.
-        let alert = build_fleet_halted_alert(&sample_halt());
+        let alert = build_fleet_halted_alert(&sample_halt(), "production");
         let rendered = format!("{alert:?}");
         for secret in [
             "postgres://",
@@ -9784,7 +9800,10 @@ mod tests {
         });
         let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
 
-        deliver_alert(&channels, &build_fleet_halted_alert(&sample_halt()));
+        deliver_alert(
+            &channels,
+            &build_fleet_halted_alert(&sample_halt(), "production"),
+        );
 
         let delivered = capture.lock().expect("lock").clone();
         assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
@@ -9795,7 +9814,7 @@ mod tests {
     fn deliver_alert_is_noop_without_channels() {
         // No `[alerts]` set means no channels. This must not panic. It
         // must deliver nothing and change no behavior.
-        deliver_alert(&[], &build_fleet_halted_alert(&sample_halt()));
+        deliver_alert(&[], &build_fleet_halted_alert(&sample_halt(), "production"));
     }
 
     #[test]
