@@ -25,23 +25,23 @@ use crate::{
 
 // ── Backend portability (issue #2108) ────────────────────────────────────────
 //
-// `changed_at` is a `timestamptz` column, but the table and the model declare
-// the portable `Timestamp` type with a `NaiveDateTime` field. The `Timestamptz`
-// SQL type is Postgres-only — `SQLite: HasSqlType<Timestamptz>` does not exist
-// — so the generated DSL below does not compile under `autumn-web/sqlite`.
+// `changed_at` is a `timestamptz` column. The table and the model declare the
+// portable `Timestamp` type with a `NaiveDateTime` field. Do not write
+// `Timestamptz` here. Diesel implements `HasSqlType<Timestamptz>` for `Pg`
+// only, so the generated DSL stops compiling under `autumn-web/sqlite`.
 //
-// The flip does not change what Postgres returns. Postgres sends `timestamp`
-// and `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC.
-// A `Timestamp` read of a `timestamptz` column therefore gives the UTC wall
-// clock, whatever the session time zone is, and `and_utc()` puts the offset
-// back at the JSON boundary. `tests/experiment_admin_db.rs` asserts that on a
-// non-UTC session.
+// This does not change what Postgres returns. Postgres sends `timestamp` and
+// `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC. A
+// `Timestamp` read of a `timestamptz` column gives the UTC wall clock. The
+// session time zone has no effect. `and_utc()` adds the offset again at the
+// JSON boundary. `tests/experiment_admin_db.rs` asserts this on a non-UTC
+// session.
 //
 // The write direction is safe too. This crate never writes `changed_at`
-// through the model — the audit rows come from the raw-SQL statements below,
-// which let the column default supply the value. If an application writes one
-// through the generated CRUD, Postgres coerces the bound `timestamp` with the
-// session time zone, and diesel-async sets every new session to UTC
+// through the model. The audit rows come from the raw SQL below, which lets
+// the column default supply the value. If an application writes one through
+// the generated CRUD, Postgres coerces the bound `timestamp` with the session
+// time zone, and diesel-async sets every new session to UTC
 // (`set_config_options` in `diesel_async::pg`).
 diesel::table! {
     autumn_experiment_changes (id) {
@@ -74,6 +74,13 @@ pub trait ExperimentChangeRepository {
 }
 
 /// Admin panel model for A/B experiments.
+///
+/// # Postgres only
+///
+/// This model reads and writes `autumn_experiments`, a Postgres-only table. Its SQL uses
+/// `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does not have. The
+/// plugin itself is backend-agnostic: on `SQLite`, register your own
+/// [`AdminModel`](crate::AdminModel)s instead. See the crate README.
 ///
 /// Register this model with the admin plugin to get an experiment management UI
 /// at `/admin/experiments/`:
@@ -533,13 +540,15 @@ impl AdminModel for ExperimentAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // The batched form binds a Postgres array. `SQLite` has no
-                // array bind type, so that statement cannot type-check there.
-                // `backend_select!` keeps the tokens of one arm and drops the
-                // other, so the array never reaches the `SQLite` type-checker
-                // (issue #2108). The `SQLite` arm falls back to the per-id
-                // path: the same statement `delete()` issues, the same count,
-                // one round trip per id.
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
+                //
+                // The SQLite arm exists to keep the crate compiling. It
+                // mirrors the trait's per-id loop and returns the same count.
+                // It cannot run: this model is Postgres-only, because its
+                // `delete()` uses a writable CTE. See the plugin README.
                 ::autumn_web::backend_select! {
                     pg => {{
                         use diesel_async::RunQueryDsl;

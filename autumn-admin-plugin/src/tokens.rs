@@ -15,6 +15,13 @@ use crate::{
 
 /// Admin panel model for scoped API tokens.
 ///
+/// # Postgres only
+///
+/// This model reads and writes `api_tokens`, a Postgres-only table. Its SQL uses
+/// `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does not have. The
+/// plugin itself is backend-agnostic: on `SQLite`, register your own
+/// [`AdminModel`](crate::AdminModel)s instead. See the crate README.
+///
 /// Register with the admin plugin to get a token management UI at
 /// `/admin/api-tokens/`:
 ///
@@ -308,13 +315,15 @@ impl AdminModel for TokenAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // The batched form binds a Postgres array. `SQLite` has no
-                // array bind type, so that statement cannot type-check there.
-                // `backend_select!` keeps the tokens of one arm and drops the
-                // other, so the array never reaches the `SQLite` type-checker
-                // (issue #2108). The `SQLite` arm falls back to the per-id
-                // path: the same statement `delete()` issues, the same count,
-                // one round trip per id.
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
+                //
+                // The SQLite arm exists to keep the crate compiling. It
+                // mirrors the trait's per-id loop and returns the same count.
+                // It cannot run: this model is Postgres-only, because its
+                // `delete()` uses `NOW()`. See the plugin README.
                 ::autumn_web::backend_select! {
                     pg => {{
                         use diesel_async::RunQueryDsl;

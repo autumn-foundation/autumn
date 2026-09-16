@@ -4,14 +4,14 @@
 //! `ExperimentAdminModel` the equivalent cover: create, get, list with search
 //! and pagination, update, delete, and the History pane.
 //!
-//! The History assertions are the important ones. Issue #2108 flips the
-//! `changed_at` / `updated_at` row fields from the Postgres-only `Timestamptz`
-//! SQL type to the portable `Timestamp` type, so the crate can also compile
-//! against `SQLite`. Postgres sends both types in the same binary form — UTC
-//! microseconds — so the value must not move. `experiment_admin_history_reads_utc_
-//! under_a_non_utc_session_timezone` proves it: the database default time zone
-//! is set to `America/New_York` on the reading connection, and the timestamp still
-//! comes back in UTC.
+//! The History assertions are the important ones. Issue #2108 changes the
+//! `changed_at` and `updated_at` row fields. They now use the portable
+//! `Timestamp` type, not the Postgres-only `Timestamptz` type, so the crate
+//! also compiles against `SQLite`. Postgres sends both types in the same binary
+//! form, in UTC microseconds, so the value must not move.
+//! `experiment_admin_history_reads_utc_under_a_non_utc_session_timezone`
+//! proves it. The test sets the SESSION time zone to `America/New_York`. The
+//! timestamp still comes back in UTC.
 //!
 //! **Requires Docker**, or a Postgres URL in `AUTUMN_ADMIN_TEST_PG_URL`.
 
@@ -266,7 +266,7 @@ struct ZoneRow {
     zone: String,
 }
 
-/// The timestamp semantics guard for issue #2108.
+/// Guard the timestamp behaviour for issue #2108.
 ///
 /// `changed_at` is a `timestamptz` column. The row now reads it as the portable
 /// `Timestamp` type, because `SQLite` has no `Timestamptz`. Postgres sends both

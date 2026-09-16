@@ -1,14 +1,13 @@
 //! A Postgres fixture for the admin-model integration tests (issue #2108).
 //!
 //! Include it with `#[path = "support/pg_fixture.rs"] mod pg_fixture;`. Cargo
-//! discovers only `tests/*.rs`, so this file is never built as its own test
-//! binary.
+//! builds `tests/*.rs` and `tests/<dir>/main.rs` as test binaries. This file is
+//! neither, so it never becomes one.
 //!
 //! The fixture starts a testcontainers Postgres by default. Set
-//! `AUTUMN_ADMIN_TEST_PG_URL` to use a server that already runs instead — a
-//! local `postgres://…` for a developer with no Docker, or a CI `services:`
-//! block. Each call then makes its own database, so the tests stay isolated
-//! either way.
+//! `AUTUMN_ADMIN_TEST_PG_URL` to use a server that already runs. Use this for a
+//! developer with no Docker, or for a CI `services:` block. Each call then
+//! makes its own database, so the tests stay isolated either way.
 
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, PgConnection};

@@ -4,9 +4,9 @@
 //! search and pagination, update, delete, bulk delete, and the History pane —
 //! including the rename ancestry the recursive audit CTE follows.
 //!
-//! `feature_flag_admin_history_reads_utc_under_a_non_utc_session_timezone` is
-//! the timestamp semantics guard for issue #2108: `changed_at` is a
-//! `timestamptz` column that the row now reads as the portable `Timestamp`
+//! `feature_flag_admin_history_reads_utc_under_a_non_utc_session_timezone`
+//! guards the timestamp behaviour for issue #2108. `changed_at` is a
+//! `timestamptz` column. The row now reads it as the portable `Timestamp`
 //! type, so the value must not move with the session time zone.
 //!
 //! **Requires Docker**, or a Postgres URL in `AUTUMN_ADMIN_TEST_PG_URL`.
@@ -213,7 +213,7 @@ struct ZoneRow {
     zone: String,
 }
 
-/// The timestamp semantics guard for issue #2108.
+/// Guard the timestamp behaviour for issue #2108.
 ///
 /// `changed_at` is a `timestamptz` column. The row now reads it as the portable
 /// `Timestamp` type, because `SQLite` has no `Timestamptz`. Postgres sends both

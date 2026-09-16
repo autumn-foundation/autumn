@@ -15,7 +15,8 @@
 //!    one index per distinct name. `SET name = $2 … WHERE id = $1` therefore
 //!    binds the id into `name` on `SQLite`. To repeat a value, bind it twice
 //!    under two placeholders.
-//! 2. **No `ILIKE`.** `LOWER(col) LIKE LOWER($1)` is case-insensitive on both.
+//! 2. **No `ILIKE`.** Write `LOWER(col) LIKE LOWER($1)`. Both backends then
+//!    match without case for ASCII text. `SQLite`'s `lower()` folds ASCII only.
 //! 3. **No `::type` cast, no `ANY($1)` array bind, and no writable CTE.**
 //!    `SQLite` has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
 //!    separate statements in a transaction.
@@ -36,8 +37,9 @@
 //! cargo test -p autumn-admin-plugin --test custom_admin_model -- --ignored
 //! ```
 //!
-//! Both tests are `#[ignore]`d, so a default `cargo test --workspace` never
-//! starts a database. Each lane names the target in `.github/workflows/ci.yml`.
+//! The database-backed test is `#[ignore]`d, so a default
+//! `cargo test --workspace` never starts a database. Each lane names the target
+//! in `.github/workflows/ci.yml`.
 
 use autumn_admin_plugin::{
     AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, AdminPlugin, ListParams,
@@ -124,9 +126,9 @@ impl AdminModel for WidgetAdminModel {
                 params.search.as_deref().unwrap_or("").to_lowercase()
             );
 
-            // `$1` is bound twice, once per placeholder. SQLite gives every
-            // distinct name ONE index, so a repeated `$1` would leave the
-            // second bind unused.
+            // One placeholder, one bind. SQLite gives each distinct `$name`
+            // one index, so a statement that writes `$1` two times accepts
+            // one bind only. A second bind then fails with a range error.
             let total: i64 = diesel::sql_query(
                 "SELECT COUNT(*) AS count FROM widgets WHERE LOWER(name) LIKE $1",
             )
