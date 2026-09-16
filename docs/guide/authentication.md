@@ -374,9 +374,17 @@ pub async fn logout(
     session.clear().await;
     session.rotate_id().await;   // old cookie can no longer be replayed
 
-    // Now fail the logout if the remember chain survived — it is a
-    // long-lived credential, so reporting success would be false.
-    revoke_result?;
+    // Fail the logout if the remember chain survived — it is a long-lived
+    // credential, so reporting success would be false. Still clear the
+    // cookie on THIS browser even on failure: otherwise it keeps presenting
+    // a still-valid remember cookie, and once the database recovers,
+    // `remember_me` would silently re-establish a session on the very next
+    // request, undoing this logout.
+    if let Err(error) = revoke_result {
+        let mut response = error.into_response();
+        append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
+        return Ok(response);
+    }
 
     let mut response = Redirect::to("/").into_response();
     append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
@@ -398,12 +406,16 @@ swallows its error (`let _ = …`) — losing that row only drops a device from
 the account's device list, so a hiccup there is not worth failing logout over.
 The remember-chain delete is different: it is a long-lived bearer credential,
 so `revoke_remember_from_cookie` returns its error instead. `logout` holds
-that result, tears the session down regardless, then propagates it — so a
-failed `DELETE` still fails the whole request (the browser sees an error, not
-a redirect), but the session is destroyed either way. If your threat model
-needs the remember-chain delete to succeed before you consider the account
-safe, queue a [durable job](./jobs.md) to retry it after this response, rather
-than treating the request's own delete attempt as final.
+that result, tears the session down regardless, and only then branches on
+it — so a failed `DELETE` still fails the whole request (the browser sees an
+error, not a redirect), but the session is destroyed either way. The error
+response still carries the remember-clear `Set-Cookie`: without it, this
+browser would keep presenting its (still valid, since the delete failed)
+remember cookie, and the next request after the database recovers would let
+`remember_me` quietly log it back in. If your threat model needs the
+remember-chain delete to succeed before you consider the account safe, queue
+a [durable job](./jobs.md) to retry it after this response, rather than
+treating the request's own delete attempt as final.
 
 Working code: [`examples/saas/src/routes/auth.rs`](../../examples/saas/src/routes/auth.rs)
 (signup with policy enforcement, [submit tokens](./submit-tokens.md), and

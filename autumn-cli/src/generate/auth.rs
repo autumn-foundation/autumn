@@ -4241,9 +4241,17 @@ pub async fn logout(
     // be skipped by a remember-chain delete failure propagated below.
     session.clear().await;
     session.rotate_id().await;
-    // Now fail the logout if the remember chain survived: it is a long-lived
-    // bearer credential and reporting success would be false.
-    revoke_result?;
+    // Fail the logout if the remember chain survived: it is a long-lived
+    // bearer credential and reporting success would be false. Still clear the
+    // cookie on THIS browser even on failure — otherwise it keeps presenting
+    // a still-valid remember cookie, and once the database recovers,
+    // `remember_me` would silently re-establish a session on the next
+    // request, undoing this logout.
+    if let Err(error) = revoke_result {{
+        let mut response = error.into_response();
+        append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
+        return Ok(response);
+    }}
     flash.info("You have been logged out.").await;
     let mut response = redirect_to("/login");
     append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
@@ -13433,11 +13441,59 @@ mod tests {
              revoke_remember_from_cookie: {logout_body}"
         );
 
-        let propagate_at = logout_body.rfind('?').filter(|&p| p > rotate_at).expect(
-            "logout must propagate the remember-chain revocation result \
-                 with `?` AFTER the session is invalidated",
-        );
+        let propagate_at = logout_body
+            .find("if let Err(")
+            .filter(|&p| p > rotate_at)
+            .expect(
+                "logout must branch on the remember-chain revocation result \
+                 AFTER the session is invalidated",
+            );
         assert!(propagate_at > clear_at && propagate_at > rotate_at);
+    }
+
+    /// #2811 review finding: on a failed remember-chain delete, `logout` must
+    /// still clear the remember cookie in the error response. Otherwise the
+    /// browser keeps presenting a still-valid remember cookie, and once the
+    /// database recovers `remember_me` silently re-establishes a session on
+    /// the user's very next request — undoing the logout entirely.
+    #[test]
+    fn logout_clears_remember_cookie_even_on_revocation_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        // The error branch must build its own response and attach the clear
+        // cookie rather than bailing out with a bare `revoke_result?;` that
+        // hands back the framework's default error response untouched.
+        assert!(
+            !logout_body.contains("revoke_result?;"),
+            "a bare `revoke_result?;` skips attaching the remember-clear \
+             cookie to the error response: {logout_body}"
+        );
+        assert!(
+            logout_body.contains("if let Err(") && logout_body.contains("revoke_result"),
+            "logout must branch on revoke_result to attach the clear cookie \
+             to the error response: {logout_body}"
+        );
+
+        let clear_cookie_calls = logout_body
+            .matches("append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg))")
+            .count();
+        assert!(
+            clear_cookie_calls >= 2,
+            "logout must clear the remember cookie on BOTH the success path \
+             and the revocation-failure error path: {logout_body}"
+        );
     }
 
     #[test]
