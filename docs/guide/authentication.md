@@ -9,6 +9,14 @@ is allowed to *do* is [authorization](./authorization.md); proving identity
 *again* before a dangerous action is
 [step-up auth](./step-up-authentication.md).
 
+Adding a **second factor** — two-factor authentication (2FA) with a TOTP
+authenticator app — is a flag on the generator rather than a separate
+subsystem: `autumn generate auth User --totp`. The generator also scaffolds
+**passwordless** sign-in (`--passkeys`, `--magic-link`), which *replaces* the
+password rather than adding a factor on top of it — a different security
+property, and not 2FA. See
+[Quick start](#quick-start-autumn-generate-auth).
+
 This guide covers:
 
 - [What's in the box](#whats-in-the-box) — the primitive behind each capability.
@@ -76,7 +84,7 @@ Optional factors compose on top, each off by default:
 | Flag | Adds |
 |---|---|
 | `--oauth github,google` | Redirect + callback handlers, `oauth_identities` table, the `oauth2` feature — see [OAuth2 / OIDC](./oauth.md) |
-| `--totp` | TOTP enrollment + login-verify, encrypted-at-rest secrets, single-use recovery codes |
+| `--totp` | Two-factor authentication (2FA) with a TOTP authenticator app: enrollment + login-verify, encrypted-at-rest secrets, single-use recovery codes |
 | `--passkeys` | WebAuthn ceremony handlers, `webauthn_credentials` table, a passkey list/revoke surface |
 | `--magic-link` | `/login/magic` request → email → verify, single-use digest tokens, per-email cooldown |
 
@@ -882,8 +890,11 @@ indistinguishable, and that logout makes the old cookie unusable. See the
   sudo-mode re-verification before destructive actions.
 - [Authorization](./authorization.md) — `Policy`, `Scope`, and `#[authorize]`
   for "may this user touch this record?".
-- Multi-factor — `autumn generate auth --totp | --passkeys | --magic-link`
-  writes the flows and their own project-local docs.
+- Two-factor authentication (2FA / MFA) — `autumn generate auth User --totp`
+  adds a TOTP second factor on top of the password.
+- Passwordless sign-in — `autumn generate auth User --passkeys` or
+  `--magic-link` replaces the password instead of adding a factor to it. Each
+  flag writes its flows and its own project-local docs.
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.

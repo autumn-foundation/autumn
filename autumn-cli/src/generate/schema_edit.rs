@@ -1001,7 +1001,7 @@ fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String
 /// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
 /// unlike Postgres, which rounds a value to `scale` — a loud failure beats
 /// silently storing what the schema says is out of range. (5)-(6) exist
-/// because SQLite compares `TEXT` byte for byte: without them, text written
+/// because `SQLite` compares `TEXT` byte for byte: without them, text written
 /// outside the wrapper (raw SQL, an import, a hand-written migration) passes
 /// the constraint while being a spelling the wrapper would never produce —
 /// and is then invisible to the equality lookups the generated `find_by_*`
