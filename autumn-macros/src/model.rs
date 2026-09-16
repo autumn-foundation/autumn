@@ -5055,12 +5055,72 @@ fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
 
 // ── #1806: `#[collaborative]` field attribute ────────────────────────────────
 
+/// Marker combinations `#[collaborative]` refuses, with the reason each one
+/// is incoherent.
+///
+/// A table rather than a match arm: every entry is a pair whose two halves
+/// disagree about what the column contains, and the reason is what the author
+/// reads.
+const COLLABORATIVE_MARKER_CONFLICTS: &[(&str, &str)] = &[
+    (
+        "encrypted",
+        "an encrypted column stores one opaque ciphertext envelope, which the \
+         merge cannot read the characters out of",
+    ),
+    (
+        "classified",
+        "a classification tier applies to one value; a CRDT document is a JSON \
+         container of characters, and the merge would move them across the \
+         boundary the tier records",
+    ),
+    (
+        "searchable",
+        "full-text search indexes the stored column, which for a collaborative \
+         field is a JSON container — the index would match character ids and \
+         JSON punctuation, not the prose",
+    ),
+    (
+        "translatable",
+        "both markers own the column's representation, and one column cannot \
+         hold a per-locale container and a CRDT document at once. Keep one \
+         collaborative column per locale",
+    ),
+    (
+        "normalize",
+        "normalizers rewrite a single string; they cannot see inside the \
+         document, and a rewrite behind the merge's back would drop characters \
+         other editors still hold",
+    ),
+    (
+        "unique",
+        "uniqueness would compare whole documents, so two records with identical \
+         text but different edit histories would never collide",
+    ),
+    (
+        "indexed",
+        "an equality index over a CRDT document matches whole documents, never \
+         the text",
+    ),
+    ("id", "a primary key must be a single scalar value"),
+    (
+        "lock_version",
+        "the optimistic-lock column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "position",
+        "the position column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "state_machine",
+        "a state column must hold one state name, not a document",
+    ),
+];
+
 /// Validate a `#[collaborative]` field.
 ///
 /// The attribute is a marker: the *type* carries the merge, so the type has to
-/// be right. Everything else rejected here is a combination whose two halves
-/// disagree about what the column contains — a CRDT document is not a string
-/// to encrypt, index, normalize, or full-text search.
+/// be right. The rest is [`COLLABORATIVE_MARKER_CONFLICTS`] plus the two
+/// renames that would desync the registry.
 fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
     if !field_is_collaborative(field) {
         return Ok(());
@@ -5087,61 +5147,7 @@ fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
              accepted, so spell the real type here.",
         ));
     }
-    // Combinations whose two halves disagree about the column's contents.
-    for (marker, why) in [
-        (
-            "encrypted",
-            "an encrypted column stores one opaque ciphertext envelope, which the \
-             merge cannot read the characters out of",
-        ),
-        (
-            "classified",
-            "a classification tier applies to one value; a CRDT document is a JSON \
-             container of characters, and the merge would move them across the \
-             boundary the tier records",
-        ),
-        (
-            "searchable",
-            "full-text search indexes the stored column, which for a collaborative \
-             field is a JSON container — the index would match character ids and \
-             JSON punctuation, not the prose",
-        ),
-        (
-            "translatable",
-            "both markers own the column's representation, and one column cannot \
-             hold a per-locale container and a CRDT document at once. Keep one \
-             collaborative column per locale",
-        ),
-        (
-            "normalize",
-            "normalizers rewrite a single string; they cannot see inside the \
-             document, and a rewrite behind the merge's back would drop characters \
-             other editors still hold",
-        ),
-        (
-            "unique",
-            "uniqueness would compare whole documents, so two records with identical \
-             text but different edit histories would never collide",
-        ),
-        (
-            "indexed",
-            "an equality index over a CRDT document matches whole documents, never \
-             the text",
-        ),
-        ("id", "a primary key must be a single scalar value"),
-        (
-            "lock_version",
-            "the optimistic-lock column is framework-managed and must stay a plain integer",
-        ),
-        (
-            "position",
-            "the position column is framework-managed and must stay a plain integer",
-        ),
-        (
-            "state_machine",
-            "a state column must hold one state name, not a document",
-        ),
-    ] {
+    for (marker, why) in COLLABORATIVE_MARKER_CONFLICTS {
         if has_attr(field, marker) {
             return Err(syn::Error::new_spanned(
                 field,

@@ -169,10 +169,15 @@ fn the_snapshot_carries_the_document_and_the_participants() {
         CollabServerMessage::Snapshot {
             elems,
             participants,
+            actor,
         } => {
             assert_eq!(elems.len(), 2);
             assert_eq!(elems.iter().map(|e| e.ch).collect::<String>(), "hi");
             assert_eq!(participants.len(), 1);
+            assert!(
+                actor.is_none(),
+                "a document-level snapshot names no editor; `CollabSession::snapshot` does"
+            );
         }
         other => panic!("expected a snapshot, got {other:?}"),
     }
