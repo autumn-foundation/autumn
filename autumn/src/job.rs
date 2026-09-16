@@ -16671,7 +16671,12 @@ mod tests {
         // clock, not this host's. `run_at` reads `clock_timestamp()`, not
         // `NOW()` (see `pg_insert_job`'s comment on why), so it is not the
         // exact same reading as `enqueued_at`'s `NOW()` — allow a generous
-        // tolerance rather than assert exact equality.
+        // tolerance rather than assert exact equality. The lower bound also
+        // has to allow for `pg_insert_job` legitimately subtracting whatever
+        // elapsed between capturing `relative_delay` and its own read, right
+        // before the INSERT (pool checkout, the unique-key eviction query)
+        // — see `RelativeDelay` — so a `bound_delay` a little under 2s does
+        // not mean the delay was miscomputed.
         #[tokio::test]
         #[ignore = "requires Docker (testcontainers)"]
         async fn pg_relative_delay_computes_run_at_on_the_database_clock() {
@@ -16708,10 +16713,11 @@ mod tests {
             let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
             let bound_delay = run_at.signed_duration_since(enqueued_at);
             assert!(
-                bound_delay >= chrono::TimeDelta::milliseconds(2_000)
+                bound_delay >= chrono::TimeDelta::milliseconds(1_000)
                     && bound_delay < chrono::TimeDelta::milliseconds(2_500),
-                "run_at must be ~2s after enqueued_at (got {bound_delay}), computed by the \
-                 database, not stamped from a Rust-side clock read"
+                "run_at must be ~2s after enqueued_at, minus at most the pool-checkout/eviction \
+                 gap before the INSERT (got {bound_delay}), computed by the database, not \
+                 stamped from a Rust-side clock read"
             );
         }
 
