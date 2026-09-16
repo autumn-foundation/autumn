@@ -216,7 +216,7 @@ impl CollabOp {
     /// trusting it lets one message push the clock to `u64::MAX` and wedge the
     /// document. The referenced character advances the clock when *its* own
     /// insert arrives, which is the only moment it is real.
-    fn minted_counter(&self) -> u64 {
+    const fn minted_counter(&self) -> u64 {
         match self {
             Self::Insert { id, .. } => id.counter,
             Self::Delete { .. } => 0,
@@ -310,13 +310,13 @@ impl CollabText {
 
     /// The replica's Lamport clock — the highest counter it has seen.
     #[must_use]
-    pub fn clock(&self) -> u64 {
+    pub const fn clock(&self) -> u64 {
         self.clock
     }
 
     /// Count of operations still waiting for their cause.
     #[must_use]
-    pub fn pending_len(&self) -> usize {
+    pub const fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
@@ -339,7 +339,7 @@ impl CollabText {
     /// Count of characters the document holds, tombstones included — what it
     /// costs, as opposed to what it shows.
     #[must_use]
-    pub fn element_count(&self) -> usize {
+    pub const fn element_count(&self) -> usize {
         self.elems.len()
     }
 
@@ -647,10 +647,7 @@ impl CollabText {
 
     /// First slot an insert anchored at `after` may occupy.
     fn slot_after(&self, after: Option<&OpId>) -> Option<usize> {
-        match after {
-            None => Some(0),
-            Some(id) => self.position_of(id).map(|p| p + 1),
-        }
+        after.map_or(Some(0), |id| self.position_of(id).map(|p| p + 1))
     }
 
     /// RGA's placement rule: from `start`, step over every character that
@@ -722,11 +719,14 @@ impl fmt::Display for CollabText {
 /// hid the buffer would make a stuck merge invisible in test output.
 impl fmt::Debug for CollabText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `finish_non_exhaustive`: the derived state (`index`, `buffered`,
+        // `clock`) restates what these three already show, and printing it
+        // would bury the text this exists to surface.
         f.debug_struct("CollabText")
             .field("text", &self.text())
             .field("elements", &self.elems.len())
             .field("pending", &self.pending.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

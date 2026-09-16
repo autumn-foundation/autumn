@@ -228,7 +228,7 @@ struct DocState {
 }
 
 impl DocState {
-    fn new(doc: CollabText) -> Self {
+    const fn new(doc: CollabText) -> Self {
         Self {
             doc,
             cursors: BTreeMap::new(),
@@ -285,7 +285,7 @@ impl CollabHub {
 
     /// Replace the per-message bounds.
     #[must_use]
-    pub fn with_limits(mut self, limits: CollabLimits) -> Self {
+    pub const fn with_limits(mut self, limits: CollabLimits) -> Self {
         self.limits = limits;
         self
     }
@@ -376,7 +376,6 @@ impl CollabHub {
         CollabDoc {
             key: key.to_owned(),
             state,
-            docs: Arc::clone(&self.docs),
             channels: self.channels.clone(),
             presence: self.presence.clone(),
             limits: self.limits,
@@ -450,9 +449,6 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for CollabHub {
 pub struct CollabDoc {
     key: String,
     state: Arc<Mutex<DocState>>,
-    /// The registry this document is listed in. The handle owns the state;
-    /// the registry only points at it weakly.
-    docs: Arc<Mutex<HashMap<String, Weak<Mutex<DocState>>>>>,
     channels: Channels,
     presence: Presence,
     limits: CollabLimits,
@@ -721,6 +717,7 @@ impl CollabDoc {
                 .cloned()
                 .collect();
             let waiting = state.doc.pending_len();
+            drop(state);
             (accepted, waiting)
         };
         self.broadcast_ops(&accepted);
@@ -854,7 +851,7 @@ impl Drop for CollabSession {
     /// during another panic's unwind, and a panic while panicking aborts the
     /// process — one bad document would take the whole server down.
     fn drop(&mut self) {
-        let last_editor = {
+        {
             let mut state = self
                 .doc
                 .state
@@ -862,8 +859,7 @@ impl Drop for CollabSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.cursors.remove(&self.actor);
             state.sessions = state.sessions.saturating_sub(1);
-            state.sessions == 0
-        };
+        }
         drop(self.presence.take());
         self.doc.broadcast_presence();
 
@@ -872,7 +868,6 @@ impl Drop for CollabSession {
         // which is *after* the handler has persisted it. Removing it here
         // instead would let a reconnect in that window re-seed from the stale
         // row and then lose the departing editor's work to the late save.
-        let _ = last_editor;
     }
 }
 
