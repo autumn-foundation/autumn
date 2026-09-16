@@ -563,10 +563,31 @@ pub fn type_name_str(ty: &syn::Type) -> String {
 fn emit_collaborative_schema_tokens() -> TokenStream {
     quote! {{
         // Bound once: the shape appears five times below.
+        //
+        // Carrying the runtime's own limits, for the reason spelled out on
+        // `maxItems` below: `OpId::from_str` refuses an actor past
+        // `MAX_ACTOR_LEN`, and the document decoder refuses a counter at or
+        // past `MAX_COUNTER`, so a schema saying `[0-9]+@.+` promises clients
+        // ids the endpoint will certainly turn away.
+        //
+        // As tight as JSON Schema can say it and no tighter — every bound
+        // here is one no legal id can fail. The digit count is the width of
+        // the largest legal counter, which still admits a few values above it;
+        // `maxLength` budgets `MAX_ACTOR_LEN` as if the actor were all
+        // single-byte, since the real limit is bytes and a pattern counts
+        // characters. Narrowing either further would start rejecting ids the
+        // endpoint accepts, which is the same fault in the other direction.
+        let counter_digits = (::autumn_web::collab::MAX_COUNTER - 1).to_string().len();
         let id = ::autumn_web::reexports::serde_json::json!({
             "type": "string",
-            "pattern": "^[0-9]+@.+$",
-            "description": "Character id, \"<counter>@<actor>\"."
+            "pattern": format!("^[0-9]{{1,{counter_digits}}}@.+$"),
+            "maxLength": counter_digits + 1 + ::autumn_web::collab::MAX_ACTOR_LEN,
+            "description": format!(
+                "Character id, \"<counter>@<actor>\". The counter is below {} and \
+                 the actor is 1..={} bytes.",
+                ::autumn_web::collab::MAX_COUNTER,
+                ::autumn_web::collab::MAX_ACTOR_LEN,
+            )
         });
         let ch = ::autumn_web::reexports::serde_json::json!({
             "type": "string",

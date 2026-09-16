@@ -170,6 +170,7 @@ async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsH
         });
     let actor = state.entropy().uuid_v4().to_string();
     let label = format!("Guest {}", &actor[..4]);
+    let key = doc_key("notes", note_id, "body");
 
     move |socket: WebSocket| async move {
         // An unknown note, or a full registry, closes the socket.
@@ -177,10 +178,25 @@ async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsH
             return;
         };
         serve_socket(&doc, actor, label, socket).await;
-        // Persist on leave. The hub evicts the document when its last editor
-        // goes, but this handle still reads it, so the final state is safe to
-        // take here. A busier app also saves on a timer.
-        store.save_body(note_id, doc.document());
+
+        // Persist on leave — through `close`, not by reading the handle.
+        //
+        // Reading it looked safe and is not. Two editors leaving at once each
+        // read the document and each write what they read: the one that reads
+        // first can be the one that writes last, putting its older text over
+        // the other's final edit. Both handles then drop, the live document
+        // goes, and the next visitor seeds from the row that lost the edit.
+        //
+        // `close` hands the state to exactly one caller and refuses while
+        // anybody is still editing — whoever is still here will persist in
+        // their turn. `finalize` answers whether the document moved while the
+        // write was in flight, which is why this is a loop and not a call: an
+        // editor can join and type between the read and the commit.
+        let mut pending = hub.close(&key);
+        while let Some(guard) = pending {
+            store.save_body(note_id, guard.text().clone());
+            pending = guard.finalize();
+        }
     }
 }
 
