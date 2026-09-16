@@ -4823,7 +4823,7 @@ fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::
     // version-history snapshot, which is built from the `Serialize` view: the
     // column would then produce no "changed" marker at all rather than the
     // redacted one the registry promises.
-    if has_attr(field, "private") || field_already_skips_serialization(field) {
+    if has_attr(field, "private") || field_may_skip_serialization(field) {
         return Err(syn::Error::new_spanned(
             field,
             "`#[confidential]` fields cannot be `#[private]` or `#[serde(skip_serializing)]`: \
@@ -4862,7 +4862,7 @@ fn validate_blind_index_companion(
             if field_serde_wire_name_override(f).is_some()
                 || diesel_column_name(f).is_some()
                 || has_attr(f, "private")
-                || field_already_skips_serialization(f)
+                || field_may_skip_serialization(f)
             {
                 return Err(syn::Error::new_spanned(
                     f,
@@ -5635,6 +5635,59 @@ fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
             }
             if let Ok(value) = meta.value() {
                 let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a field is omitted from the serialized form, conditionally or not.
+///
+/// Broader than [`field_already_skips_serialization`], which drives attribute
+/// injection and must not treat a conditional skip as an unconditional one.
+/// `#[confidential]` needs the broader question: a column omitted on any path
+/// is absent from the version-history snapshot, which is built from the
+/// `Serialize` view, so it produces no "changed" marker at all.
+fn field_may_skip_serialization(field: &syn::Field) -> bool {
+    if field_already_skips_serialization(field) {
+        return true;
+    }
+    let mut conditional = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing_if") {
+                conditional = true;
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    conditional
+}
+
+/// Whether a container reshapes its serialized form through a conversion type:
+/// `#[serde(into = "...")]`, `from` or `try_from`.
+///
+/// The conversion decides the keys, so a registry keyed on the model's own field
+/// names cannot see through it.
+fn attrs_have_serde_shape_conversion(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            for key in ["into", "from", "try_from"] {
+                if meta.path.is_ident(key) {
+                    found = found.or(Some(key));
+                }
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
             }
             Ok(())
         });
@@ -7894,6 +7947,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "`#[serde(rename_all = ...)]` cannot be combined with `#[confidential]` fields \
              (issue #1771): confidential columns are registered under their Rust names, \
              which the log filter, version history and admin redaction key off.",
+        )
+        .to_compile_error();
+    }
+    // A container conversion decides the serialized keys, and version history
+    // snapshots the model through `Serialize`. A `Wire` type that moves the
+    // sealed column under another key would carry the envelope past the
+    // sensitive-column lookup and into the history table; `from`/`try_from` are
+    // the same bypass on the way in.
+    if !confidential_columns.is_empty()
+        && let Some(key) = attrs_have_serde_shape_conversion(outer_attrs)
+    {
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`#[serde({key} = ...)]` cannot be combined with `#[confidential]` fields \
+                 (issue #1771): the conversion decides the serialized keys, so version \
+                 history and the raw-request filters — which key off the model's own field \
+                 names — cannot see the sealed column or its token through it."
+            ),
         )
         .to_compile_error();
     }
@@ -14711,6 +14783,32 @@ mod tests {
         }
     }
 
+    /// #1771: a container conversion decides the serialized keys, so a registry
+    /// keyed on the model's own field names cannot see the sealed column through
+    /// it — and version history snapshots the model through `Serialize`.
+    #[test]
+    fn a_serde_shape_conversion_on_a_confidential_model_is_refused() {
+        for conversion in [
+            quote! { #[serde(into = "Wire")] },
+            quote! { #[serde(from = "Wire")] },
+            quote! { #[serde(try_from = "Wire")] },
+        ] {
+            let input: TokenStream = quote! {
+                #conversion
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a reshaped confidential model must be refused: {expanded}"
+            );
+        }
+    }
+
     /// #1771: an alias is accepted on the way in, so a request could deliver the
     /// envelope or the token under a name no filter knows.
     #[test]
@@ -14739,9 +14837,15 @@ mod tests {
 
     /// #1771: a skipped column never reaches the version-history snapshot, which
     /// is built from the `Serialize` view, so it would leave no "changed" marker.
+    /// `skip_serializing_if` counts: a predicate true on both sides of an update
+    /// omits the column from both snapshots.
     #[test]
     fn a_confidential_field_that_skips_serialization_is_refused() {
-        for skip in [quote! { #[private] }, quote! { #[serde(skip_serializing)] }] {
+        for skip in [
+            quote! { #[private] },
+            quote! { #[serde(skip_serializing)] },
+            quote! { #[serde(skip_serializing_if = "always")] },
+        ] {
             let input: TokenStream = quote! {
                 pub struct Note {
                     pub id: i32,
