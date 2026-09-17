@@ -309,6 +309,34 @@ def dest_at(text, pos):
 _LABEL = re.compile(r"\[((?:\\.|[^\[\]\n]|\n(?!\s*\n))*)\]")
 
 
+# A LIST ITEM interrupts a paragraph only when it is non-empty, and when
+# ordered, only when it starts at 1 — so `- [A long title` followed by
+# `2024. was the year` is still one paragraph, and one link. Over-clearing
+# here would be a false failure, which is the costlier direction.
+_INTERRUPT_LIST = re.compile(r"^ {0,3}(?:[-*+]|1[.)])[ \t]+\S")
+
+
+def _interrupts(line, above):
+    """True when `line` starts a new BLOCK instead of continuing `above`.
+
+    Link text, a destination and a title all live inside one block, so a
+    bracket on either side of a boundary is not a pair. A blank line is the
+    boundary everyone remembers; it is not the only one.
+    """
+    if not line.strip():
+        return True
+    if ATX.match(line) or THEMATIC.match(line) or opens_fence(line):
+        return True
+    if BLOCKQUOTE.match(line) or _INTERRUPT_LIST.match(line):
+        return True
+    # A Setext underline ends the paragraph as a heading, but only when a
+    # paragraph line really sits above it — the same context test the rest
+    # of this file applies, rather than a fourth spelling of it.
+    if SETEXT.match(line):
+        return _setext_context(above)
+    return False
+
+
 def bracket_pairs(text):
     """Every `[` index mapped to its matching `]`, in ONE pass.
 
@@ -318,6 +346,7 @@ def bracket_pairs(text):
     on. One stack pass makes the lookups free.
     """
     pairs, stack, j, n = {}, [], 0, len(text)
+    line_start = 0
     while j < n:
         ch = text[j]
         if ch == "\\":
@@ -334,11 +363,19 @@ def bracket_pairs(text):
             # does not survive the gap — the same rule the destination, the
             # title and the definition already follow, applied to the one
             # construct that had been left out of it.
-            k = j + 1
-            while k < n and text[k] in " \t":
-                k += 1
-            if k >= n or text[k] == "\n":
+            #
+            # And a blank line is not the only boundary. A heading, a
+            # thematic break, a fence, a quote or a new list item ends the
+            # paragraph just as firmly: `- [A` over `# interrupted](x.md)`
+            # renders a literal `[A` and an `<h1>`, with no link at all.
+            # While every caller scanned one line at a time this could not
+            # be reached; reading a row at its offset in the whole text made
+            # it reachable, and the stack had to learn the rest of the rule.
+            nl = text.find("\n", j + 1)
+            nxt = text[j + 1:] if nl < 0 else text[j + 1:nl]
+            if _interrupts(nxt, text[line_start:j]):
                 stack.clear()
+            line_start = j + 1
         if ch == "[":
             stack.append(j)
         elif ch == "]" and stack:
@@ -4970,6 +5007,53 @@ self_test() {
   printf '[Guide](docs/guide/index.md)\n' > "$tmp/row_blank_break/README.md"
   _commit row_blank_break
   _case "a row's link may not cross a blank line" 1 row_blank_break
+
+  # 243. A blank line is not the only boundary. An ATX heading ends the
+  #      paragraph just as firmly: cmark-gfm renders `<li>[A</li>` and an
+  #      `<h1>`, with no link anywhere, so the page is listed nowhere.
+  #      Reading a row at its offset in the whole text is what made this
+  #      reachable, so the bracket stack had to learn the rest of the rule.
+  _scaffold row_heading_break
+  printf '# A\n' > "$tmp/row_heading_break/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A\n# interrupted](alpha.md)\n' \
+    > "$tmp/row_heading_break/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/row_heading_break/README.md"
+  _commit row_heading_break
+  _case "a heading interrupts a row's link" 1 row_heading_break
+
+  # 244. So does the next LIST ITEM, which is the boundary an index is most
+  #      likely to meet: two rows, two literal bracket runs, no link.
+  _scaffold row_item_break
+  printf '# A\n' > "$tmp/row_item_break/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A\n- B](alpha.md)\n' \
+    > "$tmp/row_item_break/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/row_item_break/README.md"
+  _commit row_item_break
+  _case "the next list item interrupts a row's link" 1 row_item_break
+
+  # 245. The same rule on the README side, where it was wrong before the row
+  #      scan existed at all. An ordered list interrupts a paragraph only
+  #      when it starts at 1, so this one does and the index is unreachable.
+  _scaffold readme_ordered_one
+  printf '# A\n' > "$tmp/readme_ordered_one/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_ordered_one/docs/guide/index.md"
+  printf '[A title\n1. was the year](docs/guide/index.md)\n' \
+    > "$tmp/readme_ordered_one/README.md"
+  _commit readme_ordered_one
+  _case "an ordered list at 1 interrupts a paragraph" 1 readme_ordered_one
+
+  # 246. ...and starting at any other number it does NOT, so the very same
+  #      README keeps its link. Over-clearing here would be a false failure,
+  #      which is the costlier direction of the two.
+  _scaffold readme_ordered_two
+  printf '# A\n' > "$tmp/readme_ordered_two/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_ordered_two/docs/guide/index.md"
+  printf '[A title\n2. was the year](docs/guide/index.md)\n' \
+    > "$tmp/readme_ordered_two/README.md"
+  _commit readme_ordered_two
+  _case "an ordered list at 2 does not interrupt" 0 readme_ordered_two
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]

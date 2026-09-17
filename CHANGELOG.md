@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **A guide index, and a gate that keeps it complete:** `docs/guide/` had no
-  index of its own, so its 147 pages were discovered through the
+  index of its own, so its pages were discovered through the
   hand-maintained `## Documentation` list in `README.md` and the agent skill
-  indexes. 92 of those 147 pages — 63% of the guide — appeared in no
-  reader-facing index at all, including `middleware.md`, `testing.md`,
-  `migrations.md`, `repositories.md`, `jobs.md`, `authorization.md`,
+  indexes. When this was measured, 92 of the guide's 147 pages — 63% of it —
+  appeared in no reader-facing index at all, including `middleware.md`,
+  `testing.md`, `migrations.md`, `repositories.md`, `jobs.md`, `authorization.md`,
   `pagination.md`, `websockets.md`, `rate-limiting.md`, `i18n.md`, `events.md`
   and `oauth.md`. A cold retrieval test over the README list found the
   answering page absent for 11 of 15 ordinary reader questions, while every
