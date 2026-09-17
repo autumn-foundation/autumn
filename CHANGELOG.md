@@ -32,11 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     whole — a dollar in three is 34/33/33, not 33/33/33 and a lost cent.
   - 34 ISO 4217 currencies, covering 0, 2 and 3 minor digits.
   - `autumn_web::money::ledger` is an append-only, double-entry store over
-    three `_autumn_ledger_*` tables. `post` refuses a transaction whose debits
+    three `_autumn_money_*` tables. `post` refuses a transaction whose debits
     do not equal its credits **before its first `INSERT`**, and also refuses
-    mixed currencies, a one-sided transaction, one that moves nothing, a
-    posting whose currency the account does not hold, and a negative amount
-    (the sign belongs to the side, which keeps `i64::MIN` out of the ledger).
+    mixed currencies, a one-sided transaction, a zero line, a posting whose
+    currency the account does not hold, and a negative amount (the sign belongs
+    to the side, which keeps `i64::MIN` out of the ledger). It also refuses a
+    posting that would put an account's balance outside `i64`: the tables are
+    append-only, so such a balance could never be read back or repaired.
+  - **`post` must run inside a transaction.** A call on a bare connection is
+    refused with `LedgerError::NotInTransaction` rather than run weakly: the
+    account locks and the balance check only mean something inside one, and a
+    transaction row written without its postings could never be repaired.
   - Posting twice posts once. Each transaction carries an idempotency key with
     a `UNIQUE` index behind it; the second call returns
     `PostOutcome::Replayed` carrying the first call's transaction. The key can
@@ -54,11 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     account's postings; `ledger::trial_balance` makes the global zero-sum
     invariant queryable from a job or a health check.
   - One configurable policy per account: `Account::disallow_negative()`. The
-    check reads the balance under `SELECT ... FOR UPDATE`, so two concurrent
-    postings cannot both pass it.
+    check reads the balance the posting *would* leave, before anything is
+    written. On Postgres the account rows are held with `SELECT ... FOR
+    UPDATE`, so two concurrent postings cannot both pass it; SQLite has no row
+    lock, so a SQLite app that posts concurrently must retry the transaction.
   - `MoneyError` and `LedgerError` map to real statuses through `AutumnError` —
-    422 for a refused value or posting, 409 for a reused key or a refused
-    negative balance.
+    422 for a refused value or posting, 409 for a reused key, a refused
+    negative balance, or a key another transaction is posting right now.
+  - `Currency` is sealed. An outside implementation could declare an exponent
+    the minor-unit table has no row for and make every conversion wrong by
+    orders of magnitude.
   - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
     runs Docker-free on every push; it includes the issue's fault-injection
     metric — 64 logical charges, each submitted two to four times with a share

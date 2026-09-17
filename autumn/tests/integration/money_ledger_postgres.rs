@@ -21,7 +21,9 @@
 
 #![cfg(feature = "db")]
 
-use autumn_web::money::ledger::{self, Account, IdempotencyKey, LedgerError, Posting, Transaction};
+use autumn_web::money::ledger::{
+    self, Account, IdempotencyKey, LedgerError, PostOutcome, Posting, Transaction,
+};
 use autumn_web::money::{Money, Usd};
 
 use diesel::sql_types::BigInt;
@@ -30,7 +32,6 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{
     AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
 };
-use scoped_futures::ScopedFutureExt as _;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -63,13 +64,22 @@ async fn setup_pool() -> (
     (pool, container)
 }
 
-fn usd(minor: i64) -> Money<Usd> {
+const fn usd(minor: i64) -> Money<Usd> {
     Money::<Usd>::from_minor(minor)
+}
+
+/// `post` refuses to run outside a transaction, so every call here gets one.
+async fn post_tx(
+    conn: &mut AsyncPgConnection,
+    transfer: &Transaction,
+) -> Result<PostOutcome, LedgerError> {
+    conn.transaction::<_, LedgerError, _>(async move |conn| ledger::post(conn, transfer).await)
+        .await
 }
 
 fn charge(amount: i64, order: &str) -> Transaction {
     let postings = vec![
-        Posting::debit("customer:wallet", usd(amount)),
+        Posting::debit("platform:cash", usd(amount)),
         Posting::credit("platform:revenue", usd(amount)),
     ];
     let key = IdempotencyKey::derive(order, &postings);
@@ -78,9 +88,9 @@ fn charge(amount: i64, order: &str) -> Transaction {
 
 async fn open_accounts(pool: &Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("conn");
-    ledger::ensure_account(&mut conn, Account::new("customer:wallet", Usd::currency()))
+    ledger::ensure_account(&mut conn, Account::new("platform:cash", Usd::currency()))
         .await
-        .expect("open the wallet");
+        .expect("open the cash account");
     ledger::ensure_account(&mut conn, Account::new("platform:revenue", Usd::currency()))
         .await
         .expect("open the revenue account");
@@ -109,11 +119,11 @@ async fn assert_books_balance(pool: &Pool<AsyncPgConnection>) {
         .expect("trial balance")
     {
         assert_eq!(
-            total.total.minor(),
+            total.total().minor(),
             0,
             "{} does not balance: {}",
-            total.currency,
-            total.total
+            total.currency(),
+            total.total()
         );
     }
 }
@@ -126,25 +136,23 @@ async fn a_duplicate_charge_posts_once_on_postgres() {
     let mut conn = pool.get().await.expect("conn");
 
     let transfer = charge(2500, "order:9911");
-    let first = ledger::post(&mut conn, &transfer)
-        .await
-        .expect("first post");
+    let first = post_tx(&mut conn, &transfer).await.expect("first post");
     assert!(first.is_posted());
-    let second = ledger::post(&mut conn, &transfer).await.expect("retry");
+    let second = post_tx(&mut conn, &transfer).await.expect("retry");
     assert!(second.is_replayed());
     assert_eq!(second.transaction().id(), first.transaction().id());
 
     // `CAST(SUM(...) AS BIGINT)`: without it Postgres returns NUMERIC and the
     // decoder fails. This is the assertion that pins it.
     assert_eq!(
-        ledger::balance(&mut conn, "customer:wallet")
+        ledger::balance(&mut conn, "platform:cash")
             .await
             .expect("balance")
             .minor(),
         2500
     );
-    assert_eq!(count_rows(&pool, "_autumn_ledger_transactions").await, 1);
-    assert_eq!(count_rows(&pool, "_autumn_ledger_postings").await, 2);
+    assert_eq!(count_rows(&pool, "_autumn_money_transactions").await, 1);
+    assert_eq!(count_rows(&pool, "_autumn_money_postings").await, 2);
     assert!(!first.transaction().posted_at().is_empty());
     assert_books_balance(&pool).await;
 }
@@ -164,8 +172,8 @@ async fn concurrent_duplicate_submits_collapse_to_one_transaction() {
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
             let mut conn = pool.get().await.expect("conn");
-            conn.transaction::<_, LedgerError, _>(|conn| {
-                async move { ledger::post(conn, &charge(2500, "order:9911")).await }.scope_boxed()
+            conn.transaction::<_, LedgerError, _>(async move |conn| {
+                ledger::post(conn, &charge(2500, "order:9911")).await
             })
             .await
         }));
@@ -182,11 +190,11 @@ async fn concurrent_duplicate_submits_collapse_to_one_transaction() {
     assert_eq!(posted, 1, "exactly one submit may write the transaction");
     assert_eq!(replayed, SUBMITS - 1, "the rest observe the first result");
 
-    assert_eq!(count_rows(&pool, "_autumn_ledger_transactions").await, 1);
-    assert_eq!(count_rows(&pool, "_autumn_ledger_postings").await, 2);
+    assert_eq!(count_rows(&pool, "_autumn_money_transactions").await, 1);
+    assert_eq!(count_rows(&pool, "_autumn_money_postings").await, 2);
     let mut conn = pool.get().await.expect("conn");
     assert_eq!(
-        ledger::balance(&mut conn, "customer:wallet")
+        ledger::balance(&mut conn, "platform:cash")
             .await
             .expect("balance")
             .minor(),
@@ -214,8 +222,8 @@ async fn concurrent_distinct_charges_all_land_exactly_once() {
                 let amount = 100 + i64::try_from(index).expect("in range") * 7;
                 let order = format!("order:{index}");
                 let mut conn = pool.get().await.expect("conn");
-                conn.transaction::<_, LedgerError, _>(|conn| {
-                    async move { ledger::post(conn, &charge(amount, &order)).await }.scope_boxed()
+                conn.transaction::<_, LedgerError, _>(async move |conn| {
+                    ledger::post(conn, &charge(amount, &order)).await
                 })
                 .await
             }));
@@ -235,7 +243,7 @@ async fn concurrent_distinct_charges_all_land_exactly_once() {
     }
     assert_eq!(posted, CHARGES, "one write per logical charge");
     assert_eq!(
-        count_rows(&pool, "_autumn_ledger_transactions").await,
+        count_rows(&pool, "_autumn_money_transactions").await,
         i64::try_from(CHARGES).expect("in range")
     );
 
@@ -244,7 +252,7 @@ async fn concurrent_distinct_charges_all_land_exactly_once() {
         .sum();
     let mut conn = pool.get().await.expect("conn");
     assert_eq!(
-        ledger::balance(&mut conn, "customer:wallet")
+        ledger::balance(&mut conn, "platform:cash")
             .await
             .expect("balance")
             .minor(),
@@ -261,9 +269,9 @@ async fn a_negative_balance_check_holds_under_concurrency() {
     let (pool, _container) = setup_pool().await;
     {
         let mut conn = pool.get().await.expect("conn");
-        ledger::ensure_account(&mut conn, Account::new("customer:wallet", Usd::currency()))
+        ledger::ensure_account(&mut conn, Account::new("platform:cash", Usd::currency()))
             .await
-            .expect("open the wallet");
+            .expect("open the cash account");
         ledger::ensure_account(
             &mut conn,
             Account::new("platform:float", Usd::currency()).disallow_negative(),
@@ -274,10 +282,10 @@ async fn a_negative_balance_check_holds_under_concurrency() {
         // Fund the float with exactly one payout's worth.
         let funding = vec![
             Posting::debit("platform:float", usd(2500)),
-            Posting::credit("customer:wallet", usd(2500)),
+            Posting::credit("platform:cash", usd(2500)),
         ];
         let key = IdempotencyKey::derive("funding", &funding);
-        ledger::post(&mut conn, &Transaction::new(key, funding))
+        post_tx(&mut conn, &Transaction::new(key, funding))
             .await
             .expect("funding");
     }
@@ -288,14 +296,13 @@ async fn a_negative_balance_check_holds_under_concurrency() {
         handles.push(tokio::spawn(async move {
             let payout = vec![
                 Posting::credit("platform:float", usd(2500)),
-                Posting::debit("customer:wallet", usd(2500)),
+                Posting::debit("platform:cash", usd(2500)),
             ];
             // Distinct keys: this is a race on the balance, not on idempotency.
             let key = IdempotencyKey::new(format!("payout:{attempt}")).expect("key");
             let mut conn = pool.get().await.expect("conn");
-            conn.transaction::<_, LedgerError, _>(|conn| {
-                async move { ledger::post(conn, &Transaction::new(key, payout)).await }
-                    .scope_boxed()
+            conn.transaction::<_, LedgerError, _>(async move |conn| {
+                ledger::post(conn, &Transaction::new(key, payout)).await
             })
             .await
         }));
@@ -331,16 +338,16 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
     open_accounts(&pool).await;
     {
         let mut conn = pool.get().await.expect("conn");
-        ledger::post(&mut conn, &charge(2500, "order:1"))
+        post_tx(&mut conn, &charge(2500, "order:1"))
             .await
             .expect("post");
     }
 
     for statement in [
-        "UPDATE _autumn_ledger_postings SET amount_minor = 1",
-        "DELETE FROM _autumn_ledger_postings",
-        "UPDATE _autumn_ledger_transactions SET memo = 'rewritten'",
-        "DELETE FROM _autumn_ledger_transactions",
+        "UPDATE _autumn_money_postings SET amount_minor = 1",
+        "DELETE FROM _autumn_money_postings",
+        "UPDATE _autumn_money_transactions SET memo = 'rewritten'",
+        "DELETE FROM _autumn_money_transactions",
     ] {
         let mut conn = pool.get().await.expect("conn");
         let result = conn.batch_execute(statement).await;
@@ -352,7 +359,7 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
 
     let mut conn = pool.get().await.expect("conn");
     assert_eq!(
-        ledger::balance(&mut conn, "customer:wallet")
+        ledger::balance(&mut conn, "platform:cash")
             .await
             .expect("balance")
             .minor(),
@@ -371,16 +378,14 @@ async fn an_unbalanced_transaction_never_reaches_postgres() {
     let transfer = Transaction::new(
         IdempotencyKey::new("bad-1").expect("key"),
         vec![
-            Posting::debit("customer:wallet", usd(2500)),
+            Posting::debit("platform:cash", usd(2500)),
             Posting::credit("platform:revenue", usd(2499)),
         ],
     );
-    let error = ledger::post(&mut conn, &transfer)
-        .await
-        .expect_err("refused");
+    let error = post_tx(&mut conn, &transfer).await.expect_err("refused");
     assert!(matches!(error, LedgerError::Unbalanced { .. }), "{error}");
-    assert_eq!(count_rows(&pool, "_autumn_ledger_transactions").await, 0);
-    assert_eq!(count_rows(&pool, "_autumn_ledger_postings").await, 0);
+    assert_eq!(count_rows(&pool, "_autumn_money_transactions").await, 0);
+    assert_eq!(count_rows(&pool, "_autumn_money_postings").await, 0);
 }
 
 #[tokio::test]
@@ -391,12 +396,12 @@ async fn the_same_key_for_different_money_is_refused_on_postgres() {
     let mut conn = pool.get().await.expect("conn");
 
     let key = IdempotencyKey::new("order:9911").expect("key");
-    ledger::post(
+    post_tx(
         &mut conn,
         &Transaction::new(
             key.clone(),
             vec![
-                Posting::debit("customer:wallet", usd(2500)),
+                Posting::debit("platform:cash", usd(2500)),
                 Posting::credit("platform:revenue", usd(2500)),
             ],
         ),
@@ -404,12 +409,12 @@ async fn the_same_key_for_different_money_is_refused_on_postgres() {
     .await
     .expect("first post");
 
-    let error = ledger::post(
+    let error = post_tx(
         &mut conn,
         &Transaction::new(
             key,
             vec![
-                Posting::debit("customer:wallet", usd(9900)),
+                Posting::debit("platform:cash", usd(9900)),
                 Posting::credit("platform:revenue", usd(9900)),
             ],
         ),
@@ -417,6 +422,6 @@ async fn the_same_key_for_different_money_is_refused_on_postgres() {
     .await
     .expect_err("a reused key for different money is a conflict");
     assert!(matches!(error, LedgerError::KeyReuse { .. }), "{error}");
-    assert_eq!(count_rows(&pool, "_autumn_ledger_transactions").await, 1);
+    assert_eq!(count_rows(&pool, "_autumn_money_transactions").await, 1);
     assert_books_balance(&pool).await;
 }

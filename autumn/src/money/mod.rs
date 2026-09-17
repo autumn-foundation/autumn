@@ -120,10 +120,18 @@ use rust_decimal::prelude::ToPrimitive as _;
 /// `i64::pow`, which can overflow.
 const MAX_EXPONENT: u32 = 4;
 
+/// The most shares [`Money::split`] will produce.
+///
+/// `split` takes a count rather than a slice, so it is the one entry point that
+/// allocates from a number a caller supplies. A request asking for a billion
+/// shares is a bad request, not an out-of-memory abort.
+pub const MAX_PARTS: usize = 10_000;
+
 /// The number of minor units in one major unit.
 ///
-/// The `_` arm cannot be reached: `currencies!` asserts every exponent is at
-/// most [`MAX_EXPONENT`] at compile time.
+/// The table is closed, and it is total: [`Currency`] is sealed, and
+/// `currencies!` asserts every exponent is at most [`MAX_EXPONENT`] at compile
+/// time. The `_` arm is therefore the exponent-4 row, not a fallback.
 const fn scale_for(exponent: u32) -> i64 {
     match exponent {
         0 => 1,
@@ -136,13 +144,34 @@ const fn scale_for(exponent: u32) -> i64 {
 
 // ── Currency ────────────────────────────────────────────────────────────────
 
+mod sealed {
+    /// Seals [`Currency`](super::Currency).
+    ///
+    /// Only the markers in this module implement it, so `EXPONENT` is always
+    /// one [`scale_for`](super::scale_for) has a row for. An outside
+    /// implementation with `EXPONENT = 8` would otherwise get the wrong scale
+    /// and make every conversion wrong by four orders of magnitude.
+    pub trait Sealed {}
+}
+
 /// One currency, as a type.
 ///
 /// Implemented by the zero-sized markers below ([`Usd`], [`Eur`], …). The type
 /// parameter of [`Money<C>`] is what makes a cross-currency operation a compile
 /// error.
+///
+/// The trait is sealed. To add a currency, add it to the table in this module.
 pub trait Currency:
-    Copy + Clone + fmt::Debug + PartialEq + Eq + core::hash::Hash + Send + Sync + 'static
+    sealed::Sealed
+    + Copy
+    + Clone
+    + fmt::Debug
+    + PartialEq
+    + Eq
+    + core::hash::Hash
+    + Send
+    + Sync
+    + 'static
 {
     /// The ISO 4217 alphabetic code, for example `"USD"`.
     const CODE: &'static str;
@@ -265,6 +294,8 @@ impl fmt::Display for CurrencyCode {
 macro_rules! currencies {
     ($( $ty:ident => ($code:literal, $exp:literal, $sym:literal) ),* $(,)?) => {
         $(
+            impl sealed::Sealed for $ty {}
+
             impl Currency for $ty {
                 const CODE: &'static str = $code;
                 const EXPONENT: u32 = $exp;
@@ -473,12 +504,11 @@ currencies! {
 /// How to turn a value with more precision than the currency into minor units.
 ///
 /// There is no implicit choice: every conversion that can round names one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Rounding {
     /// Ties go away from zero. `1.005` becomes `1.01`, `-1.005` becomes
-    /// `-1.01`. The common commercial rule, and the default.
-    #[default]
+    /// `-1.01`. The common commercial rule.
     HalfUp,
     /// Ties go to the even digit. `1.005` becomes `1.00`, `1.015` becomes
     /// `1.02`. Removes the upward bias of [`Rounding::HalfUp`] over many values.
@@ -529,8 +559,8 @@ pub enum MoneyError {
         /// The code that was supplied.
         code: String,
     },
-    /// The value has more precision than the currency, and the caller refused
-    /// to round.
+    /// The value has more precision than the currency. The caller refused to
+    /// round.
     Inexact {
         /// The value that does not fit.
         value: String,
@@ -614,8 +644,11 @@ impl<C: Currency> Money<C> {
     }
 
     /// This value's currency, runtime-tagged.
+    ///
+    /// Takes a receiver, like [`AnyMoney::currency`]. For the currency of a
+    /// type rather than a value, call the marker: `Usd::currency()`.
     #[must_use]
-    pub fn currency() -> CurrencyCode {
+    pub fn currency(self) -> CurrencyCode {
         C::currency()
     }
 
@@ -769,9 +802,13 @@ impl<C: Currency> Money<C> {
     /// Split the amount by `weights`, and lose nothing.
     ///
     /// The parts always sum back to `self`. Each part is the largest whole
-    /// number of minor units at or below its exact share; the minor units left
+    /// number of minor units at or below its exact share. The minor units left
     /// over go one each to the parts with the largest remainders, lowest index
     /// first. This is the largest-remainder method.
+    ///
+    /// Shares floor toward minus infinity, so a split is not sign-symmetric:
+    /// `100` over three equal weights is `[34, 33, 33]`, and `-100` is
+    /// `[-33, -33, -34]`. Both sum back exactly.
     ///
     /// ```rust
     /// use autumn_web::money::{Money, Usd};
@@ -854,9 +891,14 @@ impl<C: Currency> Money<C> {
     ///
     /// # Errors
     ///
-    /// The same as [`Money::allocate`]. `parts` of zero is
-    /// [`MoneyError::InvalidWeights`].
+    /// [`MoneyError::InvalidWeights`] when `parts` is zero or above
+    /// [`MAX_PARTS`]. The bound is checked **before** the weights are built: a
+    /// `parts` taken from a request must not be able to ask for an allocation
+    /// the machine cannot hold.
     pub fn split(self, parts: usize) -> Result<Vec<Self>, MoneyError> {
+        if parts == 0 || parts > MAX_PARTS {
+            return Err(MoneyError::InvalidWeights);
+        }
         self.allocate(&vec![1_i64; parts])
     }
 }

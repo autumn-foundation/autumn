@@ -95,7 +95,29 @@ fn a_transaction_that_moves_nothing_is_refused() {
         key("k1"),
         vec![Posting::debit("a", usd(0)), Posting::credit("b", usd(0))],
     );
-    assert!(matches!(transfer.validate(), Err(LedgerError::ZeroValue)));
+    assert!(matches!(
+        transfer.validate(),
+        Err(LedgerError::ZeroPosting { .. })
+    ));
+}
+
+/// A zero line has no side the store can read back: a zero debit and a zero
+/// credit both store as `0`, and `Side::of(0)` is a debit. Refused rather than
+/// written as a posting that changes side on the way out.
+#[test]
+fn a_zero_line_inside_a_real_transaction_is_refused() {
+    let transfer = Transaction::new(
+        key("k1"),
+        vec![
+            Posting::debit("a", usd(2500)),
+            Posting::credit("b", usd(2500)),
+            Posting::credit("c", usd(0)),
+        ],
+    );
+    assert!(matches!(
+        transfer.validate(),
+        Err(LedgerError::ZeroPosting { account }) if account == "c"
+    ));
 }
 
 #[test]
@@ -358,6 +380,47 @@ fn errors_carry_the_status_a_handler_should_return() {
     assert_eq!(
         LedgerError::Database(diesel::result::Error::NotFound).http_status(),
         StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        LedgerError::Conflict {
+            key: "k".to_owned()
+        }
+        .http_status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        LedgerError::NotInTransaction.http_status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        LedgerError::ZeroPosting {
+            account: "a".to_owned()
+        }
+        .http_status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// `MAX_PARTS` is checked before the weights are built, so a `parts` taken from
+/// a request cannot ask for an allocation the machine has to abort on.
+#[test]
+fn splitting_into_more_parts_than_allowed_is_refused() {
+    use crate::money::{MAX_PARTS, MoneyError};
+
+    assert_eq!(
+        Money::<Usd>::from_minor(100).split(usize::MAX),
+        Err(MoneyError::InvalidWeights)
+    );
+    assert_eq!(
+        Money::<Usd>::from_minor(100).split(MAX_PARTS.saturating_add(1)),
+        Err(MoneyError::InvalidWeights)
+    );
+    assert_eq!(
+        Money::<Usd>::from_minor(100)
+            .split(MAX_PARTS)
+            .unwrap()
+            .len(),
+        MAX_PARTS
     );
 }
 

@@ -256,10 +256,11 @@ where
         }
 
         // Money (#1837). A value that cannot be built or combined, and a
-        // posting the double-entry rules refuse, are both malformed input
-        // rather than a server fault. A reused idempotency key and a refused
-        // negative balance are state conflicts, so they take 409. Mapped by
-        // downcast for the reason given on the Constela arm above.
+        // posting the double-entry rules refuse, are malformed input rather
+        // than a server fault, so they take 422. A reused idempotency key and
+        // a refused negative balance are state conflicts, so they take 409.
+        // An overflow is a value the server built and could not hold, so it
+        // stays a 500. Mapped by downcast for the reason on the Constela arm.
         if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
             status = money_err.http_status();
         }

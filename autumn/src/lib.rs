@@ -422,16 +422,17 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
-/// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
-///
-/// See [`ledger`] module documentation for the full API (issue #1699).
 /// Typed money and an append-only, double-entry money ledger.
 ///
 /// See the [`money`] module documentation for the value type, the rounding
-/// rules and the ledger API (issue #1837). Not to be confused with [`ledger`],
-/// which records the history of a `#[repository]` row.
+/// rules and the ledger API (issue #1837). Not to be confused with [`ledger`]
+/// below, which records the history of a `#[repository]` row.
 pub mod money;
 
+/// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
+///
+/// See [`ledger`] module documentation for the full API (issue #1699). This
+/// records the history of a row. For money, see [`money`].
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are

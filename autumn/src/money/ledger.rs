@@ -37,11 +37,13 @@
 //! # Signs
 //!
 //! A posting holds a signed amount. A **debit is positive** and a **credit is
-//! negative**, and a balance is the sum of an account's postings. An account
-//! that holds money for somebody else (a customer wallet) therefore runs
-//! negative as it fills, which is what keeps the books in balance. Build
-//! postings with [`Posting::debit`] and [`Posting::credit`] and the sign is
-//! handled for you.
+//! negative**, and a balance is the sum of an account's postings.
+//!
+//! So a charge debits what you gained (`platform:cash`) and credits where it
+//! came from (`platform:revenue`). An account that holds money for somebody
+//! else — a customer wallet — is credited as it fills, so its balance runs
+//! negative: that is the money you owe them. Build postings with
+//! [`Posting::debit`] and [`Posting::credit`] and the sign is handled for you.
 //!
 //! # Example
 //!
@@ -54,7 +56,7 @@
 //! # async fn example(mut db: Db) -> AutumnResult<()> {
 //! let charge = Money::<Usd>::from_major(25)?;
 //! let postings = vec![
-//!     Posting::debit("customer:42:wallet", charge),
+//!     Posting::debit("platform:cash", charge),
 //!     Posting::credit("platform:revenue", charge),
 //! ];
 //! // The key comes from the postings, so a retry of the same charge collapses.
@@ -64,9 +66,9 @@
 //! let outcome = db
 //!     .tx(|conn| {
 //!         async move {
-//!             let wallet = Account::new("customer:42:wallet", Usd::currency());
+//!             let cash = Account::new("platform:cash", Usd::currency());
 //!             let revenue = Account::new("platform:revenue", Usd::currency());
-//!             ledger::ensure_account(conn, wallet).await?;
+//!             ledger::ensure_account(conn, cash).await?;
 //!             ledger::ensure_account(conn, revenue).await?;
 //!             // ... the application rows this charge justifies go here ...
 //!             ledger::post(conn, &transfer).await
@@ -91,12 +93,16 @@ use sha2::Digest as _;
 use crate::db::RuntimeConnection;
 use crate::money::{AnyMoney, CurrencyCode, MoneyError};
 
-/// The account table. A framework table, hence the `_autumn_` prefix.
-pub const ACCOUNTS_TABLE: &str = "_autumn_ledger_accounts";
+/// The account table.
+///
+/// `_autumn_money_`, not `_autumn_ledger_`: [`crate::ledger`] already owns
+/// `_autumn_ledger_revisions` and `_autumn_ledger_high_water`, and two ledgers
+/// sharing a table prefix is how a reader ends up in the wrong one.
+pub const ACCOUNTS_TABLE: &str = "_autumn_money_accounts";
 /// The transaction table.
-pub const TRANSACTIONS_TABLE: &str = "_autumn_ledger_transactions";
+pub const TRANSACTIONS_TABLE: &str = "_autumn_money_transactions";
 /// The posting table.
-pub const POSTINGS_TABLE: &str = "_autumn_ledger_postings";
+pub const POSTINGS_TABLE: &str = "_autumn_money_postings";
 
 /// The longest account identifier the ledger accepts.
 const MAX_ACCOUNT_ID: usize = 255;
@@ -120,9 +126,17 @@ fn ph(_n: usize) -> String {
     "?".to_owned()
 }
 
-// Row lock on one account row. On Postgres `FOR UPDATE` holds the row until the
-// enclosing transaction ends. On `SQLite` the writer lock the transaction
-// already holds excludes every other writer, so the clause degrades to nothing.
+// Row lock on one account row.
+//
+// On Postgres `FOR UPDATE` holds the row until the enclosing transaction ends,
+// which is what serializes two posts over one account.
+//
+// `SQLite` has no row lock, so the clause is empty there. `Db::tx` opens a
+// DEFERRED transaction, so two concurrent posts read the same snapshot and the
+// second one to write gets `SQLITE_BUSY_SNAPSHOT` — an error the busy handler
+// does not queue. A `SQLite` app that posts concurrently must therefore retry
+// the whole transaction. `post` refuses to run outside a transaction on either
+// backend, so the read and the write are at least always one unit.
 #[cfg(not(feature = "sqlite"))]
 const FOR_UPDATE: &str = " FOR UPDATE";
 #[cfg(feature = "sqlite")]
@@ -152,8 +166,12 @@ pub enum LedgerError {
     },
     /// The transaction has no debit, or no credit. A transfer needs both.
     OneSided,
-    /// Every posting is zero, so the transaction moves no money.
-    ZeroValue,
+    /// One posting is zero. A line that moves nothing has no side to store, so
+    /// it would read back as a debit whichever way it was written.
+    ZeroPosting {
+        /// The account the posting names.
+        account: String,
+    },
     /// The postings are not all in one currency. This slice does not convert.
     MixedCurrencies {
         /// The currency of the first posting.
@@ -202,6 +220,29 @@ pub enum LedgerError {
         /// The account's currency.
         currency: &'static str,
     },
+    /// [`post`] was called outside a database transaction.
+    ///
+    /// The account locks and the balance check are only worth anything inside
+    /// one, so this is refused rather than run weakly. Wrap the call in
+    /// [`Db::tx`](crate::db::Db::tx).
+    NotInTransaction,
+    /// Another transaction is posting this idempotency key right now.
+    ///
+    /// Only reachable above `READ COMMITTED`, where this transaction's snapshot
+    /// cannot see the row the other one just committed. Retry the whole
+    /// transaction; [`Db::tx_with`](crate::db::Db::tx_with) does that for you.
+    Conflict {
+        /// The key that is being posted elsewhere.
+        key: String,
+    },
+    /// A stored transaction has no postings.
+    ///
+    /// Only possible if something wrote to the tables around [`post`]. Reported
+    /// rather than returned as a transaction that moved nothing.
+    EmptyTransaction {
+        /// The stored transaction's identifier.
+        id: String,
+    },
     /// The database refused the statement.
     Database(diesel::result::Error),
 }
@@ -217,8 +258,12 @@ impl LedgerError {
         use axum::http::StatusCode;
         match self {
             Self::Money(err) => err.http_status(),
-            Self::KeyReuse { .. } | Self::NegativeBalance { .. } => StatusCode::CONFLICT,
-            Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::KeyReuse { .. } | Self::NegativeBalance { .. } | Self::Conflict { .. } => {
+                StatusCode::CONFLICT
+            }
+            Self::NotInTransaction | Self::EmptyTransaction { .. } | Self::Database(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
@@ -242,7 +287,12 @@ impl fmt::Display for LedgerError {
                 "a ledger transaction takes 2 to {MAX_POSTINGS} postings, not {count}"
             ),
             Self::OneSided => f.write_str("a ledger transaction needs a debit and a credit"),
-            Self::ZeroValue => f.write_str("a ledger transaction must move money"),
+            Self::ZeroPosting { account } => {
+                write!(
+                    f,
+                    "the posting to {account} moves nothing; leave the line out"
+                )
+            }
             Self::MixedCurrencies { expected, found } => write!(
                 f,
                 "a ledger transaction is in one currency: expected {expected}, found {found}"
@@ -274,6 +324,16 @@ impl fmt::Display for LedgerError {
                 "account {account} refuses a negative balance, and this posting \
                  leaves {balance} {currency} minor units"
             ),
+            Self::NotInTransaction => f.write_str(
+                "a ledger posting must run inside a database transaction; wrap the call in Db::tx",
+            ),
+            Self::Conflict { key } => write!(
+                f,
+                "another transaction is posting idempotency key {key}; retry this transaction"
+            ),
+            Self::EmptyTransaction { id } => {
+                write!(f, "stored ledger transaction {id} has no postings")
+            }
             Self::Database(err) => write!(f, "ledger database error: {err}"),
         }
     }
@@ -305,7 +365,7 @@ impl From<diesel::result::Error> for LedgerError {
 
 /// One account in the ledger.
 ///
-/// The identifier is yours: `"customer:42:wallet"`, `"platform:revenue"`. It is
+/// The identifier is yours: `"platform:cash"`, `"platform:revenue"`. It is
 /// the primary key, so pick a shape you can rebuild from your own rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -426,7 +486,8 @@ impl Posting {
         &self.account_id
     }
 
-    /// The amount, without a sign.
+    /// The amount as supplied. [`Transaction::validate`] refuses a negative
+    /// one, so a validated posting's amount is at or above zero.
     #[must_use]
     pub const fn amount(&self) -> AnyMoney {
         self.amount
@@ -572,15 +633,6 @@ impl Transaction {
         &self.memo
     }
 
-    /// The currency every posting is in.
-    ///
-    /// # Errors
-    ///
-    /// See [`Transaction::validate`].
-    pub fn currency(&self) -> Result<CurrencyCode, LedgerError> {
-        self.validate().map(|checked| checked.currency)
-    }
-
     /// Check the double-entry rules, and report the first that fails.
     ///
     /// [`post`] calls this before it writes anything, so an unbalanced
@@ -594,17 +646,17 @@ impl Transaction {
     /// * [`LedgerError::MixedCurrencies`] — the postings are not all in one
     ///   currency.
     /// * [`LedgerError::OneSided`] — no debit, or no credit.
-    /// * [`LedgerError::ZeroValue`] — every posting is zero.
+    /// * [`LedgerError::ZeroPosting`] — a line that moves nothing.
     /// * [`LedgerError::Unbalanced`] — the debits do not equal the credits.
     /// * [`LedgerError::InvalidText`] — an empty or over-long account id, key
     ///   or memo.
     /// * [`LedgerError::Money`] — the postings sum past `i64`.
     pub fn validate(&self) -> Result<Validated, LedgerError> {
         check_text("idempotency key", self.key.as_str(), MAX_IDEMPOTENCY_KEY)?;
-        if !self.memo.is_empty() && self.memo.len() > MAX_MEMO {
+        if self.memo.len() > MAX_MEMO {
             return Err(LedgerError::InvalidText {
                 field: "memo",
-                reason: "is longer than 1024 bytes",
+                reason: "is too long",
             });
         }
         if self.postings.len() < 2 || self.postings.len() > MAX_POSTINGS {
@@ -630,6 +682,11 @@ impl Transaction {
                 Some(_) => {}
             }
             let minor = posting.signed_minor()?;
+            if minor == 0 {
+                return Err(LedgerError::ZeroPosting {
+                    account: posting.account_id.clone(),
+                });
+            }
             if minor > 0 {
                 debits = debits.checked_add(minor).ok_or(MoneyError::Overflow)?;
             } else {
@@ -640,9 +697,8 @@ impl Transaction {
         let Some(currency) = currency else {
             return Err(LedgerError::PostingCount { count: 0 });
         };
-        if debits == 0 && credits == 0 {
-            return Err(LedgerError::ZeroValue);
-        }
+        // Not reachable with both totals zero: every line is non-zero and
+        // there are at least two, so one side always has something in it.
         if debits == 0 || credits == 0 {
             return Err(LedgerError::OneSided);
         }
@@ -803,12 +859,24 @@ impl PostOutcome {
 }
 
 /// One currency's total across the whole ledger. Every total must be zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CurrencyTotal {
+    currency: CurrencyCode,
+    total: AnyMoney,
+}
+
+impl CurrencyTotal {
     /// The currency.
-    pub currency: CurrencyCode,
-    /// The sum of every posting in that currency.
-    pub total: AnyMoney,
+    #[must_use]
+    pub const fn currency(self) -> CurrencyCode {
+        self.currency
+    }
+
+    /// The sum of every posting in that currency. It must be zero.
+    #[must_use]
+    pub const fn total(self) -> AnyMoney {
+        self.total
+    }
 }
 
 // ── Hashing helpers ─────────────────────────────────────────────────────────
@@ -917,6 +985,14 @@ struct PostingRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct AccountTotalRow {
+    #[diesel(sql_type = Text)]
+    account_id: String,
+    #[diesel(sql_type = BigInt)]
+    total: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct TotalRow {
     #[diesel(sql_type = BigInt)]
     total: i64,
@@ -945,14 +1021,16 @@ impl AccountRow {
 }
 
 impl PostingRow {
-    /// `post` never writes `i64::MIN`, so `saturating_abs` cannot change a
-    /// stored amount.
+    /// `post` never writes `i64::MIN`, because a negative amount is refused
+    /// before anything negates it. A stored one therefore came from outside
+    /// the ledger, and is reported rather than folded to `i64::MAX`.
     fn into_posting(self) -> Result<Posting, LedgerError> {
+        let magnitude = self
+            .amount_minor
+            .checked_abs()
+            .ok_or(MoneyError::Overflow)?;
         Ok(Posting {
-            amount: AnyMoney::new(
-                self.amount_minor.saturating_abs(),
-                parse_currency(&self.currency)?,
-            ),
+            amount: AnyMoney::new(magnitude, parse_currency(&self.currency)?),
             side: Side::of(self.amount_minor),
             account_id: self.account_id,
         })
@@ -1107,12 +1185,19 @@ async fn lock_account(
 /// money justifies. Everything the call writes then commits or rolls back with
 /// them, and the row locks it takes are held for the whole transaction.
 ///
-/// The order of work is what makes the guarantees hold:
+/// # It must run inside a transaction
+///
+/// A call outside one is refused with [`LedgerError::NotInTransaction`]. The
+/// account locks and the balance check only mean something while a transaction
+/// holds them, and a partial write cannot be repaired afterwards: the tables
+/// are append-only, so a transaction row with no postings would stay in the
+/// books for ever. The framework refuses rather than run the weak version.
+///
+/// # The order of work
 ///
 /// 1. [`Transaction::validate`] checks the double-entry rules.
-/// 2. Each account named by a posting is read under a row lock, in sorted order
-///    so two concurrent postings over the same accounts cannot deadlock. The
-///    lock is held for the rest of the call.
+/// 2. Each account named by a posting is read under a row lock, in sorted
+///    order. The lock is held until the enclosing transaction ends.
 /// 3. The idempotency key is read. When it is taken, the money was already
 ///    posted: that transaction is returned as [`PostOutcome::Replayed`].
 /// 4. Any account that refuses a negative balance has the balance this
@@ -1120,8 +1205,18 @@ async fn lock_account(
 /// 5. Only now is anything written: the transaction row with
 ///    `ON CONFLICT DO NOTHING` on the key, then the postings.
 ///
-/// Every refusal therefore happens before the first `INSERT`, so a rejected
-/// post leaves no row behind even when it is called outside a transaction.
+/// Every refusal happens before the first `INSERT`, so a rejected post leaves
+/// no row behind, and a failure after it rolls back with the transaction.
+///
+/// # Two posts in one transaction
+///
+/// The locks are sorted **within** one call, not across a transaction. Two
+/// calls in one transaction take two sorted runs, and the pair is not sorted —
+/// so two transactions that each post twice over overlapping accounts, in
+/// opposite order, can deadlock. Use [`Db::tx_with`](crate::db::Db::tx_with),
+/// which retries a deadlock, when one transaction posts more than once.
+/// [`ensure_account`] takes no ordering at all, so open accounts at boot rather
+/// than beside a post.
 ///
 /// # Errors
 ///
@@ -1133,6 +1228,9 @@ pub async fn post(
     transfer: &Transaction,
 ) -> Result<PostOutcome, LedgerError> {
     let checked = transfer.validate()?;
+    if transaction_depth(conn)? == 0 {
+        return Err(LedgerError::NotInTransaction);
+    }
 
     // Sorted and deduplicated, so every caller takes the locks in one order.
     let mut wanted: BTreeSet<&str> = BTreeSet::new();
@@ -1168,7 +1266,7 @@ pub async fn post(
         return Ok(PostOutcome::Replayed(existing.transaction));
     }
 
-    check_negative_balances(conn, &accounts, transfer).await?;
+    check_resulting_balances(conn, &accounts, transfer).await?;
 
     // Two attempts, not a loop without a bound. The account locks serialize
     // two posts over the same accounts, so the read above is normally the
@@ -1209,9 +1307,16 @@ pub async fn post(
                     }
                     return Ok(PostOutcome::Replayed(existing.transaction));
                 }
-                // The other caller rolled back. Try the insert once more.
+                // The other caller rolled back, and the key is free again.
                 None if attempt == 0 => continue,
-                None => return Err(LedgerError::Database(diesel::result::Error::NotFound)),
+                // Twice in a row means the row is committed but this
+                // transaction's snapshot predates it, which only happens above
+                // READ COMMITTED. The caller must retry the transaction.
+                None => {
+                    return Err(LedgerError::Conflict {
+                        key: transfer.key().as_str().to_owned(),
+                    });
+                }
             }
         }
 
@@ -1225,7 +1330,20 @@ pub async fn post(
         return Ok(PostOutcome::Posted(stored.transaction));
     }
 
-    Err(LedgerError::Database(diesel::result::Error::NotFound))
+    // Unreachable: the loop returns on every path but the first attempt's
+    // `continue`. Spelled out rather than left to a panic.
+    Err(LedgerError::Conflict {
+        key: transfer.key().as_str().to_owned(),
+    })
+}
+
+/// How deep the connection is in a transaction. Zero means autocommit.
+fn transaction_depth(conn: &mut RuntimeConnection) -> Result<u32, LedgerError> {
+    use diesel_async::TransactionManager as _;
+
+    type Manager = <RuntimeConnection as diesel_async::AsyncConnection>::TransactionManager;
+    let depth = Manager::transaction_manager_status_mut(conn).transaction_depth()?;
+    Ok(depth.map_or(0, std::num::NonZeroU32::get))
 }
 
 /// Write one transaction's postings, in the order they were supplied.
@@ -1260,23 +1378,29 @@ async fn write_postings(
     Ok(())
 }
 
-/// Reject a transaction that takes an account below zero, when the account says
-/// so.
+/// Check what this transaction would leave in every account it touches.
 ///
-/// Reads the balance the transaction *would* leave: the stored balance plus
-/// this transaction's own postings for that account. The account row is already
-/// locked, so no other poster can change that balance in between. Nothing has
-/// been written yet either, so a refusal leaves no row to roll back.
-async fn check_negative_balances(
+/// Two things are checked, in one query rather than one per account:
+///
+/// * **Range.** A balance that leaves `i64` cannot be read back — the `SUM`
+///   cast fails on both backends — and the tables are append-only, so the
+///   account would stay unreadable for ever. Refused here instead, which keeps
+///   every stored balance inside `i64` by induction from an empty ledger.
+/// * **Sign.** An account that refuses a negative balance gets the balance this
+///   transaction would leave, not the one it has.
+///
+/// The account rows are already locked and nothing is written yet, so the
+/// figure is exact and a refusal leaves no row to roll back.
+async fn check_resulting_balances(
     conn: &mut RuntimeConnection,
     accounts: &BTreeMap<String, Account>,
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
+    let ids: Vec<&str> = accounts.keys().map(String::as_str).collect();
+    let stored = sum_postings_by_account(conn, &ids).await?;
+
     for account in accounts.values() {
-        if account.allow_negative {
-            continue;
-        }
-        let mut balance = sum_postings(conn, &account.id).await?;
+        let mut balance = stored.get(&account.id).copied().unwrap_or(0);
         for posting in transfer.postings() {
             if posting.account_id() == account.id {
                 balance = balance
@@ -1284,7 +1408,7 @@ async fn check_negative_balances(
                     .ok_or(MoneyError::Overflow)?;
             }
         }
-        if balance < 0 {
+        if balance < 0 && !account.allow_negative {
             return Err(LedgerError::NegativeBalance {
                 account: account.id.clone(),
                 balance,
@@ -1295,12 +1419,40 @@ async fn check_negative_balances(
     Ok(())
 }
 
+/// The stored balance of each named account, in one statement.
+///
+/// An account with no postings is absent from the map rather than zero, which
+/// the caller reads as zero.
+async fn sum_postings_by_account(
+    conn: &mut RuntimeConnection,
+    ids: &[&str],
+) -> Result<BTreeMap<String, i64>, LedgerError> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (1..=ids.len()).map(ph).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT account_id, CAST(COALESCE(SUM(amount_minor), 0) AS BIGINT) AS total \
+         FROM {POSTINGS_TABLE} WHERE account_id IN ({placeholders}) GROUP BY account_id"
+    );
+    let mut query = diesel::sql_query(sql).into_boxed();
+    for id in ids {
+        query = query.bind::<Text, _>((*id).to_owned());
+    }
+    let rows: Vec<AccountTotalRow> = query.load(conn).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.account_id, row.total))
+        .collect())
+}
+
 /// The balance of `account_id`: the sum of its postings.
 ///
 /// # Errors
 ///
-/// [`LedgerError::UnknownAccount`] when there is no such account, and
-/// [`LedgerError::Database`] when the statement fails.
+/// [`LedgerError::UnknownAccount`] when there is no such account,
+/// [`LedgerError::Money`] when the stored currency code is not one this build
+/// knows, and [`LedgerError::Database`] when the statement fails.
 pub async fn balance(
     conn: &mut RuntimeConnection,
     account_id: &str,
@@ -1378,6 +1530,9 @@ async fn load_transaction(
         .bind::<Text, _>(row.id.clone())
         .load(conn)
         .await?;
+    if posting_rows.is_empty() {
+        return Err(LedgerError::EmptyTransaction { id: row.id });
+    }
     let postings = posting_rows
         .into_iter()
         .map(PostingRow::into_posting)

@@ -9,6 +9,7 @@ The ledger in this page is the **money** ledger. It is not
 [`autumn_web::ledger`](ledgered-entities.md), which records the history of a
 `#[repository]` row.
 
+- [Migrations](#migrations)
 - [The money value](#the-money-value)
 - [Rounding and splitting](#rounding-and-splitting)
 - [The ledger](#the-ledger)
@@ -16,6 +17,16 @@ The ledger in this page is the **money** ledger. It is not
 - [Balances](#balances)
 - [What the framework enforces](#what-the-framework-enforces)
 - [Not in this slice](#not-in-this-slice)
+
+## Migrations
+
+The ledger keeps three framework tables — `_autumn_money_accounts`,
+`_autumn_money_transactions` and `_autumn_money_postings`. They ship in
+Autumn's own migration set, so `autumn migrate` creates them with the rest of
+the framework schema. There is nothing to add to your own `migrations/`.
+
+They live in the **control** database. A sharded app posts money against the
+control database, not against a shard.
 
 ## The money value
 
@@ -116,11 +127,10 @@ use autumn_web::money::Usd;
 use autumn_web::prelude::*;
 
 # async fn open(conn: &mut autumn_web::db::RuntimeConnection) -> AutumnResult<()> {
-ledger::ensure_account(conn, Account::new("customer:42:wallet", Usd::currency())).await?;
+ledger::ensure_account(conn, Account::new("platform:cash", Usd::currency())).await?;
 ledger::ensure_account(conn, Account::new("platform:revenue", Usd::currency())).await?;
 
-// An account that must never go below zero. The check runs under a row lock,
-// so two concurrent postings cannot both pass it.
+// An account that must never go below zero.
 ledger::ensure_account(
     conn,
     Account::new("platform:float", Usd::currency()).disallow_negative(),
@@ -131,7 +141,7 @@ ledger::ensure_account(
 ```
 
 The account identifier is yours. Pick a shape you can rebuild from your own
-rows, such as `"customer:42:wallet"`.
+rows, such as `"platform:cash"`.
 
 Then post, inside the same `Db::tx` as the application rows the money
 justifies:
@@ -145,7 +155,7 @@ use scoped_futures::ScopedFutureExt as _;
 # async fn charge(mut db: Db) -> AutumnResult<()> {
 let amount = Money::<Usd>::from_major(25)?;
 let postings = vec![
-    Posting::debit("customer:42:wallet", amount),
+    Posting::debit("platform:cash", amount),
     Posting::credit("platform:revenue", amount),
 ];
 let key = IdempotencyKey::derive("order:9911", &postings);
@@ -172,6 +182,21 @@ Because `post` takes the connection, the postings and your rows commit
 together. If the handler fails after the post, both roll back and the
 idempotency key is free again.
 
+**`post` must run inside a transaction.** A call on a bare connection is
+refused with `LedgerError::NotInTransaction`. The account locks and the balance
+check only mean something inside one, and the tables are append-only — a
+transaction row written without its postings could never be repaired.
+
+On Postgres the account rows are held with `SELECT ... FOR UPDATE`, so two
+concurrent posts against one account are serialized. SQLite has no row lock and
+`Db::tx` opens a deferred transaction, so two concurrent posts there can leave
+the second with "database is locked". A SQLite app that posts concurrently must
+retry the transaction.
+
+The locks are sorted within one call, not across a transaction. If one
+transaction posts more than once over overlapping accounts, use `Db::tx_with`,
+which retries a deadlock.
+
 A transaction may carry more than two postings. A marketplace split is one
 transaction:
 
@@ -181,7 +206,7 @@ transaction:
 # fn example() {
 # let m = |c| Money::<Usd>::from_minor(c);
 let postings = vec![
-    Posting::debit("customer:42:wallet", m(10_000)),
+    Posting::debit("platform:cash", m(10_000)),
     Posting::credit("seller:1", m(7_000)),
     Posting::credit("seller:2", m(2_000)),
     Posting::credit("platform:fees", m(1_000)),
@@ -215,12 +240,12 @@ a retry may word it differently and still replay.
 ```rust,no_run
 use autumn_web::money::ledger;
 # async fn read(conn: &mut autumn_web::db::RuntimeConnection) -> Result<(), ledger::LedgerError> {
-let wallet = ledger::balance(conn, "customer:42:wallet").await?;
-println!("{wallet}"); // 25.00 USD
+let cash = ledger::balance(conn, "platform:cash").await?;
+println!("{cash}"); // 25.00 USD
 
 // Every currency's total across the whole ledger. Each must be zero.
 for total in ledger::trial_balance(conn).await? {
-    assert!(total.total.is_zero());
+    assert!(total.total().is_zero());
 }
 # Ok(())
 # }
@@ -236,11 +261,13 @@ health check.
 | --- | --- |
 | Debits equal credits | `Transaction::validate`, before the first `INSERT` |
 | One currency per transaction | `Transaction::validate` |
-| A transaction has a debit and a credit, and moves money | `Transaction::validate` |
+| A transaction has a debit and a credit | `Transaction::validate` |
+| No posting is zero, and no amount is negative | `Transaction::validate` |
+| A balance stays inside `i64` | `post`, before anything is written |
 | A posting's currency matches its account | `post`, after the account row is read |
 | The same key posts once | `UNIQUE (idempotency_key)`, with `ON CONFLICT DO NOTHING` |
 | The same key for different money is refused | a stored request hash |
-| No negative balance where forbidden | a balance read under `SELECT ... FOR UPDATE` |
+| No negative balance where forbidden | the balance the posting would leave, read before anything is written |
 | Nothing is rewritten | a database trigger on both backends |
 
 The last one matters most: `post` never updates or deletes a row, and a trigger
