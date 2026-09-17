@@ -375,6 +375,50 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
     assert_books_balance(&pool).await;
 }
 
+/// An account's currency is what `post` checks a posting against, so it must
+/// not move under the postings that already refer to it.
+///
+/// `INSERT ... ON CONFLICT DO UPDATE` is Postgres's answer to an SQLite
+/// `REPLACE`, and it is an `UPDATE`, so the same trigger sees it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_postgres_trigger_fixes_an_account_currency() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        post_tx(&mut conn, &charge(2500, "order:1"))
+            .await
+            .expect("post");
+    }
+
+    for statement in [
+        "UPDATE _autumn_money_accounts SET currency = 'EUR' WHERE id = 'platform:cash'",
+        "UPDATE _autumn_money_accounts SET currency = 'EUR'",
+        "INSERT INTO _autumn_money_accounts (id, currency, allow_negative) \
+         VALUES ('platform:cash', 'EUR', TRUE) \
+         ON CONFLICT (id) DO UPDATE SET currency = 'EUR'",
+    ] {
+        let mut conn = pool.get().await.expect("conn");
+        let result = conn.batch_execute(statement).await;
+        assert!(
+            result.is_err(),
+            "an account currency must not change: `{statement}` succeeded"
+        );
+    }
+
+    let mut conn = pool.get().await.expect("conn");
+    ledger::set_allow_negative(&mut conn, "platform:cash", false)
+        .await
+        .expect("the policy flag stays editable");
+    let cash = ledger::balance(&mut conn, "platform:cash")
+        .await
+        .expect("balance");
+    assert_eq!(cash.currency().code(), "USD");
+    assert_eq!(cash.minor(), 2500);
+    assert_books_balance(&pool).await;
+}
+
 /// A row trigger does not fire on `TRUNCATE`, so the append-only pair needs a
 /// statement-level counterpart. Postgres-only: `SQLite` has no `TRUNCATE`.
 #[tokio::test]

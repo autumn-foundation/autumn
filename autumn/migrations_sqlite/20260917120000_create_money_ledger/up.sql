@@ -106,3 +106,32 @@ CREATE TRIGGER IF NOT EXISTS _autumn_money_postings_no_replace
 BEGIN
     SELECT RAISE(ABORT, 'autumn money ledger is append-only: REPLACE is refused');
 END;
+
+-- An account's currency is what `post` checks a posting against, so it must not
+-- move under the postings that already refer to it. See the Postgres copy.
+CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_currency_fixed
+    BEFORE UPDATE OF currency ON _autumn_money_accounts
+    WHEN NEW.currency IS NOT OLD.currency
+BEGIN
+    SELECT RAISE(ABORT, 'autumn money ledger: an account cannot change currency');
+END;
+
+-- And the REPLACE form of the same edit, which the UPDATE trigger never sees.
+--
+-- This one asks for postings as well, and the two guards above do not. An
+-- account with no postings has nothing to relabel, and that is the case
+-- `ensure_account` reports as `AccountCurrency`: it inserts with
+-- `ON CONFLICT (id) DO NOTHING`, reads the row back and compares. A BEFORE
+-- INSERT trigger fires before that clause, so an unconditional guard would
+-- turn a named error into a database failure.
+CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_no_replace
+    BEFORE INSERT ON _autumn_money_accounts
+    WHEN EXISTS (
+        SELECT 1 FROM _autumn_money_accounts
+        WHERE id = NEW.id AND currency <> NEW.currency
+    ) AND EXISTS (
+        SELECT 1 FROM _autumn_money_postings WHERE account_id = NEW.id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'autumn money ledger: an account cannot change currency');
+END;

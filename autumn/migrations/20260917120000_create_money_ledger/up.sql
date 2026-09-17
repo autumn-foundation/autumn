@@ -91,3 +91,26 @@ DROP TRIGGER IF EXISTS _autumn_money_postings_no_truncate
 CREATE TRIGGER _autumn_money_postings_no_truncate
     BEFORE TRUNCATE ON _autumn_money_postings
     FOR EACH STATEMENT EXECUTE FUNCTION _autumn_money_append_only();
+
+-- An account's currency is what `post` checks a posting against, so it must not
+-- move under the postings that already refer to it. Changing it would relabel
+-- every stored minor unit and let the next posting in the new currency pass
+-- that check, which mixes two currencies in one account. The policy flag stays
+-- editable; only the currency is fixed.
+--
+-- `INSERT ... ON CONFLICT DO UPDATE` is an UPDATE, so this trigger sees it too.
+-- A DELETE and re-INSERT is refused by the postings foreign key.
+CREATE OR REPLACE FUNCTION _autumn_money_currency_is_fixed() RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION
+        'autumn money ledger: account % cannot change currency from % to %',
+        OLD.id, OLD.currency, NEW.currency;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS _autumn_money_accounts_currency_fixed
+    ON _autumn_money_accounts;
+CREATE TRIGGER _autumn_money_accounts_currency_fixed
+    BEFORE UPDATE OF currency ON _autumn_money_accounts
+    FOR EACH ROW WHEN (NEW.currency IS DISTINCT FROM OLD.currency)
+    EXECUTE FUNCTION _autumn_money_currency_is_fixed();

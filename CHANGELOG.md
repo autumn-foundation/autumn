@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     with either nothing or one complete balanced transaction; which of the two
     is not knowable from the cancellation alone, so a caller that races `post`
     against a timeout settles it by posting the same idempotency key again.
+  - An account never changes currency. It is what `post` checks a posting
+    against, so a change would relabel every stored minor unit and let the next
+    posting in the new currency pass that check. A trigger on both backends
+    refuses it; `set_allow_negative` is unaffected.
   - One configurable policy per account: `Account::disallow_negative()`. The
     check reads the balance the posting *would* leave, before anything is
     written. On Postgres the account rows are held with `SELECT ... FOR

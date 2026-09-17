@@ -391,6 +391,48 @@ async fn insert_or_replace_cannot_rewrite_the_ledger() {
     assert_books_balance(&mut conn).await;
 }
 
+/// An account's currency is what `post` checks a posting against, so it must
+/// not move under the postings that already refer to it.
+///
+/// Changing it would relabel every stored minor unit and let the next posting
+/// in the new currency pass that check, which mixes two currencies in one
+/// account. The policy flag stays editable; only the currency is fixed.
+#[tokio::test]
+async fn an_account_currency_cannot_change_out_of_band() {
+    let pool = boot_pool("mlg_currency_fixed").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("post");
+
+    for statement in [
+        "UPDATE _autumn_money_accounts SET currency = 'EUR' WHERE id = 'platform:cash'",
+        "UPDATE _autumn_money_accounts SET currency = 'EUR'",
+        // The REPLACE form of the same edit.
+        "INSERT OR REPLACE INTO _autumn_money_accounts (id, currency, allow_negative) \
+         VALUES ('platform:cash', 'EUR', 1)",
+    ] {
+        let result = conn.batch_execute(statement).await;
+        assert!(
+            result.is_err(),
+            "an account currency must not change: `{statement}` succeeded"
+        );
+    }
+
+    // The policy flag is still editable. The trigger must not block it.
+    ledger::set_allow_negative(&mut conn, "platform:cash", false)
+        .await
+        .expect("the policy flag stays editable");
+
+    let cash = ledger::balance(&mut conn, "platform:cash")
+        .await
+        .expect("balance");
+    assert_eq!(cash.currency().code(), "USD", "the currency is unchanged");
+    assert_eq!(cash.minor(), 2500);
+    assert_books_balance(&mut conn).await;
+}
+
 // ── Idempotency ─────────────────────────────────────────────────────────────
 
 #[tokio::test]

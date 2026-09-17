@@ -269,12 +269,18 @@ health check.
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
 | Nothing is rewritten | database triggers on both backends, `TRUNCATE` and SQLite `REPLACE` included |
+| An account never changes currency | a trigger on both backends; only `allow_negative` stays editable |
 | A cancelled `post` never half-writes | the postings go in before their transaction row, behind a deferred foreign key |
 
 The last two matter most.
 
 `post` never updates or deletes a row, and a trigger aborts an `UPDATE`, a
 `DELETE` or a `TRUNCATE` that comes from anywhere else.
+
+An account's currency is fixed once the account exists. It is what `post`
+checks a posting against, so a change would relabel every stored minor unit and
+let the next posting in the new currency pass that check — two currencies in
+one account. `set_allow_negative` still works; only the currency is frozen.
 
 `INSERT OR REPLACE` needs its own guard on SQLite. SQLite answers the conflict
 by deleting the row that is in the way, and it does not fire `DELETE` triggers
