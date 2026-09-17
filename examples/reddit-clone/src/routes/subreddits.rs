@@ -137,8 +137,6 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
 /// the fields alongside a message per field, instead of the framework's
 /// generic 422 page silently discarding the draft.
 ///
-/// The name input stays hand-written rather than `autumn_web::a11y::TextField`
-/// so it can keep its `pattern` attribute, which that widget does not support.
 fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     let input_class = "flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
                        focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -159,7 +157,6 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
                         input type="text" id="name" name="name" required
                               minlength="2" maxlength="32"
                               placeholder="rustlang"
-                              pattern="[a-zA-Z0-9_]+"
                               value=(form.field_value("name").unwrap_or_default())
                               aria-describedby="name-error"
                               aria-invalid=[name_invalid.then(|| "true")]
@@ -167,7 +164,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
                     }
                     (field_errors("name", form))
                     p class="text-xs text-gray-400 mt-1" {
-                        "Letters, numbers, and underscores only"
+                        "2-32 characters, with at least one letter or number"
                     }
                 }
                 div {
@@ -606,11 +603,12 @@ mod tests {
         }
     }
 
-    /// These are the *server's* rules. The shipped form is deliberately
-    /// narrower — `create_form`'s input carries `pattern="[a-zA-Z0-9_]+"`, so
-    /// a browser will not send `"web dev"` or `"日本語"` in the first place.
-    /// Widening that pattern is a separate UI change; what matters here is
-    /// that the server does not reject real text out of hand.
+    /// These are the *server's* rules. `create_form`'s input no longer
+    /// carries a `pattern` attribute narrower than them (issue #2441/#2454
+    /// item 3: the old `pattern="[a-zA-Z0-9_]+"` silently rejected
+    /// `"web dev"` and `"日本語"` client-side, with no server round trip
+    /// and no error message — while `"__"` passed the pattern but failed
+    /// this very rule), so these names now reach `create` at all.
     #[test]
     fn a_community_name_with_a_letter_or_number_in_any_script_is_accepted() {
         for name in ["rust", "web dev", "42", "日本語", "Привет"] {
@@ -705,6 +703,31 @@ mod tests {
         assert!(
             rendered.contains("tok-123"),
             "the CSRF token must survive the round trip so the retry can submit"
+        );
+    }
+
+    // ── Client/server rule drift (#2441/#2454 item 3) ────────────────
+
+    /// Regression guard for the mismatch itself: a `pattern` attribute here
+    /// would make the browser reject `validate_community_name`-valid input
+    /// (a space, a non-Latin letter) before any request is sent — no 422, no
+    /// error message, nothing the error-path tests above could ever catch.
+    #[test]
+    fn the_rendered_name_field_carries_no_pattern_narrower_than_the_server_rule() {
+        let blank = ChangesetForm::blank(CreateSubredditForm::default(), "tok-123");
+        let rendered = create_form_markup(&blank).into_string();
+
+        assert!(
+            !rendered.contains("pattern="),
+            "a `pattern` attribute here can only be narrower than \
+             `validate_community_name`, since that rule (2-32 characters, any \
+             script, needs one letter or number) has no HTML pattern \
+             equivalent; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("at least one letter or number"),
+            "the visible hint must describe the rule the server actually \
+             enforces, not a narrower one; rendered: {rendered}"
         );
     }
 }
