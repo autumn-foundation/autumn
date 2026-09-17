@@ -577,8 +577,22 @@ def blank_links(text):
     return "".join(out)
 
 
-def _defn_entries(body):
+def _defn_entries(body, origin=None):
     """Every REAL reference definition in `body`, as `(match, label, dest)`.
+
+    `origin` is the text BEFORE links were masked, and block starts are read
+    from it. Both callers that mask first — `definitions` via `blank_links`
+    and `candidate_labels` via `readable` — turn a paragraph whose whole line
+    is one inline link into a run of spaces. `_starts_block` then read that
+    as a blank line and invented a paragraph boundary, so
+
+        [ordinary](other.md)
+        [x]: docs/guide/index.md
+
+    resolved `x` although CommonMark keeps that second line INSIDE the
+    paragraph and renders a later `[Guide][x]` as plain text. Masking is
+    space-for-space, so the two strings share offsets and the original can
+    answer the block question while the masked copy answers the link one.
 
     One scanner for all THREE callers. The prepass that computes candidate
     labels, the scan that resolves them, and `blank_defns` had grown apart:
@@ -615,8 +629,9 @@ def _defn_entries(body):
     here. INLINE destinations are not affected — there the implementations
     agree, because `)` has to close something.
     """
+    blocks = body if origin is None else origin
     for m in DEFN.finditer(body):
-        if not _starts_block(body, m.start()):
+        if not _starts_block(blocks, m.start()):
             continue
         key = label_key(m.group(1))
         if key is None:
@@ -653,7 +668,7 @@ def candidate_labels(text):
     # The first pass terminates because it resolves no labels: with an empty
     # set every reference image is left alone, which is the conservative
     # direction, and fences and comments do not depend on labels at all.
-    return {key for _, key, _ in _defn_entries(readable(text, frozenset()))}
+    return {key for _, key, _ in _defn_entries(readable(text, frozenset()), text)}
 
 
 def opens_fence(line):
@@ -778,7 +793,7 @@ def definitions(text):
       names the page `alpha.md` rather than a file that does not exist.
     """
     out = {}
-    for _, key, dest in _defn_entries(blank_links(text)):
+    for _, key, dest in _defn_entries(blank_links(text), text):
         out.setdefault(key, dest)
     return out
 
@@ -964,6 +979,30 @@ def readable(text, resolved=None):
         nl = text.find("\n", pos)
         return n if nl < 0 else nl
 
+    def quote_limit(after, depth):
+        """Where a block opened inside a quote of `depth` has to stop.
+
+        A quote is a container: a fence, a raw HTML block, a comment, a
+        declaration or an indented-code run opened in one cannot outlive it.
+        Unbounded, an UNCLOSED one blanks every link in the rest of the file
+        — the run-to-end-of-file false failure this scan has produced four
+        times now. The bound lives here, once, because the previous fix gave
+        it to the raw-tag branch and left the comment and declaration
+        branches beside it unbounded, which is the very mistake the comment
+        above those branches warns about.
+        """
+        if not depth:
+            return n
+        k = after
+        while k <= n:
+            e = line_end(k)
+            if quote_depth(text[k:e]) < depth:
+                return k
+            if e >= n:
+                break
+            k = e + 1
+        return n
+
     while i < n:
         at_line_start = i == 0 or text[i - 1] == "\n"
         eol = line_end(i)
@@ -1119,6 +1158,7 @@ def readable(text, resolved=None):
             if COMMENT_BLOCK.match(content):
                 close = text.find("-->", i + 4)
                 stop = n if close < 0 else line_end(close + 3)
+                stop = min(stop, quote_limit(eol + 1, depth))
                 blank_to(i, stop)
                 i = stop
                 continue
@@ -1127,6 +1167,7 @@ def readable(text, resolved=None):
             if decl is not None:
                 close = text.find(decl, i + 2)
                 stop = n if close < 0 else line_end(close + len(decl))
+                stop = min(stop, quote_limit(eol + 1, depth))
                 blank_to(i, stop)
                 i = stop
                 continue
@@ -1134,22 +1175,7 @@ def readable(text, resolved=None):
             # `hm` was decided above, and is already None for an autolink or
             # a type-7 tag that does not open a block.
             if hm:
-                # A raw HTML block opened INSIDE a quote ends when the quote
-                # ends, exactly as a quoted fence does. Without the bound a
-                # quoted `<div>` would blank every link in the rest of the
-                # file — the run-to-end-of-file false failure this scan has
-                # now produced three times, so it is bounded at the source.
-                quote_stop = n
-                if depth:
-                    k = eol + 1
-                    while k <= n:
-                        e = line_end(k)
-                        if quote_depth(text[k:e]) < depth:
-                            quote_stop = k
-                            break
-                        if e >= n:
-                            break
-                        k = e + 1
+                quote_stop = quote_limit(eol + 1, depth)
                 tag = hm.group(2).lower()
                 if tag in HTML_LITERAL and not hm.group(1):
                     closer = f"</{tag}>"
@@ -2548,9 +2574,17 @@ self_test() {
   _commit ref_beside_link
   _case "a reference beside an inline link still counts" 0 ref_beside_link
 
-  # 72. The newline guard. A link span may straddle lines; blanking its
-  #     newline would join the next line to it and drop the `^` that the
-  #     definition scan anchors on, losing a good definition.
+  # 72. CORRECTED in round 44. This case used to expect a PASS, and it was
+  #     passing for the wrong reason: masking the link turned its lines into
+  #     spaces, `_starts_block` read that as a blank line, and the glued
+  #     definition resolved. Both cmark-gfm and markdown-it keep that line
+  #     inside the paragraph and render the reference as plain text —
+  #
+  #       <p><a href="y.md" title="a b">X</a> [catalog]: docs/guide/index.md</p>
+  #       <p>[Guide][catalog]</p>
+  #
+  #     — so the index is NOT reachable and the run must FAIL. The case had
+  #     encoded the bug it was sitting next to.
   _scaffold ref_multiline_link
   printf '# A\n' > "$tmp/ref_multiline_link/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
@@ -2558,7 +2592,21 @@ self_test() {
   printf '[X](y.md "a\nb")\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
     > "$tmp/ref_multiline_link/README.md"
   _commit ref_multiline_link
-  _case "a definition after a multiline link survives" 0 ref_multiline_link
+  _case "a definition glued to a multiline link defines nothing" 1 \
+    ref_multiline_link
+
+  # 72b. The newline guard the case above was written for, now with an
+  #      expectation that holds: after a real blank line the definition IS
+  #      real, which still fails if blanking a multi-line link span ate its
+  #      newlines and dropped the `^` the definition scan anchors on.
+  _scaffold ref_multiline_gap
+  printf '# A\n' > "$tmp/ref_multiline_gap/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_multiline_gap/docs/guide/index.md"
+  printf '[X](y.md "a\nb")\n\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/ref_multiline_gap/README.md"
+  _commit ref_multiline_gap
+  _case "a definition after a multiline link survives a gap" 0 ref_multiline_gap
 
   # 73. A destination may carry BALANCED parentheses. Ending the span at the
   #     first `)` left the title for the reference scan to misread.
@@ -3992,6 +4040,68 @@ self_test() {
     > "$tmp/image_label_intact/README.md"
   _commit image_label_intact
   _case "a real image still masks its alt text" 1 image_label_intact
+
+  # 193. Masking a link must not invent a paragraph boundary. A line that is
+  #      entirely one inline link becomes spaces under `blank_links`, and
+  #      `_starts_block` read that as blank — so a definition glued to it
+  #      resolved, where CommonMark keeps that line INSIDE the paragraph and
+  #      renders the later reference as plain text. Block starts are now read
+  #      from the unmasked text, which shares offsets with the masked copy.
+  _scaffold mask_invents_block
+  printf '# A\n' > "$tmp/mask_invents_block/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/mask_invents_block/docs/guide/index.md"
+  printf '[ordinary](other.md)\n[x]: docs/guide/index.md\n\n[Guide][x]\n' \
+    > "$tmp/mask_invents_block/README.md"
+  _commit mask_invents_block
+  _case "masking a link invents no block boundary" 1 mask_invents_block
+
+  # 194. The other direction: after a real blank line the definition is real,
+  #      so the fix cannot become "a definition after a link never counts".
+  _scaffold mask_real_boundary
+  printf '# A\n' > "$tmp/mask_real_boundary/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/mask_real_boundary/docs/guide/index.md"
+  printf '[ordinary](other.md)\n\n[x]: docs/guide/index.md\n\n[Guide][x]\n' \
+    > "$tmp/mask_real_boundary/README.md"
+  _commit mask_real_boundary
+  _case "a definition after a blank line still defines" 0 mask_real_boundary
+
+  # 195. An unclosed comment INSIDE a quote ends with the quote. The previous
+  #      round bounded the raw-tag branch and left the comment and
+  #      declaration branches beside it unbounded — the same one-of-several
+  #      miss, in the branch whose own comment warns about it. `quote_limit`
+  #      is now the one place all three ask.
+  _scaffold quoted_comment_bounded
+  printf '# A\n' > "$tmp/quoted_comment_bounded/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_comment_bounded/docs/guide/index.md"
+  printf '> <!-- unclosed\n\n[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/quoted_comment_bounded/README.md"
+  _commit quoted_comment_bounded
+  _case "a quoted comment ends with its quote" 0 quoted_comment_bounded
+
+  # 196. UNQUOTED, the same unclosed opener really is an HTML block to end of
+  #      file, so the bound must not leak out of block quotes.
+  _scaffold unquoted_comment_eof
+  printf '# A\n' > "$tmp/unquoted_comment_eof/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/unquoted_comment_eof/docs/guide/index.md"
+  printf '<!-- unclosed\n\n[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/unquoted_comment_eof/README.md"
+  _commit unquoted_comment_eof
+  _case "an unquoted comment block still runs to EOF" 1 unquoted_comment_eof
+
+  # 197. And a link sealed inside a CLOSED quoted comment is still not a
+  #      route, so bounding did not stop comments hiding things.
+  _scaffold quoted_comment_hides
+  printf '# A\n' > "$tmp/quoted_comment_hides/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_comment_hides/docs/guide/index.md"
+  printf '> <!-- [Guide index](docs/guide/index.md) -->\n' \
+    > "$tmp/quoted_comment_hides/README.md"
+  _commit quoted_comment_hides
+  _case "a link inside a quoted comment is not a route" 1 quoted_comment_hides
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
