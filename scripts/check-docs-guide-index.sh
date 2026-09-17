@@ -1847,8 +1847,24 @@ def entries(text, base):
     # the same thing rather than waiting to be told; blanking preserves
     # newlines, so reported line numbers stay honest.
     rows = blank_defns(body)
-    prev = ""
+    # Block structure — which line opens a section, which line starts a row —
+    # is decided per line. The LINK on a row is not: a link's text and its
+    # destination may both cross a soft line break, so
+    # `- [Middleware the stack,` / `  and your own layer](middleware.md)`
+    # is one linked list item and cmark-gfm renders it as one. Scanning each
+    # line in isolation split that link in half and reported the page as
+    # listed nowhere. The scanners are offset-based and already newline-aware,
+    # so the row is read at its absolute position in the whole text; only the
+    # line number stays local, which is the one thing a reader needs. The
+    # bracket map is document-wide for the same reason, and it already stops
+    # at a blank line, so nothing pairs across a paragraph break.
+    pairs = bracket_pairs(rows)
+    resolved = set(defs)
+    prev, offset = "", 0
     for lineno, line in enumerate(rows.split("\n"), 1):
+        # Advance past this line and its newline before any `continue` can
+        # skip the bookkeeping, exactly as `prev` is handled below.
+        start, offset = offset, offset + len(line) + 1
         # The previous line, captured before any `continue` can skip the
         # bookkeeping. Only the Setext test needs it, and getting this wrong
         # would make that test read whichever line last fell through.
@@ -1882,11 +1898,11 @@ def entries(text, base):
         # The link must begin the row's CONTENT — that column-zero anchoring
         # is what separates an index's rows from its prose, and it is why
         # both forms are read at exactly `row` rather than searched for.
-        hit = link_at(line, row, None, set(defs))
+        hit = link_at(rows, start + row, pairs, resolved)
         if hit is not None and hit[1]:
             target = hit[1]
         else:
-            ref = ref_at(line, row)
+            ref = ref_at(rows, start + row, pairs)
             if ref is not None:
                 # `[text][label]` uses `label`; `[label][]` and the shortcut
                 # `[label]` use the text itself. An undefined label is not a
@@ -4930,6 +4946,30 @@ self_test() {
     > "$tmp/defn_after_multiline/README.md"
   _commit defn_after_multiline
   _case "a definition cannot interrupt a paragraph" 1 defn_after_multiline
+
+  # 241. An index ROW's link may cross a soft line break in either half.
+  #      cmark-gfm renders `<li><a href="alpha.md">A long title, and the
+  #      rest</a></li>`, so the page IS listed and the row scan has to read
+  #      the whole link, not the first line of it.
+  _scaffold row_multiline
+  printf '# A\n' > "$tmp/row_multiline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A long title,\n  and the rest](alpha.md)\n' \
+    > "$tmp/row_multiline/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/row_multiline/README.md"
+  _commit row_multiline
+  _case "a row's link may cross a line break" 0 row_multiline
+
+  # 242. ...but not a BLANK one. Link text cannot span a paragraph break, so
+  #      both halves render as literal text and the page is listed nowhere.
+  #      Without this the document-wide bracket map would be free to pair a
+  #      `[` with a `]` on the far side of the gap.
+  _scaffold row_blank_break
+  printf '# A\n' > "$tmp/row_blank_break/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A long title,\n\n  and the rest](alpha.md)\n' \
+    > "$tmp/row_blank_break/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/row_blank_break/README.md"
+  _commit row_blank_break
+  _case "a row's link may not cross a blank line" 1 row_blank_break
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
