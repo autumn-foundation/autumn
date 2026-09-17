@@ -93,8 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
     runs Docker-free on every push; it includes the issue's fault-injection
     metric — 64 logical charges, each submitted two to four times with a share
-    of the attempts killed mid-post, ending with exactly one balanced
-    transaction per charge and `sum(debits) == sum(credits)` globally.
+    of the attempts aborted after the ledger wrote but before the enclosing
+    `Db::tx` commits, ending with exactly one balanced transaction per charge
+    and `sum(debits) == sum(credits)` globally. That exercises the rollback
+    path; the windows a *dropped* future opens are covered separately by the
+    two deferred-foreign-key tests, which put the database in exactly those
+    states and check what `COMMIT` does.
     `tests/integration/money_ledger_postgres.rs` proves the Postgres fork and
     the races only it can show: eight connections posting the same charge at
     once collapse to one transaction, and two concurrent payouts from a float

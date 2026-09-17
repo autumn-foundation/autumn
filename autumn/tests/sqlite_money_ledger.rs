@@ -18,8 +18,10 @@
 //! * **Nothing is rewritten.** An out-of-band `UPDATE` or `DELETE` is aborted
 //!   by the trigger the migration installs.
 //! * **Fault injection.** 64 logical charges, each submitted two to four times
-//!   with a share of the attempts killed mid-post, ends with exactly one
-//!   balanced transaction per charge and `sum(debits) == sum(credits)`.
+//!   with a share of the attempts aborted after the ledger wrote, ends with
+//!   exactly one balanced transaction per charge and
+//!   `sum(debits) == sum(credits)`. That is the rollback path; the cancellation
+//!   windows are covered by the two deferred-foreign-key tests instead.
 //!
 //! Only meaningful under `--features sqlite`. The file is
 //! `#![cfg(feature = "sqlite")]`, so a default `cargo test` compiles it to an
@@ -1089,15 +1091,26 @@ async fn a_rolled_back_transaction_leaves_no_postings() {
 
 // ── Fault injection (the issue's success metric) ────────────────────────────
 
-/// Duplicate and retry every money-moving call, and kill a share of them
-/// mid-post.
+/// Duplicate and retry every money-moving call, and abort a share of them
+/// after the ledger has written.
 ///
 /// 64 logical charges. Each is submitted between two and four times. Roughly
-/// one attempt in three is killed after the ledger wrote its postings but
-/// before the enclosing `Db::tx` commits — the mid-flight crash the issue
-/// names. The last attempt of each charge always survives, so every charge is
-/// one that really happened. At the end: exactly one balanced transaction per
-/// charge, and `sum(debits) == sum(credits)` globally.
+/// one attempt in three fails after the ledger wrote its postings and its
+/// transaction row but before the enclosing `Db::tx` commits. The last attempt
+/// of each charge always survives, so every charge is one that really
+/// happened. At the end: exactly one balanced transaction per charge, and
+/// `sum(debits) == sum(credits)` globally.
+///
+/// **What this does not cover.** The abort returns an error, so `post` runs to
+/// completion and the transaction rolls back. That is the rollback path, not
+/// cancellation: a rollback runs, a dropped future does not. The windows a
+/// dropped future opens — between the postings, between the postings and the
+/// transaction row, and during the read-back — are covered instead by
+/// `postings_with_no_transaction_row_cannot_commit` and
+/// `the_deferred_foreign_key_still_lets_an_ordinary_post_commit`, which put
+/// the database in exactly those states and check what `COMMIT` does. Driving
+/// a real drop from here would need `post` instrumented with a test seam in
+/// the middle of money movement, which is not a trade worth making.
 ///
 /// The schedule is deterministic (a small LCG over a fixed seed), so a failure
 /// replays rather than needing to be reproduced.
@@ -1153,9 +1166,10 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
                             .await
                             .map_err(autumn_web::AutumnError::from)?;
                         if kill {
-                            // The process dies here: the transaction never
-                            // commits, so neither the order row nor the
-                            // postings survive.
+                            // The call fails here, so the transaction rolls
+                            // back and neither the order row nor the postings
+                            // survive. This is an abort, not a dropped future:
+                            // see the note on this test.
                             return Err(autumn_web::AutumnError::bad_request_msg("killed"));
                         }
                         Ok(outcome)
