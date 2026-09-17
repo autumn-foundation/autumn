@@ -192,10 +192,15 @@ COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 # A fence opener or closer: three or more backticks or tildes, indented at most
 # three spaces, with whatever info string follows.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-# A raw HTML block at column zero. CommonMark's `<pre>`/`<script>`/`<style>`/
+# A raw HTML block opener. CommonMark's `<pre>`/`<script>`/`<style>`/
 # `<textarea>` run to their closing tag; every other block ends at a blank
 # line. Both are literal text to the reader, so neither can hold an entry.
-HTML_OPEN = re.compile(r"^<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
+#
+# The ` {0,3}` is the same allowance `FENCE` carries, and for the same reason:
+# CommonMark lets a block opener be indented up to three spaces before it
+# becomes indented code. Requiring column zero here meant ` <pre>` opened no
+# block, so a row-shaped line inside it was still read as an entry.
+HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
 HTML_LITERAL = ("pre", "script", "style", "textarea")
 
 
@@ -867,6 +872,17 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/html_then_entries/README.md"
   _commit html_then_entries
   _case "HTML block ends at a blank line" 0 html_then_entries
+
+  # 31. A raw HTML opener may be indented up to three spaces — the same
+  #     allowance `FENCE` carries — and still opens a block.
+  _scaffold html_indented
+  printf '# A\n' > "$tmp/html_indented/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/html_indented/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n <pre>\n- [B](beta.md)\n</pre>\n' \
+    > "$tmp/html_indented/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/html_indented/README.md"
+  _commit html_indented
+  _case "indented raw HTML opener still opens a block" 1 html_indented
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
