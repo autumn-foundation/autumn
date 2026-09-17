@@ -1269,6 +1269,28 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
 _LIST_COL = re.compile(r"^( *)((?:[-*+]|\d{1,9}[.)]))( +)")
 
 
+def byte_at_col(s, col):
+    """The index in `s` at which column `col` begins, or None.
+
+    A tab advances to the next multiple of four, so a column number is a
+    byte offset only in a line without tabs. Everything in this file that
+    measures indentation walks columns for that reason; this walks them back
+    the other way, so a span measured in columns can be blanked in bytes.
+
+    None when the walk steps OVER `col` — a tab straddling it — because
+    there is no byte where that column starts, and blanking a guessed span
+    is worse than leaving it readable.
+    """
+    c = 0
+    for k, ch in enumerate(s):
+        if c == col:
+            return k
+        if c > col:
+            return None
+        c = (c // 4 + 1) * 4 if ch == "\t" else c + 1
+    return len(s) if c == col else None
+
+
 def list_content_col(expanded):
     """The column an item's content starts at, or None if not an item.
 
@@ -1574,12 +1596,16 @@ def readable(text, resolved=None):
                 # looked at LATER lines, so this one stayed readable.
                 pad = _LIST_COL.match(expanded)
                 if pad is not None and len(pad.group(3)) > 4:
-                    # Columns are byte offsets only when the line has no
-                    # tabs. With tabs the mapping needs the same walk
-                    # `row_at` does, so stay lenient rather than blank the
-                    # wrong span.
-                    if content == expanded:
-                        start = i + (len(line) - len(content)) + col
+                    # A column is a byte offset only while the line holds no
+                    # TABS. `-` plus three spaces and a tab is overpadded
+                    # too — the tab advances to the next multiple of four —
+                    # so the offset comes from the same column walk `row_at`
+                    # uses rather than from the column number itself. This
+                    # branch used to bail out on tabs and leave the sample
+                    # readable.
+                    off = byte_at_col(content, col)
+                    if off is not None:
+                        start = i + (len(line) - len(content)) + off
                         blank_to(start, eol)
                         in_paragraph = False
                         i = eol + 1 if eol < n else n
@@ -1604,11 +1630,17 @@ def readable(text, resolved=None):
             #
             # An autolink is a link, not a block opener, and is checked first
             # because `HTML_OPEN`'s tag-name pattern happily matches `https`.
-            auto = AUTOLINK.match(content)
-            hm = HTML_OPEN.match(content)
+            # Measured from the item's CONTENT column, like the fence tests
+            # above: under `100. item` a five-space `<pre>` opens a raw HTML
+            # block at column zero relative to the item, and the link inside
+            # it is literal HTML content, not a route. This site was still
+            # reading the margin-relative line when round 63 gave `rel` to
+            # the fence tests beside it.
+            auto = AUTOLINK.match(rel)
+            hm = HTML_OPEN.match(rel)
             if hm and not auto:
                 tag = hm.group(2).lower()
-                alone = bool(INLINE_TAG.fullmatch(content.strip()))
+                alone = bool(INLINE_TAG.fullmatch(rel.strip()))
                 type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
                 # A type-7 tag opens a block only when it is alone on its
                 # line AND is not interrupting a paragraph. CommonMark lets
@@ -1704,15 +1736,25 @@ def readable(text, resolved=None):
             # reported: comments, declarations, and the literal blocks below.
             # Fixing one sibling and leaving the others is how the last four
             # of these findings happened.
-            if COMMENT_BLOCK.match(content):
-                close = text.find("-->", i + 4)
+            if COMMENT_BLOCK.match(rel):
+                # `<!-->` and `<!--->` close themselves here too. The
+                # terminator starts two characters after the opener, and
+                # searching from `i + 4` stepped straight over it — so the
+                # block ran to a LATER `-->` and blanked the live link
+                # between. The inline branch below learned this two commits
+                # ago and this one did not, which is the same one-of-two
+                # sites split that keeps producing these findings.
+                lead = rel.lstrip(" \t")
+                short = next((k for k in ("<!--->", "<!-->")
+                              if lead.startswith(k)), None)
+                close = text.find("-->", i + (2 if short else 4))
                 stop = n if close < 0 else line_end(close + 3)
                 stop = min(stop, quote_limit(eol + 1, depth))
                 blank_to(i, stop)
                 i = stop
                 continue
 
-            decl = next((end for pat, end in DECL if pat.match(content)), None)
+            decl = next((end for pat, end in DECL if pat.match(rel)), None)
             if decl is not None:
                 close = text.find(decl, i + 2)
                 stop = n if close < 0 else line_end(close + len(decl))
@@ -5620,6 +5662,79 @@ self_test() {
     > "$tmp/emph_literal_strong/README.md"
   _commit emph_literal_strong
   _case "strong emphasis flanks the same way" 0 emph_literal_strong
+
+  # 273. A raw HTML BLOCK inside a list item is measured from the item's
+  #      content column too. Under `100. item` a five-space `<pre>` opens
+  #      one, and the link inside it is literal HTML content. Round 63 gave
+  #      the content-relative line to the fence tests and left this site
+  #      reading the margin.
+  _scaffold html_list_col
+  printf '# A\n' > "$tmp/html_list_col/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/html_list_col/docs/guide/index.md"
+  printf '100. item\n\n     <pre>\n     [Guide](docs/guide/index.md)\n     </pre>\n' \
+    > "$tmp/html_list_col/README.md"
+  _commit html_list_col
+  _case "a list-contained html block opens" 1 html_list_col
+
+  # 274. ...and a five-space line that is NOT a block opener is still
+  #      ordinary prose at that column, so its link is a route.
+  _scaffold html_list_prose
+  printf '# A\n' > "$tmp/html_list_prose/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/html_list_prose/docs/guide/index.md"
+  printf '100. item\n\n     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/html_list_prose/README.md"
+  _commit html_list_prose
+  _case "a list-contained paragraph still links" 0 html_list_prose
+
+  # 275. A TAB can overpad a marker as surely as spaces can: `-` plus three
+  #      spaces and a tab reaches past four columns, so the rest of the line
+  #      is code. The column-to-byte walk makes that span blankable; the
+  #      branch used to bail out on tabs and leave the sample readable.
+  _scaffold marker_overpad_tab
+  printf '# A\n' > "$tmp/marker_overpad_tab/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/marker_overpad_tab/docs/guide/index.md"
+  printf -- '-   \t[Guide](docs/guide/index.md)\n' \
+    > "$tmp/marker_overpad_tab/README.md"
+  _commit marker_overpad_tab
+  _case "a tab can overpad a marker too" 1 marker_overpad_tab
+
+  # 276. One tab alone reaches column four, which is padding rather than
+  #      overpadding, so that link is still a link.
+  _scaffold marker_tab_fits
+  printf '# A\n' > "$tmp/marker_tab_fits/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/marker_tab_fits/docs/guide/index.md"
+  printf -- '-\t[Guide](docs/guide/index.md)\n' \
+    > "$tmp/marker_tab_fits/README.md"
+  _commit marker_tab_fits
+  _case "one tab of padding is still content" 0 marker_tab_fits
+
+  # 277. `<!-->` closes itself in BLOCK position as well as inline. Its
+  #      terminator starts two characters after the opener, so a search from
+  #      `i + 4` stepped over it, ran to a later `-->` and blanked the live
+  #      link between. The inline branch learned this two commits earlier.
+  _scaffold comment_block_short
+  printf '# A\n' > "$tmp/comment_block_short/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_block_short/docs/guide/index.md"
+  printf '<!-->\n[Guide](docs/guide/index.md)\nprose -->\n' \
+    > "$tmp/comment_block_short/README.md"
+  _commit comment_block_short
+  _case "a short comment closes itself in block position" 0 comment_block_short
+
+  # 278. A REAL block comment still runs to its closer, so the link sealed
+  #      inside one is still hidden.
+  _scaffold comment_block_real
+  printf '# A\n' > "$tmp/comment_block_real/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_block_real/docs/guide/index.md"
+  printf '<!-- x\n[Guide](docs/guide/index.md)\n-->\n' \
+    > "$tmp/comment_block_real/README.md"
+  _commit comment_block_real
+  _case "a real block comment still hides its link" 1 comment_block_real
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
