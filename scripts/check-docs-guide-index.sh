@@ -690,7 +690,16 @@ def definitions(text):
         # `index.md#(unterminated`, which renders no link at all — and the
         # fragment strip then hid the evidence.
         dest = m.group(2)
-        if not (dest.startswith("<") and dest.endswith(">")):
+        # The ANGLE form gets the same grammar an inline destination uses,
+        # not a startswith/endswith glance. `<index.md?>>` merely begins and
+        # ends with brackets: CommonMark closes the destination at the FIRST
+        # `>` and rejects the rest as trailing garbage, so nothing is
+        # defined. Round 32 validated the bare form here and left this one
+        # on that glance — the same one-of-two miss, in the same function.
+        if dest.startswith("<"):
+            if not _ANGLE_DEST.fullmatch(dest):
+                continue
+        else:
             span = dest_at(dest, 0)
             if span is None or span[0] != len(dest):
                 continue
@@ -1258,7 +1267,12 @@ def normalise(target, base):
     # `[A](<alpha.md>)` is a valid destination form. Capturing the brackets
     # made the path unresolvable, so a clickable link — and a real index row
     # written that way — was reported as missing.
-    if len(target) > 1 and target.startswith("<") and target.endswith(">"):
+    # The SAME grammar every other angle test uses, not a startswith /
+    # endswith glance. Every caller validates before reaching here, so this
+    # is defence rather than a fix — but a glance is how the definition scan
+    # accepted `<index.md?>>`, and leaving a third spelling of the rule in
+    # the file is how that happens again.
+    if _ANGLE_DEST.fullmatch(target):
         target = target[1:-1].strip()
     # `alpha.md#section` names the page `alpha.md`. Inline destinations are
     # already split by `_FRAG`, but a REFERENCE definition arrives whole, and
@@ -3438,6 +3452,30 @@ self_test() {
     > "$tmp/fenced_definition/README.md"
   _commit fenced_definition
   _case "a fenced definition does not resolve" 0 fenced_definition
+
+  # 166. An ANGLE definition destination gets the same grammar an inline one
+  #      does. `<index.md?>>` merely begins and ends with brackets:
+  #      CommonMark closes at the FIRST `>` and the rest is trailing
+  #      garbage, so nothing is defined.
+  _scaffold angle_defn_garbage
+  printf '# A\n' > "$tmp/angle_defn_garbage/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/angle_defn_garbage/docs/guide/index.md"
+  printf '[Guide][x]\n\n[x]: <docs/guide/index.md?>>\n' \
+    > "$tmp/angle_defn_garbage/README.md"
+  _commit angle_defn_garbage
+  _case "a malformed angle destination defines nothing" 1 angle_defn_garbage
+
+  # 167. ...and the guard: a well-formed one still resolves, so 166 is not
+  #      bought by rejecting the angle form.
+  _scaffold angle_defn_ok
+  printf '# A\n' > "$tmp/angle_defn_ok/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/angle_defn_ok/docs/guide/index.md"
+  printf '[Guide][x]\n\n[x]: <docs/guide/index.md>\n' \
+    > "$tmp/angle_defn_ok/README.md"
+  _commit angle_defn_ok
+  _case "a well-formed angle destination resolves" 0 angle_defn_ok
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
