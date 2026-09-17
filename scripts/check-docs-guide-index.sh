@@ -336,6 +336,47 @@ def bracket_span(text, pos, pairs=None):
     return None if close is None else close + 1
 
 
+def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
+    """True when a link's TEXT makes it a link a reader can use.
+
+    Two rules, and both belong to every link spelling rather than to the
+    inline one that happened to get them first:
+
+    - it must RENDER SOMETHING. `[](alpha.md)` and `[][a]` give a reader
+      nothing to see or click, which is the guarantee this gate exists for.
+      An image counts, which is what `IMAGE_MARK` is for.
+    - A LINK MAY NOT CONTAIN A LINK. When the text holds one, CommonMark
+      deactivates the OUTER opener and the inner link renders, so
+      `[outer [B](beta.md)](alpha.md)` routes the reader to beta.md and
+      nowhere near alpha.md. An IMAGE does not deactivate it — an image is
+      not a link — and `readable()` has already blanked images by here.
+
+    `link_at` had both and `ref_at` had neither, so the reference spellings
+    of the same two bugs survived the rounds that fixed the inline ones.
+    """
+    if pairs is None:
+        pairs = bracket_pairs(text)
+    if not text[pos + 1:close - 1].strip():
+        return False
+    for q in range(pos + 1, close - 1):
+        if text[q] != "[" or (q and text[q - 1] == "!"):
+            continue
+        inner_close = pairs.get(q)
+        if inner_close is None or inner_close >= close - 1:
+            continue
+        if _tail_at(text, inner_close + 1) is not None:
+            return False
+        # Only an inner INLINE link deactivates without knowing the defined
+        # labels; where they ARE known, a resolved reference does too.
+        if resolved:
+            ref = ref_at(text, q, pairs)
+            if ref is not None and ref[0] <= close - 1:
+                key = label_key(ref[1])
+                if key is not None and key in resolved:
+                    return False
+    return True
+
+
 def link_at(text, pos, pairs=None, resolved=frozenset()):
     """`(end, destination)` for an INLINE link starting at `pos`, or None."""
     if pos and text[pos - 1] == "!":
@@ -348,48 +389,8 @@ def link_at(text, pos, pairs=None, resolved=frozenset()):
     tail = _tail_at(text, close)
     if tail is None:
         return None
-    # A link with NO rendered content is not an entry and not a route. The
-    # whole point of this gate is that a reader can find and click a thing;
-    # `- [](alpha.md)` gives them nothing to see. An image counts as
-    # content, which is what `IMAGE_MARK` is for.
-    if not text[pos + 1:close - 1].strip():
+    if not _text_renders(text, pos, close, pairs, resolved):
         return None
-    # A LINK MAY NOT CONTAIN A LINK. When the text holds one, CommonMark
-    # deactivates the OUTER opener and the inner link is what renders, so
-    # `[outer [B](beta.md)](alpha.md)` gives the reader a route to beta.md
-    # and none to alpha.md. Returning the outer destination was exactly
-    # backwards: it credited a page nothing links to and skipped the page
-    # something does.
-    #
-    # An IMAGE inside the text does not deactivate it — an image is not a
-    # link — and `readable()` has already blanked images by this point, so
-    # a badge row still resolves to its page.
-    #
-    # Only an inner INLINE link is checked, which is `check-docs-orphans.sh`'s
-    # boundary: that is the one shape resolving unconditionally, without
-    # knowing which reference labels are defined.
-    for q in range(pos + 1, close - 1):
-        if text[q] != "[" or (q and text[q - 1] == "!"):
-            continue
-        inner_close = pairs.get(q)
-        if inner_close is None or inner_close >= close - 1:
-            continue
-        if _tail_at(text, inner_close + 1) is not None:
-            return None
-        # A resolved inner REFERENCE deactivates the outer opener too. Last
-        # round this checked only inline links, which is the boundary that
-        # holds when the defined labels are unknown; where they ARE known,
-        # `[outer [Other][o]](index.md)` routes the reader to `o`'s target
-        # and leaves the outer destination literal.
-        #
-        # `resolved` defaults to empty, so a caller without the set gets the
-        # narrower rule rather than a wrong one.
-        if resolved:
-            ref = ref_at(text, q, pairs)
-            if ref is not None and ref[0] <= close - 1:
-                key = label_key(ref[1])
-                if key is not None and key in resolved:
-                    return None
     return tail
 
 
@@ -422,6 +423,8 @@ def ref_at(text, pos, pairs=None, _resolved=frozenset()):
         return None
     close = bracket_span(text, pos, pairs)
     if close is None:
+        return None
+    if not _text_renders(text, pos, close, pairs, _resolved):
         return None
     inner = text[pos + 1:close - 1]
     m = _LABEL.match(text, close)
@@ -508,6 +511,9 @@ DEFN = re.compile(
 # character turned a broken destination into a working one. Same class and
 # same spelling as `check-docs-links.sh`'s `ESCAPED_PUNCT`, which had this
 # right — the fourth finding traceable to differing from a sibling.
+# A URI scheme: a letter, then letters, digits, `+`, `-` or `.`, then `:`.
+URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+
 ESCAPED_PUNCT = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 IMAGE_MARK = "\ufffc"
@@ -559,6 +565,40 @@ def blank_links(text):
     return "".join(out)
 
 
+def _defn_entries(body):
+    """Every REAL reference definition in `body`, as `(label, destination)`.
+
+    One scanner for both callers. The prepass that computes candidate labels
+    and the scan that resolves them had grown apart: block-start belonged to
+    both, destination validation had been added to one, and a malformed
+    `[o]: bad(unbalanced` therefore marked `o` resolved in the prepass and
+    unresolved in the scan — which deactivated a perfectly good outer link.
+
+    Every rule a definition must satisfy lives here, so there is no second
+    place to forget one:
+
+    - it must START A BLOCK, or it is a line of the paragraph above it
+    - its label must be a label — foldable, and within the 999-character cap
+    - its destination must parse, angled by that grammar and bare by
+      `dest_at`'s balancing
+    """
+    for m in DEFN.finditer(body):
+        if not _starts_block(body, m.start()):
+            continue
+        key = label_key(m.group(1))
+        if key is None:
+            continue
+        dest = m.group(2)
+        if dest.startswith("<"):
+            if not _ANGLE_DEST.fullmatch(dest):
+                continue
+        else:
+            span = dest_at(dest, 0)
+            if span is None or span[0] != len(dest):
+                continue
+        yield key, dest
+
+
 def candidate_labels(text):
     """The reference labels this document appears to define.
 
@@ -580,15 +620,7 @@ def candidate_labels(text):
     # The first pass terminates because it resolves no labels: with an empty
     # set every reference image is left alone, which is the conservative
     # direction, and fences and comments do not depend on labels at all.
-    base = readable(text, frozenset())
-    out = set()
-    for m in DEFN.finditer(base):
-        if not _starts_block(base, m.start()):
-            continue
-        key = label_key(m.group(1))
-        if key is not None:
-            out.add(key)
-    return out
+    return {key for key, _ in _defn_entries(readable(text, frozenset()))}
 
 
 def opens_fence(line):
@@ -681,35 +713,7 @@ def definitions(text):
       names the page `alpha.md` rather than a file that does not exist.
     """
     out = {}
-    body = blank_links(text)
-    for m in DEFN.finditer(body):
-        # A definition must START A BLOCK. Glued to the line above it —
-        # `Some prose` then `[catalog]: …` — CommonMark keeps that line in
-        # the paragraph and defines nothing, so a later `[Guide][catalog]`
-        # renders as literal text. Searching every line resolved it anyway.
-        if not _starts_block(body, m.start()):
-            continue
-        key = label_key(m.group(1))
-        if key is None:
-            continue
-        # A bare destination must balance its parentheses, the same rule
-        # `dest_at` applies to an inline one. `\S+` accepted
-        # `index.md#(unterminated`, which renders no link at all — and the
-        # fragment strip then hid the evidence.
-        dest = m.group(2)
-        # The ANGLE form gets the same grammar an inline destination uses,
-        # not a startswith/endswith glance. `<index.md?>>` merely begins and
-        # ends with brackets: CommonMark closes the destination at the FIRST
-        # `>` and rejects the rest as trailing garbage, so nothing is
-        # defined. Round 32 validated the bare form here and left this one
-        # on that glance — the same one-of-two miss, in the same function.
-        if dest.startswith("<"):
-            if not _ANGLE_DEST.fullmatch(dest):
-                continue
-        else:
-            span = dest_at(dest, 0)
-            if span is None or span[0] != len(dest):
-                continue
+    for key, dest in _defn_entries(blank_links(text)):
         out.setdefault(key, dest)
     return out
 
@@ -1300,7 +1304,14 @@ def normalise(target, base):
     target = urllib.parse.unquote(target)
     target = ESCAPED_PUNCT.sub(r"\1", target)
     target = target.rstrip("/")
-    if not target or target.startswith(("http://", "https://", "mailto:")):
+    if not target:
+        return None
+    # ANY URI scheme leaves the guide, not the three that happened to occur
+    # to me. A hard-coded list turned `ftp://example.com/file` into the
+    # relative path `docs/guide/ftp:/example.com/file` and reported a page
+    # that does not exist — and missed case variants like `HTTPS:` besides.
+    # The grammar is scheme-agnostic and case-insensitive, as URIs are.
+    if URI_SCHEME.match(target):
         return None
     # A ROOT-RELATIVE destination leaves the repository. On GitHub and every
     # other README renderer `/docs/guide/index.md` addresses the host root,
@@ -3517,6 +3528,43 @@ self_test() {
   printf '[Guide](docs/guide/\\index.md)\n' > "$tmp/escape_non_punct/README.md"
   _commit escape_non_punct
   _case "a backslash before a letter is not an escape" 1 escape_non_punct
+
+  # 171. ANY URI scheme leaves the guide, not the three that occurred to me.
+  #      A hard-coded list read `ftp://example.com/file` as the relative
+  #      path `docs/guide/ftp:/example.com/file` and reported a page that
+  #      does not exist — and missed case variants like `HTTPS:` besides.
+  _scaffold uri_schemes
+  printf '# A\n' > "$tmp/uri_schemes/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [FTP](ftp://example.com/f)\n- [X](HTTPS://example.com/x)\n' \
+    > "$tmp/uri_schemes/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/uri_schemes/README.md"
+  _commit uri_schemes
+  _case "any URI scheme is outside the guide" 0 uri_schemes
+
+  # 172. A malformed definition must not mark its label resolved. The
+  #      prepass and the real scan had drifted — block-start belonged to
+  #      both, destination validation had reached only one — so `[o]: bad(`
+  #      resolved in one and not the other, deactivating a good outer link.
+  #      `_defn_entries` is now the single scanner both call.
+  _scaffold prepass_validation
+  printf '# A\n' > "$tmp/prepass_validation/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/prepass_validation/docs/guide/index.md"
+  printf '[outer [Other][o]](docs/guide/index.md)\n\n[o]: bad(unbalanced\n' \
+    > "$tmp/prepass_validation/README.md"
+  _commit prepass_validation
+  _case "a malformed definition resolves nothing" 0 prepass_validation
+
+  # 173. An empty REFERENCE label renders an anchor with nothing in it, so
+  #      it is no more an entry than `- [](alpha.md)` is. Case 163 gave the
+  #      inline spelling this rule and `ref_at` did not share it.
+  _scaffold empty_ref_label
+  printf '# A\n' > "$tmp/empty_ref_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [][a]\n\n[a]: alpha.md\n' \
+    > "$tmp/empty_ref_label/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/empty_ref_label/README.md"
+  _commit empty_ref_label
+  _case "an empty reference label is not an entry" 1 empty_ref_label
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
