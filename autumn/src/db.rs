@@ -6587,9 +6587,18 @@ pub(crate) fn establish_migration_connection(
 /// *immediately* with `SQLITE_BUSY`, and `auto_migrate_sqlite` exits the process.
 /// With the timeout, migration statements WAIT up to 5s for the lock to clear
 /// instead of aborting; diesel migrations are idempotent, so a migrator that
-/// waits and then finds migrations already applied is fine. Only `busy_timeout`
-/// is set here — NOT `foreign_keys`/`journal_mode`, because `foreign_keys = ON`
-/// can break table-recreating migrations.
+/// waits and then finds migrations already applied is fine.
+///
+/// `recursive_triggers = ON` is set too, matching the runtime pool. Without it
+/// `SQLite` skips `DELETE` triggers for the row an `INSERT OR REPLACE` removes,
+/// so a migration could rewrite the append-only money ledger (#1837) — replace
+/// an account to change its currency, or launder a transaction-key
+/// replacement — without firing a single guard. It is safe here in a way
+/// `foreign_keys` is not: it only decides whether `DELETE` triggers see a
+/// `REPLACE`, and no migration in the tree uses `REPLACE`.
+///
+/// `foreign_keys` and `journal_mode` are still NOT set, because
+/// `foreign_keys = ON` can break table-recreating migrations.
 ///
 /// # Errors
 ///
@@ -6603,7 +6612,7 @@ pub(crate) fn establish_sqlite_migration_connection(
     use diesel::Connection as _;
     use diesel::connection::SimpleConnection as _;
     let mut conn = diesel::SqliteConnection::establish(&normalize_sqlite_target(database_url))?;
-    conn.batch_execute("PRAGMA busy_timeout = 5000;")
+    conn.batch_execute("PRAGMA busy_timeout = 5000; PRAGMA recursive_triggers = ON;")
         .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
     Ok(conn)
 }
@@ -6611,6 +6620,36 @@ pub(crate) fn establish_sqlite_migration_connection(
 #[cfg(test)]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;
+
+    /// Row shape for `PRAGMA recursive_triggers`.
+    #[cfg(feature = "sqlite")]
+    #[derive(diesel::QueryableByName)]
+    struct RecursiveTriggers {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        recursive_triggers: i32,
+    }
+
+    /// The migration connection must carry `recursive_triggers` too.
+    ///
+    /// It is a second, separate path from the pool. Without the pragma a
+    /// migration's `INSERT OR REPLACE` skips the `DELETE` triggers that keep
+    /// the money ledger (#1837) append-only.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_migration_connection_enables_recursive_triggers() {
+        use diesel::RunQueryDsl as _;
+
+        let mut conn = super::establish_sqlite_migration_connection(":memory:")
+            .expect("open an in-memory migration connection");
+        let rows: Vec<RecursiveTriggers> = diesel::sql_query("PRAGMA recursive_triggers")
+            .load(&mut conn)
+            .expect("read the pragma back");
+        assert_eq!(
+            rows.into_iter().next().map(|row| row.recursive_triggers),
+            Some(1),
+            "a migration connection must enable recursive_triggers"
+        );
+    }
 
     #[test]
     fn migration_path_selection_follows_the_tls_posture() {

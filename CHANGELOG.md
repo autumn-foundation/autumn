@@ -60,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
     `INSERT OR REPLACE` is refused too: its implicit delete skips `DELETE`
     triggers unless `PRAGMA recursive_triggers` is on, so Autumn's pool now
-    sets that pragma on every SQLite connection, and the migration adds
-    `BEFORE INSERT` guards on the posting row keys for connections that do not.
+    sets that pragma on every SQLite connection it opens, the migrator
+    included, and the migration adds `BEFORE INSERT` guards on the posting row
+    keys for a connection that does not.
     `ledger::balance` sums an account's postings; `ledger::trial_balance`
     makes the global zero-sum invariant queryable from a job or a health
     check.
@@ -1056,9 +1057,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`SQLite` connections now set `PRAGMA recursive_triggers = ON`.** `SQLite`
-  defaults it off, and with it off a `DELETE` trigger does not fire for the row
-  an `INSERT OR REPLACE` deletes to settle a conflict. The money ledger is
+- **`SQLite` connections now set `PRAGMA recursive_triggers = ON`.** Both the
+  runtime pool and the migration connection. `SQLite` defaults it off, and with
+  it off a `DELETE` trigger does not fire for the row an `INSERT OR REPLACE`
+  deletes to settle a conflict. The money ledger is
   append-only by `DELETE` trigger, so the default let a `REPLACE` rewrite the
   books silently. An application trigger on `DELETE` now also fires for such a
   row, which is what Postgres already does.

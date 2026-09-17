@@ -285,8 +285,11 @@ one account. `set_allow_negative` still works; only the currency is frozen.
 `INSERT OR REPLACE` is the same rewrite in disguise, and SQLite needs two
 things to refuse it. SQLite settles the conflict by deleting the row that is in
 the way, and it skips `DELETE` triggers for that deletion unless
-`PRAGMA recursive_triggers` is on. Autumn's pool therefore sets that pragma on
-every SQLite connection, which puts the append-only triggers back in the path.
+`PRAGMA recursive_triggers` is on. Autumn therefore sets that pragma on every
+SQLite connection it opens — the runtime pool and the migration connection
+alike — which puts the append-only triggers back in the path. The migrator
+matters on its own: a later migration doing `INSERT OR REPLACE` would otherwise
+rewrite the books with no guard firing.
 The migration also refuses an insert that collides with a posting's row keys,
 which holds even on a connection that does not set the pragma.
 

@@ -117,9 +117,10 @@ BEGIN
 END;
 
 -- And the REPLACE form of the same edit, which the UPDATE trigger never sees.
--- `PRAGMA recursive_triggers = ON` (the pool sets it on every connection) makes
--- SQLite fire this DELETE trigger for the row a REPLACE removes to settle its
--- conflict, which is what the default `OFF` suppresses.
+-- `PRAGMA recursive_triggers = ON` (Autumn sets it on every SQLite connection
+-- it opens, the runtime pool and the migrator alike) makes SQLite fire this
+-- DELETE trigger for the row a REPLACE removes to settle its conflict, which is
+-- what the default `OFF` suppresses.
 --
 -- A DELETE trigger, not a BEFORE INSERT guard: an insert guard fires before
 -- `ON CONFLICT (id) DO NOTHING`, so it would turn `ensure_account`'s documented
