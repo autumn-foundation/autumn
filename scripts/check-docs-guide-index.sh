@@ -138,6 +138,7 @@ set -euo pipefail
 run_check() {
   local dir="$1"
   python3 - "$dir" <<'PYEOF'
+import html
 import re
 import subprocess
 import sys
@@ -374,7 +375,13 @@ def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
     """
     if pairs is None:
         pairs = bracket_pairs(text)
-    if not text[pos + 1:close - 1].strip():
+    # CHARACTER REFERENCES decode before "does this render anything?" is
+    # asked. `[&#32;](alpha.md)` renders `<a href="alpha.md"> </a>` — an
+    # anchor holding one space, which a reader can neither read nor aim at —
+    # but the encoded source is six non-blank characters and looked like
+    # content. `html.unescape` is the same decode `normalise` applies to a
+    # destination, asked here of the text.
+    if not html.unescape(text[pos + 1:close - 1]).strip():
         return False
     for q in range(pos + 1, close - 1):
         if text[q] != "[" or (q and text[q - 1] == "!"):
@@ -603,8 +610,14 @@ DEFN = re.compile(
     # a row is not counted as an entry, while `definitions` could not record
     # the label it defines. The gate therefore said both "that row is a
     # definition, not an entry" and "that label is undefined".
-    r"""^(?: {0,3}(?:>[ \t]?)+)? {0,3}"""
-    r"""(?:(?:[-*+]|\d{1,9}[.)])[ \t]{1,4})?"""
+    # ...and containers COMPOSE, in any order and to any depth. A quote
+    # inside a list item (`- > [catalog]: x`) nests the other way round from
+    # the spelling the previous two commits handled, and the definition is
+    # document-global either way. Hard-coding "quote then at most one list
+    # marker" was an ordering, not a grammar; this is a repeatable segment,
+    # which is what a container prefix actually is.
+    r"""^(?:[ \t]{0,3}(?:>[ \t]?)+|[ \t]{0,3}(?:[-*+]|\d{1,9}[.)])[ \t]{1,4})*"""
+    r"""[ \t]{0,3}"""
     r"""\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
     r"""(""" + _ANGLE + r"""|\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
@@ -714,14 +727,22 @@ def _prefix_ok(prefix):
     and the prefix added for list-contained definitions repeated it. The
     arithmetic is the same one `row_at` does, which is why it reads the same.
     """
-    m = re.search(r"(?:[-*+]|\d{1,9}[.)])(?=[ \t])", prefix)
+    # The INNERMOST container decides, and only a list marker imposes this
+    # limit — a quote marker does not. So this looks for a marker followed
+    # by nothing but whitespace: in `- > [a]: x` the innermost container is
+    # the quote, and the `-` there is not padding for the definition at all.
+    # The marker is CAPTURED so the padding can be measured from where it
+    # ends: the trailing `[ \t]*$` is part of the match, and reading
+    # `m.end()` instead of `m.end(1)` would start counting past the very
+    # padding being counted.
+    m = re.search(r"((?:[-*+]|\d{1,9}[.)]))(?=[ \t])[ \t]*$", prefix)
     if m is None:
         return True
     col = 0
-    for ch in prefix[:m.end()]:
+    for ch in prefix[:m.end(1)]:
         col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
     base = col
-    for ch in prefix[m.end():]:
+    for ch in prefix[m.end(1):]:
         col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
     return 1 <= col - base <= 4
 
@@ -1656,6 +1677,13 @@ def normalise(target, base):
     # comparing the fragment as part of the filename rejected valid rows and
     # valid README links. Stripping here rather than at each call site is the
     # point: a caller cannot forget it.
+    # CHARACTER REFERENCES decode before any of this. `[A](alpha&#46;md)`
+    # names `alpha.md` — cmark-gfm emits `href="alpha.md"` — but the `#`
+    # inside `&#46;` was read as a fragment delimiter first, leaving
+    # `alpha&` and rejecting a valid row. Decoding has to happen BEFORE the
+    # fragment split for exactly that reason, which is why it sits here
+    # rather than beside the unquoting below.
+    target = html.unescape(target)
     target = target.split("#", 1)[0].rstrip()
     # A rendered link is a URL, and `check-docs-links.sh` already resolves
     # one this way. Disagreeing with the sibling gate about what a
@@ -4626,6 +4654,45 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/h3_not_section/README.md"
   _commit h3_not_section
   _case "a level-three heading opens no section" 1 h3_not_section
+
+  # 226. CHARACTER REFERENCES decode before "does this render anything?".
+  #      `[&#32;](alpha.md)` renders an anchor holding one space — nothing a
+  #      reader can read or aim at — while the encoded source is six
+  #      non-blank characters and looked like content.
+  _scaffold entity_blank_label
+  printf '# A\n' > "$tmp/entity_blank_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [&#32;](alpha.md)\n' \
+    > "$tmp/entity_blank_label/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/entity_blank_label/README.md"
+  _commit entity_blank_label
+  _case "an entity that renders blank is not content" 1 entity_blank_label
+
+  # 227. ...and they decode BEFORE the fragment split, which is the whole
+  #      point: `alpha&#46;md` names `alpha.md`, but the `#` inside the
+  #      reference was read as a fragment delimiter first, leaving `alpha&`
+  #      and rejecting a row cmark-gfm renders as a link to the page.
+  _scaffold entity_in_dest
+  printf '# A\n' > "$tmp/entity_in_dest/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha&#46;md)\n' \
+    > "$tmp/entity_in_dest/docs/guide/index.md"
+  printf '[Guide](docs/guide/index&#46;md)\n' > "$tmp/entity_in_dest/README.md"
+  _commit entity_in_dest
+  _case "a character reference decodes before the fragment" 0 entity_in_dest
+
+  # 228. Containers COMPOSE, in any order. A quote inside a list item nests
+  #      the other way round from the two spellings the previous commits
+  #      handled, and the definition is document-global either way. Hard
+  #      coding "quote then at most one list marker" was an ordering, not a
+  #      grammar.
+  _scaffold defn_composed_container
+  printf '# A\n' > "$tmp/defn_composed_container/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_composed_container/docs/guide/index.md"
+  printf -- '- > [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_composed_container/README.md"
+  _commit defn_composed_container
+  _case "container prefixes compose in any order" 0 defn_composed_container
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
