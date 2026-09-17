@@ -751,37 +751,55 @@ def blank_links(text):
     return "".join(out)
 
 
+# The two segments a container prefix is made of, mirroring `DEFN`'s own
+# alternation so the walk below and the anchor cannot disagree about what a
+# prefix is.
+_PFX_QUOTE = re.compile(r"[ \t]{0,3}(?:>[ \t]?)+")
+_PFX_LIST = re.compile(r"[ \t]{0,3}((?:[-*+]|\d{1,9}[.)]))([ \t]{1,4})")
+
+
 def _prefix_ok(prefix):
     """True when a definition's line PREFIX really leaves it a definition.
 
-    Columns, not characters. `-\t\t[a]: x` is two tabs to column eight —
-    seven columns of padding after the marker — which is indented CODE
-    inside the list item, so it defines nothing and a later `[a]` reference
-    stays literal. Counting each tab as one padding character accepted it.
+    Columns, not characters, and EVERY list container is checked — not just
+    the innermost one. Each marker opens an item whose content must begin
+    one to four columns after it; a fifth is indented code, and code inside
+    the OUTER item makes everything nested in it code too:
 
-    This is the second time on this branch that tab padding was written as a
-    character count: `row_at` was corrected the same way three commits ago,
-    and the prefix added for list-contained definitions repeated it. The
-    arithmetic is the same one `row_at` does, which is why it reads the same.
+        -<TAB><TAB>- [catalog]: x
+
+    The outer `-` ends at column 1 and its two tabs reach column 8, so that
+    whole line is code and defines nothing, however tidy the inner `- `
+    looks. Checking only the innermost marker saw a one-space padding and
+    accepted it.
+
+    Tab padding is measured the way `row_at` measures it. That arithmetic
+    has now been got wrong twice on this branch by reasoning about
+    characters instead of columns, which is why both places compute it the
+    same way rather than describing it.
     """
-    # The INNERMOST container decides, and only a list marker imposes this
-    # limit — a quote marker does not. So this looks for a marker followed
-    # by nothing but whitespace: in `- > [a]: x` the innermost container is
-    # the quote, and the `-` there is not padding for the definition at all.
-    # The marker is CAPTURED so the padding can be measured from where it
-    # ends: the trailing `[ \t]*$` is part of the match, and reading
-    # `m.end()` instead of `m.end(1)` would start counting past the very
-    # padding being counted.
-    m = re.search(r"((?:[-*+]|\d{1,9}[.)]))(?=[ \t])[ \t]*$", prefix)
-    if m is None:
-        return True
-    col = 0
-    for ch in prefix[:m.end(1)]:
-        col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
-    base = col
-    for ch in prefix[m.end(1):]:
-        col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
-    return 1 <= col - base <= 4
+    col = i = 0
+    n = len(prefix)
+    while i < n:
+        m = _PFX_QUOTE.match(prefix, i)
+        if m is not None and m.end() > i:
+            for ch in prefix[i:m.end()]:
+                col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
+            i = m.end()
+            continue
+        m = _PFX_LIST.match(prefix, i)
+        if m is not None:
+            for ch in prefix[i:m.end(1)]:
+                col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
+            base = col
+            for ch in prefix[m.end(1):m.end()]:
+                col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
+            if not 1 <= col - base <= 4:
+                return False
+            i = m.end()
+            continue
+        break
+    return True
 
 
 def _defn_entries(body, origin=None):
@@ -1109,10 +1127,19 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
 _TWS = r"""(?:[ \t]|\n(?!\s*\n))"""
 # One attribute: a name, optionally `= value` with the value bare, single- or
 # double-quoted. Quoted values are units, so a `>` inside one does not end the
-# tag.
+# tag — but a quoted value may NOT span a blank line, for the same reason
+# `_TWS` may not: the paragraph ends there and the tag never closes. `[^']*`
+# and `[^"]*` took arbitrary newlines, so `prose <span title="`, a blank
+# line, then `[Guide](index.md)">` matched ONE tag across both paragraphs
+# and blanked a link cmark-gfm renders live in the second one.
+#
+# That blank-line rule now holds in five places — bracket pairs, image
+# labels, code spans, inline comments and here — and this was the construct
+# still missing it.
+_QVAL = r"""(?:'(?:[^'\n]|\n(?!\s*\n))*'|"(?:[^"\n]|\n(?!\s*\n))*")"""
 _ATTR = (r"(?:" + _TWS + r"+[a-zA-Z_:][a-zA-Z0-9_.:-]*"
          r"(?:" + _TWS + r"*=" + _TWS + r"*"
-         r"""(?:[^ \t\n"'=<>`]+|'[^']*'|"[^"]*"))?)""")
+         r"""(?:[^ \t\n"'=<>`]+|""" + _QVAL + r"))?)")
 # An inline tag, matched against CommonMark's ACTUAL grammar rather than
 # "angle brackets with something between them". The loose version blanked
 # `<span = [catalog]>` — which is literal text, because `=` cannot begin an
@@ -4745,6 +4772,56 @@ self_test() {
     > "$tmp/entity_unterminated/README.md"
   _commit entity_unterminated
   _case "an unterminated reference does not decode" 1 entity_unterminated
+
+  # 230. EVERY list container's padding is checked, not just the innermost.
+  #      In `-<TAB><TAB>- [catalog]: x` the outer marker ends at column 1 and
+  #      its two tabs reach column 8, so the whole line is indented code and
+  #      defines nothing — however tidy the inner `- ` looks. The previous
+  #      commit checked the innermost marker only, saw one space, and
+  #      accepted it.
+  _scaffold nested_list_padding
+  printf '# A\n' > "$tmp/nested_list_padding/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/nested_list_padding/docs/guide/index.md"
+  printf -- '-\t\t- [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/nested_list_padding/README.md"
+  _commit nested_list_padding
+  _case "every nested container's padding counts" 1 nested_list_padding
+
+  # 231. Properly nested, both paddings valid, so it really is a definition.
+  _scaffold nested_list_valid
+  printf '# A\n' > "$tmp/nested_list_valid/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/nested_list_valid/docs/guide/index.md"
+  printf -- '- - [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/nested_list_valid/README.md"
+  _commit nested_list_valid
+  _case "a properly nested definition defines" 0 nested_list_valid
+
+  # 232. A quoted ATTRIBUTE VALUE may not span a blank line, for the reason
+  #      `_TWS` may not: the paragraph ends there and the tag never closes.
+  #      `[^"]*` took arbitrary newlines, so one tag matched across both
+  #      paragraphs and blanked a link cmark-gfm renders live in the second.
+  #      Fifth construct to need this rule; the last one that lacked it.
+  _scaffold attr_across_blank
+  printf '# A\n' > "$tmp/attr_across_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/attr_across_blank/docs/guide/index.md"
+  printf 'prose <span title="\n\n[Guide](docs/guide/index.md)">\n' \
+    > "$tmp/attr_across_blank/README.md"
+  _commit attr_across_blank
+  _case "a quoted attribute stops at a blank line" 0 attr_across_blank
+
+  # 233. ...and the guard: across ONE newline it is still a single tag, so a
+  #      link inside the value is attribute text and reaches nothing.
+  _scaffold attr_one_newline
+  printf '# A\n' > "$tmp/attr_one_newline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/attr_one_newline/docs/guide/index.md"
+  printf 'prose <span title="a\n[Guide](docs/guide/index.md)">\n' \
+    > "$tmp/attr_one_newline/README.md"
+  _commit attr_one_newline
+  _case "a quoted attribute may cross one newline" 1 attr_one_newline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
