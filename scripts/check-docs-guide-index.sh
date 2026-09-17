@@ -328,7 +328,7 @@ def bracket_span(text, pos, pairs=None):
     return None if close is None else close + 1
 
 
-def link_at(text, pos, pairs=None):
+def link_at(text, pos, pairs=None, resolved=frozenset()):
     """`(end, destination)` for an INLINE link starting at `pos`, or None."""
     if pos and text[pos - 1] == "!":
         return None
@@ -362,6 +362,20 @@ def link_at(text, pos, pairs=None):
             continue
         if _tail_at(text, inner_close + 1) is not None:
             return None
+        # A resolved inner REFERENCE deactivates the outer opener too. Last
+        # round this checked only inline links, which is the boundary that
+        # holds when the defined labels are unknown; where they ARE known,
+        # `[outer [Other][o]](index.md)` routes the reader to `o`'s target
+        # and leaves the outer destination literal.
+        #
+        # `resolved` defaults to empty, so a caller without the set gets the
+        # narrower rule rather than a wrong one.
+        if resolved:
+            ref = ref_at(text, q, pairs)
+            if ref is not None and ref[0] <= close - 1:
+                key = label_key(ref[1])
+                if key is not None and key in resolved:
+                    return None
     return tail
 
 
@@ -384,7 +398,7 @@ def _tail_at(text, pos):
     return end.end(), dest
 
 
-def ref_at(text, pos, pairs=None):
+def ref_at(text, pos, pairs=None, _resolved=frozenset()):
     """`(end, label)` for a REFERENCE link starting at `pos`, or None.
 
     Covers all three spellings: full `[text][label]`, collapsed `[text][]`
@@ -406,13 +420,13 @@ def ref_at(text, pos, pairs=None):
     return close, inner
 
 
-def _scan(text, at):
+def _scan(text, at, resolved=frozenset()):
     """Every non-overlapping `at()` hit in `text`, left to right."""
     pairs = bracket_pairs(text)
     i, n = 0, len(text)
     while i < n:
         if text[i] == "[":
-            hit = at(text, i, pairs)
+            hit = at(text, i, pairs, resolved)
             if hit is not None:
                 yield (i,) + hit
                 i = hit[0]
@@ -420,9 +434,9 @@ def _scan(text, at):
         i += 1
 
 
-def link_spans(text):
+def link_spans(text, resolved=frozenset()):
     """`(start, end, destination)` for every inline link in `text`."""
-    return _scan(text, link_at)
+    return _scan(text, link_at, resolved)
 
 
 def ref_labels(text):
@@ -519,6 +533,48 @@ def blank_links(text):
     return "".join(out)
 
 
+def candidate_labels(text):
+    """The reference labels this document appears to define.
+
+    Read from the text as given, before links and images are blanked,
+    because the accurate set is computed from `readable()`'s output and this
+    is needed to PRODUCE that output. The circularity is real; the way out
+    is the one `check-docs-orphans.sh` takes — over-accept slightly and say
+    so. What it over-accepts is a definition sitting inside a link or image
+    span, which is rare, and each use below states which direction that
+    pushes it.
+    """
+    out = set()
+    for m in DEFN.finditer(text):
+        if not _starts_block(text, m.start()):
+            continue
+        key = label_key(m.group(1))
+        if key is not None:
+            out.add(key)
+    return out
+
+
+def _starts_block(text, pos):
+    """True when `pos` begins a block rather than continuing a paragraph.
+
+    Only the line above matters: a definition may follow a blank line, a
+    heading, a fence, a thematic break or the start of the file, but not a
+    line of ordinary prose, which would swallow it into that paragraph.
+    """
+    if pos == 0:
+        return True
+    start = text.rfind("\n", 0, pos)
+    if start < 0:
+        return False
+    prev_end = start
+    prev_start = text.rfind("\n", 0, prev_end) + 1
+    prev = text[prev_start:prev_end]
+    if not prev.strip():
+        return True
+    return bool(ATX.match(prev) or FENCE.match(prev) or THEMATIC.match(prev)
+                or SETEXT.match(prev) or DEFN.match(prev))
+
+
 def blank_defns(text):
     """Blank every reference-definition span, space for space.
 
@@ -552,7 +608,14 @@ def definitions(text):
       names the page `alpha.md` rather than a file that does not exist.
     """
     out = {}
-    for m in DEFN.finditer(blank_links(text)):
+    body = blank_links(text)
+    for m in DEFN.finditer(body):
+        # A definition must START A BLOCK. Glued to the line above it —
+        # `Some prose` then `[catalog]: …` — CommonMark keeps that line in
+        # the paragraph and defines nothing, so a later `[Guide][catalog]`
+        # renders as literal text. Searching every line resolved it anyway.
+        if not _starts_block(body, m.start()):
+            continue
         key = label_key(m.group(1))
         if key is None:
             continue
@@ -679,7 +742,7 @@ def _escaped(text, pos):
     return n % 2 == 1
 
 
-def readable(text):
+def readable(text, resolved=None):
     """The part of a markdown document a reader can actually see and click.
 
     Everything blanked is blanked SPACE FOR SPACE, so the line numbers in
@@ -705,6 +768,8 @@ def readable(text):
     run to end of file, because the alternative deletes real rows and makes
     this gate fail on a good index.
     """
+    if resolved is None:
+        resolved = candidate_labels(text)
     out = list(text)
     n = len(text)
     i = 0
@@ -924,6 +989,16 @@ def readable(text):
             j = i
             closed = False
             while j < n:
+                # A code span cannot cross a BLANK line: the paragraph ends
+                # there and the backticks are literal on both sides of it.
+                # Searching past one paired an opener with a backtick in a
+                # later paragraph and blanked every link between them.
+                if text[j] == "\n":
+                    k = j + 1
+                    while k < n and text[k] in " \t":
+                        k += 1
+                    if k >= n or text[k] == "\n":
+                        break
                 # CommonMark does not process backslash escapes INSIDE a
                 # code span, so a closer preceded by `\` still closes it.
                 # Only the OPENER can be escaped away.
@@ -978,6 +1053,20 @@ def readable(text):
             if label is not None and label < n and text[label] in "([":
                 close = ")" if text[label] == "(" else "]"
                 end = balanced(label, text[label], close)
+                # A reference image is an image only if its label RESOLVES —
+                # the same rule the shortcut form above already follows, and
+                # this form was simply left out of it. With no definition,
+                # `![alt [x](a.md)][missing]` renders literal brackets around
+                # a REAL link, and blanking it deleted that link.
+                #
+                # An over-accepted label here keeps a real image masked,
+                # which is the safe direction for this use.
+                if end is not None and text[label] == "[":
+                    ref = text[label + 1:end - 1]
+                    key = label_key(ref) if ref.strip() else label_key(
+                        text[i + 2:label - 1])
+                    if key is None or key not in resolved:
+                        end = None
                 if end is not None:
                     blank_to(i, end)
                     i = end
@@ -1193,7 +1282,7 @@ def entries(text, base):
         # The link must begin the row's CONTENT — that column-zero anchoring
         # is what separates an index's rows from its prose, and it is why
         # both forms are read at exactly `row.end()` rather than searched for.
-        hit = link_at(line, row.end())
+        hit = link_at(line, row.end(), None, set(defs))
         if hit is not None and hit[1]:
             target = hit[1]
         else:
@@ -1313,7 +1402,8 @@ def reaches_index(text):
     # inline pass therefore reads a copy with definition spans blanked, while
     # the reference pass below still needs them intact to resolve labels.
     if any(normalise(dest, "") == INDEX
-           for _, _, dest in link_spans(blank_defns(text))):
+           for _, _, dest in link_spans(blank_defns(text),
+                                        candidate_labels(text))):
         return True
     # Definitions, then the labels actually referenced by a full
     # (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
@@ -3037,6 +3127,86 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/image_in_link/README.md"
   _commit image_in_link
   _case "an image inside link text does not deactivate it" 0 image_in_link
+
+  # 147. A definition must START A BLOCK. Glued to the line above it, the
+  #      line stays in that paragraph and defines nothing.
+  _scaffold defn_block_start
+  printf '# A\n' > "$tmp/defn_block_start/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_block_start/docs/guide/index.md"
+  printf 'Some prose\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_block_start/README.md"
+  _commit defn_block_start
+  _case "a definition glued to a paragraph defines nothing" 1 defn_block_start
+
+  # 148. ...and the guard: after a blank line it is a definition again.
+  _scaffold defn_after_blank
+  printf '# A\n' > "$tmp/defn_after_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_after_blank/docs/guide/index.md"
+  printf 'Some prose\n\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_after_blank/README.md"
+  _commit defn_after_blank
+  _case "a definition after a blank line still defines" 0 defn_after_blank
+
+  # 149. A RESOLVED inner reference deactivates the outer opener too. Case
+  #      145 covered only the inline shape, which is the right boundary
+  #      when the defined labels are unknown and too narrow when they are.
+  _scaffold resolved_ref_in_link
+  printf '# A\n' > "$tmp/resolved_ref_in_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/resolved_ref_in_link/docs/guide/index.md"
+  printf '[outer [Other][o]](docs/guide/index.md)\n\n[o]: other.md\n' \
+    > "$tmp/resolved_ref_in_link/README.md"
+  _commit resolved_ref_in_link
+  _case "a resolved inner reference deactivates the outer" 1 resolved_ref_in_link
+
+  # 150. ...and the guard: an UNRESOLVED inner reference is literal text,
+  #      so the outer link still renders.
+  _scaffold unresolved_ref_in_link
+  printf '# A\n' > "$tmp/unresolved_ref_in_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/unresolved_ref_in_link/docs/guide/index.md"
+  printf '[outer [Other][nope]](docs/guide/index.md)\n' \
+    > "$tmp/unresolved_ref_in_link/README.md"
+  _commit unresolved_ref_in_link
+  _case "an unresolved inner reference does not deactivate" 0 unresolved_ref_in_link
+
+  # 151. A code span cannot cross a BLANK line. Searching past one paired an
+  #      opener with a backtick in a later paragraph and blanked the link
+  #      between them.
+  _scaffold span_blank_line
+  printf '# A\n' > "$tmp/span_blank_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/span_blank_line/docs/guide/index.md"
+  printf '`opener\n\n[Guide](docs/guide/index.md) `\n' \
+    > "$tmp/span_blank_line/README.md"
+  _commit span_blank_line
+  _case "a code span cannot cross a blank line" 0 span_blank_line
+
+  # 152. A reference IMAGE is an image only if its label resolves — the rule
+  #      the shortcut form already followed, applied to the form that was
+  #      left out of it. Unresolved, the brackets are literal and the link
+  #      inside them is real.
+  _scaffold unresolved_ref_image
+  printf '# A\n' > "$tmp/unresolved_ref_image/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/unresolved_ref_image/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)][missing]\n' \
+    > "$tmp/unresolved_ref_image/README.md"
+  _commit unresolved_ref_image
+  _case "an unresolved reference image is literal" 0 unresolved_ref_image
+
+  # 153. ...and the guard: a RESOLVED one is a real image, so the link in
+  #      its alt text is alt text.
+  _scaffold resolved_ref_image
+  printf '# A\n' > "$tmp/resolved_ref_image/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/resolved_ref_image/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)][found]\n\n[found]: other.png\n' \
+    > "$tmp/resolved_ref_image/README.md"
+  _commit resolved_ref_image
+  _case "a resolved reference image hides its alt text" 1 resolved_ref_image
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
