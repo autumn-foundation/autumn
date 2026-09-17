@@ -71,6 +71,17 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
+/// Starts a `MinIO` testcontainer from [`minio_image`], so both tests and the
+/// registry guard below share one image definition.
+async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO> {
+    use testcontainers::runners::AsyncRunner as _;
+
+    minio_image()
+        .start()
+        .await
+        .expect("start MinIO — is Docker running?")
+}
+
 async fn create_bucket(endpoint: &str, access: &str, secret: &str, region: &str, bucket: &str) {
     let now = chrono::Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -190,12 +201,39 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
+/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub.
+/// Docker Hub no longer serves that repository at all (`MinIO` Inc. dropped
+/// it), so every pull now fails with "pull access denied ... repository does
+/// not exist". Point at `MinIO`'s other public registry, `quay.io/minio/minio`,
+/// instead. This tag choice is independent of `testcontainers-modules`, so it
+/// stays pullable even if a future crate bump changes the crate's own default.
+fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
+    use testcontainers::ImageExt as _;
+    testcontainers_modules::minio::MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .with_tag("RELEASE.2025-09-07T16-13-09Z")
+}
+
+/// Guards the registry override without needing Docker.
+///
+/// Both tests below run only in the Docker sweep, so losing the override would
+/// surface as a red job naming a registry rather than the file that forgot.
+/// This runs in the ordinary lane instead.
+#[test]
+fn minio_image_pulls_from_the_public_registry() {
+    let descriptor = minio_image().descriptor();
+    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
+    assert_eq!(
+        name, "quay.io/minio/minio",
+        "Docker Hub no longer serves minio/minio",
+    );
+    assert!(!tag.is_empty(), "the tag must be pinned explicitly");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -208,13 +246,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
-    let minio = MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");
@@ -320,9 +352,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
-    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -335,13 +365,7 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    // MinIO stopped publishing to Docker Hub in Oct 2025 (the `minio/minio`
-    // repository itself now 404s); the same tag is still mirrored on Quay.
-    let minio = MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");

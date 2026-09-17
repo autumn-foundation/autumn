@@ -359,6 +359,76 @@ async fn invite_and_accept_as_new_user() {
         .assert_body_contains("member");
 }
 
+/// A rejected password on the signup-and-join accept form used to `Err(...)`
+/// out to the generic JSON/error-page response, dropping the invitee off the
+/// accept page entirely (Wayfinder: error-path inventory) — the same
+/// anti-pattern already fixed on `/signup` itself. Each rejection must now
+/// redisplay the same "create an account to accept" card at 422, with the
+/// invited email preserved and the message shown, and a subsequent
+/// corrected submission must still succeed against the same token.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn accept_invitation_redisplays_form_on_rejected_password() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner2@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=redo@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+    let accept_path = format!("/invite/{token}/accept");
+
+    // No password at all.
+    let resp = client.post(&accept_path).form("password=").send().await;
+    resp.assert_ok();
+    assert!(resp.text().contains("A password is required"));
+    assert!(resp.text().contains(r#"value="redo@acme.test""#));
+    assert!(resp.text().contains("Create account and join"));
+
+    // Over-long password.
+    let long_password = "x".repeat(129);
+    let resp = client
+        .post(&accept_path)
+        .form(&format!("password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("at most 128 characters"));
+    assert!(resp.text().contains(r#"value="redo@acme.test""#));
+
+    // Weak (denylisted) password.
+    let resp = client
+        .post(&accept_path)
+        .form("password=password")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("too common"));
+    assert!(resp.text().contains(r#"value="redo@acme.test""#));
+
+    // The same token still works once a valid password is submitted — the
+    // rejected attempts above must not have consumed or corrupted it.
+    let accept = client
+        .post(&accept_path)
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    accept.assert_status(303);
+    let new_member_cookie = session_cookie(&accept);
+    client
+        .get("/members")
+        .header("cookie", &new_member_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("redo@acme.test");
+}
+
 /// Two concurrent submissions of the same signup-and-join accept form (a
 /// double-submit, or a browser retry) must not leave one of them with a
 /// raw 422 — the invitation lock must serialize the two requests, so the

@@ -227,6 +227,14 @@ where
             }
         }
 
+        // A failed service-to-service call (#1755) is a dependency fault, not
+        // a client one, so `?` on one in a handler produces 502 rather than
+        // blaming the caller for an upstream 404.
+        #[cfg(feature = "http-client")]
+        if let Some(wire_err) = any_err.downcast_ref::<crate::wire::WireError>() {
+            status = wire_err.status();
+        }
+
         // Web Push (#1392) distinguishes client-fault failures (a malformed
         // browser subscription, an endpoint already claimed) from server-fault
         // ones, so an app calling `push.subscribe(…).await?` from its own
@@ -943,6 +951,20 @@ impl AutumnError {
 /// let err = AutumnError::internal_server_error_msg("not a db error");
 /// assert_eq!(unique_violation_field(&err, &[("idx_users_email_unique", "email", "taken")]), None);
 /// ```
+///
+/// # `SQLite`
+///
+/// Postgres reports the violated constraint by name (`constraint_name()`),
+/// which is what `mapping` keys on. `SQLite` reports no constraint name at
+/// all — diesel boxes its error information as a bare `String`, whose
+/// `constraint_name()` is always `None` — so a violation is instead resolved
+/// by column: `SQLite`'s own message names the offending column(s) (e.g.
+/// `UNIQUE constraint failed: widgets.email`), and `mapping`'s `field` for a
+/// single-column unique index already spells that column name (`autumn
+/// generate`'s `schema_edit::unique_index_sql` names the field it maps a
+/// violation to the same way). A composite unique index still resolves
+/// correctly because at least one of its columns is the mapped field (see
+/// `idx_invitations_pending_email` in `examples/teams`, mapped to `"email"`).
 #[cfg(feature = "db")]
 #[must_use]
 pub fn unique_violation_field<'a>(
@@ -956,11 +978,35 @@ pub fn unique_violation_field<'a>(
     else {
         return None;
     };
-    let constraint = info.constraint_name()?;
+    if let Some(constraint) = info.constraint_name() {
+        return mapping
+            .iter()
+            .find(|(c, _, _)| *c == constraint)
+            .map(|(_, field, message)| (*field, *message));
+    }
+    let violated_columns = sqlite_unique_violation_columns(info.message())?;
     mapping
         .iter()
-        .find(|(c, _, _)| *c == constraint)
+        .find(|(_, field, _)| violated_columns.iter().any(|column| column == field))
         .map(|(_, field, message)| (*field, *message))
+}
+
+/// Parses the column names out of `SQLite`'s own unique-violation wording,
+/// e.g. `"UNIQUE constraint failed: widgets.email"` ->
+/// `["email"]`, or `"UNIQUE constraint failed: invitations.tenant_id,
+/// invitations.email"` -> `["tenant_id", "email"]` for a composite index.
+/// Returns `None` for any other message (a non-`SQLite` backend, or a
+/// `SQLite` error that is not this one) so callers fall through unmatched
+/// rather than misreading unrelated text.
+#[cfg(feature = "db")]
+fn sqlite_unique_violation_columns(message: &str) -> Option<Vec<&str>> {
+    let columns = message.strip_prefix("UNIQUE constraint failed: ")?;
+    Some(
+        columns
+            .split(", ")
+            .map(|qualified| qualified.rsplit('.').next().unwrap_or(qualified))
+            .collect(),
+    )
 }
 
 // ── #2423: Postgres refuses a NUL byte in TEXT — that is client input ──────
@@ -1899,6 +1945,93 @@ mod tests {
         #[test]
         fn returns_none_when_constraint_name_is_absent() {
             let err: AutumnError = AutumnError::internal_server_error(unique_violation(None));
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        // ── SQLite fallback (issue #2698) ────────────────────────────────────
+        //
+        // Diesel boxes a SQLite `DatabaseErrorInformation` as a bare `String`
+        // whose `constraint_name()` is always `None`, so these fake it the
+        // same way — `FakeDbErrorInfo` above always names a constraint, which
+        // is exactly what real SQLite errors never do. A real SQLite engine
+        // exercising this same fallback lives in
+        // `autumn/tests/sqlite_unique_violation_field.rs`, since a diesel
+        // `String` box can't be constructed outside diesel's own sqlite
+        // backend code.
+
+        #[derive(Debug)]
+        struct FakeSqliteDbErrorInfo {
+            message: &'static str,
+        }
+
+        impl diesel::result::DatabaseErrorInformation for FakeSqliteDbErrorInfo {
+            fn message(&self) -> &str {
+                self.message
+            }
+            fn details(&self) -> Option<&str> {
+                None
+            }
+            fn hint(&self) -> Option<&str> {
+                None
+            }
+            fn table_name(&self) -> Option<&str> {
+                None
+            }
+            fn column_name(&self) -> Option<&str> {
+                None
+            }
+            fn constraint_name(&self) -> Option<&str> {
+                None
+            }
+            fn statement_position(&self) -> Option<i32> {
+                None
+            }
+        }
+
+        fn sqlite_unique_violation(message: &'static str) -> diesel::result::Error {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                Box::new(FakeSqliteDbErrorInfo { message }),
+            )
+        }
+
+        #[test]
+        fn matches_sqlite_message_column_to_field_and_message() {
+            let err: AutumnError = AutumnError::internal_server_error(sqlite_unique_violation(
+                "UNIQUE constraint failed: users.email",
+            ));
+            assert_eq!(
+                unique_violation_field(&err, MAPPING),
+                Some(("email", "has already been taken"))
+            );
+        }
+
+        #[test]
+        fn matches_sqlite_message_composite_index_by_any_column() {
+            const COMPOSITE: &[(&str, &str, &str)] =
+                &[("idx_invitations_pending_email", "email", "already pending")];
+            let err: AutumnError = AutumnError::internal_server_error(sqlite_unique_violation(
+                "UNIQUE constraint failed: invitations.tenant_id, invitations.email",
+            ));
+            assert_eq!(
+                unique_violation_field(&err, COMPOSITE),
+                Some(("email", "already pending"))
+            );
+        }
+
+        #[test]
+        fn returns_none_for_sqlite_message_naming_an_unmapped_column() {
+            let err: AutumnError = AutumnError::internal_server_error(sqlite_unique_violation(
+                "UNIQUE constraint failed: users.username",
+            ));
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        #[test]
+        fn returns_none_for_unrecognized_message_shape() {
+            let err: AutumnError = AutumnError::internal_server_error(sqlite_unique_violation(
+                "some other database error text",
+            ));
             assert_eq!(unique_violation_field(&err, MAPPING), None);
         }
 

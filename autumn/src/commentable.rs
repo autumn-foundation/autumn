@@ -755,6 +755,11 @@ pub async fn add_comment(
         )));
     }
 
+    // Resolved from THIS `spec` reference, before it is copied below:
+    // `commentable_model_for_spec` (inside `resolve_soft_deletes`) matches the
+    // registry by pointer identity, which an owned copy would not carry.
+    let soft_deletes = resolve_soft_deletes(spec);
+
     // Owned copies so the transaction closure — which must be `'static`-ish
     // across the `scope_boxed` boundary — can move them.
     let spec = *spec;
@@ -764,7 +769,7 @@ pub async fn add_comment(
 
     scoped_immediate_transaction::<Comment, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, parent_id, tenant.as_deref(), soft_deletes).await?;
 
             if let Some(reply_to) = reply_to {
                 let parent_depth =
@@ -833,6 +838,9 @@ pub async fn delete_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
+    // See `add_comment`'s comment: resolved before the copy below, from the
+    // spec reference the registry actually holds.
+    let soft_deletes = resolve_soft_deletes(spec);
     let spec = *spec;
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);
@@ -868,7 +876,14 @@ pub async fn delete_comment(
                 return Err(AutumnError::not_found_msg("Comment not found"));
             };
 
-            lock_parent(conn, &spec, target.commentable_id, tenant.as_deref()).await?;
+            lock_parent(
+                conn,
+                &spec,
+                target.commentable_id,
+                tenant.as_deref(),
+                soft_deletes,
+            )
+            .await?;
 
             let removed = delete_subtree(conn, &spec, &parent_type, parent_id, comment_id).await?;
 
@@ -924,8 +939,11 @@ pub async fn recompute_comment_count(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
+    // See `add_comment`'s comment: resolved before either branch below copies
+    // or otherwise loses this reference's identity.
+    let soft_deletes = resolve_soft_deletes(spec);
     let Some(counter_column) = spec.counter_column else {
-        probe_parent(conn, spec, parent_id, tenant, false).await?;
+        probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
         return Ok(0);
     };
 
@@ -935,7 +953,7 @@ pub async fn recompute_comment_count(
 
     scoped_immediate_transaction::<i64, AutumnError, _>(conn, |conn| {
         async move {
-            lock_parent(conn, &spec, parent_id, tenant.as_deref()).await?;
+            lock_parent(conn, &spec, parent_id, tenant.as_deref(), soft_deletes).await?;
 
             let comments = quote_ident(spec.comments_table);
             let type_column = quote_ident(spec.type_column);
@@ -999,7 +1017,8 @@ pub async fn comment_thread(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    probe_parent(conn, spec, parent_id, tenant, false).await?;
+    let soft_deletes = resolve_soft_deletes(spec);
+    probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
 
     let comments = quote_ident(spec.comments_table);
     let pk = quote_ident(spec.comment_pk);
@@ -1173,28 +1192,45 @@ fn build_nodes(
 
 // ── Statement helpers ───────────────────────────────────────────────────────
 
+/// Whether `spec`'s parent hides on `deleted_at`.
+///
+/// The column's presence is the fallback, not the answer. A `deleted_at`
+/// timestamp on a model whose repository does not opt into `soft_delete` is
+/// ordinary audit data, and filtering on it would 404 rows the app still
+/// serves deliberately. Only when no repository is registered does the
+/// column get to decide.
+///
+/// Call this with the spec reference the `#[commentable]` registry actually
+/// holds. `commentable_model_for_spec` matches it by pointer identity
+/// (`std::ptr::eq`); a copy of the `Copy` `CommentableSpec` value lives at a
+/// new address and would never match, silently falling back to the column
+/// alone (issue #2263). Every public entry point in this module resolves
+/// this **before** it copies `spec` for its transaction closure, then passes
+/// the answer down explicitly — never re-derives it after the copy.
+fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
+    commentable_model_for_spec(spec)
+        .and_then(model_soft_deletes)
+        .unwrap_or(spec.parent_soft_delete)
+}
+
 /// Probe the parent row, optionally taking the row lock.
 ///
 /// The single point that enforces "this parent exists, is live, and belongs to
 /// this caller's tenant". Everything else in this module keys on `parent_id`
 /// having passed through here.
+///
+/// `soft_deletes` is resolved by the caller via [`resolve_soft_deletes`],
+/// not derived here — see that function's doc for why.
 async fn probe_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
     parent_id: i64,
     tenant: Option<&str>,
+    soft_deletes: bool,
     lock: bool,
 ) -> AutumnResult<()> {
     let parent_table = quote_ident(spec.parent_table);
     let parent_pk = quote_ident(spec.parent_pk);
-    // The column's presence is the fallback, not the answer. A `deleted_at`
-    // timestamp on a model whose repository does not opt into `soft_delete` is
-    // ordinary audit data, and filtering on it would 404 rows the app still
-    // serves deliberately. Only when no repository is registered does the
-    // column get to decide.
-    let soft_deletes = commentable_model_for_spec(spec)
-        .and_then(model_soft_deletes)
-        .unwrap_or(spec.parent_soft_delete);
     let live = if soft_deletes {
         format!(" AND {parent_table}.{} IS NULL", quote_ident(DELETED_AT))
     } else {
@@ -1254,8 +1290,9 @@ async fn lock_parent(
     spec: &CommentableSpec,
     parent_id: i64,
     tenant: Option<&str>,
+    soft_deletes: bool,
 ) -> AutumnResult<()> {
-    probe_parent(conn, spec, parent_id, tenant, true).await
+    probe_parent(conn, spec, parent_id, tenant, soft_deletes, true).await
 }
 
 /// The depth of `comment_id` within `(parent_type, parent_id)`'s thread, where
@@ -2367,7 +2404,7 @@ async fn post_comment(
     // `Form` extractor below, so the connection would be held for as long as
     // the client takes to send its body — which the client chooses. Enough
     // slow-body requests would pin the whole pool.
-    deferred_db: crate::db::DeferredDb,
+    lazy_db: crate::db::LazyDb,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
 ) -> AutumnResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
@@ -2396,7 +2433,7 @@ async fn post_comment(
 
     // The body is read and validated, so take the connection now. A malformed
     // submission is rejected above without ever touching the pool.
-    let mut db = deferred_db.checkout().await?;
+    let mut db = lazy_db.checkout().await?;
 
     let outcome = add_comment(
         &mut db,

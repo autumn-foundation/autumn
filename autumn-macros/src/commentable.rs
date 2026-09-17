@@ -778,6 +778,11 @@ pub fn emit_commentable_items(
         #counter_guard
         #author_guard
 
+        // Keep this a `static`, never a `const`. The runtime finds a model's
+        // repository facts by comparing THIS item's address
+        // (`commentable_model_for_spec`, `std::ptr::eq`). A `const` has no
+        // fixed address and the compiler may inline a fresh copy at each use,
+        // breaking that lookup.
         #[doc = #spec_doc]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]

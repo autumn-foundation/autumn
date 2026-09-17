@@ -1,0 +1,5 @@
+error: #[derive(WireShape)] refuses `#[serde(into = …)]`: the wire shape is the other type's, and this struct's fields are not on the wire
+  --> tests/compile-fail/wire_shape_rejects_container_rewrites.rs:18:12
+   |
+18 | pub struct Item {
+   |            ^^^^

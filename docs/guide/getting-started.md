@@ -226,9 +226,9 @@ On a fresh project, before `autumn setup`, you will see something like:
 ✅ port_bindable — port 3000 is available
 ❌ tailwind_binary — target/autumn/tailwindcss not found
    hint: Run `autumn setup` to download the Tailwind CSS binary
-⚠️  signing_secret — using an ephemeral per-process signing secret (dev/test
-    only; sessions and signed URLs will not survive restarts or be shared
-    across replicas)
+⚠️  signing_secret — no signing secret configured (dev/test only): sessions and
+    CSRF tokens ride unsigned; local-storage signed URLs use an ephemeral
+    per-process key instead
    hint: Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production
 ⚠️  dotenv — `.env.example` is present but no `.env` exists
    hint: Copy `.env.example` to `.env` and fill in local values
@@ -1505,8 +1505,10 @@ See the [testing guide](testing.md) for `TestDb`, fixtures, and
 ## Before you deploy
 
 The generated app starts with local-safe defaults: in-memory sessions,
-in-process `#[scheduled]` tasks, an ephemeral signing secret, and a generic
-container Dockerfile. Before running multiple replicas you usually want to:
+in-process `#[scheduled]` tasks, no configured signing secret (see
+[signing secrets](signing-secrets.md) for what that does and does not sign),
+and a generic container Dockerfile. Before running multiple replicas you
+usually want to:
 
 1. Set `AUTUMN_ENV=prod`
 2. Set a durable `AUTUMN_SECURITY__SIGNING_SECRET` and a trusted-hosts list

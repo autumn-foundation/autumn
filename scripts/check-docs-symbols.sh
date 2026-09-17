@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Symbol drift gate: every `autumn_web::…` path the reader-facing docs put in
-# front of someone must name an item that exists.
+# Symbol drift gate: every workspace-crate path the reader-facing docs put in
+# front of someone must name an item that exists — and live in a crate a reader
+# can actually import.
 #
 # WHY THIS EXISTS: the corpus already gates the four things a reader copies off
 # a page and the one thing they cannot copy at all.
@@ -17,6 +18,37 @@
 # layer (172 fences) combined. A renamed or never-shipped item leaves behind a
 # line that looks exactly like a working one, and nothing in the tree could tell
 # the difference.
+#
+# WIDENED FROM `autumn_web::` TO EVERY PUBLISHED CRATE. For its first several
+# revisions this gate scanned one prefix, `autumn_web::`, even though it already
+# MODELLED `autumn_macros`, `autumn_edge` and `autumn_search` — it had to, to
+# follow an `autumn_web` re-export into them. The gap that left is the whole
+# reason for the widening: the sibling crates are how a reader adopts a plugin
+# (`use autumn_billing::BillingPlugin;`, `use autumn_storage_s3::S3BlobStore;`),
+# the corpus writes 67 such paths, and not one of them was a passing check. They
+# were not checked at all. A path into a sibling fails exactly the way an
+# `autumn_web::` one does — E0432 against the reader's own file — so there was
+# never a reason for the two to be gated differently, only an accident of which
+# prefix got written first.
+#
+# Widening it meant seeding resolution with the crate the path NAMES instead of
+# `autumn_web` unconditionally. That single hardcoded root was wrong in both
+# directions, and the self-test now pins both: a real item in a sibling crate
+# resolved against `autumn_web` is a false FAILURE, and — worse — a sibling path
+# that happens to collide with an `autumn_web` module would have passed while
+# naming something that does not exist where the reader is looking.
+#
+# AND THE CLASS THAT NO RENAME FIXES: a crate with no library target. See
+# `binary_only_crates` — `autumn-cli` is `src/main.rs` and nothing else, so
+# `pub` inside it is visible only within the binary. The baseline run of the
+# widened gate found the corpus's one instance, and it is the nastiest shape
+# here: `docs/guide/accessibility.md` offered a "Programmatic use" section whose
+# `use autumn_cli::check::{A11yCheckOptions, run_a11y_check, print_report};`
+# names a module that is real, items that are real and really `pub`, in a crate
+# `cargo add` installs without complaint. Every signal a reader has says the
+# line is fine. What does not exist is a library to import it from, and no
+# spelling of the path fixes that — which is why it is reported as its own
+# defect class rather than as a dead segment with a `did you mean` hint.
 #
 # WHERE IT SITS ON THE VISIBILITY SCALE: both ends of it, which is the reason
 # to gate the whole surface rather than the import lines alone.
@@ -156,6 +188,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 run_py() {
   python3 - "$@" <<'PYEOF'
 import collections
+import glob as globlib
 import os
 import pathlib
 import re
@@ -167,15 +200,390 @@ import tempfile
 MODE = sys.argv[1]
 ROOT = sys.argv[2]
 
-# The workspace crates a documented path can reach into. `autumn_web` is the
-# one readers name; the others are named only because `autumn_web` re-exports
+# The workspace crates a documented path can reach into.
+#
+# `autumn_web` is the one readers name most; `autumn_macros`, `autumn_edge` and
+# `autumn_search` were originally modelled only because `autumn_web` re-exports
 # out of them, and a path that lands in one has to keep resolving there.
+#
+# The rest are here because readers name them DIRECTLY. Adopting a plugin crate
+# is a `use autumn_billing::…`/`use autumn_storage_s3::…` line in the reader's
+# own file — the corpus writes 67 such sibling-crate paths across 26 distinct
+# spellings — and until this gate scanned for them only the `autumn_web::`
+# prefix was audited. A path into a sibling fails exactly the way an
+# `autumn_web::` one does (E0432 against the reader's own file), so there is no
+# reason for the two to be gated differently.
 CRATES = {
     'autumn_web': 'autumn/src',
     'autumn_macros': 'autumn-macros/src',
     'autumn_edge': 'autumn-edge/src',
     'autumn_search': 'autumn-search/src',
+    'autumn_billing': 'autumn-billing/src',
+    'autumn_storage_s3': 'autumn-storage-s3/src',
+    'autumn_cache_redis': 'autumn-cache-redis/src',
+    'autumn_admin_plugin': 'autumn-admin-plugin/src',
+    'autumn_media_plugin': 'autumn-media-plugin/src',
+    'autumn_schema_core': 'autumn-schema-core/src',
 }
+# NOT modelled: `autumn_plugin_reference`. It was listed here at first, which
+# was inconsistent with this gate's own rule — the crate is `publish = false`,
+# so `workspace_crates` deliberately keeps it out of the reader-facing set,
+# while a `CRATES` entry put its prefix back into `prefix_re` and built a
+# resolvable surface for it. A page recommending
+# `autumn_plugin_reference::ReferencePlugin` would then have PASSED, for a
+# crate no reader can depend on at all. It is not re-exported by any published
+# crate (only named in one `plugin_contract.rs` doc comment) and the corpus
+# writes no path into it, so the entry bought nothing and cost that.
+
+
+def workspace_crates(root):
+    """ident -> (src dir, has a library target), read from the workspace.
+
+    DERIVED rather than listed, for the reason the plugin-root scan in
+    `check-docs-toml.sh` is derived: a list of crates outlives the tree it
+    describes. A new publishable crate has to be MODELLED (see
+    `undeclared_crates`) or a reader can be handed a path into it that nothing
+    resolves, and a crate that stops shipping a library has to stop being
+    resolvable the same day.
+
+    Only PUBLISHED members count, because a reader reaches a crate by depending
+    on it, so a crate nobody can depend on is not a prefix anybody can write:
+    that rules out the `examples/` and `benchmarks/` members, and also
+    `example-e2e` and `autumn-plugin-reference`, which sit at the top level
+    beside the real crates and would otherwise be demanded here as
+    reader-facing surface.
+
+    Publishability is `_published`, NOT a literal `publish is False` test of my
+    own. Cargo spells "do not publish" three ways — `publish = false`,
+    `publish = []`, and `publish.workspace = true` inheriting a `false` from
+    `[workspace.package]` — and this file already had all three right in
+    `_published`, for the corpus scan. A second, weaker copy here would read a
+    private library as published and fail the gate as an undeclared crate,
+    which is the self-maintaining check firing on the one shape it exists to
+    tolerate.
+    """
+    with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
+        manifest = tomllib.load(fh)
+    ws = manifest.get('workspace') or {}
+    # The members enumerated here are the ROOT workspace's, so the root
+    # manifest is the one an inherited `publish` resolves against.
+    ws_package = ws.get('package') or {}
+    out = {}
+    for rel in _member_dirs(root, ws):
+        path = os.path.join(root, rel, 'Cargo.toml')
+        if not os.path.exists(path):
+            continue
+        with open(path, 'rb') as fh:
+            data = tomllib.load(fh)
+        pkg = data.get('package') or {}
+        name = pkg.get('name')
+        if not name or not _published(pkg, ws_package):
+            continue
+        lib = _lib_file(root, rel, data)
+        out[_import_ident(data, name)] = (
+            os.path.join(rel, 'src'),
+            # Anchored at the MANIFEST directory, which is where Cargo anchors
+            # it. A declared root need not live under `src/` (`[lib] path =
+            # "lib/api.rs"` is valid), and treating the path as `src`-relative
+            # scanned `<crate>/src/lib/api.rs` — a file that does not exist,
+            # so the crate came back empty, or worse, one that does and the
+            # wrong API got audited.
+            os.path.join(rel, lib) if lib is not None else None)
+    return out
+
+
+def _member_dirs(root, ws):
+    """Workspace member directories, repo-relative, globs expanded.
+
+    `members` accepts Cargo's globs (`crates/*`), and reading each entry as a
+    literal directory silently drops every package a glob matches. That is not
+    a missing check but a VOIDED one: `undeclared_crates` could no longer see
+    those crates, so the "every published crate is modelled" guarantee would
+    keep passing while covering none of them — the same
+    unaudited-looks-like-clean failure as an unmatched `[lib] name`.
+
+    `exclude` semantics are cargo's (`WorkspaceRootConfig::is_excluded`) and
+    are not symmetrical with `members`: entries are literal path PREFIXES, so
+    `exclude = ["crates/*"]` matches nothing, and an explicitly listed member
+    always wins over an exclude. Mirrored from
+    `scripts/check-example-bin-names.sh`, which worked these rules out first —
+    the shape, not a second guess at it.
+
+    IN-TREE PATH DEPENDENCIES ARE MEMBERS TOO, even when `members` does not
+    name them — cargo's documented behaviour, and the reason this function
+    walks them. An earlier revision of this gate deliberately did not, on the
+    reasoning that a path dependency reflects what the workspace BUILDS rather
+    than what it PUBLISHES. That reasoning was wrong: cargo makes such a
+    dependency a real member, so a published one is a crate a reader can name,
+    and omitting it left `undeclared_crates` green with that crate's whole
+    prefix unaudited. Adding a published sibling through `path = "../new"`
+    alone is enough to trigger it.
+
+    Membership is NOT taken from `cargo metadata`, which would be the
+    authoritative answer: this gate is a toolchain-free job that reports in
+    seconds (see its step in ci.yml), and shelling out to cargo would cost
+    that. The rules are mirrored from `scripts/check-example-bin-names.sh`
+    instead, which resolved them first on #2712 — including the two that are
+    easy to get wrong: a `[workspace.dependencies]` path is relative to the
+    ROOT while a direct `path` is relative to the dependent package, and a
+    dependency carrying its own `[workspace]` table is a separate workspace
+    and is not recursed into.
+    """
+    raw = ws.get('members', []) or []
+    exclude = ws.get('exclude', []) or []
+    ws_deps = ws.get('dependencies') or {}
+    if not isinstance(ws_deps, dict):
+        ws_deps = {}
+    rootp = pathlib.Path(root).resolve()
+
+    def under(rel, pat):
+        pat = pat.strip('/')
+        return bool(pat) and (rel == pat or rel.startswith(pat + '/'))
+
+    def excluded(rel):
+        return (any(under(rel, p) for p in exclude)
+                and not any(under(rel, p) for p in raw))
+
+    out, seen, queue = [], set(), []
+
+    def note(rel):
+        if rel and rel not in seen and not excluded(rel):
+            seen.add(rel)
+            out.append(rel)
+            queue.append(rel)
+
+    for pattern in raw:
+        if globlib.has_magic(pattern):
+            matches = sorted(p.relative_to(rootp).as_posix()
+                             for p in rootp.glob(pattern)
+                             if p.is_dir() and (p / 'Cargo.toml').is_file())
+        else:
+            matches = [pattern.strip('/')]
+        for rel in matches:
+            note(rel)
+
+    # The ROOT package is a member too, when the root manifest carries both
+    # `[package]` and `[workspace]` — cargo adds it even though `members` does
+    # not say `"."`. Seeded last so an explicit `.` entry keeps its position.
+    # This repository's root manifest has no `[package]` (only `patch`,
+    # `profile` and `workspace`), so nothing is added here today; a published
+    # root library would otherwise never reach `undeclared_crates` at all.
+    try:
+        with open(os.path.join(root, 'Cargo.toml'), 'rb') as fh:
+            if 'package' in tomllib.load(fh):
+                note('.')
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+
+    while queue:
+        rel = queue.pop(0)
+        try:
+            with open(os.path.join(root, rel, 'Cargo.toml'), 'rb') as fh:
+                data = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        for dep_path, from_root in _path_deps(data, ws_deps):
+            base = rootp if from_root else (rootp / rel)
+            try:
+                dep = (base / dep_path).resolve().relative_to(rootp).as_posix()
+            except ValueError:
+                continue            # outside the workspace: never a member
+            manifest = os.path.join(root, dep, 'Cargo.toml')
+            if dep in seen or not os.path.isfile(manifest):
+                continue
+            try:
+                with open(manifest, 'rb') as fh:
+                    dep_data = tomllib.load(fh)
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            if 'workspace' in dep_data:
+                continue            # its own workspace root, not this one
+            note(dep)
+    return out
+
+
+def _path_deps(manifest, ws_deps):
+    """`(path, is_relative_to_workspace_root)` for one manifest's path deps.
+
+    Covers `dependencies`, `dev-dependencies` and `build-dependencies`, and the
+    same three under every `[target.*]` table — a crate reachable only through
+    a target-gated dependency is still a member.
+
+    `dep.workspace = true` inherits from `[workspace.dependencies]`, whose key
+    is `package = "…"` when the dependency is renamed, and whose paths are
+    relative to the workspace root rather than to the dependent package.
+    """
+    out = []
+    tables = [manifest]
+    targets = manifest.get('target')
+    if isinstance(targets, dict):
+        tables += [t for t in targets.values() if isinstance(t, dict)]
+    for table in tables:
+        for section in ('dependencies', 'dev-dependencies',
+                        'build-dependencies'):
+            deps = table.get(section)
+            if not isinstance(deps, dict):
+                continue
+            for name, spec in deps.items():
+                if not isinstance(spec, dict):
+                    continue
+                if isinstance(spec.get('path'), str):
+                    out.append((spec['path'], False))
+                elif spec.get('workspace') is True:
+                    inherited = ws_deps.get(spec.get('package', name), {})
+                    if isinstance(inherited, dict) and isinstance(
+                            inherited.get('path'), str):
+                        out.append((inherited['path'], True))
+    return out
+
+
+def _import_ident(data, pkg_name):
+    """The identifier a reader writes at the head of a path into this crate.
+
+    `[lib] name = "sdk"` means downstream paths start `sdk::`, NOT with the
+    package name — so deriving the prefix from `[package].name` alone would ask
+    for a `CRATES` entry under a name nobody writes and, worse, leave the
+    crate's real prefix out of `prefix_re` entirely. That is a silent hole in
+    the every-published-crate guarantee this gate now makes, which is the one
+    kind of gap worth being fussy about: an unaudited prefix looks exactly like
+    a clean one.
+
+    Cargo normalizes `-` to `_` for the import name in both cases.
+    """
+    declared = (data.get('lib') or {}).get('name')
+    chosen = declared if isinstance(declared, str) and declared else pkg_name
+    return chosen.replace('-', '_')
+
+
+def _lib_file(root, rel, data):
+    """The crate-root FILE of this package's library target, or None.
+
+    Returns a path rather than a boolean, because the file is the thing the
+    scanner needs and a boolean silently discards it. `[lib] path =
+    "src/api.rs"` is a valid published library; classifying it as "has a lib"
+    and then reading `src/lib.rs` anyway yields an EMPTY surface, and an empty
+    surface does not fail — it reports every documented path into that crate as
+    dead. Worse, `undeclared_crates` would have just instructed the author to
+    map the crate, so the gate's own advice produces the wrong answer. (The
+    empty-surface guard in `main` is the second half of that fix; a path is
+    only useful if a missing one is loud.)
+
+    Three cases, in the order Cargo resolves them:
+
+      1. An explicit `[lib]` table declares one outright. Its `path` wins,
+         defaulting to `src/lib.rs` when the table omits it. Checked first
+         because `autolib` governs auto-DISCOVERY and says nothing about a
+         target the manifest declares by hand.
+      2. `package.autolib = false` turns auto-discovery off. A `src/lib.rs`
+         then sits in the tree with no library built from it, so the file's
+         presence is not proof and cannot be the last word.
+      3. Otherwise Cargo auto-discovers `src/lib.rs`.
+
+    Getting (2) wrong is not a cosmetic miss. A published package with
+    `autolib = false` and a leftover `src/lib.rs` would be read as a library,
+    so it would skip the binary-only class entirely: instead of the accurate
+    "ships no library target", a path into it would be demanded as a modelled
+    crate and then reported as an unresolved SYMBOL — sending the reader to
+    look for a renamed item in a crate that exposes nothing at all.
+    """
+    if 'lib' in data:
+        libtable = data.get('lib') or {}
+        if not _rust_linkable(libtable):
+            return None
+        declared = libtable.get('path')
+        return declared if isinstance(declared, str) else 'src/lib.rs'
+    if (data.get('package') or {}).get('autolib') is False:
+        return None
+    if os.path.exists(os.path.join(root, rel, 'src', 'lib.rs')):
+        return 'src/lib.rs'
+    return None
+
+
+# Workspace crates that ship NO library target, and so can never appear in a
+# path a reader writes.
+#
+# `autumn-cli` is the whole class today: it is `src/main.rs` and nothing else,
+# with no `src/lib.rs` and no `[lib]` section, so `pub` inside it is visible
+# only within the binary. That is the nastiest shape this gate meets, because
+# every OTHER signal a reader has says the path is fine — the module is real,
+# the items are real and really `pub`, and `cargo add autumn-cli` succeeds,
+# since the crate does publish a binary. What does not exist is a library to
+# import, and no spelling of the path fixes that: the reader cannot route
+# around it the way they can route around a renamed item.
+#
+# So a path into one is reported as its own defect rather than as a dead
+# segment. "No `check` in `autumn_cli`" would be actively misleading advice —
+# `autumn-cli/src/check.rs` is right there, `pub`, and the suggestion machinery
+# would happily propose a near-miss inside a crate that cannot be imported at
+# all. The answer is never a different path; it is the CLI, or an API the
+# library crates actually expose.
+#: Crate types a dependent crate can actually `use`. `cdylib` and `staticlib`
+#: build an artifact for C, not an rlib for rustc, so a package whose only
+#: crate types are those "provides no linkable target" (cargo says so in as
+#: many words) and every `use pkg::Thing` against it is E0432 — even though
+#: `src/lib.rs` is right there and this gate could resolve the path out of it.
+#:
+#: That is the SAME shape as the `autumn-cli` defect this gate was widened to
+#: catch: a crate that reads as importable and is not. Different manifest key,
+#: identical consequence for the reader, so it belongs in the same class rather
+#: than in a check of its own.
+#:
+#: `proc-macro` is linkable and must stay so — `autumn-macros` is one, declared
+#: as `[lib] proc-macro = true`, and its derives are named through re-exports
+#: the resolver follows.
+RUST_LINKABLE = frozenset({'lib', 'rlib', 'dylib', 'proc-macro'})
+
+
+def _rust_linkable(libtable):
+    """Whether `[lib]`'s crate types include one rustc can link against.
+
+    ABSENT and EMPTY are different answers, and an earlier revision of this
+    function got that wrong in a committed test that asserted `crate-type = []`
+    was "the default, not a denial". It is a denial. Measured rather than
+    reasoned, which is what settled it:
+
+        [lib] crate-type = []          # in a path dependency
+        $ cargo metadata   -> kind=[] crate_types=[]
+        $ cargo check -p dependent
+        warning: the package `emptyct` provides no linkable target
+        error: could not compile `emptyct`
+
+    So only an absent key gets the default — `lib`, or `proc-macro` under
+    `proc-macro = true`, which is what all 10 modelled crates rely on. An
+    explicit list answers for itself, and an empty one names nothing linkable.
+
+    A non-list value is a manifest cargo itself rejects; it is read as the
+    default rather than as a denial, so a malformed manifest cannot manufacture
+    a docs defect out of this gate.
+    """
+    if 'crate-type' in libtable:
+        kinds = libtable['crate-type']
+    elif 'crate_type' in libtable:
+        kinds = libtable['crate_type']
+    else:
+        return True
+    if not isinstance(kinds, list):
+        return True
+    return any(k in RUST_LINKABLE for k in kinds if isinstance(k, str))
+
+
+def binary_only_crates(root):
+    return {ident: rel for ident, (rel, lib) in workspace_crates(root).items()
+            if lib is None}
+
+
+def undeclared_crates(root):
+    """Publishable library crates that `CRATES` does not model.
+
+    The declaration has to keep being true rather than merely keep matching
+    something: a crate added to the workspace with a library target is a
+    prefix readers can write, and leaving it out of `CRATES` would make every
+    path into it silently unaudited — the exact gap this gate closed for the
+    seven sibling crates. Failing here is how the next one gets modelled on the
+    day it lands instead of the day a reader files a bug.
+    """
+    return sorted(ident for ident, (_, lib) in workspace_crates(root).items()
+                  if lib is not None and ident not in CRATES)
 
 # ------------------------------------------------------------------ parsing
 
@@ -368,13 +776,24 @@ def expand_braces(spec):
 class Crate:
     """The public surface of one crate, read statically from its sources."""
 
-    def __init__(self, ident, srcdir):
+    def __init__(self, ident, srcdir, rootpath=None):
         self.ident = ident
-        self.src = srcdir
+        # `rootpath` is the crate-root FILE, and when given it decides BOTH
+        # halves: the file to read and the directory submodules resolve
+        # against, which Rust takes to be the crate root's own directory. They
+        # have to move together — a `[lib] path = "lib/api.rs"` crate whose
+        # root is read from `lib/` but whose `mod` lookups still ran against
+        # `src/` would resolve the root and then lose every submodule under it.
+        if rootpath is not None:
+            self.src = os.path.dirname(rootpath)
+            self.rootfile = os.path.basename(rootpath)
+        else:
+            self.src = srcdir
+            self.rootfile = 'lib.rs'
         self.mods = {}            # tuple(path) -> {name: 'item'|'mod'}
         self.uses = {}            # tuple(path) -> [(target, leaf, alias, glob)]
         self.exported_macros = set()
-        if os.path.isfile(os.path.join(self.src, 'lib.rs')):
+        if os.path.isfile(os.path.join(self.src, self.rootfile)):
             self._scan_file([])
         # `#[macro_export]` hoists a macro to the crate root regardless of the
         # module it is written in.
@@ -383,7 +802,7 @@ class Crate:
 
     def _modfile(self, mp):
         if not mp:
-            return os.path.join(self.src, 'lib.rs')
+            return os.path.join(self.src, self.rootfile)
         p = self.src
         for seg in mp[:-1]:
             p = os.path.join(p, seg)
@@ -494,11 +913,33 @@ class Crate:
 class Surface:
     """Every workspace crate, with path resolution across their re-exports."""
 
-    def __init__(self, root, crates=CRATES):
-        self.crates = {ident: Crate(ident, os.path.join(root, rel))
-                       for ident, rel in crates.items()}
+    def __init__(self, root, crates=CRATES, rootpaths=None):
+        # `rootpaths` maps a crate ident to its crate-root FILE, already
+        # absolute. Given, it overrides the `<mapped dir>/lib.rs` default
+        # entirely — path and submodule base together. Absent (and in the
+        # self-test's synthetic trees) the default holds, which is what all 11
+        # crates in this workspace actually use.
+        rootpaths = rootpaths or {}
+        self.crates = {
+            ident: Crate(ident, os.path.join(root, rel),
+                         rootpaths.get(ident))
+            for ident, rel in crates.items()}
         self.external = set()
         self._memo = {}
+
+    def empty(self):
+        """Modelled crates whose crate root published no names at all.
+
+        A crate that resolves to nothing is the one failure this gate cannot
+        report as a defect, because it does not look like one: every path into
+        it comes back `dead:<first segment>`, which reads exactly like a batch
+        of renamed items. The cause is always the model, not the docs — a
+        mapped directory with no crate root in it, or a `[lib] path` pointing
+        somewhere the mapping does not reach — so it is raised as a gate error
+        before any page is judged.
+        """
+        return sorted(ident for ident, c in self.crates.items()
+                      if not self.names_of(c, ()))
 
     def names_of(self, crate, mp, depth=0):
         """Public names visible at `crate::mp`, following `pub use`."""
@@ -628,10 +1069,10 @@ class Surface:
             return None
         return ('mod', c, cur)
 
-    def resolve(self, path):
+    def resolve(self, path, root='autumn_web'):
         """'ok' | 'opaque' | 'dead:<the prefix that broke>'."""
         segs = path.split('::')
-        c, cur = self.crates['autumn_web'], ()
+        c, cur = self.crates[root], ()
         for i, s in enumerate(segs):
             # Deliberately NOT the structural `(cur + (s,)) in c.mods` shortcut
             # used for re-export targets below: that tree contains private and
@@ -658,11 +1099,11 @@ class Surface:
             return 'ok'
         return 'ok'
 
-    def suggest(self, path):
+    def suggest(self, path, root='autumn_web'):
         """Closest existing sibling for the segment that broke, or None."""
         import difflib
         segs = path.split('::')
-        c, cur = self.crates['autumn_web'], ()
+        c, cur = self.crates[root], ()
         for s in segs:
             names = self.names_of(c, cur)
             if s in names:
@@ -890,7 +1331,14 @@ def corpus(root):
                           if p in tracked and p not in seen)
 
 
-PREFIX_RE = re.compile(r'\bautumn_web::')
+# Every crate prefix a reader can write, longest first so `autumn_web::` can
+# never shadow a longer ident that starts with it. Built from the modelled
+# crates plus the binary-only ones: a path into a crate with no library target
+# is a defect this gate must SEE in order to report, so its prefix has to scan.
+def prefix_re(root):
+    idents = sorted(set(CRATES) | set(binary_only_crates(root)),
+                    key=len, reverse=True)
+    return re.compile(r'\b(' + '|'.join(idents) + ')::')
 IDENT_RE = re.compile(r'[a-zA-Z_]\w*')
 # A path claim, once braces are expanded: identifiers separated by `::` and
 # nothing else. The guide also writes brace groups that are PROSE rather than
@@ -935,8 +1383,8 @@ def is_shown_as_output(line, col):
     return col < (cell_end if cell_end != -1 else len(line))
 
 
-def scan_paths(text):
-    """Yield (raw path spelling, offset) for every `autumn_web::…` in `text`.
+def scan_paths(text, pattern):
+    """Yield (crate ident, raw path spelling, offset) for every crate path.
 
     Scans the whole document rather than line by line, and matches braces by
     counting them, because the guide writes grouped imports BOTH nested
@@ -946,7 +1394,8 @@ def scan_paths(text):
     all 14 of those in this corpus: the symbols a reader copies off them were
     never audited at all, which is the failure this gate exists to prevent.
     """
-    for m in PREFIX_RE.finditer(text):
+    for m in pattern.finditer(text):
+        crate = m.group(1)
         i, parts = m.end(), []
         while True:
             if i < len(text) and text[i] == '{':
@@ -985,11 +1434,11 @@ def scan_paths(text):
                 continue
             break
         if parts:
-            yield '::'.join(parts), m.start()
+            yield crate, '::'.join(parts), m.start()
 
 
-def occurrences(root, files):
-    """[(path, file, line, waived)] for every documented `autumn_web::` path."""
+def occurrences(root, files, pattern):
+    """[(crate, path, file, line, waived)] for every documented crate path."""
     found = []
     for rel in files:
         full = os.path.join(root, rel)
@@ -998,7 +1447,7 @@ def occurrences(root, files):
                 text = fh.read()
         except OSError:
             continue
-        for raw, offset in scan_paths(text):
+        for crate, raw, offset in scan_paths(text, pattern):
             line_no = text.count('\n', 0, offset) + 1
             line_end = text.find('\n', offset)
             line = text[text.rfind('\n', 0, offset) + 1:
@@ -1014,64 +1463,117 @@ def occurrences(root, files):
                 if m:
                     path = m.group(1)
                 if path and PATH_SHAPE.match(path):
-                    found.append((path, rel, line_no, waived))
+                    found.append((crate, path, rel, line_no, waived))
     return found
 
 
 def audit(root):
-    surface = Surface(root)
+    # The crate root each modelled crate actually declares. `CRATES` maps to a
+    # `src` DIRECTORY, so without this a crate whose manifest points its
+    # library somewhere else is scanned for a `lib.rs` it does not have.
+    rootpaths = {ident: os.path.join(root, lib)
+                 for ident, (_, lib) in workspace_crates(root).items()
+                 if lib is not None and ident in CRATES}
+    surface = Surface(root, rootpaths=rootpaths)
     files = corpus(root)
-    occ = occurrences(root, files)
-    dead, opaque, ok, waived = [], collections.Counter(), 0, 0
-    for (path, rel, line, is_waived) in occ:
+    binary_only = binary_only_crates(root)
+    occ = occurrences(root, files, prefix_re(root))
+    dead, unimportable = [], []
+    opaque, ok, waived = collections.Counter(), 0, 0
+    for (crate, path, rel, line, is_waived) in occ:
         if is_waived:
             waived += 1
             continue
-        r = surface.resolve(path)
+        # A crate with no library target is not a resolution question. Reported
+        # before `resolve` is consulted, because there is nothing to consult:
+        # the crate is not in `CRATES` and never can be.
+        if crate in binary_only:
+            unimportable.append((crate, path, rel, line, binary_only[crate]))
+            continue
+        r = surface.resolve(path, crate)
         if r.startswith('dead:'):
-            dead.append((path, rel, line, r[5:], surface.suggest(path)))
+            dead.append((crate, path, rel, line, r[5:],
+                         surface.suggest(path, crate)))
         elif r == 'opaque':
-            opaque[path] += 1
+            opaque[f'{crate}::{path}'] += 1
         else:
             ok += 1
-    return surface, files, occ, dead, opaque, ok, waived
+    return (surface, files, occ, dead, unimportable, opaque, ok, waived)
 
 
 def main():
-    surface, files, occ, dead, opaque, ok, waived = audit(ROOT)
+    unmodelled = undeclared_crates(ROOT)
+    if unmodelled:
+        print('FAIL: publishable library crates that `CRATES` does not model: '
+              + ', '.join(unmodelled))
+        print('')
+        print('Each is a prefix a reader can write in a `use` line, so every')
+        print('path into it would go unaudited. Add it to `CRATES` with its')
+        print('`src` directory rather than letting the gate skip the crate.')
+        return 1
+
+    surface, files, occ, dead, unimportable, opaque, ok, waived = audit(ROOT)
+    blank = surface.empty()
+    if blank:
+        print('FAIL: modelled crates that published no names at all: '
+              + ', '.join(blank))
+        print('')
+        print('This is a MODEL error, not a docs defect: every path into such')
+        print('a crate comes back dead, which reads like a batch of renamed')
+        print('items. Check that the `CRATES` entry points at the directory')
+        print('holding the crate root, and that a `[lib] path` outside `src/`')
+        print('is reachable from it.')
+        return 1
     aw = surface.crates['autumn_web']
+    by_crate = collections.Counter(c for c, *_ in occ)
     print(f'corpus: {len(files)} reader-facing markdown files')
     print(f'surface: {len(aw.mods)} modules, '
           f'{len(surface.names_of(aw, ()))} names at the crate root, '
-          f'{len(surface.crates)} workspace crates')
-    print(f'checked: {len(occ)} `autumn_web::` occurrences')
+          f'{len(surface.crates)} workspace crates modelled')
+    print(f'checked: {len(occ)} crate-path occurrences '
+          f'({by_crate.get("autumn_web", 0)} `autumn_web::`, '
+          f'{len(occ) - by_crate.get("autumn_web", 0)} sibling-crate)')
     print(f'  resolved: {ok}')
     print(f'  opaque (re-export of a crate outside this workspace): '
           f'{sum(opaque.values())}')
     print(f'  waived (shown as output: compiler error or log line): {waived}')
     print('')
-    if dead:
-        for (path, rel, line, broke, near) in sorted(dead,
-                                                     key=lambda d: (d[1], d[2])):
-            hint = f'  (did you mean `{near}`?)' if near else ''
-            print(f'{rel}:{line}: `autumn_web::{path}` does not resolve '
-                  f'-- no `{broke.split("::")[-1]}` in '
-                  f'`autumn_web{"::" + "::".join(broke.split("::")[:-1]) if "::" in broke else ""}`'
-                  f'{hint}')
-    print(f'defects: {len(dead)} ({waived} waived)')
-    return 1 if dead else 0
+    for (crate, path, rel, line, broke, near) in sorted(
+            dead, key=lambda d: (d[2], d[3])):
+        hint = f'  (did you mean `{near}`?)' if near else ''
+        parent = ('::' + '::'.join(broke.split('::')[:-1])
+                  if '::' in broke else '')
+        print(f'{rel}:{line}: `{crate}::{path}` does not resolve '
+              f'-- no `{broke.split("::")[-1]}` in `{crate}{parent}`{hint}')
+    for (crate, path, rel, line, src) in sorted(unimportable,
+                                                key=lambda d: (d[2], d[3])):
+        print(f'{rel}:{line}: `{crate}::{path}` cannot be imported '
+              f'-- `{crate}` ships no Rust-linkable library target '
+              f'(no `lib.rs` under `{src}` and no `[lib]` declaring one, or a '
+              f'`[lib] crate-type` with no `lib`/`rlib`/`dylib`/`proc-macro` '
+              f'in it), so nothing in it is nameable from another crate. Point '
+              f'the reader at the CLI or at a library crate instead of a path.')
+    print(f'defects: {len(dead) + len(unimportable)} '
+          f'({len(dead)} unresolved, {len(unimportable)} unimportable; '
+          f'{waived} waived)')
+    return 1 if (dead or unimportable) else 0
 
 
 def do_list():
-    surface, files, occ, dead, opaque, ok, waived = audit(ROOT)
+    surface, files, occ, dead, unimportable, opaque, ok, waived = audit(ROOT)
     print(f'corpus: {len(files)} reader-facing markdown files')
     print(f'occurrences: {len(occ)}')
+    print('')
+    print('BY CRATE -- the prefixes the corpus actually writes.')
+    for crate, n in sorted(collections.Counter(c for c, *_ in occ).items(),
+                           key=lambda kv: (-kv[1], kv[0])):
+        print(f'  {n:4d}  {crate}::')
     print('')
     print('OPAQUE -- re-exports of crates whose source is not in this tree.')
     print('A path here is NOT checked; the count is printed so it cannot grow')
     print('quietly.')
     for path, n in sorted(opaque.items(), key=lambda kv: (-kv[1], kv[0])):
-        print(f'  {n:4d}  autumn_web::{path}')
+        print(f'  {n:4d}  {path}')
     print(f'  total: {sum(opaque.values())}')
     print('')
     print(f'external crates reached: {", ".join(sorted(surface.external))}')
@@ -1196,8 +1698,16 @@ macro_rules! declassify { () => {} }
                '#[proc_macro_derive(OpenApiSchema, attributes(schema))]\n'
                'pub fn derive_open_api_schema(a: TokenStream) -> TokenStream { a }\n')
 
+        # A sibling a reader names DIRECTLY, rather than one reached through an
+        # `autumn_web` re-export: the shape of every plugin crate in the real
+        # workspace, and the surface this gate was blind to.
+        _write(tmp, 'fake_sibling/src/lib.rs', 'pub mod plugin;\n')
+        _write(tmp, 'fake_sibling/src/plugin.rs',
+               'pub struct Thing;\npub(crate) struct Hidden;\n')
+
         s = Surface(tmp, {'autumn_web': 'fake/src', 'fake_macros': 'fake_macros/src',
-                          'fake_edge': 'fake_edge/src'})
+                          'fake_edge': 'fake_edge/src',
+                          'fake_sibling': 'fake_sibling/src'})
 
         check('plain module item', s.resolve('app::AppBuilder'), 'ok')
         check('module itself', s.resolve('app'), 'ok')
@@ -1288,28 +1798,387 @@ macro_rules! declassify { () => {} }
               ['a', 'a::b'])
 
         # -- corpus extraction ------------------------------------------------
+        pat = re.compile(r'\b(autumn_web|fake_sibling|autumn_cli)::')
         _write(tmp, 'docs/guide/x.md',
                'use autumn_web::{app::AppBuilder, Error};\n'
                '| `error[E0432]: unresolved import `autumn_web::foo`` | x | y |\n')
-        found = occurrences(tmp, ['docs/guide/x.md'])
-        paths = sorted(p for (p, _, _, w) in found if not w)
+        found = occurrences(tmp, ['docs/guide/x.md'], pat)
+        paths = sorted(p for (_, p, _, _, w) in found if not w)
         check('brace-grouped doc import is expanded', paths,
               ['Error', 'app::AppBuilder'])
         check('compiler-error line is waived',
-              [p for (p, _, _, w) in found if w], ['foo'])
+              [p for (_, p, _, _, w) in found if w], ['foo'])
         # The waiver covers the error's own table cell, not the row: the FIX
         # column is a live recommendation and must stay audited.
         _write(tmp, 'docs/guide/mig.md',
                '| `error[E0063]: missing field` | a literal | '
                'add `autumn_web::app::AppBuilder` |\n'
                'INFO  autumn_web::route::Route: started\n')
-        rows = occurrences(tmp, ['docs/guide/mig.md'])
+        rows = occurrences(tmp, ['docs/guide/mig.md'], pat)
         check('path inside the error cell is waived',
-              sorted(p for (p, _, _, w) in rows if w),
+              sorted(p for (_, p, _, _, w) in rows if w),
               ['route::Route'])
         check('path in the fix column is still audited',
-              sorted(p for (p, _, _, w) in rows if not w),
+              sorted(p for (_, p, _, _, w) in rows if not w),
               ['app::AppBuilder'])
+
+        # -- sibling crates are scanned, and attributed to their own crate ----
+        # Before this, `PREFIX_RE` was `autumn_web::` alone: a path into a
+        # sibling was not a passing check, it was not a check at all.
+        _write(tmp, 'docs/guide/sib.md',
+               'use fake_sibling::plugin::Thing;\n'
+               'use autumn_web::app::AppBuilder;\n')
+        sib = occurrences(tmp, ['docs/guide/sib.md'], pat)
+        check('sibling-crate path is scanned',
+              sorted((c, p) for (c, p, _, _, w) in sib if not w),
+              [('autumn_web', 'app::AppBuilder'),
+               ('fake_sibling', 'plugin::Thing')])
+        # The crate a path is resolved AGAINST has to be the one it names.
+        # Resolving a sibling path against `autumn_web` is how a real item in
+        # the wrong crate passes, and a real item in the right crate fails.
+        check('sibling path resolves against its own crate',
+              s.resolve('plugin::Thing', 'fake_sibling'), 'ok')
+        check('…and a sibling miss is dead, not silently ok',
+              s.resolve('plugin::Nope', 'fake_sibling'), 'dead:plugin::Nope')
+        check('pub(crate) in a sibling is not reader-nameable',
+              s.resolve('plugin::Hidden', 'fake_sibling'),
+              'dead:plugin::Hidden')
+        # The same spelling must NOT resolve against `autumn_web`: that is the
+        # bug a single hardcoded root produces in both directions.
+        check('a sibling path is not resolved against autumn_web',
+              s.resolve('plugin::Thing'), 'dead:plugin')
+
+        # -- crates with no library target ------------------------------------
+        # The defect this class exists for: every other signal says the path is
+        # fine, and none of them is the one that matters.
+        _write(tmp, 'bin_only/Cargo.toml',
+               '[package]\nname = "bin-only"\nversion = "0.1.0"\n')
+        _write(tmp, 'bin_only/src/main.rs', 'pub mod check;\nfn main() {}\n')
+        _write(tmp, 'lib_crate/Cargo.toml',
+               '[package]\nname = "lib-crate"\nversion = "0.1.0"\n')
+        _write(tmp, 'lib_crate/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["bin_only", "lib_crate", '
+               '"examples/demo"]\n')
+        ws = workspace_crates(tmp)
+        check('binary-only crate is detected as having no lib',
+              ws.get('bin_only'), (os.path.join('bin_only', 'src'), None))
+        check('library crate reports its crate-root file',
+              ws.get('lib_crate'),
+              (os.path.join('lib_crate', 'src'),
+               os.path.join('lib_crate', 'src', 'lib.rs')))
+        check('binary-only set is exactly the crates with no lib target',
+              sorted(binary_only_crates(tmp)), ['bin_only'])
+        check('a missing member directory is skipped, not fatal',
+              'demo' in ws, False)
+        # `[lib]` with no `src/lib.rs` still ships a library (the manifest can
+        # point `path` anywhere), so the manifest has to be consulted too.
+        _write(tmp, 'bin_only/Cargo.toml',
+               '[package]\nname = "bin-only"\nversion = "0.1.0"\n'
+               '[lib]\npath = "src/other.rs"\n')
+        check('an explicit [lib] counts even without src/lib.rs',
+              sorted(binary_only_crates(tmp)), [])
+
+        # -- `autolib = false` disables auto-discovery of src/lib.rs ----------
+        # The file is present and Cargo builds NO library from it. Reading the
+        # file as proof would skip the binary-only class and report a path into
+        # such a crate as an unresolved symbol instead.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n'
+               'autolib = false\n')
+        _write(tmp, 'no_autolib/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["bin_only", "lib_crate", '
+               '"no_autolib", "examples/demo"]\n')
+        check('autolib = false means no library target despite src/lib.rs',
+              sorted(binary_only_crates(tmp)), ['no_autolib'])
+        # An explicit [lib] still wins: `autolib` governs DISCOVERY only.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n'
+               'autolib = false\n[lib]\npath = "src/lib.rs"\n')
+        check('an explicit [lib] beats autolib = false',
+              sorted(binary_only_crates(tmp)), [])
+
+        # -- every Cargo spelling of "not published" is honoured --------------
+        # Reusing `_published` rather than testing `publish is False` here:
+        # a private LIBRARY read as published fails the gate as an undeclared
+        # crate, which is the self-maintaining check firing on the one shape it
+        # exists to tolerate.
+        _write(tmp, 'no_autolib/Cargo.toml',
+               '[package]\nname = "no-autolib"\nversion = "0.1.0"\n')
+        _write(tmp, 'priv_empty/Cargo.toml',
+               '[package]\nname = "priv-empty"\nversion = "0.1.0"\n'
+               'publish = []\n')
+        _write(tmp, 'priv_empty/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'priv_inherit/Cargo.toml',
+               '[package]\nname = "priv-inherit"\nversion = "0.1.0"\n'
+               'publish.workspace = true\n')
+        _write(tmp, 'priv_inherit/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'registry_only/Cargo.toml',
+               '[package]\nname = "registry-only"\nversion = "0.1.0"\n'
+               'publish = ["some-registry"]\n')
+        _write(tmp, 'registry_only/src/lib.rs', 'pub mod thing;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "priv_empty", '
+               '"priv_inherit", "registry_only"]\n'
+               '[workspace.package]\npublish = false\n')
+        ws2 = workspace_crates(tmp)
+        check('publish = [] is not published', 'priv_empty' in ws2, False)
+        check('publish.workspace = true inherits false',
+              'priv_inherit' in ws2, False)
+        check('publish = ["registry"] IS published',
+              'registry_only' in ws2, True)
+        check('an absent publish key is still published',
+              'lib_crate' in ws2, True)
+
+        # -- `[lib] path` is preserved, not reduced to a boolean -------------
+        # A boolean said "library"; the scanner then read `src/lib.rs`, found
+        # nothing, and reported every path into the crate as dead — after the
+        # gate had just told the author to map it.
+        _write(tmp, 'odd_lib/Cargo.toml',
+               '[package]\nname = "odd-lib"\nversion = "0.1.0"\n'
+               '[lib]\npath = "src/api.rs"\n')
+        _write(tmp, 'odd_lib/src/api.rs', 'pub mod thing;\npub struct Real;\n')
+        _write(tmp, 'odd_lib/src/thing.rs', 'pub struct Inner;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "odd_lib"]\n')
+        check('[lib] path is reported, anchored at the manifest dir',
+              workspace_crates(tmp).get('odd_lib'),
+              (os.path.join('odd_lib', 'src'),
+               os.path.join('odd_lib', 'src', 'api.rs')))
+        check('a [lib] table with no path defaults to src/lib.rs',
+              _lib_file(tmp, 'lib_crate', {'lib': {}}), 'src/lib.rs')
+        # Scanned through the declared root, the surface is real.
+        s2 = Surface(tmp, {'odd_lib': 'odd_lib/src'},
+                     rootpaths={'odd_lib': os.path.join(tmp, 'odd_lib',
+                                                        'src', 'api.rs')})
+        check('a crate scanned via its declared root resolves',
+              s2.resolve('Real', 'odd_lib'), 'ok')
+        check('…and its submodules resolve too',
+              s2.resolve('thing::Inner', 'odd_lib'), 'ok')
+        check('a declared-root crate is not empty', s2.empty(), [])
+        # The guard: the same crate mapped WITHOUT its root file is silent
+        # otherwise — every path into it reads as a rename.
+        s3 = Surface(tmp, {'odd_lib': 'odd_lib/src'})
+        check('a crate whose root file is missing is reported empty',
+              s3.empty(), ['odd_lib'])
+        check('…and its paths would otherwise look merely renamed',
+              s3.resolve('Real', 'odd_lib'), 'dead:Real')
+
+        # -- a library root OUTSIDE `src/` ------------------------------------
+        # `[lib] path = "lib/api.rs"` is valid. Treating the declared path as
+        # `src`-relative looked for `<crate>/src/lib/api.rs`: a file that does
+        # not exist (so the crate came back empty) or, worse, one that does and
+        # the wrong API got audited. Both halves have to anchor at the manifest
+        # directory — the root file AND the submodule base under it.
+        _write(tmp, 'out_of_src/Cargo.toml',
+               '[package]\nname = "out-of-src"\nversion = "0.1.0"\n'
+               '[lib]\npath = "lib/api.rs"\n')
+        _write(tmp, 'out_of_src/lib/api.rs',
+               'pub mod deep;\npub struct Outside;\n')
+        _write(tmp, 'out_of_src/lib/deep.rs', 'pub struct Nested;\n')
+        # A decoy at the path the old `src`-relative join would have read.
+        _write(tmp, 'out_of_src/src/lib/api.rs', 'pub struct Decoy;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "odd_lib", '
+               '"out_of_src"]\n')
+        check('a root outside src/ is anchored at the manifest dir',
+              workspace_crates(tmp).get('out_of_src'),
+              (os.path.join('out_of_src', 'src'),
+               os.path.join('out_of_src', 'lib', 'api.rs')))
+        s4 = Surface(tmp, {'out_of_src': 'out_of_src/src'},
+                     rootpaths={'out_of_src': os.path.join(
+                         tmp, 'out_of_src', 'lib', 'api.rs')})
+        check('the real API resolves through a root outside src/',
+              s4.resolve('Outside', 'out_of_src'), 'ok')
+        check('submodules resolve beside that root, not under src/',
+              s4.resolve('deep::Nested', 'out_of_src'), 'ok')
+        check('the decoy under src/ is NOT what got audited',
+              s4.resolve('Decoy', 'out_of_src'), 'dead:Decoy')
+
+        # -- `[lib] name` is the prefix a reader writes -----------------------
+        # Downstream paths start with the LIBRARY name, not the package name.
+        # Deriving the ident from `[package].name` alone asks for a `CRATES`
+        # entry nobody writes and leaves the real prefix out of `prefix_re`,
+        # which is an unaudited prefix that looks exactly like a clean one.
+        _write(tmp, 'renamed/Cargo.toml',
+               '[package]\nname = "renamed-pkg"\nversion = "0.1.0"\n'
+               '[lib]\nname = "sdk"\n')
+        _write(tmp, 'renamed/src/lib.rs', 'pub struct Client;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["lib_crate", "renamed"]\n')
+        ws3 = workspace_crates(tmp)
+        check('[lib] name becomes the import ident', 'sdk' in ws3, True)
+        check('…and the package name is not the ident',
+              'renamed_pkg' in ws3, False)
+        check('a dash in [lib] name normalizes to an underscore',
+              _import_ident({'lib': {'name': 'my-sdk'}}, 'pkg'), 'my_sdk')
+        check('an absent [lib] name falls back to the package name',
+              _import_ident({'lib': {'proc-macro': True}}, 'autumn-macros'),
+              'autumn_macros')
+
+        # -- globbed `members`, and cargo's asymmetric `exclude` -------------
+        # Reading a glob as a literal directory does not merely miss crates,
+        # it VOIDS the coverage guarantee: `undeclared_crates` stops seeing
+        # them, so the gate keeps passing while modelling none of them.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n')
+        _write(tmp, 'crates/alpha/src/lib.rs', 'pub struct A;\n')
+        _write(tmp, 'crates/beta/Cargo.toml',
+               '[package]\nname = "beta"\nversion = "0.1.0"\n')
+        _write(tmp, 'crates/beta/src/lib.rs', 'pub struct B;\n')
+        _write(tmp, 'crates/notacrate/README.md', 'no manifest here\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/*"]\n')
+        check('a glob expands to the manifests under it',
+              _member_dirs(tmp, {'members': ['crates/*']}),
+              ['crates/alpha', 'crates/beta'])
+        check('a globbed member is actually read',
+              sorted(workspace_crates(tmp)), ['alpha', 'beta'])
+        # `exclude` is literal-prefix, NOT a glob: cargo's own asymmetry.
+        check('exclude drops a globbed member by prefix',
+              _member_dirs(tmp, {'members': ['crates/*'],
+                                 'exclude': ['crates/beta']}),
+              ['crates/alpha'])
+        check('a glob in exclude matches nothing, as cargo has it',
+              _member_dirs(tmp, {'members': ['crates/*'],
+                                 'exclude': ['crates/*']}),
+              ['crates/alpha', 'crates/beta'])
+        check('an explicitly listed member wins over exclude',
+              _member_dirs(tmp, {'members': ['crates/alpha', 'crates/beta'],
+                                 'exclude': ['crates/beta']}),
+              ['crates/alpha', 'crates/beta'])
+        check('a literal member entry still works',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+
+        # -- implicit members: in-tree path dependencies ---------------------
+        # Cargo treats an unexcluded in-tree path dependency as a member even
+        # when `members` omits it. An earlier revision of this gate did not
+        # walk them, on the reasoning that they are what the workspace BUILDS
+        # rather than what it PUBLISHES — which was wrong, and left a
+        # published sibling added through `path = "../new"` alone entirely
+        # unaudited while `undeclared_crates` stayed green.
+        _write(tmp, 'implicit/Cargo.toml',
+               '[package]\nname = "implicit"\nversion = "0.1.0"\n')
+        _write(tmp, 'implicit/src/lib.rs', 'pub struct I;\n')
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('an in-tree path dep is an implicit member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        # End to end, through the root manifest: the implicit member arrives
+        # in `workspace_crates`, which is what `undeclared_crates` reads.
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n')
+        check('…and it reaches workspace_crates, so coverage can see it',
+              sorted(workspace_crates(tmp)), ['alpha', 'implicit'])
+        # A dependency outside the workspace root is never a member.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nout = { path = "../../../elsewhere" }\n')
+        check('a path dep outside the root is not a member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        # A dependency with its own [workspace] table is a separate workspace.
+        _write(tmp, 'nested/Cargo.toml',
+               '[workspace]\nmembers = []\n'
+               '[package]\nname = "nested"\nversion = "0.1.0"\n')
+        _write(tmp, 'nested/src/lib.rs', 'pub struct N;\n')
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nnested = { path = "../../nested" }\n')
+        check('a nested workspace root is not absorbed as a member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        # dev- and build-dependencies count, and so do target-gated ones.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dev-dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('a dev-dependency path is a member too',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[target."cfg(unix)".dependencies]\n'
+               'implicit = { path = "../../implicit" }\n')
+        check('a target-gated path dep is a member too',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', 'implicit'])
+        # An inherited `workspace = true` path resolves against the ROOT, not
+        # the dependent package — and the lookup key is `package` when renamed.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nrenamed-dep = { workspace = true, '
+               'package = "implicit" }\n')
+        check('an inherited workspace path dep resolves against the root',
+              _member_dirs(tmp, {'members': ['crates/alpha'],
+                                 'dependencies': {
+                                     'implicit': {'path': 'implicit'}}}),
+              ['crates/alpha', 'implicit'])
+        # `exclude` still wins over an implicit member.
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+               '[dependencies]\nimplicit = { path = "../../implicit" }\n')
+        check('exclude drops an implicit member',
+              _member_dirs(tmp, {'members': ['crates/alpha'],
+                                 'exclude': ['implicit']}),
+              ['crates/alpha'])
+
+        # -- the root package is a member when the root manifest has one -----
+        _write(tmp, 'crates/alpha/Cargo.toml',
+               '[package]\nname = "alpha"\nversion = "0.1.0"\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n')
+        check('no [package] at the root adds no root member',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha'])
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha"]\n'
+               '[package]\nname = "rootpkg"\nversion = "0.1.0"\n')
+        _write(tmp, 'src/lib.rs', 'pub struct Root;\n')
+        check('a root [package] is a member even without "." in members',
+              _member_dirs(tmp, {'members': ['crates/alpha']}),
+              ['crates/alpha', '.'])
+        check('…and the root package reaches workspace_crates',
+              'rootpkg' in workspace_crates(tmp), True)
+
+        # -- crate types rustc cannot link against ---------------------------
+        # Same shape as the `autumn-cli` defect this gate exists to catch: a
+        # `src/lib.rs` sits right there and the path still does not resolve for
+        # a dependent, because cdylib/staticlib build for C, not for rustc.
+        check('cdylib alone is not importable',
+              _rust_linkable({'crate-type': ['cdylib']}), False)
+        check('staticlib alone is not importable',
+              _rust_linkable({'crate-type': ['staticlib']}), False)
+        check('cdylib + rlib IS importable',
+              _rust_linkable({'crate-type': ['cdylib', 'rlib']}), True)
+        check('an absent crate-type defaults to lib',
+              _rust_linkable({'proc-macro': True}), True)
+        check('proc-macro stays linkable',
+              _rust_linkable({'crate-type': ['proc-macro']}), True)
+        # An explicitly EMPTY list is a denial, not the default. Verified
+        # against cargo: `crate_types=[]` in metadata, and a dependent's
+        # `cargo check` prints "provides no linkable target" and fails.
+        check('an empty crate-type list is a denial',
+              _rust_linkable({'crate-type': []}), False)
+        check('an absent crate-type key is the default',
+              _rust_linkable({}), True)
+        check('the crate_type spelling is honoured too',
+              _rust_linkable({'crate_type': ['cdylib']}), False)
+        check('a malformed crate-type is read as the default, not a defect',
+              _rust_linkable({'crate-type': 'cdylib'}), True)
+        _write(tmp, 'cdyl/Cargo.toml',
+               '[package]\nname = "cdyl"\nversion = "0.1.0"\n'
+               '[lib]\ncrate-type = ["cdylib"]\n')
+        _write(tmp, 'cdyl/src/lib.rs', 'pub struct NotReachable;\n')
+        _write(tmp, 'Cargo.toml',
+               '[workspace]\nmembers = ["crates/alpha", "cdyl"]\n')
+        check('a cdylib-only crate lands in the unimportable class',
+              sorted(binary_only_crates(tmp)), ['cdyl'])
+        check('…so it is NOT demanded as an undeclared library crate',
+              'cdyl' in undeclared_crates(tmp), False)
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)
@@ -1361,14 +2230,14 @@ case "${1:-}" in
     run_py --corpus "$root"
     ;;
   "")
-    echo "Checking autumn_web:: symbol paths across the reader-facing docs..."
+    echo "Checking workspace-crate symbol paths across the reader-facing docs..."
     if run_py --check "$root"; then
       echo "Symbol drift gate OK."
     else
       cat >&2 <<'EOF'
 
-FAIL: the docs put an `autumn_web::…` path in front of a reader that does not
-resolve (above).
+FAIL: the docs put a workspace-crate path in front of a reader that they cannot
+write (above).
 
 Where the path reaches name resolution, `rustc` reports it against the READER's
 file, not against the page, so they are told their code is wrong when the
@@ -1378,6 +2247,9 @@ discards), nothing reports it at all and the reader simply carries away a name
 that does not exist.
 
 Fix each one where it lives:
+  - no library     -> the crate ships only a binary (`autumn-cli`), so NO path
+                      into it resolves and no rename helps. Document the
+                      command, or an API a library crate exports.
   - renamed item   -> use the current name (the `did you mean` hint is the
                       closest name in the same module)
   - moved item     -> use the path a reader can actually write; it is usually a
