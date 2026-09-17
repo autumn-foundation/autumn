@@ -1,4 +1,4 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.57s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
      Running tests/custom_admin_model.rs (target/debug/deps/custom_admin_model-6a4ba4e6924db59e)
 
 running 1 test

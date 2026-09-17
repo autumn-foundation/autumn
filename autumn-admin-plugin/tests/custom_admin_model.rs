@@ -841,11 +841,22 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
     let client = build_sealed_notes_client(pool);
     client.post("/login-admin").send().await.assert_ok();
 
+    // `render_cell_value` (list view only) truncates any plain string cell to
+    // 80 chars with an ellipsis (`truncate_display`), and this envelope is
+    // ~112 base64 chars — longer than that limit. Checking the full envelope
+    // string against the list HTML would therefore pass vacuously if the
+    // list's confidential check regressed: the render would leak only a
+    // truncated ciphertext prefix, never the complete `envelope` this
+    // assertion looks for (Codex review, #2834). A 60-char prefix survives
+    // `truncate_display`'s 79-char keep window, so a leak there is still
+    // caught.
+    let envelope_prefix: String = envelope.chars().take(60).collect();
+
     let list_response = client.get("/admin/admin_sealed_notes").send().await;
     list_response.assert_ok();
     let list_html = list_response.text();
     assert!(
-        !list_html.contains(&envelope),
+        !list_html.contains(&envelope_prefix),
         "list view must not leak the sealed envelope: {list_html}"
     );
     assert!(

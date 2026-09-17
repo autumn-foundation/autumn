@@ -172,8 +172,19 @@ detail and readonly-display renderers use at `templates.rs:2001/2136/2181`).
 The first positive assertion used the lowercase list/detail wording and
 failed — the fixture was checking for text the edit-form path never
 emits, which is exactly the kind of accidentally-vacuous check the second
-Codex finding was about. Corrected to the actual string; see `after.txt`
-for the now-passing run.
+Codex finding was about. Corrected to the actual string.
+
+A third Codex pass, on the fixed commit, found one more gap of the same
+shape: `render_cell_value` (list view only) truncates any plain-string
+cell to 80 characters with an ellipsis (`truncate_display`), and the
+seeded envelope is ~108 base64 characters — past that limit. Checking the
+*full* envelope string against the list HTML would pass vacuously if the
+list's confidential check regressed, since a regressed render would leak
+only a truncated ciphertext prefix, never the complete string the
+assertion looked for. Fixed by checking a 60-character prefix instead,
+comfortably inside `truncate_display`'s 79-character keep window, so a
+leak there is still caught. See `after.txt` for the run after all three
+fixes.
 
 ## ✅ Verification
 
