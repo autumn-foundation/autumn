@@ -675,21 +675,38 @@ pub async fn set_post_terms(
 /// row is locked — see [`set_post_terms`] for why the order and the timing both
 /// matter. The ids are sorted here rather than trusted from the caller, because
 /// a caller that forgets is exactly the bug this prevents.
+///
+/// One `WHERE id = ANY(...)` query rather than one `.find()` per id — this
+/// used to loop, and looping is exactly what made `set_post_terms` an N+1 on
+/// the statement count (N cheap PK point lookups, invisible in a buffer-cost
+/// ranking but dominant in `pg_stat_statements.calls`). The row-level lock
+/// still has to be acquired in ascending id order (see [`set_post_terms`]),
+/// which is what `.order(terms::id.asc())` is for — checked with `EXPLAIN
+/// (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` against the real `terms_pkey` index,
+/// including with the ids handed to the planner in descending order (the
+/// opposite of what's asked for) at a realistic 65-id width: Postgres
+/// satisfies the `ORDER BY` from the `Index Scan using terms_pkey` itself —
+/// its `= ANY(...)` support against a btree index presorts the array and
+/// walks the index in order — rather than adding a separate `Sort` node, so
+/// there is no unordered scan for `LockRows` to lock. A term deleted
+/// underneath us simply has no row to lock and nothing to recount, same as
+/// the loop's `.optional()`; `recount_term` reaches the same conclusion for
+/// the one lock it still takes per row (see its own doc comment for why that
+/// one stays unbatched).
 async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
-    for term_id in ordered {
-        // A term deleted underneath us has no row to lock and nothing to
-        // recount; `recount_term` reaches the same conclusion.
-        let _locked: Option<i64> = terms::table
-            .find(term_id)
-            .select(terms::id)
-            .for_update()
-            .first(conn)
-            .await
-            .optional()?;
+    if ordered.is_empty() {
+        return Ok(());
     }
+    let _locked: Vec<i64> = terms::table
+        .filter(terms::id.eq_any(&ordered))
+        .select(terms::id)
+        .order(terms::id.asc())
+        .for_update()
+        .load(conn)
+        .await?;
     Ok(())
 }
 
