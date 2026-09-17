@@ -432,7 +432,19 @@ def ref_at(text, pos, pairs=None, _resolved=frozenset()):
         if text[m.end():m.end() + 1] in ("(", ":"):
             return None
         return m.end(), (m.group(1) or inner)
-    if text[close:close + 1] in ("[", "(", ":"):
+    if text[close:close + 1] in ("[", "("):
+        return None
+    # A colon after a SHORTCUT reference only disqualifies it when what
+    # follows really makes a definition. `- [Alpha]: alpha.md` is one — it
+    # renders an empty list item and lists no page — but `- [Alpha]: the
+    # page` is not, because `the page` is no destination, so both renderers
+    # show `<a href="alpha.md">Alpha</a>: the page` and the row IS an entry.
+    # Rejecting on the colon alone failed that perfectly good index.
+    #
+    # `blank_defns` does not cover this: its `DEFN` is anchored to the line
+    # start, so a definition nested in a list item never reaches it, which is
+    # why the test has to happen here and has to parse rather than peek.
+    if text[close:close + 1] == ":" and _DEFN_AT.match(text, pos):
         return None
     return close, inner
 
@@ -473,7 +485,15 @@ def ref_labels(text):
 # the marker, because a fifth space starts an indented code block inside the
 # item instead. `LIST_ITEM` below already carried the digit and bullet rules,
 # which is where they should have been read from in the first place.
-_ROW = r"^(?:[-*+]|\d{1,9}[.)]) {1,4}"
+#
+# A TAB is padding too, and this accepted only literal spaces — so `-\t[A](a.md)`
+# was reported unlisted while both renderers show a linked item. A tab advances
+# to the next multiple of four, so ONE of them is always valid padding after a
+# marker, and up to three spaces may precede it; TWO tabs reach column eight,
+# which is indented code inside the item and not a row. The rest of this file
+# handles tabs by `expandtabs(4)`, which cannot be used here because the match
+# end is an offset into the ORIGINAL line that `link_at` reads from.
+_ROW = r"^(?:[-*+]|\d{1,9}[.)])(?: {0,3}\t| {1,4})"
 ROW = re.compile(_ROW)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
@@ -517,6 +537,18 @@ ROW = re.compile(_ROW)
 # needed the same grammar, which `_ANGLE` already had.
 DEFN = re.compile(
     r"""^ {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
+    r"""(""" + _ANGLE + r"""|\S+)"""
+    r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
+    re.MULTILINE)
+
+# The same grammar with NO line-start anchor, for asking "is a definition
+# HERE?" at an arbitrary offset. A definition may sit inside a list item,
+# where `DEFN`'s `^ {0,3}` cannot reach it: `- [Alpha]: alpha.md` renders an
+# EMPTY list item and lists no page, while `- [Alpha]: the page` is a
+# paragraph whose `[Alpha]` is a live shortcut reference. Telling those two
+# apart needs the destination grammar, not the mere presence of a colon.
+_DEFN_AT = re.compile(
+    r"""\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
     r"""(""" + _ANGLE + r"""|\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
@@ -4278,6 +4310,54 @@ self_test() {
     > "$tmp/folded_label/README.md"
   _commit folded_label
   _case "a folded label still resolves" 0 folded_label
+
+  # 208. A TAB is list-marker padding. The row grammar accepted only literal
+  #      spaces, so a tab-padded row was reported unlisted while both
+  #      renderers show a linked item. Round 40 widened this grammar and left
+  #      tabs out deliberately; that was the wrong call.
+  _scaffold row_tab_pad
+  printf '# A\n' > "$tmp/row_tab_pad/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n-\t[Alpha](alpha.md)\n' \
+    > "$tmp/row_tab_pad/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_tab_pad/README.md"
+  _commit row_tab_pad
+  _case "a tab is list-marker padding" 0 row_tab_pad
+
+  # 209. TWO tabs reach column eight, which is indented code inside the item,
+  #      so the bound still holds and the page really is listed nowhere.
+  _scaffold row_tab_code
+  printf '# A\n' > "$tmp/row_tab_code/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n-\t\t[Alpha](alpha.md)\n' \
+    > "$tmp/row_tab_code/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_tab_code/README.md"
+  _commit row_tab_code
+  _case "two tabs after a marker is code" 1 row_tab_code
+
+  # 210. A colon after a SHORTCUT reference disqualifies it only when what
+  #      follows really makes a definition. `the page` is no destination, so
+  #      both renderers render `<a href="alpha.md">Alpha</a>: the page` and
+  #      the row is an entry. Rejecting on the colon alone failed a correct
+  #      index.
+  _scaffold shortcut_colon_row
+  printf '# A\n' > "$tmp/shortcut_colon_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [Alpha]: the page\n\n[Alpha]: alpha.md\n' \
+    > "$tmp/shortcut_colon_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/shortcut_colon_row/README.md"
+  _commit shortcut_colon_row
+  _case "a shortcut before a colon is still a link" 0 shortcut_colon_row
+
+  # 211. And the guard the colon test exists for: a row that IS a definition
+  #      renders an empty list item and lists no page. `blank_defns` cannot
+  #      catch this one — its pattern is anchored to the line start and this
+  #      definition is nested in a list item — which is why `ref_at` parses.
+  _scaffold definition_row
+  printf '# A\n' > "$tmp/definition_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [Alpha]: alpha.md\n' \
+    > "$tmp/definition_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/definition_row/README.md"
+  _commit definition_row
+  _case "a definition row lists nothing" 1 definition_row
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
