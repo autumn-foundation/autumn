@@ -1384,6 +1384,24 @@ def readable(text, resolved=None):
             if (indent == 0 or indent < list_col) and not LIST_ITEM.match(content):
                 in_list = False
                 list_col = 0
+            # A block inside a list item is measured from the item's CONTENT
+            # column too, not from the margin: under `100. Example:` the
+            # content column is five, so a five-space `~~~md` is a fence at
+            # column zero relative to the item and CommonMark opens it. The
+            # fence grammar allows three columns of indent, counted from the
+            # margin, so it saw five and opened nothing — leaving the sample
+            # inside readable and its link counted as a route.
+            #
+            # Stripped once here, the way the quote prefix is, so the fence
+            # tests below agree with each other. KNOWN GAP: only the fence
+            # tests use this. `ATX`, `THEMATIC` and `SETEXT` on the same
+            # line still measure from the margin, so a heading indented to a
+            # wide item's content column is not seen as one. That affects
+            # paragraph state rather than reachability, and widening it is
+            # the container-tracking question, not a patch.
+            rel = content
+            if list_col and indent >= list_col and content == expanded:
+                rel = content[list_col:]
             # Code opens four columns past the CONTENT column, which is the
             # margin outside a list and the item's content column inside
             # one. `not in_list` suppressed the test entirely, so nothing
@@ -1413,6 +1431,24 @@ def readable(text, resolved=None):
             if col is not None:
                 in_list = True
                 list_col = col
+                # An OVERPADDED marker puts code on the marker's own line.
+                # `-` plus five spaces spends one on padding and leaves the
+                # rest four columns past the item's content column, so
+                # `-     [Guide](x)` renders `<li><pre><code>` and the link
+                # is a sample, not a route. The code rule above only ever
+                # looked at LATER lines, so this one stayed readable.
+                pad = _LIST_COL.match(expanded)
+                if pad is not None and len(pad.group(3)) > 4:
+                    # Columns are byte offsets only when the line has no
+                    # tabs. With tabs the mapping needs the same walk
+                    # `row_at` does, so stay lenient rather than blank the
+                    # wrong span.
+                    if content == expanded:
+                        start = i + (len(line) - len(content)) + col
+                        blank_to(start, eol)
+                        in_paragraph = False
+                        i = eol + 1 if eol < n else n
+                        continue
             elif LIST_ITEM.match(content):
                 # A marker with no content after it opens an item whose
                 # content column cannot be measured from this line. Keep the
@@ -1467,7 +1503,7 @@ def readable(text, resolved=None):
             # was given this rule in round 40 and this site was not.
             setext = SETEXT.match(content) and was_paragraph
             in_paragraph = not (ATX.match(content)
-                                or opens_fence(content)
+                                or opens_fence(rel)
                                 or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
@@ -1481,8 +1517,8 @@ def readable(text, resolved=None):
             # Only the detection is stripped; the text itself is untouched
             # and still blanked space for space, so reported line numbers
             # stay accurate.
-            m = FENCE.match(content)
-            if opens_fence(content):
+            m = FENCE.match(rel)
+            if opens_fence(rel):
                 char, length = m.group(1)[0], len(m.group(1))
                 j = eol + 1
                 while j <= n:
@@ -1498,7 +1534,16 @@ def readable(text, resolved=None):
                         blank_to(i, j)
                         i = j
                         break
-                    c = FENCE.match(BLOCKQUOTE.sub("", seg) if depth else seg)
+                    # The CLOSER is measured from the same column as the
+                    # opener. A fence opened at an item's content column is
+                    # closed by one there too, and comparing it against the
+                    # margin would miss it and run to end of file.
+                    inner = BLOCKQUOTE.sub("", seg) if depth else seg
+                    if list_col and inner == inner.expandtabs(4):
+                        pre = len(inner) - len(inner.lstrip(" "))
+                        if pre >= list_col:
+                            inner = inner[list_col:]
+                    c = FENCE.match(inner)
                     if (c and c.group(1)[0] == char
                             and len(c.group(1)) >= length
                             and not c.group(2).strip()):
@@ -5233,6 +5278,57 @@ self_test() {
     > "$tmp/defn_ordered_two/README.md"
   _commit defn_ordered_two
   _case "an ordered marker at 2 opens no block" 1 defn_ordered_two
+
+  # 256. An OVERPADDED marker puts code on the marker's own line: `-` plus
+  #      five spaces spends one on padding and leaves the rest four columns
+  #      past the content column, so cmark-gfm renders `<li><pre><code>`
+  #      and the link is a sample. The code rule only looked at LATER
+  #      lines, so this one stayed readable.
+  _scaffold marker_overpad
+  printf '# A\n' > "$tmp/marker_overpad/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/marker_overpad/docs/guide/index.md"
+  printf -- '-     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/marker_overpad/README.md"
+  _commit marker_overpad
+  _case "an overpadded marker puts code on its line" 1 marker_overpad
+
+  # 257. Four spaces of padding is the most that still counts as padding,
+  #      so the same line one space narrower is an ordinary link.
+  _scaffold marker_pad_four
+  printf '# A\n' > "$tmp/marker_pad_four/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/marker_pad_four/docs/guide/index.md"
+  printf -- '-    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/marker_pad_four/README.md"
+  _commit marker_pad_four
+  _case "four spaces of padding is still content" 0 marker_pad_four
+
+  # 258. A FENCE inside a list item is measured from the item's content
+  #      column: under `100. Example:` that column is five, so a five-space
+  #      `~~~md` opens a fence at column zero relative to the item and the
+  #      only link in the README is a code sample.
+  _scaffold fence_list_col
+  printf '# A\n' > "$tmp/fence_list_col/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/fence_list_col/docs/guide/index.md"
+  printf '100. Example:\n\n     ~~~md\n     [Guide](docs/guide/index.md)\n     ~~~\n' \
+    > "$tmp/fence_list_col/README.md"
+  _commit fence_list_col
+  _case "a fence at the item content column opens" 1 fence_list_col
+
+  # 259. ...and it CLOSES at that column too, so a link after the fence is
+  #      still a link. Measuring the closer from the margin would miss it
+  #      and blank the rest of the file — the run-to-end-of-file false
+  #      failure this scan has produced four times.
+  _scaffold fence_list_closes
+  printf '# A\n' > "$tmp/fence_list_closes/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/fence_list_closes/docs/guide/index.md"
+  printf '100. Example:\n\n     ~~~md\n     x\n     ~~~\n\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/fence_list_closes/README.md"
+  _commit fence_list_closes
+  _case "a fence in a list item closes at that column" 0 fence_list_closes
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
