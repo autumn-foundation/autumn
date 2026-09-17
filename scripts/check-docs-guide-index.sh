@@ -335,7 +335,39 @@ def link_at(text, pos, pairs=None):
     close = bracket_span(text, pos, pairs)
     if close is None:
         return None
-    op = _OPEN.match(text, close)
+    if pairs is None:
+        pairs = bracket_pairs(text)
+    tail = _tail_at(text, close)
+    if tail is None:
+        return None
+    # A LINK MAY NOT CONTAIN A LINK. When the text holds one, CommonMark
+    # deactivates the OUTER opener and the inner link is what renders, so
+    # `[outer [B](beta.md)](alpha.md)` gives the reader a route to beta.md
+    # and none to alpha.md. Returning the outer destination was exactly
+    # backwards: it credited a page nothing links to and skipped the page
+    # something does.
+    #
+    # An IMAGE inside the text does not deactivate it — an image is not a
+    # link — and `readable()` has already blanked images by this point, so
+    # a badge row still resolves to its page.
+    #
+    # Only an inner INLINE link is checked, which is `check-docs-orphans.sh`'s
+    # boundary: that is the one shape resolving unconditionally, without
+    # knowing which reference labels are defined.
+    for q in range(pos + 1, close - 1):
+        if text[q] != "[" or (q and text[q - 1] == "!"):
+            continue
+        inner_close = pairs.get(q)
+        if inner_close is None or inner_close >= close - 1:
+            continue
+        if _tail_at(text, inner_close + 1) is not None:
+            return None
+    return tail
+
+
+def _tail_at(text, pos):
+    """`(end, destination)` for the `(dest "title")` after a link's text."""
+    op = _OPEN.match(text, pos)
     if op is None:
         return None
     ang = _ANGLE_DEST.match(text, op.end())
@@ -439,6 +471,10 @@ DEFN = re.compile(
     re.MULTILINE)
 
 
+# CommonMark caps a reference label at 999 characters.
+LABEL_LIMIT = 999
+
+
 def label_key(raw):
     """Markdown reference labels fold case and collapse whitespace, so
     `[guide   catalog]` and `[Guide Catalog]` are the same label.
@@ -446,8 +482,20 @@ def label_key(raw):
     Shared by the index-entry scan and the README reachability scan. They read
     different files, but a label is a label in both, and the two callers want
     exactly the same folding — the reason this is shared rather than copied.
+
+    `casefold`, not `lower`: CommonMark matches labels after a FULL Unicode
+    case fold, so `[Guide][\u1e9e]` resolves against `[ss]:` where `lower()`
+    gives `\u00df` and matches nothing — rejecting an index the reader can
+    reach. Overlong labels are not labels at all: the spec caps them at 999
+    characters, and past that the syntax renders as plain text.
+
+    Both rules are `check-docs-orphans.sh`'s, which had them already. Writing
+    this helper from scratch instead of reading the one next door is what
+    made these two findings, and it returns None the same way that one does.
     """
-    return " ".join(raw.split()).lower()
+    if len(raw) > LABEL_LIMIT:
+        return None
+    return " ".join(raw.split()).casefold()
 
 
 def blank_links(text):
@@ -505,7 +553,19 @@ def definitions(text):
     """
     out = {}
     for m in DEFN.finditer(blank_links(text)):
-        out.setdefault(label_key(m.group(1)), m.group(2))
+        key = label_key(m.group(1))
+        if key is None:
+            continue
+        # A bare destination must balance its parentheses, the same rule
+        # `dest_at` applies to an inline one. `\S+` accepted
+        # `index.md#(unterminated`, which renders no link at all — and the
+        # fragment strip then hid the evidence.
+        dest = m.group(2)
+        if not (dest.startswith("<") and dest.endswith(">")):
+            span = dest_at(dest, 0)
+            if span is None or span[0] != len(dest):
+                continue
+        out.setdefault(key, dest)
     return out
 
 # One left-to-right scan replaces what used to be six sequential passes.
@@ -1144,7 +1204,8 @@ def entries(text, base):
                 # link, so the row is not an entry and the page it meant to
                 # list is reported as listed nowhere — the safe direction,
                 # and the same one an unparseable inline row already takes.
-                target = defs.get(label_key(ref[1]))
+                key = label_key(ref[1])
+                target = None if key is None else defs.get(key)
         if target is None:
             continue
         path = normalise(target, base)
@@ -1277,7 +1338,8 @@ def reaches_index(text):
     # by a real reference link. `LINK` dropped this two rounds ago and these
     # two kept it, which is the same one-of-two-sites miss as four findings
     # before it; they are now the last of that shape in the file.
-    used = {label_key(label) for label in ref_labels(text)}
+    used = {key for key in (label_key(l) for l in ref_labels(text))
+            if key is not None}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
 
@@ -2917,6 +2979,64 @@ self_test() {
     > "$tmp/label_blank_line/README.md"
   _commit label_blank_line
   _case "a label cannot cross a blank line" 1 label_blank_line
+
+  # 142. Labels fold with `casefold`, not `lower`: `[ẞ]` resolves against
+  #      `[ss]:`. `check-docs-orphans.sh` had this already, with the
+  #      rationale; writing the helper from scratch is what lost it.
+  _scaffold label_casefold
+  printf '# A\n' > "$tmp/label_casefold/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_casefold/docs/guide/index.md"
+  printf '[Guide][\xe1\xba\x9e]\n\n[ss]: docs/guide/index.md\n' \
+    > "$tmp/label_casefold/README.md"
+  _commit label_casefold
+  _case "a label folds with full Unicode case folding" 0 label_casefold
+
+  # 143. A label over CommonMark's 999-character cap defines nothing.
+  _scaffold label_too_long
+  printf '# A\n' > "$tmp/label_too_long/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_too_long/docs/guide/index.md"
+  long=$(python3 -c "print('a'*1000)")
+  printf '[Guide][%s]\n\n[%s]: docs/guide/index.md\n' "$long" "$long" \
+    > "$tmp/label_too_long/README.md"
+  _commit label_too_long
+  _case "a 1000-character label is not a label" 1 label_too_long
+
+  # 144. A definition's bare destination must balance its parentheses, the
+  #      same rule `dest_at` applies inline. `\S+` accepted a malformed one
+  #      and the fragment strip then hid the evidence.
+  _scaffold defn_dest_parens
+  printf '# A\n' > "$tmp/defn_dest_parens/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_dest_parens/docs/guide/index.md"
+  printf '[x]: docs/guide/index.md#(unterminated\n\n[Guide][x]\n' \
+    > "$tmp/defn_dest_parens/README.md"
+  _commit defn_dest_parens
+  _case "a definition destination must balance parens" 1 defn_dest_parens
+
+  # 145. A LINK MAY NOT CONTAIN A LINK: the outer opener is deactivated and
+  #      the inner link renders. Found by reading the sibling gate rather
+  #      than from review — it credited a page nothing links to.
+  _scaffold link_in_link
+  printf '# A\n' > "$tmp/link_in_link/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/link_in_link/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [[x](beta.md)](alpha.md)\n- [B](beta.md)\n' \
+    > "$tmp/link_in_link/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/link_in_link/README.md"
+  _commit link_in_link
+  _case "a link inside link text deactivates the outer" 1 link_in_link
+
+  # 146. ...and the guard: an IMAGE inside the text does NOT deactivate it,
+  #      because an image is not a link. A badge row still resolves.
+  _scaffold image_in_link
+  printf '# A\n' > "$tmp/image_in_link/docs/guide/alpha.md"
+  printf 'x' > "$tmp/image_in_link/docs/guide/img.png"
+  printf '# Guide\n\n## S\n\n- [![badge](img.png)](alpha.md)\n' \
+    > "$tmp/image_in_link/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/image_in_link/README.md"
+  _commit image_in_link
+  _case "an image inside link text does not deactivate it" 0 image_in_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
