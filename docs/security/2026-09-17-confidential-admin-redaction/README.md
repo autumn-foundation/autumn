@@ -143,6 +143,38 @@ check — fails this test loudly instead of shipping unverified, the way
 `autumn/tests/integration/confidential_threat_model.rs` guards the
 framework-owned sinks.
 
+## 🔁 Review round (Codex)
+
+Codex's automated PR review caught two real gaps in the first version of
+this test, both fixed before merge:
+
+1. The fixture inherited `AdminModel::csv_export_columns()`'s default
+   implementation, which already strips confidential columns in
+   `traits.rs` before `model_export_csv` (`routes.rs:1311`) ever runs its
+   own re-filter — so the CSV assertions never actually exercised that
+   route-level guard, which exists specifically for a model that
+   overrides `csv_export_columns()` to return a curated list. Fixed by
+   overriding `csv_export_columns()` in the fixture to deliberately
+   *include* `sealed_body`/`sealed_body_bidx`, so the route's own filter
+   is the only thing standing between the model and a leaked export.
+2. The edit-form and CSV-export sections asserted only the *absence* of
+   the envelope/token, so an unrelated regression (a 401, 404, 500, or an
+   empty body) would have passed those two checks vacuously without ever
+   reaching the redaction code. Fixed by asserting `assert_ok()` plus a
+   positive marker (the mask text on the edit form, the non-confidential
+   columns in the CSV body) before the negative assertions.
+
+Re-running after both fixes caught a **real bug in the test itself**, not
+the framework: the edit-form mask text is `"Sealed for its owner — the
+server cannot read or write it"` (`templates.rs:2239`, capital S, a
+different string from the lowercase `"sealed for its owner"` the list,
+detail and readonly-display renderers use at `templates.rs:2001/2136/2181`).
+The first positive assertion used the lowercase list/detail wording and
+failed — the fixture was checking for text the edit-form path never
+emits, which is exactly the kind of accidentally-vacuous check the second
+Codex finding was about. Corrected to the actual string; see `after.txt`
+for the now-passing run.
+
 ## ✅ Verification
 
 - `cargo fmt --all -- --check` — clean.

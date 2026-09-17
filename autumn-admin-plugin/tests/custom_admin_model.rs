@@ -652,6 +652,17 @@ impl AdminModel for SealedNoteAdminModel {
         true
     }
 
+    /// Deliberately does NOT filter out `sealed_body`/`sealed_body_bidx` the
+    /// way the default `csv_export_columns()` impl does (Codex review, #2834):
+    /// an override that returns a curated list never runs that default
+    /// filter, so the only thing standing between this model and a leaked
+    /// export is `model_export_csv`'s own re-filter in `routes.rs`. Returning
+    /// the confidential columns here exercises that route-level guard
+    /// directly instead of the test passing vacuously off the trait default.
+    fn csv_export_columns(&self) -> Vec<&'static str> {
+        vec!["owner_id", "title", "sealed_body", "sealed_body_bidx"]
+    }
+
     fn list(&self, pool: &AdminPool, params: ListParams) -> AdminFuture<'_, ListResult> {
         use diesel_async::RunQueryDsl;
 
@@ -830,7 +841,9 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
     let client = build_sealed_notes_client(pool);
     client.post("/login-admin").send().await.assert_ok();
 
-    let list_html = client.get("/admin/admin_sealed_notes").send().await.text();
+    let list_response = client.get("/admin/admin_sealed_notes").send().await;
+    list_response.assert_ok();
+    let list_html = list_response.text();
     assert!(
         !list_html.contains(&envelope),
         "list view must not leak the sealed envelope: {list_html}"
@@ -848,11 +861,9 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
         "a non-confidential column must still render normally: {list_html}"
     );
 
-    let detail_html = client
-        .get("/admin/admin_sealed_notes/1")
-        .send()
-        .await
-        .text();
+    let detail_response = client.get("/admin/admin_sealed_notes/1").send().await;
+    detail_response.assert_ok();
+    let detail_html = detail_response.text();
     assert!(
         !detail_html.contains(&envelope),
         "detail view must not leak the sealed envelope: {detail_html}"
@@ -865,12 +876,22 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
         detail_html.contains("sealed for its owner"),
         "detail view must show the confidential-field mask: {detail_html}"
     );
+    assert!(
+        detail_html.contains("checkup notes"),
+        "a non-confidential column must still render normally: {detail_html}"
+    );
 
-    let edit_html = client
-        .get("/admin/admin_sealed_notes/1/edit")
-        .send()
-        .await
-        .text();
+    let edit_response = client.get("/admin/admin_sealed_notes/1/edit").send().await;
+    edit_response.assert_ok();
+    let edit_html = edit_response.text();
+    // A positive check first (Codex review, #2834): without it, a 401/404/500
+    // or an empty body would also contain neither the envelope nor the token
+    // and pass the negative assertions below without ever exercising the
+    // form-widget redaction path.
+    assert!(
+        edit_html.contains("Sealed for its owner"),
+        "edit form must show the confidential-field mask: {edit_html}"
+    );
     assert!(
         !edit_html.contains(&envelope),
         "edit form must not pre-fill the sealed envelope: {edit_html}"
@@ -880,11 +901,19 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
         "edit form must not pre-fill the blind-index token: {edit_html}"
     );
 
-    let csv = client
+    let csv_response = client
         .get("/admin/admin_sealed_notes/export.csv")
         .send()
-        .await
-        .text();
+        .await;
+    csv_response.assert_ok();
+    let csv = csv_response.text();
+    // Same reasoning as the edit form: prove the CSV actually rendered real
+    // rows (the non-confidential columns this model's override still lists)
+    // before trusting the absence checks below.
+    assert!(
+        csv.contains("owner_id") && csv.contains("checkup notes"),
+        "CSV export must still carry the non-confidential columns: {csv}"
+    );
     assert!(
         !csv.contains(&envelope),
         "CSV export must not leak the sealed envelope: {csv}"
@@ -895,6 +924,7 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
     );
     assert!(
         !csv.contains("sealed_body"),
-        "CSV header must drop the confidential column and its blind-index companion: {csv}"
+        "CSV header must drop the confidential column and its blind-index companion, even \
+         though this model's csv_export_columns() override names both: {csv}"
     );
 }
