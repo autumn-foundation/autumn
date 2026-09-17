@@ -554,6 +554,18 @@ def candidate_labels(text):
     return out
 
 
+def opens_fence(line):
+    """True when `line` opens a fenced code block.
+
+    A backtick fence's info string may not contain a backtick, so ```` ```md`x ````
+    is paragraph text. `readable()` had this test inline and `_starts_block`
+    used the raw `FENCE` match, so the two disagreed about whether such a
+    line ends a paragraph. One predicate, both callers.
+    """
+    m = FENCE.match(line)
+    return bool(m) and not (m.group(1)[0] == "`" and "`" in m.group(2))
+
+
 def _starts_block(text, pos):
     """True when `pos` begins a block rather than continuing a paragraph.
 
@@ -561,18 +573,30 @@ def _starts_block(text, pos):
     heading, a fence, a thematic break or the start of the file, but not a
     line of ordinary prose, which would swallow it into that paragraph.
     """
-    if pos == 0:
-        return True
-    start = text.rfind("\n", 0, pos)
-    if start < 0:
-        return False
-    prev_end = start
-    prev_start = text.rfind("\n", 0, prev_end) + 1
-    prev = text[prev_start:prev_end]
-    if not prev.strip():
-        return True
-    return bool(ATX.match(prev) or FENCE.match(prev) or THEMATIC.match(prev)
-                or SETEXT.match(prev) or DEFN.match(prev))
+    # A run of definitions is definitions only if the FIRST one starts a
+    # block: `Some prose`, `[a]: x.md`, `[b]: y.md` defines neither, because
+    # `a` is paragraph text and `b` is that paragraph's third line. So the
+    # run is walked back to its head.
+    #
+    # ITERATIVE, not recursive. The obvious recursive spelling crashed with
+    # RecursionError on a 2000-line definition chain — a crash rather than a
+    # wrong answer, found by probing the bound rather than assuming it.
+    while True:
+        if pos == 0:
+            return True
+        start = text.rfind("\n", 0, pos)
+        if start < 0:
+            return False
+        prev_start = text.rfind("\n", 0, start) + 1
+        prev = text[prev_start:start]
+        if not prev.strip():
+            return True
+        if (ATX.match(prev) or opens_fence(prev) or THEMATIC.match(prev)
+                or SETEXT.match(prev)):
+            return True
+        if not DEFN.match(prev):
+            return False
+        pos = prev_start
 
 
 def blank_defns(text):
@@ -582,7 +606,19 @@ def blank_defns(text):
     visible and nothing inside one is clickable. Newlines survive, for the
     same reason they do in `blank_links`.
     """
-    return DEFN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    out, last = [], 0
+    for m in DEFN.finditer(text):
+        # Only a real definition is blanked. `definitions()` gained the
+        # block-start check and this did not, so a definition-SHAPED line
+        # glued to a paragraph — which defines nothing and whose links are
+        # live — had its whole line removed, taking a real link with it.
+        if not _starts_block(text, m.start()):
+            continue
+        out.append(text[last:m.start()])
+        out.append(_blank(m.group(0)))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
 
 
 def definitions(text):
@@ -870,7 +906,7 @@ def readable(text, resolved=None):
             # heading let the next indented line open code and swallowed a
             # link that a reader can click.
             in_paragraph = not (ATX.match(line)
-                                or FENCE.match(line)
+                                or opens_fence(line)
                                 or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
@@ -880,8 +916,7 @@ def readable(text, resolved=None):
                                 or SETEXT.match(line))
 
             m = FENCE.match(line)
-            # A backtick opener's info string may not contain a backtick.
-            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            if opens_fence(line):
                 char, length = m.group(1)[0], len(m.group(1))
                 j = eol + 1
                 while j <= n:
@@ -3207,6 +3242,53 @@ self_test() {
     > "$tmp/resolved_ref_image/README.md"
   _commit resolved_ref_image
   _case "a resolved reference image hides its alt text" 1 resolved_ref_image
+
+  # 154. `blank_defns` must honour the block-start rule too. It blanked
+  #      every definition-SHAPED line, so one glued to a paragraph — which
+  #      defines nothing and whose links are live — lost its whole line.
+  _scaffold blank_defn_block_start
+  printf '# A\n' > "$tmp/blank_defn_block_start/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/blank_defn_block_start/docs/guide/index.md"
+  printf 'Some prose\n[c]: other.md "title [Guide](docs/guide/index.md)"\n' \
+    > "$tmp/blank_defn_block_start/README.md"
+  _commit blank_defn_block_start
+  _case "only a real definition is blanked" 0 blank_defn_block_start
+
+  # 155. A backtick fence's info string may not contain a backtick, so
+  #      ```` ```md`x ```` is paragraph text and does not end a paragraph.
+  #      `readable()` knew this and `_starts_block` did not.
+  _scaffold invalid_fence_boundary
+  printf '# A\n' > "$tmp/invalid_fence_boundary/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/invalid_fence_boundary/docs/guide/index.md"
+  printf '```md`invalid\n[c]: docs/guide/index.md\n\n[Guide][c]\n' \
+    > "$tmp/invalid_fence_boundary/README.md"
+  _commit invalid_fence_boundary
+  _case "an invalid fence is not a block boundary" 1 invalid_fence_boundary
+
+  # 156. A run of definitions defines nothing unless the FIRST starts a
+  #      block. Found by sweeping for the rule's other homes rather than
+  #      from review.
+  _scaffold defn_chain_glued
+  printf '# A\n' > "$tmp/defn_chain_glued/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_chain_glued/docs/guide/index.md"
+  printf 'Some prose\n[a]: other.md\n[c]: docs/guide/index.md\n\n[Guide][c]\n' \
+    > "$tmp/defn_chain_glued/README.md"
+  _commit defn_chain_glued
+  _case "a definition chain glued to prose defines nothing" 1 defn_chain_glued
+
+  # 157. ...and the guard: the same chain after a blank line still defines,
+  #      so 156 is not bought by rejecting consecutive definitions.
+  _scaffold defn_chain_ok
+  printf '# A\n' > "$tmp/defn_chain_ok/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_chain_ok/docs/guide/index.md"
+  printf 'Some prose\n\n[a]: other.md\n[c]: docs/guide/index.md\n\n[Guide][c]\n' \
+    > "$tmp/defn_chain_ok/README.md"
+  _commit defn_chain_ok
+  _case "a definition chain after a blank line defines" 0 defn_chain_ok
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
