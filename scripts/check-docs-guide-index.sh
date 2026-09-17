@@ -188,12 +188,23 @@ ATX_H1 = re.compile(r"^ {0,3}#(?:[ \t].*)?$")
 # sits directly above it, which is why the caller checks that rather than
 # treating a bare `===` — which is just a paragraph — as a heading.
 SETEXT_H1 = re.compile(r"^ {0,3}=+[ \t]*$")
+# Whitespace inside a link, optional and required. Neither may cross a BLANK
+# line: a blank line ends the paragraph, so `[Guide](target\n\n)` is not a
+# link at all and its text renders as literal characters. Plain `\s*` crossed
+# one and accepted it as navigation.
+_WS = r"[ \t]*(?:\n[ \t]*)?"
+_WS1 = r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+# A title body, which may span a line ending but not a blank one, for the
+# same reason.
+_TITLE = (r'''"(?:[^"\n]|\n(?!\s*\n))*"'''
+          r"""|'(?:[^'\n]|\n(?!\s*\n))*'"""
+          r"""|\((?:[^)\n]|\n(?!\s*\n))*\)""")
 # An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
 # and the required whitespace before one is what keeps a parenthesised title
 # from being read as more balanced destination.
-_CLOSE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)'''
+_CLOSE = r"(?:" + _WS1 + r"(?:" + _TITLE + r"))?" + _WS + r"\)"
 
-LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
+LINK = re.compile(r"(?<!!)\[[^\]]*\]\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -222,7 +233,7 @@ LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _ANGLE + r"|" + _DEST + r"*)" 
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
 _ROW = r"^(?:- |\d{1,3}[.)] )"
-ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(\s*(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
+ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
 # shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
@@ -561,7 +572,11 @@ def readable(text):
                 if tag in HTML_LITERAL and not hm.group(1):
                     closer = f"</{tag}>"
                     idx = text.lower().find(closer, i)
-                    stop = n if idx < 0 else idx + len(closer)
+                    # The whole CLOSING LINE belongs to the block, not just
+                    # the tag. `<pre></pre> [Guide](x.md)` renders that link
+                    # as literal text, but stopping at the `>` handed the
+                    # rest of the line back to the scanner as markdown.
+                    stop = n if idx < 0 else line_end(idx + len(closer))
                 else:
                     # CommonMark ends the block at a blank line, and a line of
                     # spaces or tabs IS blank. Searching for a literal "\n\n"
@@ -578,6 +593,27 @@ def readable(text):
             stop = n if close < 0 else close + 3
             blank_to(i, stop)
             i = stop
+            continue
+
+        if text[i] == "\\":
+            # A backslash RUN, resolved by parity. Pairs are literal
+            # backslashes; only an odd run leaves a live escape for the
+            # character after it, and `\[` or `\!` then stops that character
+            # opening a link or an image.
+            #
+            # This lives here rather than in a lookbehind on `LINK` because
+            # Python's lookbehind is fixed-width and cannot count a run, so
+            # `(?<!\\)` rejected `\\[Guide](…)` — an escaped BACKSLASH
+            # followed by a perfectly live link — and reported the index
+            # unreachable. Blanking the escaped opener instead lets the
+            # pattern drop that lookbehind entirely.
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            if (j - i) % 2 == 1 and j < n and text[j] in "[!":
+                blank_to(j, j + 1)
+                j += 1
+            i = j
             continue
 
         if text[i] == "`":
@@ -2115,6 +2151,70 @@ self_test() {
     > "$tmp/image_escape_single/README.md"
   _commit image_escape_single
   _case "one backslash escapes an image opener" 0 image_escape_single
+
+  # 99. A link may not cross a BLANK line: the blank line ends the
+  #     paragraph, so the text renders as literal characters.
+  _scaffold link_blank_line
+  printf '# A\n' > "$tmp/link_blank_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_blank_line/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md\n\n)\n' > "$tmp/link_blank_line/README.md"
+  _commit link_blank_line
+  _case "a link cannot cross a blank line" 1 link_blank_line
+
+  # 100. ...and the guard: ONE line ending inside a link is fine, so 99 is
+  #      not bought by requiring links to sit on a single line.
+  _scaffold link_one_newline
+  printf '# A\n' > "$tmp/link_one_newline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_one_newline/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md\n)\n' > "$tmp/link_one_newline/README.md"
+  _commit link_one_newline
+  _case "a link may span one line ending" 0 link_one_newline
+
+  # 101. Escape parity for a LINK opener, the twin of case 97's image. A
+  #      one-character lookbehind rejected `\\[Guide](…)`, which is an
+  #      escaped BACKSLASH followed by a live link.
+  _scaffold link_escape_parity
+  printf '# A\n' > "$tmp/link_escape_parity/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_escape_parity/docs/guide/index.md"
+  printf '\\\\[Guide](docs/guide/index.md)\n' > "$tmp/link_escape_parity/README.md"
+  _commit link_escape_parity
+  _case "two backslashes leave a live link" 0 link_escape_parity
+
+  # 102. ...and the guard: ONE backslash does escape the `[`, so there is
+  #      no link and the index is unreachable.
+  _scaffold link_escape_single
+  printf '# A\n' > "$tmp/link_escape_single/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_escape_single/docs/guide/index.md"
+  printf '\\[Guide](docs/guide/index.md)\n' > "$tmp/link_escape_single/README.md"
+  _commit link_escape_single
+  _case "one backslash escapes a link opener" 1 link_escape_single
+
+  # 103. A literal HTML block owns its whole CLOSING LINE. Stopping at the
+  #      tag handed the rest of the line back to the scanner as markdown,
+  #      though it renders as raw text.
+  _scaffold literal_closing_line
+  printf '# A\n' > "$tmp/literal_closing_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/literal_closing_line/docs/guide/index.md"
+  printf '<pre></pre> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/literal_closing_line/README.md"
+  _commit literal_closing_line
+  _case "a literal block owns its closing line" 1 literal_closing_line
+
+  # 104. ...and the guard: the block really does END there, so a link on a
+  #      LATER line is clickable.
+  _scaffold literal_after_close
+  printf '# A\n' > "$tmp/literal_after_close/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/literal_after_close/docs/guide/index.md"
+  printf '<pre></pre>\n\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/literal_after_close/README.md"
+  _commit literal_after_close
+  _case "a link after the closing line is clickable" 0 literal_after_close
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
