@@ -566,7 +566,17 @@ def label_key(raw):
     """
     if len(raw) > LABEL_LIMIT:
         return None
-    return " ".join(raw.split()).casefold()
+    key = " ".join(raw.split()).casefold()
+    # A label needs at least one NON-WHITESPACE character. `[ ]` folds to the
+    # empty string, and an empty key matched another empty key happily — so
+    # `- [A][ ]` with `[ ]: alpha.md` counted as an entry, where cmark-gfm and
+    # markdown-it both render `[A][ ]` and `[ ]: alpha.md` as literal text and
+    # the page is listed nowhere.
+    #
+    # `ref_at` already refused the EMPTY spelling `[]`; this is the same rule
+    # for the spelling that merely looks empty after folding, which is where
+    # that earlier fix stopped.
+    return key or None
 
 
 def blank_links(text):
@@ -4232,6 +4242,42 @@ self_test() {
     > "$tmp/angle_defn_space/README.md"
   _commit angle_defn_space
   _case "an angle definition may hold a space" 0 angle_defn_space
+
+  # 205. A label needs one NON-WHITESPACE character. `[ ]` folds to the empty
+  #      string, and an empty key matched another empty key happily, so
+  #      `- [A][ ]` with `[ ]: alpha.md` counted as an entry — while both
+  #      renderers leave the row and the definition as literal text and the
+  #      page is listed nowhere. `ref_at` already refused the bare `[]`; this
+  #      is where that fix stopped.
+  _scaffold blank_label_row
+  printf '# A\n' > "$tmp/blank_label_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][ ]\n\n[ ]: alpha.md\n' \
+    > "$tmp/blank_label_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/blank_label_row/README.md"
+  _commit blank_label_row
+  _case "a whitespace-only label is not a label" 1 blank_label_row
+
+  # 206. The README side of the same rule.
+  _scaffold blank_label_readme
+  printf '# A\n' > "$tmp/blank_label_readme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/blank_label_readme/docs/guide/index.md"
+  printf '[Guide][ ]\n\n[ ]: docs/guide/index.md\n' \
+    > "$tmp/blank_label_readme/README.md"
+  _commit blank_label_readme
+  _case "a whitespace-only label reaches nothing" 1 blank_label_readme
+
+  # 207. And the guard: a real label with INTERNAL whitespace still folds and
+  #      still resolves, so the fix cannot become "labels with spaces fail".
+  _scaffold folded_label
+  printf '# A\n' > "$tmp/folded_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/folded_label/docs/guide/index.md"
+  printf '[Guide][big  catalog]\n\n[BIG CATALOG]: docs/guide/index.md\n' \
+    > "$tmp/folded_label/README.md"
+  _commit folded_label
+  _case "a folded label still resolves" 0 folded_label
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
