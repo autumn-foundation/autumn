@@ -183,8 +183,19 @@ list's confidential check regressed, since a regressed render would leak
 only a truncated ciphertext prefix, never the complete string the
 assertion looked for. Fixed by checking a 60-character prefix instead,
 comfortably inside `truncate_display`'s 79-character keep window, so a
-leak there is still caught. See `after.txt` for the run after all three
-fixes.
+leak there is still caught.
+
+A fourth Codex pass found a genuine coverage gap in the fixture's field
+setup: with both confidential fields plain (no field-level flags at all),
+the edit route sent both `sealed_body` and `sealed_body_bidx` through
+`render_form_widget`, so `render_readonly_display` — the separately-coded
+confidential check for a `create_only` field on the edit page
+(`templates.rs:2178`) — was never exercised by this HTTP-level test at
+all. Fixed by marking `sealed_body_bidx` `.create_only()`, which routes it
+through `render_readonly_display` on `GET .../edit` instead, and adding a
+positive assertion for that path's own mask text (lowercase `"sealed for
+its owner"`, distinct from `render_form_widget`'s capitalized wording).
+See `after.txt` for the run after all four fixes.
 
 ## ✅ Verification
 

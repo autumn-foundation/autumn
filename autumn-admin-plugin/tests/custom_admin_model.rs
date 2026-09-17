@@ -644,7 +644,14 @@ impl AdminModel for SealedNoteAdminModel {
             // entirely by the name-based `confidential::is_confidential_column_name`
             // lookup, not by anything set on `AdminField`.
             AdminField::new("sealed_body", AdminFieldKind::Text),
-            AdminField::new("sealed_body_bidx", AdminFieldKind::Text),
+            // `.create_only()` (Codex review, #2834): with both confidential
+            // fields plain, the edit route sends both through
+            // `render_form_widget`, leaving `render_readonly_display`'s own,
+            // separately-coded confidential check (`templates.rs:2178`)
+            // completely unexercised by this HTTP-level test. Marking this
+            // one create-only routes it through that path on GET .../edit
+            // instead.
+            AdminField::new("sealed_body_bidx", AdminFieldKind::Text).create_only(),
         ]
     }
 
@@ -901,7 +908,12 @@ async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
     // form-widget redaction path.
     assert!(
         edit_html.contains("Sealed for its owner"),
-        "edit form must show the confidential-field mask: {edit_html}"
+        "edit form must show the form-widget confidential mask for sealed_body: {edit_html}"
+    );
+    assert!(
+        edit_html.contains("sealed for its owner"),
+        "edit form must show the create-only readonly-display confidential mask for \
+         sealed_body_bidx: {edit_html}"
     );
     assert!(
         !edit_html.contains(&envelope),
