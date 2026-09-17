@@ -668,7 +668,13 @@ def candidate_labels(text):
     # The first pass terminates because it resolves no labels: with an empty
     # set every reference image is left alone, which is the conservative
     # direction, and fences and comments do not depend on labels at all.
-    return {key for _, key, _ in _defn_entries(readable(text, frozenset()), text)}
+    # NO `origin` here, deliberately. `readable` blanks BLOCKS and leaves
+    # inline links alone, so its output is the better answer to the block
+    # question, not a worse one: a closed `<pre></pre>` is blank in it and a
+    # definition below one is real. Round 44 handed `origin` to both callers
+    # when only `definitions` needed it — that one masks links, this one does
+    # not — and the extra argument blinded this scan to every HTML block.
+    return {key for _, key, _ in _defn_entries(readable(text, frozenset()))}
 
 
 def opens_fence(line):
@@ -4135,6 +4141,34 @@ self_test() {
     > "$tmp/angle_inner_space/README.md"
   _commit angle_inner_space
   _case "a space inside a destination is part of the name" 0 angle_inner_space
+
+  # 200. A definition after a CLOSED raw HTML block is real, so the reference
+  #      image below it IS an image and its alt text is not navigation. Round
+  #      44 gave `origin` to both definition callers when only `definitions`
+  #      needed it — that one masks links, `candidate_labels` does not — and
+  #      the extra argument blinded this scan to every HTML block. cmark-gfm
+  #      renders the construct as `<img src="pic.png" alt="alt Guide">`: no
+  #      clickable guide link, so the index is unreachable and this FAILS.
+  _scaffold defn_after_html_block
+  printf '# A\n' > "$tmp/defn_after_html_block/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_after_html_block/docs/guide/index.md"
+  printf '<pre></pre>\n[img]: pic.png\n\n![alt [Guide](docs/guide/index.md)][img]\n' \
+    > "$tmp/defn_after_html_block/README.md"
+  _commit defn_after_html_block
+  _case "a definition after an html block is real" 1 defn_after_html_block
+
+  # 201. The same definition, used as a plain reference LINK, does reach the
+  #      index — the other direction, so 200 cannot become "definitions after
+  #      HTML blocks never count".
+  _scaffold defn_after_html_reaches
+  printf '# A\n' > "$tmp/defn_after_html_reaches/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_after_html_reaches/docs/guide/index.md"
+  printf '<pre></pre>\n[x]: docs/guide/index.md\n\n[Guide][x]\n' \
+    > "$tmp/defn_after_html_reaches/README.md"
+  _commit defn_after_html_reaches
+  _case "a reference after an html block reaches" 0 defn_after_html_reaches
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
