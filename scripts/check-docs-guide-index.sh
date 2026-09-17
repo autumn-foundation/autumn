@@ -455,7 +455,18 @@ def ref_at(text, pos, pairs=None, _resolved=frozenset()):
     inner = text[pos + 1:close - 1]
     m = _LABEL.match(text, close)
     if m is not None:
-        if text[m.end():m.end() + 1] in ("(", ":"):
+        # A colon cannot disqualify a FULL or COLLAPSED reference: a
+        # definition is one bracket pair followed by `:`, and this has two,
+        # so `- [Middleware][mw]: the built-in stack` is a reference link
+        # followed by ordinary punctuation — which cmark-gfm renders as
+        # `<a href="middleware.md">Middleware</a>: the built-in stack`.
+        # Round 49 taught the SHORTCUT branch below to parse rather than
+        # peek and left this branch peeking at both characters.
+        #
+        # The `(` stays: `[a][b](c.md)` is an inline link at `[b]` that
+        # deactivates the outer opener, so treating it as a reference here
+        # would credit a destination the reader never reaches.
+        if text[m.end():m.end() + 1] == "(":
             return None
         return m.end(), (m.group(1) or inner)
     if text[close:close + 1] in ("[", "("):
@@ -1339,6 +1350,15 @@ def readable(text, resolved=None):
             # `#not-a-heading` is an ordinary paragraph. Treating it as a
             # heading let the next indented line open code and swallowed a
             # link that a reader can click.
+            # A SETEXT underline ends the paragraph only when it really is
+            # a heading, which needs a paragraph line above it — and
+            # `was_paragraph` is exactly that question, already answered.
+            # Unconditionally, a bare `===` cleared the paragraph, so the
+            # four-space line under it became indented code; CommonMark
+            # keeps `===` as paragraph text there and indented code cannot
+            # interrupt a paragraph, so the link is live. `_starts_block`
+            # was given this rule in round 40 and this site was not.
+            setext = SETEXT.match(content) and was_paragraph
             in_paragraph = not (ATX.match(content)
                                 or opens_fence(content)
                                 or hm
@@ -1347,7 +1367,7 @@ def readable(text, resolved=None):
                                 # paragraph, so an indented line after one is
                                 # code.
                                 or THEMATIC.match(content)
-                                or SETEXT.match(content))
+                                or setext)
 
             # Fence detection runs on the QUOTE-STRIPPED content computed
             # above, so `> ```md` opens a fence like ```` ```md ```` does.
@@ -4822,6 +4842,94 @@ self_test() {
     > "$tmp/attr_one_newline/README.md"
   _commit attr_one_newline
   _case "a quoted attribute may cross one newline" 1 attr_one_newline
+
+  # 234. A colon cannot disqualify a FULL or COLLAPSED reference: a
+  #      definition is ONE bracket pair followed by `:`, and this has two.
+  #      `- [A][a]: the page` is a reference link plus ordinary punctuation.
+  #      Round 49 taught the shortcut branch to parse rather than peek and
+  #      left this branch peeking at both characters.
+  _scaffold full_ref_colon
+  printf '# A\n' > "$tmp/full_ref_colon/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]: the page\n\n[a]: alpha.md\n' \
+    > "$tmp/full_ref_colon/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/full_ref_colon/README.md"
+  _commit full_ref_colon
+  _case "a full reference survives a colon" 0 full_ref_colon
+
+  # 235. The `(` guard stays, and its effect is the opposite of the obvious
+  #      reading: `[x][y](index.md)` renders `[x]<a href="…">y</a>`, so
+  #      refusing the REFERENCE reading is what lets the inline link at
+  #      `[y]` be found — and the index is reached through it.
+  _scaffold full_ref_paren
+  printf '# A\n' > "$tmp/full_ref_paren/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/full_ref_paren/docs/guide/index.md"
+  printf '[x][y](docs/guide/index.md)\n' > "$tmp/full_ref_paren/README.md"
+  _commit full_ref_paren
+  _case "a paren after a full reference finds the inline link" 0 full_ref_paren
+
+  # 236. A bare `===` is paragraph text, so the four-space line under it
+  #      cannot become indented code — code cannot interrupt a paragraph —
+  #      and the link is live. `_starts_block` was given this rule in round
+  #      40; `readable`'s own paragraph tracking was not.
+  _scaffold setext_paragraph_indent
+  printf '# A\n' > "$tmp/setext_paragraph_indent/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/setext_paragraph_indent/docs/guide/index.md"
+  printf '===\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/setext_paragraph_indent/README.md"
+  _commit setext_paragraph_indent
+  _case "a bare setext keeps its paragraph open" 0 setext_paragraph_indent
+
+  # 237. ...and a REAL setext heading still ends the paragraph, so a
+  #      four-space line after one IS code and reaches nothing.
+  _scaffold setext_heading_indent
+  printf '# A\n' > "$tmp/setext_heading_indent/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/setext_heading_indent/docs/guide/index.md"
+  printf 'Title\n===\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/setext_heading_indent/README.md"
+  _commit setext_heading_indent
+  _case "a real setext heading still ends the paragraph" 1 setext_heading_indent
+
+  # 238. Indentation inside a block quote is measured from the content column,
+  #      not from the start of the line: `>` plus five spaces leaves four
+  #      columns of content indent, which is an indented code block, so
+  #      cmark-gfm emits `<pre><code>` inside the `<blockquote>` and the link
+  #      is literal text. This used to be a known lenient gap; the column walk
+  #      closed it, so pin it before it can reopen.
+  _scaffold quoted_indent_code
+  printf '# A\n' > "$tmp/quoted_indent_code/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_indent_code/docs/guide/index.md"
+  printf '>     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_indent_code/README.md"
+  _commit quoted_indent_code
+  _case "a quoted line four columns in is code" 1 quoted_indent_code
+
+  # 239. One space fewer and the content sits three columns in, which is
+  #      still a paragraph, so the same link is found.
+  _scaffold quoted_indent_para
+  printf '# A\n' > "$tmp/quoted_indent_para/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_indent_para/docs/guide/index.md"
+  printf '>    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_indent_para/README.md"
+  _commit quoted_indent_para
+  _case "a quoted line three columns in is a paragraph" 0 quoted_indent_para
+
+  # 240. A definition cannot interrupt a paragraph. After a link whose title
+  #      spans a newline the paragraph is still open, so the next line is
+  #      TEXT, not a definition, and the reference below it resolves against
+  #      nothing.
+  _scaffold defn_after_multiline
+  printf '# A\n' > "$tmp/defn_after_multiline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_after_multiline/docs/guide/index.md"
+  printf '[X](y.md "a\nb")\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_after_multiline/README.md"
+  _commit defn_after_multiline
+  _case "a definition cannot interrupt a paragraph" 1 defn_after_multiline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
