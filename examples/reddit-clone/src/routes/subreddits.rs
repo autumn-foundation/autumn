@@ -744,7 +744,7 @@ mod tests {
     /// rejected in the browser before the request was ever sent.
     #[test]
     fn a_supplementary_plane_name_within_the_character_limit_is_accepted() {
-        let name: String = std::iter::repeat('\u{10400}').take(17).collect();
+        let name: String = "\u{10400}".repeat(17);
         assert_eq!(
             name.chars().count(),
             17,
