@@ -21,6 +21,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code. A plain `deploy status` (no `--strict`) never sends an alert.
   Neither the drift model nor the `--json` contract changed. See
   `docs/guide/fleet-deploys.md`.
+- **🤝 Collaborative fields: make any record collaboratively editable
+  (`#[collaborative]`, issue #1806):** autumn could broadcast changes
+  (`channels`), show who is online (`presence`) and reconcile offline writes
+  (`sync`), but concurrent edits to one field were resolved by
+  last-write-wins — `sync::resolver` compares `updated_at` and discards the
+  loser, so one of two people typing in the same box loses their characters.
+  There was no convergent-merge seam anywhere in the tree, which left
+  Notion/Figma-grade editing to an external service (Liveblocks, Yjs,
+  PartyKit). The new `collab` feature adds one.
+  - `autumn_web::collab::CollabText` is a text CRDT — a Replicated Growable
+    Array — implemented in-tree with **zero new dependencies**. Replicas that
+    hold the same operations render the same text in any delivery order; an
+    operation that arrives before the character it refers to waits in a buffer
+    instead of being dropped; applying one twice is a no-op, so a reconnect is
+    safe; and an edit anchors to a neighbouring character rather than an
+    index, so it lands where the author meant even when the document changed
+    in flight.
+  - `#[collaborative]` marks the field, mirroring `#[translatable]`: the
+    macro validates the type, refuses the markers that disagree with it,
+    registers the column (`CollaborativeColumnDescriptor`), and generates
+    `body_text()`, `body_insert(..)`, `body_remove(..)`, `body_set_text(..)`,
+    `body_merge(..)` plus the field-name-keyed `collaborative(..)` accessors.
+    Storage is a plain `TEXT` column holding JSON, through the same Diesel
+    codec `Translated` uses; a column that still holds prose decodes as a
+    seeded document, so promoting an existing field keeps its content.
+  - `CollabHub` hosts the live sessions on the seams that already exist:
+    operations fan out over a `Channels` topic, membership comes from
+    `Presence`, and cursors ride a `Cursor` message merged into the
+    participant list. `serve_socket` is the whole client protocol in one call
+    from a `#[ws]` handler. The hub bounds insert size, delete size and
+    document size, because it is a shared authority a single client could
+    otherwise grow without limit.
+  - `CollabResolver` replaces last-write-wins for collaborative fields in the
+    offline-sync engine, so an edit made offline merges on reconnect. Every
+    other column of the same row keeps the wrapped resolver's verdict, and a
+    delete on either side is still a row-level decision — merging would
+    resurrect a deleted row.
+  - Convergence is proven, not asserted: `sim_collab_convergence` exhausts
+    **all 720 interleavings** of a fixed six-operation set and checks every
+    one reaches byte-identical state, then property-tests randomized
+    interleavings across 2–5 replicas with zero dropped operations.
+  - `examples/collab-notes` runs the whole story with `cargo run -p
+    collab-notes` — no database, no container, no external service — and its
+    Chromium smoke drives **two browser pages** editing one field and asserts
+    they converge. See `docs/guide/collaboration.md`.
+  - Scope of this first slice: one CRDT type (text) and one field marker.
+    Lists, maps, counters and trees; rich text and a block model; undo/redo;
+    and `autumn generate model`'s `{collaborative}` DSL marker are all
+    follow-ups. The LWW default for non-collaborative fields is unchanged.
 
 ### Fixed
 
@@ -53,6 +102,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result, and the existing `cargo test -p cms` suite (99 unit tests +
   existing integration suite) passes unchanged. See
   `docs/reports/2026-09-16-ledger-cms-set-post-terms-lock-batch/`.
+
+- **jobs:** a Postgres relative-delay enqueue (`enqueue_in` and its
+  transactional/after-commit siblings) no longer binds a Rust-computed
+  `chrono::Utc::now() + delay` into `run_at`. The database now computes it
+  (`clock_timestamp() + delay`), closing the last piece of #2111's
+  app-vs-database clock skew: an app host whose clock has drifted from the
+  database's no longer stamps the wrong deadline, and a transactional
+  enqueue (`enqueue_in_on_conn`) no longer measures the delay from when its
+  surrounding transaction happened to start. An explicit `enqueue_at`
+  instant is unaffected — it is inserted exactly as before. Also fixes an
+  unrelated, pre-existing bug the fix surfaced: the Postgres test suite's
+  own migration runner split each `up.sql` file on `;`, which cut a
+  migration's own comment in half wherever the comment contained a
+  semicolon, corrupting the next statement. It now runs each file through
+  `batch_execute` in one round trip. [no-plugin]
 
 - **Frame-forge the SQLite fork for the framework control-plane migrations
   (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
@@ -293,6 +357,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/commentable.md`.
 
 ### Added
+
+- **🔒 `#[confidential]` — operator-blind fields sealed under a key the server
+  never holds (#1771).** `#[encrypted]` protects a column at rest under keys
+  *the operator holds*: it stops a stolen disk, not a rogue admin, a subpoena or
+  a leaked backup. A `#[confidential]` field removes the operator from the trust
+  boundary. The value is sealed client side with `autumn_web::confidential`:
+  AES-256-GCM under per-field keys derived from a client-held `RootKey` and a
+  length-prefixed table/column/owner scope. That scope, the envelope header and
+  an optional record id are the AEAD associated data, so an envelope copied into
+  another column, table or user no longer opens — and `FieldContext::for_record`
+  extends that to the row, which `FieldContext::new` deliberately leaves open
+  and the guide says so. The column is declared as the opaque `Sealed` type
+  rather than `String`, so the only value the server can bind is the envelope —
+  and the database, `autumn db backup` output, the access and error log, replay
+  capsules, record version history, the admin UI and its CSV export carry
+  ciphertext by construction rather than by scrubbing. Equality still works,
+  through a client-computed `BlindIndex` token in a `<field>_bidx` companion
+  column: a fixed-length keyed MAC that leaks neither the plaintext nor its
+  length, that an operator cannot recompute, and that compares in constant time.
+  Everything that would make the operator read, index, order or join the value
+  is a **build failure**: `#[searchable]`, `#[unique]`, `#[indexed]`,
+  `#[references]`, `#[normalize]`, `#[encrypted]`, `#[classified]`,
+  `#[translatable]`, a serde or Diesel column rename, the model's shard key, a
+  non-`Sealed` field type, and — across the macro boundary, through the column
+  list `#[model]` publishes — a derived `find_by_<field>`,
+  `find_or_create_by_<field>`, `cursor_key = <field>` or grouped aggregate in
+  `#[repository]`. The `Sealed` and `BlindIndex` field types are proven by a
+  generated type assertion, not only by name, so an app type that happens to
+  share a name cannot earn the guarantee. `RootKey` has no `Serialize`, no
+  `Display` and no byte accessor, is never built from configuration or the
+  credentials store, and zeroizes on drop along with the AES key schedule.
+  `docs/guide/confidential-fields.md` states the threat model — including what
+  sealing does *not* hide — and `confidential_threat_model` asserts in CI that
+  the guide and the code agree on the "cannot see" set, while
+  `confidential_red_team` stores and re-reads a value over authenticated HTTP,
+  then dumps the database, a backup artifact, the full log and a replay capsule
+  and proves zero plaintext in all four.
 
 - **`autumn-admin-plugin` builds under the `SQLite` backend, and an
   application's own `AdminModel`s run there (#2108) [no-plugin].** A `SQLite`

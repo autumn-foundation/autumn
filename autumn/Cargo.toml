@@ -16,6 +16,13 @@ autotests = false
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
+# Conflict-free collaborative editing (issue #1806). Adds
+# `autumn_web::collab`: an in-tree RGA text CRDT (`CollabText`), the
+# `#[collaborative]` model field marker, and the session hub that streams ops
+# and cursors over the existing channel/presence seams. Zero new dependencies.
+# The hub half additionally needs `presence`; the CRDT, the marker and the
+# offline-sync resolver compile without it.
+collab = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -427,7 +434,13 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+# `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
+# drops. It matters on the client side of `#[confidential]` (#1771), where a
+# crash dump would otherwise expose material the field key is derived from.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Deterministic wipe of the client root key used by `#[confidential]` (#1771).
+# Adds NO new crate to the graph: `aes-gcm` and `secrecy` already resolve it.
+zeroize = "1"
 # NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
 # (RFC 8292) and the ECDH half of RFC 8291 payload encryption. Adds NO new
 # crate to the graph — `jsonwebtoken` (a non-optional dependency above) already
@@ -921,6 +934,22 @@ path = "tests/sqlite_commit_hook_worker.rs"
 [[test]]
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
+
+# Snag QA probe (#1771): runs the `#[repository]`-generated
+# `find_by_body_bidx` finder against real data (many owners, some sharing
+# plaintext) on a tempfile SQLite pool, which nothing in the existing
+# confidential-fields suite does (`confidential_model.rs` queries the
+# blind-index column with a raw Diesel `.filter(...)`, and
+# `tests/compile-pass/confidential_blind_index_finder.rs` only proves the
+# generated finder compiles). Isolated for the same feature-unification
+# reason as `sqlite_jobs_scheduler_e2e` above: `sqlite` flips
+# `db::RuntimeConnection` for the whole build graph, so it cannot share the
+# consolidated `integration_tests` binary with the Postgres-assuming `db`
+# suite. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test confidential_repository_bidx`.
+[[test]]
+name = "confidential_repository_bidx"
+path = "tests/confidential_repository_bidx.rs"
 
 # FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
 # (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,

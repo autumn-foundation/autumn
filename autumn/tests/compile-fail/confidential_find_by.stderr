@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: `find_by_body` puts `ConfidentialNote::body` in a server-side WHERE clause, but that column is `#[confidential]`: it is sealed under a key the server never holds, so the database only ever compares ciphertext. Declare the field `#[confidential(blind_index)]` and query its companion column `body_bidx`, whose token the client computes and the server can compare.
+  --> tests/compile-fail/confidential_find_by.rs:28:1
+   |
+28 | #[autumn_web::repository(ConfidentialNote, table = "confidential_notes")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `<PgConfidentialNoteRepository as ConfidentialNoteRepository>::find_by_body::{closure#0}::_` failed here

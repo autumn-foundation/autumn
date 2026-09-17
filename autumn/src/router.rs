@@ -4101,6 +4101,7 @@ fn build_shadow_layer(
         // pages, failure capsules, and now the recorded divergence samples.
         let mut filter_parameters = config.log.filter_parameters.clone();
         filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
         let filter = Arc::new(crate::log::filter::ParameterFilter::new(
             &filter_parameters,
             &config.log.unfilter_parameters,
@@ -5139,6 +5140,8 @@ fn apply_middleware(
         // `[log] filter_parameters` list governs both.
         let mut capture_filter_parameters = config.log.filter_parameters.clone();
         capture_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        capture_filter_parameters
+            .extend(crate::confidential::registered_confidential_column_names());
         let capture_filter = Arc::new(crate::log::filter::ParameterFilter::new(
             &capture_filter_parameters,
             &config.log.unfilter_parameters,
@@ -5179,6 +5182,8 @@ fn apply_middleware(
     // enter the context output.
     let mut log_context_filter_parameters = config.log.filter_parameters.clone();
     log_context_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    log_context_filter_parameters
+        .extend(crate::confidential::registered_confidential_column_names());
     let log_context_filter = Arc::new(crate::log::filter::ParameterFilter::new(
         &log_context_filter_parameters,
         &config.log.unfilter_parameters,
@@ -5322,6 +5327,7 @@ fn apply_middleware(
         // values never leak through logs even if an app forgets to list them.
         let mut filter_parameters = config.log.filter_parameters.clone();
         filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
         let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
         let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
             renderer,

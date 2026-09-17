@@ -32,6 +32,8 @@ use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
+#[cfg(all(feature = "collab", feature = "presence"))]
+use crate::collab::CollabHub;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
@@ -159,6 +161,13 @@ pub struct AppState {
     /// [`presence()`](Self::presence) for convenient access.
     #[cfg(feature = "presence")]
     pub(crate) presence: Presence,
+
+    /// Registry of live collaborative documents (issue #1806).
+    ///
+    /// Available when both `collab` and `presence` are enabled. Use
+    /// [`collab()`](Self::collab) for convenient access.
+    #[cfg(all(feature = "collab", feature = "presence"))]
+    pub(crate) collab: CollabHub,
 
     /// Cancellation token signalled during graceful shutdown.
     ///
@@ -885,6 +894,15 @@ impl AppState {
         &self.presence
     }
 
+    /// Returns a reference to the registry of live collaborative documents.
+    ///
+    /// Shorthand for the [`CollabHub`] extractor.
+    #[cfg(all(feature = "collab", feature = "presence"))]
+    #[must_use]
+    pub const fn collab(&self) -> &CollabHub {
+        &self.collab
+    }
+
     /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
     #[cfg(feature = "ws")]
     #[must_use]
@@ -937,6 +955,11 @@ impl AppState {
     pub fn detached() -> Self {
         #[cfg(feature = "ws")]
         let channels = Channels::new(32);
+        // One tracker, shared: `state.presence()` and the collaboration hub
+        // must see the same membership, or a participant list read through
+        // one would disagree with the other.
+        #[cfg(feature = "presence")]
+        let presence = Presence::new(channels.clone());
         Self {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
@@ -959,8 +982,10 @@ impl AppState {
             config_props: actuator::ConfigProperties::default(),
             metrics_source_registry: actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: CollabHub::new(channels.clone(), presence.clone()),
             #[cfg(feature = "presence")]
-            presence: Presence::new(channels.clone()),
+            presence,
             #[cfg(feature = "ws")]
             channels,
             #[cfg(feature = "ws")]
@@ -1223,6 +1248,14 @@ impl AppState {
     /// struct-update syntax (`AppState { field: ..., ..AppState::test_default() }`)
     /// rather than repeating the other twenty-odd fields.
     pub(crate) fn test_default() -> Self {
+        // One registry and one tracker across all three fields, for the
+        // reason `detached()` gives: a hub wired to a different `Channels`
+        // than `state.channels()` publishes where nobody is listening, and a
+        // test asserting on either would pass vacuously.
+        #[cfg(feature = "ws")]
+        let channels = crate::channels::Channels::new(32);
+        #[cfg(feature = "presence")]
+        let presence = crate::presence::Presence::new(channels.clone());
         Self {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1247,10 +1280,12 @@ impl AppState {
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: CollabHub::new(channels.clone(), presence.clone()),
             #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            presence,
+            #[cfg(feature = "ws")]
+            channels,
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),

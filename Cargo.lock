@@ -68,6 +68,7 @@ dependencies = [
  "ctr 0.9.2",
  "ghash 0.5.1",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -865,6 +866,7 @@ dependencies = [
  "webauthn-rs",
  "webpki-roots 1.0.9",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -2128,6 +2130,19 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "validator",
+]
+
+[[package]]
+name = "collab-notes"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "diesel",
+ "example-e2e",
+ "maud",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
