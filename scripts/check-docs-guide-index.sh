@@ -419,7 +419,11 @@ def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
     # content. `decode_char_refs` is the same decode `normalise` applies to
     # a destination, asked here of the text — semicolon-terminated only, as
     # CommonMark requires.
-    if not strip_emphasis(decode_char_refs(text[pos + 1:close - 1])).strip():
+    # RAW first, decoded second. `strip_emphasis` decides flanking, which
+    # CommonMark settles on the source: `&#32;` is not whitespace yet, so
+    # `*&#32;*` opens emphasis while `* *` does not. Decoding before the
+    # strip made those two identical and rejected the valid one.
+    if not decode_char_refs(strip_emphasis(text[pos + 1:close - 1])).strip():
         return False
     for q in range(pos + 1, close - 1):
         if text[q] != "[" or (q and text[q - 1] == "!"):
@@ -737,6 +741,8 @@ def decode_char_refs(s):
 
 # `*`, `_` and `~` when they form emphasis, strong emphasis or strikethrough.
 _DELIMS = "*_~"
+# CommonMark's Unicode whitespace, which decides delimiter flanking.
+_WS = " \t\n\r\f\v"
 
 
 def strip_emphasis(s):
@@ -759,6 +765,20 @@ def strip_emphasis(s):
     mode leaves `~~ ~~` literal while cmark-gfm renders `<del> </del>`.
     These pages render on GitHub, so cmark-gfm is the authority here and
     the delimiter is included.
+
+    FLANKING is decided on the SOURCE, before character references decode,
+    and that distinction is the whole of this function's subtlety:
+
+        [* *](x)        ->  <a href="x">* *</a>        VISIBLE
+        [*&#32;*](x)    ->  <a href="x"><em> </em></a>  invisible
+
+    A delimiter run followed by whitespace does not open emphasis, so the
+    first renders its asterisks as text. `&#32;` is not whitespace while
+    flanking is being decided — it becomes a space only afterwards — so the
+    second does open, and closes around nothing visible. Both verified in
+    both renderers. Decoding first made the two identical and rejected the
+    valid one, so `s` must arrive here RAW and be decoded by the caller
+    afterwards.
     """
     while len(s) >= 2:
         ch = s[0]
@@ -769,6 +789,10 @@ def strip_emphasis(s):
         # One run, not two: `***` is three literal asterisks, not emphasis
         # wrapped around nothing.
         if lead + tail >= len(s):
+            break
+        # The opener must be left-flanking and the closer right-flanking:
+        # neither may sit against whitespace on its inner side.
+        if s[lead] in _WS or s[len(s) - tail - 1] in _WS:
             break
         s = s[1:-1]
     return s
@@ -5561,6 +5585,41 @@ self_test() {
   printf '[*](docs/guide/index.md)\n' > "$tmp/emph_lone_star/README.md"
   _commit emph_lone_star
   _case "a lone delimiter is visible text" 0 emph_lone_star
+
+  # 270. FLANKING is decided on the SOURCE. A delimiter run followed by
+  #      literal whitespace does not open emphasis, so `[* *](x)` renders
+  #      its asterisks as visible text — while `[*&#32;*](x)` opens, because
+  #      `&#32;` is not whitespace until after emphasis is parsed. Decoding
+  #      before stripping made the two identical and rejected the valid one.
+  _scaffold emph_literal_space
+  printf '# A\n' > "$tmp/emph_literal_space/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/emph_literal_space/docs/guide/index.md"
+  printf '[* *](docs/guide/index.md)\n' \
+    > "$tmp/emph_literal_space/README.md"
+  _commit emph_literal_space
+  _case "a delimiter against whitespace stays visible" 0 emph_literal_space
+
+  # 271. The same on the INDEX side, so a row written that way still lists
+  #      its page rather than being rejected.
+  _scaffold emph_literal_row
+  printf '# A\n' > "$tmp/emph_literal_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [* *](alpha.md)\n' \
+    > "$tmp/emph_literal_row/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/emph_literal_row/README.md"
+  _commit emph_literal_row
+  _case "a visible delimiter row still lists" 0 emph_literal_row
+
+  # 272. Strong emphasis follows the same rule, so `[** **](x)` is visible
+  #      where `[**&#32;**](x)` is not.
+  _scaffold emph_literal_strong
+  printf '# A\n' > "$tmp/emph_literal_strong/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/emph_literal_strong/docs/guide/index.md"
+  printf '[** **](docs/guide/index.md)\n' \
+    > "$tmp/emph_literal_strong/README.md"
+  _commit emph_literal_strong
+  _case "strong emphasis flanks the same way" 0 emph_literal_strong
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
