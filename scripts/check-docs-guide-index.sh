@@ -748,6 +748,14 @@ def readable(text):
                     continue
             auto = AUTOLINK.match(text, i)
             if auto:
+                # BLANKED, not merely skipped. An autolink is a single link
+                # whose body is a URI, so `[catalog]` inside one is part of
+                # that URI and not a reference use — but leaving the text in
+                # place let the label scan find it and call a definition
+                # referenced. Nothing inside an autolink can ever be a guide
+                # link either: an autolink needs a scheme, and `<alpha.md>`
+                # after `](` or `]:` is a destination, handled above this.
+                blank_to(i, auto.end())
                 i = auto.end()
                 continue
             tag = INLINE_TAG.match(text, i)
@@ -1040,7 +1048,13 @@ def reaches_index(text):
     # scanned over the same blanked text, since a `[Guide][catalog]` sitting
     # inside a link's title is title text and reaches nothing.
     defs = definitions(text)
-    text = blank_links(text)
+    # The USES are read from a copy with links AND definitions blanked. Only
+    # `defs` above needs the definitions intact. Blanking them for the inline
+    # pass but not this one left a label inside a definition's own title
+    # counting as a use of itself — so a definition nothing references looked
+    # referenced, and the index looked reachable from text that renders
+    # nowhere.
+    text = blank_links(blank_defns(text))
     if not defs:
         return False
     # No `\\` in these lookbehinds. `readable()` already resolved escape
@@ -2388,6 +2402,52 @@ self_test() {
     > "$tmp/ref_escape_single/README.md"
   _commit ref_escape_single
   _case "one backslash escapes a reference opener" 1 ref_escape_single
+
+  # 115. A label inside a definition's own TITLE is not a use of it. The
+  #      inline pass read a blanked copy and the USE scan did not, so a
+  #      definition nothing references looked referenced.
+  _scaffold label_in_own_title
+  printf '# A\n' > "$tmp/label_in_own_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_in_own_title/docs/guide/index.md"
+  printf '[catalog]: docs/guide/index.md "title [catalog]"\n' \
+    > "$tmp/label_in_own_title/README.md"
+  _commit label_in_own_title
+  _case "a label in its own title is not a use" 1 label_in_own_title
+
+  # 116. ...and the guard: a real use elsewhere on the page still counts.
+  _scaffold label_used_elsewhere
+  printf '# A\n' > "$tmp/label_used_elsewhere/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_used_elsewhere/docs/guide/index.md"
+  printf 'see [catalog]\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/label_used_elsewhere/README.md"
+  _commit label_used_elsewhere
+  _case "a real reference use still counts" 0 label_used_elsewhere
+
+  # 117. An autolink's body is a URI, so a label inside it is part of that
+  #      URI, not a reference use. Skipping it without blanking left the
+  #      text for the label scan to find.
+  _scaffold label_in_autolink
+  printf '# A\n' > "$tmp/label_in_autolink/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_in_autolink/docs/guide/index.md"
+  printf '<https://example.com/[catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/label_in_autolink/README.md"
+  _commit label_in_autolink
+  _case "a label inside an autolink is not a use" 1 label_in_autolink
+
+  # 118. ...and the guard that blanking autolinks must not break: an ANGLE
+  #      destination is not an autolink, and a real link beside an autolink
+  #      is still a link.
+  _scaffold autolink_guard
+  printf '# A\n' > "$tmp/autolink_guard/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](<alpha.md>)\n' \
+    > "$tmp/autolink_guard/docs/guide/index.md"
+  printf '<https://example.com> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/autolink_guard/README.md"
+  _commit autolink_guard
+  _case "an autolink hides neither destination nor link" 0 autolink_guard
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
