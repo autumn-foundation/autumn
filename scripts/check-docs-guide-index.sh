@@ -267,6 +267,9 @@ def dest_at(text, pos):
     while j < n:
         ch = text[j]
         if ch == "\\" and j + 1 < n:
+            # Same rule as `bracket_pairs`: never past a line ending.
+            if text[j + 1] == "\n":
+                break
             j += 2
             continue
         if ch in " \t\n":
@@ -299,7 +302,12 @@ def bracket_pairs(text):
     while j < n:
         ch = text[j]
         if ch == "\\":
-            j += 2
+            # A backslash never swallows the LINE ENDING. Skipping two
+            # characters unconditionally ate the newline before a blank
+            # line, so the paragraph boundary went unseen and the bracket
+            # stack survived it — `[Guide\\`, blank line, `x](y.md)` was
+            # accepted as a link CommonMark does not render.
+            j += 1 if j + 1 < n and text[j + 1] == "\n" else 2
             continue
         if ch == "\n":
             # A BLANK line ends the paragraph, and link text cannot span
@@ -339,6 +347,12 @@ def link_at(text, pos, pairs=None, resolved=frozenset()):
         pairs = bracket_pairs(text)
     tail = _tail_at(text, close)
     if tail is None:
+        return None
+    # A link with NO rendered content is not an entry and not a route. The
+    # whole point of this gate is that a reader can find and click a thing;
+    # `- [](alpha.md)` gives them nothing to see. An image counts as
+    # content, which is what `IMAGE_MARK` is for.
+    if not text[pos + 1:close - 1].strip():
         return None
     # A LINK MAY NOT CONTAIN A LINK. When the text holds one, CommonMark
     # deactivates the OUTER opener and the inner link is what renders, so
@@ -486,6 +500,11 @@ DEFN = re.compile(
 
 
 # CommonMark caps a reference label at 999 characters.
+# Stands in for an image inside `readable()`'s output: not whitespace, so
+# a link wrapping an image still has visible content, and not a character
+# any markdown construct matches.
+IMAGE_MARK = "\ufffc"
+
 LABEL_LIMIT = 999
 
 
@@ -544,9 +563,20 @@ def candidate_labels(text):
     span, which is rare, and each use below states which direction that
     pushes it.
     """
+    # Read from a FIRST PASS of `readable()` with nothing resolved, not from
+    # the raw text. Scanning raw meant a definition inside a fenced code
+    # block counted — `_starts_block` sees a fence OPENER above it and says
+    # yes, which is right for a definition after a fence and wrong for one
+    # inside it. Marking that label resolved then masked a real reference
+    # image and deleted the live link in its brackets.
+    #
+    # The first pass terminates because it resolves no labels: with an empty
+    # set every reference image is left alone, which is the conservative
+    # direction, and fences and comments do not depend on labels at all.
+    base = readable(text, frozenset())
     out = set()
-    for m in DEFN.finditer(text):
-        if not _starts_block(text, m.start()):
+    for m in DEFN.finditer(base):
+        if not _starts_block(base, m.start()):
             continue
         key = label_key(m.group(1))
         if key is not None:
@@ -1065,7 +1095,8 @@ def readable(text, resolved=None):
                 depth, k = 1, pos + 1
                 while k < n and depth:
                     if text[k] == "\\":
-                        k += 2
+                        # Same rule again: an escape never spans a newline.
+                        k += 1 if k + 1 < n and text[k + 1] == "\n" else 2
                         continue
                     if text[k] == opener:
                         depth += 1
@@ -1113,6 +1144,15 @@ def readable(text, resolved=None):
                         end = None
                 if end is not None:
                     blank_to(i, end)
+                    # An image renders something a reader can SEE, so a link
+                    # wrapping one has content even though its text is now
+                    # blank. One marker character records that, which is the
+                    # difference between `[](a.md)` — nothing to click —
+                    # and a badge row. It occupies a position the span
+                    # already owned, so line numbers are untouched, and it
+                    # matches no markdown construct.
+                    if out[i] != "\n":
+                        out[i] = IMAGE_MARK
                     i = end
                     continue
             i += 1
@@ -3351,6 +3391,53 @@ self_test() {
   printf '[Guide](./docs/guide/index.md)\n' > "$tmp/dot_slash/README.md"
   _commit dot_slash
   _case "a ./ prefix still resolves" 0 dot_slash
+
+  # 162. A backslash never swallows the LINE ENDING. Skipping two characters
+  #      unconditionally ate the newline before a blank line, so the
+  #      paragraph boundary went unseen and the bracket stack survived it.
+  _scaffold escaped_newline
+  printf '# A\n' > "$tmp/escaped_newline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escaped_newline/docs/guide/index.md"
+  printf '[Guide\\\n\ncontinued](docs/guide/index.md)\n' \
+    > "$tmp/escaped_newline/README.md"
+  _commit escaped_newline
+  _case "an escape does not swallow a blank line" 1 escaped_newline
+
+  # 163. A link with NO rendered content is not an entry and not a route:
+  #      `- [](alpha.md)` gives a reader nothing to see or click, which is
+  #      the whole thing this gate exists to guarantee.
+  _scaffold empty_label
+  printf '# A\n' > "$tmp/empty_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [](alpha.md)\n' \
+    > "$tmp/empty_label/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/empty_label/README.md"
+  _commit empty_label
+  _case "an empty link label is not an entry" 1 empty_label
+
+  # 164. ...and the guard: an IMAGE is content, so a badge row stays a row.
+  #      This is what `IMAGE_MARK` exists for.
+  _scaffold image_label
+  printf '# A\n' > "$tmp/image_label/docs/guide/alpha.md"
+  printf 'x' > "$tmp/image_label/docs/guide/img.png"
+  printf '# Guide\n\n## S\n\n- [![badge](img.png)](alpha.md)\n' \
+    > "$tmp/image_label/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/image_label/README.md"
+  _commit image_label
+  _case "an image label is rendered content" 0 image_label
+
+  # 165. A definition inside a FENCE is code, not a definition.
+  #      `_starts_block` sees a fence opener above it and says yes, which is
+  #      right after a fence and wrong inside one — so the candidate set is
+  #      read from a first `readable()` pass rather than the raw text.
+  _scaffold fenced_definition
+  printf '# A\n' > "$tmp/fenced_definition/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/fenced_definition/docs/guide/index.md"
+  printf '```\n[missing]: other.md\n```\n\n![alt [Guide](docs/guide/index.md)][missing]\n' \
+    > "$tmp/fenced_definition/README.md"
+  _commit fenced_definition
+  _case "a fenced definition does not resolve" 0 fenced_definition
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
