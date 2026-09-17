@@ -240,6 +240,9 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 
 ## Documentation
 
+- [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
+  full table of contents for `docs/guide/`; the list below is a selection of
+  highlights, not the whole guide
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
