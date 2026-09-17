@@ -64,7 +64,9 @@ const WEBAUTHN_RS_FEATURES: &[&str] = &["danger-allow-state-serialisation", "con
 /// `ensure_cargo_dependencies` skips a crate that is already declared, so a project
 /// that already lists `webauthn-rs` without `conditional-ui` would scaffold but fail
 /// to compile. This merges the missing features into the existing declaration —
-/// shorthand, inline-table, or `[dependencies.webauthn-rs]` subtable form.
+/// shorthand, inline-table, or `[dependencies.webauthn-rs]` subtable form
+/// (including a multi-line `features = [...]` array in the subtable, where the
+/// missing features are appended to the array's closing line).
 fn ensure_webauthn_rs_features(toml: &str) -> String {
     const CRATE: &str = "webauthn-rs";
     let trailing_newline = toml.ends_with('\n');
@@ -147,6 +149,56 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         .collect();
                     if let Some(new_line) = merge_missing(&t) {
                         lines[j] = format!("{ind2}{new_line}");
+                    } else if t.contains('[') {
+                        // Multi-line `features = [` array: `merge_missing` only
+                        // handles single-line lists, so scan forward for the
+                        // closing line and append any missing features there,
+                        // mirroring `ensure_autumn_web_oauth2_feature`
+                        // (#2753 missed-fix #2).
+                        let mut seen: Vec<bool> = WEBAUTHN_RS_FEATURES
+                            .iter()
+                            .map(|f| t.contains(&format!("\"{f}\"")))
+                            .collect();
+                        let mut k = j + 1;
+                        while k < lines.len() {
+                            let tk = lines[k].trim().to_owned();
+                            if tk.starts_with('[') {
+                                break;
+                            }
+                            for (flag, f) in seen.iter_mut().zip(WEBAUTHN_RS_FEATURES.iter()) {
+                                if tk.contains(&format!("\"{f}\"")) {
+                                    *flag = true;
+                                }
+                            }
+                            if let Some(close_idx) = tk.find(']') {
+                                let missing: Vec<String> = WEBAUTHN_RS_FEATURES
+                                    .iter()
+                                    .zip(seen.iter())
+                                    .filter(|(_, s)| !**s)
+                                    .map(|(f, _)| format!("\"{f}\""))
+                                    .collect();
+                                if !missing.is_empty() {
+                                    let before_close = tk[..close_idx].trim();
+                                    let sep =
+                                        if before_close.is_empty() || before_close.ends_with(',') {
+                                            ""
+                                        } else {
+                                            ", "
+                                        };
+                                    let indent_k: String = lines[k]
+                                        .chars()
+                                        .take_while(char::is_ascii_whitespace)
+                                        .collect();
+                                    lines[k] = format!(
+                                        "{indent_k}{before_close}{sep}{}{}",
+                                        missing.join(", "),
+                                        &tk[close_idx..]
+                                    );
+                                }
+                                break;
+                            }
+                            k += 1;
+                        }
                     }
                     let mut out = lines.join("\n");
                     if trailing_newline {
@@ -1499,6 +1551,8 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+/// A multi-line `features = [...]` array in the subtable form gains the feature
+/// on the array's closing line (and is left alone when it already names it).
 #[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
@@ -1618,12 +1672,32 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 .collect();
                             lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
+                            // Multi-line `features = [` array: scan forward for the
+                            // closing line, appending the feature there only if it
+                            // is not already named on any line of the array
+                            // (#2753 missed-fix #2 drive-by: the old scan only
+                            // checked the opening line and could duplicate the
+                            // feature).
                             let mut k = j + 1;
+                            let mut close_line = None;
+                            let mut present = false;
                             while k < lines.len() {
                                 let tk = lines[k].trim();
                                 if tk.starts_with('[') {
                                     break;
                                 }
+                                if tk.contains(FEATURE) {
+                                    present = true;
+                                    break;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if let (Some(cl), false) = (close_line, present) {
+                                let tk = lines[cl].trim().to_owned();
                                 if let Some(close_idx) = tk.find(']') {
                                     let before_close = tk[..close_idx].trim();
                                     let sep =
@@ -1632,17 +1706,15 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                         } else {
                                             ", "
                                         };
-                                    let indent_k: String = lines[k]
+                                    let indent_k: String = lines[cl]
                                         .chars()
                                         .take_while(char::is_ascii_whitespace)
                                         .collect();
-                                    lines[k] = format!(
+                                    lines[cl] = format!(
                                         "{indent_k}{before_close}{sep}{FEATURE}{}",
                                         &tk[close_idx..]
                                     );
-                                    break;
                                 }
-                                k += 1;
                             }
                         }
                     }
@@ -1706,7 +1778,8 @@ pub fn run_with_options(
 /// - `[dependencies.autumn-web]` subtable (hyphenated or Cargo's underscore-normalized
 ///   `[dependencies.autumn_web]` spelling — both are valid TOML keys for the same
 ///   dependency, as `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` already
-///   check)
+///   check), including a multi-line `features = [...]` array, where `mail` is
+///   appended to the array's closing line
 #[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
@@ -1802,20 +1875,63 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if !t.contains(FEATURE)
-                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
-                    {
-                        let inner = t[open + 1..close].trim();
-                        let new_inner = if inner.is_empty() {
-                            FEATURE.to_owned()
-                        } else {
-                            format!("{inner}, {FEATURE}")
-                        };
-                        let indent_j: String = lines[j]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    if !t.contains(FEATURE) {
+                        if let (Some(open), Some(close)) = (t.find('['), t.rfind(']')) {
+                            let inner = t[open + 1..close].trim();
+                            let new_inner = if inner.is_empty() {
+                                FEATURE.to_owned()
+                            } else {
+                                format!("{inner}, {FEATURE}")
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!("{indent_j}features = [{new_inner}]");
+                        } else if t.contains('[') {
+                            // Multi-line `features = [` array: scan forward for the
+                            // closing line, appending the feature there only if it
+                            // is not already named on any line of the array
+                            // (#2753 missed-fix #2).
+                            let mut k = j + 1;
+                            let mut close_line = None;
+                            let mut present = false;
+                            while k < lines.len() {
+                                let tk = lines[k].trim().to_owned();
+                                if tk.starts_with('[') {
+                                    break;
+                                }
+                                if tk.contains(FEATURE) {
+                                    present = true;
+                                    break;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if let (Some(cl), false) = (close_line, present) {
+                                let tk = lines[cl].trim().to_owned();
+                                if let Some(close_idx) = tk.find(']') {
+                                    let before_close = tk[..close_idx].trim();
+                                    let sep =
+                                        if before_close.is_empty() || before_close.ends_with(',') {
+                                            ""
+                                        } else {
+                                            ", "
+                                        };
+                                    let indent_k: String = lines[cl]
+                                        .chars()
+                                        .take_while(char::is_ascii_whitespace)
+                                        .collect();
+                                    lines[cl] = format!(
+                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                        &tk[close_idx..]
+                                    );
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -10933,6 +11049,8 @@ older browsers.
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["webauthn"]`.
+/// Like its `mail`/`oauth2` siblings, a multi-line `features = [...]` array in the
+/// subtable form gains the feature on the array's closing line.
 #[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
@@ -11037,20 +11155,63 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if !t.contains(FEATURE)
-                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
-                    {
-                        let inner = t[open + 1..close].trim();
-                        let new_inner = if inner.is_empty() {
-                            FEATURE.to_owned()
-                        } else {
-                            format!("{inner}, {FEATURE}")
-                        };
-                        let indent_j: String = lines[j]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    if !t.contains(FEATURE) {
+                        if let (Some(open), Some(close)) = (t.find('['), t.rfind(']')) {
+                            let inner = t[open + 1..close].trim();
+                            let new_inner = if inner.is_empty() {
+                                FEATURE.to_owned()
+                            } else {
+                                format!("{inner}, {FEATURE}")
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!("{indent_j}features = [{new_inner}]");
+                        } else if t.contains('[') {
+                            // Multi-line `features = [` array: scan forward for the
+                            // closing line, appending the feature there only if it
+                            // is not already named on any line of the array
+                            // (#2753 missed-fix #2).
+                            let mut k = j + 1;
+                            let mut close_line = None;
+                            let mut present = false;
+                            while k < lines.len() {
+                                let tk = lines[k].trim().to_owned();
+                                if tk.starts_with('[') {
+                                    break;
+                                }
+                                if tk.contains(FEATURE) {
+                                    present = true;
+                                    break;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if let (Some(cl), false) = (close_line, present) {
+                                let tk = lines[cl].trim().to_owned();
+                                if let Some(close_idx) = tk.find(']') {
+                                    let before_close = tk[..close_idx].trim();
+                                    let sep =
+                                        if before_close.is_empty() || before_close.ends_with(',') {
+                                            ""
+                                        } else {
+                                            ", "
+                                        };
+                                    let indent_k: String = lines[cl]
+                                        .chars()
+                                        .take_while(char::is_ascii_whitespace)
+                                        .collect();
+                                    lines[cl] = format!(
+                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                        &tk[close_idx..]
+                                    );
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -14512,6 +14673,31 @@ mod tests {
         );
     }
 
+    /// Drive-by (#2753): the oauth2 copy already scanned multi-line arrays, but
+    /// only checked the opening line for the feature — an array already naming
+    /// it on a later line got a duplicate. The scan now checks every line.
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_does_not_duplicate_present_multiline_array() {
+        let input = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"oauth2\",\n]\n";
+        assert_eq!(
+            ensure_autumn_web_oauth2_feature(input),
+            input,
+            "multiline array already carrying oauth2 must be untouched"
+        );
+        let missing =
+            "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(missing);
+        assert!(
+            out.contains("\"oauth2\""),
+            "oauth2 must still be merged into a multiline subtable array: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
+        );
+    }
+
     #[test]
     fn cargo_toml_gets_webauthn_feature_subtable_underscore_form() {
         let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
@@ -14519,6 +14705,32 @@ mod tests {
         assert!(
             out.contains("features = [\"webauthn\"]"),
             "webauthn feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Missed-fix #2 (#2753): a multi-line `features = [` array in the subtable
+    /// form must gain the feature too — previously the function silently returned
+    /// the TOML unchanged for this shape.
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_merges_multiline_subtable_array() {
+        let input = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn must be merged into a multiline subtable array: {out}"
+        );
+        assert_eq!(out.matches("\"ws\"").count(), 1, "ws duplicated: {out}");
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "webauthn duplicated: {out}"
+        );
+        // Already-present across the multi-line array: leave it alone.
+        let present = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"webauthn\",\n]\n";
+        assert_eq!(
+            ensure_autumn_web_webauthn_feature(present),
+            present,
+            "multiline array already carrying webauthn must be untouched"
         );
     }
 
@@ -14549,6 +14761,28 @@ mod tests {
         assert_eq!(
             out, input,
             "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
+        );
+    }
+
+    /// Missed-fix #2 (#2753): a multi-line `features = [` array in the subtable
+    /// form must gain the feature too — previously the function silently returned
+    /// the TOML unchanged for this shape, exactly like missed-fix #1.
+    #[test]
+    fn ensure_autumn_web_mail_feature_merges_multiline_subtable_array() {
+        let input = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(
+            out.contains("\"mail\""),
+            "mail must be merged into a multiline subtable array: {out}"
+        );
+        assert_eq!(out.matches("\"ws\"").count(), 1, "ws duplicated: {out}");
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+        // Already-present across the multi-line array: leave it alone.
+        let present = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"mail\",\n]\n";
+        assert_eq!(
+            ensure_autumn_web_mail_feature(present),
+            present,
+            "multiline array already carrying mail must be untouched"
         );
     }
 
@@ -16443,6 +16677,36 @@ mod tests {
         let toml = "webauthn-rs = { version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }\n";
         let out = ensure_webauthn_rs_features(toml);
         assert_eq!(out, toml, "idempotent: should not duplicate features");
+    }
+
+    /// Missed-fix #2 (#2753): a multi-line `features = [` array in the subtable
+    /// form must gain the missing features — previously the function silently
+    /// returned the TOML unchanged for this shape.
+    #[test]
+    fn ensure_webauthn_rs_features_merges_multiline_subtable_array() {
+        let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"danger-allow-state-serialisation\",\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"conditional-ui\""),
+            "multiline subtable features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"danger-allow-state-serialisation\"").count(),
+            1,
+            "feature duplicated: {out}"
+        );
+        assert_eq!(
+            out.matches("\"conditional-ui\"").count(),
+            1,
+            "feature duplicated: {out}"
+        );
+        // Already-complete multi-line array: left byte-identical.
+        let complete = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"danger-allow-state-serialisation\",\n    \"conditional-ui\",\n]\n";
+        assert_eq!(
+            ensure_webauthn_rs_features(complete),
+            complete,
+            "already-complete multiline array must be untouched"
+        );
     }
 
     #[test]

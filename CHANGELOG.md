@@ -24,6 +24,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🪞 Echo: `generate` now merges features into multi-line subtable arrays
+  (#2753 missed-fix #2):** `ensure_autumn_web_mail_feature`,
+  `ensure_autumn_web_webauthn_feature`, and `ensure_webauthn_rs_features` only
+  recognized a `features = [...]` array that opened *and* closed on one line —
+  a multi-line array in a `[dependencies.<crate>]` subtable made each function
+  silently return the Cargo.toml unchanged, so `autumn generate auth --mail`,
+  `--passkeys`, or the webauthn-rs dependency merge skipped the feature with
+  no error. All three now scan forward to the array's closing line and append
+  the missing feature(s) there, mirroring the already-correct
+  `ensure_autumn_web_oauth2_feature` / `ensure_totp_rs_features` behavior. A
+  multi-line array that already carries every required feature is left
+  byte-identical. Drive-by in the same scan: the oauth2 copy's own multi-line
+  path only checked the array's opening line for the feature, so an array that
+  already named it on a later line got a duplicate — the scan now checks every
+  line before appending.
+- **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
+  drops content (#2801):** `Pdf::render`'s layout walker silently dropped
+  any HTML past 512 levels of tag nesting — no error, no log line —
+  contradicting the module docs' "degrades gracefully" promise. Each
+  render that hits the cap now logs one `tracing::warn!` at target
+  `autumn::pdf`, no matter how many nodes it drops, and the cap plus the
+  warning are documented in `autumn_web::pdf`'s new "Nesting depth limit"
+  section. No shipped example is affected today (`examples/invoice` never
+  nests this deep), but any caller who feeds it recursive content (a
+  comment thread, a nested reply tree) can now detect truncation instead
+  of shipping an incomplete PDF unnoticed.
+- **jobs:** a Postgres relative-delay enqueue (`enqueue_in` and its
+  transactional/after-commit siblings) no longer binds a Rust-computed
+  `chrono::Utc::now() + delay` into `run_at`. The database now computes it
+  (`clock_timestamp() + delay`), closing the last piece of #2111's
+  app-vs-database clock skew: an app host whose clock has drifted from the
+  database's no longer stamps the wrong deadline, and a transactional
+  enqueue (`enqueue_in_on_conn`) no longer measures the delay from when its
+  surrounding transaction happened to start. An explicit `enqueue_at`
+  instant is unaffected — it is inserted exactly as before. Also fixes an
+  unrelated, pre-existing bug the fix surfaced: the Postgres test suite's
+  own migration runner split each `up.sql` file on `;`, which cut a
+  migration's own comment in half wherever the comment contained a
+  semicolon, corrupting the next statement. It now runs each file through
+  `batch_execute` in one round trip. [no-plugin]
+
 - **Frame-forge the SQLite fork for the framework control-plane migrations
   (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
   api_tokens, the job queue, feature flags, experiments, the shard
