@@ -2840,6 +2840,40 @@ self_test() {
   _commit unbalanced_parens_dest
   _case "an unbalanced paren is not a destination" 1 unbalanced_parens_dest
 
+  # 136-138. Shapes `check-docs-links.sh` thought worth encoding, checked
+  #     here because two gates over one corpus must agree about what a link
+  #     is. All three already passed when first probed; they are pinned so
+  #     they keep doing so, since nothing else in this suite covered them.
+  #
+  #     A linked IMAGE is the one that earned its own pattern next door: a
+  #     badge row nests a link inside a link, and the outer one is the entry.
+  _scaffold linked_image_row
+  printf '# A\n' > "$tmp/linked_image_row/docs/guide/alpha.md"
+  printf 'x' > "$tmp/linked_image_row/docs/guide/img.png"
+  printf '# Guide\n\n## S\n\n- [![badge](img.png)](alpha.md)\n' \
+    > "$tmp/linked_image_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/linked_image_row/README.md"
+  _commit linked_image_row
+  _case "a linked-image row targets the page" 0 linked_image_row
+
+  _scaffold escaped_bracket_text
+  printf '# A\n' > "$tmp/escaped_bracket_text/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [closing \\]](alpha.md)\n' \
+    > "$tmp/escaped_bracket_text/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/escaped_bracket_text/README.md"
+  _commit escaped_bracket_text
+  _case "an escaped bracket stays inside link text" 0 escaped_bracket_text
+
+  _scaffold single_quoted_title_row
+  printf '# A\n' > "$tmp/single_quoted_title_row/docs/guide/alpha.md"
+  printf "# Guide\n\n## S\n\n- [A](alpha.md 'why')\n" \
+    > "$tmp/single_quoted_title_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/single_quoted_title_row/README.md"
+  _commit single_quoted_title_row
+  _case "a single-quoted title on a row is a row" 0 single_quoted_title_row
+
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
 }
