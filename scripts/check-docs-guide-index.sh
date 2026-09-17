@@ -157,7 +157,7 @@ README = "README.md"
 # `(?<![!\\])` rejects two things that share every other character with a link
 # and navigate nowhere: an image (`![alt](page.md)` renders a picture) and an
 # escaped bracket (`\[Guide](page.md)` renders literal text).
-LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]+)")
+LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^)]*\)")
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -295,7 +295,12 @@ def readable(text):
     # exists for the README link scan, which matches links anywhere. The
     # single-scan rewrite dropped it on the same reasoning that dropped the
     # code-span pass once before — true for entries, false for README.
-    prev_blank = True
+    # CommonMark: indented code cannot interrupt a PARAGRAPH, but it may open
+    # after anything else — a blank line, a heading, a closed fence. Keying on
+    # "previous line was blank" missed the heading case; keying on "previous
+    # line was paragraph text" is the actual rule, and still lets a wrapped,
+    # indented continuation line stay part of its paragraph.
+    in_paragraph = False
     in_list = False
 
     def blank_to(start, stop):
@@ -319,12 +324,12 @@ def readable(text):
             stripped = expanded.lstrip(" ")
             indent = len(expanded) - len(stripped)
             if not stripped:
-                prev_blank = True
+                in_paragraph = False
                 i = eol + 1 if eol < n else n
                 continue
             if indent == 0 and not LIST_ITEM.match(line):
                 in_list = False
-            if indent >= 4 and prev_blank and not in_list:
+            if indent >= 4 and not in_paragraph and not in_list:
                 # Runs while the indent holds; a line back under four spaces
                 # ends it.
                 j = i
@@ -337,11 +342,15 @@ def readable(text):
                     blank_to(j, stop)
                     j = stop + 1
                 i = min(j, n)
-                prev_blank = False
+                in_paragraph = False
                 continue
             if LIST_ITEM.match(line):
                 in_list = True
-            prev_blank = False
+            # A heading or a fence line is not paragraph text, so an indented
+            # line after one opens code.
+            in_paragraph = not (stripped.startswith("#")
+                                or FENCE.match(line)
+                                or HTML_OPEN.match(line))
 
             m = FENCE.match(line)
             # A backtick opener's info string may not contain a backtick.
@@ -1446,6 +1455,38 @@ self_test() {
     > "$tmp/html_ws_blank/README.md"
   _commit html_ws_blank
   _case "HTML block ends at a whitespace-only line" 0 html_ws_blank
+
+  # 62. Indented code may open after ANY non-paragraph line, not only a blank
+  #     one — here, straight after a heading.
+  _scaffold code_after_heading
+  printf '# A\n' > "$tmp/code_after_heading/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/code_after_heading/docs/guide/index.md"
+  printf '# Documentation\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/code_after_heading/README.md"
+  _commit code_after_heading
+  _case "indented code opens after a heading" 1 code_after_heading
+
+  # 63. ...but it cannot INTERRUPT a paragraph: an indented continuation line
+  #     is still paragraph text, and its link still counts.
+  _scaffold para_continuation
+  printf '# A\n' > "$tmp/para_continuation/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/para_continuation/docs/guide/index.md"
+  printf 'Some prose text\n    continued [Guide](docs/guide/index.md)\n' \
+    > "$tmp/para_continuation/README.md"
+  _commit para_continuation
+  _case "indented code cannot interrupt a paragraph" 0 para_continuation
+
+  # 64. An inline link must CLOSE. `[Guide](path` renders as literal text.
+  _scaffold unterminated_link
+  printf '# A\n' > "$tmp/unterminated_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/unterminated_link/docs/guide/index.md"
+  printf 'See [Guide](docs/guide/index.md\n' \
+    > "$tmp/unterminated_link/README.md"
+  _commit unterminated_link
+  _case "unterminated link is not a link" 1 unterminated_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
