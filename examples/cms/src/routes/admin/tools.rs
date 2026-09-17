@@ -1636,12 +1636,23 @@ pub async fn import(
             let wanted_status = import_status(&post.status, post.published_at).to_owned();
             let ours_id = ours.id;
             let current_status = ours.status.clone();
-            let transitioned = repos
+            // The discussion is restored in the same transaction as the terms
+            // and the status, and *before* the transition: publishing the post
+            // first left it publicly commentable with no discussion in between,
+            // and a crash — or a concurrent visitor comment — in that window
+            // made the retry read "the post already has a comment" as "already
+            // restored" and drop the backup's thread. Committed together, there
+            // is no window: a failure anywhere rolls the publish back with the
+            // rest, and the retry starts clean.
+            let incoming = imported_comments(&post.comments);
+            let (transitioned, discussion_restored) = repos
                 .with_conn(async |conn| {
                     use diesel_async::AsyncConnection as _;
                     conn.transaction(async move |conn| {
                         content::set_post_terms(conn, ours_id, term_ids).await?;
-                        if wanted_status != current_status {
+                        let discussion_restored =
+                            content::import_comments(conn, ours_id, &incoming).await?;
+                        let transitioned = if wanted_status != current_status {
                             content::transition_status(
                                 conn,
                                 ours_id,
@@ -1650,9 +1661,11 @@ pub async fn import(
                                 None,
                             )
                             .await?;
-                            return Ok::<_, AutumnError>(true);
-                        }
-                        Ok::<_, AutumnError>(false)
+                            true
+                        } else {
+                            false
+                        };
+                        Ok::<_, AutumnError>((transitioned, discussion_restored))
                     })
                     .await
                 })
@@ -1660,13 +1673,7 @@ pub async fn import(
             if transitioned {
                 transitioned_ids.push(ours.id);
             }
-            // The discussion too. Skipped when the post already carries one, so
-            // finishing a half-done import does not append a second copy — see
-            // `content::import_comments`.
-            let incoming = imported_comments(&post.comments);
-            comments_restored += repos
-                .with_conn(async |conn| content::import_comments(conn, ours.id, &incoming).await)
-                .await?;
+            comments_restored += discussion_restored;
             let fields = imported_meta(&post.meta);
             repos
                 .with_conn(async |conn| content::import_post_meta(conn, ours.id, &fields).await)
@@ -1801,10 +1808,14 @@ pub async fn import(
                         // whose path `page_ancestry` then truncates, so the
                         // page is unreachable at the URL it advertises.
                         content::lock_page_hierarchy(conn).await?;
-                        if content::validate_parent(conn, None, &draft.post_type, parent_id)
-                            .await
-                            .is_err()
-                        {
+                        // Only an expected refusal drops the parent: an
+                        // operational failure is already an `Err` and fails the
+                        // import — staying resumable — rather than silently
+                        // filing the page at the top level. See
+                        // `content::import_parent_outcome`.
+                        if !content::import_parent_outcome(
+                            content::validate_parent(conn, None, &draft.post_type, parent_id).await,
+                        )? {
                             draft.parent_id = None;
                         }
                     }
@@ -1817,7 +1828,17 @@ pub async fn import(
                         content::insert_imported_post_with_unique_slug(conn, draft).await?;
                     content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
-                    if wanted_status != "draft" {
+                    // The discussion before the status transition below, for
+                    // the same reason as the retry path above: the transition
+                    // can publish the post, and the import must not leave it
+                    // publicly commentable with no discussion in between. A
+                    // failure anywhere in here rolls the insert back with the
+                    // rest, so there is still no row for the next run to
+                    // misread.
+                    let incoming = imported_comments(&post.comments);
+                    let discussion_restored =
+                        content::import_comments(conn, created.id, &incoming).await?;
+                    let transitioned = if wanted_status != "draft" {
                         content::transition_status(
                             conn,
                             created.id,
@@ -1826,14 +1847,16 @@ pub async fn import(
                             None,
                         )
                         .await?;
-                        return Ok::<_, AutumnError>((created.id, true));
-                    }
-                    Ok::<_, AutumnError>((created.id, false))
+                        true
+                    } else {
+                        false
+                    };
+                    Ok::<_, AutumnError>((created.id, transitioned, discussion_restored))
                 })
                 .await
             })
             .await?;
-        let (created_id, transitioned) = outcome;
+        let (created_id, transitioned, discussion_restored) = outcome;
 
         // No unwind: the transaction above is the unwind. A failure anywhere in
         // it rolls the insert back with everything else, so there is no row to
@@ -1841,10 +1864,7 @@ pub async fn import(
         if transitioned {
             transitioned_ids.push(created_id);
         }
-        let incoming = imported_comments(&post.comments);
-        comments_restored += repos
-            .with_conn(async |conn| content::import_comments(conn, created_id, &incoming).await)
-            .await?;
+        comments_restored += discussion_restored;
         let fields = imported_meta(&post.meta);
         repos
             .with_conn(async |conn| content::import_post_meta(conn, created_id, &fields).await)

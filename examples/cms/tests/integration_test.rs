@@ -16048,3 +16048,297 @@ async fn every_approved_comment_stays_reachable() {
     );
     assert!(!second.contains("Root 001"), "page two is not page one");
 }
+
+/// A visitor's comment must not read as a finished import.
+///
+/// `import_comments` used to skip the whole backup thread when the post
+/// already had *any* comment — so a crash (or a concurrent visitor) between
+/// the status transition committing and the comment import running made the
+/// retry drop the backup's discussion and mark the post complete. Completion
+/// is now a dedicated marker written in the same transaction as the rows, and
+/// only the marker skips the import.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn import_comments_ignores_unrelated_existing_comments() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Thread", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // A visitor comment that has nothing to do with the backup.
+    cms::content::create_comment(
+        &mut conn,
+        cms::models::NewComment {
+            post_id,
+            parent_id: None,
+            author_id: None,
+            author_name: "Visitor".to_owned(),
+            author_email: "visitor@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "Unrelated visitor comment".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "",
+    )
+    .await
+    .expect("visitor comment");
+
+    let incoming = vec![cms::content::ImportedComment {
+        author_username: None,
+        author_name: "Archivist".to_owned(),
+        author_email: "archivist@example.com".to_owned(),
+        author_url: String::new(),
+        body: "From the backup".to_owned(),
+        status: "approved".to_owned(),
+        created_at: chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("time"),
+        replies: vec![],
+    }];
+
+    // The backup's discussion still imports — one row, not zero.
+    let created = cms::content::import_comments(&mut conn, post_id, &incoming)
+        .await
+        .expect("import");
+    assert_eq!(created, 1, "the backup's thread must not be dropped");
+
+    // And the retry is still safe: the marker — not the count — skips it, so
+    // no second copy is appended.
+    let again = cms::content::import_comments(&mut conn, post_id, &incoming)
+        .await
+        .expect("retry");
+    assert_eq!(again, 0, "a re-run must not append a second copy");
+}
+
+/// Create a page through the admin editor and return its id.
+async fn create_page(client: &TestClient, cookie: &str, title: &str) -> i64 {
+    let resp = client
+        .post("/admin/content/page")
+        .header("cookie", cookie)
+        .form(&form(&[
+            ("title", title),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(resp.status, 303, "create should redirect: {}", resp.text());
+    resp.header("location")
+        .expect("redirect to the editor")
+        .rsplit('/')
+        .next()
+        .expect("id is the last path segment")
+        .parse()
+        .expect("id is numeric")
+}
+
+/// A refused parent is a skipped link; a failed check is a failed import.
+///
+/// `set_post_parent` used to treat *any* `validate_parent` error as an
+/// expected refusal and return `Ok(false)` — so an operational failure (a
+/// query error, a timeout) read as a deliberate orphaning, and the import
+/// marked the page complete at the top level instead of failing and staying
+/// resumable. Refusals still return `Ok(false)`; the failure half of the
+/// distinction is pinned without a database by
+/// `content::parent_check_tests`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn set_post_parent_distinguishes_refusal_from_failure() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let parent = create_page(&client, &cookie, "Parent").await;
+    let child = create_page(&client, &cookie, "Child").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // A good link applies.
+    assert!(
+        cms::content::set_post_parent(&mut conn, child, parent)
+            .await
+            .expect("a valid link applies"),
+        "the link must be applied"
+    );
+
+    // A cycle is an expected refusal: Ok(false), not an error.
+    assert!(
+        !cms::content::set_post_parent(&mut conn, parent, child)
+            .await
+            .expect("a refusal is not an error"),
+        "a cycle must decline the link, not fail the import"
+    );
+
+    // A parent that does not exist is an expected refusal too.
+    assert!(
+        !cms::content::set_post_parent(&mut conn, child, 999_999_999)
+            .await
+            .expect("a refusal is not an error"),
+        "a missing parent must decline the link, not fail the import"
+    );
+}
+
+/// A reply past the thread's display budget is refused, not silently dropped.
+///
+/// `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`, keeping the
+/// oldest rows where the budget runs out — so an accepted reply past the cap
+/// was counted in `comment_count` but appeared on no page. The write path now
+/// refuses it, and moderation refuses to approve one, under the post's lock.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_reply_past_the_display_budget_is_refused() {
+    use cms::schema::comments;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Crowded", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // One root, then enough approved children to fill the page's budget: the
+    // root takes one slot of `MAX_THREAD_COMMENTS`, so 999 children fill it
+    // and the thousandth reply has no renderable window.
+    let root_id: i64 = diesel::insert_into(comments::table)
+        .values((
+            comments::post_id.eq(post_id),
+            comments::parent_id.eq(None::<i64>),
+            comments::author_id.eq(None::<i64>),
+            comments::author_name.eq("Crowd"),
+            comments::author_email.eq("crowd@example.com"),
+            comments::author_url.eq(""),
+            comments::author_ip.eq(""),
+            comments::body.eq("Root"),
+            comments::status.eq("approved"),
+        ))
+        .returning(comments::id)
+        .get_result(&mut conn)
+        .await
+        .expect("seed root");
+    let children: Vec<_> = (0..999)
+        .map(|i| {
+            (
+                comments::post_id.eq(post_id),
+                comments::parent_id.eq(Some(root_id)),
+                comments::author_id.eq(None::<i64>),
+                comments::author_name.eq("Crowd"),
+                comments::author_email.eq("crowd@example.com"),
+                comments::author_url.eq(""),
+                comments::author_ip.eq(""),
+                comments::body.eq(format!("Child {i}")),
+                comments::status.eq("approved"),
+            )
+        })
+        .collect();
+    diesel::insert_into(comments::table)
+        .values(&children)
+        .execute(&mut conn)
+        .await
+        .expect("seed children");
+
+    let refused = cms::content::create_comment(
+        &mut conn,
+        cms::models::NewComment {
+            post_id,
+            parent_id: Some(root_id),
+            author_id: None,
+            author_name: "Latecomer".to_owned(),
+            author_email: "late@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "One too many".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a reply past the display budget must be refused, not accepted and left unreadable"
+    );
+
+    // Approving a pending reply onto the same full thread is refused too.
+    let pending_id: i64 = diesel::insert_into(comments::table)
+        .values((
+            comments::post_id.eq(post_id),
+            comments::parent_id.eq(Some(root_id)),
+            comments::author_id.eq(None::<i64>),
+            comments::author_name.eq("Waiting"),
+            comments::author_email.eq("waiting@example.com"),
+            comments::author_url.eq(""),
+            comments::author_ip.eq(""),
+            comments::body.eq("Pending past the budget"),
+            comments::status.eq("pending"),
+        ))
+        .returning(comments::id)
+        .get_result(&mut conn)
+        .await
+        .expect("seed pending");
+    let approval = cms::content::moderate_comment(&mut conn, pending_id, "approved").await;
+    assert!(
+        approval.is_err(),
+        "approving a reply with no renderable window must be refused"
+    );
+}
+
+/// The moderation queue pages, and the pager keeps the selected queue.
+///
+/// 51 pending comments spill onto a second page. The first page links to the
+/// second with the status preserved; a stale far-future page clamps to the
+/// last page instead of rendering an empty one.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn moderation_queue_renders_a_pager() {
+    use cms::schema::comments;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Flood", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    let pending: Vec<_> = (0..51)
+        .map(|i| {
+            (
+                comments::post_id.eq(post_id),
+                comments::parent_id.eq(None::<i64>),
+                comments::author_id.eq(None::<i64>),
+                comments::author_name.eq("Spammer"),
+                comments::author_email.eq("spam@example.com"),
+                comments::author_url.eq(""),
+                comments::author_ip.eq(""),
+                comments::body.eq(format!("Spam {i}")),
+                comments::status.eq("pending"),
+            )
+        })
+        .collect();
+    diesel::insert_into(comments::table)
+        .values(&pending)
+        .execute(&mut conn)
+        .await
+        .expect("seed queue");
+
+    let first = client
+        .get("/admin/comments?status=pending")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first
+        .assert_ok()
+        .assert_body_contains("Page 1 of 2")
+        .assert_body_contains("/admin/comments?status=pending&amp;page=2");
+
+    // A stale bookmark past the end clamps to the last page.
+    let stale = client
+        .get("/admin/comments?status=pending&page=99")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    stale
+        .assert_ok()
+        .assert_body_contains("Page 2 of 2")
+        .assert_body_contains("/admin/comments?status=pending&amp;page=1");
+}

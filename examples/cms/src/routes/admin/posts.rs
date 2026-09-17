@@ -1429,7 +1429,9 @@ pub async fn create(
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
         repos
             .with_conn(async |conn| {
-                content::validate_parent(conn, None, registered.slug, parent_id).await
+                content::validate_parent(conn, None, registered.slug, parent_id)
+                    .await?
+                    .into_result()
             })
             .await?;
     }
@@ -1497,7 +1499,8 @@ pub async fn create(
                 let created = content::insert_post_with_unique_slug(conn, draft).await?;
                 if let Some(parent_id) = created.parent_id {
                     content::validate_parent(conn, Some(created.id), registered.slug, parent_id)
-                        .await?;
+                        .await?
+                        .into_result()?;
                 }
 
                 if registered.supports_revisions {
@@ -1626,7 +1629,9 @@ pub async fn update(
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
         repos
             .with_conn(async |conn| {
-                content::validate_parent(conn, Some(id), &post_type, parent_id).await
+                content::validate_parent(conn, Some(id), &post_type, parent_id)
+                    .await?
+                    .into_result()
             })
             .await?;
     }
