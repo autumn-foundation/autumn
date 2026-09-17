@@ -21,24 +21,23 @@
 
 #![cfg(feature = "db")]
 
-use autumn_web::money::ledger::{
-    self, Account, IdempotencyKey, LedgerError, Posting, Transaction,
-};
+use autumn_web::money::ledger::{self, Account, IdempotencyKey, LedgerError, Posting, Transaction};
 use autumn_web::money::{Money, Usd};
 
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{
+    AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
+};
 use scoped_futures::ScopedFutureExt as _;
-use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 /// The migration SQL Autumn actually ships, applied verbatim — so a syntax
 /// error or a schema change in `migrations/` fails this suite rather than
 /// sailing past it.
-const LEDGER_UP: &str =
-    include_str!("../../migrations/20260917120000_create_money_ledger/up.sql");
+const LEDGER_UP: &str = include_str!("../../migrations/20260917120000_create_money_ledger/up.sql");
 
 async fn setup_pool() -> (
     Pool<AsyncPgConnection>,
@@ -105,7 +104,10 @@ async fn count_rows(pool: &Pool<AsyncPgConnection>, table: &str) -> i64 {
 /// Every currency's total must be zero.
 async fn assert_books_balance(pool: &Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("conn");
-    for total in ledger::trial_balance(&mut conn).await.expect("trial balance") {
+    for total in ledger::trial_balance(&mut conn)
+        .await
+        .expect("trial balance")
+    {
         assert_eq!(
             total.total.minor(),
             0,
@@ -124,7 +126,9 @@ async fn a_duplicate_charge_posts_once_on_postgres() {
     let mut conn = pool.get().await.expect("conn");
 
     let transfer = charge(2500, "order:9911");
-    let first = ledger::post(&mut conn, &transfer).await.expect("first post");
+    let first = ledger::post(&mut conn, &transfer)
+        .await
+        .expect("first post");
     assert!(first.is_posted());
     let second = ledger::post(&mut conn, &transfer).await.expect("retry");
     assert!(second.is_replayed());
@@ -220,7 +224,12 @@ async fn concurrent_distinct_charges_all_land_exactly_once() {
 
     let mut posted = 0_usize;
     for handle in handles {
-        if handle.await.expect("task joins").expect("post succeeds").is_posted() {
+        if handle
+            .await
+            .expect("task joins")
+            .expect("post succeeds")
+            .is_posted()
+        {
             posted += 1;
         }
     }

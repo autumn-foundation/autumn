@@ -64,8 +64,10 @@
 //! let outcome = db
 //!     .tx(|conn| {
 //!         async move {
-//!             ledger::ensure_account(conn, Account::new("customer:42:wallet", Usd::currency())).await?;
-//!             ledger::ensure_account(conn, Account::new("platform:revenue", Usd::currency())).await?;
+//!             let wallet = Account::new("customer:42:wallet", Usd::currency());
+//!             let revenue = Account::new("platform:revenue", Usd::currency());
+//!             ledger::ensure_account(conn, wallet).await?;
+//!             ledger::ensure_account(conn, revenue).await?;
 //!             // ... the application rows this charge justifies go here ...
 //!             ledger::post(conn, &transfer).await
 //!         }
@@ -211,7 +213,7 @@ impl LedgerError {
     /// `From`, so `error.rs` reads this through a downcast, the same way
     /// `ConstelaError` and `PushError` are mapped.
     #[must_use]
-    pub fn http_status(&self) -> axum::http::StatusCode {
+    pub const fn http_status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode;
         match self {
             Self::Money(err) => err.http_status(),
@@ -369,7 +371,19 @@ pub enum Side {
 impl Side {
     /// The side of a stored, signed amount. Zero counts as a debit.
     const fn of(signed_minor: i64) -> Self {
-        if signed_minor < 0 { Self::Credit } else { Self::Debit }
+        if signed_minor < 0 {
+            Self::Credit
+        } else {
+            Self::Debit
+        }
+    }
+
+    /// The side's name, for the request hash.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Debit => "debit",
+            Self::Credit => "credit",
+        }
     }
 }
 
@@ -453,7 +467,9 @@ impl Posting {
         match self.side {
             Side::Debit => Ok(minor),
             // Safe: `minor` is at or above zero, so its negation exists.
-            Side::Credit => minor.checked_neg().ok_or(LedgerError::Money(MoneyError::Overflow)),
+            Side::Credit => minor
+                .checked_neg()
+                .ok_or(LedgerError::Money(MoneyError::Overflow)),
         }
     }
 }
@@ -522,7 +538,7 @@ pub struct Transaction {
 impl Transaction {
     /// A transaction with `key` over `postings`.
     #[must_use]
-    pub fn new(key: IdempotencyKey, postings: Vec<Posting>) -> Self {
+    pub const fn new(key: IdempotencyKey, postings: Vec<Posting>) -> Self {
         Self {
             key,
             postings,
@@ -747,7 +763,9 @@ impl PostedTransaction {
             .postings
             .iter()
             .filter(|posting| posting.is_debit())
-            .fold(0_i64, |sum, posting| sum.saturating_add(posting.amount.minor()));
+            .fold(0_i64, |sum, posting| {
+                sum.saturating_add(posting.amount.minor())
+            });
         AnyMoney::new(total, self.currency)
     }
 }
@@ -809,25 +827,27 @@ fn push_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
 
 /// Hash the postings in a canonical order, so build order does not matter.
 ///
-/// A posting whose amount is negative cannot be hashed as a signed value, so it
-/// keeps its own amount and side. `validate` refuses it either way; this only
-/// has to stay injective.
+/// Hashes the amount and the side as they were supplied, rather than the signed
+/// value: the signed value does not exist for a posting `validate` is about to
+/// refuse, and the pair carries the same information.
 fn push_normalized_postings(hasher: &mut sha2::Sha256, postings: &[Posting]) {
-    let mut lines: Vec<(String, i64, &'static str)> = postings
+    let mut lines: Vec<(&str, i64, Side, &'static str)> = postings
         .iter()
         .map(|posting| {
             (
-                posting.account_id.clone(),
-                posting.signed_minor().unwrap_or(posting.amount.minor()),
+                posting.account_id.as_str(),
+                posting.amount.minor(),
+                posting.side,
                 posting.amount.currency().code(),
             )
         })
         .collect();
     lines.sort_unstable();
     push_field(hasher, "count", lines.len().to_string().as_bytes());
-    for (account, minor, currency) in lines {
+    for (account, minor, side, currency) in lines {
         push_field(hasher, "account", account.as_bytes());
         push_field(hasher, "minor", minor.to_string().as_bytes());
+        push_field(hasher, "side", side.label().as_bytes());
         push_field(hasher, "currency", currency.as_bytes());
     }
 }
@@ -842,7 +862,7 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), LedgerError> {
+const fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), LedgerError> {
     if value.is_empty() {
         return Err(LedgerError::InvalidText {
             field,
@@ -973,11 +993,12 @@ pub async fn ensure_account(
         .execute(conn)
         .await?;
 
-    let stored = load_account(conn, &account.id)
-        .await?
-        .ok_or_else(|| LedgerError::UnknownAccount {
-            id: account.id.clone(),
-        })?;
+    let stored =
+        load_account(conn, &account.id)
+            .await?
+            .ok_or_else(|| LedgerError::UnknownAccount {
+                id: account.id.clone(),
+            })?;
     if stored.currency != account.currency {
         return Err(LedgerError::AccountCurrency {
             account: account.id,
@@ -1051,7 +1072,10 @@ async fn load_account(
         .bind::<Text, _>(account_id)
         .load(conn)
         .await?;
-    rows.into_iter().next().map(AccountRow::into_account).transpose()
+    rows.into_iter()
+        .next()
+        .map(AccountRow::into_account)
+        .transpose()
 }
 
 /// Read one account and hold its row until the enclosing transaction ends.
@@ -1071,7 +1095,10 @@ async fn lock_account(
         .bind::<Text, _>(account_id)
         .load(conn)
         .await?;
-    rows.into_iter().next().map(AccountRow::into_account).transpose()
+    rows.into_iter()
+        .next()
+        .map(AccountRow::into_account)
+        .transpose()
 }
 
 /// Post `transfer` to the ledger, exactly once.
@@ -1116,7 +1143,9 @@ pub async fn post(
     for id in &wanted {
         let account = lock_account(conn, id)
             .await?
-            .ok_or_else(|| LedgerError::UnknownAccount { id: (*id).to_owned() })?;
+            .ok_or_else(|| LedgerError::UnknownAccount {
+                id: (*id).to_owned(),
+            })?;
         if account.currency != checked.currency {
             return Err(LedgerError::AccountCurrency {
                 account: account.id,
@@ -1236,8 +1265,8 @@ async fn write_postings(
 ///
 /// Reads the balance the transaction *would* leave: the stored balance plus
 /// this transaction's own postings for that account. The account row is already
-/// locked, so no other poster can change that balance in between, and nothing
-/// has been written yet — so a refusal leaves no row to roll back.
+/// locked, so no other poster can change that balance in between. Nothing has
+/// been written yet either, so a refusal leaves no row to roll back.
 async fn check_negative_balances(
     conn: &mut RuntimeConnection,
     accounts: &BTreeMap<String, Account>,
@@ -1276,21 +1305,19 @@ pub async fn balance(
     conn: &mut RuntimeConnection,
     account_id: &str,
 ) -> Result<AnyMoney, LedgerError> {
-    let account = load_account(conn, account_id)
-        .await?
-        .ok_or_else(|| LedgerError::UnknownAccount {
-            id: account_id.to_owned(),
-        })?;
+    let account =
+        load_account(conn, account_id)
+            .await?
+            .ok_or_else(|| LedgerError::UnknownAccount {
+                id: account_id.to_owned(),
+            })?;
     let total = sum_postings(conn, account_id).await?;
     Ok(AnyMoney::new(total, account.currency))
 }
 
 /// `CAST(... AS BIGINT)` because Postgres widens `SUM(BIGINT)` to `NUMERIC`,
 /// which no `BigInt` decoder accepts. `SQLite` keeps the integer either way.
-async fn sum_postings(
-    conn: &mut RuntimeConnection,
-    account_id: &str,
-) -> Result<i64, LedgerError> {
+async fn sum_postings(conn: &mut RuntimeConnection, account_id: &str) -> Result<i64, LedgerError> {
     let sql = format!(
         "SELECT CAST(COALESCE(SUM(amount_minor), 0) AS BIGINT) AS total \
          FROM {POSTINGS_TABLE} WHERE account_id = {}",

@@ -121,12 +121,17 @@ async fn a_duplicate_charge_posts_once_and_balances() {
 
     let transfer = charge(2500, "order:9911");
 
-    let first = ledger::post(&mut conn, &transfer).await.expect("first post");
+    let first = ledger::post(&mut conn, &transfer)
+        .await
+        .expect("first post");
     assert!(first.is_posted(), "the first submit writes the transaction");
 
     // The retry. Same money, same key, no second entry.
     let second = ledger::post(&mut conn, &transfer).await.expect("retry");
-    assert!(second.is_replayed(), "the retry must not write a second entry");
+    assert!(
+        second.is_replayed(),
+        "the retry must not write a second entry"
+    );
     assert_eq!(
         second.transaction().id(),
         first.transaction().id(),
@@ -276,7 +281,10 @@ async fn a_posting_in_the_wrong_currency_for_the_account_is_refused() {
     let error = ledger::post(&mut conn, &transfer)
         .await
         .expect_err("a currency the account does not hold is refused");
-    assert!(matches!(error, LedgerError::AccountCurrency { .. }), "{error}");
+    assert!(
+        matches!(error, LedgerError::AccountCurrency { .. }),
+        "{error}"
+    );
     assert_eq!(count_transactions(&mut conn).await, 0);
 }
 
@@ -442,10 +450,11 @@ async fn an_account_that_refuses_a_negative_balance_refuses_the_posting() {
     let error = ledger::post(&mut conn, &Transaction::new(key, payout))
         .await
         .expect_err("the float refuses to go negative");
-    assert!(
-        matches!(&error, LedgerError::NegativeBalance { account, .. } if account == "platform:float"),
-        "{error}"
-    );
+    let refused_account = match &error {
+        LedgerError::NegativeBalance { account, .. } => account.as_str(),
+        other => panic!("expected a negative-balance refusal, got {other}"),
+    };
+    assert_eq!(refused_account, "platform:float");
 
     // Fund it, and the same payout goes through.
     let funding = vec![
@@ -517,7 +526,10 @@ async fn an_account_cannot_change_currency() {
     let error = ledger::ensure_account(&mut conn, Account::new("customer:wallet", Eur::currency()))
         .await
         .expect_err("a stored account keeps its currency");
-    assert!(matches!(error, LedgerError::AccountCurrency { .. }), "{error}");
+    assert!(
+        matches!(error, LedgerError::AccountCurrency { .. }),
+        "{error}"
+    );
 
     assert!(
         ledger::account(&mut conn, "customer:ghost")
@@ -536,11 +548,10 @@ struct CountRow {
 }
 
 async fn count_rows(conn: &mut RuntimeConnection, table: &str) -> i64 {
-    let rows: Vec<CountRow> =
-        diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
-            .load(conn)
-            .await
-            .expect("count");
+    let rows: Vec<CountRow> = diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+        .load(conn)
+        .await
+        .expect("count");
     rows.into_iter().next().map_or(0, |row| row.count)
 }
 
@@ -631,8 +642,16 @@ async fn a_rolled_back_transaction_leaves_no_postings() {
     }
 
     let mut conn = pool.get().await.expect("checkout");
-    assert_eq!(count_rows(&mut conn, "ml_orders").await, 0, "the order rolled back");
-    assert_eq!(count_transactions(&mut conn).await, 0, "the posting rolled back");
+    assert_eq!(
+        count_rows(&mut conn, "ml_orders").await,
+        0,
+        "the order rolled back"
+    );
+    assert_eq!(
+        count_transactions(&mut conn).await,
+        0,
+        "the posting rolled back"
+    );
     assert_eq!(count_postings(&mut conn).await, 0);
     assert_books_balance(&mut conn).await;
     drop(conn);
@@ -658,11 +677,12 @@ async fn a_rolled_back_transaction_leaves_no_postings() {
 /// Duplicate and retry every money-moving call, and kill a share of them
 /// mid-post.
 ///
-/// 64 logical charges. Each is submitted between two and four times. A
-/// deterministic share of the attempts is killed after the ledger wrote its
-/// postings but before the enclosing `Db::tx` commits — the mid-flight crash the
-/// issue names. At the end: exactly one balanced transaction per charge, and
-/// `sum(debits) == sum(credits)` globally.
+/// 64 logical charges. Each is submitted between two and four times. Roughly
+/// one attempt in three is killed after the ledger wrote its postings but
+/// before the enclosing `Db::tx` commits — the mid-flight crash the issue
+/// names. The last attempt of each charge always survives, so every charge is
+/// one that really happened. At the end: exactly one balanced transaction per
+/// charge, and `sum(debits) == sum(credits)` globally.
 ///
 /// The schedule is deterministic (a small LCG over a fixed seed), so a failure
 /// replays rather than needing to be reproduced.
@@ -697,8 +717,12 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
         expected_total += amount;
 
         for attempt in 0..attempts {
-            // Kill roughly one attempt in three, after the postings are written.
-            let kill = next() % 3 == 0;
+            // Kill roughly one attempt in three, after the ledger wrote its
+            // postings. The last attempt always survives: a charge every
+            // attempt of which died is a charge that never happened, and it
+            // would make the count below a probability rather than a fact.
+            let last = attempt + 1 == attempts;
+            let kill = !last && next() % 3 == 0;
             let transfer = charge(amount, &order);
             let order_row = format!("{order}:{attempt}");
             let mut db = Db::connect_for_test(&pool).await.expect("db checkout");

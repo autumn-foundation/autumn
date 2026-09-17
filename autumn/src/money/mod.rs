@@ -282,8 +282,10 @@ macro_rules! currencies {
                 }
             }
 
-            // Keeps `scale_for`'s closed table total.
-            const _: () = assert!($exp <= MAX_EXPONENT);
+            // Keeps `scale_for`'s closed table total. Spelled as a set rather
+            // than `<= MAX_EXPONENT`, because a comparison between two
+            // constants is folded away and reported as useless.
+            const _: () = assert!(matches!($exp, 0..=MAX_EXPONENT));
         )*
 
         /// Every currency in the table, sorted by code.
@@ -583,6 +585,7 @@ impl MoneyError {
 ///
 /// See the [module documentation](self) for the reasoning. `C` is a
 /// [`Currency`] marker such as [`Usd`].
+#[derive(Clone, Copy)]
 pub struct Money<C: Currency> {
     minor: i64,
     currency: PhantomData<C>,
@@ -694,9 +697,7 @@ impl<C: Currency> Money<C> {
     ///
     /// [`MoneyError::Overflow`] when a partial sum leaves `i64`.
     pub fn try_sum<I: IntoIterator<Item = Self>>(values: I) -> Result<Self, MoneyError> {
-        values
-            .into_iter()
-            .try_fold(Self::ZERO, |total, value| total.checked_add(value))
+        values.into_iter().try_fold(Self::ZERO, Self::checked_add)
     }
 
     /// True when the amount is zero.
@@ -817,9 +818,7 @@ impl<C: Currency> Money<C> {
                 .ok_or(MoneyError::Overflow)?;
             let share = numerator.div_euclid(divisor);
             let remainder = numerator.rem_euclid(divisor);
-            floor_total = floor_total
-                .checked_add(share)
-                .ok_or(MoneyError::Overflow)?;
+            floor_total = floor_total.checked_add(share).ok_or(MoneyError::Overflow)?;
             let share = i64::try_from(share).map_err(|_| MoneyError::Overflow)?;
             shares.push((share, remainder));
         }
@@ -862,12 +861,6 @@ impl<C: Currency> Money<C> {
     }
 }
 
-impl<C: Currency> Clone for Money<C> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<C: Currency> Copy for Money<C> {}
 impl<C: Currency> PartialEq for Money<C> {
     fn eq(&self, other: &Self) -> bool {
         self.minor == other.minor
@@ -1031,7 +1024,9 @@ impl AnyMoney {
     ) -> Result<Self, MoneyError> {
         values
             .into_iter()
-            .try_fold(Self::zero(currency), |total, value| total.checked_add(value))
+            .try_fold(Self::zero(currency), |total, value| {
+                total.checked_add(value)
+            })
     }
 
     /// Recover the typed form.

@@ -20,7 +20,10 @@ fn major_units_scale_by_the_currency_exponent() {
 
 #[test]
 fn major_unit_overflow_is_an_error_not_a_wrap() {
-    assert_eq!(Money::<Usd>::from_major(i64::MAX), Err(MoneyError::Overflow));
+    assert_eq!(
+        Money::<Usd>::from_major(i64::MAX),
+        Err(MoneyError::Overflow)
+    );
 }
 
 // ── Arithmetic in one currency ──────────────────────────────────────────────
@@ -179,31 +182,45 @@ fn decimal_round_trips_through_minor_units() {
 fn rounding_modes_are_explicit_and_distinct() {
     let half = dec("1.005");
     assert_eq!(
-        Money::<Usd>::from_decimal(half, Rounding::HalfUp).unwrap().minor(),
+        Money::<Usd>::from_decimal(half, Rounding::HalfUp)
+            .unwrap()
+            .minor(),
         101
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(half, Rounding::HalfEven).unwrap().minor(),
+        Money::<Usd>::from_decimal(half, Rounding::HalfEven)
+            .unwrap()
+            .minor(),
         100
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(half, Rounding::HalfDown).unwrap().minor(),
+        Money::<Usd>::from_decimal(half, Rounding::HalfDown)
+            .unwrap()
+            .minor(),
         100
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("1.009"), Rounding::TowardZero).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("1.009"), Rounding::TowardZero)
+            .unwrap()
+            .minor(),
         100
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("1.001"), Rounding::AwayFromZero).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("1.001"), Rounding::AwayFromZero)
+            .unwrap()
+            .minor(),
         101
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("-1.001"), Rounding::Floor).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("-1.001"), Rounding::Floor)
+            .unwrap()
+            .minor(),
         -101
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("-1.009"), Rounding::Ceiling).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("-1.009"), Rounding::Ceiling)
+            .unwrap()
+            .minor(),
         -100
     );
 }
@@ -211,11 +228,15 @@ fn rounding_modes_are_explicit_and_distinct() {
 #[test]
 fn rounding_is_symmetric_for_negative_values() {
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("-1.005"), Rounding::HalfUp).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("-1.005"), Rounding::HalfUp)
+            .unwrap()
+            .minor(),
         -101
     );
     assert_eq!(
-        Money::<Usd>::from_decimal(dec("-1.005"), Rounding::HalfDown).unwrap().minor(),
+        Money::<Usd>::from_decimal(dec("-1.005"), Rounding::HalfDown)
+            .unwrap()
+            .minor(),
         -100
     );
 }
@@ -223,11 +244,15 @@ fn rounding_is_symmetric_for_negative_values() {
 #[test]
 fn exact_conversion_refuses_to_round() {
     assert_eq!(
-        Money::<Usd>::from_decimal_exact(dec("12.50")).unwrap().minor(),
+        Money::<Usd>::from_decimal_exact(dec("12.50"))
+            .unwrap()
+            .minor(),
         1250
     );
     assert_eq!(
-        Money::<Usd>::from_decimal_exact(dec("12.5")).unwrap().minor(),
+        Money::<Usd>::from_decimal_exact(dec("12.5"))
+            .unwrap()
+            .minor(),
         1250
     );
     assert!(matches!(
@@ -264,7 +289,9 @@ fn allocation_loses_no_minor_unit() {
 
 #[test]
 fn allocation_follows_the_weights() {
-    let parts = Money::<Usd>::from_minor(10_000).allocate(&[70, 20, 10]).unwrap();
+    let parts = Money::<Usd>::from_minor(10_000)
+        .allocate(&[70, 20, 10])
+        .unwrap();
     assert_eq!(minors(&parts), vec![7000, 2000, 1000]);
 
     // 5 cents over three unequal weights: the largest remainders take the
@@ -392,7 +419,10 @@ fn errors_convert_into_autumn_errors() {
     use crate::error::AutumnError;
 
     let overflow = AutumnError::from(MoneyError::Overflow);
-    assert_eq!(overflow.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        overflow.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
     let mismatch = AutumnError::from(MoneyError::CurrencyMismatch {
         expected: "USD",
         found: "EUR",
