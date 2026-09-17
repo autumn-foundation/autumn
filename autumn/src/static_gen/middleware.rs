@@ -1943,18 +1943,18 @@ mod tests {
             "the build must record the handler's pre-layer type, not the layer's rewrite"
         );
         // ... and ISR accepts the refresh, writing the handler's body.
-        let dest_new = dist_new.join("page/index.html");
-        std::fs::write(&dest_new, "<h1>stale</h1>").expect("write stale");
+        let page_new = dist_new.join("page/index.html");
+        std::fs::write(&page_new, "<h1>stale</h1>").expect("write stale");
         regenerate_page(
             &base,
             "/page",
-            &dest_new,
+            &page_new,
             manifest_new.routes["/page"].content_type.as_deref(),
         )
         .await
         .expect("ISR regeneration must accept the pre-layer recording");
         assert_eq!(
-            std::fs::read_to_string(&dest_new).unwrap(),
+            std::fs::read_to_string(&page_new).unwrap(),
             "<h1>v1</h1>",
             "the regenerated body is the handler's output"
         );
