@@ -58,11 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
     `DELETE` of a transaction or a posting, and a statement-level pair on
     Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
-    `INSERT OR REPLACE` is refused too: its implicit delete skips `DELETE`
-    triggers unless `PRAGMA recursive_triggers` is on, so Autumn's pool now
-    sets that pragma on every SQLite connection it opens, the migrator
-    included, and the migration adds `BEFORE INSERT` guards on the posting row
-    keys for a connection that does not.
+    `INSERT OR REPLACE` is refused by `BEFORE INSERT` guards on the row keys.
+    They are guards rather than the `DELETE` triggers because SQLite skips
+    `DELETE` triggers for the row a `REPLACE` removes unless
+    `PRAGMA recursive_triggers` is on, and turning that on globally would
+    change the recursion semantics of every application trigger. One shape is
+    therefore **not** covered: a `REPLACE` that collides on the idempotency key
+    with a fresh row id, in a transaction that re-inserts the deleted id before
+    `COMMIT`. Like `DROP TABLE`, it needs deliberate multi-statement SQL against
+    framework-private tables; the triggers are a guard-rail against operational
+    accidents, not a boundary against arbitrary SQL.
     `ledger::balance` sums an account's postings; `ledger::trial_balance`
     makes the global zero-sum invariant queryable from a job or a health
     check.
@@ -1060,14 +1065,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fifth unwatched spelling is how that recurs.
 
 ### Changed
-
-- **`SQLite` connections now set `PRAGMA recursive_triggers = ON`.** Both the
-  runtime pool and the migration connection. `SQLite` defaults it off, and with
-  it off a `DELETE` trigger does not fire for the row an `INSERT OR REPLACE`
-  deletes to settle a conflict. The money ledger is
-  append-only by `DELETE` trigger, so the default let a `REPLACE` rewrite the
-  books silently. An application trigger on `DELETE` now also fires for such a
-  row, which is what Postgres already does.
 
 - **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
   `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL

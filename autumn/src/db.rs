@@ -1301,12 +1301,6 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 /// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
 ///   WAL` and `synchronous` both write, and would fail connection setup with
 ///   "attempt to write a readonly database", taking the whole pool 503.
-/// * `recursive_triggers = ON` everywhere. `SQLite` defaults it off, and with it
-///   off a `DELETE` trigger does **not** fire for the row an `INSERT OR REPLACE`
-///   deletes to settle a conflict. The money ledger (#1837) is append-only by
-///   `DELETE` trigger, so with the default a `REPLACE` rewrites the books
-///   silently. Postgres has no `REPLACE`, so this also makes the two backends
-///   agree.
 /// * When **replication is active** (#1628), `wal_autocheckpoint = 0` is added so
 ///   the replicator is the only component that ever checkpoints. An
 ///   auto-checkpoint rewrites the main database file, which would tear a base
@@ -1316,21 +1310,18 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
-         PRAGMA foreign_keys = ON; \
-         PRAGMA recursive_triggers = ON;"
+         PRAGMA foreign_keys = ON;"
     } else if replicating {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA journal_mode = WAL; \
          PRAGMA wal_autocheckpoint = 0; \
          PRAGMA synchronous = NORMAL; \
-         PRAGMA foreign_keys = ON; \
-         PRAGMA recursive_triggers = ON;"
+         PRAGMA foreign_keys = ON;"
     } else {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL; \
-         PRAGMA foreign_keys = ON; \
-         PRAGMA recursive_triggers = ON;"
+         PRAGMA foreign_keys = ON;"
     }
 }
 
@@ -3726,10 +3717,6 @@ mod tests {
             assert!(pragmas.contains("journal_mode = WAL"));
             assert!(pragmas.contains("foreign_keys = ON"));
             assert!(pragmas.contains("busy_timeout = 5000"));
-            // The money ledger (#1837) is append-only by DELETE trigger, and
-            // SQLite skips those for the row an INSERT OR REPLACE removes
-            // unless this is on. Removing it reopens a silent rewrite.
-            assert!(pragmas.contains("recursive_triggers = ON"));
         }
 
         // A read-only target still gets no writing pragmas — including under
@@ -3739,7 +3726,6 @@ mod tests {
             assert!(!read_only.contains("journal_mode"));
             assert!(!read_only.contains("wal_autocheckpoint"));
             assert!(read_only.contains("foreign_keys = ON"));
-            assert!(read_only.contains("recursive_triggers = ON"));
         }
     }
 
@@ -6589,15 +6575,7 @@ pub(crate) fn establish_migration_connection(
 /// instead of aborting; diesel migrations are idempotent, so a migrator that
 /// waits and then finds migrations already applied is fine.
 ///
-/// `recursive_triggers = ON` is set too, matching the runtime pool. Without it
-/// `SQLite` skips `DELETE` triggers for the row an `INSERT OR REPLACE` removes,
-/// so a migration could rewrite the append-only money ledger (#1837) — replace
-/// an account to change its currency, or launder a transaction-key
-/// replacement — without firing a single guard. It is safe here in a way
-/// `foreign_keys` is not: it only decides whether `DELETE` triggers see a
-/// `REPLACE`, and no migration in the tree uses `REPLACE`.
-///
-/// `foreign_keys` and `journal_mode` are still NOT set, because
+/// Only `busy_timeout` is set here — NOT `foreign_keys`/`journal_mode`, because
 /// `foreign_keys = ON` can break table-recreating migrations.
 ///
 /// # Errors
@@ -6612,7 +6590,7 @@ pub(crate) fn establish_sqlite_migration_connection(
     use diesel::Connection as _;
     use diesel::connection::SimpleConnection as _;
     let mut conn = diesel::SqliteConnection::establish(&normalize_sqlite_target(database_url))?;
-    conn.batch_execute("PRAGMA busy_timeout = 5000; PRAGMA recursive_triggers = ON;")
+    conn.batch_execute("PRAGMA busy_timeout = 5000;")
         .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
     Ok(conn)
 }
@@ -6620,36 +6598,6 @@ pub(crate) fn establish_sqlite_migration_connection(
 #[cfg(test)]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;
-
-    /// Row shape for `PRAGMA recursive_triggers`.
-    #[cfg(feature = "sqlite")]
-    #[derive(diesel::QueryableByName)]
-    struct RecursiveTriggers {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        recursive_triggers: i32,
-    }
-
-    /// The migration connection must carry `recursive_triggers` too.
-    ///
-    /// It is a second, separate path from the pool. Without the pragma a
-    /// migration's `INSERT OR REPLACE` skips the `DELETE` triggers that keep
-    /// the money ledger (#1837) append-only.
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn the_migration_connection_enables_recursive_triggers() {
-        use diesel::RunQueryDsl as _;
-
-        let mut conn = super::establish_sqlite_migration_connection(":memory:")
-            .expect("open an in-memory migration connection");
-        let rows: Vec<RecursiveTriggers> = diesel::sql_query("PRAGMA recursive_triggers")
-            .load(&mut conn)
-            .expect("read the pragma back");
-        assert_eq!(
-            rows.into_iter().next().map(|row| row.recursive_triggers),
-            Some(1),
-            "a migration connection must enable recursive_triggers"
-        );
-    }
 
     #[test]
     fn migration_path_selection_follows_the_tls_posture() {

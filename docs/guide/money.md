@@ -282,22 +282,21 @@ checks a posting against, so a change would relabel every stored minor unit and
 let the next posting in the new currency pass that check — two currencies in
 one account. `set_allow_negative` still works; only the currency is frozen.
 
-`INSERT OR REPLACE` is the same rewrite in disguise, and SQLite needs two
-things to refuse it. SQLite settles the conflict by deleting the row that is in
-the way, and it skips `DELETE` triggers for that deletion unless
-`PRAGMA recursive_triggers` is on. Autumn therefore sets that pragma on every
-SQLite connection it opens — the runtime pool and the migration connection
-alike — which puts the append-only triggers back in the path. The migrator
-matters on its own: a later migration doing `INSERT OR REPLACE` would otherwise
-rewrite the books with no guard firing.
-The migration also refuses an insert that collides with a posting's row keys,
-which holds even on a connection that does not set the pragma.
+`INSERT OR REPLACE` is the same rewrite in disguise. SQLite settles the
+conflict by deleting the row that is in the way, and it skips `DELETE` triggers
+for that deletion unless `PRAGMA recursive_triggers` is on. Autumn does **not**
+turn that pragma on: it changes the recursion semantics of every trigger the
+application itself declares, and an ordinary `AFTER UPDATE` trigger that
+touches its own row would start failing with `too many levels of trigger
+recursion`. The migration uses `BEFORE INSERT` guards on the row keys instead.
 
-Both are needed. The deferred foreign key is **not** enough on its own: a
-`REPLACE` that collides on the idempotency key can put the deleted row's id
-back before `COMMIT`, which satisfies the foreign key and leaves the real
-postings under forged transaction metadata. Only the `DELETE` trigger, reached
-through the pragma, stops that.
+One shape is therefore not covered, and it is worth knowing about: a `REPLACE`
+that collides on the idempotency key with a fresh row id, inside a transaction
+that re-inserts the deleted id before `COMMIT`, satisfies the deferred foreign
+key and slips past. Like `DROP TABLE`, it takes deliberate multi-statement SQL
+aimed at framework-private tables. These triggers are a guard-rail against
+operational accidents — a maintenance `UPDATE`, a stray `DELETE`, a
+`TRUNCATE` — not a boundary against arbitrary SQL.
 
 Postgres needs neither. It has no `REPLACE`, and it answers the same statement
 with `ON CONFLICT DO UPDATE`, which is an `UPDATE` the trigger above sees.

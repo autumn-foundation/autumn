@@ -117,23 +117,33 @@ BEGIN
 END;
 
 -- And the REPLACE form of the same edit, which the UPDATE trigger never sees.
--- `PRAGMA recursive_triggers = ON` (Autumn sets it on every SQLite connection
--- it opens, the runtime pool and the migrator alike) makes SQLite fire this
--- DELETE trigger for the row a REPLACE removes to settle its conflict, which is
--- what the default `OFF` suppresses.
+-- SQLite settles a REPLACE by deleting the row in the way, and skips DELETE
+-- triggers for that deletion unless `PRAGMA recursive_triggers` is on. Turning
+-- that pragma on globally would change every application trigger's recursion
+-- semantics, so this is a BEFORE INSERT guard instead.
 --
--- A DELETE trigger, not a BEFORE INSERT guard: an insert guard fires before
--- `ON CONFLICT (id) DO NOTHING`, so it would turn `ensure_account`'s documented
--- `AccountCurrency` error into an opaque database failure.
---
--- An account with no postings has nothing to relabel, so removing one is still
--- allowed. The postings foreign key already refuses a plain DELETE of an
--- account in use; this covers the REPLACE that foreign key does not see.
+-- It asks for postings as well. An account with no postings has nothing to
+-- relabel, and `ensure_account` reads the row back before inserting, so the
+-- guard never stands between a caller and the `AccountCurrency` error.
+CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_no_replace
+    BEFORE INSERT ON _autumn_money_accounts
+    WHEN EXISTS (
+        SELECT 1 FROM _autumn_money_accounts
+        WHERE id = NEW.id AND currency <> NEW.currency
+    ) AND EXISTS (
+        SELECT 1 FROM _autumn_money_postings WHERE account_id = NEW.id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'autumn money ledger: an account cannot change currency');
+END;
+
+-- A plain DELETE of an account in use. The postings foreign key already refuses
+-- this; the trigger makes the refusal say why.
 CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_no_delete
     BEFORE DELETE ON _autumn_money_accounts
     WHEN EXISTS (
         SELECT 1 FROM _autumn_money_postings WHERE account_id = OLD.id
     )
 BEGIN
-    SELECT RAISE(ABORT, 'autumn money ledger: an account with postings cannot be removed or replaced');
+    SELECT RAISE(ABORT, 'autumn money ledger: an account with postings cannot be removed');
 END;

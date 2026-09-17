@@ -1118,6 +1118,21 @@ pub async fn ensure_account(
 ) -> Result<Account, LedgerError> {
     check_text("account id", &account.id, MAX_ACCOUNT_ID)?;
 
+    // Read first. An account that already exists needs no INSERT, and on SQLite
+    // the REPLACE guard would otherwise abort the statement before
+    // `ON CONFLICT DO NOTHING` could apply — turning the `AccountCurrency`
+    // answer below into a database error for an account that holds postings.
+    if let Some(stored) = load_account(conn, &account.id).await? {
+        if stored.currency != account.currency {
+            return Err(LedgerError::AccountCurrency {
+                account: account.id,
+                expected: stored.currency.code(),
+                found: account.currency.code(),
+            });
+        }
+        return Ok(stored);
+    }
+
     let sql = format!(
         "INSERT INTO {ACCOUNTS_TABLE} (id, currency, allow_negative, created_at) \
          VALUES ({}, {}, {}, {NOW}) ON CONFLICT (id) DO NOTHING",
