@@ -375,6 +375,19 @@ section summary table tbody td tfoot th thead title tr track ul
 # An HTML comment that begins a line is a raw BLOCK; one that appears mid-line
 # (`see <!-- x --> and`) is inline, and owns only itself.
 COMMENT_BLOCK = re.compile(r"^ {0,3}<!--")
+
+# The characters a live backslash escape neutralises, for this scanner's
+# purposes: exactly the ones the inline loop BRANCHES on. An escape stops the
+# character opening its construct, so `\<https://x>` is not an autolink and
+# `\[a]` is not a link.
+#
+# Listing `[` and `!` only — which is what this was — meant adding the autolink
+# blanking last round instantly created a false failure on `\<`. The set is
+# the branch points rather than CommonMark's full ASCII-punctuation list on
+# purpose: an escaped paren inside a link destination is the business of the
+# destination grammar, and blanking it here would break a link this scanner is
+# supposed to find.
+ESCAPABLE = "[]!<`"
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
@@ -650,7 +663,7 @@ def readable(text):
             j = i
             while j < n and text[j] == "\\":
                 j += 1
-            if (j - i) % 2 == 1 and j < n and text[j] in "[!":
+            if (j - i) % 2 == 1 and j < n and text[j] in ESCAPABLE:
                 blank_to(j, j + 1)
                 j += 1
             i = j
@@ -2448,6 +2461,30 @@ self_test() {
     > "$tmp/autolink_guard/README.md"
   _commit autolink_guard
   _case "an autolink hides neither destination nor link" 0 autolink_guard
+
+  # 119. An escape neutralises `<` too. Blanking autolinks (case 117) made
+  #      this a false failure the same round it was added, because the
+  #      escapable set listed only `[` and `!` — the branch points that
+  #      existed when it was written.
+  _scaffold escaped_angle
+  printf '# A\n' > "$tmp/escaped_angle/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escaped_angle/docs/guide/index.md"
+  printf '\\<https://example.com/[catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/escaped_angle/README.md"
+  _commit escaped_angle
+  _case "an escaped < is not an autolink" 0 escaped_angle
+
+  # 120. ...and the guard: an UNESCAPED `<` still opens one, so 119 is not
+  #      bought by giving up on autolinks.
+  _scaffold unescaped_angle
+  printf '# A\n' > "$tmp/unescaped_angle/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/unescaped_angle/docs/guide/index.md"
+  printf '<https://example.com/[catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/unescaped_angle/README.md"
+  _commit unescaped_angle
+  _case "an unescaped < still opens an autolink" 1 unescaped_angle
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
