@@ -1536,8 +1536,17 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             "the resolver (ACME) entry point must advertise the same ALPN"
         );
 
+        // rustls refuses to build a client verifier with zero trust anchors
+        // (`NoRootAnchors`) even in `Optional` mode, so load the client CA
+        // fixture instead of an empty store — the anchors are irrelevant to
+        // the ALPN assertion below; only the `Some(verifier)` arm matters.
+        let ca = write_temp(
+            dir.path(),
+            "ca.pem",
+            include_str!("../tests/fixtures/tls/client/ca.cert.pem"),
+        );
         let verifier = client_auth::build_client_verifier(
-            rustls::RootCertStore::empty(),
+            client_auth::load_client_roots(&ca).expect("client roots load"),
             vec![],
             crate::config::ClientAuthMode::Optional,
             Arc::clone(&provider),
