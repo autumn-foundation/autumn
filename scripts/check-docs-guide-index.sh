@@ -230,7 +230,17 @@ ENTRY_REF = re.compile(_ROW + r"\[([^\]]+)\](?:\[([^\]]*)\])?(?![(:])")
 # `\s*` crossed blank lines, so `[a]:`, a blank line, then `alpha.md` resolved
 # — but CommonMark does not allow a definition to span a blank line, so that
 # row renders as plain text and the page it claimed to list was unfindable.
-DEFN = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*(?:\n[ \t]*)?(\S+)", re.MULTILINE)
+#
+# Nothing but an optional title may follow the destination. `[a]: alpha.md
+# trailing garbage` is not a definition at all, so a row referencing it
+# renders as plain text — and the page it claimed to list was unfindable.
+# A title on the FOLLOWING line is still fine: this stops at the end of the
+# destination's line, which leaves the definition valid and the title line to
+# be read as the prose it resembles.
+DEFN = re.compile(
+    r"""^ {0,3}\[([^\]]+)\]:[ \t]*(?:\n[ \t]*)?(\S+)"""
+    r"""(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$""",
+    re.MULTILINE)
 
 
 def label_key(raw):
@@ -454,6 +464,10 @@ def readable(text):
                 continue
             if LIST_ITEM.match(line):
                 in_list = True
+            # Whether the PREVIOUS line was paragraph text, captured before
+            # this line overwrites it. A type-7 HTML opener cannot interrupt
+            # a paragraph, and that is the only way to know it is doing so.
+            was_paragraph = in_paragraph
             # A heading or a fence line is not paragraph text, so an indented
             # line after one opens code.
             #
@@ -512,7 +526,14 @@ def readable(text):
                 tag = hm.group(2).lower()
                 alone = bool(re.fullmatch(r"\s*" + INLINE_TAG.pattern + r"\s*",
                                           line, re.VERBOSE))
-                if tag not in HTML_LITERAL and tag not in BLOCK_TAGS and not alone:
+                type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
+                # A type-7 tag opens a block only when it is alone on its
+                # line AND is not interrupting a paragraph. CommonMark lets
+                # the type-6 list interrupt one but not type 7, so after
+                # `Some prose` a lone `<span>` is inline HTML and the lines
+                # under it are still paragraph text — blanking them as a raw
+                # block swallowed a link the reader can click.
+                if type7 and (not alone or was_paragraph):
                     hm = None
             if hm and not auto:
                 tag = hm.group(2).lower()
@@ -752,6 +773,14 @@ def entries(text, base):
     for lineno, line in enumerate(body.split("\n"), 1):
         if line.startswith("## "):
             section = line[3:].strip()
+            continue
+        # A new LEVEL-ONE heading ends the section. Rows appended after one
+        # are under no `## ` at all, and carrying the previous section name
+        # across let them satisfy the section-placement rule from a heading
+        # a reader scanning that section would never reach. A `### ` is a
+        # subheading INSIDE the current section, so it does not reset.
+        if line.startswith("# "):
+            section = None
             continue
         target = None
         m = ENTRY.match(line)
@@ -1888,6 +1917,80 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_one_newline/README.md"
   _commit defn_one_newline
   _case "a definition may use one line ending" 0 defn_one_newline
+
+  # 88. A type-7 HTML tag cannot interrupt a paragraph. After prose, a lone
+  #     `<span>` is inline HTML, so the lines under it are still paragraph
+  #     text — blanking them as a raw block swallowed a clickable link.
+  _scaffold type7_paragraph
+  printf '# A\n' > "$tmp/type7_paragraph/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/type7_paragraph/docs/guide/index.md"
+  printf 'Some prose\n<span>\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/type7_paragraph/README.md"
+  _commit type7_paragraph
+  _case "a type-7 tag cannot interrupt a paragraph" 0 type7_paragraph
+
+  # 89. ...and the guard, twice over: the SAME tag after a blank line does
+  #     open a block, and a type-6 tag interrupts a paragraph even though
+  #     type 7 cannot. Case 88 is not bought by ignoring HTML blocks.
+  _scaffold type7_guard
+  printf '# A\n' > "$tmp/type7_guard/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/type7_guard/docs/guide/index.md"
+  printf 'Some prose\n\n<span>\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/type7_guard/README.md"
+  _commit type7_guard
+  _case "a type-7 tag after a blank line opens a block" 1 type7_guard
+
+  _scaffold type6_paragraph
+  printf '# A\n' > "$tmp/type6_paragraph/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/type6_paragraph/docs/guide/index.md"
+  printf 'Some prose\n<div>\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/type6_paragraph/README.md"
+  _commit type6_paragraph
+  _case "a type-6 tag does interrupt a paragraph" 1 type6_paragraph
+
+  # 90. Nothing but an optional title may follow a definition's destination.
+  #     `[a]: alpha.md trailing garbage` is not a definition, so the row
+  #     referencing it renders as plain text.
+  _scaffold defn_trailing
+  printf '# A\n' > "$tmp/defn_trailing/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: alpha.md trailing garbage\n' \
+    > "$tmp/defn_trailing/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_trailing/README.md"
+  _commit defn_trailing
+  _case "trailing garbage is not a definition" 1 defn_trailing
+
+  # 91. ...and the guard: a real title is not garbage, in all three
+  #     spellings CommonMark allows.
+  _scaffold defn_title_ok
+  printf '# A\n' > "$tmp/defn_title_ok/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: alpha.md "Alpha guide"\n' \
+    > "$tmp/defn_title_ok/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_title_ok/README.md"
+  _commit defn_title_ok
+  _case "a definition may carry a title" 0 defn_title_ok
+
+  # 92. A new LEVEL-ONE heading ends the section, so rows appended under it
+  #     are under no `## ` and must be reported. A `### ` does not reset.
+  _scaffold section_reset
+  printf '# A\n' > "$tmp/section_reset/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/section_reset/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n# Appendix\n\n- [B](beta.md)\n' \
+    > "$tmp/section_reset/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/section_reset/README.md"
+  _commit section_reset
+  _case "a level-one heading ends the section" 1 section_reset
+
+  _scaffold section_subheading
+  printf '# A\n' > "$tmp/section_subheading/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/section_subheading/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n### Sub\n\n- [B](beta.md)\n' \
+    > "$tmp/section_subheading/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/section_subheading/README.md"
+  _commit section_subheading
+  _case "a level-three subheading keeps the section" 0 section_subheading
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
