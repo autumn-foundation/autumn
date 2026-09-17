@@ -650,6 +650,64 @@ async fn a_balance_that_would_leave_i64_is_refused() {
     assert_books_balance(&mut conn).await;
 }
 
+/// The range check must not depend on the order the postings were listed in.
+///
+/// `IdempotencyKey::derive` and the request hash both normalize posting order
+/// away, so two submissions of the same money are the same transaction. A
+/// balance check that added each posting to the stored balance in turn could
+/// accept one ordering and refuse the other, near the `i64` boundary.
+#[tokio::test]
+async fn an_offsetting_pair_is_checked_on_its_net_delta_not_posting_order() {
+    let pool = boot_pool("mlg_net_delta").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+
+    // Put the cash account at the very top of the range.
+    let fill = vec![
+        Posting::debit("platform:cash", usd(i64::MAX)),
+        Posting::credit("platform:revenue", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::derive("fill", &fill);
+    post_tx(&mut conn, &Transaction::new(key, fill))
+        .await
+        .expect("fill the account to i64::MAX");
+
+    // A pair of offsetting lines against that same account nets to zero, so it
+    // is legal whichever way round it is written. Each intermediate sum
+    // overflows one way round and not the other, which is exactly the trap.
+    for (label, postings) in [
+        (
+            "debit first",
+            vec![
+                Posting::debit("platform:cash", usd(i64::MAX)),
+                Posting::credit("platform:cash", usd(i64::MAX)),
+            ],
+        ),
+        (
+            "credit first",
+            vec![
+                Posting::credit("platform:cash", usd(i64::MAX)),
+                Posting::debit("platform:cash", usd(i64::MAX)),
+            ],
+        ),
+    ] {
+        let key = IdempotencyKey::new(format!("net:{label}")).expect("key");
+        post_tx(&mut conn, &Transaction::new(key, postings))
+            .await
+            .unwrap_or_else(|err| panic!("{label} must post: {err}"));
+    }
+
+    // The balance is untouched, and the books still balance.
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:cash")
+            .await
+            .expect("balance")
+            .minor(),
+        i64::MAX
+    );
+    assert_books_balance(&mut conn).await;
+}
+
 /// The mechanism behind cancellation safety: a posting whose transaction row
 /// never arrives makes the COMMIT fail.
 ///

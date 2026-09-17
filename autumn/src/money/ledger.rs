@@ -116,6 +116,38 @@ const MAX_POSTINGS: usize = 1024;
 /// `CURRENT_TIMESTAMP` rather than `NOW()`: both backends spell it that way.
 const NOW: &str = "CURRENT_TIMESTAMP";
 
+/// The radix the balance reads split each posting across. Any power of ten
+/// does; this one leaves both halves far inside `i64`.
+const SPLIT: i64 = 1_000_000;
+
+/// `SUM` over `amount_minor`, in two halves that no row order can overflow.
+///
+/// `SUM` accumulates row by row, and `SQLite` raises `integer overflow` the
+/// moment a *partial* sum leaves `i64` — even when the total is well inside it.
+/// An account holding one very large debit and its matching credit could
+/// therefore become unreadable depending on the order the rows came back in.
+///
+/// Splitting each row as `x = (x / SPLIT) * SPLIT + (x % SPLIT)` and summing
+/// the halves separately is exact — both backends truncate integer division
+/// toward zero and give `%` the sign of the dividend, which is what makes the
+/// identity hold term by term — and it raises the overflow threshold by
+/// `SPLIT`. [`join_split`] puts the halves back together in `i128`.
+fn split_sum(column: &str) -> String {
+    format!(
+        "CAST(COALESCE(SUM({column} / {SPLIT}), 0) AS BIGINT) AS hi, \
+         CAST(COALESCE(SUM({column} % {SPLIT}), 0) AS BIGINT) AS lo"
+    )
+}
+
+/// Recombine the halves [`split_sum`] produced.
+fn join_split(hi: i64, lo: i64) -> Result<i64, LedgerError> {
+    let total = i128::from(hi)
+        .checked_mul(i128::from(SPLIT))
+        .and_then(|high| high.checked_add(i128::from(lo)))
+        .ok_or(MoneyError::Overflow)?;
+    i64::try_from(total).map_err(|_| LedgerError::Money(MoneyError::Overflow))
+}
+
 // Backend-forked placeholder. Postgres numbers its binds, `SQLite` does not.
 #[cfg(not(feature = "sqlite"))]
 fn ph(n: usize) -> String {
@@ -991,13 +1023,17 @@ struct AccountTotalRow {
     #[diesel(sql_type = Text)]
     account_id: String,
     #[diesel(sql_type = BigInt)]
-    total: i64,
+    hi: i64,
+    #[diesel(sql_type = BigInt)]
+    lo: i64,
 }
 
 #[derive(diesel::QueryableByName)]
 struct TotalRow {
     #[diesel(sql_type = BigInt)]
-    total: i64,
+    hi: i64,
+    #[diesel(sql_type = BigInt)]
+    lo: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1005,7 +1041,9 @@ struct CurrencyTotalRow {
     #[diesel(sql_type = Text)]
     currency: String,
     #[diesel(sql_type = BigInt)]
-    total: i64,
+    hi: i64,
+    #[diesel(sql_type = BigInt)]
+    lo: i64,
 }
 
 fn parse_currency(code: &str) -> Result<CurrencyCode, LedgerError> {
@@ -1405,14 +1443,26 @@ async fn check_resulting_balances(
     let stored = sum_postings_by_account(conn, &ids).await?;
 
     for account in accounts.values() {
-        let mut balance = stored.get(&account.id).copied().unwrap_or(0);
+        // Sum this transaction's own postings for the account first, in `i128`,
+        // and apply the net delta once. Adding them to the stored balance one
+        // at a time would make the range check depend on the order the postings
+        // were listed in: an account near the `i64` boundary with an offsetting
+        // pair of lines would pass one way round and overflow the other. The
+        // request hash normalizes that order away, so two submissions of the
+        // same money must not disagree here either.
+        let mut delta: i128 = 0;
         for posting in transfer.postings() {
             if posting.account_id() == account.id {
-                balance = balance
-                    .checked_add(posting.signed_minor()?)
+                delta = delta
+                    .checked_add(i128::from(posting.signed_minor()?))
                     .ok_or(MoneyError::Overflow)?;
             }
         }
+        let balance = i128::from(stored.get(&account.id).copied().unwrap_or(0))
+            .checked_add(delta)
+            .ok_or(MoneyError::Overflow)?;
+        let balance = i64::try_from(balance).map_err(|_| MoneyError::Overflow)?;
+
         if balance < 0 && !account.allow_negative {
             return Err(LedgerError::NegativeBalance {
                 account: account.id.clone(),
@@ -1436,8 +1486,9 @@ async fn sum_postings_by_account(
         return Ok(BTreeMap::new());
     }
     let placeholders = (1..=ids.len()).map(ph).collect::<Vec<_>>().join(", ");
+    let totals = split_sum("amount_minor");
     let sql = format!(
-        "SELECT account_id, CAST(COALESCE(SUM(amount_minor), 0) AS BIGINT) AS total \
+        "SELECT account_id, {totals} \
          FROM {POSTINGS_TABLE} WHERE account_id IN ({placeholders}) GROUP BY account_id"
     );
     let mut query = diesel::sql_query(sql).into_boxed();
@@ -1445,10 +1496,9 @@ async fn sum_postings_by_account(
         query = query.bind::<Text, _>((*id).to_owned());
     }
     let rows: Vec<AccountTotalRow> = query.load(conn).await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.account_id, row.total))
-        .collect())
+    rows.into_iter()
+        .map(|row| Ok((row.account_id, join_split(row.hi, row.lo)?)))
+        .collect()
 }
 
 /// The balance of `account_id`: the sum of its postings.
@@ -1475,16 +1525,18 @@ pub async fn balance(
 /// `CAST(... AS BIGINT)` because Postgres widens `SUM(BIGINT)` to `NUMERIC`,
 /// which no `BigInt` decoder accepts. `SQLite` keeps the integer either way.
 async fn sum_postings(conn: &mut RuntimeConnection, account_id: &str) -> Result<i64, LedgerError> {
+    let totals = split_sum("amount_minor");
     let sql = format!(
-        "SELECT CAST(COALESCE(SUM(amount_minor), 0) AS BIGINT) AS total \
-         FROM {POSTINGS_TABLE} WHERE account_id = {}",
+        "SELECT {totals} FROM {POSTINGS_TABLE} WHERE account_id = {}",
         ph(1)
     );
     let rows: Vec<TotalRow> = diesel::sql_query(sql)
         .bind::<Text, _>(account_id)
         .load(conn)
         .await?;
-    Ok(rows.into_iter().next().map_or(0, |row| row.total))
+    rows.into_iter()
+        .next()
+        .map_or(Ok(0), |row| join_split(row.hi, row.lo))
 }
 
 /// Read the transaction posted under `key`, if there is one.
@@ -1570,8 +1622,9 @@ async fn load_transaction(
 pub async fn trial_balance(
     conn: &mut RuntimeConnection,
 ) -> Result<Vec<CurrencyTotal>, LedgerError> {
+    let totals = split_sum("amount_minor");
     let sql = format!(
-        "SELECT currency, CAST(SUM(amount_minor) AS BIGINT) AS total \
+        "SELECT currency, {totals} \
          FROM {POSTINGS_TABLE} GROUP BY currency ORDER BY currency"
     );
     let rows: Vec<CurrencyTotalRow> = diesel::sql_query(sql).load(conn).await?;
@@ -1580,7 +1633,7 @@ pub async fn trial_balance(
             let currency = parse_currency(&row.currency)?;
             Ok(CurrencyTotal {
                 currency,
-                total: AnyMoney::new(row.total, currency),
+                total: AnyMoney::new(join_split(row.hi, row.lo)?, currency),
             })
         })
         .collect()
