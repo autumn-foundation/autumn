@@ -1156,6 +1156,54 @@ async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
     assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
 }
 
+/// Issue #2263: `cmt_audit_softs.deleted_at` is audit history, not a
+/// tombstone — `CmtAuditSoftRepository` never declares `soft_delete`. A
+/// non-null value must not hide the parent, or the comment thread would
+/// disagree with the repository's own finders about whether the record
+/// exists.
+///
+/// This is the write path: `add_comment` is exactly where a prior bug
+/// silently lost the registry's answer (a `CommentableSpec` copy taken for
+/// the transaction closure broke a pointer-identity lookup) and fell back to
+/// treating the column alone as a tombstone. The read-only router test
+/// beside this one does not exercise that path.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_audit_deleted_at_column_does_not_hide_the_parent() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtAuditSoftRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_audit_softs", "title", "t").await;
+
+    repo.add_comment(target, author, "before", None)
+        .await
+        .expect("live parent accepts comments");
+
+    // Stamp the audit column — this repository never opted into `soft_delete`,
+    // so the value carries no meaning for comment visibility.
+    diesel::sql_query("UPDATE cmt_audit_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the audit column");
+
+    let comment = repo
+        .add_comment(target, author, "after", None)
+        .await
+        .expect("an audit deleted_at without soft_delete must not hide the parent");
+    assert_eq!(comment.body, "after");
+    let thread = repo
+        .comment_thread(target)
+        .await
+        .expect("the thread must still read");
+    assert_eq!(
+        flatten(&thread),
+        vec![(0, "before".to_owned()), (0, "after".to_owned())]
+    );
+    assert_eq!(counter(&mut conn, "cmt_audit_softs", target).await, 2);
+}
+
 /// The two 404s on the delete path: an unknown comment, and a comment that
 /// belongs to a **different record of the same model**. The second is what
 /// stops any signed-in user deleting any comment by walking ids.
@@ -1354,6 +1402,33 @@ async fn a_tenant_scoped_repository_with_no_context_refuses_to_comment() {
     assert_eq!(counter(&mut conn, "cmt_tenanted", acme).await, 0);
 }
 
+/// Issue #2263: `cmt_denorm_tenants.tenant_id` is denormalized data —
+/// `CmtDenormTenantRepository` never declares `tenant_scoped`. Comments must
+/// work with no tenant context at all, unlike the `tenant_scoped` case above.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_denormalized_tenant_column_does_not_require_a_tenant_context() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtDenormTenantRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_tenanted(&mut conn, "cmt_denorm_tenants", "acme", "theirs").await;
+
+    // No `CURRENT_TENANT` scope anywhere in this test.
+    let comment = repo
+        .add_comment(target, author, "no tenant needed", None)
+        .await
+        .expect("a non-tenant_scoped repository must not require a tenant context");
+    assert_eq!(comment.body, "no tenant needed");
+
+    let thread = repo
+        .comment_thread(target)
+        .await
+        .expect("reads must not require a tenant context either");
+    assert_eq!(flatten(&thread), vec![(0, "no tenant needed".to_owned())]);
+    assert_eq!(counter(&mut conn, "cmt_denorm_tenants", target).await, 1);
+}
+
 // ── The generic router ──────────────────────────────────────────────────────
 //
 // One pair of routes serves every registered model. Nothing else in the suite
@@ -1455,6 +1530,35 @@ async fn router_renders_the_thread_for_any_registered_model() {
     );
     // Signed out: the thread renders, every form is gone.
     assert!(!body.contains("<form"), "{body}");
+}
+
+/// Issue #2263, the router's write path: `CmtDenormTenant` carries a
+/// `tenant_id` column, but its repository never declares `tenant_scoped`.
+/// The router is mounted with **no tenancy middleware at all**. The sibling
+/// `router_ignores_a_denormalized_tenant_column_with_no_tenant_context` test
+/// covers the read (`GET`) side of this; this one covers the write (`POST`)
+/// side, which had no router-level coverage before this change.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_serves_a_denormalized_tenant_column_with_no_tenancy_middleware() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_tenanted(&mut conn, "cmt_denorm_tenants", "acme", "hello").await;
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call_with_author(
+        app.clone(),
+        form_post(&format!("/comments/CmtDenormTenant/{target}"), "body=hi"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200, "no tenant middleware, no 500: {body}");
+
+    let (status, body) = call(app, get(&format!("/comments/CmtDenormTenant/{target}"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("hi"), "{body}");
 }
 
 /// The registry is the whole gate: a type no model claims cannot be reached.

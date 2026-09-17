@@ -669,6 +669,25 @@ impl ParentRef {
             ParentRef::Path(id) | ParentRef::Bare(id) => id,
         }
     }
+
+    /// Finds this reference among content the file does not declare
+    /// (#2763).
+    ///
+    /// `Path` names an exact position. Match it exactly, like any
+    /// file-declared identity.
+    ///
+    /// `Bare` names only a slug, never a position. Match it by slug. An
+    /// exact-position match would fail as soon as the target post moved.
+    async fn resolve_local(
+        &self,
+        repos: &Repos,
+        post_type: &str,
+    ) -> AutumnResult<Option<crate::models::Post>> {
+        match self {
+            ParentRef::Path(id) => find_local(repos, post_type, id).await,
+            ParentRef::Bare(slug) => find_local_by_slug(repos, post_type, slug).await,
+        }
+    }
 }
 
 /// The identity of a post's parent, as the file describes it.
@@ -794,14 +813,16 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 /// unaffected by the allocator suffixing an ancestor's slug.
 ///
 /// Only when the parent is not part of this file — content this import does
-/// not itself declare — does this fall back to that parent's real, current
-/// position: the one signal available for content this importer does not
-/// track. `parent_now` is that fallback's input, and only ever applies at
-/// the top of the recursion, where the caller has already resolved it; a
-/// parent found one or more levels up the file's own chain has no such
-/// value computed for it, so a *second* external parent further up a
-/// legacy chain falls back to its own bare slug instead. Bounded by
-/// `MAX_PAGE_DEPTH` like every other ancestry walk in this module.
+/// not itself declare — does this anchor to that parent's row id instead
+/// (#2763). A row id never changes. A position-based anchor went stale the
+/// moment an editor moved that external parent. A later re-import then
+/// computed a different key than the one on record, and filed a duplicate.
+/// `parent_now` is that anchor's input. It applies only at the top of the
+/// recursion, where the caller has already resolved it. A parent found
+/// further up the file's own chain has no such value, so a second external
+/// parent higher in a legacy chain falls back to its own bare slug instead.
+/// Bounded by `MAX_PAGE_DEPTH` like every other ancestry walk in this
+/// module.
 ///
 /// This is the plain, undecorated position — not yet a marker key. Every
 /// recursive step composes on this exact value, deliberately, so a chain
@@ -813,7 +834,6 @@ async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResu
 /// own exporter always writes one — could no longer recognize its own,
 /// already-imported pages by position alone.
 fn stable_identity<'a>(
-    repos: &'a Repos,
     posts: &'a [ExportPost],
     graph: &'a FileGraph,
     index: usize,
@@ -834,21 +854,13 @@ fn stable_identity<'a>(
             match graph.find(post.post_type.as_str(), &parent) {
                 Some(parent_index) => {
                     let parent_stable =
-                        stable_identity(repos, posts, graph, parent_index, memo, None, depth + 1)
-                            .await?;
+                        stable_identity(posts, graph, parent_index, memo, None, depth + 1).await?;
                     format!("{parent_stable}/{}", post.slug)
                 }
-                None => match parent_now.map(|id| repos.posts.find_by_id(id)) {
-                    Some(query) => match query.await? {
-                        Some(parent_row) => {
-                            format!(
-                                "{}/{}",
-                                local_identity(repos, &parent_row).await?,
-                                post.slug
-                            )
-                        }
-                        None => post.slug.clone(),
-                    },
+                // Anchor to the id, not the position. The id does not
+                // change when this external parent moves (#2763).
+                None => match parent_now {
+                    Some(parent_id) => format!("id:{parent_id}/{}", post.slug),
                     None => post.slug.clone(),
                 },
             }
@@ -858,6 +870,159 @@ fn stable_identity<'a>(
         memo[index] = Some(value.clone());
         Ok(value)
     })
+}
+
+/// The marker `stable_identity` would have recorded for this post before
+/// #2763 shipped, computed from the parent's *current* row (#2763).
+///
+/// Exact, not a guess: this is one specific string, built the same way the
+/// pre-#2763 scheme always built it, so a direct match is trusted the same
+/// way any other qualified marker in this file is — by the string alone,
+/// with no further check. It is only ever *right* when the parent has not
+/// moved since the original import: recomputing from a *moved* parent's
+/// current row produces its new position, not the old one the marker
+/// actually named, so a mismatch here does not mean the row is missing —
+/// see `recovered_legacy_owner` for that case.
+async fn legacy_marker_at_current_position(
+    repos: &Repos,
+    parent_id: i64,
+    slug: &str,
+) -> AutumnResult<Option<String>> {
+    Ok(match repos.posts.find_by_id(parent_id).await? {
+        Some(parent_row) => Some(disambiguated_identity(format!(
+            "{}/{}",
+            local_identity(repos, &parent_row).await?,
+            slug
+        ))),
+        None => None,
+    })
+}
+
+/// An index over `imported_source_slugs`'s *legacy-shaped* markers, built
+/// once per import rather than scanned per post (#2763).
+///
+/// Keyed by `(post_type, direct-parent segment, own slug)` — the same two
+/// facts `recovered_legacy_owner` checks a candidate against, extracted
+/// from the marker string up front. `imported_source_slugs` itself already
+/// exists so a bulk import pays for the marker table once; without this
+/// index, recovering every pathless post with an external parent rescanned
+/// the whole table each time, `O(posts × markers)` on a populated site. An
+/// `id:`-anchored marker is excluded here too, for the same reason
+/// `recovered_legacy_owner` always excluded it.
+fn legacy_marker_index(
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+) -> std::collections::HashMap<(String, String, String), Vec<i64>> {
+    let mut index: std::collections::HashMap<(String, String, String), Vec<i64>> =
+        std::collections::HashMap::new();
+    for ((post_type, marker), ids) in imported_source_slugs {
+        if marker.starts_with("id:") {
+            continue;
+        }
+        let Some((prefix, own_slug)) = marker.rsplit_once('/') else {
+            continue;
+        };
+        let parent_segment = prefix.rsplit('/').next().unwrap_or(prefix);
+        index
+            .entry((
+                post_type.clone(),
+                parent_segment.to_owned(),
+                own_slug.to_owned(),
+            ))
+            .or_default()
+            .extend(ids);
+    }
+    index
+}
+
+/// Finds a row a prior import already created for this externally-parented
+/// post, when the parent has moved since and
+/// `legacy_marker_at_current_position` cannot find it (#2763).
+///
+/// The parent's *old* position — what that marker actually named — is
+/// gone, not just unreachable by id, once the parent has moved: nothing
+/// here recomputes it. Two things about the marker itself take its place,
+/// both read from `legacy_marker_index` rather than the raw marker string.
+///
+/// First, the marker's own direct-parent segment — the slug immediately
+/// before `/{slug}`, however deep the recorded position was — must equal
+/// `parent_id`'s own *current* slug. An editor's move changes a parent's
+/// *position*, not normally its slug, so this still holds after any
+/// number of moves; it is what a marker recorded for some other parent
+/// entirely, coincidentally now sharing `parent_id` as its current
+/// parent, can never satisfy — unlike a shared `/{slug}` suffix alone,
+/// which proves nothing about which parent a marker was ever about.
+///
+/// Second, only a candidate whose actual, current `parent_id` still
+/// equals `parent_id` is accepted — accurate no matter how many times an
+/// ancestor has moved, and the same check that rules out an unrelated
+/// page merely sharing this suffix.
+async fn recovered_legacy_owner(
+    repos: &Repos,
+    legacy_marker_index: &std::collections::HashMap<(String, String, String), Vec<i64>>,
+    post_type: &str,
+    slug: &str,
+    parent_id: i64,
+) -> AutumnResult<Option<crate::models::Post>> {
+    let Some(parent_row) = repos.posts.find_by_id(parent_id).await? else {
+        return Ok(None);
+    };
+    let Some(ids) = legacy_marker_index.get(&(
+        post_type.to_owned(),
+        parent_row.slug.clone(),
+        slug.to_owned(),
+    )) else {
+        return Ok(None);
+    };
+    for &id in ids {
+        if let Some(candidate) = repos.posts.find_by_id(id).await?
+            && candidate.parent_id == Some(parent_id)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Recovers a row a prior import already created for a post whose parent
+/// is external, when no other marker lookup found one (#2763).
+///
+/// Tries the exact recomputed marker first, and only falls back to the
+/// parent-verified suffix scan when that misses — see
+/// `legacy_marker_at_current_position` and `recovered_legacy_owner` for
+/// why each exists and what each one alone cannot do.
+///
+/// Neither tier recovers a row whose external parent *and* the row itself
+/// have both moved since the original import: the exact marker no longer
+/// matches (the parent moved), and the row's own current parent no longer
+/// agrees either (the row moved) — the same gap applies if the parent was
+/// also re-slugged, since the suffix scan's parent check reads its
+/// *current* slug. The same gap opens even without a double move if the
+/// parent's *original* slug is later freed (by a rename) and claimed by
+/// an unrelated row, which the row then moves under: every check here
+/// reads current, sibling-unique slugs and current parent ids, neither of
+/// which can tell "the same parent, moved" apart from "a different parent
+/// that now happens to hold the same slug and the same child." Telling
+/// such a row apart from a genuinely new, unrelated one sharing its slug
+/// would need every page to carry a permanent identity of its own, not
+/// only the ones this importer created — a materially bigger change than
+/// this fix, and the same one #2763 itself named as the alternative to
+/// accepting this gap.
+async fn recover_legacy_row(
+    repos: &Repos,
+    imported_source_slugs: &std::collections::HashMap<(String, String), Vec<i64>>,
+    legacy_marker_index: &std::collections::HashMap<(String, String, String), Vec<i64>>,
+    post_type: &str,
+    slug: &str,
+    parent_id: i64,
+) -> AutumnResult<Option<crate::models::Post>> {
+    if let Some(legacy_marker) = legacy_marker_at_current_position(repos, parent_id, slug).await?
+        && let Some(&id) = imported_source_slugs
+            .get(&(post_type.to_owned(), legacy_marker))
+            .and_then(|ids| ids.first())
+    {
+        return repos.posts.find_by_id(id).await;
+    }
+    recovered_legacy_owner(repos, legacy_marker_index, post_type, slug, parent_id).await
 }
 
 /// Turns a `stable_identity` position into a safe marker key.
@@ -888,6 +1053,7 @@ struct ImportGraph<'a> {
     posts: &'a [ExportPost],
     graph: &'a FileGraph<'a>,
     imported_source_slugs: &'a std::collections::HashMap<(String, String), Vec<i64>>,
+    legacy_marker_index: &'a std::collections::HashMap<(String, String, String), Vec<i64>>,
     created_ids: &'a [(i64, String, String, Option<String>)],
     completed_imports: &'a std::collections::HashSet<i64>,
 }
@@ -926,16 +1092,7 @@ fn resolved_post_id<'a>(
             return Ok(Some(*id));
         }
         let stable = disambiguated_identity(
-            stable_identity(
-                import.repos,
-                import.posts,
-                import.graph,
-                index,
-                stable_memo,
-                None,
-                0,
-            )
-            .await?,
+            stable_identity(import.posts, import.graph, index, stable_memo, None, 0).await?,
         );
         // Its own marker: a qualified key like this one names exactly one
         // row, so the first (and only) candidate is enough.
@@ -946,29 +1103,62 @@ fn resolved_post_id<'a>(
         {
             return Ok(Some(id));
         }
+        // This post's own parent, resolved the same way the main loop
+        // resolves any other: recursively, through this same function, for
+        // one already declared in this file, or against local content
+        // otherwise. Needed below regardless of which fallback applies, so
+        // resolved once rather than twice. Bounded the same way every other
+        // ancestry walk in this module is: a cyclic legacy chain must stop
+        // recursing here, before it ever reaches the recursive call, or it
+        // never terminates.
+        let parent = parent_identity(post);
+        let in_file_parent = parent
+            .as_ref()
+            .and_then(|parent| import.graph.find(post.post_type.as_str(), parent));
+        let parent_now = if depth <= content::MAX_PAGE_DEPTH + 2 {
+            match (&parent, in_file_parent) {
+                (Some(_), Some(parent_index)) => {
+                    resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
+                }
+                (Some(parent), None) => parent
+                    .resolve_local(import.repos, &post.post_type)
+                    .await?
+                    .map(|found| found.id),
+                (None, _) => None,
+            }
+        } else {
+            None
+        };
         if depth <= content::MAX_PAGE_DEPTH + 2
             && stable != own_identity
             && let Some(ids) = import
                 .imported_source_slugs
                 .get(&(post.post_type.clone(), own_identity.clone()))
-        {
-            let expected_parent = match parent_identity(post) {
-                Some(parent) => match import.graph.find(post.post_type.as_str(), &parent) {
-                    Some(parent_index) => {
-                        resolved_post_id(import, stable_memo, parent_index, depth + 1).await?
-                    }
-                    None => find_local(import.repos, &post.post_type, parent.as_str())
-                        .await?
-                        .map(|found| found.id),
-                },
-                None => None,
-            };
-            if let Some(candidate) =
-                pick_marker_candidate(import.repos, ids, import.completed_imports, expected_parent)
+            && let Some(candidate) =
+                pick_marker_candidate(import.repos, ids, import.completed_imports, parent_now)
                     .await?
-            {
-                return Ok(Some(candidate.id));
-            }
+        {
+            return Ok(Some(candidate.id));
+        }
+        // A pre-#2763 marker for a post whose own parent is external, the
+        // same recovery the main loop tries for any other post (#2763). A
+        // post declared as another's parent needs this too: without it, a
+        // legacy row like this one is never added to `created_ids`, and a
+        // new descendant naming it as parent could not find its real id.
+        if parent.is_some()
+            && in_file_parent.is_none()
+            && let Some(parent_id) = parent_now
+            && let Some(candidate) = recover_legacy_row(
+                import.repos,
+                import.imported_source_slugs,
+                import.legacy_marker_index,
+                &post.post_type,
+                &post.slug,
+                parent_id,
+            )
+            .await?
+        {
+            return Ok(Some(candidate.id));
         }
         Ok(find_local(import.repos, &post.post_type, &own_identity)
             .await?
@@ -1041,6 +1231,35 @@ async fn find_local(
         }
     }
     Ok(None)
+}
+
+/// Finds a stored post of `post_type` with this slug, at any position
+/// (#2763).
+///
+/// A `Bare` parent reference is a legacy slug. It never names a position.
+/// Prefer an exact, top-level match first — the same match `find_local`
+/// makes, and what a bare reference has always resolved to when a
+/// same-slug page also exists at another position. Only when no candidate
+/// is top-level does this accept a single, unambiguous one at any
+/// position: two such candidates mean the reference cannot pick one.
+async fn find_local_by_slug(
+    repos: &Repos,
+    post_type: &str,
+    slug: &str,
+) -> AutumnResult<Option<crate::models::Post>> {
+    if let Some(top_level) = find_local(repos, post_type, slug).await? {
+        return Ok(Some(top_level));
+    }
+    let mut candidates = repos
+        .posts
+        .find_by_slug(slug.to_owned())
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate.post_type == post_type);
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) => Ok(Some(only)),
+        _ => Ok(None),
+    }
 }
 
 /// The status an imported post should land in.
@@ -1223,6 +1442,10 @@ pub async fn import(
     let imported_source_slugs = repos
         .with_conn(async |conn| content::imported_source_slugs(conn).await)
         .await?;
+    // Built once from the same table, for the same reason: recovering
+    // every pathless post with an external parent otherwise rescanned it
+    // per post (#2763).
+    let legacy_marker_index = legacy_marker_index(&imported_source_slugs);
     // Which of those a previous run *finished*. The source marker is written
     // before the row's terms, status and ancestry are, so on its own it cannot
     // distinguish "ours, unfinished, repair it" from "ours, done, leave it".
@@ -1300,12 +1523,14 @@ pub async fn import(
                         posts: &payload.posts,
                         graph: &graph,
                         imported_source_slugs: &imported_source_slugs,
+                        legacy_marker_index: &legacy_marker_index,
                         created_ids: &created_ids,
                         completed_imports: &completed_imports,
                     };
                     resolved_post_id(&import, &mut stable_memo, parent_index, 0).await?
                 }
-                None => match find_local(&repos, &post.post_type, parent.as_str())
+                None => match parent
+                    .resolve_local(&repos, &post.post_type)
                     .await?
                     .map(|found| found.id)
                 {
@@ -1324,7 +1549,6 @@ pub async fn import(
         // also what gets recorded below, if this post turns out to be new.
         let marker_identity = disambiguated_identity(
             stable_identity(
-                &repos,
                 &payload.posts,
                 &graph,
                 index,
@@ -1334,7 +1558,7 @@ pub async fn import(
             )
             .await?,
         );
-        let marker_owned = match imported_source_slugs
+        let mut marker_owned = match imported_source_slugs
             .get(&(post.post_type.clone(), marker_identity.clone()))
         {
             // A qualified key like this one names exactly one row.
@@ -1360,6 +1584,25 @@ pub async fn import(
             }
             None => None,
         };
+        // A site that imported this page before #2763 shipped still
+        // carries a marker for its external parent under an older scheme.
+        // Tried last, and only when nothing above matched, so upgrading
+        // does not duplicate it.
+        if marker_owned.is_none()
+            && let Some(parent) = parent_identity(post)
+            && graph.find(post.post_type.as_str(), &parent).is_none()
+            && let Some(parent_id) = parent_now
+        {
+            marker_owned = recover_legacy_row(
+                &repos,
+                &imported_source_slugs,
+                &legacy_marker_index,
+                &post.post_type,
+                &post.slug,
+                parent_id,
+            )
+            .await?;
+        }
         // Matched on the *path*, not the bare slug: a local `/about/team`
         // does not make the file's `/company/team` already present. Treating
         // it as such dropped a page out of the site's own backup.
@@ -1639,6 +1882,14 @@ pub async fn import(
         // shape, and there the parent is *skipped* as already-present — so it
         // is absent from the map, and consulting only the map would drop the
         // child to the top level and change its canonical path.
+        //
+        // `find_local` here still expects an exact position, even for a
+        // bare, external `parent_identity` (#2763). That is safe: the
+        // creation pass above already resolved and applied a bare
+        // external parent through `ParentRef::resolve_local`, so
+        // `already_linked` below is already true for it and this lookup's
+        // result is never used. It matters only for a *file-declared*
+        // parent, which always names an exact position.
         let parent_id = match by_file_identity.get(&(post_type.as_str(), parent_identity.as_str()))
         {
             Some(id) => Some(*id),
