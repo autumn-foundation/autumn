@@ -461,7 +461,19 @@ def ref_labels(text):
     return (label for _, _, label in _scan(text, ref_at))
 
 
-_ROW = r"^(?:- |\d{1,3}[.)] )"
+# An index ROW is a top-level list item. Every marker CommonMark allows is
+# one, and this accepted a third of them: `- ` only, with at most three
+# digits. So `* [A](alpha.md)`, `+ [A](alpha.md)`, `1000. [A](alpha.md)` and
+# `-  [A](alpha.md)` are all ordinary rows that render as list items in
+# cmark-gfm, and all four were reported as "listed in no section" — a false
+# failure telling a contributor to fix an index that is already correct.
+#
+# The limits are CommonMark's own: bullets are `-`, `*` or `+`; an ordered
+# marker is up to NINE digits; and the content sits one to four spaces after
+# the marker, because a fifth space starts an indented code block inside the
+# item instead. `LIST_ITEM` below already carried the digit and bullet rules,
+# which is where they should have been read from in the first place.
+_ROW = r"^(?:[-*+]|\d{1,9}[.)]) {1,4}"
 ROW = re.compile(_ROW)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
@@ -566,21 +578,42 @@ def blank_links(text):
 
 
 def _defn_entries(body):
-    """Every REAL reference definition in `body`, as `(label, destination)`.
+    """Every REAL reference definition in `body`, as `(match, label, dest)`.
 
-    One scanner for both callers. The prepass that computes candidate labels
-    and the scan that resolves them had grown apart: block-start belonged to
-    both, destination validation had been added to one, and a malformed
-    `[o]: bad(unbalanced` therefore marked `o` resolved in the prepass and
-    unresolved in the scan — which deactivated a perfectly good outer link.
+    One scanner for all THREE callers. The prepass that computes candidate
+    labels, the scan that resolves them, and `blank_defns` had grown apart:
+    block-start reached all three, label and destination validation reached
+    only one. So a definition-SHAPED line that defines nothing was blanked
+    anyway by `blank_defns` — and a real, clickable link inside what is
+    actually ordinary paragraph text went with it.
 
-    Every rule a definition must satisfy lives here, so there is no second
+    Every rule a definition must satisfy lives here, so there is no fourth
     place to forget one:
 
     - it must START A BLOCK, or it is a line of the paragraph above it
     - its label must be a label — foldable, and within the 999-character cap
     - its destination must parse, angled by that grammar and bare by
       `dest_at`'s balancing
+
+    KNOWN RENDERER SPLIT, on that last rule. The premise behind it — that
+    `[x]: dest#(unterminated` "creates no definition" — is true of
+    markdown-it-py and of the spec's "parentheses only if balanced" wording,
+    but NOT of cmark 0.31 or cmark-gfm, which is what GitHub serves this
+    README with. Both of those define the label and resolve the reference:
+
+        [x]: bad(unbalanced        ->  <p><a href="bad(unbalanced">Guide</a></p>
+
+        [Guide][x]
+
+    So this rule costs a false failure against GitHub on that one spelling.
+    It is kept anyway, deliberately: `check-docs-orphans.sh` applies the same
+    rule to the same construct, and the repo pins it in
+    `migration_guide_gate_rejects_an_unbalanced_paren_in_a_definition`. Three
+    gates disagreeing about what a definition IS would be a worse defect than
+    all three being stricter than GitHub on a spelling no corpus page uses.
+    Changing it is a cross-gate decision, raised on the PR rather than taken
+    here. INLINE destinations are not affected — there the implementations
+    agree, because `)` has to close something.
     """
     for m in DEFN.finditer(body):
         if not _starts_block(body, m.start()):
@@ -596,7 +629,7 @@ def _defn_entries(body):
             span = dest_at(dest, 0)
             if span is None or span[0] != len(dest):
                 continue
-        yield key, dest
+        yield m, key, dest
 
 
 def candidate_labels(text):
@@ -620,7 +653,7 @@ def candidate_labels(text):
     # The first pass terminates because it resolves no labels: with an empty
     # set every reference image is left alone, which is the conservative
     # direction, and fences and comments do not depend on labels at all.
-    return {key for key, _ in _defn_entries(readable(text, frozenset()))}
+    return {key for _, key, _ in _defn_entries(readable(text, frozenset()))}
 
 
 def opens_fence(line):
@@ -633,6 +666,20 @@ def opens_fence(line):
     """
     m = FENCE.match(line)
     return bool(m) and not (m.group(1)[0] == "`" and "`" in m.group(2))
+
+
+def _setext_context(line_above):
+    """True when a SETEXT underline under `line_above` forms a heading.
+
+    An underline needs a PARAGRAPH line above it. Under a blank line, a
+    heading, a thematic break or a list marker it underlines nothing and is
+    itself ordinary text. Both places that care about Setext now ask this,
+    rather than one asking and the other assuming.
+    """
+    return bool(line_above.strip()
+                and not ATX.match(line_above)
+                and not THEMATIC.match(line_above)
+                and not LIST_ITEM.match(line_above))
 
 
 def _starts_block(text, pos):
@@ -660,9 +707,25 @@ def _starts_block(text, pos):
         prev = text[prev_start:start]
         if not prev.strip():
             return True
-        if (ATX.match(prev) or opens_fence(prev) or THEMATIC.match(prev)
-                or SETEXT.match(prev)):
+        if ATX.match(prev) or opens_fence(prev) or THEMATIC.match(prev):
             return True
+        # A SETEXT underline is a heading — and so a block boundary — only
+        # when a paragraph line sits directly above it. Bare `===` at the
+        # top of a file is ordinary text, so a definition beneath it is that
+        # paragraph's second line and defines nothing; cmark-gfm and
+        # markdown-it both leave the matching `[Guide][x]` literal. Treating
+        # every `===` as a boundary resolved the label anyway and passed a
+        # README whose only route to the index does not render.
+        #
+        # This file already had the rule — the section-heading scan below
+        # spells it out and applies it. It just never reached here, which is
+        # the same one-of-two-sites miss as the five findings before it, so
+        # the context test is now `_setext_context` and lives in one place.
+        if SETEXT.match(prev):
+            if prev_start == 0:
+                return False
+            above_start = text.rfind("\n", 0, prev_start - 1) + 1
+            return _setext_context(text[above_start:prev_start - 1])
         if not DEFN.match(prev):
             return False
         pos = prev_start
@@ -676,13 +739,15 @@ def blank_defns(text):
     same reason they do in `blank_links`.
     """
     out, last = [], 0
-    for m in DEFN.finditer(text):
-        # Only a real definition is blanked. `definitions()` gained the
-        # block-start check and this did not, so a definition-SHAPED line
-        # glued to a paragraph — which defines nothing and whose links are
-        # live — had its whole line removed, taking a real link with it.
-        if not _starts_block(text, m.start()):
-            continue
+    # Only a REAL definition is blanked, and "real" is `_defn_entries`'s
+    # answer rather than a second opinion assembled here. This scan had the
+    # block-start check and neither of the other two rules, so a line like
+    # `[]: alpha.md "t [Guide](docs/guide/index.md)"` — an empty label, so
+    # not a definition, so ordinary paragraph text whose Guide link is live
+    # in cmark-gfm AND markdown-it alike — was blanked whole, and the index
+    # it linked to was reported unreachable. A false failure, from the third
+    # copy of one scan.
+    for m, _, _ in _defn_entries(text):
         out.append(text[last:m.start()])
         out.append(_blank(m.group(0)))
         last = m.end()
@@ -713,7 +778,7 @@ def definitions(text):
       names the page `alpha.md` rather than a file that does not exist.
     """
     out = {}
-    for key, dest in _defn_entries(blank_links(text)):
+    for _, key, dest in _defn_entries(blank_links(text)):
         out.setdefault(key, dest)
     return out
 
@@ -1393,10 +1458,7 @@ def entries(text, base):
         if ATX_H1.match(line):
             section = None
             continue
-        if (SETEXT_H1.match(line) and line_above.strip()
-                and not ATX.match(line_above)
-                and not THEMATIC.match(line_above)
-                and not LIST_ITEM.match(line_above)):
+        if SETEXT_H1.match(line) and _setext_context(line_above):
             section = None
             continue
         target = None
@@ -3218,8 +3280,17 @@ self_test() {
   _case "a 1000-character label is not a label" 1 label_too_long
 
   # 144. A definition's bare destination must balance its parentheses, the
-  #      same rule `dest_at` applies inline. `\S+` accepted a malformed one
-  #      and the fragment strip then hid the evidence.
+  #      same rule `dest_at` applies inline, and the same rule
+  #      `check-docs-orphans.sh` applies to this construct.
+  #
+  #      Round 40 checked the premise this case was written on and found it
+  #      only half true: cmark and cmark-gfm — what GitHub serves — DO define
+  #      the label here and resolve `[Guide][x]`, so against GitHub this
+  #      expectation is a false failure. markdown-it-py and the spec's
+  #      "parentheses only if balanced" wording say otherwise. The behaviour
+  #      is kept to stay consistent with the sibling gate and with
+  #      `migration_guide_gate_rejects_an_unbalanced_paren_in_a_definition`;
+  #      changing it is a cross-gate call, raised on the PR, not taken here.
   _scaffold defn_dest_parens
   printf '# A\n' > "$tmp/defn_dest_parens/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
@@ -3541,11 +3612,16 @@ self_test() {
   _commit uri_schemes
   _case "any URI scheme is outside the guide" 0 uri_schemes
 
-  # 172. A malformed definition must not mark its label resolved. The
-  #      prepass and the real scan had drifted — block-start belonged to
-  #      both, destination validation had reached only one — so `[o]: bad(`
-  #      resolved in one and not the other, deactivating a good outer link.
-  #      `_defn_entries` is now the single scanner both call.
+  # 172. The prepass and the real scan must agree about what a definition is.
+  #      They had drifted, so `[o]: bad(unbalanced` resolved in one and not
+  #      the other; `_defn_entries` is the single scanner all three callers
+  #      now use, so they cannot drift again.
+  #
+  #      Which answer they agree ON is the separate, cross-gate question
+  #      case 144 records: cmark-gfm would define `o` here and make the index
+  #      genuinely unreachable, while this gate and its sibling do not define
+  #      it, leaving the outer link live. The consolidation is what would
+  #      make that a one-line change instead of three.
   _scaffold prepass_validation
   printf '# A\n' > "$tmp/prepass_validation/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
@@ -3553,7 +3629,7 @@ self_test() {
   printf '[outer [Other][o]](docs/guide/index.md)\n\n[o]: bad(unbalanced\n' \
     > "$tmp/prepass_validation/README.md"
   _commit prepass_validation
-  _case "a malformed definition resolves nothing" 0 prepass_validation
+  _case "one scanner decides what a definition is" 0 prepass_validation
 
   # 173. An empty REFERENCE label renders an anchor with nothing in it, so
   #      it is no more an entry than `- [](alpha.md)` is. Case 163 gave the
@@ -3565,6 +3641,86 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/empty_ref_label/README.md"
   _commit empty_ref_label
   _case "an empty reference label is not an entry" 1 empty_ref_label
+
+  # 174. An AUTOLINK in a link's text does NOT deactivate the outer opener.
+  #      Reported as a bug; it is not one. cmark, cmark-gfm and markdown-it
+  #      all render the outer link, because an autolink never touches the
+  #      bracket delimiter stack that the no-nested-links rule works on:
+  #
+  #        <a href="docs/guide/index.md">outer <a href="https://e.com">…</a></a>
+  #
+  #      An HTML parser closes the outer anchor at the inner one, so "outer "
+  #      is clickable and lands on the index. The gate must PASS.
+  _scaffold autolink_in_text
+  printf '# A\n' > "$tmp/autolink_in_text/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/autolink_in_text/docs/guide/index.md"
+  printf '[outer <https://example.com>](docs/guide/index.md)\n' \
+    > "$tmp/autolink_in_text/README.md"
+  _commit autolink_in_text
+  _case "an autolink does not deactivate its outer link" 0 autolink_in_text
+
+  # 175. A definition-SHAPED line that is not a definition is paragraph text,
+  #      and the links in it are live. `blank_defns` blanked this line whole
+  #      — taking the only route to the index with it — because it carried
+  #      the block-start rule and neither of the other two. An empty label is
+  #      not a label in cmark-gfm or markdown-it, so both render the Guide
+  #      link and the gate must PASS.
+  _scaffold blank_defns_validated
+  printf '# A\n' > "$tmp/blank_defns_validated/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/blank_defns_validated/docs/guide/index.md"
+  printf '[]: alpha.md "t [Guide](docs/guide/index.md)"\n' \
+    > "$tmp/blank_defns_validated/README.md"
+  _commit blank_defns_validated
+  _case "a non-definition keeps its links" 0 blank_defns_validated
+
+  # 176. A bare `===` underlines nothing, so it is ordinary text and the
+  #      definition below it is that paragraph's second line. Both renderers
+  #      leave `[Guide][x]` literal, so the index is unreachable and the run
+  #      must FAIL. `_starts_block` called every `===` a block boundary and
+  #      passed this README.
+  _scaffold setext_needs_context
+  printf '# A\n' > "$tmp/setext_needs_context/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/setext_needs_context/docs/guide/index.md"
+  printf '===\n[x]: docs/guide/index.md\n\n[Guide][x]\n' \
+    > "$tmp/setext_needs_context/README.md"
+  _commit setext_needs_context
+  _case "a bare setext underline is not a boundary" 1 setext_needs_context
+
+  # 177. A real Setext heading IS a boundary — the pin for the other
+  #      direction, so 176's fix cannot be "never treat `===` as one".
+  _scaffold setext_real_heading
+  printf '# A\n' > "$tmp/setext_real_heading/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/setext_real_heading/docs/guide/index.md"
+  printf 'Title\n===\n[x]: docs/guide/index.md\n\n[Guide][x]\n' \
+    > "$tmp/setext_real_heading/README.md"
+  _commit setext_real_heading
+  _case "a real setext heading is a boundary" 0 setext_real_heading
+
+  # 178. Every marker CommonMark allows starts an index row. `- ` with at
+  #      most three digits was a third of them, and the rest were reported
+  #      "listed in no section" — a false failure on a correct index.
+  _scaffold row_markers
+  for p in a b c d; do printf '# %s\n' "$p" > "$tmp/row_markers/docs/guide/$p.md"; done
+  printf '# Guide\n\n## S\n\n* [A](a.md)\n+ [B](b.md)\n1000. [C](c.md)\n-  [D](d.md)\n' \
+    > "$tmp/row_markers/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_markers/README.md"
+  _commit row_markers
+  _case "every list marker starts a row" 0 row_markers
+
+  # 179. The other direction: five spaces after the marker is an indented
+  #      code block inside the item, so the link renders as literal text and
+  #      the page really is listed nowhere.
+  _scaffold row_indent_code
+  printf '# A\n' > "$tmp/row_indent_code/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n-     [A](alpha.md)\n' \
+    > "$tmp/row_indent_code/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_indent_code/README.md"
+  _commit row_indent_code
+  _case "five spaces after a marker is code, not a row" 1 row_indent_code
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
