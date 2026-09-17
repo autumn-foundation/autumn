@@ -193,6 +193,9 @@ that doesn't fit the built-in memory/Redis split.
 
 ## `ChannelsBackend` - replace the local/Redis realtime backend
 
+The channels surface is behind the non-default `ws` feature
+(`features = ["ws"]`); see [WebSockets](websockets.md).
+
 ```rust,no_run
 use autumn_web::prelude::*;
 

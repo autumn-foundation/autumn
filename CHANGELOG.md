@@ -7,7 +7,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
+  `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
+  rollout halts. `autumn deploy status --strict` sends one when it finds
+  drift. Both reuse the same `[alerts]` config and channels that `autumn
+  alert test` uses: PagerDuty, Slack, Discord, or a signed webhook. They do
+  not send email. Email needs a running mailer. Each alert's dedup key
+  includes the app name and the deploy profile, so two apps — or staging and
+  production — sharing one destination never fold into one incident.
+  Delivery is best-effort. A failed send never changes the command's exit
+  code. A plain `deploy status` (no `--strict`) never sends an alert.
+  Neither the drift model nor the `--json` contract changed. See
+  `docs/guide/fleet-deploys.md`.
+
 ### Fixed
+
+- **Frame-forge the SQLite fork for the framework control-plane migrations
+  (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
+  api_tokens, the job queue, feature flags, experiments, the shard
+  directory, and the ledger — was Postgres-only DDL (`BIGSERIAL`, `JSONB`,
+  `TIMESTAMPTZ`, `NOW()`, `pg_notify` triggers) with no `_sqlite` sibling,
+  so a SQLite app that registered it could not apply it. Added
+  `autumn/migrations_sqlite`, the SQLite fork of all 21 migration
+  versions: tables already owned by their own SQLite bootstrap (the job
+  queue, job tracking) or moot under `sqlite_sharding_unsupported_guard`
+  (the shard directory and map) get a no-op shim, matching the existing
+  compatibility-shim convention; the rest translate the Postgres DDL
+  following the same rules the framework's three existing `_sqlite` forks
+  (`derivation_migrations_sqlite`, `repository_commit_hook_migrations_sqlite`,
+  `version_history_migrations_sqlite`) already use. `FRAMEWORK_MIGRATIONS`
+  is now backend-forked behind `#[cfg(feature = "sqlite")]` like those
+  three, and `run_pending_sqlite_with_framework_migrations` applies it
+  alongside them. `autumn-cli`'s `--features sqlite` build now refuses a
+  non-`sqlite://` target instead of silently applying its (now SQLite-only)
+  embedded framework migrations to it: `FRAMEWORK_MIGRATIONS` is chosen once,
+  at compile time, by that cargo feature, not per target at runtime.
+- **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
+  api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
+  token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
+  nowhere told them where the token comes from or how to take it back. All
+  four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
+  `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
+  reached readers only through the agent skill tree and `list` / `rotate` /
+  `revoke` reached them nowhere: searching all 160 guide pages for "revoke
+  api token" returned **zero results**, and `issue_scoped_api_token` /
+  `IssueTokenSpec` appeared on none of them. A reader holding a leaked
+  credential had no path from the page that raised the question to the
+  command that answers it. This is a findability defect, not a coverage
+  one — the answer existed and was correct — so the fix is a crosslink at
+  the point the question arises rather than a new page: a section under
+  "Protecting routes" in `docs/guide/authentication.md` naming all four
+  commands and linking the Rust equivalents, and a pointer from
+  `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token. The
+  worked block captures what `issue` and `rotate` print (they write the token to
+  stdout and the confirmation to stderr, so a `$(…)` capture gets the secret and
+  nothing else), and says plainly that `rotate` and `revoke` are alternatives
+  rather than steps: rotating already revokes the token passed to it, so a
+  following `revoke "$TOKEN"` would retire a dead token and strand the live
+  replacement with its secret lost. The Rust pointers name one helper per
+  subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
+  `revoke_api_token` — rather than omitting list and rotate and listing the
+  `IssueTokenSpec` data type as though it were an operation.
+
+  Found by running the docs corpus against the CLI surface in the direction
+  no existing gate runs: the eleven docs gates all ask "is what we wrote
+  still true?" (drift), and none asks "is what we shipped written down
+  anywhere?" (coverage), so a command can ship documented nowhere and the
+  whole tree stays green. That measurement found 26 of 194 command paths
+  absent from all 212 reader-facing pages; most were benign (13 `destroy`
+  subcommands covered by the rule `generators.md` states over the family,
+  one `#[command(hide = true)]` internal), and the `autumn token` family was
+  the defect worth fixing. A gate to hold that line is NOT included here —
+  see the note in the PR: a correct one has to reuse
+  `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
+  its own change.
+- **🧭 Wayfinder: redisplay the "create account to accept" form on a
+  rejected password in examples/teams (error-path 0/3 → 3/3, email
+  preserved):** `POST /invite/{token}/accept` — the join step of the
+  `teams` example's core register/invited → accept → join journey, and the
+  form every not-yet-registered invitee hits to create their account —
+  discarded the submitted invitation (and dropped the visitor onto a
+  generic `application/problem+json`/error-page dead end) on all three of
+  its recoverable failure modes: an empty password, a password over 128
+  characters, and one that fails the configured password policy. Each
+  reached a bare `Err(AutumnError::unprocessable_msg(...))`, the exact
+  anti-pattern already fixed on this same app's `/signup` form (Wayfinder,
+  prior PR) — but `routes::invitations::accept_invitation` lives in a
+  different module and was missed. The invited email is fixed
+  (`readonly`/`disabled`) in this one-field form, so nothing but the error
+  message needed to survive the round trip; the token itself is untouched
+  by a rejected attempt, so a corrected resubmission still succeeds.
+  `accept_signup_form` is now shared between `show_invitation`'s GET
+  render and the new `redisplay_accept_signup`, which each of the three
+  branches calls instead of returning `Err`, re-rendering at 422 with
+  `role="alert"`/`aria-invalid` wired the same way `/signup`'s redisplay
+  already is. `create_invitation`'s admin-facing "Send Invitation" form
+  (on `/members`) has the same underlying anti-pattern on its own two
+  failure modes (bad email, unknown role) but is a separate page/form —
+  deliberately left as a smaller, out-of-scope follow-up.
+- **🧭 Wayfinder: redisplay the admin post editor on failure in `examples/cms`
+  (error-path 0/5 → 5/5) [no-plugin]:** an error-path inventory of `cms`'s
+  admin content editor — `create`/`update` behind `/admin/content/{post_type}`,
+  `supported`-tier and the richest hand-written form in the example fleet
+  (title, slug, body, excerpt, status, scheduled date, taxonomies, featured
+  image, parent/order, comments/sticky/password) — found five recoverable
+  failure modes (a blank/whitespace title while publishing, going private, or
+  scheduling; a scheduled date in the past; no scheduled date at all; and —
+  folded in alongside #2790's own inventory of this same editor — a
+  scheduled date that daylight saving skips) each reached `AutumnError` via
+  `?` (the state machine's `can_publish` guard,
+  `normalize_post`'s direct-create check, `require_future_publish_date`) and
+  produced the generic `application/problem+json`/error-page response instead
+  of redisplaying the form: 0 of 5 failure modes were adjacent to cause,
+  persisted in place, said how to recover, or preserved the author's draft.
+  Same anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530),
+  `reddit-clone`'s create-community form (#2665) and `blog`'s post editor
+  (#2687), on the example fleet's largest form yet to carry it. Fix:
+  `validate_submission` runs all five checks pre-flight, before any write,
+  and `create`/`update` redisplay the editor at 422 through a new
+  `EditorValues` (the submission's own values, not the database) and
+  `apply_submitted_taxonomies`/`ensure_submitted_choices_visible` (the
+  taxonomy/parent/featured-image picks the author made, re-added to their
+  bounded pickers the same way `EditorContext::load` already re-adds a post's
+  *persisted* ones), instead of the generic error page. `title`/`publish_at`
+  wire `aria-invalid`/`aria-describedby` to a `role="alert"` message; every
+  Tailwind class and control is unchanged. The hidden stale-edit
+  `lock_version` field now comes from the submission (`EditorValues::
+  lock_version`), not a fresh database read, so a submission that was already
+  stale when it hit a validation error stays stale through the redisplay
+  rather than laundering into a version the corrected resubmission would
+  silently pass. The deeper checks (`guard_deferred_transition`, the state
+  machine's `can_publish` guard, `normalize_post`'s own check) are untouched —
+  they remain the authority for the JSON API and importer. 9 new unit tests
+  (`editor_validation_tests`) and 4 new Docker-gated integration tests cover
+  the five failure modes, the stale-lock-version regression, and that a
+  rejected transition never partially applies.
+
+- **🛣️ Onramp: a route-attribute typo (`#[get()]`) no longer cascades through
+  `routes![]` into two extra "cannot find" errors, one of them naming an
+  internal macro symbol (errors 3→1):** a fresh-context audit of the README
+  quickstart (`docs/reports/echo-audit-run.md`) typo'd `#[get("/")]` as
+  `#[get()]` and, once the handler was registered the documented way
+  (`routes![handler]`), got the real "expected string literal" error plus
+  `error[E0425]: cannot find value `handler`` and `error[E0425]: cannot find
+  function `__autumn_route_info_handler`` — the handler had silently vanished
+  from the module, because `route_macro` returned bare `compile_error!`
+  tokens on an attribute-parse failure without re-emitting the annotated
+  function at all. `#[agent_operable]` and `#[query_budget]` already guarded
+  against exactly this; `route_macro` — the macro every `#[get]`/`#[post]`/
+  `#[put]`/`#[patch]`/`#[delete]` handler goes through — was the one
+  exception. `emit_with_attr_parse_error` now re-emits the handler plus a
+  stub `__autumn_route_info_*` companion alongside the diagnostic, handling
+  an already-expanded guard's leading gate items (`#[secured]`/`#[step_up]`/
+  `#[throttle]` stacked above the malformed attribute) and stripping the
+  route-macro-only `#[intercept(...)]`/`#[api_doc(...)]` markers so neither
+  adds its own "cannot find attribute" on top.
 
 - **the Cold-Start Onboarding Gate stops failing every scheduled run (#2309):**
   the gate (issue #977) checks the no-DB `hello` app against a p95 60s / max
@@ -106,6 +263,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/commentable.md`.
 
 ### Added
+
+- **🔒 `#[confidential]` — operator-blind fields sealed under a key the server
+  never holds (#1771).** `#[encrypted]` protects a column at rest under keys
+  *the operator holds*: it stops a stolen disk, not a rogue admin, a subpoena or
+  a leaked backup. A `#[confidential]` field removes the operator from the trust
+  boundary. The value is sealed client side with `autumn_web::confidential`:
+  AES-256-GCM under per-field keys derived from a client-held `RootKey` and a
+  length-prefixed table/column/owner scope. That scope, the envelope header and
+  an optional record id are the AEAD associated data, so an envelope copied into
+  another column, table or user no longer opens — and `FieldContext::for_record`
+  extends that to the row, which `FieldContext::new` deliberately leaves open
+  and the guide says so. The column is declared as the opaque `Sealed` type
+  rather than `String`, so the only value the server can bind is the envelope —
+  and the database, `autumn db backup` output, the access and error log, replay
+  capsules, record version history, the admin UI and its CSV export carry
+  ciphertext by construction rather than by scrubbing. Equality still works,
+  through a client-computed `BlindIndex` token in a `<field>_bidx` companion
+  column: a fixed-length keyed MAC that leaks neither the plaintext nor its
+  length, that an operator cannot recompute, and that compares in constant time.
+  Everything that would make the operator read, index, order or join the value
+  is a **build failure**: `#[searchable]`, `#[unique]`, `#[indexed]`,
+  `#[references]`, `#[normalize]`, `#[encrypted]`, `#[classified]`,
+  `#[translatable]`, a serde or Diesel column rename, the model's shard key, a
+  non-`Sealed` field type, and — across the macro boundary, through the column
+  list `#[model]` publishes — a derived `find_by_<field>`,
+  `find_or_create_by_<field>`, `cursor_key = <field>` or grouped aggregate in
+  `#[repository]`. The `Sealed` and `BlindIndex` field types are proven by a
+  generated type assertion, not only by name, so an app type that happens to
+  share a name cannot earn the guarantee. `RootKey` has no `Serialize`, no
+  `Display` and no byte accessor, is never built from configuration or the
+  credentials store, and zeroizes on drop along with the AES key schedule.
+  `docs/guide/confidential-fields.md` states the threat model — including what
+  sealing does *not* hide — and `confidential_threat_model` asserts in CI that
+  the guide and the code agree on the "cannot see" set, while
+  `confidential_red_team` stores and re-reads a value over authenticated HTTP,
+  then dumps the database, a backup artifact, the full log and a replay capsule
+  and proves zero plaintext in all four.
+
+- **`autumn-admin-plugin` builds under the `SQLite` backend, and an
+  application's own `AdminModel`s run there (#2108) [no-plugin].** A `SQLite`
+  app could not compile the admin plugin at all. Two Postgres-only diesel
+  constructs stopped it: the `Timestamptz` SQL type on five `QueryableByName`
+  rows and on the typed `ExperimentChange` model, and three `Array<BigInt>`
+  bulk binds. PR #2125 changed the connection type to `RuntimeConnection`. That
+  change did not remove these errors. This change removes them. Every timestamp
+  row now declares the portable `Timestamp` type with a `NaiveDateTime` field,
+  and the three batched bulk deletes sit in the `pg` arm of
+  `autumn_web::backend_select!`. `cargo clippy -p autumn-admin-plugin --features
+  autumn-web/sqlite --all-targets` is clean, and CI's `SQLite runtime` job gates
+  it. **No change to any SQL sent, or to any value read, on Postgres.** Postgres
+  sends `timestamp` and `timestamptz` in the same binary form: microseconds from
+  2000-01-01 UTC. A `Timestamp` read of a `timestamptz` column gives the same
+  instant. The new `experiment_admin_db` and `feature_flag_admin_db` suites
+  assert this on a non-UTC session, for `changed_at` and for `updated_at`. The
+  Postgres statement text does not change, so the one-statement result the
+  `*_bulk_delete_batch_profile` harnesses measure still holds; a new guard test
+  keeps the batched fragment of each statement. An app on either backend can now
+  register its own `AdminModel`s;
+  `autumn-admin-plugin/tests/custom_admin_model.rs` runs one test body on both,
+  from CI's `Test (Docker)` and `SQLite runtime` jobs. The three BUILT-IN models
+  (`tokens`, `experiments`, `feature_flags`) stay Postgres-only, because their
+  migrations use Postgres-only DDL and the tables do not exist on `SQLite`. On
+  `SQLite` each refuses every call with an error that names the model and points
+  at the README, instead of sending Postgres SQL to a `SQLite` driver — a
+  source guard keeps every method opening with that check, and a SQLite-lane
+  test drives all 23 of them. The
+  plugin README lists the four rules that keep an application model's SQL
+  portable.
+
+- **`scripts/check-docs-features.sh` — feature-gate documentation gate
+  [no-plugin].** Every reader-facing page that shows Rust reaching for an
+  `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature
+  on the page. Every docs gate before it read the corpus against a crate built
+  with every feature on, and `check-docs-symbols.sh` says
+  so deliberately: resolving against the default set "would report an item a
+  reader can absolutely use as missing". That reasoning is right, and it leaves
+  a hole the shape of its own premise — proving `autumn_web::pdf::Pdf` EXISTS
+  is not the reader's question. Theirs is whether it exists in *their* build,
+  and `autumn-web`'s default set is eight features (`maud`, `htmx`, `tailwind`,
+  `db`, `cache-moka`, `http-client`, `reporting`, `flash`) out of fifty. So a
+  page could open on `use autumn_web::pdf::Pdf;` with every path resolving,
+  every macro argument valid, every link live — and the reader who pastes it
+  into the project the quickstart just scaffolded gets `error[E0433]: failed to
+  resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
+  whose fix is a line in a file the page never showed them. Baseline: 78 gated
+  uses checked, **17 defects across 13 pages**. Three sat under a literal
+  "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
+  `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
+  read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
+  the missing line — "requires the `maud` feature; enabled together with `pdf`
+  in the quick start above", where the quick start above carried no
+  `Cargo.toml` at all. The tenth — `docs/guide/jobs.md:824`, a
+  `use autumn_web::data::csv::export_csv;` in the async-CSV-export walkthrough,
+  on a page that never names `csv` — is reachable only once a second path
+  segment is resolved: `pub mod data;` is unconditional, so the gate that reads
+  only the head segment drops the path entirely. All ten are fixed in the same
+  commit. Truth set is
+  parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs` and
+  `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
+  snapshot — so moving an item behind a new feature moves the gate in the same
+  commit; only column-zero declarations count, which keeps `lib.rs`'s five
+  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. A
+  `#[cfg(all(…))]` conjunction requires every conjunct, so each non-default one
+  is reported separately and `autumn_web::presence_stream` asks for `presence`
+  *and* `ws`; the attribute is read by parenthesis balance, since that item's
+  gate wraps across four lines, and `pub use autumn_edge as edge;` is read as
+  the module it is to a reader despite carrying no `::`. `any(…)` and `not(…)`
+  leave an item ungated — naming one alternative already satisfies the first,
+  and the second marks an item that exists when the feature is *off*, so
+  demanding it would tell a reader to enable the one flag that removes what
+  they came for. One level BELOW the crate root is resolved too, because a gate
+  under an unconditional module is invisible from the head segment and worst
+  when the head is default — `autumn_web::db::sqlite_types` needs `sqlite`
+  while `db` is on by default — and a fence inside a `>` callout is read like
+  any other. Naming an *implying* feature counts, walking the manifest's
+  implication graph rather than subtracting the default closure alone:
+  `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
+  `presence_stream` snippet is complete, and demanding `ws` by name there would
+  be the gate telling an author to break a page that works. A gated
+  `#[macro_export] macro_rules!` in the crate root is recorded too — reachable
+  as neither a module nor a `pub use`, so `embed_static!()` and
+  `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
+  group is read entry by entry, which ordinary use-tree syntax had slipped past.
+  Judged
+  A declaration also made with no feature requirement — a complementary
+  `not(…)` arm — removes its gated siblings in the same namespace, so
+  `db::RuntimeConnection` is not reported as needing `sqlite` when it exists in
+  a default build; per namespace, since `edge` is an ungated attribute macro
+  *and* a gated module re-export.
+  `#[cfg(any(test, feature = "X"))]` resolves to `X`, since `cfg(test)` never
+  holds for a dependency — a reader testing against autumn-web needs the
+  feature. A `--features` flag counts only when the command does not select
+  another package (`cargo install diesel_cli --features postgres` does not),
+  a local `[features]` row counts only when it forwards
+  (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
+  is tied to an `autumn-web` dependency — in either TOML string form, and
+  including the `autumn_web = { package = "autumn-web", … }` rename Cargo
+  requires when the table key uses an underscore, and in a `dev-`/`build-`
+  dependency table as readily as a plain one; `-F` counts as `--features`: unqualified, any crate's array satisfied the gate, and the corpus
+  carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
+  enables axum's websockets and nothing of autumn-web's.
+  One level below the root resolves both gated MODULES and gated ITEMS, since
+  `pub mod openapi;` carries no `#[cfg]` while `openapi::Parameter` does.
+  Which macros are attributes and which are bang calls is read from
+  `autumn-macros`'s own `#[proc_macro]`/`#[proc_macro_attribute]` lines rather
+  than listed by hand, so `t!`, `mail_previews![…]` and `wire_client!` are
+  judged as the bang macros they are; a group hanging off a module segment
+  (`storage::{variant::{Transform}}`) resolves its inner child.
+  A bare type name is read inside a fence that writes
+  `use autumn_web::prelude::*;` — scoped to that glob and to names starting
+  uppercase — which is how four further defects surfaced, among them
+  `docs/guide/presence.md` telling readers to enable `ws` when the feature is
+  `presence` (`presence = ["ws"]` runs one way only, so an app on `ws` alone has
+  no `Presence` extractor at all). Judged
+  only inside ```` ```rust ```` fences, since a feature gate is a *compile*
+  failure: a capability table naming `autumn_web::pdf::Pdf` describes an
+  example, it does not hand anyone a line. Presence is gated, placement is not
+  — three pages name the feature only after the code that needs it (worst:
+  `tauri-mobile-offline-sync.md`, +221 lines) and that count is printed on
+  every run rather than enforced, because a page whose enabling line sits in a
+  later "Prerequisites" section is a legitimate shape. A construct a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- feature-gate-allow: … — reason -->` marker; the baseline needed none.
+  Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit rather
+  than after its corpus had a chance to drift, for the reason #2709 exists.
 
 - **The docs symbol gate now covers every published crate, and rejects a path
   into a crate with no library target:** `scripts/check-docs-symbols.sh`
@@ -581,6 +903,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
+  `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL
+  type the generated DSL binds, and `DateTime<Utc>` maps to the Postgres-only
+  `Timestamptz`, which stopped the crate compiling under `autumn-web/sqlite`.
+  **Breaking:** a downstream that names this public type sees three changes —
+  the field type itself, the `Serialize` output (now `"2024-01-15T12:34:56"`,
+  with no `Z`), and the derived OpenAPI schema (no `"format": "date-time"`).
+  Call `.and_utc()` to recover a `DateTime<Utc>`. The column stays
+  `timestamptz`, and the value does not move. See the
+  [migration guide](docs/migrations/next.md#admin-plugin-experimentchangechanged_at-is-now-naivedatetime).
+
 - **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
   CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
   `csrf.rs` and `submit_token.rs` each carried a byte-identical private
@@ -729,6 +1062,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undetected. Key-quoting is now stripped (key portion only; value quotes
   stay significant) before the rules run, in `feed()`'s output for entries
   and on section headers. Pinned by three new self-test cases (32/32).
+- **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
+  admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
+  an error-path inventory of `POST /admin/users` — the
+  account-creation half of `cms`'s user/role management screen, the `#[state_machine]`
+  post lifecycle example's "roles"/"moderate" journey (`supported`-tier per
+  EXAMPLES.md) — found all 5 of the handler's recoverable failure modes (a
+  password failing the configured policy, an invalid email, an email over the
+  length cap, an empty username, a username that is not already a slug) sent
+  the submission through `AutumnError::unprocessable_msg`'s generic
+  `application/problem+json`/error-page response, instead of redisplaying the
+  "Add user" card: 0 of 5 were adjacent to their cause, persisted in place,
+  said how to recover, or preserved the username/email/role the administrator
+  had already entered — a long session of account setup lost to a single
+  rejected password, with only a link back to the dashboard. Same anti-pattern
+  already fixed in `blog`'s post editor (#2687), `reddit-clone`'s
+  create-community form (#2665), `saas`/`teams`'s auth forms (#2530), and
+  `autumn-admin-plugin`'s generic form (#2422). Fix: `create` now catches
+  both the pre-check password-policy failure and any
+  `Err` `create_user_as` returns — a `normalize_new_user` rejection (422) or a
+  duplicate username/email (409/unique-violation) — and calls the new
+  `redisplay_add_user`, which re-renders the whole Users screen (table,
+  pagination, and the "Add user" card refilled with the submitted username,
+  email and role — never the password, same convention `/register` already
+  uses) at 422 with the failure message next to the card, announced via
+  `role="alert"`. `list` and `create` now share one `users_page` renderer
+  instead of duplicating the table/pagination markup. Any other failure (pool
+  outage, an unrelated 5xx) still propagates unchanged. No new dependency and
+  no redesign — same Tailwind classes, same fields, same layout. `Csrf` gains
+  a `#[cfg(test)]`-only `disabled()` constructor so this and future route
+  modules can unit-test markup that embeds `csrf.input()` without a live
+  request. Four new unit tests in `routes::admin::users::tests` cover value
+  preservation, the error being announced adjacent to the fields, the
+  no-error case rendering no alert, and the pre-fix `unprocessable_msg` status
+  (`cargo test -p cms --lib routes::admin::users`: 4 passed). `cargo clippy -p
+  cms --all-targets -- -D warnings` and `cargo fmt --all -- --check`: clean.
+  This environment had no Postgres/Docker available to boot a live server, so
+  — unlike the `blog`/`reddit-clone` fixes — the redisplay was verified
+  through the unit tests above rather than an end-to-end curl session; a
+  reviewer with a database should confirm a live rejected submission
+  end-to-end before merge.
 - **`unique_violation_field` on SQLite (#2698):** diesel boxes a `SQLite`
   unique-constraint violation's error information as a bare `String`, whose
   `constraint_name()` always returns `None` — there is no `SQLite`
@@ -1466,6 +1839,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `docs/security/2026-09-13-repository-owner-api-bypass/`.
 
 ### Performance
+
+- **🗃️ Ledger: batch `autumn-billing`'s dunning restart re-arm into one
+  round trip (insert calls N→1 per restart):** every process restart,
+  `dunning::rearm_pending` re-queues every open dunning retry row. It used
+  to call `JobClient::enqueue_due` once per row, awaited in sequence, so N
+  open rows cost N sequential `INSERT INTO autumn_jobs` round trips against
+  the pool a freshly-restarted process is about to serve live traffic
+  through — worst right when an upstream payment-provider outage has
+  already grown the backlog (issue #2748). `JobClient` gains
+  `enqueue_many_due` (`autumn/src/job.rs`): one batched
+  `INSERT ... SELECT ... FROM UNNEST(...)` statement for the whole item
+  list, still applying each row's own uniqueness dedup guard and
+  `ON CONFLICT (name, unique_key) DO NOTHING`, when the active backend and
+  job settings can't observe a difference — Postgres, no registered
+  `JobInterceptor`, no TTL uniqueness window. Any other case (an
+  interceptor, the local/redis backend, a TTL-windowed job) falls back to
+  one `enqueue_due` call per item, identical to today's behavior. Dunning's
+  retry job (`unique_by = "invoice_id"`, `unique_window = "pending"`) meets
+  all three conditions, so `dunning::rearm_rows` now calls
+  `enqueue_many_due` once per restart instead of looping a single-row
+  enqueue: the Docker-gated `dunning_rearm_pending_profile` harness (added
+  as a findings-only measurement in issue #2747) now asserts exactly one
+  `INSERT INTO autumn_jobs` call at every backlog tier (50/500/2,000 open
+  rows), not one call per row. The batch shares the single-row path's
+  `"job_queue"` circuit breaker (`JobClient::job_queue_breaker`, extracted
+  from `enqueue_durable`), so a Postgres outage trips the breaker and
+  fails the batch fast the same way it already did per row, rather than
+  bypassing that protection. `JobClient::enqueue_many_due`'s gating logic
+  is covered by a new unit test
+  (`can_batch_enqueue_only_when_postgres_uninterrupted_and_non_ttl`); no
+  other call site was changed.
+
+- **⚡ Bolt: `MemorySearchBackend::keyword_search` sorts only the requested
+  page instead of the whole match set (instructions -15.4%, DHAT bytes
+  -24.9%):** `keyword_search` (`autumn-search/src/memory.rs`) collected every
+  matching document into `hits`, ran a full `sort_hits` (stable `sort_by`)
+  over the entire match set, then handed the sorted `Vec` to `paginate`,
+  which only ever keeps one `size`-row page (20 rows in
+  `benches/keyword_search.rs`, the shape `SearchClient::search` exposes). An
+  AND query over a shared vocabulary routinely matches a large fraction of
+  the corpus — profiling the committed 5,000-document/2-field bench found
+  the sort (`quicksort`/`quicksort'2`) costing ~13.5% of the bench's own
+  instructions to serve a 20-row page out of matches numbering in the
+  thousands. `keyword_search` now computes the page's `offset + size` window
+  up front and calls a new `sort_top_k`, which uses
+  `select_nth_unstable_by` to partition the match set around the last
+  needed index in O(n), then runs the same canonical-order `sort_by` (now
+  `hit_order`, factored out of `sort_hits`) over only that prefix — falling
+  back to a full `sort_hits` when the requested window covers the whole
+  match set. `vector_search`'s own `sort_hits` + `truncate` is untouched:
+  this fix only changes what `keyword_search` measurably pays for, per its
+  committed benchmark.
+  Measured on `autumn-search/benches/keyword_search.rs` (2,000 queries):
+  `valgrind --tool=callgrind` instructions 23,551,537,844 → 19,919,821,513
+  (**-15.4%** overall, **-16.2%** on the per-query marginal after
+  subtracting the shared 0-iteration fixed cost); `valgrind --tool=dhat`
+  total allocated bytes 1,158,185,947 → 870,024,907 (**-24.9%**, block count
+  unchanged at ~18.45M — Rust's stable sort allocates a merge buffer sized
+  to the slice being sorted, so sorting ~20 elements instead of the whole
+  match set shrinks that buffer's size, not the number of allocations).
+  Behavior is unchanged: all 128 `autumn-search` lib tests pass unmodified,
+  including the pagination-total and tie-break-by-id cases.
+
+- **⚡ Bolt: cache the AES-256-GCM cipher on `DataKey` instead of rebuilding
+  it on every `encrypt`/`decrypt` call (instructions -25.5%):**
+  `KeyRing::encrypt`/`KeyRing::decrypt` (`autumn/src/encryption.rs`, the
+  `#[encrypted]` attribute-encryption read/write path) each called
+  `Aes256Gcm::new_from_slice(&data_key.key)` — running the AES-256 round-key
+  expansion — on every single call, even though a `KeyRing` is built once
+  at startup and its `DataKey`s are immutable for the life of the process.
+  `DataKey` now builds its `Aes256Gcm` cipher once, in `derive_data_key`,
+  and `encrypt`/`decrypt` reuse it. Measured on the committed
+  `autumn/benches/attribute_encryption.rs` harness (10,000-row mixed
+  plaintext/encrypted read workload): `valgrind --tool=callgrind`
+  instructions 110,539,489 → 82,350,474 (**-25.5%**), the AES key-init
+  functions (`Aes256Enc::new`/`KeyInit::new_from_slice`) that accounted for
+  ~9.8% of the pre-fix profile no longer appear. No change in allocation
+  count (`valgrind --tool=dhat`: 85,531 blocks / 4,376,259 bytes, both
+  before and after — the cipher never heap-allocated). Behavior is
+  unchanged: all 31 `encryption`/`push::encryption`/`push::service` unit
+  tests pass unmodified.
 
 - **🗃️ Ledger: batch `examples/cms`'s search/listing permalink resolution
   (statements 16-80→0, buffers -42%..-80%):** `Repos::permalink`
@@ -7649,6 +8103,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cover this: a database-level test in
   `autumn/tests/integration/commentable.rs`, and scaffold-output tests in
   `autumn-cli`'s `scaffold_commentable.rs`.
+
+### Performance
+
+- **The Postgres pool no longer pings twice per checkout (#2485):** every
+  `#[repository]`-generated acquire, and every `Db::checkout`, already runs
+  `SET statement_timeout` on each checkout — a round trip to Postgres that
+  already proves the connection is alive. Deadpool's default
+  `RecyclingMethod::Verified` sent a second, redundant `SELECT 1` for the
+  same signal. `create_pool`'s `ManagerConfig` now sets
+  `RecyclingMethod::Fast`, dropping that extra round trip — the same
+  recycling method the `record_db`/`replay_db` capture pools already use,
+  for the same reason. A dead connection still fails fast: at the `SET
+  statement_timeout` call, not at the pool's own ping. Measured in the
+  issue's `repository_crud` bench: -13.00% instructions and
+  -14.44%/-16.20% allocation blocks/bytes per round (`valgrind
+  --tool=callgrind`/`--tool=dhat`, 5,020 rounds).
+
+  Two health/readiness checks relied on the pool's own ping instead of
+  running a query: `ShardHealthIndicator`'s primary/replica checks
+  (`sharding.rs`) and the replica readiness probe (`probe.rs`) checked out a
+  connection and dropped it, with no query in between. Under `Fast` that
+  checkout alone no longer proves the connection is alive, so a dead
+  primary or replica could report ready. Both now run a `SELECT 1` (the new
+  `db::probe_connection_alive`) on the checked-out connection before
+  deciding readiness, independent of the pool's recycling method.
 
 ## [0.7.0] - 2026-08-23
 

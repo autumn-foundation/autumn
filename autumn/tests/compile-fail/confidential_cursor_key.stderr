@@ -1,0 +1,10 @@
+error[E0080]: evaluation panicked: `cursor_page` puts `PagedNote::body` in a server-side ORDER BY and keyset predicate, but that column is `#[confidential]`: it is sealed under a key the server never holds, so the database only ever compares ciphertext. Declare the field `#[confidential(blind_index)]` and query its companion column `body_bidx`, whose token the client computes and the server can compare.
+  --> tests/compile-fail/confidential_cursor_key.rs:22:1
+   |
+22 | / #[autumn_web::repository(
+23 | |     PagedNote,
+24 | |     table = "paged_notes",
+25 | |     cursor_key = body,
+26 | |     cursor_key_type = autumn_web::confidential::Sealed
+27 | | )]
+   | |__^ evaluation of `<PgPagedNoteRepository as PagedNoteRepository>::cursor_page::{closure#0}::_` failed here

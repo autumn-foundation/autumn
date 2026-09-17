@@ -162,9 +162,17 @@ import sys
 # and the whole argument of this file is that copying is exactly what needs
 # watching: a fifth spelling of "reader-facing", unwatched, is how the three
 # divergences in the header happened.
+#
+# `check-docs-features.sh` joins on the same terms, in the same commit that adds
+# it. It asks the sixth question about one page — whether the page names the
+# Cargo feature the Rust it shows needs — and a page that is reader-facing for
+# the `autumn_web::…` path in a fence is reader-facing for the feature that path
+# is behind. The two gates read the same fences; splitting their corpora would
+# put an item under one owner and its enabling line under none.
 SIBLINGS = (
     'scripts/check-docs-cli.sh',
     'scripts/check-docs-config.sh',
+    'scripts/check-docs-features.sh',
     'scripts/check-docs-symbols.sh',
     'scripts/check-docs-versions.sh',
 )
@@ -510,7 +518,10 @@ examples/todo/NOTES.md'
       git -C "$dir" init -q
       git -C "$dir" add -A
 
-      for g in cli config symbols versions; do
+      # Every name in `SIBLINGS`: a synthetic tree missing one of them makes
+      # the gate fail for want of a script rather than over the corpora the
+      # case is about, which is how three passing cases read as failures.
+      for g in cli config features symbols versions; do
         { echo '#!/usr/bin/env bash'; echo "cat <<'CORPUS'"; echo "$sib"
           echo 'CORPUS'; } > "$dir/scripts/check-docs-$g.sh"
       done
