@@ -141,6 +141,7 @@ run_check() {
 import re
 import subprocess
 import sys
+import urllib.parse
 
 root = sys.argv[1]
 
@@ -245,7 +246,41 @@ _CLOSE = r"(?:" + _WS1 + r"(?:" + _TITLE + r"))?" + _WS + r"\)"
 # and every fixed bound is a false failure one level further down. The rest
 # of this file's grammar stays in regex; only the counting part moved out,
 # because counting is the part a regex cannot do.
-_TAIL = re.compile(r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
+# The pieces of a link's tail that regex still handles: the opening paren
+# with its whitespace, the angle-bracketed destination form, and the close
+# (optional title, whitespace, `)`). The BARE destination is scanned instead,
+# for the same reason link text is — its parens nest to any depth, and every
+# fixed level is a false failure one level down.
+_OPEN = re.compile(r"\(" + _WS)
+_ANGLE_DEST = re.compile(_ANGLE)
+_CLOSE_RE = re.compile(_CLOSE)
+
+
+def dest_at(text, pos):
+    """`(end, destination)` for a BARE destination at `pos`.
+
+    Stops at whitespace or at a `)` that is not inside a balanced pair, so
+    `a((b)).md` is one destination and `x.md)` ends at the close. A fragment
+    is split off here, as `_FRAG` used to do.
+    """
+    depth, j, n = 0, pos, len(text)
+    while j < n:
+        ch = text[j]
+        if ch == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if ch in " \t\n":
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        j += 1
+    if depth:
+        return None
+    return j, text[pos:j]
 # A reference LABEL, which — unlike text — may not contain unescaped
 # brackets, so it stays a flat run.
 _LABEL = re.compile(r"\[([^\]]*)\]")
@@ -288,10 +323,21 @@ def link_at(text, pos, pairs=None):
     close = bracket_span(text, pos, pairs)
     if close is None:
         return None
-    m = _TAIL.match(text, close)
-    if m is None:
+    op = _OPEN.match(text, close)
+    if op is None:
         return None
-    return m.end(), m.group(1)
+    ang = _ANGLE_DEST.match(text, op.end())
+    if ang is not None:
+        after, dest = ang.end(), ang.group(0)
+    else:
+        hit = dest_at(text, op.end())
+        if hit is None:
+            return None
+        after, dest = hit
+    end = _CLOSE_RE.match(text, after)
+    if end is None:
+        return None
+    return end.end(), dest
 
 
 def ref_at(text, pos, pairs=None):
@@ -975,6 +1021,18 @@ def normalise(target, base):
     # valid README links. Stripping here rather than at each call site is the
     # point: a caller cannot forget it.
     target = target.split("#", 1)[0].rstrip()
+    # A rendered link is a URL, and `check-docs-links.sh` already resolves
+    # one this way. Disagreeing with the sibling gate about what a
+    # destination means is worse than either convention on its own: the two
+    # would accept different indexes. So the same three transformations, in
+    # the same order.
+    #
+    # `alpha.md?plain=1` addresses the file, not a file with a query in its
+    # name; `alpha%2Emd` is percent-encoded; `alpha\.md` carries markdown
+    # escapes that are not part of the path.
+    target = target.split("?", 1)[0]
+    target = urllib.parse.unquote(target)
+    target = re.sub(r"\\(.)", r"\1", target)
     target = target.rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
         return None
@@ -2745,6 +2803,42 @@ self_test() {
     > "$tmp/valid_tag_blanked/README.md"
   _commit valid_tag_blanked
   _case "a label inside an attribute is not a reference" 1 valid_tag_blanked
+
+  # 133. A rendered link is a URL, and `check-docs-links.sh` already resolves
+  #      one this way. Comparing the query, the encoding or the markdown
+  #      escape as part of the filename rejected ordinary rows — and would
+  #      have had the two gates disagree about what an index may contain.
+  _scaffold url_spellings
+  printf '# A\n' > "$tmp/url_spellings/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/url_spellings/docs/guide/beta.md"
+  printf '# C\n' > "$tmp/url_spellings/docs/guide/gamma.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha\\.md)\n- [B](beta%%2Emd)\n- [C](gamma.md?plain=1)\n' \
+    > "$tmp/url_spellings/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/url_spellings/README.md"
+  _commit url_spellings
+  _case "escaped, encoded and queried destinations resolve" 0 url_spellings
+
+  # 134. Parentheses nest in a bare destination too, so the destination is
+  #      scanned for the same reason link text is.
+  _scaffold nested_parens_dest
+  printf '# A\n' > "$tmp/nested_parens_dest/docs/guide/a((b)).md"
+  printf '# Guide\n\n## S\n\n- [A](a((b)).md)\n' \
+    > "$tmp/nested_parens_dest/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/nested_parens_dest/README.md"
+  _commit nested_parens_dest
+  _case "parentheses nest in a destination" 0 nested_parens_dest
+
+  # 135. ...and the guard: an UNBALANCED paren does not swallow the close,
+  #      so the row is reported rather than half-read.
+  _scaffold unbalanced_parens_dest
+  printf '# A\n' > "$tmp/unbalanced_parens_dest/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](a(b.md)\n' \
+    > "$tmp/unbalanced_parens_dest/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/unbalanced_parens_dest/README.md"
+  _commit unbalanced_parens_dest
+  _case "an unbalanced paren is not a destination" 1 unbalanced_parens_dest
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
