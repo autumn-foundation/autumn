@@ -1163,6 +1163,31 @@ SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # A list item marker, used only to tell a nested list from an indented
 # code block.
 LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
+# The same marker, split so the item's CONTENT COLUMN can be measured.
+# Indentation inside a list item is counted from that column, not from the
+# margin: six spaces under `- ` is four past the content column and opens an
+# indented code block, while four spaces is only two past and stays prose.
+# Suppressing code detection for the whole of a list — which is what
+# `in_list` alone did — made a README whose only route to the index sat in a
+# worked example look clickable.
+_LIST_COL = re.compile(r"^( *)((?:[-*+]|\d{1,9}[.)]))( +)")
+
+
+def list_content_col(expanded):
+    """The column an item's content starts at, or None if not an item.
+
+    `expanded` must already have had its tabs expanded and any block-quote
+    marker removed, so a column really is a column.
+    """
+    m = _LIST_COL.match(expanded)
+    if m is None:
+        return None
+    marker_end = len(m.group(1)) + len(m.group(2))
+    pad = len(m.group(3))
+    # Five or more spaces after a marker do not push the content column out
+    # that far: the item's content begins one column past the marker and the
+    # rest is an indented code block inside it.
+    return marker_end + (pad if pad <= 4 else 1)
 # A well-formed inline HTML tag, whose ATTRIBUTES are not links. A tag may
 # wrap across lines — `<span\ntitle="…">` is one tag — but never across a
 # BLANK line, which bounds the damage a stray `<` can do: with no `>` before
@@ -1259,6 +1284,10 @@ def readable(text, resolved=None):
     # indented continuation line stay part of its paragraph.
     in_paragraph = False
     in_list = False
+    # The content column of the innermost open list item. Zero outside a
+    # list, which makes every threshold below read exactly as it did before
+    # list columns were tracked at all.
+    list_col = 0
 
     def blank_to(start, stop):
         for k in range(start, min(stop, n)):
@@ -1325,7 +1354,12 @@ def readable(text, resolved=None):
                 continue
             if indent == 0 and not LIST_ITEM.match(content):
                 in_list = False
-            if indent >= 4 and not in_paragraph and not in_list:
+                list_col = 0
+            # Code opens four columns past the CONTENT column, which is the
+            # margin outside a list and the item's content column inside
+            # one. `not in_list` suppressed the test entirely, so nothing
+            # inside a list item was ever code.
+            if indent >= 4 + list_col and not in_paragraph:
                 # Runs while the indent holds; a line back under four spaces
                 # ends it. Inside a quote the run also ends when the quote
                 # does, so a dedent out of the quote cannot be mistaken for
@@ -1339,14 +1373,21 @@ def readable(text, resolved=None):
                     seg = (BLOCKQUOTE.sub("", raw) if depth
                            else raw).expandtabs(4)
                     body = seg.lstrip(" ")
-                    if body and len(seg) - len(body) < 4:
+                    if body and len(seg) - len(body) < 4 + list_col:
                         break
                     blank_to(j, stop)
                     j = stop + 1
                 i = min(j, n)
                 in_paragraph = False
                 continue
-            if LIST_ITEM.match(content):
+            col = list_content_col(expanded)
+            if col is not None:
+                in_list = True
+                list_col = col
+            elif LIST_ITEM.match(content):
+                # A marker with no content after it opens an item whose
+                # content column cannot be measured from this line. Keep the
+                # previous column rather than guessing one.
                 in_list = True
             # Whether the PREVIOUS line was paragraph text, captured before
             # this line overwrites it. A type-7 HTML opener cannot interrupt
@@ -5054,6 +5095,54 @@ self_test() {
     > "$tmp/readme_ordered_two/README.md"
   _commit readme_ordered_two
   _case "an ordered list at 2 does not interrupt" 0 readme_ordered_two
+
+  # 247. Indentation inside a LIST ITEM is measured from the item's content
+  #      column. Six spaces under `- ` is four past it, so cmark-gfm puts
+  #      the link in a `<pre><code>` inside the `<li>` and the README's only
+  #      route to the index is a worked example, not a link. Suppressing
+  #      code detection for the whole of a list made this look clickable.
+  _scaffold list_code_six
+  printf '# A\n' > "$tmp/list_code_six/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_code_six/docs/guide/index.md"
+  printf -- '- Example:\n\n      [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_code_six/README.md"
+  _commit list_code_six
+  _case "six spaces in a list item is code" 1 list_code_six
+
+  # 248. Four spaces is only two past that column, so the very same README
+  #      keeps a live link. Measuring from the margin instead would have
+  #      turned this into a false failure.
+  _scaffold list_code_four
+  printf '# A\n' > "$tmp/list_code_four/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_code_four/docs/guide/index.md"
+  printf -- '- Example:\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_code_four/README.md"
+  _commit list_code_four
+  _case "four spaces in a list item is prose" 0 list_code_four
+
+  # 249. An ordered marker puts the content column at three, so the
+  #      threshold moves with the marker rather than being fixed at two.
+  _scaffold list_code_ordered
+  printf '# A\n' > "$tmp/list_code_ordered/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_code_ordered/docs/guide/index.md"
+  printf '1. Example:\n\n       [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_code_ordered/README.md"
+  _commit list_code_ordered
+  _case "seven spaces under an ordered item is code" 1 list_code_ordered
+
+  # 250. And at the margin four spaces is still code, so tracking the column
+  #      did not loosen the ordinary case.
+  _scaffold margin_code_four
+  printf '# A\n' > "$tmp/margin_code_four/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/margin_code_four/docs/guide/index.md"
+  printf 'Example:\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/margin_code_four/README.md"
+  _commit margin_code_four
+  _case "four spaces at the margin is still code" 1 margin_code_four
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
