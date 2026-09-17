@@ -206,6 +206,17 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # `<textarea>` run to their closing tag; any other tag ends at a blank line.
 HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
 HTML_LITERAL = ("pre", "script", "style", "textarea")
+# CommonMark's type-6 block tags: these open a raw block even with text after
+# them. Any OTHER tag (type 7) opens one only when it is alone on its line —
+# `<span>Docs:</span> [Guide](x.md)` is a paragraph containing a real link,
+# and treating it as a block opener blanked that link and failed the gate.
+BLOCK_TAGS = frozenset("""
+address article aside base basefont blockquote body caption center col
+colgroup dd details dialog dir div dl dt fieldset figcaption figure footer
+form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li
+link main menu menuitem nav noframes ol optgroup option p param search
+section summary table tbody td tfoot th thead title tr track ul
+""".split())
 # Declaration-style blocks, each with its own terminator.
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
@@ -302,8 +313,11 @@ def readable(text):
         line = text[i:eol]
 
         if at_line_start:
-            stripped = line.lstrip(" ")
-            indent = len(line) - len(stripped)
+            # A tab indents to the next multiple of four, so measuring
+            # spaces alone read a tab-indented code line as column zero.
+            expanded = line.expandtabs(4)
+            stripped = expanded.lstrip(" ")
+            indent = len(expanded) - len(stripped)
             if not stripped:
                 prev_blank = True
                 i = eol + 1 if eol < n else n
@@ -316,7 +330,7 @@ def readable(text):
                 j = i
                 while j < n:
                     stop = line_end(j)
-                    seg = text[j:stop]
+                    seg = text[j:stop].expandtabs(4)
                     body = seg.lstrip(" ")
                     if body and len(seg) - len(body) < 4:
                         break
@@ -367,6 +381,12 @@ def readable(text):
             hm = HTML_OPEN.match(line)
             if hm and not auto:
                 tag = hm.group(2).lower()
+                alone = bool(re.fullmatch(r"\s*" + INLINE_TAG.pattern + r"\s*",
+                                          line, re.VERBOSE))
+                if tag not in HTML_LITERAL and tag not in BLOCK_TAGS and not alone:
+                    hm = None
+            if hm and not auto:
+                tag = hm.group(2).lower()
                 if tag in HTML_LITERAL and not hm.group(1):
                     closer = f"</{tag}>"
                     idx = text.lower().find(closer, i)
@@ -396,7 +416,10 @@ def readable(text):
             j = i
             closed = False
             while j < n:
-                if text[j] != "`" or _escaped(text, j):
+                # CommonMark does not process backslash escapes INSIDE a
+                # code span, so a closer preceded by `\` still closes it.
+                # Only the OPENER can be escaped away.
+                if text[j] != "`":
                     j += 1
                     continue
                 cstart = j
@@ -654,8 +677,37 @@ for path, hits in sorted(seen.items()):
 #    anywhere. Caught in review on the PR that added this gate.
 with open(f"{root}/{README}", encoding="utf-8") as fh:
     readme = readable(fh.read())
-if not any(normalise(m.group(1), "") == INDEX
-           for m in LINK.finditer(readme)):
+
+
+def reaches_index(text):
+    """True when `text` carries a clickable markdown link to the index.
+
+    Inline links (`[Guide](docs/guide/index.md)`) and REFERENCE links
+    (`[Guide][catalog]` with `[catalog]: docs/guide/index.md` below) both
+    count. Only inline destinations were resolved before, so a README that
+    reached the index perfectly well through a reference link was reported as
+    having no link at all — a false failure on ordinary markdown, which is
+    worse than the exotic near-misses this check has mostly been about.
+    """
+    if any(normalise(m.group(1), "") == INDEX for m in LINK.finditer(text)):
+        return True
+    # `[label]: target` definitions, then the labels actually referenced by a
+    # full (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
+    # reference. A definition nothing references is not a link.
+    defs = {m.group(1).strip().lower(): m.group(2)
+            for m in re.finditer(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)",
+                                 text, re.MULTILINE)}
+    if not defs:
+        return False
+    used = {m.group(1).strip().lower() or m.group(2).strip().lower()
+            for m in re.finditer(r"(?<![!\\])\[([^\]]*)\]\[([^\]]*)\]", text)}
+    used |= {m.group(1).strip().lower()
+             for m in re.finditer(r"(?<![!\\])\[([^\]]+)\](?![\[(:])", text)}
+    return any(normalise(defs[label], "") == INDEX
+               for label in used if label in defs)
+
+
+if not reaches_index(readme):
     defects.append(
         (README,
          f"has no markdown link whose target resolves to {INDEX}; a mention "
@@ -1273,6 +1325,58 @@ self_test() {
     > "$tmp/quoted_gt/README.md"
   _commit quoted_gt
   _case "quoted > does not end an inline tag" 1 quoted_gt
+
+  # 53. A REFERENCE link reaches the index perfectly well. Resolving only
+  #     inline destinations failed a README that was not broken.
+  _scaffold readme_ref_link
+  printf '# A\n' > "$tmp/readme_ref_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_ref_link/docs/guide/index.md"
+  printf 'See [Guide][catalog].\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/readme_ref_link/README.md"
+  _commit readme_ref_link
+  _case "reference link in README reaches the index" 0 readme_ref_link
+
+  # 54. ...but a definition nothing references is not a link.
+  _scaffold readme_unused_def
+  printf '# A\n' > "$tmp/readme_unused_def/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_unused_def/docs/guide/index.md"
+  printf 'Nothing links it.\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/readme_unused_def/README.md"
+  _commit readme_unused_def
+  _case "unreferenced definition is not a link" 1 readme_unused_def
+
+  # 55. A generic tag with text after it is a PARAGRAPH, not a raw block. The
+  #     single-scan rewrite blanked the whole line and failed a good README.
+  _scaffold inline_span_line
+  printf '# A\n' > "$tmp/inline_span_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/inline_span_line/docs/guide/index.md"
+  printf '<span>Docs:</span> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/inline_span_line/README.md"
+  _commit inline_span_line
+  _case "tag with text after it is not a block opener" 0 inline_span_line
+
+  # 56. A tab indents to four columns, so a tab-indented line is code.
+  _scaffold tab_code
+  printf '# A\n' > "$tmp/tab_code/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/tab_code/docs/guide/index.md"
+  printf 'Docs:\n\n\t[Guide](docs/guide/index.md)\n' > "$tmp/tab_code/README.md"
+  _commit tab_code
+  _case "tab-indented README line is code" 1 tab_code
+
+  # 57. Backslash escapes do NOT apply inside a code span, so a closer
+  #     preceded by `\` still closes it. Only the opener can be escaped away.
+  _scaffold span_close_escape
+  printf '# A\n' > "$tmp/span_close_escape/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/span_close_escape/docs/guide/index.md"
+  printf 'Code `[Guide](docs/guide/index.md)\\`\n' \
+    > "$tmp/span_close_escape/README.md"
+  _commit span_close_escape
+  _case "backslash before a span closer still closes it" 1 span_close_escape
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
