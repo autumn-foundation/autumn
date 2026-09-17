@@ -15,6 +15,14 @@ use crate::{
 
 /// Admin panel model for scoped API tokens.
 ///
+/// # Postgres only
+///
+/// This model reads and writes `api_tokens`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
+///
 /// Register with the admin plugin to get a token management UI at
 /// `/admin/api-tokens/`:
 ///
@@ -96,6 +104,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -149,6 +158,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -176,6 +186,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let principal_id = data
                 .get("principal_id")
                 .and_then(Value::as_str)
@@ -237,6 +248,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // A token's secret/principal are immutable; only the human-readable
             // name and granted scopes are editable after issuance.
             let name = data.get("name").and_then(Value::as_str).unwrap_or("");
@@ -272,6 +284,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // "Delete" a token means revoke it: keep the audit row, stop it
             // authenticating. Idempotent — re-revoking is a no-op.
             let mut conn = pool
@@ -296,8 +309,6 @@ impl AdminModel for TokenAdminModel {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        use diesel_async::RunQueryDsl;
-
         // `TokenAdminModel` never declares soft delete (`supports_soft_delete`
         // is the trait default, `false`), so `actions()` (traits.rs) only
         // ever offers `"delete"` — the admin UI can't reach `"restore"` or
@@ -310,33 +321,51 @@ impl AdminModel for TokenAdminModel {
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
-                // Batch every id into ONE round trip instead of the trait
-                // default's one-`UPDATE`-per-id loop (an operator selecting
-                // hundreds of rows in the admin list and clicking "Delete
-                // selected" otherwise costs hundreds of statements and pool
-                // checkouts for what is, on the wire, one predicate). Same
-                // idempotent semantics as `delete()`: an id that doesn't
-                // exist, or is already revoked, is silently a no-op for that
-                // id.
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
                 //
-                // The returned count matches the *ids submitted*, not rows
-                // actually changed, exactly like the loop this replaces
-                // (which incremented its counter once per id regardless of
-                // whether that id's `UPDATE` matched a row) — a duplicate or
-                // already-revoked id was, and still is, counted as "applied".
-                let mut conn = pool
-                    .get()
-                    .await
-                    .map_err(|e| AdminError::Database(e.to_string()))?;
-                diesel::sql_query(
-                    "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
-                     WHERE id = ANY($1) AND revoked_at IS NULL",
-                )
-                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
-                .execute(&mut conn)
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-                Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // TokenAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-`UPDATE`-per-id loop (an operator selecting
+                        // hundreds of rows in the admin list and clicking "Delete
+                        // selected" otherwise costs hundreds of statements and pool
+                        // checkouts for what is, on the wire, one predicate). Same
+                        // idempotent semantics as `delete()`: an id that doesn't
+                        // exist, or is already revoked, is silently a no-op for that
+                        // id.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually changed, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id's `UPDATE` matched a row) — a duplicate or
+                        // already-revoked id was, and still is, counted as "applied".
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                             WHERE id = ANY($1) AND revoked_at IS NULL",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("TokenAdminModel").map(|()| 0)
+                    }},
+                }
             });
         }
 

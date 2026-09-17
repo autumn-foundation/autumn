@@ -159,6 +159,7 @@ pub mod consent;
 // `classify` carry one: an outer `///` here is merged with the module's own
 // `//!` docs, and the whole block then resolves its intra-doc links in *this*
 // scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
 pub mod credentials;
@@ -831,6 +832,16 @@ pub use db::Db;
 /// helper for [`Db::tx_with`]. See [`db::TxOptions`].
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
+
+/// Lazy database connection extractor.
+///
+/// Use `LazyDb` instead of `Db` in a handler that also takes a body
+/// extractor (`Form`, `Json`, `Multipart`, ...). `Db` checks out a pooled
+/// connection before the body is read. `LazyDb` waits until the handler
+/// calls [`db::LazyDb::checkout`]. See [`db::LazyDb`] for the full contract
+/// and an example.
+#[cfg(feature = "db")]
+pub use db::LazyDb;
 
 /// The runtime database connection type (Postgres by default; `SQLite` under the
 /// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as

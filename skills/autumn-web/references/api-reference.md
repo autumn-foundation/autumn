@@ -47,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -300,6 +300,40 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
+- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+  marks a column **operator-blind**: the value is sealed on the client under a
+  key the server never receives, so the server holds only ciphertext. Unlike
+  `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
+  Rust), the field is declared as `autumn_web::confidential::Sealed` — an opaque
+  envelope with no `Display`, no `Deref` and no accessor that yields plaintext.
+  Every generated struct (`NewX`/`UpdateX`/`Changeset`/`XFactory`/JSON view)
+  therefore carries ciphertext, and the database, `autumn db backup` output, the
+  access and error log, replay capsules, record version history, the admin UI and
+  its CSV export hold only that.
+  Client side: `RootKey::generate()` / `::from_hex` / `::from_bytes` (no
+  `Serialize`, no `Display`, no byte accessor, zeroizes on drop, never built from
+  config or the credentials store),
+  `FieldContext::for_record(table, column, owner, record)` (or `::new` without
+  the record, which leaves rows interchangeable), then
+  `key.seal(&ctx, plaintext)? -> Sealed` and `key.unseal(&ctx, &sealed)?`.
+  Equality: `#[confidential(blind_index)]` requires a companion
+  `<field>_bidx: autumn_web::confidential::BlindIndex` column; the client sends
+  `key.blind_index(&ctx, plaintext)` and the server compares the token
+  (constant-time `PartialEq`, fixed 32 hex characters, so no length leak).
+  Refused at **build time**: `#[encrypted]`, `#[classified]`, `#[searchable]`,
+  `#[unique]`, `#[indexed]`, `#[references]`, `#[normalize]`, `#[translatable]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `#[default]`, a
+  `tenant_id` column, `#[serde(rename)]` / `rename_all`,
+  `#[diesel(column_name)]`, the model's shard key, a non-`Sealed` field type —
+  and, through the `Model::__AUTUMN_CONFIDENTIAL_COLUMNS` list `#[model]`
+  publishes, a `#[repository]` `find_by_<field>` / `count_by_` / `delete_by_` /
+  `exists_by_`, `find_or_create_by_<field>`, `cursor_key = <field>` or grouped
+  aggregate. Query the `_bidx` companion instead. Generated: a type assertion
+  proving the field really is `Sealed`, a
+  `confidential::ConfidentialColumnDescriptor` inventory registration, and
+  `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
+  `docs/guide/confidential-fields.md` for the threat model, including what
+  sealing does not hide.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -1063,7 +1097,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,
