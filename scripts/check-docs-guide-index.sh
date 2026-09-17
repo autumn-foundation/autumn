@@ -134,7 +134,12 @@ README = "README.md"
 # (`docs/guide/middleware.md`). Both spellings resolve to the same page, and
 # both are accepted so the gate never argues with `check-docs-links.sh` about
 # relative depth — that is its sibling's job, not this one's.
-LINK = re.compile(r"\[[^\]]*\]\(\s*([^)\s#]+)")
+#
+# The `(?<!!)` rejects image syntax. `![alt](page.md)` shares every character of
+# a link but renders a picture, so it navigates nowhere: an index row reading
+# `- ![preview](beta.md)` indexes nothing, and `![Guide](docs/guide/index.md)`
+# in README.md is not a way to reach the index.
+LINK = re.compile(r"(?<!!)\[[^\]]*\]\(\s*([^)\s#]+)")
 
 # An HTML comment, to the closing `-->` or to end of file if it never closes.
 COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
@@ -191,16 +196,22 @@ def blank_indented_code(text):
     runs until the indent drops, so it cannot interrupt a paragraph — which is
     what CommonMark says, and what keeps a wrapped line of prose readable.
 
-    It also cannot open INSIDE A LIST. Four-space indentation under a list item
-    is that item's continuation or a nested list, not code, and blanking it
-    would delete real entries from an index that nests them. That distinction
-    is the whole risk in this function: over-blanking here silently removes
-    entries, which is the one direction that makes the gate quieter rather than
-    louder.
+    Indentation is RELATIVE TO THE ENCLOSING LIST ITEM, which is the whole
+    subtlety. Under `- Example:` — content indent 2 — a code block starts at
+    six spaces, not four, and four spaces there is a nested list. An earlier
+    revision collapsed this to "no code blocks inside a list at all", which
+    left a code block nested in a list counting as a real entry; the revision
+    before that had no list awareness and blanked nested lists instead. Both
+    directions are wrong and they fail differently: missing a code block lets
+    an unlisted page pass, while blanking a nested list silently DELETES real
+    entries. The second is the dangerous one, because it makes this gate
+    quieter rather than louder, so the stack below is kept honest by
+    self-tests pinning both.
     """
     out = []
     in_code = False
-    in_list = False
+    # Content indents of the open list items, outermost first. `- x` pushes 2.
+    lists = []
     prev_blank = True
     for line in text.split("\n"):
         if not line.strip():
@@ -209,27 +220,28 @@ def blank_indented_code(text):
             continue
         indent = len(line) - len(line.lstrip(" "))
         if in_code:
-            if indent >= 4:
+            if indent >= (lists[-1] if lists else 0) + 4:
                 out.append(_blank(line))
                 prev_blank = False
                 continue
             in_code = False
-        # A line back at column 0 that is not itself a list item closes any
-        # open list.
-        if indent == 0 and not LIST_ITEM.match(line):
-            in_list = False
+        # Dropping back to or past an enclosing item's content column closes
+        # every list item indented deeper than this line.
+        while lists and indent < lists[-1]:
+            lists.pop()
         # The code-block test comes BEFORE the list-item test, because
         # `    - [B](b.md)` after a blank line and outside a list is a code
         # block that happens to contain a bullet, not a bullet that happens to
         # be indented. Testing for the list marker first made exactly that
         # example count as an entry.
-        if indent >= 4 and prev_blank and not in_list:
+        if indent >= (lists[-1] if lists else 0) + 4 and prev_blank:
             in_code = True
             out.append(_blank(line))
             prev_blank = False
             continue
-        if LIST_ITEM.match(line):
-            in_list = True
+        m = LIST_ITEM.match(line)
+        if m:
+            lists.append(len(m.group(0)))
         out.append(line)
         prev_blank = False
     return "\n".join(out)
@@ -743,6 +755,49 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/prose_xref/README.md"
   _commit prose_xref
   _case "prose cross-reference is not an entry" 0 prose_xref
+
+  # 22. A code block NESTED IN A LIST. Under `- Example:` (content indent 2) a
+  #     block starts at six spaces. Treating "inside a list" as "no code blocks
+  #     here" let this count as an entry.
+  _scaffold list_code
+  printf '# A\n' > "$tmp/list_code/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/list_code/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- Example:\n\n      - [B](beta.md)\n' \
+    > "$tmp/list_code/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/list_code/README.md"
+  _commit list_code
+  _case "code block nested in a list does not count" 1 list_code
+
+  # 23. ...and four spaces under that same item is a NESTED LIST, not code,
+  #     because the block would start at six. This is the direction that
+  #     silently deletes real entries, so it is pinned separately.
+  _scaffold list_nested_deep
+  printf '# A\n' > "$tmp/list_nested_deep/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/list_nested_deep/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n    - [B](beta.md)\n' \
+    > "$tmp/list_nested_deep/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/list_nested_deep/README.md"
+  _commit list_nested_deep
+  _case "nested list after a blank line still counts" 0 list_nested_deep
+
+  # 24. An image is not a navigable link, in an index...
+  _scaffold image_entry
+  printf '# A\n' > "$tmp/image_entry/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/image_entry/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- ![preview](beta.md)\n' \
+    > "$tmp/image_entry/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/image_entry/README.md"
+  _commit image_entry
+  _case "image entry does not count" 1 image_entry
+
+  # 25. ...nor in README.md.
+  _scaffold image_readme
+  printf '# A\n' > "$tmp/image_readme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_readme/docs/guide/index.md"
+  printf '![Guide](docs/guide/index.md)\n' > "$tmp/image_readme/README.md"
+  _commit image_readme
+  _case "image in README is not an index link" 1 image_readme
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
