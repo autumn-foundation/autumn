@@ -1,58 +1,39 @@
-//! Ledger findings harness for `dunning::rearm_pending`
-//! (`autumn-billing/src/dunning.rs`), the step every app-process startup
-//! takes to re-queue whatever dunning retries were still open when the
-//! process last stopped — "a restart re-arms from the store" (module doc
-//! comment).
+//! Ledger regression harness for `dunning::rearm_pending`
+//! (`autumn-billing/src/dunning.rs`), the step every app-process restart
+//! takes to re-queue dunning retries that were still open when the process
+//! last stopped — "a restart re-arms from the store" (module doc comment).
 //!
-//! `rearm_pending` loads every open (`Pending`/`Running`) row via
-//! `BillingStore::open_dunning()` — one round trip, correctly unscoped: this
-//! is the one place in the codebase that legitimately needs every open row,
-//! system-wide, not the over-broad read the 09-11 `close_dunning_for` fix
-//! (`docs/reports/2026-09-11-ledger-dunning-close-scan-scoped/`) scoped down
-//! for the request path. The defect is on the WRITE side, untouched by that
-//! fix: `rearm_row` (dunning.rs) calls `schedule()` → `JobClient::enqueue_due`
-//! once per row, sequentially awaited
-//! (`for row in rows { rearm_row(&state, &row).await }`), so re-arming N open
-//! rows costs N sequential `INSERT INTO autumn_jobs` round trips. Production
-//! `rearm_pending` spawns this loop (`tokio::runtime::Handle::spawn`) rather
-//! than awaiting it, and `run_startup_hooks` never sees that spawned task —
-//! it awaits only the `on_startup` closure's own future, which returns as
-//! soon as the spawn call does — so this does NOT delay
-//! `ProbeState::mark_startup_complete()` or readiness. What it does cost:
-//! every one of these N round trips runs against the same connection pool
-//! and Postgres instance a freshly-restarted process is about to start
-//! serving live traffic through, and no retry in the backlog is actually
-//! re-queued until its row's turn in the sequential loop comes up — so a
-//! large backlog extends how long the *payment-retry recovery itself* takes
-//! after a restart, even though the process reports itself ready well
-//! before that finishes.
+//! `rearm_pending` loads every open (`Pending`/`Running`) row with one
+//! query, through `BillingStore::open_dunning()`. This one query is
+//! correct: it is the one place in the code that must read every open row,
+//! system-wide. It is not the over-broad read the 09-11 `close_dunning_for`
+//! fix (`docs/reports/2026-09-11-ledger-dunning-close-scan-scoped/`) scoped
+//! down for the request path.
 //!
-//! This is a **findings issue** harness, not a before/after fix. The
-//! mechanism is identical to the one already filed and deliberately left
-//! unfixed in `autumn/tests/integration/webhook_outbound_dispatch_fanout_profile.rs`:
-//! `JobClient::enqueue`/`enqueue_due` is not a thin `INSERT` wrapper — per
-//! logical call it also evaluates the uniqueness dedup subquery
-//! (`ON CONFLICT ... DO NOTHING`, with a TTL-window eviction step; the dunning
-//! retry job declares `unique_by = "invoice_id"`, so this is live here, not
-//! hypothetical), captures OTLP trace context, invokes any registered
-//! `JobInterceptor`, and updates the in-process `JobRegistry` counters — all
-//! before the row is written. Collapsing that into one batched round trip
-//! would have to happen inside `JobClient` itself (a new `enqueue_many`) to
-//! help this call site *and* the webhook one, and is the same job-queue-wide
-//! API/semantics decision that finding already routed to a human rather than
-//! shipping silently. A narrower, crate-local "just batch the INSERT" fix
-//! would mean re-implementing the dedup/interceptor/tracing logic in
-//! `autumn-billing` by hand — the exact correctness risk that finding
-//! rejected the same trade for.
+//! Issue #2748 found the defect on the write side: `dunning::rearm_rows`
+//! used to call `JobClient::enqueue_due` once per open row, and await each
+//! call before starting the next. N open rows cost N sequential
+//! `INSERT INTO autumn_jobs` round trips. Production `rearm_pending` spawns
+//! this work (`tokio::runtime::Handle::spawn`) rather than awaiting it, so
+//! it never delayed `ProbeState::mark_startup_complete()` — but each row's
+//! insert still had to wait its turn, so a large backlog took longer to
+//! finish re-arming after a restart, right when a payment-provider outage
+//! makes that backlog largest.
 //!
-//! This harness adds a second, real measured data point for that decision:
-//! unlike the webhook fan-out (triggered per business event, at whatever rate
-//! the app receives them), this N+1 runs **every single process restart**,
-//! and specifically grows with an *upstream outage* — the one moment a
-//! payment provider incident is already degrading service, every redeploy or
-//! crash-restart during the incident pays for the full backlog again,
-//! sequentially, in the background — not blocking startup (see above), but
-//! extending how long that backlog stays un-re-armed.
+//! The fix: `JobClient::enqueue_many_due` (`autumn/src/job.rs`) batches
+//! every row's insert into one round trip, one multi-row
+//! `INSERT ... SELECT ... FROM UNNEST(...)` statement, when the active
+//! backend and job settings allow it — Postgres, no `JobInterceptor`
+//! registered, no TTL uniqueness window. Dunning's retry job meets all
+//! three (`unique_by = "invoice_id"`, `unique_window = "pending"`), so
+//! `dunning::rearm_rows` now calls `enqueue_many_due` once per restart
+//! instead of looping a single-row enqueue. Every other call — a job with
+//! an interceptor, a TTL window, or a non-Postgres backend — still falls
+//! back to one `enqueue_due` call per item, unchanged.
+//!
+//! This harness proves the fix: it seeds three growing open-row backlogs
+//! and checks that each restart issues exactly **one**
+//! `INSERT INTO autumn_jobs` statement, not one per row.
 //!
 //! Exercises the real production path: `dunning::rearm_pending_now` is the
 //! exact body `dunning::rearm_pending` (the private startup-hook entry point
@@ -481,8 +462,9 @@ async fn dunning_rearm_pending_profile() {
             &format!("restart re-arming {cumulative_open} open rows"),
         );
         assert_eq!(
-            target_calls, cumulative_open,
-            "rearm issues exactly one INSERT INTO autumn_jobs per open row, sequentially"
+            target_calls, 1,
+            "rearm must batch every open row into one INSERT INTO autumn_jobs call, \
+             not one call per row"
         );
         let buffers_pct = 100.0 * target_buffers as f64 / workload_buffers.max(1) as f64;
         println!(
@@ -506,32 +488,22 @@ async fn dunning_rearm_pending_profile() {
         println!("{open_rows:<12} {calls:>12} {buffers:>14} {workload:>18}");
     }
 
-    // Illustrative EXPLAIN of the two shapes -- the per-row insert this
-    // harness measures, run today once per open row, vs. what a batched
-    // `enqueue_many` (not implemented; the job-queue-wide API/semantics
-    // decision this finding routes to a human) would let this call site
-    // issue instead: one multi-row `INSERT ... SELECT ... FROM unnest(...)`.
-    // Diagnostic only, not the scale claim -- the scale claim is the
-    // pg_stat_statements table above.
+    // Illustrative EXPLAIN of the real batched shape `pg_insert_jobs_many`
+    // (`autumn/src/job.rs`) now issues for the whole restart backlog, one
+    // multi-row `INSERT ... SELECT ... FROM UNNEST(...)`. Diagnostic only,
+    // not the scale claim -- the scale claim is the pg_stat_statements
+    // table above.
     explain(
         &mut conn,
-        "one row's job insert, issued once per open dunning row today",
+        "20 open rows' job inserts batched into one multi-row INSERT",
         "INSERT INTO autumn_jobs \
          (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at) \
-         SELECT 'illustrative-single', 'autumn_billing_dunning_retry', 'billing', '{}'::JSONB, \
+         SELECT t.id, 'autumn_billing_dunning_retry', 'billing', '{}'::JSONB, \
            'enqueued', 1, 5, 60000, NOW(), NOW() \
-         RETURNING id",
-    );
-    explain(
-        &mut conn,
-        "20 rows' job inserts batched into one multi-row INSERT (illustrative; not implemented)",
-        "INSERT INTO autumn_jobs \
-         (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
-          enqueued_at, run_at) \
-         SELECT 'illustrative-' || gs, 'autumn_billing_dunning_retry', 'billing', '{}'::JSONB, \
-           'enqueued', 1, 5, 60000, NOW(), NOW() \
-         FROM generate_series(1, 20) AS gs \
+         FROM UNNEST(ARRAY( \
+           SELECT 'illustrative-' || gs FROM generate_series(1, 20) AS gs \
+         )) AS t(id) \
          RETURNING id",
     );
 
