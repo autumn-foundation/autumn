@@ -201,6 +201,16 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # becomes indented code. Requiring column zero here meant ` <pre>` opened no
 # block, so a row-shaped line inside it was still read as an entry.
 HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
+# CommonMark's declaration-style block openers, each with its own terminator:
+# `<?…?>`, `<![CDATA[…]]>` and `<!DOCTYPE …>`. `<!--` is handled by `COMMENT`.
+# `HTML_OPEN` matches a tag NAME, so none of these looked like a block at all.
+DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
+        (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
+        (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
+# An inline code span on one line. `[Guide](x.md)` inside backticks renders as
+# literal text, so it is not a link — which matters for the README scan, the
+# one caller that still matches links rather than the `ENTRY` shape.
+INLINE_CODE = re.compile(r"`+[^`\n]*`+")
 HTML_LITERAL = ("pre", "script", "style", "textarea")
 
 
@@ -242,10 +252,18 @@ def blank_fences(text):
 def blank_html_blocks(text):
     """Blank raw HTML blocks, whose contents are literal text to the reader.
 
-    `<pre>`, `<script>`, `<style>` and `<textarea>` run to their closing tag;
-    every other block at column zero ends at a blank line, which is what
-    CommonMark says and what keeps this from swallowing a document that merely
-    opens with a `<div>`.
+    Three shapes, each with its own terminator:
+
+      - `<pre>`, `<script>`, `<style>`, `<textarea>` — to their closing tag
+      - `<?…?>`, `<![CDATA[…]]>`, `<!DOCTYPE …>` — to their own closer. These
+        are not tags, so the tag-name pattern did not see them as blocks at
+        all, and a row inside one still counted.
+      - any other tag — to the next blank line, which is what CommonMark says
+        and what keeps this from swallowing a document that merely opens with
+        a `<div>` or a `<details>`
+
+    `literal` holds the terminator string, whichever shape opened the block,
+    so a one-line `<pre>…</pre>` closes on its own line.
     """
     out = []
     literal = None
@@ -253,7 +271,14 @@ def blank_html_blocks(text):
     for line in text.split("\n"):
         if literal is not None:
             out.append(_blank(line))
-            if f"</{literal}>" in line.lower():
+            if literal in line.lower():
+                literal = None
+            continue
+        decl = next((end for pat, end in DECL if pat.match(line)), None)
+        if decl is not None:
+            literal = decl
+            out.append(_blank(line))
+            if decl in line:
                 literal = None
             continue
         if in_block:
@@ -267,8 +292,10 @@ def blank_html_blocks(text):
         if m:
             tag = m.group(2).lower()
             if tag in HTML_LITERAL and not m.group(1):
-                literal = tag
+                closer = f"</{tag}>"
                 out.append(_blank(line))
+                # A one-line `<pre>…</pre>` closes on the line that opened it.
+                literal = None if closer in line.lower() else closer
                 continue
             in_block = True
             out.append(_blank(line))
@@ -293,10 +320,18 @@ def readable(text):
         mid-edit move, and it must not keep an unlisted page green
       - raw HTML blocks — `<pre>` and friends render their contents literally
 
+    Inline code spans are blanked too, and that is about the README rather
+    than about entries. `ENTRY` rejects `` - `[A](a.md)` `` on its own, so the
+    redesign dropped this pass — but the README check is the one caller that
+    still matches LINKS rather than the entry shape, and dropping it let a
+    README whose only occurrence was `` `[Guide](docs/guide/index.md)` ``
+    satisfy reachability with nothing clickable on the page. A regression of
+    the redesign, caught in review.
+
     Everything else that used to live here is gone, because `ENTRY` rejects it
-    without a rule: inline code, four-space indented blocks, blocks indented
-    relative to an enclosing list item, tab indentation, images and escaped
-    brackets all fail to match a column-zero `- [text](target)`.
+    without a rule: four-space indented blocks, blocks indented relative to an
+    enclosing list item, tab indentation, images and escaped brackets all fail
+    to match a column-zero `- [text](target)`.
 
     Fences are blanked first, so a comment delimiter or a `<pre>` inside a code
     sample cannot open a region that swallows the rest of the file. Every
@@ -304,8 +339,11 @@ def readable(text):
     vanish and the gate FAIL. That is the safe direction: malformed markup
     should make the gate loud, not blind.
     """
-    return blank_html_blocks(
-        COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
+    return INLINE_CODE.sub(
+        lambda m: _blank(m.group(0)),
+        blank_html_blocks(
+            COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
+        ),
     )
 
 
@@ -883,6 +921,40 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/html_indented/README.md"
   _commit html_indented
   _case "indented raw HTML opener still opens a block" 1 html_indented
+
+  # 32. Declaration-style blocks — `<![CDATA[`, `<?`, `<!DOCTYPE` — are not
+  #     tags, so the tag-name pattern never saw them as blocks.
+  _scaffold cdata
+  printf '# A\n' > "$tmp/cdata/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/cdata/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n<![CDATA[\n- [B](beta.md)\n]]>\n' \
+    > "$tmp/cdata/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/cdata/README.md"
+  _commit cdata
+  _case "row inside a CDATA block is not an entry" 1 cdata
+
+  # 33. A one-line `<pre>…</pre>` closes on its own line and must not swallow
+  #     the rows after it — the over-blanking direction again.
+  _scaffold pre_oneline
+  printf '# A\n' > "$tmp/pre_oneline/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/pre_oneline/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n<pre>sample</pre>\n\n- [A](alpha.md)\n- [B](beta.md)\n' \
+    > "$tmp/pre_oneline/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/pre_oneline/README.md"
+  _commit pre_oneline
+  _case "one-line <pre> does not swallow later rows" 0 pre_oneline
+
+  # 34. The README scan is the one caller that still matches LINKS rather than
+  #     the entry shape, so it needs inline code blanked. The redesign dropped
+  #     that pass and regressed exactly this.
+  _scaffold inline_readme
+  printf '# A\n' > "$tmp/inline_readme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/inline_readme/docs/guide/index.md"
+  printf 'Write it as `[Guide](docs/guide/index.md)` in your docs.\n' \
+    > "$tmp/inline_readme/README.md"
+  _commit inline_readme
+  _case "inline-code link in README is not an index link" 1 inline_readme
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
