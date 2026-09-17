@@ -1086,8 +1086,17 @@ def readable(text, resolved=None):
             # would delete that link — the over-blanking direction — so a
             # shortcut image is left alone.
             if label is not None and label < n and text[label] in "([":
-                close = ")" if text[label] == "(" else "]"
-                end = balanced(label, text[label], close)
+                if text[label] == "(":
+                    # The INLINE form must be a valid image tail, not merely
+                    # balanced parentheses. `![alt …](not a valid dest)`
+                    # forms no image, so its brackets are literal and a link
+                    # inside them is real — blanking on balance alone
+                    # deleted that link. Same `_tail_at` a link uses, so the
+                    # two cannot drift apart.
+                    hit = _tail_at(text, label)
+                    end = None if hit is None else hit[0]
+                else:
+                    end = balanced(label, "[", "]")
                 # A reference image is an image only if its label RESOLVES —
                 # the same rule the shortcut form above already follows, and
                 # this form was simply left out of it. With no definition,
@@ -1231,6 +1240,14 @@ def normalise(target, base):
     target = re.sub(r"\\(.)", r"\1", target)
     target = target.rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
+        return None
+    # A ROOT-RELATIVE destination leaves the repository. On GitHub and every
+    # other README renderer `/docs/guide/index.md` addresses the host root,
+    # not this checkout, so a reader following it does not arrive. Dropping
+    # the empty leading segment silently turned it into a repo path and
+    # accepted a link that reaches nothing — and disagreed with
+    # `check-docs-links.sh`, which rejects the same target.
+    if target.startswith("/"):
         return None
     if target.startswith("./"):
         target = target[2:]
@@ -3289,6 +3306,51 @@ self_test() {
     > "$tmp/defn_chain_ok/README.md"
   _commit defn_chain_ok
   _case "a definition chain after a blank line defines" 0 defn_chain_ok
+
+  # 158. An inline IMAGE must have a valid tail, not merely balanced
+  #      parentheses. `![alt …](not a valid dest)` forms no image, so the
+  #      link inside its brackets is real and blanking it deleted one.
+  _scaffold invalid_image_tail
+  printf '# A\n' > "$tmp/invalid_image_tail/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/invalid_image_tail/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)](not a valid dest)\n' \
+    > "$tmp/invalid_image_tail/README.md"
+  _commit invalid_image_tail
+  _case "a malformed image is not an image" 0 invalid_image_tail
+
+  # 159. ...and the guard: a VALID image still masks its alt text, so 158
+  #      is not bought by giving up on images.
+  _scaffold valid_image_tail
+  printf '# A\n' > "$tmp/valid_image_tail/docs/guide/alpha.md"
+  printf 'x' > "$tmp/valid_image_tail/docs/guide/img.png"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/valid_image_tail/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)](img.png)\n' \
+    > "$tmp/valid_image_tail/README.md"
+  _commit valid_image_tail
+  _case "a valid image still masks its alt text" 1 valid_image_tail
+
+  # 160. A ROOT-RELATIVE destination leaves the repository: on every README
+  #      renderer `/docs/guide/index.md` addresses the host root. Dropping
+  #      the empty leading segment accepted a link that reaches nothing,
+  #      and disagreed with `check-docs-links.sh`, which rejects it.
+  _scaffold root_relative
+  printf '# A\n' > "$tmp/root_relative/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/root_relative/docs/guide/index.md"
+  printf '[Guide](/docs/guide/index.md)\n' > "$tmp/root_relative/README.md"
+  _commit root_relative
+  _case "a root-relative destination does not resolve" 1 root_relative
+
+  # 161. ...and the guard: a `./` prefix is repo-relative and still does.
+  _scaffold dot_slash
+  printf '# A\n' > "$tmp/dot_slash/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/dot_slash/docs/guide/index.md"
+  printf '[Guide](./docs/guide/index.md)\n' > "$tmp/dot_slash/README.md"
+  _commit dot_slash
+  _case "a ./ prefix still resolves" 0 dot_slash
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
