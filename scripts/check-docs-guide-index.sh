@@ -51,9 +51,13 @@
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
 #   1. Every tracked page under `docs/guide/` is listed in the index that owns
-#      it — exactly once. Twice is a defect too: a reader who meets the same
-#      page under two headings cannot tell whether they are the same page, and
-#      the second entry is the one that rots.
+#      it — exactly once, counted ACROSS ALL INDEXES. Twice is a defect: a
+#      reader who meets the same page under two headings cannot tell whether
+#      they are the same page, and the second entry is the one that rots. A
+#      per-file tally cannot see the worst version of this — the top-level
+#      index listing a tutorial chapter that `tutorial/index.md` also lists
+#      shows one hit in each file — so entries are gathered from every index
+#      before any of them is judged.
 #   2. Every guide page an index links exists, and is a guide page. A link to
 #      a page that moved is caught by `check-docs-links.sh` as a 404; this
 #      catches an index pointing somewhere outside the corpus it indexes.
@@ -69,13 +73,22 @@
 #
 # ONLY LINKS A READER CAN FOLLOW COUNT, everywhere links are extracted — in an
 # index and in `README.md` alike. `readable()` blanks fenced code (``` and ~~~),
-# HTML comments and inline code spans before anything is matched. Each of those
-# is a way an unlisted page was kept green while no reader could reach it: an
-# example of what an entry looks like, an entry parked behind `<!-- -->`, a
-# README whose only index link sat inside a fence. They arrived as three
-# separate review findings against three separate ad-hoc filters, which is why
-# the reduction now lives in ONE function that every caller goes through rather
-# than in a filter per caller.
+# HTML comments, inline code spans and four-space indented code blocks before
+# anything is matched. Each of those is a way an unlisted page was kept green
+# while no reader could reach it: an example of what an entry looks like, an
+# entry parked behind `<!-- -->`, a README whose only index link sat inside a
+# fence. They arrived as four separate review findings against four separate
+# ad-hoc filters, which is why the reduction now lives in ONE function that
+# every caller goes through rather than in a filter per caller.
+#
+# AN ENTRY IS A LINK IN A LIST ITEM. That is what separates an index's rows
+# from its prose, and it is load-bearing in both directions. `tutorial/index.md`
+# carries four ordinary cross-references in paragraphs and blockquotes — "see
+# the [i18n guide]", "if you have already read the [Getting Started guide]" —
+# which claim to index nothing. Counting them made the gate report 165 links
+# for 161 required pages, and under the cross-index rule above it would have
+# flagged every one of them as a duplicate listing of a page another index
+# owns. Writing about a page is not indexing it.
 #
 # DELEGATION TO A SUB-INDEX. A subdirectory of `docs/guide/` that carries its
 # own `index.md` — `tutorial/` does — is represented in the TOP-LEVEL index by
@@ -131,6 +144,9 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # An inline code span on one line. Multi-line spans are not matched; see the
 # note in `readable()`.
 INLINE_CODE = re.compile(r"`+[^`\n]*`+")
+# A list item marker — `-`, `*`, `+` or `1.` / `1)` — and everything up to the
+# content after it. An index ENTRY is a link in a list item; see `entries()`.
+LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
 
 
 def _blank(s):
@@ -168,6 +184,57 @@ def blank_fences(text):
     return "\n".join(out)
 
 
+def blank_indented_code(text):
+    """Blank markdown's four-space indented code blocks.
+
+    A block opens at an indent of four or more spaces after a blank line and
+    runs until the indent drops, so it cannot interrupt a paragraph — which is
+    what CommonMark says, and what keeps a wrapped line of prose readable.
+
+    It also cannot open INSIDE A LIST. Four-space indentation under a list item
+    is that item's continuation or a nested list, not code, and blanking it
+    would delete real entries from an index that nests them. That distinction
+    is the whole risk in this function: over-blanking here silently removes
+    entries, which is the one direction that makes the gate quieter rather than
+    louder.
+    """
+    out = []
+    in_code = False
+    in_list = False
+    prev_blank = True
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line)
+            prev_blank = True
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if in_code:
+            if indent >= 4:
+                out.append(_blank(line))
+                prev_blank = False
+                continue
+            in_code = False
+        # A line back at column 0 that is not itself a list item closes any
+        # open list.
+        if indent == 0 and not LIST_ITEM.match(line):
+            in_list = False
+        # The code-block test comes BEFORE the list-item test, because
+        # `    - [B](b.md)` after a blank line and outside a list is a code
+        # block that happens to contain a bullet, not a bullet that happens to
+        # be indented. Testing for the list marker first made exactly that
+        # example count as an entry.
+        if indent >= 4 and prev_blank and not in_list:
+            in_code = True
+            out.append(_blank(line))
+            prev_blank = False
+            continue
+        if LIST_ITEM.match(line):
+            in_list = True
+        out.append(line)
+        prev_blank = False
+    return "\n".join(out)
+
+
 def readable(text):
     """The part of a markdown document a reader can actually see and click.
 
@@ -200,9 +267,11 @@ def readable(text):
     corpus, and the conservative single-line pattern cannot run away on an
     unmatched backtick.
     """
-    return INLINE_CODE.sub(
-        lambda m: _blank(m.group(0)),
-        COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text)),
+    return blank_indented_code(
+        INLINE_CODE.sub(
+            lambda m: _blank(m.group(0)),
+            COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text)),
+        )
     )
 
 
@@ -281,7 +350,15 @@ def normalise(target, base):
 
 
 def entries(text, base):
-    """Every guide-page link in a file, with the `##` section it sits under.
+    """Every index ENTRY in a file, with the `##` section it sits under.
+
+    An entry is a link in a LIST ITEM. That is what separates the index's rows
+    from its prose, and the distinction is load-bearing: `tutorial/index.md`
+    carries four cross-references in paragraphs and blockquotes — "see the
+    [i18n guide]", "if you have already read the [Getting Started guide]" —
+    which are ordinary writing, not claims to index those pages. Counting them
+    as entries made the gate report 165 links for 161 required pages, and would
+    make the cross-index ownership rule below flag every one of them.
 
     Only links a reader can actually follow count; `readable()` says which
     those are, and blanking rather than skipping is what keeps the reported
@@ -293,6 +370,8 @@ def entries(text, base):
     for lineno, line in enumerate(readable(text).split("\n"), 1):
         if line.startswith("## "):
             section = line[3:].strip()
+            continue
+        if not LIST_ITEM.match(line):
             continue
         for m in LINK.finditer(line):
             path = normalise(m.group(1), base)
@@ -327,47 +406,56 @@ if INDEX not in plan:
     )
 
 defects = []
-required_total = 0
-linked_total = 0
+required_total = sum(len(n) for n in plan.values())
 
-for index_path, need in sorted(plan.items()):
-    required_total += len(need)
+# Entries from EVERY index, gathered before anything is judged. Counting per
+# index in isolation is what let a page be listed twice — once in the
+# top-level index and once in the sub-index that owns it — while each file's
+# own tally showed one. The duplicate is invisible from inside either file, so
+# the check cannot live inside the per-file loop.
+owner_of = {p: idx for idx, need in plan.items() for p in need}
+seen = {}
+for index_path in sorted(plan):
     base = index_path.rsplit("/", 1)[0] + "/"
     with open(f"{root}/{index_path}", encoding="utf-8") as fh:
-        found = entries(fh.read(), base)
+        for path, lineno, section in entries(fh.read(), base):
+            seen.setdefault(path, []).append((index_path, lineno, section))
 
-    seen = {}
-    for path, lineno, section in found:
-        seen.setdefault(path, []).append((lineno, section))
-    linked_total += len(seen)
-    where = index_path
+linked_total = sum(len(h) for h in seen.values())
 
-    # 1. Every page this index owns is listed, and listed exactly once.
-    for path in sorted(need - set(seen)):
-        defects.append((path, f"listed in no section of {where}"))
-    for path, hits in sorted(seen.items()):
-        if len(hits) > 1:
-            lines = ", ".join(f"line {n}" for n, _ in hits)
+# 1. Every page is listed exactly once, across all indexes, by the index that
+#    owns it.
+for path, index_path in sorted(owner_of.items()):
+    if path not in seen:
+        defects.append((path, f"listed in no section of {index_path}"))
+for path, hits in sorted(seen.items()):
+    if len(hits) > 1:
+        where = ", ".join(f"{i} line {n}" for i, n, _ in hits)
+        defects.append((path, f"listed {len(hits)} times ({where})"))
+    owner = owner_of.get(path)
+    for index_path, lineno, _ in hits:
+        if owner is not None and index_path != owner:
             defects.append(
-                (path, f"listed {len(hits)} times in {where} ({lines})")
+                (path,
+                 f"{index_path} line {lineno}: listed here, but {owner} owns "
+                 "this page — an entry belongs to exactly one index")
             )
 
-    # 2. Every link resolves to a page that exists.
-    for path, hits in sorted(seen.items()):
-        if path not in page_set:
-            defects.append(
-                (path, f"{where} line {hits[0][0]}: no such guide page")
-            )
+# 2. Every link resolves to a page that exists.
+for path, hits in sorted(seen.items()):
+    if path not in page_set:
+        index_path, lineno, _ = hits[0]
+        defects.append((path, f"{index_path} line {lineno}: no such guide page"))
 
-    # 3. Every entry sits under a `## ` heading.
-    for path, hits in sorted(seen.items()):
-        for lineno, section in hits:
-            if section is None:
-                defects.append(
-                    (path,
-                     f"{where} line {lineno}: not under any `## ` section "
-                     "heading")
-                )
+# 3. Every entry sits under a `## ` heading.
+for path, hits in sorted(seen.items()):
+    for index_path, lineno, section in hits:
+        if section is None:
+            defects.append(
+                (path,
+                 f"{index_path} line {lineno}: not under any `## ` section "
+                 "heading")
+            )
 
 # 4. The index is reachable from the landing page — by a LINK, not a mention.
 #    Checking for the literal path as a substring passed on a plain-text or
@@ -605,6 +693,56 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/inline/README.md"
   _commit inline
   _case "inline-code entry does not count" 1 inline
+
+  # 18. A four-space indented code block hides its links too.
+  _scaffold indented
+  printf '# A\n' > "$tmp/indented/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/indented/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\nFor example:\n\n    - [B](beta.md)\n' \
+    > "$tmp/indented/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/indented/README.md"
+  _commit indented
+  _case "indented-code entry does not count" 1 indented
+
+  # 19. ...but four-space indentation UNDER A LIST ITEM is a nested list, not
+  #     code. Over-blanking here would delete real entries, which is the one
+  #     direction that makes this gate quieter instead of louder.
+  _scaffold nested_list
+  printf '# A\n' > "$tmp/nested_list/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/nested_list/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n    - [B](beta.md)\n' \
+    > "$tmp/nested_list/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/nested_list/README.md"
+  _commit nested_list
+  _case "nested list item still counts as an entry" 0 nested_list
+
+  # 20. A page listed in BOTH the top-level index and the sub-index that owns
+  #     it. Each file's own tally shows one hit, so this is invisible from
+  #     inside either of them.
+  _scaffold cross_dup
+  printf '# A\n' > "$tmp/cross_dup/docs/guide/alpha.md"
+  printf '# T\n\n## Chapters\n\n1. [One](01-x.md)\n' \
+    > "$tmp/cross_dup/docs/guide/tutorial/index.md"
+  printf '# T1\n' > "$tmp/cross_dup/docs/guide/tutorial/01-x.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [T](tutorial/index.md)\n- [One](tutorial/01-x.md)\n' \
+    > "$tmp/cross_dup/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/cross_dup/README.md"
+  _commit cross_dup
+  _case "page listed in two indexes fails" 1 cross_dup
+
+  # 21. A PROSE cross-reference is not an entry and must not trip rule 1. The
+  #     real `tutorial/index.md` carries four of these; counting them would
+  #     flag ordinary writing as a duplicate listing.
+  _scaffold prose_xref
+  printf '# A\n' > "$tmp/prose_xref/docs/guide/alpha.md"
+  printf '# T\n\n## Chapters\n\n1. [One](01-x.md)\n\nSee the [A guide](../alpha.md) when you finish.\n' \
+    > "$tmp/prose_xref/docs/guide/tutorial/index.md"
+  printf '# T1\n' > "$tmp/prose_xref/docs/guide/tutorial/01-x.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [T](tutorial/index.md)\n' \
+    > "$tmp/prose_xref/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/prose_xref/README.md"
+  _commit prose_xref
+  _case "prose cross-reference is not an entry" 0 prose_xref
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
