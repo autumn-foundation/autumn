@@ -33,6 +33,12 @@ defaults into a convention-over-configuration stack with proc-macro ergonomics.
 This file is the quick operating guide. Load the adjacent reference files only
 when their details matter:
 
+- `docs/guide/index.md` - the complete guide catalog: every page under
+  `docs/guide/`, grouped by task, each entry naming the question that page
+  answers. Start here when the topic you need is not covered by this file or
+  the references below, rather than guessing a filename — the index is gated
+  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
 - `references/examples.md` - official 0.7.0 example patterns for minimal apps,
