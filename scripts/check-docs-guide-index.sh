@@ -287,7 +287,7 @@ def dest_at(text, pos):
 # A reference LABEL, which — unlike text — may not contain unescaped
 # brackets, so it stays a flat run. It may not cross a blank line
 # either, for the same reason the text above it cannot.
-_LABEL = re.compile(r"\[((?:[^\]\n]|\n(?!\s*\n))*)\]")
+_LABEL = re.compile(r"\[((?:\\.|[^\[\]\n]|\n(?!\s*\n))*)\]")
 
 
 def bracket_pairs(text):
@@ -494,7 +494,7 @@ ROW = re.compile(_ROW)
 # when a link's could not; two grammars for one construct is how most of this
 # file's findings started.
 DEFN = re.compile(
-    r"""^ {0,3}\[([^\]]+)\]:[ \t]*(?:\n[ \t]*)?(\S+)"""
+    r"""^ {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?(\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
 
@@ -503,6 +503,13 @@ DEFN = re.compile(
 # Stands in for an image inside `readable()`'s output: not whitespace, so
 # a link wrapping an image still has visible content, and not a character
 # any markdown construct matches.
+# Markdown drops a backslash only before ASCII PUNCTUATION. `\\index.md`
+# keeps its backslash and names no tracked file, so unescaping every
+# character turned a broken destination into a working one. Same class and
+# same spelling as `check-docs-links.sh`'s `ESCAPED_PUNCT`, which had this
+# right — the fourth finding traceable to differing from a sibling.
+ESCAPED_PUNCT = re.compile(r"\\([!-/:-@\[-`{-~])")
+
 IMAGE_MARK = "\ufffc"
 
 LABEL_LIMIT = 999
@@ -1291,7 +1298,7 @@ def normalise(target, base):
     # escapes that are not part of the path.
     target = target.split("?", 1)[0]
     target = urllib.parse.unquote(target)
-    target = re.sub(r"\\(.)", r"\1", target)
+    target = ESCAPED_PUNCT.sub(r"\1", target)
     target = target.rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
         return None
@@ -3476,6 +3483,40 @@ self_test() {
     > "$tmp/angle_defn_ok/README.md"
   _commit angle_defn_ok
   _case "a well-formed angle destination resolves" 0 angle_defn_ok
+
+  # 168. A reference LABEL may not hold an UNESCAPED bracket. Round 28 said
+  #      so in a comment and left `[` out of the pattern, so `[a[b]` both
+  #      defined and resolved while rendering no link at all.
+  _scaffold label_raw_bracket
+  printf '# A\n' > "$tmp/label_raw_bracket/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [Alpha][a[b]\n\n[a[b]: alpha.md\n' \
+    > "$tmp/label_raw_bracket/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/label_raw_bracket/README.md"
+  _commit label_raw_bracket
+  _case "an unescaped bracket is not a label" 1 label_raw_bracket
+
+  # 169. ...and the guard: an ESCAPED bracket is ordinary label content, so
+  #      168 is not bought by rejecting brackets outright.
+  _scaffold label_escaped_bracket
+  printf '# A\n' > "$tmp/label_escaped_bracket/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [Alpha][a\\[b]\n\n[a\\[b]: alpha.md\n' \
+    > "$tmp/label_escaped_bracket/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/label_escaped_bracket/README.md"
+  _commit label_escaped_bracket
+  _case "an escaped bracket is label content" 0 label_escaped_bracket
+
+  # 170. A backslash escapes only ASCII PUNCTUATION. Unescaping every
+  #      character turned `docs/guide/\index.md` — which names no tracked
+  #      file — into one that does, and passed a broken link.
+  _scaffold escape_non_punct
+  printf '# A\n' > "$tmp/escape_non_punct/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escape_non_punct/docs/guide/index.md"
+  printf '[Guide](docs/guide/\\index.md)\n' > "$tmp/escape_non_punct/README.md"
+  _commit escape_non_punct
+  _case "a backslash before a letter is not an escape" 1 escape_non_punct
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
