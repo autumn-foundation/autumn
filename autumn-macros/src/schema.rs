@@ -24,6 +24,14 @@ pub fn field_is_translatable(field: &syn::Field) -> bool {
     has_attr(field, "translatable")
 }
 
+/// Whether a field is declared `#[collaborative]` (issue #1806): its column
+/// holds an `autumn_web::collab::CollabText` document — a text CRDT that
+/// merges concurrent edits — instead of a plain string that the last writer
+/// overwrites.
+pub fn field_is_collaborative(field: &syn::Field) -> bool {
+    has_attr(field, "collaborative")
+}
+
 /// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
 /// to *serialization*, if any. Handles both the plain form and the split
 /// `rename_all(serialize = "...", deserialize = "...")` form (taking the
@@ -545,19 +553,126 @@ pub fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Emit the JSON-Schema `TokenStream` for a `#[collaborative]` field.
+///
+/// Describes both wire shapes a client must build: the element records in
+/// `elems`, and the tagged operations in `pending`. An `object` with no
+/// properties is not enough — a client cannot tell that an id is the string
+/// `"<counter>@<actor>"` rather than a two-field object, and a request built
+/// on that guess is refused.
+fn emit_collaborative_schema_tokens() -> TokenStream {
+    quote! {{
+        // Bound once: the shape appears five times below.
+        //
+        // Carrying the runtime's own limits, for the reason spelled out on
+        // `maxItems` below: `OpId::from_str` refuses an actor past
+        // `MAX_ACTOR_LEN`, and the document decoder refuses a counter at or
+        // past `MAX_COUNTER`, so a schema saying `[0-9]+@.+` promises clients
+        // ids the endpoint will certainly turn away.
+        //
+        // As tight as JSON Schema can say it and no tighter — every bound
+        // here is one no legal id can fail. The digit count is the width of
+        // the largest legal counter, which still admits a few values above it;
+        // `maxLength` budgets `MAX_ACTOR_LEN` as if the actor were all
+        // single-byte, since the real limit is bytes and a pattern counts
+        // characters. Narrowing either further would start rejecting ids the
+        // endpoint accepts, which is the same fault in the other direction.
+        let counter_digits = (::autumn_web::collab::MAX_COUNTER - 1).to_string().len();
+        let id = ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "pattern": format!("^[0-9]{{1,{counter_digits}}}@.+$"),
+            "maxLength": counter_digits + 1 + ::autumn_web::collab::MAX_ACTOR_LEN,
+            "description": format!(
+                "Character id, \"<counter>@<actor>\". The counter is below {} and \
+                 the actor is 1..={} bytes.",
+                ::autumn_web::collab::MAX_COUNTER,
+                ::autumn_web::collab::MAX_ACTOR_LEN,
+            )
+        });
+        let ch = ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1
+        });
+        ::autumn_web::reexports::serde_json::json!({
+            "type": "object",
+            "description": "Collaborative text document (issue #1806). Read \
+        `elems` for the characters; send operations to change the text. A bare string \
+        is refused: it would discard concurrent edits.",
+            "properties": {
+                "elems": {
+                    "type": "array",
+                    "description": "Every character, in document order. A deleted \
+        character stays as a tombstone, so concurrent edits keep their anchor.",
+                    // Named, not hardcoded: a generated validator that accepts
+                    // more than the endpoint does sends clients into a
+                    // deterministic rejection they were told was fine.
+                    "maxItems": ::autumn_web::collab::MAX_WIRE_ELEMENTS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": id.clone(),
+                            "after": id.clone(),
+                            "ch": ch.clone(),
+                            "deleted": { "type": "boolean", "default": false }
+                        },
+                        "required": ["id", "ch"]
+                    }
+                },
+                "pending": {
+                    "type": "array",
+                    "description": "Operations that wait for the character they \
+        name. Each applies when that character arrives.",
+                    "maxItems": ::autumn_web::collab::MAX_WIRE_PENDING,
+                    "items": { "oneOf": [
+                        {
+                            "type": "object",
+                            "title": "insert",
+                            "properties": {
+                                "op": { "const": "insert" },
+                                "id": id.clone(),
+                                "after": id.clone(),
+                                "ch": ch
+                            },
+                            "required": ["op", "id", "ch"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "delete",
+                            "properties": {
+                                "op": { "const": "delete" },
+                                "target": id
+                            },
+                            "required": ["op", "target"]
+                        }
+                    ] }
+                }
+            },
+            // `elems` is required on the wire, so the advertised contract
+            // has to say so — otherwise a generated client treats `{}` as
+            // a valid document and the endpoint rejects it.
+            "required": ["elems"]
+        })
+    }}
+}
+
 /// Emit the JSON-Schema `TokenStream` for one model field.
 ///
 /// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
-/// field (issue #1384) is described inline as a locale-tag→string map, which is
-/// exactly what its lossless `Serialize` emits. Without that, the field would
-/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
-/// referencing a component nothing registers.
+/// field (issue #1384) is described inline as a locale-tag→string map, and a
+/// `#[collaborative]` field (issue #1806) as its CRDT document — which is
+/// exactly what each one's lossless `Serialize` emits. Without that, the field
+/// would fall through to the `$ref` branch and `autumn openapi` would ship a
+/// spec referencing a component nothing registers.
 ///
 /// Keyed on the **attribute**, never on the type's name: an application type
 /// that merely happens to be called `Translated` (`domain::Translated`) keeps
 /// its ordinary `$ref`, so the advertised contract cannot silently disagree
 /// with what that type actually serializes to.
 pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_collaborative(field) {
+        return emit_collaborative_schema_tokens();
+    }
     if field_is_translatable(field) {
         return quote! {
             ::autumn_web::reexports::serde_json::json!({

@@ -246,6 +246,9 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `mail` | Transactional email, mailer macros, previews, deferred delivery |
 | `seed` | `SeedContext` for seed binaries |
 | `system-info` | Optional system information in actuator surfaces |
+| `presence` | Per-topic membership tracking with join/leave events; implies `ws` |
+| `offline-sync` | Offline-first local `SQLite` store plus a background sync engine |
+| `collab` | `#[collaborative]` text fields merged by an in-tree CRDT, with live sessions over the channel/presence seams — see [collaboration](../../docs/guide/collaboration.md) |
 
 For S3 storage add `autumn-storage-s3 = "0.7"`; `storage-s3` is no longer an
 `autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.7"`.
