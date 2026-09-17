@@ -282,8 +282,9 @@ def dest_at(text, pos):
         return None
     return j, text[pos:j]
 # A reference LABEL, which — unlike text — may not contain unescaped
-# brackets, so it stays a flat run.
-_LABEL = re.compile(r"\[([^\]]*)\]")
+# brackets, so it stays a flat run. It may not cross a blank line
+# either, for the same reason the text above it cannot.
+_LABEL = re.compile(r"\[((?:[^\]\n]|\n(?!\s*\n))*)\]")
 
 
 def bracket_pairs(text):
@@ -300,6 +301,17 @@ def bracket_pairs(text):
         if ch == "\\":
             j += 2
             continue
+        if ch == "\n":
+            # A BLANK line ends the paragraph, and link text cannot span
+            # one. Brackets either side of it are not a pair, so the stack
+            # does not survive the gap — the same rule the destination, the
+            # title and the definition already follow, applied to the one
+            # construct that had been left out of it.
+            k = j + 1
+            while k < n and text[k] in " \t":
+                k += 1
+            if k >= n or text[k] == "\n":
+                stack.clear()
         if ch == "[":
             stack.append(j)
         elif ch == "]" and stack:
@@ -2873,6 +2885,38 @@ self_test() {
     > "$tmp/single_quoted_title_row/README.md"
   _commit single_quoted_title_row
   _case "a single-quoted title on a row is a row" 0 single_quoted_title_row
+
+  # 139. Link TEXT may not cross a blank line. The destination, the title
+  #      and the definition all learned this rule in earlier rounds; the
+  #      text was the one construct left out of it.
+  _scaffold text_blank_line
+  printf '# A\n' > "$tmp/text_blank_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/text_blank_line/docs/guide/index.md"
+  printf '[Guide\n\ntext](docs/guide/index.md)\n' > "$tmp/text_blank_line/README.md"
+  _commit text_blank_line
+  _case "link text cannot cross a blank line" 1 text_blank_line
+
+  # 140. ...and the guard: ONE line ending inside link text is fine, so 139
+  #      is not bought by requiring links to sit on a single line.
+  _scaffold text_one_newline
+  printf '# A\n' > "$tmp/text_one_newline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/text_one_newline/docs/guide/index.md"
+  printf '[Guide\ntext](docs/guide/index.md)\n' > "$tmp/text_one_newline/README.md"
+  _commit text_one_newline
+  _case "link text may span one line ending" 0 text_one_newline
+
+  # 141. The same rule for a reference LABEL, found by checking the sibling
+  #      construct rather than waiting for it to be reported.
+  _scaffold label_blank_line
+  printf '# A\n' > "$tmp/label_blank_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/label_blank_line/docs/guide/index.md"
+  printf '[Guide][cat\n\nalog]\n\n[cat alog]: docs/guide/index.md\n' \
+    > "$tmp/label_blank_line/README.md"
+  _commit label_blank_line
+  _case "a label cannot cross a blank line" 1 label_blank_line
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
