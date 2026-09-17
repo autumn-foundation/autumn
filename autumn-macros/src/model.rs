@@ -5824,18 +5824,18 @@ fn fake_expr_core(
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
         // Issue #2597: a shaped decimal draws from `fake::decimal_with(p, s)`
         // so factory values fit the declared `decimal{p,s}` by construction.
-        "Decimal" => Some(match decimal_shape {
-            Some((p, s)) => quote! { ::autumn_web::fake::decimal_with(#p, #s) },
-            None => quote! { ::autumn_web::fake::decimal() },
-        }),
+        "Decimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s) },
+        )),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
         // The SQLite newtypes (issue #1924) wrap exactly those values. Without
         // these arms every faked row falls back to `Default` — one shared nil
         // UUID, which collides on a `:unique` column the first time twice.
-        "SqliteDecimal" => Some(match decimal_shape {
-            Some((p, s)) => quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
-            None => quote! { ::autumn_web::fake::decimal().into() },
-        }),
+        "SqliteDecimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal().into() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
+        )),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
