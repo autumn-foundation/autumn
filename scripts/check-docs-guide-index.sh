@@ -204,7 +204,12 @@ ENTRY = re.compile(r'''^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)[^\s)]*(?:\s
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # A raw HTML block opener at line start. `<pre>`/`<script>`/`<style>`/
 # `<textarea>` run to their closing tag; any other tag ends at a blank line.
-HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
+#
+# The lookahead is not decoration. CommonMark ends a block tag's NAME at
+# whitespace, `>`, `/>` or end of line; without that check the pattern read
+# `<div.class` as the tag `div` and blanked raw HTML through end of file,
+# losing every real link after a line that is in fact an ordinary paragraph.
+HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)(?=[ \t>]|/>|$)")
 HTML_LITERAL = ("pre", "script", "style", "textarea")
 # CommonMark's type-6 block tags: these open a raw block even with text after
 # them. Any OTHER tag (type 7) opens one only when it is alone on its line —
@@ -732,6 +737,21 @@ def reaches_index(text):
     """
     if any(normalise(m.group(1), "") == INDEX for m in LINK.finditer(text)):
         return True
+    # The inline pass above has already accounted for every complete inline
+    # link, so the reference passes below must not read back inside one. A
+    # link's TITLE is ordinary text to CommonMark, not navigation: in
+    # `[Other](other.md "see [Guide][catalog]")` the `[Guide][catalog]` is
+    # part of the title and renders as characters, yet the reference scan
+    # collected it and reported the index as reachable when nothing on the
+    # page reached it. Blanking the spans keeps the same rule the single
+    # scan in `readable()` uses — whichever construct opens first consumes
+    # its own extent — across the two passes of this function.
+    # Newlines survive the blanking. A link span can straddle lines, and
+    # replacing its newline with a space would join the following line to it
+    # — dropping the `^` that the MULTILINE definition scan below anchors on,
+    # so a perfectly good `[catalog]: ...` definition would stop counting.
+    text = LINK.sub(
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
     # `[label]: target` definitions, then the labels actually referenced by a
     # full (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
     # reference. A definition nothing references is not a link.
@@ -1528,6 +1548,64 @@ self_test() {
     > "$tmp/thematic_break/README.md"
   _commit thematic_break
   _case "indented code opens after a thematic break" 1 thematic_break
+
+  # 68. A block tag's NAME ends at whitespace, `>`, `/>` or end of line.
+  #     `<div.class` is an ordinary paragraph, not raw HTML, and reading it
+  #     as the tag `div` blanked the real link under it.
+  _scaffold tag_delimiter
+  printf '# A\n' > "$tmp/tag_delimiter/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/tag_delimiter/docs/guide/index.md"
+  printf '<div.class\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/tag_delimiter/README.md"
+  _commit tag_delimiter
+  _case "a tag name needs a delimiter to open a block" 0 tag_delimiter
+
+  # 69. ...and the other direction: a REAL block opener still swallows what
+  #     follows it, so case 68 cannot have been bought by disabling the rule.
+  _scaffold tag_delimiter_real
+  printf '# A\n' > "$tmp/tag_delimiter_real/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/tag_delimiter_real/docs/guide/index.md"
+  printf '<div class="x">\n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/tag_delimiter_real/README.md"
+  _commit tag_delimiter_real
+  _case "a real block opener still blanks its block" 1 tag_delimiter_real
+
+  # 70. A link-shaped REFERENCE inside a link's title is title text, not
+  #     navigation. The inline pass already consumed that span, so the
+  #     reference pass must not read back into it.
+  _scaffold ref_in_title
+  printf '# A\n' > "$tmp/ref_in_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_in_title/docs/guide/index.md"
+  printf '[Other](other.md "see [Guide][catalog]")\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/ref_in_title/README.md"
+  _commit ref_in_title
+  _case "reference inside a title is not a link" 1 ref_in_title
+
+  # 71. ...and the guard: blanking those spans must not eat a GENUINE
+  #     reference link sitting next to one. Case 70 is worthless without it.
+  _scaffold ref_beside_link
+  printf '# A\n' > "$tmp/ref_beside_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_beside_link/docs/guide/index.md"
+  printf '[X](y.md) [Guide][catalog]\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/ref_beside_link/README.md"
+  _commit ref_beside_link
+  _case "a reference beside an inline link still counts" 0 ref_beside_link
+
+  # 72. The newline guard. A link span may straddle lines; blanking its
+  #     newline would join the next line to it and drop the `^` that the
+  #     definition scan anchors on, losing a good definition.
+  _scaffold ref_multiline_link
+  printf '# A\n' > "$tmp/ref_multiline_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_multiline_link/docs/guide/index.md"
+  printf '[X](y.md "a\nb")\n[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/ref_multiline_link/README.md"
+  _commit ref_multiline_link
+  _case "a definition after a multiline link survives" 0 ref_multiline_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
