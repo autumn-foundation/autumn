@@ -216,16 +216,37 @@ DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
 # and it can never be an index row or a link to a `.md` page anyway.
 AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*>"
                       r"|<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>")
+# A list item marker, used only to tell a nested list from an indented
+# code block.
+LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
 # A well-formed inline HTML tag, whose ATTRIBUTES are not links. A tag may
 # wrap across lines — `<span\ntitle="…">` is one tag — but never across a
 # BLANK line, which bounds the damage a stray `<` can do: with no `>` before
 # the next blank line there is no match at all, and nothing is blanked.
-INLINE_TAG = re.compile(r"<[a-zA-Z/!?](?:[^>\n]|\n(?!\s*\n))*>")
+#
+# Quoted attribute values are matched as units, so a `>` inside one does not
+# end the tag: `<span title="a > b">` is one tag, and the text after that `>`
+# is still attribute text rather than prose.
+INLINE_TAG = re.compile(
+    r"""<[a-zA-Z/!?](?:"[^"]*"|'[^']*'|[^>'"\n]|\n(?!\s*\n))*>""")
 
 
 def _blank(s):
     """`s` with every character replaced by a space, newlines preserved."""
     return "".join("\n" if c == "\n" else " " for c in s)
+
+
+def _escaped(text, pos):
+    """True when `text[pos]` is preceded by an odd number of backslashes.
+
+    A backslash-escaped backtick is literal text, so it neither opens nor
+    closes a code span. Pairing one with a real delimiter left the span's
+    contents visible.
+    """
+    n = 0
+    while pos - n - 1 >= 0 and text[pos - n - 1] == "\\":
+        n += 1
+    return n % 2 == 1
 
 
 def readable(text):
@@ -257,6 +278,14 @@ def readable(text):
     out = list(text)
     n = len(text)
     i = 0
+    # Indented-code state. A block opens at four spaces after a blank line and
+    # only OUTSIDE a list, where four spaces is a continuation or a nested
+    # list instead. `ENTRY` is column-anchored so this never affects rows; it
+    # exists for the README link scan, which matches links anywhere. The
+    # single-scan rewrite dropped it on the same reasoning that dropped the
+    # code-span pass once before — true for entries, false for README.
+    prev_blank = True
+    in_list = False
 
     def blank_to(start, stop):
         for k in range(start, min(stop, n)):
@@ -273,6 +302,33 @@ def readable(text):
         line = text[i:eol]
 
         if at_line_start:
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            if not stripped:
+                prev_blank = True
+                i = eol + 1 if eol < n else n
+                continue
+            if indent == 0 and not LIST_ITEM.match(line):
+                in_list = False
+            if indent >= 4 and prev_blank and not in_list:
+                # Runs while the indent holds; a line back under four spaces
+                # ends it.
+                j = i
+                while j < n:
+                    stop = line_end(j)
+                    seg = text[j:stop]
+                    body = seg.lstrip(" ")
+                    if body and len(seg) - len(body) < 4:
+                        break
+                    blank_to(j, stop)
+                    j = stop + 1
+                i = min(j, n)
+                prev_blank = False
+                continue
+            if LIST_ITEM.match(line):
+                in_list = True
+            prev_blank = False
+
             m = FENCE.match(line)
             # A backtick opener's info string may not contain a backtick.
             if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
@@ -330,6 +386,9 @@ def readable(text):
             continue
 
         if text[i] == "`":
+            if _escaped(text, i):
+                i += 1
+                continue
             start = i
             while i < n and text[i] == "`":
                 i += 1
@@ -337,7 +396,7 @@ def readable(text):
             j = i
             closed = False
             while j < n:
-                if text[j] != "`":
+                if text[j] != "`" or _escaped(text, j):
                     j += 1
                     continue
                 cstart = j
@@ -1170,6 +1229,50 @@ self_test() {
     > "$tmp/stray_lt/README.md"
   _commit stray_lt
   _case "unterminated tag blanks nothing" 0 stray_lt
+
+  # 49. Indented code in README. `ENTRY` is column-anchored so this never
+  #     mattered for rows, but the README scan matches links anywhere — and
+  #     the single-scan rewrite dropped the pass on exactly that reasoning.
+  _scaffold readme_indent
+  printf '# A\n' > "$tmp/readme_indent/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_indent/docs/guide/index.md"
+  printf 'Docs:\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/readme_indent/README.md"
+  _commit readme_indent
+  _case "indented-code link in README is not an index link" 1 readme_indent
+
+  # 50. ...but four spaces under a LIST ITEM is a continuation, not code, so
+  #     a link there still counts. Over-blanking it would fail a good README.
+  _scaffold readme_list_cont
+  printf '# A\n' > "$tmp/readme_list_cont/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_list_cont/docs/guide/index.md"
+  printf 'Docs\n\n- a bullet\n    continued [Guide](docs/guide/index.md)\n' \
+    > "$tmp/readme_list_cont/README.md"
+  _commit readme_list_cont
+  _case "list continuation is not indented code" 0 readme_list_cont
+
+  # 51. A backslash-escaped backtick is literal, so it neither opens nor
+  #     closes a span; pairing it with a real delimiter left the span visible.
+  _scaffold escaped_backtick
+  printf '# A\n' > "$tmp/escaped_backtick/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escaped_backtick/docs/guide/index.md"
+  printf 'Escaped \\` then `[Guide](docs/guide/index.md)`\n' \
+    > "$tmp/escaped_backtick/README.md"
+  _commit escaped_backtick
+  _case "escaped backtick does not open a span" 1 escaped_backtick
+
+  # 52. A quoted `>` inside an attribute does not end the tag.
+  _scaffold quoted_gt
+  printf '# A\n' > "$tmp/quoted_gt/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_gt/docs/guide/index.md"
+  printf 'Docs <span title="not a link > [Guide](docs/guide/index.md)">t</span>\n' \
+    > "$tmp/quoted_gt/README.md"
+  _commit quoted_gt
+  _case "quoted > does not end an inline tag" 1 quoted_gt
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
