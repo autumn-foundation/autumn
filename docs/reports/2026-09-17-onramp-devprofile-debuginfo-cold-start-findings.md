@@ -187,11 +187,25 @@ still resolve their location (they ship their own separately-built debug
 info, unaffected by the local crate's flag). So under `-C debuginfo=0`,
 `panic.backtrace` for a real Autumn app would still show the call stack's
 function names — you'd still see *that* `my_app::handlers::checkout` panicked
-and what called it — just without the file:line for any of the application's
-own frames, which is real information developers use ("which of these three
-call sites hit this branch") and today get for free. `#[track_caller]`'s own
+and what called it — just without the file:line for any of those frames,
+which is real information developers use ("which of these three call sites
+hit this branch") and today get for free. `#[track_caller]`'s own
 panic-location string (`"thread panicked at src/foo.rs:42"`) is separate from
 `Backtrace` entirely and is unaffected either way.
+
+**Correction (thanks to further review on PR #2829): this is not limited to
+the application's own code.** A `[profile.dev]` override in the
+generated-project's manifest is a Cargo profile setting, and Cargo profiles
+apply to the whole resolved dependency graph by default (`[profile.dev.package.*]`
+overrides are how you'd claw back debug info for specific crates, and the
+templates set none). So `debug = 0` there would strip file:line from every
+locally-compiled frame in a backtrace — the application's own code, and
+`autumn-web` itself, and every other path/registry dependency compiled for
+that build — not just the app's frames. Only genuinely precompiled
+components survive, which in practice means the standard library's prebuilt
+sysroot artifacts (the only thing the two-function experiment above actually
+exercised) and nothing else; there is no intermediate tier of "your deps keep
+their debug info, only your app loses it."
 
 This is an undocumented quality trade-off, not a contract violation — but
 it's still a real cost for every developer, on every build, forever, not just
@@ -217,10 +231,13 @@ If a human wants to pursue this: pick a debug-info level for the generated
 project templates' `[profile.dev]` (currently unset, so `debug = true`/full):
 
 - `debug = 0` — larger win (~18%, pending re-measurement above the noise
-  floor and against the real harness), but drops file:line resolution for the
-  application's own stack frames in every panic backtrace (function names
-  still show; see the empirical check above) — a quality cost, not a broken
-  contract, but a real and permanent one.
+  floor and against the real harness), but drops file:line resolution for
+  every locally-compiled frame in a panic backtrace — the application's own
+  code, `autumn-web`, and every other dependency Cargo builds from source for
+  that project (function names still show; see the empirical check above,
+  and the profile-scope correction just before this section) — a quality
+  cost, not a broken contract, but a real and permanent one, and broader than
+  "just the app's code."
 - `debug = "line-tables-only"` — keeps backtrace file:line resolution intact,
   but only ~8.7% on this apparatus, short of the impact floor on its own.
 - Do nothing, and let #2795's next attempt keep looking at the frontend/
