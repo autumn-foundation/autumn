@@ -981,10 +981,33 @@ def _setext_context(line_above):
 def _starts_block(text, pos):
     """True when `pos` begins a block rather than continuing a paragraph.
 
-    Only the line above matters: a definition may follow a blank line, a
-    heading, a fence, a thematic break or the start of the file, but not a
-    line of ordinary prose, which would swallow it into that paragraph.
+    Usually only the line above matters: a definition may follow a blank
+    line, a heading, a fence, a thematic break or the start of the file,
+    but not a line of ordinary prose, which would swallow it into that
+    paragraph. The exception is a definition that opens a CONTAINER of its
+    own — see below.
     """
+    # `> [catalog]: x.md` or `- [catalog]: x.md` directly under prose is a
+    # definition, because the marker opens a NEW block quote or list item
+    # and that interrupts the paragraph above. Walking back to the previous
+    # line asks about a paragraph this definition is not in, and answered
+    # no — rejecting a README whose reference link cmark-gfm renders live.
+    #
+    # New is the whole of it. A quote already open carries its paragraph
+    # across, so `> prose` then `> [a]: x.md` is that quoted paragraph's
+    # second line and defines nothing, exactly as it would unquoted; only a
+    # DEEPER quote opens a block. A list marker always opens a fresh item,
+    # so it always interrupts. And a bare `[catalog]: x.md` under prose
+    # opens nothing at all.
+    eol = text.find("\n", pos)
+    own = text[pos:] if eol < 0 else text[pos:eol]
+    if _INTERRUPT_LIST.match(own):
+        return True
+    if BLOCKQUOTE.match(own):
+        above = text.rfind("\n", 0, pos)
+        prev_line = "" if above < 0 else text[text.rfind("\n", 0, above) + 1:above]
+        if quote_depth(own) > quote_depth(prev_line):
+            return True
     # A run of definitions is definitions only if the FIRST one starts a
     # block: `Some prose`, `[a]: x.md`, `[b]: y.md` defines neither, because
     # `a` is paragraph text and `b` is that paragraph's third line. So the
@@ -5162,6 +5185,54 @@ self_test() {
     > "$tmp/list_wide_marker/README.md"
   _commit list_wide_marker
   _case "a line below the content column leaves the item" 1 list_wide_marker
+
+  # 252. A container opened on the definition's OWN line is a block start.
+  #      `> [catalog]: x` under prose puts the definition in a new quote,
+  #      which interrupts the paragraph above, so it defines and the
+  #      reference below renders as a link. Asking only about the line
+  #      above asks about a paragraph the definition is not in.
+  _scaffold defn_opens_quote
+  printf '# A\n' > "$tmp/defn_opens_quote/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_opens_quote/docs/guide/index.md"
+  printf 'prose\n> [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_opens_quote/README.md"
+  _commit defn_opens_quote
+  _case "a definition opening a quote defines" 0 defn_opens_quote
+
+  # 253. A list marker opens a fresh item every time, so it interrupts even
+  #      when an item is already open.
+  _scaffold defn_opens_item
+  printf '# A\n' > "$tmp/defn_opens_item/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_opens_item/docs/guide/index.md"
+  printf -- '- item\n- [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_opens_item/README.md"
+  _commit defn_opens_item
+  _case "a definition opening a list item defines" 0 defn_opens_item
+
+  # 254. NEW is the whole of it for a quote: at the same depth the quoted
+  #      paragraph carries across, so only a DEEPER quote opens a block.
+  #      Case 218 pins the same-depth half; this is its other direction.
+  _scaffold defn_deeper_quote
+  printf '# A\n' > "$tmp/defn_deeper_quote/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_deeper_quote/docs/guide/index.md"
+  printf '> prose\n> > [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_deeper_quote/README.md"
+  _commit defn_deeper_quote
+  _case "a definition in a deeper quote defines" 0 defn_deeper_quote
+
+  # 255. And an ordered marker not at 1 interrupts nothing, so the
+  #      definition stays paragraph text and the reference stays literal.
+  _scaffold defn_ordered_two
+  printf '# A\n' > "$tmp/defn_ordered_two/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_ordered_two/docs/guide/index.md"
+  printf 'prose\n2. [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_ordered_two/README.md"
+  _commit defn_ordered_two
+  _case "an ordered marker at 2 opens no block" 1 defn_ordered_two
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
