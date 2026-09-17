@@ -180,6 +180,14 @@ _ANGLE = r"<[^<>\n]*>"
 # An ATX heading: one to six `#`, then whitespace or end of line. The trailing
 # requirement is the whole point — `#not-a-heading` is a paragraph.
 ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+# A LEVEL-ONE ATX heading specifically: exactly one `#`, then whitespace or
+# end of line. `#`, `# Appendix` and `#\tAppendix` are all level-one headings;
+# matching the literal prefix `"# "` saw only the middle one.
+ATX_H1 = re.compile(r"^ {0,3}#(?:[ \t].*)?$")
+# A level-one SETEXT underline. It only forms a heading when a paragraph line
+# sits directly above it, which is why the caller checks that rather than
+# treating a bare `===` — which is just a paragraph — as a heading.
+SETEXT_H1 = re.compile(r"^ {0,3}=+[ \t]*$")
 # An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
 # and the required whitespace before one is what keeps a parenthesised title
 # from being read as more balanced destination.
@@ -468,6 +476,34 @@ def readable(text):
             # this line overwrites it. A type-7 HTML opener cannot interrupt
             # a paragraph, and that is the only way to know it is doing so.
             was_paragraph = in_paragraph
+            # Whether this line actually OPENS a raw HTML block is decided
+            # HERE, before anything reads it. Testing `HTML_OPEN` directly in
+            # the paragraph rule below was not the same question: it marked
+            # every tag-shaped line as non-paragraph, including a type-7 tag
+            # that the rule further down then declined to open a block for.
+            # The paragraph ended anyway, so a four-space-indented line under
+            # it became code and its link vanished — the guard added for that
+            # exact case, defeated by the line above it.
+            #
+            # An autolink is a link, not a block opener, and is checked first
+            # because `HTML_OPEN`'s tag-name pattern happily matches `https`.
+            auto = AUTOLINK.match(line)
+            hm = HTML_OPEN.match(line)
+            if hm and not auto:
+                tag = hm.group(2).lower()
+                alone = bool(re.fullmatch(r"\s*" + INLINE_TAG.pattern + r"\s*",
+                                          line, re.VERBOSE))
+                type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
+                # A type-7 tag opens a block only when it is alone on its
+                # line AND is not interrupting a paragraph. CommonMark lets
+                # the type-6 list interrupt one but not type 7, so after
+                # `Some prose` a lone `<span>` is inline HTML and the lines
+                # under it are still paragraph text.
+                if type7 and (not alone or was_paragraph):
+                    hm = None
+            else:
+                hm = None
+
             # A heading or a fence line is not paragraph text, so an indented
             # line after one opens code.
             #
@@ -478,7 +514,7 @@ def readable(text):
             # link that a reader can click.
             in_paragraph = not (ATX.match(line)
                                 or FENCE.match(line)
-                                or HTML_OPEN.match(line)
+                                or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
                                 # paragraph, so an indented line after one is
@@ -518,24 +554,9 @@ def readable(text):
                 i = stop
                 continue
 
-            # An autolink is a link, not a block opener. Checked BEFORE
-            # `HTML_OPEN`, whose tag-name pattern happily matches `https`.
-            auto = AUTOLINK.match(line)
-            hm = HTML_OPEN.match(line)
-            if hm and not auto:
-                tag = hm.group(2).lower()
-                alone = bool(re.fullmatch(r"\s*" + INLINE_TAG.pattern + r"\s*",
-                                          line, re.VERBOSE))
-                type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
-                # A type-7 tag opens a block only when it is alone on its
-                # line AND is not interrupting a paragraph. CommonMark lets
-                # the type-6 list interrupt one but not type 7, so after
-                # `Some prose` a lone `<span>` is inline HTML and the lines
-                # under it are still paragraph text — blanking them as a raw
-                # block swallowed a link the reader can click.
-                if type7 and (not alone or was_paragraph):
-                    hm = None
-            if hm and not auto:
+            # `hm` was decided above, and is already None for an autolink or
+            # a type-7 tag that does not open a block.
+            if hm:
                 tag = hm.group(2).lower()
                 if tag in HTML_LITERAL and not hm.group(1):
                     closer = f"</{tag}>"
@@ -590,8 +611,13 @@ def readable(text):
                 continue
             continue
 
-        if text[i] == "!" and i + 1 < n and text[i + 1] == "[" and (
-                i == 0 or text[i - 1] != "\\"):
+        # `_escaped` counts the backslash RUN, not just the character before.
+        # `\\![alt …](x.png)` is an escaped backslash followed by a live `!`,
+        # so the image still opens and the link inside its alt text is only
+        # alt text. Looking at one character read that as escaped, left the
+        # image unblanked, and let that nested link count as navigation.
+        if (text[i] == "!" and i + 1 < n and text[i + 1] == "["
+                and not _escaped(text, i)):
             def balanced(pos, opener, closer):
                 depth, k = 1, pos + 1
                 while k < n and depth:
@@ -770,7 +796,12 @@ def entries(text, base):
     # row may sit above the `[label]: target` line that resolves it, which is
     # the usual way people write them.
     defs = definitions(body)
+    prev = ""
     for lineno, line in enumerate(body.split("\n"), 1):
+        # The previous line, captured before any `continue` can skip the
+        # bookkeeping. Only the Setext test needs it, and getting this wrong
+        # would make that test read whichever line last fell through.
+        prev, line_above = line, prev
         if line.startswith("## "):
             section = line[3:].strip()
             continue
@@ -779,7 +810,20 @@ def entries(text, base):
         # across let them satisfy the section-placement rule from a heading
         # a reader scanning that section would never reach. A `### ` is a
         # subheading INSIDE the current section, so it does not reset.
-        if line.startswith("# "):
+        #
+        # All three level-one spellings count, not just `# Title`: a bare
+        # `#`, a tab after the `#`, and the Setext form underlined with
+        # `===`. A Setext underline is only a heading when a paragraph line
+        # sits directly above it — under a blank line, or under another
+        # heading, `===` is just text and must NOT reset the section, or an
+        # index would be told its rows are unplaced when they are not.
+        if ATX_H1.match(line):
+            section = None
+            continue
+        if (SETEXT_H1.match(line) and line_above.strip()
+                and not ATX.match(line_above)
+                and not THEMATIC.match(line_above)
+                and not LIST_ITEM.match(line_above)):
             section = None
             continue
         target = None
@@ -1991,6 +2035,86 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/section_subheading/README.md"
   _commit section_subheading
   _case "a level-three subheading keeps the section" 0 section_subheading
+
+  # 93. The type-7 guard from case 88, defeated by the line above it: the
+  #     paragraph rule tested `HTML_OPEN` directly, so a tag that did NOT
+  #     open a block still ended the paragraph and the indented line under
+  #     it became code. The decision is made once now, before either use.
+  _scaffold type7_paragraph_state
+  printf '# A\n' > "$tmp/type7_paragraph_state/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/type7_paragraph_state/docs/guide/index.md"
+  printf 'Some prose\n<span>\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/type7_paragraph_state/README.md"
+  _commit type7_paragraph_state
+  _case "a type-7 tag does not end the paragraph" 0 type7_paragraph_state
+
+  # 94. ...and the guard: a type-6 tag DOES end it, so the line under it is
+  #     code and its link is not clickable.
+  _scaffold type6_paragraph_state
+  printf '# A\n' > "$tmp/type6_paragraph_state/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/type6_paragraph_state/docs/guide/index.md"
+  printf 'Some prose\n<div>\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/type6_paragraph_state/README.md"
+  _commit type6_paragraph_state
+  _case "a type-6 tag does end the paragraph" 1 type6_paragraph_state
+
+  # 95. Every level-one spelling ends the section, not just `# Title`: a
+  #     bare `#`, a tab after the `#`, and the Setext `===` form.
+  _scaffold section_reset_bare
+  printf '# A\n' > "$tmp/section_reset_bare/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/section_reset_bare/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n#\n\n- [B](beta.md)\n' \
+    > "$tmp/section_reset_bare/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/section_reset_bare/README.md"
+  _commit section_reset_bare
+  _case "a bare # ends the section" 1 section_reset_bare
+
+  _scaffold section_reset_setext
+  printf '# A\n' > "$tmp/section_reset_setext/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/section_reset_setext/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\nAppendix\n===\n\n- [B](beta.md)\n' \
+    > "$tmp/section_reset_setext/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/section_reset_setext/README.md"
+  _commit section_reset_setext
+  _case "a Setext level-one heading ends the section" 1 section_reset_setext
+
+  # 96. ...and the guard that matters most, because resetting wrongly tells
+  #     an index its rows are unplaced when they are not: `===` is only a
+  #     heading when a PARAGRAPH sits directly above it. Under a blank line
+  #     it is ordinary text.
+  _scaffold setext_not_heading
+  printf '# A\n' > "$tmp/setext_not_heading/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/setext_not_heading/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n===\n\n- [B](beta.md)\n' \
+    > "$tmp/setext_not_heading/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/setext_not_heading/README.md"
+  _commit setext_not_heading
+  _case "a bare === is text, not a heading" 0 setext_not_heading
+
+  # 97. Escape parity for an image opener. `\\!` is an escaped BACKSLASH
+  #     followed by a live `!`, so the image opens and the link inside its
+  #     alt text is only alt text.
+  _scaffold image_escape_parity
+  printf '# A\n' > "$tmp/image_escape_parity/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_escape_parity/docs/guide/index.md"
+  printf '\\\\![alt [Guide](docs/guide/index.md)](preview.png)\n' \
+    > "$tmp/image_escape_parity/README.md"
+  _commit image_escape_parity
+  _case "two backslashes still open an image" 1 image_escape_parity
+
+  # 98. ...and the guard: ONE backslash does escape the `!`, so what follows
+  #     is a link, not an image.
+  _scaffold image_escape_single
+  printf '# A\n' > "$tmp/image_escape_single/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_escape_single/docs/guide/index.md"
+  printf '\\![alt](preview.png) [Guide](docs/guide/index.md)\n' \
+    > "$tmp/image_escape_single/README.md"
+  _commit image_escape_single
+  _case "one backslash escapes an image opener" 0 image_escape_single
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
