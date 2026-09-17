@@ -148,7 +148,11 @@ mod fs_atomic;
 // not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
 // The module documents itself.
 pub mod classify;
+// A plain comment, not a doc comment: the module carries its own `//!` docs
+// and an outer `///` here would be merged with them.
 pub mod cluster;
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod config;
 pub mod consent;
 // Parse, validate and server-render Constela documents: the constrained JSON UI

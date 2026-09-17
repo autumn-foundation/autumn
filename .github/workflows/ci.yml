@@ -106,11 +106,18 @@ jobs:
         # whoever shapes the model's prompt can trigger on demand. Its nine modules
         # carry the panic gate and are configured out without this feature.
         #
+        # `collab` (#1806) is here because `collab/resolver.rs` is gated on
+        # `collab` AND `offline-sync`. The workspace lane above unifies
+        # `collab` in from examples/collab-notes but never `offline-sync`, and
+        # this lane had `offline-sync` without `collab` -- so the resolver, the
+        # piece that decides whether an offline edit merges or is discarded,
+        # was linted by no lane at all.
+        #
         # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
         # check-panic-gate.sh verifies every gated module's feature is covered by an
         # enforcing CI clippy lane, so a feature dropped from here silently disarms
         # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -1323,7 +1330,7 @@ jobs:
           # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
           # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
           # backend, which this pg-integration test requires). See #1614.
-          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
+          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,collab,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           # The Redis job-admin dashboard suite lives in autumn-web's `--lib`
           # test module (it drives crate-private types: RedisJobAdminBackend,
@@ -1539,8 +1546,21 @@ jobs:
           # testcontainer) compiles into this binary and is swept. `i18n` is a
           # pure request-path/codegen feature — it pulls in no extra runner
           # service and cannot flip a backend.
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests -- \
+          #
+          # `collab` joined in #1806 for both halves of the same reason. The
+          # `#[collaborative]` round-trip suite (`collab_model`, Postgres
+          # testcontainer) is gated `db + collab` and would not compile into
+          # this binary otherwise — the exact hole #1384 closed for
+          # `translatable_model`. And `collab_offline_merge` is gated
+          # `collab + offline-sync`: `offline-sync` is enabled by no workspace
+          # member, so `cargo test --workspace` compiles it out, and this is
+          # the only job that builds that pair. It is a pure
+          # merge/codegen feature — no extra runner service, no backend flip.
+          # Its non-Docker tests are named below so they run here rather than
+          # nowhere.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests collab_offline_merge
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
