@@ -207,10 +207,52 @@ HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
-# An inline code span on one line. `[Guide](x.md)` inside backticks renders as
-# literal text, so it is not a link — which matters for the README scan, the
-# one caller that still matches links rather than the `ENTRY` shape.
-INLINE_CODE = re.compile(r"`+[^`\n]*`+")
+def blank_code_spans(text):
+    """Blank inline code spans, including ones that wrap across lines.
+
+    `[Guide](x.md)` inside backticks renders as literal text, so it is not a
+    link — which matters for the README scan, the one caller that still
+    matches links rather than the `ENTRY` shape.
+
+    CommonMark's rule is followed exactly rather than approximated, because
+    the approximation is dangerous in the direction that hurts. A run of N
+    backticks opens a span only if a run of EXACTLY N appears later; if none
+    does, the backticks are literal text and nothing is blanked. That is what
+    makes an unmatched backtick harmless here — a greedy "backtick to
+    backtick" pattern would instead swallow whatever followed it and DELETE
+    real entries, leaving the gate quieter rather than louder.
+
+    Fences are blanked before this runs, so the only backticks reachable here
+    are the ones outside them.
+    """
+    out = list(text)
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "`":
+            i += 1
+            continue
+        start = i
+        while i < n and text[i] == "`":
+            i += 1
+        run = i - start
+        j = i
+        while j < n:
+            if text[j] != "`":
+                j += 1
+                continue
+            close = j
+            while j < n and text[j] == "`":
+                j += 1
+            if j - close == run:
+                for k in range(start, j):
+                    if out[k] != "\n":
+                        out[k] = " "
+                i = j
+                break
+        # No closing run of the same length: the opening backticks are
+        # literal, and scanning simply continues after them.
+    return "".join(out)
 HTML_LITERAL = ("pre", "script", "style", "textarea")
 
 
@@ -339,11 +381,10 @@ def readable(text):
     vanish and the gate FAIL. That is the safe direction: malformed markup
     should make the gate loud, not blind.
     """
-    return INLINE_CODE.sub(
-        lambda m: _blank(m.group(0)),
+    return blank_code_spans(
         blank_html_blocks(
             COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
-        ),
+        )
     )
 
 
@@ -955,6 +996,29 @@ self_test() {
     > "$tmp/inline_readme/README.md"
   _commit inline_readme
   _case "inline-code link in README is not an index link" 1 inline_readme
+
+  # 35. A code span may wrap across lines, and its contents are still literal.
+  _scaffold span_wrap
+  printf '# A\n' > "$tmp/span_wrap/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/span_wrap/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\nwrite `like this:\n- [B](beta.md)` in docs\n' \
+    > "$tmp/span_wrap/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/span_wrap/README.md"
+  _commit span_wrap
+  _case "multi-line code span hides its rows" 1 span_wrap
+
+  # 36. An UNMATCHED backtick is literal text in CommonMark and must blank
+  #     nothing. A greedy backtick-to-backtick pattern would instead swallow
+  #     the rows after it — over-blanking, the direction that makes this gate
+  #     quieter rather than louder.
+  _scaffold stray_backtick
+  printf '# A\n' > "$tmp/stray_backtick/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/stray_backtick/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n100%% of the `budget is spent\n\n- [A](alpha.md)\n- [B](beta.md)\n' \
+    > "$tmp/stray_backtick/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/stray_backtick/README.md"
+  _commit stray_backtick
+  _case "unmatched backtick blanks nothing" 0 stray_backtick
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
