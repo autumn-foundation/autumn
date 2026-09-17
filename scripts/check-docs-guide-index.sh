@@ -267,9 +267,19 @@ def dest_at(text, pos):
     while j < n:
         ch = text[j]
         if ch == "\\" and j + 1 < n:
-            # Same rule as `bracket_pairs`: never past a line ending.
-            if text[j + 1] == "\n":
-                break
+            # An escape only exists before ASCII PUNCTUATION. `\\ ` is a
+            # literal backslash followed by a space, and a space ENDS a bare
+            # destination — so `[Guide](index.md?\\ foo)` is not a link at
+            # all, and skipping the pair let the scanner run past the space,
+            # keep `foo`, and then report a route the reader does not have.
+            #
+            # `ESCAPED_PUNCT` is the same class the rest of the file uses;
+            # a backslash before anything else is just a character, and the
+            # newline case falls out of that (a newline is not punctuation,
+            # so the loop reaches it and stops).
+            if not ESCAPED_PUNCT.match(text, j):
+                j += 1
+                continue
             j += 2
             continue
         if ch in " \t\n":
@@ -486,15 +496,46 @@ def ref_labels(text):
 # item instead. `LIST_ITEM` below already carried the digit and bullet rules,
 # which is where they should have been read from in the first place.
 #
-# A TAB is padding too, and this accepted only literal spaces — so `-\t[A](a.md)`
-# was reported unlisted while both renderers show a linked item. A tab advances
-# to the next multiple of four, so ONE of them is always valid padding after a
-# marker, and up to three spaces may precede it; TWO tabs reach column eight,
-# which is indented code inside the item and not a row. The rest of this file
-# handles tabs by `expandtabs(4)`, which cannot be used here because the match
-# end is an offset into the ORIGINAL line that `link_at` reads from.
-_ROW = r"^(?:[-*+]|\d{1,9}[.)])(?: {0,3}\t| {1,4})"
-ROW = re.compile(_ROW)
+# A TAB is padding too, and whether it FITS depends on the marker's width, so
+# this is a function rather than a pattern. A tab advances to the next multiple
+# of four, so the same tab is valid padding after one marker and too much after
+# another, and no regex can say which:
+#
+#   -<TAB>[A](a.md)        marker ends col 1, tab -> col 4, indent 3   row
+#   -  <TAB>[A](a.md)      ends col 1, tab -> col 4, indent 3          row
+#   -   <TAB>[A](a.md)     ends col 1, tab -> col 8, indent 7          code
+#   10.<TAB>[A](a.md)      ends col 3, tab -> col 4, indent 1          row
+#   10. <TAB>[A](a.md)     ends col 3, tab -> col 8, indent 5          code
+#
+# Round 49 wrote ` {0,3}\t` by analogy with the space rule instead of counting
+# columns, which accepted the third and fifth of those — indented code read as
+# an index entry. All five are cmark-gfm's own output.
+#
+# `expandtabs(4)`, which the rest of the file uses for indentation, cannot
+# serve here: the result must be an offset into the ORIGINAL line, because
+# `link_at` reads the link from that line.
+MARKER = re.compile(r"^(?:[-*+]|\d{1,9}[.)])")
+
+
+def row_at(line):
+    """Offset where a top-level list item's CONTENT starts, or None.
+
+    Padding is measured in COLUMNS, from where the marker ends, and must be
+    one to four of them: a fifth column starts an indented code block inside
+    the item, and what renders there is not an entry.
+    """
+    m = MARKER.match(line)
+    if m is None:
+        return None
+    base = col = m.end()
+    i = m.end()
+    while i < len(line) and line[i] in " \t":
+        col = col + 1 if line[i] == " " else (col // 4 + 1) * 4
+        i += 1
+    indent = col - base
+    if not 1 <= indent <= 4 or i >= len(line):
+        return None
+    return i
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
 # shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
@@ -1667,17 +1708,17 @@ def entries(text, base):
             section = None
             continue
         target = None
-        row = ROW.match(line)
+        row = row_at(line)
         if row is None:
             continue
         # The link must begin the row's CONTENT — that column-zero anchoring
         # is what separates an index's rows from its prose, and it is why
-        # both forms are read at exactly `row.end()` rather than searched for.
-        hit = link_at(line, row.end(), None, set(defs))
+        # both forms are read at exactly `row` rather than searched for.
+        hit = link_at(line, row, None, set(defs))
         if hit is not None and hit[1]:
             target = hit[1]
         else:
-            ref = ref_at(line, row.end())
+            ref = ref_at(line, row)
             if ref is not None:
                 # `[text][label]` uses `label`; `[label][]` and the shortcut
                 # `[label]` use the text itself. An undefined label is not a
@@ -4358,6 +4399,56 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/definition_row/README.md"
   _commit definition_row
   _case "a definition row lists nothing" 1 definition_row
+
+  # 212. A backslash escapes only ASCII PUNCTUATION. `\ ` is a literal
+  #      backslash and a space, and a space ENDS a bare destination, so
+  #      `[Guide](index.md?\ foo)` is not a link at all — cmark-gfm renders
+  #      the whole construct as text. Skipping the pair ran the scanner past
+  #      the space and reported a route the reader does not have.
+  _scaffold escape_space_dest
+  printf '# A\n' > "$tmp/escape_space_dest/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escape_space_dest/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md?\\ foo)\n' \
+    > "$tmp/escape_space_dest/README.md"
+  _commit escape_space_dest
+  _case "a backslash before a space is not an escape" 1 escape_space_dest
+
+  # 213. Tab padding is measured in COLUMNS FROM THE MARKER'S END, so the
+  #      same tab fits after one marker and not after another. Round 49 wrote
+  #      ` {0,3}\t` by analogy with the space rule instead of counting, which
+  #      read indented code as an entry. All four spellings below are
+  #      cmark-gfm's own output; the two that render code must FAIL.
+  _scaffold row_tab_columns
+  for p in a b c d; do printf '# %s\n' "$p" > "$tmp/row_tab_columns/docs/guide/$p.md"; done
+  printf '# Guide\n\n## S\n\n-\t[A](a.md)\n-  \t[B](b.md)\n10.\t[C](c.md)\n- [D](d.md)\n' \
+    > "$tmp/row_tab_columns/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/row_tab_columns/README.md"
+  _commit row_tab_columns
+  _case "tab padding is counted in columns" 0 row_tab_columns
+
+  # 214. Three spaces then a tab reaches column eight after a one-character
+  #      marker — seven columns of padding, which is indented code.
+  _scaffold row_tab_overflow
+  printf '# A\n' > "$tmp/row_tab_overflow/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n-   \t[A](alpha.md)\n' \
+    > "$tmp/row_tab_overflow/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/row_tab_overflow/README.md"
+  _commit row_tab_overflow
+  _case "a tab past column four is code" 1 row_tab_overflow
+
+  # 215. And the marker-width half: after `10.` even ONE space before the tab
+  #      overflows, which no fixed space count could express.
+  _scaffold row_tab_wide_marker
+  printf '# A\n' > "$tmp/row_tab_wide_marker/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n10. \t[A](alpha.md)\n' \
+    > "$tmp/row_tab_wide_marker/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/row_tab_wide_marker/README.md"
+  _commit row_tab_wide_marker
+  _case "tab padding depends on marker width" 1 row_tab_wide_marker
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
