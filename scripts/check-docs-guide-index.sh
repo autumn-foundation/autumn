@@ -50,25 +50,35 @@
 # is a page that drifts against the pages it indexes.
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
-#   1. Every tracked page under `docs/guide/` is listed in
-#      `docs/guide/index.md` — exactly once. Twice is a defect too: a reader
-#      who meets the same page under two headings cannot tell whether they are
-#      the same page, and the second entry is the one that rots.
-#   2. Every guide page the index links exists, and is a guide page. A link to
+#   1. Every tracked page under `docs/guide/` is listed in the index that owns
+#      it — exactly once. Twice is a defect too: a reader who meets the same
+#      page under two headings cannot tell whether they are the same page, and
+#      the second entry is the one that rots.
+#   2. Every guide page an index links exists, and is a guide page. A link to
 #      a page that moved is caught by `check-docs-links.sh` as a 404; this
-#      catches the index pointing somewhere outside the corpus it indexes.
+#      catches an index pointing somewhere outside the corpus it indexes.
 #   3. Every entry sits under a `## ` section heading, so a page appended to
 #      the end of the file lands somewhere a reader is actually scanning.
-#   4. `README.md` links `docs/guide/index.md`. An index nobody can reach from
-#      the landing page is the very defect this gate exists to prevent, and it
-#      would otherwise be the one page the gate could not see.
+#   4. `README.md` carries a markdown LINK whose target resolves to
+#      `docs/guide/index.md`. An index nobody can reach from the landing page
+#      is the very defect this gate exists to prevent, and it would otherwise
+#      be the one page the gate could not see. Checking for the literal path as
+#      a substring is not enough: a plain-text or inline-code mention satisfies
+#      it while getting the reader nowhere, so the README's link destinations
+#      are parsed and resolved.
 #
 # DELEGATION TO A SUB-INDEX. A subdirectory of `docs/guide/` that carries its
-# own `index.md` — `tutorial/` does — is represented in the top-level index by
-# that `index.md` alone. The tutorial is 12 ordered chapters; listing them
-# individually in a task-shaped index would spray twelve near-identical entries
-# across it and tell a reader nothing about which one to open first. The
-# sub-index is listed, and it owns its own ordering.
+# own `index.md` — `tutorial/` does — is represented in the TOP-LEVEL index by
+# that `index.md` alone, and owns its own pages. The tutorial is 12 ordered
+# chapters; listing them individually in a task-shaped index would spray twelve
+# near-identical entries across it and tell a reader nothing about which one to
+# open first. The sub-index is listed, and it owns its own ordering.
+#
+# Delegation is not an escape. Each page is checked against the NEAREST index
+# above it, so an unlisted tutorial chapter fails against `tutorial/index.md`
+# rather than vanishing from the required set — and the rule nests to any
+# depth. Getting that wrong is how the first revision of this gate let a new
+# tutorial chapter listed nowhere at all pass with zero defects.
 #
 # TRUTH SET: `git ls-files docs/guide`, read at run time. There is no snapshot
 # to regenerate — a page added in a commit is required by this gate in the same
@@ -112,53 +122,74 @@ def tracked(root):
     return sorted(p for p in out.split("\0") if p.endswith(".md"))
 
 
-def required(pages):
-    """The pages the top-level index must list.
+def index_plan(pages):
+    """Map every index page under `docs/guide/` to the pages it must list.
 
-    Everything tracked under `docs/guide/`, minus the index itself, minus the
-    pages of any subdirectory that carries its own `index.md` — that
-    subdirectory is represented by its index, which IS required. See the
-    DELEGATION note in this file's header.
+    A page is owned by the NEAREST index above it: `tutorial/01-*.md` belongs
+    to `tutorial/index.md`, and `tutorial/index.md` itself belongs to the
+    top-level index, which is owned by nobody. Delegation is therefore not a
+    hole — an unlisted tutorial chapter fails against its own sub-index — and
+    it nests to any depth without this function knowing how deep the tree is.
+
+    An earlier revision of this gate excluded a delegated subdirectory's pages
+    from the required set and stopped there, never checking the sub-index that
+    was supposed to have taken responsibility for them. A new tutorial chapter
+    listed nowhere at all passed with zero defects, which is exactly the
+    guarantee this gate exists to make. Caught in review on the PR that added
+    it; the synthetic corpora below now pin both halves.
     """
-    sub_indexes = {p for p in pages
-                   if p.endswith("/index.md") and p != INDEX}
-    delegated = {p.rsplit("/", 1)[0] + "/" for p in sub_indexes}
-    out = set()
+    indexes = sorted(p for p in pages
+                     if p == INDEX or p.endswith("/index.md"))
+    plan = {i: set() for i in indexes}
     for p in pages:
         if p == INDEX:
             continue
-        if any(p.startswith(d) for d in delegated) and p not in sub_indexes:
-            continue
-        out.add(p)
-    return out
+        owner, owner_dir = None, None
+        for idx in indexes:
+            if idx == p:
+                continue
+            d = idx.rsplit("/", 1)[0] + "/"
+            if p.startswith(d) and (owner_dir is None or len(d) > len(owner_dir)):
+                owner, owner_dir = idx, d
+        if owner is not None:
+            plan[owner].add(p)
+    return plan
 
 
-def normalise(target):
-    """Resolve an index link target to a repo-relative guide path, or None.
+def normalise(target, base):
+    """Resolve a link target to a repo-relative guide path, or None.
+
+    `base` is the directory of the file the link was written in ("" for a
+    repo-root file such as README.md), so a sub-index's `01-project-setup.md`
+    resolves against its own directory rather than against `docs/guide/`.
 
     A target that resolves outside `docs/guide/` returns None and is simply not
-    an entry: the index is allowed to link docs.rs, and pointing that out is
-    not this gate's job. A target INSIDE the guide is returned whether or not
-    the page exists, so a link to a page that was deleted is reported as a
-    defect rather than quietly ignored.
+    an entry: an index is allowed to link docs.rs, and pointing that out is not
+    this gate's job. A target INSIDE the guide is returned whether or not the
+    page exists, so a link to a page that was deleted is reported as a defect
+    rather than quietly ignored.
     """
     target = target.strip().rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
         return None
     if target.startswith("./"):
         target = target[2:]
-    # Written from the repo root.
-    if target.startswith(GUIDE):
-        return target
-    # Written relative to the index, which lives in `docs/guide/`. A target
-    # climbing out with `../` leaves the guide, so it is not an entry.
-    if not target.startswith(".."):
-        return GUIDE + target
-    return None
+    # Written from the repo root, or relative to `base`.
+    path = target if target.startswith(GUIDE) else base + target
+    parts = []
+    for seg in path.split("/"):
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        elif seg not in ("", "."):
+            parts.append(seg)
+    path = "/".join(parts)
+    return path if path.startswith(GUIDE) else None
 
 
-def entries(text):
-    """Every guide-page link in the index, with the `##` section it sits under.
+def entries(text, base):
+    """Every guide-page link in a file, with the `##` section it sits under.
 
     Links inside fenced code are not entries: a fence showing what an entry
     looks like is documentation about the index, not a row of it.
@@ -176,8 +207,8 @@ def entries(text):
             section = line[3:].strip()
             continue
         for m in LINK.finditer(line):
-            path = normalise(m.group(1))
-            if path is None or not path.startswith(GUIDE):
+            path = normalise(m.group(1), base)
+            if path is None:
                 continue
             out.append((path, lineno, section))
     return out
@@ -197,58 +228,76 @@ if not pages:
     )
 
 page_set = set(pages)
-need = required(pages)
+plan = index_plan(pages)
 
-try:
-    with open(f"{root}/{INDEX}", encoding="utf-8") as fh:
-        index_text = fh.read()
-except FileNotFoundError:
+if INDEX not in plan:
     print(f"corpus: {len(pages)} pages under {GUIDE}")
-    print(f"defects: {len(need)}")
+    print(f"defects: {len(pages)}")
     sys.exit(
-        f"FAIL: {INDEX} does not exist, so none of the {len(need)} guide "
+        f"FAIL: {INDEX} does not exist, so none of the {len(pages)} guide "
         "pages is listed in a reader-facing index."
     )
 
-found = entries(index_text)
-
 defects = []
+required_total = 0
+linked_total = 0
 
-seen = {}
-for path, lineno, section in found:
-    seen.setdefault(path, []).append((lineno, section))
+for index_path, need in sorted(plan.items()):
+    required_total += len(need)
+    base = index_path.rsplit("/", 1)[0] + "/"
+    with open(f"{root}/{index_path}", encoding="utf-8") as fh:
+        found = entries(fh.read(), base)
 
-# 1. Listed, and exactly once.
-for path in sorted(need - set(seen)):
-    defects.append((path, "listed in no section of the index"))
-for path, hits in sorted(seen.items()):
-    if len(hits) > 1:
-        where = ", ".join(f"line {n}" for n, _ in hits)
-        defects.append((path, f"listed {len(hits)} times ({where})"))
+    seen = {}
+    for path, lineno, section in found:
+        seen.setdefault(path, []).append((lineno, section))
+    linked_total += len(seen)
+    where = index_path
 
-# 2. Every link resolves to a page that exists.
-for path, hits in sorted(seen.items()):
-    if path not in page_set:
-        defects.append((path, f"line {hits[0][0]}: no such guide page"))
-
-# 3. Every entry sits under a `## ` heading.
-for path, hits in sorted(seen.items()):
-    for lineno, section in hits:
-        if section is None:
+    # 1. Every page this index owns is listed, and listed exactly once.
+    for path in sorted(need - set(seen)):
+        defects.append((path, f"listed in no section of {where}"))
+    for path, hits in sorted(seen.items()):
+        if len(hits) > 1:
+            lines = ", ".join(f"line {n}" for n, _ in hits)
             defects.append(
-                (path, f"line {lineno}: not under any `## ` section heading")
+                (path, f"listed {len(hits)} times in {where} ({lines})")
             )
 
-# 4. The index is reachable from the landing page.
+    # 2. Every link resolves to a page that exists.
+    for path, hits in sorted(seen.items()):
+        if path not in page_set:
+            defects.append(
+                (path, f"{where} line {hits[0][0]}: no such guide page")
+            )
+
+    # 3. Every entry sits under a `## ` heading.
+    for path, hits in sorted(seen.items()):
+        for lineno, section in hits:
+            if section is None:
+                defects.append(
+                    (path,
+                     f"{where} line {lineno}: not under any `## ` section "
+                     "heading")
+                )
+
+# 4. The index is reachable from the landing page — by a LINK, not a mention.
+#    Checking for the literal path as a substring passed on a plain-text or
+#    inline-code mention, which is not clickable and does not get the reader
+#    anywhere. Caught in review on the PR that added this gate.
 with open(f"{root}/{README}", encoding="utf-8") as fh:
     readme = fh.read()
-if INDEX not in readme:
+if not any(normalise(m.group(1), "") == INDEX
+           for m in LINK.finditer(readme)):
     defects.append(
-        (README, f"does not link {INDEX}; the index itself is unfindable")
+        (README,
+         f"has no markdown link whose target resolves to {INDEX}; a "
+         "plain-text mention is not clickable, so the index is unfindable")
     )
 
 print(f"corpus: {len(pages)} pages under {GUIDE}")
-print(f"index:  {len(need)} required entries, {len(seen)} linked")
+print(f"indexes: {len(plan)} ({', '.join(sorted(plan))})")
+print(f"entries: {required_total} required, {linked_total} linked")
 print(f"defects: {len(defects)}")
 
 if defects:
@@ -294,11 +343,12 @@ self_test() {
   _scaffold ok
   printf '# A\n' > "$tmp/ok/docs/guide/alpha.md"
   printf '# B\n' > "$tmp/ok/docs/guide/beta.md"
-  printf '# T\n' > "$tmp/ok/docs/guide/tutorial/index.md"
+  printf '# T\n\n## Chapters\n\n1. [One](01-x.md)\n' \
+    > "$tmp/ok/docs/guide/tutorial/index.md"
   printf '# T1\n' > "$tmp/ok/docs/guide/tutorial/01-x.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [B](beta.md)\n- [T](tutorial/index.md)\n' \
     > "$tmp/ok/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/ok/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ok/README.md"
   _commit ok
   _case "complete index passes" 0 ok
 
@@ -307,7 +357,7 @@ self_test() {
   printf '# A\n' > "$tmp/missing/docs/guide/alpha.md"
   printf '# B\n' > "$tmp/missing/docs/guide/beta.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' > "$tmp/missing/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/missing/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/missing/README.md"
   _commit missing
   _case "unlisted page fails" 1 missing
 
@@ -316,7 +366,7 @@ self_test() {
   printf '# A\n' > "$tmp/dup/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n## T\n\n- [A again](alpha.md)\n' \
     > "$tmp/dup/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/dup/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/dup/README.md"
   _commit dup
   _case "duplicate entry fails" 1 dup
 
@@ -324,7 +374,7 @@ self_test() {
   _scaffold nosection
   printf '# A\n' > "$tmp/nosection/docs/guide/alpha.md"
   printf '# Guide\n\n- [A](alpha.md)\n' > "$tmp/nosection/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/nosection/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/nosection/README.md"
   _commit nosection
   _case "entry outside a section fails" 1 nosection
 
@@ -333,7 +383,7 @@ self_test() {
   printf '# A\n' > "$tmp/ghost/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [G](ghost.md)\n' \
     > "$tmp/ghost/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/ghost/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ghost/README.md"
   _commit ghost
   _case "link to a missing guide page fails" 1 ghost
 
@@ -349,7 +399,7 @@ self_test() {
   # 7. A missing index file fails rather than passing vacuously.
   _scaffold noindex
   printf '# A\n' > "$tmp/noindex/docs/guide/alpha.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/noindex/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/noindex/README.md"
   _commit noindex
   _case "absent index fails" 1 noindex
 
@@ -359,9 +409,49 @@ self_test() {
   printf '# B\n' > "$tmp/fence/docs/guide/beta.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [B](beta.md)\n\n```\n- [A](alpha.md)\n```\n' \
     > "$tmp/fence/docs/guide/index.md"
-  printf 'see docs/guide/index.md\n' > "$tmp/fence/README.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/fence/README.md"
   _commit fence
   _case "fenced entry is not double-counted" 0 fence
+
+  # 9. A page in a delegated subdirectory, listed in NEITHER index, fails.
+  #    The first revision of this gate passed this corpus: it dropped the
+  #    subdirectory's pages from the required set and never checked the
+  #    sub-index that was meant to own them.
+  _scaffold delegated
+  printf '# A\n' > "$tmp/delegated/docs/guide/alpha.md"
+  printf '# T\n\n## Chapters\n\n1. [One](01-x.md)\n' \
+    > "$tmp/delegated/docs/guide/tutorial/index.md"
+  printf '# T1\n' > "$tmp/delegated/docs/guide/tutorial/01-x.md"
+  printf '# T2\n' > "$tmp/delegated/docs/guide/tutorial/02-unlisted.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [T](tutorial/index.md)\n' \
+    > "$tmp/delegated/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/delegated/README.md"
+  _commit delegated
+  _case "unlisted page in a delegated subdir fails" 1 delegated
+
+  # 10. The same corpus passes once the sub-index lists it — a sub-index link
+  #     resolves against its OWN directory, not against docs/guide/.
+  _scaffold delegated_ok
+  printf '# A\n' > "$tmp/delegated_ok/docs/guide/alpha.md"
+  printf '# T\n\n## Chapters\n\n1. [One](01-x.md)\n2. [Two](02-listed.md)\n' \
+    > "$tmp/delegated_ok/docs/guide/tutorial/index.md"
+  printf '# T1\n' > "$tmp/delegated_ok/docs/guide/tutorial/01-x.md"
+  printf '# T2\n' > "$tmp/delegated_ok/docs/guide/tutorial/02-listed.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [T](tutorial/index.md)\n' \
+    > "$tmp/delegated_ok/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/delegated_ok/README.md"
+  _commit delegated_ok
+  _case "delegated page listed in its sub-index passes" 0 delegated_ok
+
+  # 11. A README that MENTIONS the index without linking it fails. The
+  #     substring check this replaced passed on exactly this corpus.
+  _scaffold mention
+  printf '# A\n' > "$tmp/mention/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' > "$tmp/mention/docs/guide/index.md"
+  printf 'The guide index lives at `docs/guide/index.md` somewhere.\n' \
+    > "$tmp/mention/README.md"
+  _commit mention
+  _case "README mention without a link fails" 1 mention
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
