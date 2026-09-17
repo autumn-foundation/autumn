@@ -4168,6 +4168,7 @@ mod tests {
     /// serves `/file.` — matchit 404s there — so the two segments do not
     /// overlap, while `/file.json` still does. (#2499)
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn a_capture_must_consume_a_character_so_a_bare_prefix_does_not_overlap() {
         let ext = normalize_captures("file.{ext}");
         assert!(!segments_overlap(&ext, "file."));
@@ -4180,6 +4181,7 @@ mod tests {
     /// `/file.{ext}` and `/file.` share no URL, while `/file.json` is inside
     /// the capture's range. (#2499)
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn the_capture_minimum_length_reaches_intersect_and_covers() {
         let ext = normalize_captures("/file.{ext}");
         assert_eq!(intersect(&ext, "/file."), None);

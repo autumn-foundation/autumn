@@ -69,6 +69,36 @@ fn is_sqlite_target(database_url: &str) -> bool {
     )
 }
 
+/// Reject a `database_url` this CLI build's embedded `FRAMEWORK_MIGRATIONS`
+/// would apply wrong DDL to.
+///
+/// `FRAMEWORK_MIGRATIONS` (`autumn/src/migrate.rs`) is chosen once, at
+/// COMPILE time, by the `sqlite` cargo feature — never per target at
+/// runtime. A `sqlite`-feature build therefore embeds the `SQLite` fork for
+/// the WHOLE binary: several of its migrations are no-op shims (tables a
+/// `SQLite` app already owns elsewhere), others use `SQLite`-only DDL. Run
+/// against a non-`SQLite` target, Diesel would record a shim or
+/// incompatible version as "applied" over the real `PostgreSQL` schema
+/// instead of running it — silently, since the version names match.
+/// `autumn-cli/Cargo.toml` already documents `sqlite` as mutually exclusive
+/// with the default `PostgreSQL` build; this rejects the mismatch at runtime
+/// too, instead of trusting the operator to never point one build at the
+/// other backend's database.
+fn framework_migrations_backend_mismatch(database_url: &str) -> Result<(), String> {
+    if cfg!(feature = "sqlite") && !is_sqlite_target(database_url) {
+        return Err(
+            "this CLI build was compiled with `--features sqlite`, so its embedded framework \
+             migrations are the SQLite fork for the whole binary (chosen once, at compile time) \
+             \u{2014} not selected per target. This target's URL is not `sqlite://`, so applying \
+             them would run SQLite-shaped DDL, including no-op shims, against a different \
+             database instead of the real schema. Rebuild the default (PostgreSQL) CLI for this \
+             target; the `sqlite` feature must never be pointed at a non-SQLite database."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Whether every resolved target is a `SQLite` URL, used to skip the Postgres-only
 /// `diesel` CLI preflight (`check_diesel_cli`) — the `SQLite` apply path uses the
 /// in-process harness, never the `diesel` subprocess.
@@ -79,8 +109,9 @@ fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
 /// Apply pending user migrations against a `SQLite` database through the unlocked
 /// diesel harness (no advisory lock, no `diesel` subprocess — issue #1999/#2036
 /// precedent), then the `SQLite` variants of the framework tables every
-/// database needs, with the two enumerated together first so an app migration
-/// sharing a framework version cannot mask it (see
+/// database needs — the control-plane schema (`FRAMEWORK_MIGRATIONS`, issue
+/// #2699) and the shard-required sets — with the two enumerated together
+/// first so an app migration sharing a framework version cannot mask it (see
 /// [`autumn_web::migrate::run_pending_sqlite_with_framework_migrations`]).
 /// Real only under the `sqlite` feature; the default build returns the
 /// [`SQLITE_FEATURE_MSG`] seam.
@@ -292,6 +323,12 @@ pub fn run(
                          `autumn migrate down` only \u{2014} run those to apply or roll back a \
                          `sqlite://` database."
                     );
+                    eprintln!();
+                    sqlite_unsupported = true;
+                    continue;
+                }
+                if let Err(message) = framework_migrations_backend_mismatch(url) {
+                    eprintln!("  \u{2717} {message}");
                     eprintln!();
                     sqlite_unsupported = true;
                     continue;
@@ -608,6 +645,11 @@ fn run_single_target(
         return run_single_target_sqlite(database_url, migrations_dir);
     }
 
+    if let Err(message) = framework_migrations_backend_mismatch(database_url) {
+        eprintln!("\u{274C} {message}");
+        return false;
+    }
+
     // Startup wait — only when enabled (startup_wait_secs > 0 or --wait N).
     // When wait == Duration::ZERO we skip entirely so the existing fail-fast
     // path is preserved byte-for-byte (AC #6).
@@ -736,13 +778,14 @@ fn run_single_target(
 ///
 /// Deliberately mirrors `autumn schema migrate`'s `SQLite` path: no advisory lock
 /// (`SQLite` is single-writer, #1999), no `diesel` subprocess, and no Postgres
-/// content-checksum bookkeeping. The Postgres control-plane schema is never
-/// applied (its DDL has no `SQLite` variant); the three shard-required sets
-/// that do have one (version history, commit-hook queue, derivation state) are,
-/// so a deployment with startup auto-migration off still gets them (#1769).
-/// The app set and those three are version-disambiguated together before
-/// either is applied, as at boot, so an app migration that shares a version
-/// with a framework one masks nothing.
+/// content-checksum bookkeeping. The Postgres control-plane schema
+/// (`FRAMEWORK_MIGRATIONS`) now has a `SQLite` variant too (issue #2699), so it
+/// applies here alongside the three shard-required sets (version history,
+/// commit-hook queue, derivation state) — a deployment with startup
+/// auto-migration off still gets all of them (#1769). The app set and the
+/// framework sets are version-disambiguated together before any is applied,
+/// as at boot, so an app migration that shares a version with a framework one
+/// masks nothing.
 fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
     let dir = std::path::Path::new(migrations_dir);
     eprintln!(
@@ -3501,6 +3544,33 @@ replica_url = "postgres://replica:5432/app"
     fn reject_sqlite_sharding_allows_no_control_no_shards() {
         // No primary role and no shards: nothing to reject.
         assert_eq!(reject_sqlite_sharding_topology(None, &[]), Ok(()));
+    }
+
+    #[test]
+    fn framework_migrations_backend_mismatch_rejects_non_sqlite_targets_under_a_sqlite_build() {
+        // `FRAMEWORK_MIGRATIONS` is chosen once, at compile time, by the `sqlite`
+        // cargo feature (autumn/src/migrate.rs) — never per target at runtime.
+        // Compiled with `sqlite`, this build's embedded set is the SQLite fork
+        // for the WHOLE binary, so a non-SQLite target must be rejected here
+        // rather than silently applying the wrong DDL. The default build has no
+        // such mismatch to reject. `cfg!` makes this assertion track whichever
+        // build actually compiled it, so the test is meaningful either way.
+        let is_mismatch = framework_migrations_backend_mismatch("postgres://control/app").is_err();
+        assert_eq!(
+            is_mismatch,
+            cfg!(feature = "sqlite"),
+            "a `sqlite`-feature build must reject a non-SQLite target; the default build must not"
+        );
+    }
+
+    #[test]
+    fn framework_migrations_backend_mismatch_allows_sqlite_targets_in_any_build() {
+        // A genuine `sqlite://` target is never a backend mismatch, regardless
+        // of which backend this CLI was compiled for.
+        assert_eq!(
+            framework_migrations_backend_mismatch("sqlite:///tmp/app.db"),
+            Ok(())
+        );
     }
 
     #[test]

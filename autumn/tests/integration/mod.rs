@@ -61,6 +61,13 @@ mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(feature = "db")]
+mod confidential_model;
+#[cfg(feature = "db")]
+mod confidential_red_team;
+mod confidential_sealing;
+#[cfg(feature = "db")]
+mod confidential_threat_model;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
@@ -78,6 +85,7 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+mod edge_conformance_ci_coverage;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which

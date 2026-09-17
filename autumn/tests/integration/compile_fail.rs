@@ -16,6 +16,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_async_main.rs");
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
+    t.compile_fail("tests/compile-fail/route_attr_error_cascades_through_routes.rs");
 
     // An attribute matching #[authorize]'s argument grammar under a
     // different name is refused rather than guessed at, whether it's really
@@ -88,6 +89,23 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_ledgered_purge_rejected.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_ledgered_sensitive_columns.rs");
+
+    // Warden security review, 2026-09-13: `owner = <column>` only emits
+    // opt-in `list_scoped`/`search_page_scoped` methods for a hand-written
+    // handler to call explicitly — the generated `api = "..."` CRUD routes
+    // never call them and only branch on `policy` (`scope` filters only the
+    // list endpoint's SQL). Left on its own next to `api = "..."`, `owner`
+    // silently shipped a fully public REST API that looked, at the
+    // declaration site, like a per-owner-scoped one.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_owner_api_without_policy_or_scope.rs");
+    // `scope = Type` alone (no `policy`) is equally insufficient: it only
+    // filters `GET <api>`'s SQL query, leaving `_api_get`/`_api_update`/
+    // `_api_delete` fully unguarded. Caught in review (Codex, PR #2770) on
+    // the first cut of this fix, which wrongly accepted `scope` as an
+    // alternative to `policy`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_owner_api_with_scope_but_no_policy.rs");
 
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
@@ -276,6 +294,23 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
 
+    // Operator-blind confidential fields (#1771). A `#[confidential]` column is
+    // sealed under a key the server never holds, so anything that would make the
+    // operator read, index or compare the value is a build failure rather than a
+    // query that silently matches nothing.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_searchable.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_plain_string.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_missing_blind_index.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_or_create_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_cursor_key.rs");
+
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
     #[cfg(feature = "maud")]
@@ -376,6 +411,9 @@ fn query_budget_compile_fail_tests() {
     // round 2): `self.conn().await?`, the real shape in
     // `autumn-search/src/postgres.rs`'s `write_documents`.
     t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
+    // `LazyDb::checkout` (PR #2762 review, #2264): `let mut db =
+    // lazy_db.checkout().await?;`, the documented public idiom.
+    t.compile_fail("tests/compile-fail/query_budget_lazy_db_checkout_n_plus_one.rs");
     // The `.expect(...)`/`.unwrap()` idiom `autumn/src/seed.rs` documents as
     // its own canonical usage (PR #2546 review, round 5) — the same
     // accessor-tracking gap as the `?` shape above, for a different
@@ -421,6 +459,8 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     ("agent_authority_job_not_listed", false),
     // A helper handed a tracked handle is opaque, never assumed effect-free.
     ("agent_authority_opaque_helper", false),
+    // Same, through a `Db` obtained via `LazyDb::checkout` (#2264, PR #2762).
+    ("agent_authority_lazy_db_checkout_opaque_helper", false),
     // Including an *associated* one: an uppercase path segment is a shape, not
     // evidence that the callee is framework surface.
     ("agent_authority_opaque_associated_helper", false),
@@ -502,6 +542,31 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+/// Wire contracts (#1755), in their own `#[test]` so the shard that owns them
+/// is the `rest` filter in ci.yml's `trybuild` job rather than the big
+/// `compile_fail_tests` one.
+///
+/// The first three are the falsification the issue asks for: each is a change
+/// that keeps the callee compiling and the caller type-checking, and each must
+/// still turn the build red at the caller's call site. The rest are the
+/// refusals that keep the check from ever passing vacuously, or from
+/// describing a wire shape it cannot actually read.
+#[test]
+fn compile_fail_wire_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/wire_response_field_not_produced.rs");
+    t.compile_fail("tests/compile-fail/wire_request_field_not_accepted.rs");
+    t.compile_fail("tests/compile-fail/wire_missing_required_request_field.rs");
+    t.compile_fail("tests/compile-fail/wire_endpoint_below_route_attribute.rs");
+    t.compile_fail("tests/compile-fail/wire_contract_checked_client_not_found.rs");
+    t.compile_fail("tests/compile-fail/wire_endpoint_name_is_not_an_identifier.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_flatten.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_transparent.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
+    t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
+}
+
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
 // shards (see the `trybuild` job in .github/workflows/ci.yml). Each half owns a
 // disjoint slice of the SAME fixture list — nothing is gated on the split, so a
@@ -566,6 +631,10 @@ fn compile_pass_tests_a() {
     // the terminal query, not a handle-refining step (PR #2546 review,
     // round 4) — its result must not be promoted to a handle either.
     t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
+    // `LazyDb::checkout` (PR #2762 review, second round, #2264): the
+    // checkout call itself must not cost a query, or the documented idiom
+    // plus one real query would need `#[query_budget(2)]`.
+    t.pass("tests/compile-pass/query_budget_lazy_db_checkout_excluded_from_budget.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
@@ -630,6 +699,17 @@ fn compile_pass_tests_a() {
     // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
+
+    // Wire contracts (#1755): the compatible half of the falsification — a
+    // caller that reads only produced fields and supplies every required one
+    // compiles, including across a serde rename and a `skip_serializing_if`.
+    t.pass("tests/compile-pass/wire_contract_holds.rs");
+
+    // #1771: the escape hatch the confidential build failure names. A finder
+    // over the blind-index companion column has to compile, or the diagnostic
+    // sends authors somewhere that does not work.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_blind_index_finder.rs");
 }
 
 // The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.

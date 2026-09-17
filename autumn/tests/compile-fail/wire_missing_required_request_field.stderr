@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: wire contract broken in `create` at `create_item(…)`: endpoint `create_item` requires a request field that the request type does not always put on the wire, and the call site sets only [name]
+  --> tests/compile-fail/wire_missing_required_request_field.rs:37:10
+   |
+37 |         .create_item(NewItem {
+   |          ^^^^^^^^^^^ evaluation of `_` failed here

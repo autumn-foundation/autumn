@@ -614,7 +614,13 @@ pub trait AdminModel: Send + Sync + 'static {
         self.fields()
             .into_iter()
             .filter(|f| {
-                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+                // #1771: a confidential column, and its blind-index companion,
+                // leave the database in a file built for sharing. The envelope
+                // and the token are both per-owner values, so an exported file
+                // is a portable correlation handle.
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+                    && !f.encrypted
+                    && !::autumn_web::confidential::is_confidential_column_name(f.name)
             })
             .map(|f| f.name)
             .collect()
@@ -702,6 +708,39 @@ pub trait AdminModel: Send + Sync + 'static {
                     .to_owned(),
             ))
         })
+    }
+}
+
+/// Refuse a call on the `SQLite` backend, for a model that needs Postgres.
+///
+/// The three built-in models (`tokens`, `experiments`, `feature_flags`) read
+/// Postgres-only tables with Postgres-only SQL: `ILIKE`, `::type` casts,
+/// `NOW()` and writable CTEs. Since issue #2108 the crate COMPILES under
+/// `autumn-web/sqlite`, so registering one on `SQLite` is now a run-time
+/// mistake instead of a build error. Without this guard the operator sees a
+/// raw driver message such as `near "ILIKE": syntax error`.
+///
+/// Call it first in every method of a Postgres-only model. On Postgres it is a
+/// compile-time `Ok(())`: `backend_select!` drops the other arm.
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "the Postgres arm is a trivial Ok(()); the SQLite arm formats an error"
+)]
+pub fn require_postgres(model: &str) -> Result<(), AdminError> {
+    ::autumn_web::backend_select! {
+        pg => {{
+            let _ = model;
+            Ok(())
+        }},
+        sqlite => {{
+            Err(AdminError::Other(format!(
+                "{model} needs the Postgres backend: it reads a Postgres-only table \
+                 with Postgres-only SQL. This app runs on SQLite. Register your own \
+                 AdminModel instead — see the autumn-admin-plugin README, \
+                 \"Database Backends\" (issue #2108)."
+            )))
+        }},
     }
 }
 

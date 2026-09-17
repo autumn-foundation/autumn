@@ -8889,3 +8889,121 @@ fn codemod_gate_accepts_a_walkthrough_codemod_bullet_wrapped_onto_a_continuation
     let output = run_migration_gate(tmp.path());
     assert!(output.status.success(), "{}", gate_report(&output));
 }
+
+/// The registry every `MinIO` testcontainer must be pulled from.
+const MINIO_REGISTRY: &str = "quay.io/minio/minio";
+
+/// Collect `.rs` files under `dir`, skipping build output.
+fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+    {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_dir() {
+            if name != "target" && name != ".git" {
+                rust_sources(&path, found);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// The builder lines a `MinIO::default()` call spans, since rustfmt splits it.
+fn builder_window(source: &str, index: usize) -> String {
+    source
+        .lines()
+        .skip(index)
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn every_minio_container_is_pulled_from_the_public_registry() {
+    // Docker Hub refuses anonymous pulls of `minio/minio` — its registry answers
+    // 401, which Docker reports as "repository does not exist". Every call site
+    // must therefore override the name that `testcontainers-modules` pins.
+    //
+    // This is a whole-tree scan rather than a list, because the tests it guards
+    // run only in the Docker sweep: a fourth call site added without the
+    // override would compile, pass review, and fail CI with an error that names
+    // a registry rather than the file that forgot.
+    let root = workspace_root();
+    let mut sources = Vec::new();
+    rust_sources(&root, &mut sources);
+
+    let mut offenders = String::new();
+    for path in sources {
+        // This file states the rule and carries its own fixtures, so it would
+        // otherwise report itself.
+        if path.ends_with("repo_hygiene.rs") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        for (index, line) in content.lines().enumerate() {
+            if !line.contains("MinIO::default()") {
+                continue;
+            }
+            let window = builder_window(&content, index);
+            // Only a container actually being started needs the override; the
+            // builder is also read for its tag, which pulls nothing.
+            if !window.contains(".start()") {
+                continue;
+            }
+            // The registry may be named inline or through a constant, so the
+            // literal is looked for anywhere in the file rather than in the
+            // builder itself.
+            if window.contains(".with_name(") && content.contains(MINIO_REGISTRY) {
+                continue;
+            }
+            let relative = path.strip_prefix(&root).unwrap_or(&path);
+            let _ = writeln!(
+                offenders,
+                "  {}:{} — {}",
+                relative.display(),
+                index + 1,
+                line.trim(),
+            );
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "every MinIO container must be started with \
+         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub denies anonymous pulls \
+         of minio/minio. Unqualified call sites:\n{offenders}",
+    );
+}
+
+#[test]
+fn the_minio_registry_scan_sees_an_unqualified_call_site() {
+    // Proves the scan above can fail: its assertion is worth nothing if the
+    // matcher never fires.
+    let flags = |src: &str| -> bool {
+        src.lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("MinIO::default()"))
+            .any(|(index, _)| {
+                let window = builder_window(src, index);
+                window.contains(".start()")
+                    && !(window.contains(".with_name(") && src.contains(MINIO_REGISTRY))
+            })
+    };
+    let unqualified = "let c = MinIO::default()\n    .start()\n    .await;";
+    let inline = format!(
+        "let c = MinIO::default()\n    .with_name(\"{MINIO_REGISTRY}\")\n    .start()\n    .await;",
+    );
+    let via_const = format!(
+        "const IMAGE: &str = \"{MINIO_REGISTRY}\";\n\
+         let c = MinIO::default()\n    .with_name(IMAGE)\n    .start()\n    .await;",
+    );
+    let wrong_registry = "let c = MinIO::default()\n    .with_name(\"docker.io/minio/minio\")\n    .start()\n    .await;";
+    let tag_only = "let t = MinIO::default().tag();";
+    assert!(flags(unqualified), "an unqualified start must be caught");
+    assert!(!flags(&inline), "an inline registry must pass");
+    assert!(!flags(&via_const), "a registry named by constant must pass");
+    assert!(flags(wrong_registry), "a different registry must be caught");
+    assert!(!flags(tag_only), "reading the tag pulls nothing");
+}

@@ -2994,7 +2994,51 @@ pub(super) fn render_repository_for_pull(
     )
 }
 
-#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+/// Warden 2026-09-13: `owner = <col>` on its own does not gate the
+/// auto-generated `api = "..."` CRUD routes at all — only `policy = Type`
+/// does (`GET`/`PUT`/`DELETE <api>/{id}` have no `scope`/`owner`-driven
+/// check; only `has_policy` gates them). `#[repository]` now refuses this
+/// exact combination at compile time (`autumn-macros/src/repository.rs`).
+///
+/// The scaffold's call site only ever passes `owner_column: Some(..)` when
+/// `authorize_wiring` held, which itself requires `policy_on` — i.e. a
+/// `{pascal_name}Policy` is already being generated and registered on the
+/// app in every case that reaches here. So wiring it in is not new
+/// authorization, only completing what the doc comment already told the
+/// developer to do by hand ("reference it from `#[repository(..., policy =
+/// Policy)]` to guard the JSON mutating API too") — for the one path
+/// (owner-scoped, non-sharded, non-live) where the scaffold can do it
+/// automatically because the policy's shape (owner-comparing
+/// `can_show`/`can_update`/`can_delete`) is already known.
+///
+/// `policy = ...` parses as a bare `Ident`, not a path (see
+/// `parse_repo_args`), so the returned attribute names the type unqualified
+/// and the returned `use` import brings it into scope.
+///
+/// Returns `(owner_attr, policy_attr, policy_use)`, each empty when
+/// `owner_column` is `None`.
+fn owner_policy_wiring(
+    owner_column: Option<&str>,
+    pascal_name: &str,
+    snake_name: &str,
+) -> (String, String, String) {
+    owner_column.map_or_else(
+        || (String::new(), String::new(), String::new()),
+        |col| {
+            (
+                format!(", owner = {col}"),
+                format!(", policy = {pascal_name}Policy"),
+                format!("use crate::policies::{snake_name}::{pascal_name}Policy;\n"),
+            )
+        },
+    )
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)] // one straight-line template builder, like its siblings elsewhere in this file
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,
@@ -3014,11 +3058,22 @@ fn render_repository_file(
     // When `broadcasts = true` is set, `#[repository]` synthesizes internal
     // hooks whose generated `update` body expands an unqualified
     // `{Pascal}DraftExt::from_patch(...)`. Import that trait alongside the other
-    // model types so the generated repository compiles (issue #1853). Gated on
-    // the same `live` boolean that drives `broadcasts_attr` — the default
-    // (non-broadcast) scaffold emits no hooks and no `from_patch`, so it keeps
-    // the plain three-name import.
-    let draft_ext_import = if live {
+    // model types so the generated repository compiles (issue #1853).
+    //
+    // Warden 2026-09-13: the macro's `_api_update` handler does the same thing
+    // whenever `policy = Type` is present (`has_policy`, issue #1801's
+    // merged-model validation) — and `api = "/api/{plural}"` is unconditional
+    // in this function's template (the `api` bool param below only toggles
+    // the doc comment/fragment content, never whether the attribute carries
+    // `api = ...`), so `has_policy` is live whenever `owner_column.is_some()`
+    // (`owner_policy_wiring` above always wires a `policy = Type` alongside
+    // `owner = <col>`) — on EVERY owner-scoped scaffold, `--api` or not. So
+    // the import is needed whenever EITHER drives `has_policy`: `live`
+    // (broadcasts) or `owner_column.is_some()` (policy). Caught by CI's
+    // `owner-searchable`/`nullable-owner-searchable`/`attachment-owner`/
+    // `policy-scaffold` generator-conformance jobs (E0405: `PostDraftExt` not
+    // found) after an earlier cut of this fix wrongly gated on `api` too.
+    let draft_ext_import = if live || owner_column.is_some() {
         format!(", {pascal_name}DraftExt")
     } else {
         String::new()
@@ -3027,13 +3082,12 @@ fn render_repository_file(
     // `search_page(query, &PageRequest)` methods (backed by the model's
     // `#[searchable]` fields + the migration's `search_vector` column).
     let searchable_attr = if searchable { ", searchable" } else { "" };
-    // Issue #1841: `owner = <col>` makes `#[repository]` emit owner-filtered
-    // `list_scoped` / `search_page_scoped` methods that the owner-scoped index +
-    // `/search` handlers call so they never return another user's rows. Only the
-    // caller's in-scope standard Db path passes `Some`; every other scaffold
-    // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
-    // the attr — and the scoped methods — are omitted.
-    let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
+    // Issue #1841 + Warden 2026-09-13 (see `owner_policy_wiring`'s doc comment):
+    // `owner = <col>` + `policy = <Type>` make `#[repository]` emit owner-filtered
+    // `list_scoped`/`search_page_scoped` and gate the auto-API. Only the caller's
+    // in-scope standard Db path passes `Some`; every other scaffold passes `None`.
+    let (owner_attr, policy_attr, policy_use) =
+        owner_policy_wiring(owner_column, pascal_name, snake_name);
     // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
     // `position(column = "...", scope = "...")` into the generated
     // `#[repository(...)]` attribute, which is what actually generates the
@@ -3150,8 +3204,9 @@ fn render_repository_file(
         "{doc_comment}\n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
+         {policy_use}\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{position_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{policy_attr}{position_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -18968,8 +19023,15 @@ async fn main() {
         // scoped methods.
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(
-            repo.contains(", owner = user_id)"),
+            repo.contains(", owner = user_id"),
             "owner-scoped repository must carry `owner = user_id` on the attr: {repo}"
+        );
+        // Warden 2026-09-13: `owner = ...` alone does not gate `api = "..."`'s
+        // CRUD routes — the scaffold must also wire in the generated policy.
+        assert!(
+            repo.contains(", policy = PostPolicy)")
+                && repo.contains("use crate::policies::post::PostPolicy;"),
+            "owner-scoped repository must also carry `policy = ...` or it no longer compiles: {repo}"
         );
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
