@@ -1313,6 +1313,15 @@ jobs:
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
         timeout-minutes: 75
+        env:
+          # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
+          # which compiles `postgresql_embedded`; its build script downloads
+          # Postgres binaries via the GitHub API and, unauthenticated, hits the
+          # 60 req/hr rate limit and fails the build with a 403 (2026-09-16, run
+          # 35126796648). Authenticate with the job's token to get the higher
+          # rate limit, as the `coverage` job and the Windows Tier 1 journey job
+          # already do.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored

@@ -442,6 +442,77 @@ _None as of 2026-09-05._
   outage resolved itself via PR #2790 (merged 2026-09-14T23:07:59Z) before
   this pass began sampling.
 
+### `postgresql_embedded` build script: GitHub API rate limit (403) fetching release metadata
+
+- **New, 2026-09-17.** First occurrence found in this pass. Run 35126796648
+  (branch `claude/determined-bardeen-unefhv`, job `Test (Docker)`, completed
+  2026-09-16T17:53Z; the triggering branch's diff has nothing to do with
+  `postgresql_embedded` or Postgres tooling). `cargo build` failed compiling
+  `postgresql_embedded v0.19.0`'s build script:
+  `` error: failed to run custom build command for `postgresql_embedded v0.19.0` ``,
+  stderr: `Error: HTTP status client error (403 rate limit exceeded) for url
+  (https://api.github.com/repos/theseus-rs/postgresql-binaries/releases?page=1&per_page=100)`.
+  This failed the required `Test suite` gate (via `test-docker`).
+- **Mechanism**: unpinned/rate-limited external dependency — the crate's
+  build script fetches PostgreSQL binary release metadata from GitHub's REST
+  API unauthenticated (60 requests/hour per source IP), and GitHub Actions
+  runners draw from a shared IP pool that many workflows across many repos
+  hit simultaneously, so the limit can be exhausted by traffic this repo's
+  own CI never generated. Structurally the same category as the closed
+  MinIO/Docker-Hub and RUSTSEC-2026-0285 entries above (an external fact
+  outside this repo's control failing the required gate independent of the
+  triggering PR's own diff). **Unlike those two, this did not need a
+  dozens-of-runs campaign to root-cause**: `ci.yml` itself already names
+  and fixes this exact mechanism twice — the `coverage` job's own comment
+  states it explicitly (`"postgresql_embedded's build script downloads
+  Postgres binaries via the GitHub API; unauthenticated it hits the 60
+  req/hr rate limit and fails the build with a 403. Authenticate with the
+  job's token to get the higher rate limit."`, `GITHUB_TOKEN:
+  ${{ secrets.GITHUB_TOKEN }}` at job scope), and the Windows Tier 1 journey
+  job's "the app builds on Windows" step carries the identical fix, citing
+  the coverage job by name ("as the coverage job already does"). The
+  `test-docker` job's "Run Docker-dependent tests" step — which builds
+  `feature_flags_pg_integration` with the `managed-pg-bundled` feature, the
+  same feature that pulls in `postgresql_embedded` — simply never got the
+  same `env:` block added.
+- **Correction (post-review, via a Codex review comment on PR #2833): this
+  is not feature-dependent or occasional exposure.** Read directly against
+  `ci.yml`: `test-gate`'s `needs:` is `[test, trybuild, test-features,
+  test-docker]`, unconditional, and `test-docker`'s "Run Docker-dependent
+  tests" step is gated only on `runner.os == 'Linux'` (which
+  `heavy_runs_on` always resolves to for `pull_request` events), not on any
+  feature flag. So every PR reaching this required shard compiles
+  `postgresql_embedded` unauthenticated until this fix — the exposure was
+  universal on every PR, not merely n=1-and-hope-it-doesn't-recur.
+- **Test-vs-product**: neither — pure CI/build infrastructure; no product
+  code path is implicated.
+- **Fix**: applied in this same PR (#2833) — added
+  `GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to `test-docker`'s "Run
+  Docker-dependent tests" step, matching the `coverage` and Windows-journey
+  jobs exactly, with a comment naming the 2026-09-16 run that hit this and
+  pointing at the two existing instances of the same fix. Root-caused
+  against the repo's own prior fixes for the identical mechanism, not a
+  tolerance widening — nothing about the build's determinism changes, only
+  whether the GitHub API call gets the 60/hour or 5,000/hour rate-limit
+  tier.
+- **Verification**: `python3 -c "import yaml; yaml.safe_load(...)"` confirms
+  the edited `ci.yml` is still valid YAML; `actionlint` was not available in
+  this sandbox to run directly. No CI-native rerun of `test-docker` was
+  captured before this entry was written (the failure this fixes is not a
+  flake with a rate to measure — see Diagnosis in
+  `docs/reports/2026-09-17-semaphore-ci-health-followup.md` — so there is no
+  before/after rerun-rate table; the `coverage` job's own clean history since
+  its identical fix landed is the closest available evidence that this
+  pattern works). Revert check: not applicable in the rerun-campaign sense
+  (nothing about test determinism changed), but reverting the added `env:`
+  block would restore the exact unauthenticated call that produced the
+  2026-09-16 403.
+- **Status**: closed as fixed, 2026-09-17, #2833 (🚦 Semaphore).
+- **Linked issue/PR**: none — the fix landed directly in this ledger's own
+  tracking PR (#2833) rather than a separate issue, following this repo's
+  "red CI is work now" convention once the mechanism was confirmed rather
+  than merely hypothesized.
+
 ## Under active investigation, not yet quarantined
 
 These are tracked here because they are the subject of an open rerun
@@ -964,30 +1035,41 @@ without also filling in the intake form above.
   unexercised for over a week while the signature count on this one test
   keeps growing.
 - **2026-09-17 update — 9th consecutive pass, harness still undispatched; a
-  third occurrence of the line-686 signature, this time on a plain `Test
-  (ubuntu-latest)` job with no coverage instrumentation at all.** Sampled
-  `ci.yml` `pull_request` runs from the 2026-09-16 report's own cutoff
+  fourth observed occurrence of the line-686 signature.** Sampled `ci.yml`
+  `pull_request` runs from the 2026-09-16 report's own cutoff
   (2026-09-16T09:40:05Z, exclusive) to 2026-09-17T09:59:29Z (~24.3h; the
   `status=completed` filter combined with `page=1` returned a stale,
   weeks-old slice on this pass — a new instance of the pagination
-  instability this ledger has already flagged — worked around by omitting
-  `status` and filtering client-side on `created_at`/`conclusion`) — 120
-  runs: 81 cancelled/31 success/7 failure/1 in-progress. Run 35089021085
-  (branch `claude/determined-bardeen-unefhv`, job `Test (ubuntu-latest)`,
-  completed 2026-09-16T12:14:00Z): `test result: FAILED. 5 passed; 1
-  failed`, failing test
-  `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`.
+  instability this ledger has already flagged — worked around by combining
+  a `status=completed`/`page=2` query for the window's near edge with an
+  unfiltered `page=1` query for its far edge) — 120 runs: 81 cancelled/31
+  success/7 failure/1 in-progress. Run 35089021085 (branch
+  `claude/determined-bardeen-unefhv`, job `Test (ubuntu-latest)`, completed
+  2026-09-16T12:14:00Z): `test result: FAILED. 5 passed; 1 failed`, failing
+  test `upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`.
   The available tail (400 lines) did not reach the panic banner text itself
   (the same per-request-tracing truncation this ledger has hit before on
   this test), but the backtrace frame for the test body resolves to
   `./tests/live_upgrade.rs:686:5` — the exact line already tracked as the
-  `status: 0`/unparseable-response signature. This is the first occurrence
-  of this signature where the line number is confirmed directly from a
-  backtrace frame rather than inferred from result shape alone (the
-  2026-09-16 report's second hit), and it is a **second independent
-  confirmation** (after 2026-09-11) that this signature does not need
-  `cargo llvm-cov` instrumentation to manifest — it fired on a plain `Test`
-  job. Verdict still not rendered; still short of a rerun-rate baseline.
+  `status: 0`/unparseable-response signature. **Correction (post-review, via
+  a Codex review comment on PR #2833): this is not "a third occurrence,"
+  and not "the first occurrence on a plain Test job."** Against this
+  ledger's own prior entries: 2026-09-09 and 2026-09-11 are each confirmed
+  by exact panic message text (2 confirmed occurrences); the 2026-09-16
+  report's run 35069353632 matched only on line/shape, with message text
+  explicitly not confirmed (a 3rd *observed*, not confirmed, hit — the
+  2026-09-16 entry above says so itself: "consistent with, not confirmed
+  as"). Today's run is therefore a 4th observed occurrence, with the line
+  independently confirmed via the backtrace frame rather than inferred from
+  result shape alone — a different evidentiary path than the 2026-09-16 hit,
+  but not a step up to full text-confirmation the way 2026-09-09/11 were.
+  Separately, the 2026-09-11 hit was already on a plain `Test (ubuntu-latest)`
+  job per that entry's own text ("now also on a plain Test (ubuntu-latest)
+  job with no coverage instrumentation") — so today's is a *second*
+  occurrence on a plain `Test` job, not the first, though it does still
+  reinforce (not newly establish) that this signature isn't
+  coverage-instrumentation-specific. Verdict still not rendered; still short
+  of a rerun-rate baseline.
   Of the other 6 failures this pass found, 5 were ordinary branch-owned
   WIP (`codex/locate-density-test-and-separate-metrics`'s own Clippy
   failure; `vesper/bugbash-2321-alpn`'s own stale-lockfile/formatting
@@ -997,15 +1079,23 @@ without also filling in the intake form above.
   reading the `Test tls` job's log directly, not assumed from the branch
   name; `vesper/macro-crate-split`'s own recurring multi-job break, this
   time via a stale `fuzz/Cargo.lock`; `vesper/bugbash-2405-prelayer-content-type`'s
-  own Clippy failure), and 1 is a brand-new signature recorded in its own
-  entry below (`postgresql_embedded`'s GitHub API rate limit). None of the
-  6 matched `cache_stampede`, `sim_fault_plan`, or
-  `job_tracking_stores_integration`. `manual-macos-contention-check.yml`:
-  still `total_count: 0` against `workflow_dispatch` runs, checked
-  2026-09-17T~09:59Z — unchanged for a 9th straight pass since it became
-  dispatchable 2026-09-08T15:07:44Z (now ~210.9 hours idle, close to 9
-  days). The recommendation to dispatch it stands, more overdue with each
-  pass this signature keeps recurring uncampaigned.
+  own Clippy failure), and 1 is a `test-docker` build failure recorded and
+  **fixed** in its own entry above, under "Closed entries"
+  (`postgresql_embedded`'s GitHub API rate limit). None of the 6 matched
+  `cache_stampede`, `sim_fault_plan`, or
+  `job_tracking_stores_integration` — **caveat (post-review, via a further
+  Codex review comment on PR #2833)**: only these 7 failure/1 in-progress
+  runs were inspected at job level; the 81 `cancelled`-overall runs were
+  not, and per this ledger's own 2026-09-14 correction (`cancel-in-progress:
+  true` can let a job fail before its run is superseded and marked
+  `cancelled`), this "no repeat" finding is scoped to the 8 runs actually
+  inspected, not proven-exhaustive across the full 120-run window.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-17T~09:59Z — unchanged for a 9th
+  straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~210.9 hours idle, close to 9 days). The recommendation to dispatch it
+  stands, more overdue with each pass this signature keeps recurring
+  uncampaigned.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1047,44 +1137,6 @@ without also filling in the intake form above.
   address the new line-567 signature above regardless (different assertion
   entirely). Track it against the rerun campaign above before treating this
   entry as resolved — "merged" is not the same as "verified."
-
-### `postgresql_embedded` build script: GitHub API rate limit (403) fetching release metadata
-
-- **New, 2026-09-17.** First occurrence found in this pass. Run 35126796648
-  (branch `claude/determined-bardeen-unefhv`, job `Test (Docker)`, completed
-  2026-09-16T17:53Z; the triggering branch's diff has nothing to do with
-  `postgresql_embedded` or Postgres tooling). `cargo build` failed compiling
-  `postgresql_embedded v0.19.0`'s build script:
-  `` error: failed to run custom build command for `postgresql_embedded v0.19.0` ``,
-  stderr: `Error: HTTP status client error (403 rate limit exceeded) for url
-  (https://api.github.com/repos/theseus-rs/postgresql-binaries/releases?page=1&per_page=100)`.
-  This failed the required `Test suite` gate (via `test-docker`).
-- **Mechanism**: unpinned/rate-limited external dependency — the crate's
-  build script fetches PostgreSQL binary release metadata from GitHub's REST
-  API unauthenticated (60 requests/hour per source IP), and GitHub Actions
-  runners draw from a shared IP pool that many workflows across many repos
-  hit simultaneously, so the limit can be exhausted by traffic this repo's
-  own CI never generated. Structurally the same category as the closed
-  MinIO/Docker-Hub and RUSTSEC-2026-0285 entries above (an external fact
-  outside this repo's control failing the required gate independent of the
-  triggering PR's own diff), but **not yet confirmed at that evidentiary
-  level** — this is n=1, not the dozens-of-runs, 100%-reproducing pattern
-  that closed the MinIO entry.
-- **Test-vs-product**: neither — pure CI/build infrastructure; no product
-  code path is implicated.
-- **Fix**: not applied. A single occurrence does not meet this role's own
-  bar for a fix PR (see the hard gate — no baseline, no repeat pattern to
-  root-cause against). The likely fix, if this recurs, is well-understood
-  in advance from the crate's own behavior: set `GITHUB_TOKEN` in the
-  environment the build script reads (every Actions job already has
-  `secrets.GITHUB_TOKEN` available), which raises the same endpoint's rate
-  limit from 60/hour unauthenticated to 5,000/hour authenticated.
-- **Status**: open, n=1, not campaigned. Logged so a second occurrence is
-  recognized as a repeat of this exact signature rather than re-diagnosed
-  from scratch. No skip/quarantine applied — nothing to quarantine yet at
-  n=1 for a build-script (not test) failure.
-- **Linked issue/PR**: none yet — filing is premature at n=1 per this
-  role's own evidentiary bar; revisit on a second occurrence.
 
 ### `cache_stampede::swr_serves_stale_and_refreshes_in_background`
 
