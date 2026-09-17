@@ -71,24 +71,43 @@
 #      getting the reader nowhere, so the README's link destinations are
 #      parsed and resolved.
 #
-# ONLY LINKS A READER CAN FOLLOW COUNT, everywhere links are extracted — in an
-# index and in `README.md` alike. `readable()` blanks fenced code (``` and ~~~),
-# HTML comments, inline code spans and four-space indented code blocks before
-# anything is matched. Each of those is a way an unlisted page was kept green
-# while no reader could reach it: an example of what an entry looks like, an
-# entry parked behind `<!-- -->`, a README whose only index link sat inside a
-# fence. They arrived as four separate review findings against four separate
-# ad-hoc filters, which is why the reduction now lives in ONE function that
-# every caller goes through rather than in a filter per caller.
+# AN ENTRY HAS A SHAPE, and stating it is what retired this gate's markdown
+# parser. An entry is a COLUMN-ZERO list item whose content begins with a link:
 #
-# AN ENTRY IS A LINK IN A LIST ITEM. That is what separates an index's rows
-# from its prose, and it is load-bearing in both directions. `tutorial/index.md`
-# carries four ordinary cross-references in paragraphs and blockquotes — "see
-# the [i18n guide]", "if you have already read the [Getting Started guide]" —
-# which claim to index nothing. Counting them made the gate report 165 links
-# for 161 required pages, and under the cross-index rule above it would have
-# flagged every one of them as a duplicate listing of a page another index
-# owns. Writing about a page is not indexing it.
+#   - [Forms, Validation and Normalization](forms.md) — re-rendering a …
+#   1. [Project Setup](01-project-setup.md) — scaffold a project, run …
+#
+# The first several revisions asked the opposite question — "is this link in a
+# context where a reader could click it?" — and answered it by subtracting
+# contexts one at a time. Review found nine of them: fenced code, HTML
+# comments, inline code, four-space indented blocks, blocks indented relative
+# to an enclosing list item, tab indentation, images, escaped brackets, raw
+# HTML. Each finding was correct, the list had no end (the real task was
+# "implement CommonMark"), and two of the patches introduced fresh bugs in the
+# opposite direction — once blanking nested lists that were real rows, once
+# refusing to see code nested inside a list.
+#
+# Matching the shape instead rejects all of those without a rule for any of
+# them, and it fails SAFE: because this gate separately requires every page to
+# have an entry, a row written in one of those ways is reported as a page
+# listed nowhere. The index is told it is malformed, loudly, rather than
+# half-checked quietly.
+#
+# `readable()` now handles only what is left — the multi-line regions that can
+# still put a row-shaped line at column zero: fenced code, HTML comments and
+# raw HTML blocks.
+#
+# The shape also separates an index's rows from its PROSE, which matters in the
+# other direction. `tutorial/index.md` carries four ordinary cross-references
+# in paragraphs and blockquotes — "see the [i18n guide]", "if you have already
+# read the [Getting Started guide]" — which claim to index nothing. Counting
+# them made the gate report 165 links for 161 required pages, and under the
+# cross-index rule above it would have flagged every one as a duplicate listing
+# of a page another index owns. Writing about a page is not indexing it.
+#
+# The cost is that a row must be top level. An index that nests rows under
+# sub-bullets is told so by name; that is a constraint on 161 lines this gate
+# also owns, and a cheap one for retiring an open-ended parser.
 #
 # DELEGATION TO A SUB-INDEX. A subdirectory of `docs/guide/` that carries its
 # own `index.md` — `tutorial/` does — is represented in the TOP-LEVEL index by
@@ -135,23 +154,49 @@ README = "README.md"
 # both are accepted so the gate never argues with `check-docs-links.sh` about
 # relative depth — that is its sibling's job, not this one's.
 #
-# The `(?<!!)` rejects image syntax. `![alt](page.md)` shares every character of
-# a link but renders a picture, so it navigates nowhere: an index row reading
-# `- ![preview](beta.md)` indexes nothing, and `![Guide](docs/guide/index.md)`
-# in README.md is not a way to reach the index.
-LINK = re.compile(r"(?<!!)\[[^\]]*\]\(\s*([^)\s#]+)")
+# `(?<![!\\])` rejects two things that share every other character with a link
+# and navigate nowhere: an image (`![alt](page.md)` renders a picture) and an
+# escaped bracket (`\[Guide](page.md)` renders literal text).
+LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]+)")
+
+# An index ENTRY, and the reason this gate no longer tries to parse markdown.
+#
+# An entry is a list item AT COLUMN ZERO whose content begins immediately with
+# a link: `- [Title](page.md) — what it answers`, or `1. [Chapter](01-x.md)` in
+# an ordered sub-index. Nothing else is an entry.
+#
+# Recognising entries by "a link, minus every context where a link is not
+# clickable" was the source of nine of this PR's review findings. Each was
+# correct and each was a different markdown construct — fenced code, HTML
+# comments, inline code, four-space indented blocks, blocks indented relative
+# to an enclosing list item, tab indentation, images, escaped brackets — and
+# the list does not end, because the real task was "implement CommonMark",
+# which no amount of regex reaches. Two of the patches introduced fresh bugs in
+# the opposite direction.
+#
+# Stating the shape instead inverts the problem. Every one of those constructs
+# fails to match this pattern, so none of them is an entry, and none of them
+# needs its own rule. It also fails in the SAFE direction: this gate separately
+# requires every page to have an entry, so a row written in any of those ways
+# is reported as a page listed nowhere. The index is malformed loudly rather
+# than accepted quietly, and the message says what the shape is.
+#
+# The cost is that an entry must be a top-level row. An index that nests rows
+# under sub-bullets is told so by name rather than silently half-checked; that
+# is a constraint on 161 lines this gate also owns, and a cheap one for
+# retiring an open-ended parser.
+ENTRY = re.compile(r"^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)\)")
 
 # An HTML comment, to the closing `-->` or to end of file if it never closes.
 COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 # A fence opener or closer: three or more backticks or tildes, indented at most
 # three spaces, with whatever info string follows.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-# An inline code span on one line. Multi-line spans are not matched; see the
-# note in `readable()`.
-INLINE_CODE = re.compile(r"`+[^`\n]*`+")
-# A list item marker — `-`, `*`, `+` or `1.` / `1)` — and everything up to the
-# content after it. An index ENTRY is a link in a list item; see `entries()`.
-LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
+# A raw HTML block at column zero. CommonMark's `<pre>`/`<script>`/`<style>`/
+# `<textarea>` run to their closing tag; every other block ends at a blank
+# line. Both are literal text to the reader, so neither can hold an entry.
+HTML_OPEN = re.compile(r"^<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
+HTML_LITERAL = ("pre", "script", "style", "textarea")
 
 
 def _blank(s):
@@ -189,61 +234,41 @@ def blank_fences(text):
     return "\n".join(out)
 
 
-def blank_indented_code(text):
-    """Blank markdown's four-space indented code blocks.
+def blank_html_blocks(text):
+    """Blank raw HTML blocks, whose contents are literal text to the reader.
 
-    A block opens at an indent of four or more spaces after a blank line and
-    runs until the indent drops, so it cannot interrupt a paragraph — which is
-    what CommonMark says, and what keeps a wrapped line of prose readable.
-
-    Indentation is RELATIVE TO THE ENCLOSING LIST ITEM, which is the whole
-    subtlety. Under `- Example:` — content indent 2 — a code block starts at
-    six spaces, not four, and four spaces there is a nested list. An earlier
-    revision collapsed this to "no code blocks inside a list at all", which
-    left a code block nested in a list counting as a real entry; the revision
-    before that had no list awareness and blanked nested lists instead. Both
-    directions are wrong and they fail differently: missing a code block lets
-    an unlisted page pass, while blanking a nested list silently DELETES real
-    entries. The second is the dangerous one, because it makes this gate
-    quieter rather than louder, so the stack below is kept honest by
-    self-tests pinning both.
+    `<pre>`, `<script>`, `<style>` and `<textarea>` run to their closing tag;
+    every other block at column zero ends at a blank line, which is what
+    CommonMark says and what keeps this from swallowing a document that merely
+    opens with a `<div>`.
     """
     out = []
-    in_code = False
-    # Content indents of the open list items, outermost first. `- x` pushes 2.
-    lists = []
-    prev_blank = True
+    literal = None
+    in_block = False
     for line in text.split("\n"):
-        if not line.strip():
-            out.append(line)
-            prev_blank = True
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if in_code:
-            if indent >= (lists[-1] if lists else 0) + 4:
-                out.append(_blank(line))
-                prev_blank = False
-                continue
-            in_code = False
-        # Dropping back to or past an enclosing item's content column closes
-        # every list item indented deeper than this line.
-        while lists and indent < lists[-1]:
-            lists.pop()
-        # The code-block test comes BEFORE the list-item test, because
-        # `    - [B](b.md)` after a blank line and outside a list is a code
-        # block that happens to contain a bullet, not a bullet that happens to
-        # be indented. Testing for the list marker first made exactly that
-        # example count as an entry.
-        if indent >= (lists[-1] if lists else 0) + 4 and prev_blank:
-            in_code = True
+        if literal is not None:
             out.append(_blank(line))
-            prev_blank = False
+            if f"</{literal}>" in line.lower():
+                literal = None
             continue
-        m = LIST_ITEM.match(line)
+        if in_block:
+            if not line.strip():
+                in_block = False
+                out.append(line)
+                continue
+            out.append(_blank(line))
+            continue
+        m = HTML_OPEN.match(line)
         if m:
-            lists.append(len(m.group(0)))
+            tag = m.group(2).lower()
+            if tag in HTML_LITERAL and not m.group(1):
+                literal = tag
+                out.append(_blank(line))
+                continue
+            in_block = True
+            out.append(_blank(line))
+            continue
         out.append(line)
-        prev_blank = False
     return "\n".join(out)
 
 
@@ -253,37 +278,29 @@ def readable(text):
     Everything blanked here is blanked SPACE FOR SPACE, so the line numbers in
     reported defects stay accurate.
 
-    This function is the answer to a class of finding rather than to one
-    instance of it. Review of this gate turned up three separate ways to
-    satisfy the completeness check with a link no reader can follow — an entry
-    inside an HTML comment, an entry inside a tilde fence, and a README whose
-    only index link sat inside a fenced example. Each was a different hole in
-    ad-hoc, per-caller extraction. One reduction, applied at every place links
-    are extracted, closes all three and whatever the next spelling would have
-    been:
+    With `ENTRY` stating the shape of a row, this only has to handle the
+    constructs that can put a line at COLUMN ZERO that still looks like one —
+    the multi-line regions:
 
-      - fenced code, ``` or ~~~ — an example showing what an entry looks like
-        is documentation about the index, not a row of it
+      - fenced code, ``` or ~~~ — an example of what an entry looks like is
+        documentation about the index, not a row of it
       - HTML comments — parking an entry by commenting it out is an ordinary
         mid-edit move, and it must not keep an unlisted page green
-      - inline code spans — `[A](a.md)` renders as literal text, not a link
+      - raw HTML blocks — `<pre>` and friends render their contents literally
 
-    Fences are blanked first, so a comment delimiter inside a code sample
-    cannot start a comment that swallows the rest of the file. Both remaining
-    unterminated cases — a fence or a comment that never closes — blank to end
-    of file, which makes entries below them vanish and the gate FAIL. That is
-    the safe direction: malformed markup should make the gate loud, not blind.
+    Everything else that used to live here is gone, because `ENTRY` rejects it
+    without a rule: inline code, four-space indented blocks, blocks indented
+    relative to an enclosing list item, tab indentation, images and escaped
+    brackets all fail to match a column-zero `- [text](target)`.
 
-    Known limit: an inline code span that wraps across lines is not blanked. A
-    link inside one would still count. Multi-line spans do not occur in this
-    corpus, and the conservative single-line pattern cannot run away on an
-    unmatched backtick.
+    Fences are blanked first, so a comment delimiter or a `<pre>` inside a code
+    sample cannot open a region that swallows the rest of the file. Every
+    unterminated case blanks to end of file, which makes entries below it
+    vanish and the gate FAIL. That is the safe direction: malformed markup
+    should make the gate loud, not blind.
     """
-    return blank_indented_code(
-        INLINE_CODE.sub(
-            lambda m: _blank(m.group(0)),
-            COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text)),
-        )
+    return blank_html_blocks(
+        COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
     )
 
 
@@ -364,18 +381,20 @@ def normalise(target, base):
 def entries(text, base):
     """Every index ENTRY in a file, with the `##` section it sits under.
 
-    An entry is a link in a LIST ITEM. That is what separates the index's rows
-    from its prose, and the distinction is load-bearing: `tutorial/index.md`
-    carries four cross-references in paragraphs and blockquotes — "see the
-    [i18n guide]", "if you have already read the [Getting Started guide]" —
-    which are ordinary writing, not claims to index those pages. Counting them
-    as entries made the gate report 165 links for 161 required pages, and would
-    make the cross-index ownership rule below flag every one of them.
+    An entry is a row matching `ENTRY` — a column-zero list item whose content
+    begins with a link. That shape is what separates the index's rows from its
+    prose, and the distinction is load-bearing in both directions:
+    `tutorial/index.md` carries four cross-references in paragraphs and
+    blockquotes — "see the [i18n guide]", "if you have already read the
+    [Getting Started guide]" — which are ordinary writing, not claims to index
+    those pages. Counting them made the gate report 165 links for 161 required
+    pages, and the cross-index ownership rule below would have flagged every
+    one of them.
 
-    Only links a reader can actually follow count; `readable()` says which
-    those are, and blanking rather than skipping is what keeps the reported
-    line numbers honest. A `## ` heading inside a fence does not open a
-    section, for the same reason.
+    `readable()` removes the multi-line regions that can still put a
+    row-shaped line at column zero, and blanking rather than skipping is what
+    keeps the reported line numbers honest. A `## ` heading inside a fence does
+    not open a section, for the same reason.
     """
     out = []
     section = None
@@ -383,12 +402,11 @@ def entries(text, base):
         if line.startswith("## "):
             section = line[3:].strip()
             continue
-        if not LIST_ITEM.match(line):
+        m = ENTRY.match(line)
+        if not m:
             continue
-        for m in LINK.finditer(line):
-            path = normalise(m.group(1), base)
-            if path is None:
-                continue
+        path = normalise(m.group(1), base)
+        if path is not None:
             out.append((path, lineno, section))
     return out
 
@@ -716,9 +734,9 @@ self_test() {
   _commit indented
   _case "indented-code entry does not count" 1 indented
 
-  # 19. ...but four-space indentation UNDER A LIST ITEM is a nested list, not
-  #     code. Over-blanking here would delete real entries, which is the one
-  #     direction that makes this gate quieter instead of louder.
+  # 19. A nested row is NOT an entry: `ENTRY` requires column zero. The page
+  #     is then reported as listed nowhere, which is the loud direction — the
+  #     index is told its row is malformed rather than half-checked.
   _scaffold nested_list
   printf '# A\n' > "$tmp/nested_list/docs/guide/alpha.md"
   printf '# B\n' > "$tmp/nested_list/docs/guide/beta.md"
@@ -726,7 +744,7 @@ self_test() {
     > "$tmp/nested_list/docs/guide/index.md"
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/nested_list/README.md"
   _commit nested_list
-  _case "nested list item still counts as an entry" 0 nested_list
+  _case "nested row is not an entry" 1 nested_list
 
   # 20. A page listed in BOTH the top-level index and the sub-index that owns
   #     it. Each file's own tally shows one hit, so this is invisible from
@@ -768,9 +786,8 @@ self_test() {
   _commit list_code
   _case "code block nested in a list does not count" 1 list_code
 
-  # 23. ...and four spaces under that same item is a NESTED LIST, not code,
-  #     because the block would start at six. This is the direction that
-  #     silently deletes real entries, so it is pinned separately.
+  # 23. Same at a deeper indent, and after a blank line: still not column
+  #     zero, so still not an entry, and still reported rather than ignored.
   _scaffold list_nested_deep
   printf '# A\n' > "$tmp/list_nested_deep/docs/guide/alpha.md"
   printf '# B\n' > "$tmp/list_nested_deep/docs/guide/beta.md"
@@ -778,7 +795,7 @@ self_test() {
     > "$tmp/list_nested_deep/docs/guide/index.md"
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/list_nested_deep/README.md"
   _commit list_nested_deep
-  _case "nested list after a blank line still counts" 0 list_nested_deep
+  _case "nested row after a blank line is not an entry" 1 list_nested_deep
 
   # 24. An image is not a navigable link, in an index...
   _scaffold image_entry
@@ -798,6 +815,58 @@ self_test() {
   printf '![Guide](docs/guide/index.md)\n' > "$tmp/image_readme/README.md"
   _commit image_readme
   _case "image in README is not an index link" 1 image_readme
+
+  # 26. A tab-indented row is not at column zero, so not an entry.
+  _scaffold tab_indent
+  printf '# A\n' > "$tmp/tab_indent/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/tab_indent/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n\t- [B](beta.md)\n' \
+    > "$tmp/tab_indent/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/tab_indent/README.md"
+  _commit tab_indent
+  _case "tab-indented row is not an entry" 1 tab_indent
+
+  # 27. `\[B](b.md)` renders literal text, so it indexes nothing...
+  _scaffold escaped
+  printf '# A\n' > "$tmp/escaped/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/escaped/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- \\[B](beta.md)\n' \
+    > "$tmp/escaped/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/escaped/README.md"
+  _commit escaped
+  _case "escaped bracket is not an entry" 1 escaped
+
+  # 28. ...and does not reach the index from README.md either.
+  _scaffold escaped_readme
+  printf '# A\n' > "$tmp/escaped_readme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escaped_readme/docs/guide/index.md"
+  printf '\\[Guide](docs/guide/index.md)\n' > "$tmp/escaped_readme/README.md"
+  _commit escaped_readme
+  _case "escaped link in README is not an index link" 1 escaped_readme
+
+  # 29. A raw HTML block renders its contents literally, so a row-shaped line
+  #     inside one is not an entry even at column zero.
+  _scaffold raw_html
+  printf '# A\n' > "$tmp/raw_html/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/raw_html/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n<pre>\n- [B](beta.md)\n</pre>\n' \
+    > "$tmp/raw_html/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/raw_html/README.md"
+  _commit raw_html
+  _case "row inside a raw HTML block is not an entry" 1 raw_html
+
+  # 30. ...but a `<details>` wrapper closed by a blank line must not swallow
+  #     the entries that follow it. Over-blanking deletes real rows, which is
+  #     the direction that makes this gate quieter rather than louder.
+  _scaffold html_then_entries
+  printf '# A\n' > "$tmp/html_then_entries/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/html_then_entries/docs/guide/beta.md"
+  printf '# Guide\n\n<details><summary>note</summary>\n\n## S\n\n- [A](alpha.md)\n- [B](beta.md)\n' \
+    > "$tmp/html_then_entries/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/html_then_entries/README.md"
+  _commit html_then_entries
+  _case "HTML block ends at a blank line" 0 html_then_entries
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
