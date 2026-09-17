@@ -1142,6 +1142,78 @@ db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed(
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
 
+## Money and the double-entry ledger (unreleased, issue #1837)
+
+Do **not** hand-roll a money type or a ledger. `autumn_web::money` has both.
+Not to be confused with `autumn_web::ledger` (`ledgered = true` above), which
+records the history of a row; this one records money.
+
+`Money<C>` is an amount in one currency, held as an `i64` count of minor units.
+The currency is a type parameter, so `Money<Usd>` and `Money<Eur>` do not add.
+**Never use `f64` for money**, and never reach for `+`/`-` here — there are no
+operator impls, because an operator cannot report an overflow:
+
+```rust
+use autumn_web::money::{Money, Rounding, Usd};
+
+let fee = Money::<Usd>::from_minor(250);      // $2.50
+let tip = Money::<Usd>::from_major(1)?;       // $1.00
+let total = fee.checked_add(tip)?;            // checked_sub/neg/abs/mul, try_sum
+
+// Rounding is always named; `from_decimal_exact` refuses to round at all.
+let price = Money::<Usd>::from_decimal(decimal, Rounding::HalfEven)?;
+
+// Splits lose nothing: the parts always sum back to the whole.
+let parts = total.split(3)?;                  // or .allocate(&[70, 20, 10])
+```
+
+`AnyMoney` is the runtime-tagged form for a stored row, and rejects a currency
+mismatch at run time. Render with `number_to_currency(m.to_decimal())`.
+
+The ledger is append-only and double-entry. A transaction is a set of postings;
+a **debit is positive**, a **credit is negative**, and a balance is the sum of
+an account's postings:
+
+```rust
+use autumn_web::money::ledger::{self, Account, IdempotencyKey, Posting, Transaction};
+
+// Once, at boot. `disallow_negative()` is the one policy flag.
+ledger::ensure_account(conn, Account::new("platform:cash", Usd::currency())).await?;
+
+let postings = vec![
+    Posting::debit("platform:cash", amount),
+    Posting::credit("platform:revenue", amount),
+];
+// Idempotent by construction: the key is the money, so a retry collapses.
+let key = IdempotencyKey::derive("order:9911", &postings);
+let outcome = db.tx(|conn| async move {
+    // ... the application rows this charge justifies ...
+    ledger::post(conn, &Transaction::new(key, postings)).await.map_err(AutumnError::from)
+}.scope_boxed()).await?;
+outcome.is_replayed();   // true when the money had already moved
+```
+
+Rules that matter:
+
+- **`post` must run inside `Db::tx`.** A bare connection is refused with
+  `LedgerError::NotInTransaction`; the locks and the balance check mean nothing
+  outside one, and the tables are append-only so a partial write cannot be
+  repaired. Posting twice in one transaction needs `Db::tx_with` (deadlock
+  retry).
+- `post` refuses an unbalanced transaction **before its first `INSERT`**, plus
+  mixed currencies, a one-sided transaction, a zero line, a negative amount, a
+  currency the account does not hold, and a balance that would leave `i64`.
+- The same key for *different* money is `LedgerError::KeyReuse` (409), never a
+  silent replay of the wrong result.
+- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
+  returns every currency's total, each of which must be zero — run it from a
+  scheduled job or a health check.
+- The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
+  **control** database. Nothing to add to the app's `migrations/`.
+
+Out of scope in this slice: FX conversion, provider reconciliation, and a
+payment-provider client. See `docs/guide/money.md`.
+
 ## Security and auth
 
 ```rust
