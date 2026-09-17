@@ -970,24 +970,45 @@ def readable(text, resolved=None):
         line = text[i:eol]
 
         if at_line_start:
+            # BLOCK-QUOTE markers come off before anything measures or
+            # matches this line. A quote is a container: what is inside it
+            # is ordinary markdown, indented from the marker, not from
+            # column zero. Measuring the raw line read `>     [Guide](x)` as
+            # indent 0 — prose with a live link — where CommonMark reads
+            # indent 4 inside the quote and renders indented CODE.
+            #
+            # Round 42 introduced this strip for FENCE detection only and
+            # left the neighbouring tests reading the raw line, which is the
+            # same one-of-several-sites divergence this gate keeps
+            # producing — this time authored by me, one commit earlier. The
+            # strip now happens once, here, and everything below sees the
+            # quote's content.
+            depth = quote_depth(line)
+            content = BLOCKQUOTE.sub("", line) if depth else line
             # A tab indents to the next multiple of four, so measuring
             # spaces alone read a tab-indented code line as column zero.
-            expanded = line.expandtabs(4)
+            expanded = content.expandtabs(4)
             stripped = expanded.lstrip(" ")
             indent = len(expanded) - len(stripped)
             if not stripped:
                 in_paragraph = False
                 i = eol + 1 if eol < n else n
                 continue
-            if indent == 0 and not LIST_ITEM.match(line):
+            if indent == 0 and not LIST_ITEM.match(content):
                 in_list = False
             if indent >= 4 and not in_paragraph and not in_list:
                 # Runs while the indent holds; a line back under four spaces
-                # ends it.
+                # ends it. Inside a quote the run also ends when the quote
+                # does, so a dedent out of the quote cannot be mistaken for
+                # more code and swallow the prose after it.
                 j = i
                 while j < n:
                     stop = line_end(j)
-                    seg = text[j:stop].expandtabs(4)
+                    raw = text[j:stop]
+                    if depth and quote_depth(raw) < depth:
+                        break
+                    seg = (BLOCKQUOTE.sub("", raw) if depth
+                           else raw).expandtabs(4)
                     body = seg.lstrip(" ")
                     if body and len(seg) - len(body) < 4:
                         break
@@ -996,7 +1017,7 @@ def readable(text, resolved=None):
                 i = min(j, n)
                 in_paragraph = False
                 continue
-            if LIST_ITEM.match(line):
+            if LIST_ITEM.match(content):
                 in_list = True
             # Whether the PREVIOUS line was paragraph text, captured before
             # this line overwrites it. A type-7 HTML opener cannot interrupt
@@ -1013,11 +1034,11 @@ def readable(text, resolved=None):
             #
             # An autolink is a link, not a block opener, and is checked first
             # because `HTML_OPEN`'s tag-name pattern happily matches `https`.
-            auto = AUTOLINK.match(line)
-            hm = HTML_OPEN.match(line)
+            auto = AUTOLINK.match(content)
+            hm = HTML_OPEN.match(content)
             if hm and not auto:
                 tag = hm.group(2).lower()
-                alone = bool(INLINE_TAG.fullmatch(line.strip()))
+                alone = bool(INLINE_TAG.fullmatch(content.strip()))
                 type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
                 # A type-7 tag opens a block only when it is alone on its
                 # line AND is not interrupting a paragraph. CommonMark lets
@@ -1037,22 +1058,15 @@ def readable(text, resolved=None):
             # `#not-a-heading` is an ordinary paragraph. Treating it as a
             # heading let the next indented line open code and swallowed a
             # link that a reader can click.
-            # Quote-stripped content, computed once for BOTH fence tests
-            # below. Testing `opens_fence` on the raw line here and on the
-            # stripped one further down would be two callers disagreeing
-            # about one line, which is the shape of most findings on this
-            # gate.
-            depth = quote_depth(line)
-            content = BLOCKQUOTE.sub("", line) if depth else line
-            in_paragraph = not (ATX.match(line)
+            in_paragraph = not (ATX.match(content)
                                 or opens_fence(content)
                                 or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
                                 # paragraph, so an indented line after one is
                                 # code.
-                                or THEMATIC.match(line)
-                                or SETEXT.match(line))
+                                or THEMATIC.match(content)
+                                or SETEXT.match(content))
 
             # Fence detection runs on the QUOTE-STRIPPED content computed
             # above, so `> ```md` opens a fence like ```` ```md ```` does.
@@ -1102,14 +1116,14 @@ def readable(text, resolved=None):
             # reported: comments, declarations, and the literal blocks below.
             # Fixing one sibling and leaving the others is how the last four
             # of these findings happened.
-            if COMMENT_BLOCK.match(line):
+            if COMMENT_BLOCK.match(content):
                 close = text.find("-->", i + 4)
                 stop = n if close < 0 else line_end(close + 3)
                 blank_to(i, stop)
                 i = stop
                 continue
 
-            decl = next((end for pat, end in DECL if pat.match(line)), None)
+            decl = next((end for pat, end in DECL if pat.match(content)), None)
             if decl is not None:
                 close = text.find(decl, i + 2)
                 stop = n if close < 0 else line_end(close + len(decl))
@@ -1120,6 +1134,22 @@ def readable(text, resolved=None):
             # `hm` was decided above, and is already None for an autolink or
             # a type-7 tag that does not open a block.
             if hm:
+                # A raw HTML block opened INSIDE a quote ends when the quote
+                # ends, exactly as a quoted fence does. Without the bound a
+                # quoted `<div>` would blank every link in the rest of the
+                # file — the run-to-end-of-file false failure this scan has
+                # now produced three times, so it is bounded at the source.
+                quote_stop = n
+                if depth:
+                    k = eol + 1
+                    while k <= n:
+                        e = line_end(k)
+                        if quote_depth(text[k:e]) < depth:
+                            quote_stop = k
+                            break
+                        if e >= n:
+                            break
+                        k = e + 1
                 tag = hm.group(2).lower()
                 if tag in HTML_LITERAL and not hm.group(1):
                     closer = f"</{tag}>"
@@ -1136,6 +1166,7 @@ def readable(text, resolved=None):
                     # every link after it.
                     m_blank = re.compile(r"\n[ \t]*\n").search(text, i)
                     stop = n if not m_blank else m_blank.start()
+                stop = min(stop, quote_stop)
                 blank_to(i, stop)
                 i = stop
                 continue
@@ -1244,6 +1275,20 @@ def readable(text, resolved=None):
                         # Same rule again: an escape never spans a newline.
                         k += 1 if k + 1 < n and text[k + 1] == "\n" else 2
                         continue
+                    if text[k] == "\n":
+                        # A BLANK line ends the paragraph, and an image's
+                        # label cannot span one — the same rule
+                        # `bracket_pairs` applies to link text, which this
+                        # scan had been left out of. Without it `![alt`, a
+                        # blank line, then `[Guide](index.md)](image.png)`
+                        # balanced across the gap and masked the whole span,
+                        # deleting a link CommonMark renders live and
+                        # failing a README that does reach the index.
+                        t = k + 1
+                        while t < n and text[t] in " \t":
+                            t += 1
+                        if t >= n or text[t] == "\n":
+                            return None
                     if text[k] == opener:
                         depth += 1
                     elif text[k] == closer:
@@ -3885,6 +3930,68 @@ self_test() {
     > "$tmp/quoted_prose_link/README.md"
   _commit quoted_prose_link
   _case "a link in quoted prose is a link" 0 quoted_prose_link
+
+  # 188. A raw HTML block inside a quote is a raw HTML block. Round 42 gave
+  #      the quote strip to FENCE detection only and left its neighbours
+  #      reading the raw line — my own one-of-several-sites divergence, one
+  #      commit old. The strip now happens once, before anything measures or
+  #      matches the line.
+  _scaffold quoted_html_block
+  printf '# A\n' > "$tmp/quoted_html_block/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_html_block/docs/guide/index.md"
+  printf '> <div>\n> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_html_block/README.md"
+  _commit quoted_html_block
+  _case "a quoted html block is a block" 1 quoted_html_block
+
+  # 189. Indentation is measured INSIDE the quote. `>     [Guide](x)` is four
+  #      spaces past the marker, so CommonMark renders indented code; the raw
+  #      line measures zero and looked like prose with a live link.
+  _scaffold quoted_indent_code
+  printf '# A\n' > "$tmp/quoted_indent_code/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_indent_code/docs/guide/index.md"
+  printf '>     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_indent_code/README.md"
+  _commit quoted_indent_code
+  _case "quoted indentation is measured inside the quote" 1 quoted_indent_code
+
+  # 190. Both of the above end WITH THE QUOTE. Running either to end of file
+  #      would blank every link after it, which is the run-to-end-of-file
+  #      false failure this scan has produced three times now.
+  _scaffold quoted_block_bounded
+  printf '# A\n' > "$tmp/quoted_block_bounded/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_block_bounded/docs/guide/index.md"
+  printf '> <div>\n\n[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/quoted_block_bounded/README.md"
+  _commit quoted_block_bounded
+  _case "a quoted html block ends with its quote" 0 quoted_block_bounded
+
+  # 191. An image's LABEL may not span a blank line. `bracket_pairs` already
+  #      refused to pair link brackets across one; this balancing loop was
+  #      the construct left out, so it masked a whole pseudo-image and
+  #      deleted a link CommonMark renders live.
+  _scaffold image_label_blank
+  printf '# A\n' > "$tmp/image_label_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_label_blank/docs/guide/index.md"
+  printf '![alt\n\n[Guide](docs/guide/index.md)](image.png)\n' \
+    > "$tmp/image_label_blank/README.md"
+  _commit image_label_blank
+  _case "an image label stops at a blank line" 0 image_label_blank
+
+  # 192. The other direction: a REAL image still masks its alt text, so a
+  #      link written inside the label is not a route.
+  _scaffold image_label_intact
+  printf '# A\n' > "$tmp/image_label_intact/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_label_intact/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)](image.png)\n' \
+    > "$tmp/image_label_intact/README.md"
+  _commit image_label_intact
+  _case "a real image still masks its alt text" 1 image_label_intact
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
