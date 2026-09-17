@@ -33,7 +33,7 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true, features = ["util"] }
 
 [lints]
