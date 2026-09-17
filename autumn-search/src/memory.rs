@@ -345,15 +345,46 @@ fn score(
     }
 }
 
-/// Sort hits into the canonical order: score descending, then id ascending so
-/// ties are stable across calls (and so pagination never skips or repeats).
+/// The canonical order: score descending, then id ascending so ties are
+/// stable across calls (and so pagination never skips or repeats).
+///
+/// `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: mapping NaN to
+/// `Equal` yields a non-transitive comparator, and a sort panics on one
+/// ("user-provided comparison function does not correctly implement a total
+/// order"). No in-tree producer emits NaN, but a third-party backend or a
+/// hand-built `SearchHit` can.
+fn hit_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+}
+
+/// Sort hits into the canonical order (see [`hit_order`]).
 fn sort_hits(hits: &mut [SearchHit]) {
-    // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: mapping NaN to
-    // `Equal` yields a non-transitive comparator, and `sort_by` panics on one
-    // ("user-provided comparison function does not correctly implement a total
-    // order"). No in-tree producer emits NaN, but a third-party backend or a
-    // hand-built `SearchHit` can.
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    hits.sort_by(hit_order);
+}
+
+/// Reorder `hits` so that `hits[..k.min(hits.len())]` holds the top `k` hits
+/// in canonical order (see [`hit_order`]), leaving the rest in arbitrary
+/// order.
+///
+/// `keyword_search` only ever serves one page out of a match set that can be
+/// most of the corpus (an AND query over a shared vocabulary matches a large
+/// fraction of documents — see `autumn-search/benches/keyword_search.rs`,
+/// where profiling found the full `sort_hits` over the whole match set
+/// costing ~13% of the bench's own instructions to serve a 20-row page).
+/// `select_nth_unstable_by` partitions in O(n) around the element that would
+/// land at index `k - 1` after a full sort — every element before it compares
+/// `<=`, every element after `>=` — so only that prefix needs sorting to
+/// reproduce a full sort's first `k` elements.
+fn sort_top_k(hits: &mut [SearchHit], k: usize) {
+    let len = hits.len();
+    if k == 0 || k >= len {
+        sort_hits(hits);
+        return;
+    }
+    hits.select_nth_unstable_by(k.saturating_sub(1), hit_order);
+    if let Some(prefix) = hits.get_mut(..k) {
+        prefix.sort_by(hit_order);
+    }
 }
 
 /// Take the `request`-th page of `hits`, preserving the pre-slice total.
@@ -480,7 +511,14 @@ impl SearchBackend for MemorySearchBackend {
                 hits
             });
 
-            sort_hits(&mut hits);
+            // Only `paginate`'s eventual `skip(offset).take(size)` window
+            // needs to be in canonical order; the same offset/size it derives
+            // from `query.page`, computed here too so `sort_top_k` never
+            // orders more of `hits` than that window requires.
+            let size = query.page.size() as usize;
+            let offset = (query.page.page().saturating_sub(1) as usize).saturating_mul(size);
+            let needed = offset.saturating_add(size).min(hits.len());
+            sort_top_k(&mut hits, needed);
             Ok(paginate(hits, &query.page))
         })
     }
@@ -697,6 +735,37 @@ mod tests {
         ];
         sort_hits(&mut hits);
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn top_k_sort_matches_a_full_sorts_prefix() {
+        // A deliberately unsorted, tie-heavy input so a wrong partition
+        // point or a stale `k` off-by-one would show up in the prefix.
+        let make_hits = || {
+            vec![
+                SearchHit::new("a", 7, 2.0),
+                SearchHit::new("a", 3, 5.0),
+                SearchHit::new("a", 1, 5.0),
+                SearchHit::new("a", 9, 1.0),
+                SearchHit::new("a", 2, 5.0),
+                SearchHit::new("a", 5, 3.0),
+                SearchHit::new("a", 4, 1.0),
+            ]
+        };
+
+        for k in 0..=make_hits().len() {
+            let mut full = make_hits();
+            sort_hits(&mut full);
+
+            let mut top_k = make_hits();
+            sort_top_k(&mut top_k, k);
+
+            assert_eq!(
+                top_k[..k].iter().map(|h| h.id).collect::<Vec<_>>(),
+                full[..k].iter().map(|h| h.id).collect::<Vec<_>>(),
+                "sort_top_k(.., {k}) prefix must match a full sort's first {k} elements"
+            );
+        }
     }
 
     #[test]

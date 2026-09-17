@@ -16,6 +16,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_async_main.rs");
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
+    t.compile_fail("tests/compile-fail/route_attr_error_cascades_through_routes.rs");
 
     // An attribute matching #[authorize]'s argument grammar under a
     // different name is refused rather than guessed at, whether it's really
@@ -88,6 +89,23 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_ledgered_purge_rejected.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_ledgered_sensitive_columns.rs");
+
+    // Warden security review, 2026-09-13: `owner = <column>` only emits
+    // opt-in `list_scoped`/`search_page_scoped` methods for a hand-written
+    // handler to call explicitly — the generated `api = "..."` CRUD routes
+    // never call them and only branch on `policy` (`scope` filters only the
+    // list endpoint's SQL). Left on its own next to `api = "..."`, `owner`
+    // silently shipped a fully public REST API that looked, at the
+    // declaration site, like a per-owner-scoped one.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_owner_api_without_policy_or_scope.rs");
+    // `scope = Type` alone (no `policy`) is equally insufficient: it only
+    // filters `GET <api>`'s SQL query, leaving `_api_get`/`_api_update`/
+    // `_api_delete` fully unguarded. Caught in review (Codex, PR #2770) on
+    // the first cut of this fix, which wrongly accepted `scope` as an
+    // alternative to `policy`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_owner_api_with_scope_but_no_policy.rs");
 
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
@@ -275,6 +293,23 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/classified_write_struct_leak.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
+
+    // Operator-blind confidential fields (#1771). A `#[confidential]` column is
+    // sealed under a key the server never holds, so anything that would make the
+    // operator read, index or compare the value is a build failure rather than a
+    // query that silently matches nothing.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_searchable.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_plain_string.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_missing_blind_index.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_or_create_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_cursor_key.rs");
 
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
@@ -669,6 +704,12 @@ fn compile_pass_tests_a() {
     // caller that reads only produced fields and supplies every required one
     // compiles, including across a serde rename and a `skip_serializing_if`.
     t.pass("tests/compile-pass/wire_contract_holds.rs");
+
+    // #1771: the escape hatch the confidential build failure names. A finder
+    // over the blind-index companion column has to compile, or the diagnostic
+    // sends authors somewhere that does not work.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_blind_index_finder.rs");
 }
 
 // The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.

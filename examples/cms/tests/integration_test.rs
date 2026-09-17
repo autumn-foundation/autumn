@@ -642,6 +642,24 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
         .await
 }
 
+/// The post's current `lock_version`, read directly from the database.
+///
+/// Split out from [`edit_form`] so a staleness test can capture a version
+/// stamp *before* a later request changes it — `edit_form` always reads the
+/// current value, which is right for every ordinary test but cannot express
+/// "the form this stale request carries."
+async fn lock_version_of(id: i64) -> i32 {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::schema::posts::table
+        .find(id)
+        .select(cms::schema::posts::lock_version)
+        .first::<i32>(&mut conn)
+        .await
+        .expect("the post")
+}
+
 /// Encode an editor form, stamping the post's current `lock_version`.
 ///
 /// The editor renders that hidden field on every edit and the update handler
@@ -649,19 +667,8 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
 /// make — and, before the check existed, one that silently skipped the
 /// stale-edit guard.
 async fn edit_form(id: &impl std::fmt::Display, fields: &[(&str, &str)]) -> String {
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
     let id: i64 = id.to_string().parse().expect("a post id");
-    let version = {
-        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        cms::schema::posts::table
-            .find(id)
-            .select(cms::schema::posts::lock_version)
-            .first::<i32>(&mut conn)
-            .await
-            .expect("the post")
-            .to_string()
-    };
+    let version = lock_version_of(id).await.to_string();
     let mut all: Vec<(&str, &str)> = fields.to_vec();
     all.push(("lock_version", version.as_str()));
     form(&all)
@@ -701,6 +708,236 @@ async fn create_post(
         .expect("id is the last path segment")
         .parse()
         .expect("id is numeric")
+}
+
+/// A blank/whitespace-only title on a status that requires one (`publish`,
+/// `private`, `future`) used to reach `AutumnError::unprocessable_msg` three
+/// layers into the create transaction — the state machine's `can_publish`
+/// guard for private/future, `normalize_post`'s direct-create check for
+/// publish — producing the generic `application/problem+json`/error-page
+/// response and discarding whatever body, excerpt and taxonomy picks the
+/// author had already entered. It is now caught pre-flight and redisplays the
+/// editor at 422 with the draft intact and a message next to Title.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for status in ["publish", "private", "future"] {
+        let mut fields = vec![
+            ("title", "   "),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body nobody should lose."),
+            ("status", status),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ];
+        if status == "future" {
+            fields.push(("publish_at", "2999-01-01T00:00"));
+        }
+        let resp = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected {status} submission must not redirect"
+        );
+        resp.assert_body_contains("A body nobody should lose.")
+            .assert_body_contains("must have a title");
+    }
+}
+
+/// The same redisplay, exercised on `update` against an existing post — the
+/// state machine's `can_publish` guard is what `update` hits (see
+/// [`create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact`]),
+/// and the post must still be a draft afterwards: a rejected transition must
+/// not have partially applied.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_draft() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(
+        &client,
+        &cookie,
+        "Original Title",
+        "Original body.",
+        "draft",
+    )
+    .await;
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "   "),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "An edit nobody should lose."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    resp.assert_body_contains("An edit nobody should lose.")
+        .assert_body_contains("must have a title");
+
+    // Not published — the rejected transition never reached the write path.
+    sign_out(&client);
+    let front = client.get("/original-title").send().await;
+    assert_eq!(
+        front.status, 404,
+        "the post must still be an unreachable draft"
+    );
+}
+
+/// The redisplay must not silently repair a stale edit.
+///
+/// `EditorContext`/`editor` are shared between the GET routes (which always
+/// want the row's *current* `lock_version`) and the validation-error 422
+/// branch (which must echo back exactly what was submitted, stale or not) —
+/// see `EditorValues::lock_version`. Getting this backwards would make a
+/// rejected-then-corrected submission pass optimistic locking against an
+/// edit it never actually saw, silently overwriting it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_rejected_submission_does_not_launder_a_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Concurrent Post", "v1", "draft").await;
+    let stale_version = lock_version_of(id).await;
+
+    // A concurrent edit lands and succeeds, bumping `lock_version`.
+    let bump = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Concurrent Post"),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "v2, from someone else"),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    assert_eq!(bump.status, 303, "the concurrent edit should succeed");
+    assert_ne!(
+        lock_version_of(id).await,
+        stale_version,
+        "the concurrent edit must have advanced the lock version"
+    );
+
+    // The original editor, unaware of the concurrent edit, submits the stale
+    // `lock_version` it loaded with — but also a blank title while trying to
+    // publish, which the pre-flight check rejects. The redisplay must carry
+    // the *stale* version back, not the row's now-current one.
+    let stale_form = form(&[
+        ("title", "   "),
+        ("slug", ""),
+        ("excerpt", ""),
+        ("body", "v1, edited but never saved"),
+        ("status", "publish"),
+        ("password", ""),
+        ("taxonomy_names[post_tag]", ""),
+        ("comment_status", "open"),
+        ("lock_version", &stale_version.to_string()),
+    ]);
+    let rejected = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form)
+        .send()
+        .await;
+    rejected
+        .assert_status(422)
+        .assert_body_contains(&format!(r#"value="{stale_version}""#));
+
+    // Correcting just the title and resubmitting the same (still-stale) form
+    // must now be caught by optimistic locking — not silently accepted.
+    let resubmitted = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form.replacen("title=+++", "title=Fixed", 1))
+        .send()
+        .await;
+    resubmitted.assert_status(409);
+}
+
+/// A scheduled post's date needs to be both present and in the future — see
+/// `require_future_publish_date`. Both failures used to reach the same
+/// generic error page via `?`; both now redisplay the editor.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_with_a_past_or_missing_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A past date.
+    let past = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Backdated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("publish_at", "2000-01-01T00:00"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    past.assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("publish date in the future");
+
+    // No date at all.
+    let missing = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Undated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    missing
+        .assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("Pick a publish date");
 }
 
 #[tokio::test]
@@ -3634,6 +3871,117 @@ async fn search_results_render_pagination() {
     let html = second.assert_ok().text();
     assert!(html.contains("← Newer"), "the second page must link back");
     assert!(html.contains("Page 2 of 3"), "and say where it is:\n{html}");
+}
+
+/// A hierarchical page's permalink in a search result must still resolve its
+/// full nested path when it comes from a batched ancestor lookup rather than
+/// a per-row one.
+///
+/// `search()` used to call `Repos::permalink` once per result, which for a
+/// page walked its ancestor chain a row at a time. It now resolves every
+/// result's ancestors in one batched pass (`content::posts_with_ancestors`)
+/// and builds the URL from that map with `site::permalink_from` — the same
+/// pure function `site::nav_for` already uses for the nav menu. This is the
+/// equivalence proof for the new call sites: a three-level chain must still
+/// produce its full path, two sibling leaves sharing the same parent (the
+/// shape the batching actually has to get right — a single result works
+/// under any implementation) must each resolve independently and correctly,
+/// and a flat, non-hierarchical post must render exactly as before.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn search_resolves_hierarchical_page_permalinks_from_the_batched_lookup() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    async fn create_page(
+        client: &TestClient,
+        cookie: &str,
+        title: &str,
+        slug: &str,
+        parent_id: Option<&str>,
+    ) -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            (
+                "body",
+                "Zzflorb marks the search token this test looks for.",
+            ),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent_id {
+            fields.push(("parent_id", parent));
+        }
+        let resp = client
+            .post("/admin/content/page")
+            .header("cookie", cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(
+            resp.status,
+            303,
+            "create page should redirect: {}",
+            resp.text()
+        );
+        resp.header("location")
+            .expect("redirect to the editor")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    }
+
+    // docs > docs/install > docs/install/{setup-a,setup-b}: a three-level
+    // chain with two sibling leaves sharing the same immediate parent, so the
+    // batch has to resolve one shared ancestor path for two distinct results.
+    let docs = create_page(&client, &cookie, "Docs Zzflorb", "docs", None).await;
+    let install = create_page(&client, &cookie, "Install Zzflorb", "install", Some(&docs)).await;
+    create_page(
+        &client,
+        &cookie,
+        "Setup A Zzflorb",
+        "setup-a",
+        Some(&install),
+    )
+    .await;
+    create_page(
+        &client,
+        &cookie,
+        "Setup B Zzflorb",
+        "setup-b",
+        Some(&install),
+    )
+    .await;
+
+    // A flat post: `permalink()`/`permalink_from` never walk ancestry for a
+    // non-`page` type at all, batched or not.
+    create_post(&client, &cookie, "Flat Zzflorb", "A flat post.", "publish").await;
+
+    sign_out(&client);
+    let html = client
+        .get("/search?s=zzflorb")
+        .send()
+        .await
+        .assert_ok()
+        .text();
+
+    assert!(
+        html.contains(r#"href="/docs/install/setup-a""#),
+        "the first sibling must resolve its full three-level path:\n{html}"
+    );
+    assert!(
+        html.contains(r#"href="/docs/install/setup-b""#),
+        "the second sibling, sharing the same parent, must resolve its own \
+         full path too -- not be dropped or given the first sibling's URL by \
+         the batched lookup:\n{html}"
+    );
+    assert!(
+        html.contains("Flat Zzflorb"),
+        "a flat post must still appear, unaffected by ancestry batching:\n{html}"
+    );
 }
 
 /// An absurd page number is bounded, not an overflow.
@@ -8877,6 +9225,315 @@ async fn a_scheduled_date_is_read_in_the_sites_timezone() {
     );
 }
 
+/// Creating a post with `status=future` and no publish date redisplays the
+/// editor with the author's draft intact, instead of bouncing to the generic
+/// error page `require_future_publish_date`'s `?` used to produce.
+///
+/// See [`cms::routes::admin::posts`]'s `PostForm::validate_fields`: the same
+/// anti-pattern already fixed for `examples/wiki`'s page forms (#2773),
+/// `examples/blog`'s post editor (#2687) and `reddit-clone`'s
+/// create-community form (#2665).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A future post"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body worth keeping."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", ""),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("A future post") && body.contains("A body worth keeping."),
+        "the author's title and body must round-trip rather than be lost: {body}"
+    );
+    assert!(
+        body.contains(r#"aria-describedby="publish_at-error""#),
+        "the publish-date field must be wired to its error for assistive tech: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let count: i64 = cms::schema::posts::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "a rejected submission must not create a row");
+}
+
+/// Same rejection, for a publish date that has already passed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_a_past_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Already due"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Still a draft."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", past.as_str()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("A scheduled post needs a publish date in the future"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains(&past),
+        "the exact wall clock the author typed must round-trip, not a reformatted or blanked \
+         value: {body}"
+    );
+}
+
+/// The same rejection on the *update* path: editing an already-published
+/// post's title/body while switching its status to "Scheduled" without
+/// picking a publish date must redisplay the editor with the edit intact
+/// rather than discard it. `require_future_publish_date`'s own doc comment
+/// names this general shape as an easy, ordinary editing mistake — not a
+/// crafted request — since the field is not required and nothing prompts an
+/// editor to fill it in before switching to "Scheduled".
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn rescheduling_an_edit_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Once live"),
+            ("slug", "once-live"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Once live, edited"),
+                    ("slug", "once-live"),
+                    ("excerpt", ""),
+                    ("body", "Edited body worth keeping."),
+                    ("status", "future"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("Once live, edited") && body.contains("Edited body worth keeping."),
+        "the just-typed edit must round-trip, not the previously-saved content: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let stored_title: String = cms::schema::posts::table
+        .find(id.parse::<i64>().expect("id"))
+        .select(cms::schema::posts::title)
+        .first(&mut conn)
+        .await
+        .expect("the post");
+    assert_eq!(
+        stored_title, "Once live",
+        "a rejected submission must not write the edit"
+    );
+}
+
+/// A validation-rejected redisplay must carry the *submitted* `lock_version`
+/// forward, not the row's current one — otherwise a stale edit's retry
+/// silently stops being stale.
+///
+/// Concretely: editor A loads the form at version 1. Editor B saves first,
+/// advancing the row to version 2. A submits their (now-stale) version-1 form
+/// with a scheduling mistake (`status=future`, no date); `validate_fields`
+/// rejects it and redisplays the editor. If that redisplay's hidden
+/// `lock_version` field were stamped from the freshly-reloaded row (version 2)
+/// instead of from A's own stale submission (version 1), fixing the date and
+/// resubmitting would pass the stale-edit check it should fail, silently
+/// overwriting B's edit — exactly the loss `expected_lock_version` exists to
+/// prevent. This must still return 409, not 303.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn validation_redisplay_keeps_the_submitted_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's starting point"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "draft"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let stale_version: i32 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::lock_version)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+
+    // Editor B saves first, advancing the row past the version A's form was
+    // rendered from.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Editor B's save"),
+                    ("slug", "race"),
+                    ("excerpt", ""),
+                    ("body", "Editor B's body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+
+    // Editor A submits their stale version-1 form with a scheduling mistake.
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains(&format!(r#"name="lock_version" value="{stale_version}""#)),
+        "the redisplay must stamp back the version A actually submitted, not the row's current \
+         (already-advanced) version: {body}"
+    );
+
+    // A fixes the date and resubmits the same (still-stale) lock_version, as
+    // the redisplayed form's hidden field instructs them to.
+    let future = (chrono::Utc::now() + chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let retry = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+            ("publish_at", future.as_str()),
+        ]))
+        .send()
+        .await;
+    retry.assert_status(409);
+
+    let stored_title: String = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::title)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert_eq!(
+        stored_title, "Editor B's save",
+        "editor A's stale retry must not overwrite editor B's save"
+    );
+}
+
 /// A completed import is not reconciled again.
 ///
 /// The source marker says "an import created this row" and is written before
@@ -11695,6 +12352,946 @@ async fn re_importing_a_backup_recognizes_a_child_of_a_moved_ancestor() {
         404,
         "the import must not have created a second `p` under the old `/a`"
     );
+}
+
+/// A re-import must still recognize a page whose parent is external — local
+/// content the file itself never declares — even after an editor moves
+/// that parent (#2763).
+///
+/// Only `P` is in the file. `A` already exists. On first import, `P`'s
+/// marker anchors to `A`'s row id. An editor then moves `A` under a new
+/// parent. The re-import must recompute the same anchor: `A`'s id, not its
+/// new position.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_moved_external_parent() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // `A` is created directly, the same way an editor would — not through
+    // an import. The file below never names it as one of its own posts.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/a/p").send().await.assert_ok();
+
+    // A separate top-level page, then the editor moves `A` underneath it.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The same backup again. `P`'s file entry still names `A`, unqualified,
+    // as its parent — the file never described `A` at all.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    // `A`'s move stands, and no duplicate `p` appeared anywhere.
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
+/// A re-import must still recognize a page whose marker a pre-#2763 site
+/// recorded against its external parent's *old* position, when that
+/// parent then moved before the site upgraded to this fix (#2763).
+///
+/// The stored marker (`a/p`) reflects `A`'s position at the *original*
+/// import. Recomputing that marker from `A`'s *current* row cannot recover
+/// it once `A` has moved since — the old position is gone, not just
+/// unreachable by id. Recognizing `P` here must not depend on recomputing
+/// any position at all: it must find the old marker by its slug suffix and
+/// confirm it by `P`'s real, current parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_marker_after_the_parent_moved() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `A`'s position at
+    // this import (`a`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The editor moves `A` — before the site ever upgrades to this fix.
+    let x_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "X"),
+                ("slug", "x"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating X: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    client
+        .post(&format!("/admin/content/page/{a_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &a_id,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", x_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+
+    // The site now upgrades to this fix and re-imports the same backup.
+    // `P`'s marker still reads `a/p`, and `A`'s position is now `x/a`.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/x/a/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under the old `/a`"
+    );
+    assert_eq!(
+        client.get("/p").send().await.status,
+        404,
+        "the import must not have created a second, top-level `p`"
+    );
+}
+
+/// A re-import must still recognize a page whose own marker predates
+/// #2763, when an editor has since moved that *page itself* — not its
+/// external parent (#2763).
+///
+/// `P`'s marker (`a/p`) is a single, unambiguous match for its slug
+/// suffix, so recovering it must trust that string directly rather than
+/// requiring `P`'s *current* parent to still be `A`: an editor moving `P`
+/// away from `A` is exactly the case an ordinary marker match already
+/// tolerates elsewhere in this importer, and recovering a legacy marker
+/// must not regress it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_backup_recognizes_a_pre_upgrade_marker_after_the_child_moved() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `A`'s position at
+    // this import (`a`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // The editor moves `P` itself — not `A` — before the site upgrades.
+    let b_id = {
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", "B"),
+                ("slug", "b"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating B: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", b_id.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+
+    // The site now upgrades to this fix and re-imports the same backup.
+    // `P`'s file entry still names `A`, and `P`'s marker still reads
+    // `a/p`, but `P`'s real parent is now `B`.
+    let cookie = sign_in(&client, "owner").await;
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported, 1 already present");
+
+    // The editor's move stands, and no duplicate `p` appeared under `A`.
+    sign_out(&client);
+    client.get("/b/p").send().await.assert_ok();
+    assert_eq!(
+        client.get("/a/p").send().await.status,
+        404,
+        "the import must not have created a second `p` under `A`"
+    );
+}
+
+/// Importing a genuinely new page must not be dropped just because an
+/// unrelated page, under a different external parent, already carries a
+/// pre-#2763 marker ending in the same slug (#2763).
+///
+/// Recovering a legacy marker by its slug suffix alone cannot tell `p`
+/// under `A` apart from an unrelated `p` under `Other` sharing that
+/// suffix. Only the candidate's real, current parent can — a shared
+/// suffix must not be trusted on its own.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_an_unrelated_pre_upgrade_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An unrelated page, external to every file this test imports, whose
+    // marker predates #2763: `other/p`, not the id-anchored shape this fix
+    // now records.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Other"),
+            ("slug", "other"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating Other: {}", created.text());
+
+    let unrelated_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "other", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, unrelated_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    let unrelated_p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(unrelated_p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("other/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A different external parent, never before related to any `p`.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    // A genuinely new file, naming a `p` this site has never imported
+    // under `A`. Its slug collides with the unrelated page above only by
+    // coincidence.
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Both pages exist: the unrelated one, untouched, and the new one.
+    sign_out(&client);
+    client.get("/other/p").send().await.assert_ok();
+    client.get("/a/p").send().await.assert_ok();
+}
+
+/// A new descendant of a page whose own marker predates #2763 must nest
+/// under that page's real row, not land at the top level (#2763).
+///
+/// `P`'s marker (`a/p`) is the pre-#2763 shape. `C` names `P` as its
+/// parent, and `P` is also declared in this same file, so `C`'s parent
+/// resolves through `resolved_post_id` — which needs the same legacy
+/// recovery the main loop uses, or it can never find `P`'s real id.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_descendant_of_a_pre_upgrade_legacy_parent_nests_it_correctly() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("a/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A backup that names `P` again, and adds a new child `C` under it.
+    let second_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""},
+            {"post_type": "page", "title": "C", "slug": "c", "status": "publish",
+             "author": "owner", "parent": "p", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, second_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 1 already present");
+
+    sign_out(&client);
+    client.get("/a/p/c").send().await.assert_ok();
+    assert_eq!(
+        client.get("/c").send().await.status,
+        404,
+        "the import must not have created a second, top-level `c`"
+    );
+}
+
+/// Importing a genuinely new page must not be confused with an unrelated,
+/// *current-scheme* marker whose row an editor has since dragged under the
+/// same external parent by coincidence (#2763).
+///
+/// `P`'s marker is `id:<B>/p` — the shape this fix itself now writes, not
+/// a legacy one. An editor moving `P` to `A` afterwards must not make the
+/// legacy-recovery suffix scan mistake it for a *different* `p` this file
+/// is naming under `A` for the first time: an `id:`-anchored marker is
+/// never a legacy candidate, no matter whose slug it ends in.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_a_relocated_current_scheme_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "B"),
+            ("slug", "b"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating B: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+    client.get("/b/p").send().await.assert_ok();
+
+    // A different external parent, then the editor drags `P` under it
+    // directly — not through any import.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+    let (p_id, a_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let p = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p");
+        let a = cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a");
+        (p, a)
+    };
+    let a_id_str = a_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", a_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/a/p").send().await.assert_ok();
+
+    // A genuinely new file, naming a different `P2` under `A` — its slug
+    // collides with the relocated page above only by coincidence.
+    let cookie = sign_in(&client, "owner").await;
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P2", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // The new page exists under `A`, alongside the relocated one.
+    sign_out(&client);
+    let new_under_a: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::title.eq("P2"))
+            .filter(cms::schema::posts::parent_id.eq(a_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count")
+    };
+    assert_eq!(new_under_a, 1, "the new `P2` must exist under `A`");
+    client.get("/a/p").send().await.assert_ok();
+}
+
+/// Importing a genuinely new page must not be confused with an unrelated
+/// *legacy-scheme* marker whose row an editor has since dragged under the
+/// same external parent by coincidence (#2763).
+///
+/// `P`'s marker is `b/p` — legacy-shaped, but recorded for parent `B`, not
+/// `A`. A shared `/p` suffix and a coincidentally-matching current parent
+/// are not enough: the marker's own recorded parent segment (`b`) must
+/// also agree with `A`'s slug, or an unrelated page's move can steal a
+/// genuinely new page's identity.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_new_page_is_not_confused_with_a_relocated_legacy_namesake() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "B"),
+            ("slug", "b"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating B: {}", created.text());
+
+    let first_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "b", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, first_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // Rewrite `P`'s marker to the *pre-#2763* shape: `B`'s position at
+    // this import (`b`), not the id-anchored marker this fix now records.
+    let p_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("p"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("p")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::update(
+            cms::schema::post_meta::table
+                .filter(cms::schema::post_meta::post_id.eq(p_id))
+                .filter(cms::schema::post_meta::meta_key.eq(cms::content::IMPORT_SOURCE_SLUG_KEY)),
+        )
+        .set(cms::schema::post_meta::meta_value.eq("b/p"))
+        .execute(&mut conn)
+        .await
+        .expect("rewrite the marker");
+    }
+
+    // A different external parent, then the editor drags `P` under it
+    // directly — not through any import.
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "creating A: {}", created.text());
+    let a_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("a"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("a")
+    };
+    let a_id_str = a_id.to_string();
+    client
+        .post(&format!("/admin/content/page/{p_id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &p_id,
+                &[
+                    ("title", "P"),
+                    ("slug", "p"),
+                    ("excerpt", ""),
+                    ("body", ""),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", a_id_str.as_str()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/a/p").send().await.assert_ok();
+
+    // A genuinely new file, naming a different `P2` under `A` — its slug
+    // collides with the relocated page above only by coincidence.
+    let cookie = sign_in(&client, "owner").await;
+    let new_payload = serde_json::json!({
+        "version": 2,
+        "site_title": "repro",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {"post_type": "page", "title": "P2", "slug": "p", "status": "publish",
+             "author": "owner", "parent": "a", "comment_status": "open", "password": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, new_payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported, 0 already present");
+
+    // The new page exists under `A`, alongside the relocated one.
+    sign_out(&client);
+    let new_under_a: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::title.eq("P2"))
+            .filter(cms::schema::posts::parent_id.eq(a_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count")
+    };
+    assert_eq!(new_under_a, 1, "the new `P2` must exist under `A`");
+    client.get("/a/p").send().await.assert_ok();
 }
 
 /// Re-importing a whole multi-level, pathless backup must still recognize
