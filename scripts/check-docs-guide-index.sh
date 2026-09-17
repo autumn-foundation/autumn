@@ -379,9 +379,10 @@ def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
     # asked. `[&#32;](alpha.md)` renders `<a href="alpha.md"> </a>` — an
     # anchor holding one space, which a reader can neither read nor aim at —
     # but the encoded source is six non-blank characters and looked like
-    # content. `html.unescape` is the same decode `normalise` applies to a
-    # destination, asked here of the text.
-    if not html.unescape(text[pos + 1:close - 1]).strip():
+    # content. `decode_char_refs` is the same decode `normalise` applies to
+    # a destination, asked here of the text — semicolon-terminated only, as
+    # CommonMark requires.
+    if not decode_char_refs(text[pos + 1:close - 1]).strip():
         return False
     for q in range(pos + 1, close - 1):
         if text[q] != "[" or (q and text[q - 1] == "!"):
@@ -616,6 +617,23 @@ DEFN = re.compile(
     # document-global either way. Hard-coding "quote then at most one list
     # marker" was an ordering, not a grammar; this is a repeatable segment,
     # which is what a container prefix actually is.
+    # KNOWN GAP, recorded rather than approximated: a definition written as
+    # a list item's CONTINUATION content is missed. `- note`, a blank line,
+    # then four spaces and `[catalog]: docs/guide/index.md` is a real,
+    # document-global definition — four absolute spaces is two past a `- `
+    # item's content column, short of the four that would make it code — and
+    # cmark-gfm renders a later `[Guide][catalog]` as a live link. This
+    # anchor needs the marker ON the definition's own line, so it does not
+    # match, and the README is reported as not reaching the index.
+    #
+    # `check-docs-orphans.sh` documents the same shape as its own known gap
+    # (and reaches the opposite error from it, a missed orphan rather than a
+    # false failure), with the reason this is not a patch: six spaces there
+    # IS code and must keep counting, so the two cannot be told apart by
+    # indent alone. It needs the active list content column threaded into
+    # the anchor — container tracking, which is the parser question raised
+    # on the PR. Approximating it would trade this false failure for a
+    # phantom definition inside real indented code.
     r"""^(?:[ \t]{0,3}(?:>[ \t]?)+|[ \t]{0,3}(?:[-*+]|\d{1,9}[.)])[ \t]{1,4})*"""
     r"""[ \t]{0,3}"""
     r"""\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
@@ -649,6 +667,25 @@ _DEFN_AT = re.compile(
 URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 
 ESCAPED_PUNCT = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+# CommonMark decodes only SEMICOLON-TERMINATED character references.
+# `html.unescape` is HTML5-lenient and takes `&#46md` as well, which renders
+# literally — cmark-gfm emits `href="alpha&#46md"` — so decoding it invents a
+# `.md` the reader never sees and makes a row point at a page it does not
+# reach.
+#
+# The previous commit introduced that by reaching for `html.unescape`
+# directly. `check-docs-orphans.sh` had already hit it and written the fix
+# down, comment and all; this is its `CHAR_REF` and its `decode_char_refs`,
+# copied rather than re-derived. "Check the sibling first" is a rule I have
+# applied all over this branch and did not apply when adding the decode.
+CHAR_REF = re.compile(
+    r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]*);")
+
+
+def decode_char_refs(s):
+    return CHAR_REF.sub(lambda m: html.unescape(m.group(0)), s)
+
 
 IMAGE_MARK = "\ufffc"
 # The same idea for a CODE SPAN, which also renders something a reader can
@@ -1683,7 +1720,7 @@ def normalise(target, base):
     # `alpha&` and rejecting a valid row. Decoding has to happen BEFORE the
     # fragment split for exactly that reason, which is why it sits here
     # rather than beside the unquoting below.
-    target = html.unescape(target)
+    target = decode_char_refs(target)
     target = target.split("#", 1)[0].rstrip()
     # A rendered link is a URL, and `check-docs-links.sh` already resolves
     # one this way. Disagreeing with the sibling gate about what a
@@ -4693,6 +4730,21 @@ self_test() {
     > "$tmp/defn_composed_container/README.md"
   _commit defn_composed_container
   _case "container prefixes compose in any order" 0 defn_composed_container
+
+  # 229. Only SEMICOLON-TERMINATED references decode. `alpha&#46md` renders
+  #      literally — cmark-gfm emits `href="alpha&#46md"` — so the row
+  #      reaches nothing, while `html.unescape` would invent `alpha.md`.
+  #      The previous commit introduced exactly that by reaching for
+  #      `html.unescape`; `check-docs-orphans.sh` had already written the
+  #      fix down, and this case pins the sibling's rule here too.
+  _scaffold entity_unterminated
+  printf '# A\n' > "$tmp/entity_unterminated/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha&#46md)\n' \
+    > "$tmp/entity_unterminated/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/entity_unterminated/README.md"
+  _commit entity_unterminated
+  _case "an unterminated reference does not decode" 1 entity_unterminated
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
