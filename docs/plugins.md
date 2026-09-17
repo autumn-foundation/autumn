@@ -583,6 +583,11 @@ plugin `autumn-plugin-example 0.6.2` supports autumn-web 0.6, but this applicati
   → or, to boot anyway while you sort it out, set AUTUMN_PLUGIN_CONTRACT=warn
 ```
 
+<!-- version-pin-allow: autumn-web = "0.6" — inside the reproduced
+     plugin-contract panic text. The old line is what makes the example an
+     incompatible pairing, and the pin is the message's own remediation line,
+     not a dependency the reader adds. -->
+
 The last line is the escape hatch. Cargo has already proven the app and the
 plugin link one `autumn-web` — otherwise there would be two copies and a
 compile error — so a mismatch here means the plugin's *declared* range is

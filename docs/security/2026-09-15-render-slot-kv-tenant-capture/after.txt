@@ -1,0 +1,9 @@
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 45s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-347d6fc992bee7fb)
+
+running 1 test
+test integration::plugin_sandbox_capabilities::the_tenant_a_render_hooks_kv_write_lands_under_is_the_callers_own ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2074 filtered out; finished in 0.01s
+

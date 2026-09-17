@@ -24,14 +24,20 @@ Presence handles all of that so you can ship collaborative UI features in minute
 
 ## Enabling Presence
 
-Presence is part of the `ws` Cargo feature (same as `Channels`):
+Presence is behind its own `presence` Cargo feature — **not** `ws`, which is
+what `Channels` needs:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.7", features = ["ws"] }
+autumn-web = { version = "0.7", features = ["presence"] }
 ```
 
-It is available from `autumn_web::prelude::*` automatically when `ws` is enabled.
+`presence = ["ws"]` in the manifest, so enabling `presence` turns `ws` on for
+you and you get `Channels` too. The reverse does not hold: an app built with
+`features = ["ws"]` alone has no `Presence` extractor at all.
+
+It is available from `autumn_web::prelude::*` automatically when `presence` is
+enabled.
 
 ## The Contract
 

@@ -20,8 +20,8 @@ use super::emit::Plan;
 use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, schema_has_table,
-    unique_index_sql, update_main_rs,
+    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, declares_package,
+    schema_has_table, unique_index_sql, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -1703,7 +1703,11 @@ pub fn run_with_options(
 /// Handles the three common forms a fresh Autumn project may use:
 /// - `autumn-web = "x.y"` (simple string)
 /// - `autumn-web = { version = "x.y", ... }` (inline table)
-/// - `[dependencies.autumn-web]` subtable
+/// - `[dependencies.autumn-web]` subtable (hyphenated or Cargo's underscore-normalized
+///   `[dependencies.autumn_web]` spelling — both are valid TOML keys for the same
+///   dependency, as `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` already
+///   check)
+#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
     const FEATURE: &str = "\"mail\"";
@@ -1714,6 +1718,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     let simple_prefix = format!("{CRATE} = \"");
     let table_prefix = format!("{CRATE} = {{");
     let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
 
     let mut i = 0;
     while i < lines.len() {
@@ -1769,7 +1774,24 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header {
+        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
+        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
+        // unrelated package `autumn_web` unless its body renames it back with
+        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
+        // that declaration before treating the underscore form as a match, the
+        // same way `find_section_start_with_autumn_web_package` does.
+        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
+            let body_end = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |p| i + 1 + p);
+            lines[i + 1..body_end].iter().any(|l| {
+                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
+                declares_package(code, CRATE)
+            })
+        };
+
+        if trimmed == subtable_header || underscore_aliases_autumn_web {
             // Scan ahead within the subtable.
             let mut j = i + 1;
             let mut found_features = false;
@@ -2993,18 +3015,21 @@ pub async fn issue_remember_cookie(
     ))
 }}
 
-/// Revoke the remember chain identified by the request's remember cookie (used
-/// by logout). No-op when the cookie is absent or malformed.
+/// Revoke the remember chain named by the request's remember cookie (used by
+/// logout). Does nothing when the cookie is absent or malformed. Returns the
+/// delete error on failure: the remember cookie is a long-lived credential,
+/// so the caller must not report logout as successful when revocation fails.
 async fn revoke_remember_from_cookie(
     db: &mut Db,
     config: &RememberConfig,
     headers: &axum::http::HeaderMap,
-) {{
+) -> autumn_web::AutumnResult<()> {{
     if let Some(value) = read_cookie(headers, &config.cookie_name)
         && let Some((series, _token)) = parse_remember_cookie_value(&value)
     {{
-        let _ = delete_remember_series(&mut **db, &series).await;
+        delete_remember_series(&mut **db, &series).await?;
     }}
+    Ok(())
 }}
 
 /// Project a stored row into the pure [`RememberRecord`] the decision function
@@ -4062,17 +4087,23 @@ pub async fn login(
                                 format!("{{:x}}:{{:x}}:{{:x}}:{{:x}}::/64", s[0], s[1], s[2], s[3])
                             }}
                         }};
-                        // Salt the digest with the deployment secret so the
-                        // account ID cannot be recovered by hashing small integers.
+                        // Salt the digest with the app's signing secret. This
+                        // stops recovery of the account ID from small integers.
+                        // Production always has this secret set (see
+                        // fail_fast_on_invalid_signing_secret). Dev and test may
+                        // not; the fallback salt below only affects those local,
+                        // process-only logs.
                         let account_id_digest = {{
                             use sha2::{{Digest, Sha256}};
-                            // Require a deployment secret for the digest salt. Operators
-                            // MUST set SECRET_KEY_BASE (already required for sessions) or
-                            // AUTUMN_ADMIN_SECRET. The static fallback prevents reversibility
-                            // only within this process; set the env var in production.
-                            let salt = std::env::var("SECRET_KEY_BASE")
-                                .or_else(|_| std::env::var("AUTUMN_ADMIN_SECRET"))
-                                .unwrap_or_else(|_| "autumn-lockout-fallback-salt".to_string());
+                            let salt = config.security.signing_secret.secret.as_deref()
+                                .unwrap_or_else(|| {{
+                                    tracing::warn!(
+                                        "account_locked digest is salted with a public \
+                                         constant: set AUTUMN_SECURITY__SIGNING_SECRET so \
+                                         it cannot be reversed to an account id"
+                                    );
+                                    "autumn-lockout-fallback-salt"
+                                }});
                             let hash = Sha256::digest(
                                 format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
                             );
@@ -4199,14 +4230,28 @@ pub async fn logout(
     let _ = untrack_current_session(&mut db, &session).await;
     // Revoke this device's remember chain (issue #1397) so a stolen remember
     // cookie cannot re-establish a login after logout. No-op when absent.
-    revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
+    // Hold the result rather than propagating it here: the session below is
+    // the primary credential and must be invalidated even if this failed.
+    let revoke_result = revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
     // Invalidate the session: clear all data (drops the auth keys) and rotate
     // the id so the pre-logout cookie can no longer be replayed — the old id is
     // destroyed in the session store on save. This is equivalent to `destroy()`
     // for replay safety while letting a one-shot logout notice ride the freshly
-    // rotated session through to the login page.
+    // rotated session through to the login page. Unconditional: it must not
+    // be skipped by a remember-chain delete failure propagated below.
     session.clear().await;
     session.rotate_id().await;
+    // Fail the logout if the remember chain survived: it is a long-lived
+    // bearer credential and reporting success would be false. Still clear the
+    // cookie on THIS browser even on failure — otherwise it keeps presenting
+    // a still-valid remember cookie, and once the database recovers,
+    // `remember_me` would silently re-establish a session on the next
+    // request, undoing this logout.
+    if let Err(error) = revoke_result {{
+        let mut response = error.into_response();
+        append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
+        return Ok(response);
+    }}
     flash.info("You have been logged out.").await;
     let mut response = redirect_to("/login");
     append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
@@ -13308,6 +13353,149 @@ mod tests {
         );
     }
 
+    /// #2152: a failed remember-chain delete must fail the logout, not be
+    /// swallowed. The remember cookie is a long-lived bearer credential; if
+    /// the delete fails silently, the cookie clears client-side but the chain
+    /// still authenticates on the server, while the response tells the user
+    /// they signed out.
+    #[test]
+    fn logout_propagates_remember_chain_revocation_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let sig_start = routes
+            .find("async fn revoke_remember_from_cookie")
+            .expect("revoke_remember_from_cookie must be defined");
+        let sig_end = sig_start
+            + routes[sig_start..]
+                .find('{')
+                .expect("function signature must have a body");
+        let signature = &routes[sig_start..sig_end];
+        assert!(
+            signature.contains("-> autumn_web::AutumnResult<()>")
+                || signature.contains("-> AutumnResult<()>"),
+            "revoke_remember_from_cookie must return a Result so a failed \
+             delete can fail the logout, not `()`: {signature}"
+        );
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+        assert!(
+            logout_body
+                .contains("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await"),
+            "logout must call revoke_remember_from_cookie and keep its result \
+             to propagate later, not discard it: {logout_body}"
+        );
+    }
+
+    /// #2152 follow-up: the session is the primary credential, so logout must
+    /// invalidate it (`clear` + `rotate_id`) even when the remember-chain
+    /// delete fails. Propagating that failure with `?` BEFORE invalidating
+    /// the session would let a transient DB error on the remember-chain
+    /// delete leave the pre-logout session cookie live — worse than the bug
+    /// this was meant to fix, since the session is more sensitive than the
+    /// remember cookie.
+    #[test]
+    fn logout_invalidates_session_before_propagating_remember_chain_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        let revoke_call_at = logout_body
+            .find("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await")
+            .expect("logout must call revoke_remember_from_cookie");
+        assert!(
+            !logout_body[revoke_call_at..]
+                .starts_with("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await?"),
+            "the revoke call must not short-circuit the handler with `?` \
+             directly — that skips session invalidation on failure: {logout_body}"
+        );
+
+        let clear_at = logout_body
+            .find("session.clear()")
+            .expect("logout must clear the session");
+        let rotate_at = logout_body
+            .find("session.rotate_id()")
+            .expect("logout must rotate the session id");
+        assert!(
+            clear_at > revoke_call_at && rotate_at > revoke_call_at,
+            "logout must invalidate the session after calling \
+             revoke_remember_from_cookie: {logout_body}"
+        );
+
+        let propagate_at = logout_body
+            .find("if let Err(")
+            .filter(|&p| p > rotate_at)
+            .expect(
+                "logout must branch on the remember-chain revocation result \
+                 AFTER the session is invalidated",
+            );
+        assert!(propagate_at > clear_at && propagate_at > rotate_at);
+    }
+
+    /// #2811 review finding: on a failed remember-chain delete, `logout` must
+    /// still clear the remember cookie in the error response. Otherwise the
+    /// browser keeps presenting a still-valid remember cookie, and once the
+    /// database recovers `remember_me` silently re-establishes a session on
+    /// the user's very next request — undoing the logout entirely.
+    #[test]
+    fn logout_clears_remember_cookie_even_on_revocation_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        // The error branch must build its own response and attach the clear
+        // cookie rather than bailing out with a bare `revoke_result?;` that
+        // hands back the framework's default error response untouched.
+        assert!(
+            !logout_body.contains("revoke_result?;"),
+            "a bare `revoke_result?;` skips attaching the remember-clear \
+             cookie to the error response: {logout_body}"
+        );
+        assert!(
+            logout_body.contains("if let Err(") && logout_body.contains("revoke_result"),
+            "logout must branch on revoke_result to attach the clear cookie \
+             to the error response: {logout_body}"
+        );
+
+        let clear_cookie_calls = logout_body
+            .matches("append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg))")
+            .count();
+        assert!(
+            clear_cookie_calls >= 2,
+            "logout must clear the remember cookie on BOTH the success path \
+             and the revocation-failure error path: {logout_body}"
+        );
+    }
+
     #[test]
     fn routes_file_emits_flash_messages() {
         let tmp = project_with_main();
@@ -14296,6 +14484,71 @@ mod tests {
             out.matches("\"mail\"").count(),
             1,
             "must not duplicate feature"
+        );
+    }
+
+    /// Cargo does not normalize `-`/`_` in a dependency table key: `[dependencies.autumn_web]`
+    /// names an unrelated package `autumn_web` unless its body renames it back with
+    /// `package = "autumn-web"` (`cargo metadata` on a manifest with
+    /// `[dependencies.async_trait]` and no `package` key: "no matching package found ...
+    /// perhaps you meant: async-trait" — it does not fall back to the hyphenated name).
+    /// Every fixture below therefore carries that `package` line, matching how `autumn
+    /// new`/`cargo add --rename` would actually produce this form.
+    ///
+    /// `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` both check
+    /// `[dependencies.autumn_web]` via a `subtable_header_underscore` variable, but —
+    /// like `ensure_autumn_web_mail_feature` before this fix — neither verifies the
+    /// `package` rename, so they too would incorrectly match (and mutate) an unrelated
+    /// `autumn_web` dependency that isn't actually this framework. That's tracked
+    /// separately (see the clone-class findings issue for this file) rather than fixed
+    /// here, since this PR is scoped to `ensure_autumn_web_mail_feature` alone.
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize a
+    /// properly `package`-renamed `[dependencies.autumn_web]` the same way its
+    /// `oauth2`/`webauthn` siblings do (see
+    /// `cargo_toml_gets_oauth2_feature_subtable_underscore_form` above). Before this
+    /// fix the function silently returned the TOML unmodified for this form.
+    #[test]
+    fn cargo_toml_gets_mail_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(
+            out.contains("features = [\"mail\"]"),
+            "mail feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Negative case for the fix above: `[dependencies.autumn_web]` with no `package`
+    /// rename names a real (if unlikely) dependency on a crate literally called
+    /// `autumn_web` — not this framework. `ensure_autumn_web_mail_feature` must leave
+    /// it untouched rather than injecting `mail` into an unrelated dependency's
+    /// features.
+    #[test]
+    fn cargo_toml_mail_feature_ignores_unrenamed_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert_eq!(
+            out, input,
+            "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
         );
     }
 
@@ -16471,6 +16724,42 @@ mod tests {
             "telemetry must be gated behind a check that the lock-stamp UPDATE \
              actually affected a row (`if locked_rows > 0`), not fired \
              unconditionally after attempting the write: {routes}"
+        );
+    }
+
+    /// #2152: the `account_locked` digest salt must come from the app's
+    /// configured signing secret, not an ad hoc env var chain. A deployment
+    /// that sets `AUTUMN_SECURITY__SIGNING_SECRET` (the documented signing
+    /// secret) — and nothing else — must not silently fall back to the
+    /// public constant salt, which lets anyone holding the logs invert the
+    /// digest back to an account id.
+    #[test]
+    fn account_locked_digest_salts_from_the_signing_secret() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let digest_start = routes
+            .find("let account_id_digest")
+            .expect("login handler must compute account_id_digest");
+        let digest_end = digest_start
+            + routes[digest_start..]
+                .find("hex::encode")
+                .expect("account_id_digest must hex-encode the hash");
+        let digest_block = &routes[digest_start..digest_end];
+
+        assert!(
+            digest_block.contains("signing_secret"),
+            "account_locked digest salt must derive from \
+             config.security.signing_secret: {digest_block}"
+        );
+        assert!(
+            !digest_block.contains("SECRET_KEY_BASE")
+                && !digest_block.contains("AUTUMN_ADMIN_SECRET"),
+            "account_locked digest salt must not read SECRET_KEY_BASE or \
+             AUTUMN_ADMIN_SECRET — AUTUMN_SECURITY__SIGNING_SECRET is the \
+             documented signing secret and must be consulted instead: {digest_block}"
         );
     }
 
