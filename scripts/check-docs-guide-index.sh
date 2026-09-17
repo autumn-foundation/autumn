@@ -288,6 +288,16 @@ def blank_links(text):
     return LINK.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
+def blank_defns(text):
+    """Blank every reference-definition span, space for space.
+
+    Definitions vanish from the rendered page, so nothing inside one is
+    visible and nothing inside one is clickable. Newlines survive, for the
+    same reason they do in `blank_links`.
+    """
+    return DEFN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
 def definitions(text):
     """Every `[label]: target` definition in `text`, as {folded label: target}.
 
@@ -351,6 +361,9 @@ link main menu menuitem nav noframes ol optgroup option p param search
 section summary table tbody td tfoot th thead title tr track ul
 """.split())
 # Declaration-style blocks, each with its own terminator.
+# An HTML comment that begins a line is a raw BLOCK; one that appears mid-line
+# (`see <!-- x --> and`) is inline, and owns only itself.
+COMMENT_BLOCK = re.compile(r"^ {0,3}<!--")
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
@@ -557,10 +570,26 @@ def readable(text):
                     i = n
                 continue
 
+            # A raw HTML block that STARTS a line owns that line to its end,
+            # including whatever follows its terminator. `<!-- x --> [Guide]
+            # (y.md)` renders the link as literal text; resuming at the `-->`
+            # handed the rest of the line back to the scanner as markdown.
+            #
+            # All three block kinds get this, not just the one that was
+            # reported: comments, declarations, and the literal blocks below.
+            # Fixing one sibling and leaving the others is how the last four
+            # of these findings happened.
+            if COMMENT_BLOCK.match(line):
+                close = text.find("-->", i + 4)
+                stop = n if close < 0 else line_end(close + 3)
+                blank_to(i, stop)
+                i = stop
+                continue
+
             decl = next((end for pat, end in DECL if pat.match(line)), None)
             if decl is not None:
                 close = text.find(decl, i + 2)
-                stop = n if close < 0 else close + len(decl)
+                stop = n if close < 0 else line_end(close + len(decl))
                 blank_to(i, stop)
                 i = stop
                 continue
@@ -832,8 +861,15 @@ def entries(text, base):
     # row may sit above the `[label]: target` line that resolves it, which is
     # the usual way people write them.
     defs = definitions(body)
+    # Rows are read from a copy with definition spans blanked, while `defs`
+    # above needs them intact. A definition's title may span lines, so a
+    # row-shaped line inside one counted as an entry — listing a page with
+    # text that renders nowhere. Found by probing the README-side fix for
+    # the same thing rather than waiting to be told; blanking preserves
+    # newlines, so reported line numbers stay honest.
+    rows = blank_defns(body)
     prev = ""
-    for lineno, line in enumerate(body.split("\n"), 1):
+    for lineno, line in enumerate(rows.split("\n"), 1):
         # The previous line, captured before any `continue` can skip the
         # bookkeeping. Only the Setext test needs it, and getting this wrong
         # would make that test read whichever line last fell through.
@@ -978,7 +1014,12 @@ def reaches_index(text):
     having no link at all — a false failure on ordinary markdown, which is
     worse than the exotic near-misses this check has mostly been about.
     """
-    if any(normalise(m.group(1), "") == INDEX for m in LINK.finditer(text)):
+    # A reference DEFINITION is removed from the rendered output entirely, so
+    # a link inside one's title is not navigation — it is not even text. The
+    # inline pass therefore reads a copy with definition spans blanked, while
+    # the reference pass below still needs them intact to resolve labels.
+    if any(normalise(m.group(1), "") == INDEX
+           for m in LINK.finditer(blank_defns(text))):
         return True
     # Definitions, then the labels actually referenced by a full
     # (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
@@ -2215,6 +2256,74 @@ self_test() {
     > "$tmp/literal_after_close/README.md"
   _commit literal_after_close
   _case "a link after the closing line is clickable" 0 literal_after_close
+
+  # 105. A comment that BEGINS a line is a raw block and owns the line to
+  #      its end, terminator included.
+  _scaffold comment_closing_line
+  printf '# A\n' > "$tmp/comment_closing_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_closing_line/docs/guide/index.md"
+  printf '<!-- hidden --> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/comment_closing_line/README.md"
+  _commit comment_closing_line
+  _case "a comment block owns its closing line" 1 comment_closing_line
+
+  # 106. ...and the guard: a comment MID-line is inline and owns only
+  #      itself, so a link beside it is still clickable.
+  _scaffold comment_inline
+  printf '# A\n' > "$tmp/comment_inline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_inline/docs/guide/index.md"
+  printf 'see <!-- x --> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/comment_inline/README.md"
+  _commit comment_inline
+  _case "a mid-line comment keeps the link" 0 comment_inline
+
+  # 107. The declaration block is the third sibling of the same rule, and
+  #      was fixed with the other two rather than one round later.
+  _scaffold decl_closing_line
+  printf '# A\n' > "$tmp/decl_closing_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/decl_closing_line/docs/guide/index.md"
+  printf '<!DOCTYPE html> [Guide](docs/guide/index.md)\n' \
+    > "$tmp/decl_closing_line/README.md"
+  _commit decl_closing_line
+  _case "a declaration block owns its closing line" 1 decl_closing_line
+
+  # 108. A reference DEFINITION vanishes from the rendered page, so a link
+  #      inside its title is not navigation and not even text.
+  _scaffold link_in_defn_title
+  printf '# A\n' > "$tmp/link_in_defn_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_in_defn_title/docs/guide/index.md"
+  printf '[other]: other.md "title [Guide](docs/guide/index.md)"\n' \
+    > "$tmp/link_in_defn_title/README.md"
+  _commit link_in_defn_title
+  _case "a link in a definition title is not a link" 1 link_in_defn_title
+
+  # 109. ...and the guard: a definition that RESOLVES to the index, used by
+  #      a real reference, still counts. The inline pass reads a blanked
+  #      copy; the reference pass needs them intact.
+  _scaffold defn_still_resolves
+  printf '# A\n' > "$tmp/defn_still_resolves/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_still_resolves/docs/guide/index.md"
+  printf '[Guide][c]\n\n[c]: docs/guide/index.md\n' \
+    > "$tmp/defn_still_resolves/README.md"
+  _commit defn_still_resolves
+  _case "a definition used by a reference still counts" 0 defn_still_resolves
+
+  # 110. The same hole on the ENTRY side, which review did not report: a
+  #      definition title may span lines, so a row-shaped line inside one
+  #      listed a page with text that renders nowhere.
+  _scaffold row_in_defn_title
+  printf '# A\n' > "$tmp/row_in_defn_title/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/row_in_defn_title/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n[c]: o.md "t\n- [B](beta.md)\n"\n' \
+    > "$tmp/row_in_defn_title/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_in_defn_title/README.md"
+  _commit row_in_defn_title
+  _case "a row inside a definition title is not a row" 1 row_in_defn_title
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
