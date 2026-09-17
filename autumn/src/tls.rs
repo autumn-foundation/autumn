@@ -1571,9 +1571,8 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     // this green.
     #[test]
     fn serve_stack_speaks_http2() {
-        let mut builder = hyper_util::server::conn::auto::Builder::new(
-            hyper_util::rt::TokioExecutor::new(),
-        );
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         let _ = builder.http2();
     }
 }
