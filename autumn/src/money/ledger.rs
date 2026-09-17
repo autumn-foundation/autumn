@@ -262,9 +262,12 @@ pub enum LedgerError {
     ///
     /// Rare: the account locks serialize every poster over the same accounts,
     /// so this needs a poster that shares the key but not the accounts, or a
-    /// snapshot above `READ COMMITTED` that cannot see the row. Retry the whole
-    /// transaction and the retry replays; [`Db::tx_with`](crate::db::Db::tx_with)
-    /// does that for you.
+    /// snapshot above `READ COMMITTED` that cannot see the row.
+    ///
+    /// Re-run the whole transaction and the retry replays off the read `post`
+    /// starts with. The retry is **yours to do**:
+    /// [`Db::tx_with`](crate::db::Db::tx_with) only retries the SQLSTATEs a
+    /// database reports (`40001`, `40P01`), and this is not one of them.
     Conflict {
         /// The key that is being posted elsewhere.
         key: String,
@@ -1250,13 +1253,26 @@ async fn lock_account(
 ///
 /// # Cancellation
 ///
-/// Dropping this future part-way cannot half-write the books. The postings are
-/// written before the transaction row, behind a deferred foreign key, so a
-/// dropped `post` leaves the enclosing transaction holding postings with no
-/// parent — and the database refuses that COMMIT. A caller that races `post`
-/// against a timeout therefore loses the whole transaction rather than
-/// committing a transaction row with no postings, which the append-only tables
-/// could never repair.
+/// Dropping this future part-way cannot half-write the books, but it does
+/// leave the **outcome unknown**.
+///
+/// What is guaranteed: the ledger ends up with either nothing, or one complete
+/// balanced transaction — never a transaction row without its postings, which
+/// the append-only tables could never repair. The postings are written before
+/// the transaction row, behind a deferred foreign key, so a drop between them
+/// leaves the enclosing transaction holding postings with no parent and the
+/// database refuses that COMMIT.
+///
+/// What is **not** guaranteed is which of the two happened. A drop after the
+/// last write — while the read-back is in flight — leaves a complete
+/// transaction that commits normally, so a caller that swallows the
+/// cancellation and returns `Ok` can commit a charge it never saw the result
+/// of.
+///
+/// So a caller that races `post` against a timeout must treat a cancellation as
+/// indeterminate and settle it by posting the **same idempotency key** again:
+/// that replays if the money moved and posts if it did not. Not racing `post`
+/// at all is simpler.
 ///
 /// # Two posts in one transaction
 ///

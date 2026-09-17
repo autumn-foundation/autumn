@@ -61,12 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ledger::balance` sums an account's postings; `ledger::trial_balance`
     makes the global zero-sum invariant queryable from a job or a health
     check.
-  - A cancelled `post` writes nothing. The postings go in **before** the
+  - A cancelled `post` never half-writes. The postings go in **before** the
     transaction row they belong to, behind a `DEFERRABLE INITIALLY DEFERRED`
-    foreign key, so a future dropped part-way leaves the enclosing transaction
-    holding postings with no parent — and the database refuses that commit.
-    The other order could commit a transaction row with no postings, which
-    append-only tables could never repair.
+    foreign key, so a future dropped between the two leaves the enclosing
+    transaction holding postings with no parent — and the database refuses that
+    commit. The other order could commit a transaction row with no postings,
+    which append-only tables could never repair. The ledger therefore ends up
+    with either nothing or one complete balanced transaction; which of the two
+    is not knowable from the cancellation alone, so a caller that races `post`
+    against a timeout settles it by posting the same idempotency key again.
   - One configurable policy per account: `Account::disallow_negative()`. The
     check reads the balance the posting *would* leave, before anything is
     written. On Postgres the account rows are held with `SELECT ... FOR

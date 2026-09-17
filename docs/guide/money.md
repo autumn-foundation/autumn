@@ -269,7 +269,7 @@ health check.
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
 | Nothing is rewritten | a database trigger on both backends, `TRUNCATE` included |
-| A cancelled `post` writes nothing | the postings go in before their transaction row, behind a deferred foreign key |
+| A cancelled `post` never half-writes | the postings go in before their transaction row, behind a deferred foreign key |
 
 The last two matter most.
 
@@ -277,12 +277,18 @@ The last two matter most.
 `DELETE` or a `TRUNCATE` that comes from anywhere else.
 
 And `post` writes the postings **before** the transaction row they belong to.
-That looks backwards; it is what makes the call cancellation-safe. The foreign
-key is deferred, so the database checks it at `COMMIT` — and a `post` whose
-future is dropped part-way (a caller racing it against a timeout) leaves
-postings with no parent, which refuses the commit. The alternative order could
-commit a transaction row with no postings, and append-only tables could never
-repair that.
+That looks backwards; it is what keeps a cancelled call from half-writing the
+books. The foreign key is deferred, so the database checks it at `COMMIT` — and
+a `post` whose future is dropped between the two leaves postings with no parent,
+which refuses the commit. The alternative order could commit a transaction row
+with no postings, and append-only tables could never repair that.
+
+The ledger therefore ends up with either nothing or one complete balanced
+transaction. It does **not** tell you which: a drop after the last write, while
+the read-back is in flight, leaves a complete transaction that commits normally.
+If you race `post` against a timeout, treat a cancellation as indeterminate and
+settle it by posting the same idempotency key again — that replays if the money
+moved and posts if it did not. Not racing it is simpler.
 
 ## Not in this slice
 

@@ -1211,9 +1211,11 @@ Rules that matter:
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are
   append-only by trigger — `UPDATE`, `DELETE` and `TRUNCATE` all abort.
-- `post` is cancellation-safe: it writes the postings before their transaction
-  row behind a deferred foreign key, so a dropped future costs the enclosing
-  transaction rather than half-writing the books.
+- A cancelled `post` never half-writes: it writes the postings before their
+  transaction row behind a deferred foreign key, so the ledger ends up with
+  nothing or one complete transaction. Which one is not knowable from the
+  cancellation, so re-post the same idempotency key to settle it. Simpler still:
+  do not race `post` against a timeout.
 
 Out of scope in this slice: FX conversion, provider reconciliation, and a
 payment-provider client. See `docs/guide/money.md`.
