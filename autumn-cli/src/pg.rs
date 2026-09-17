@@ -1897,12 +1897,27 @@ mod tests {
         // just appending an `sslmode=require` at the end regardless of
         // position) preserves whichever of the two actually comes last, the
         // same "last one wins" rule that already governs a connection
-        // string with two explicit `sslmode=` occurrences.
-        let sanitized = sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Disable
+        // string with two explicit `sslmode=` occurrences. Scopes away
+        // PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing value set by
+        // another test's `temp_env` call (e.g.
+        // `sanitize_rejects_pgsslcert_env_var_in_url_form`) can't trip the
+        // sslcert/sslkey rejection instead of the translation this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Disable
+                );
+            },
         );
     }
 
