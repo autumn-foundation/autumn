@@ -157,7 +157,7 @@ README = "README.md"
 # `(?<![!\\])` rejects two things that share every other character with a link
 # and navigate nowhere: an image (`![alt](page.md)` renders a picture) and an
 # escaped bracket (`\[Guide](page.md)` renders literal text).
-LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^)]*\)")
+LINK = re.compile(r'''(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^\s)]*(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)''')
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -185,7 +185,7 @@ LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^)]*\)")
 # under sub-bullets is told so by name rather than silently half-checked; that
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
-ENTRY = re.compile(r"^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)\)")
+ENTRY = re.compile(r'''^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)[^\s)]*(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)''')
 
 # One left-to-right scan replaces what used to be six sequential passes.
 #
@@ -227,6 +227,10 @@ DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
 # and it can never be an index row or a link to a `.md` page anyway.
 AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*>"
                       r"|<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>")
+# A thematic break and a Setext heading underline. Neither is
+# paragraph text, so indented code may open straight after one.
+THEMATIC = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # A list item marker, used only to tell a nested list from an indented
 # code block.
 LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
@@ -350,7 +354,13 @@ def readable(text):
             # line after one opens code.
             in_paragraph = not (stripped.startswith("#")
                                 or FENCE.match(line)
-                                or HTML_OPEN.match(line))
+                                or HTML_OPEN.match(line)
+                                # A thematic break (`---`, `***`, `___`) and a
+                                # Setext underline (`===`, `---`) both end the
+                                # paragraph, so an indented line after one is
+                                # code.
+                                or THEMATIC.match(line)
+                                or SETEXT.match(line))
 
             m = FENCE.match(line)
             # A backtick opener's info string may not contain a backtick.
@@ -1487,6 +1497,37 @@ self_test() {
     > "$tmp/unterminated_link/README.md"
   _commit unterminated_link
   _case "unterminated link is not a link" 1 unterminated_link
+
+  # 65. A link may carry a TITLE, and an index row written that way is a row.
+  _scaffold row_link_title
+  printf '# A\n' > "$tmp/row_link_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md "Alpha guide")\n' \
+    > "$tmp/row_link_title/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_link_title/README.md"
+  _commit row_link_title
+  _case "row link with a title is still a row" 0 row_link_title
+
+  # 66. ...but a link-shaped string INSIDE a title is not a link. Ending the
+  #     outer link at the `)` within the title exposed it.
+  _scaffold link_in_title
+  printf '# A\n' > "$tmp/link_in_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/link_in_title/docs/guide/index.md"
+  printf '[Other](other.md "title ) [Guide](docs/guide/index.md)")\n' \
+    > "$tmp/link_in_title/README.md"
+  _commit link_in_title
+  _case "link inside a title is not a link" 1 link_in_title
+
+  # 67. A thematic break ends the paragraph, so an indented line after one is
+  #     code. Tracking only headings, fences and HTML missed it.
+  _scaffold thematic_break
+  printf '# A\n' > "$tmp/thematic_break/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/thematic_break/docs/guide/index.md"
+  printf -- '---\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/thematic_break/README.md"
+  _commit thematic_break
+  _case "indented code opens after a thematic break" 1 thematic_break
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
