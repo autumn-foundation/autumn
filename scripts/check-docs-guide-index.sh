@@ -1101,8 +1101,29 @@ def readable(text, resolved=None):
                 continue
 
         if text.startswith("<!--", i):
-            close = text.find("-->", i + 4)
-            stop = n if close < 0 else close + 3
+            # An INLINE comment needs its closer, and needs it inside the
+            # same paragraph. Inline raw HTML cannot contain a blank line,
+            # so `-->` on the far side of one closes nothing.
+            #
+            # Running to EOF when no closer existed was a false failure with
+            # the widest blast radius in this file: one unmatched `<!--`
+            # anywhere in README.md blanked EVERY link after it, and the gate
+            # reported the index unfindable from a README where it is plainly
+            # a link. cmark-gfm and markdown-it agree on all four shapes —
+            # closer on the same line or the next one forms a comment; no
+            # closer, or a closer past a blank line, leaves `<!--` as the
+            # literal text it renders as.
+            #
+            # A line-initial `<!--` is a different construct — HTML block
+            # type 2, which DOES run to its closer across blank lines — and
+            # is handled by `COMMENT_BLOCK` above, not here.
+            para = re.compile(r"\n[ \t]*\n").search(text, i)
+            limit = n if para is None else para.start()
+            close = text.find("-->", i + 4, limit)
+            if close < 0:
+                i += 1
+                continue
+            stop = close + 3
             blank_to(i, stop)
             i = stop
             continue
@@ -3721,6 +3742,56 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_indent_code/README.md"
   _commit row_indent_code
   _case "five spaces after a marker is code, not a row" 1 row_indent_code
+
+  # 180. An UNMATCHED inline `<!--` is literal text, not a comment that runs
+  #      to end of file. This had the widest blast radius of any false
+  #      failure in this file: one unmatched opener anywhere in README.md
+  #      blanked every link after it. cmark-gfm and markdown-it both render
+  #      `<p>prose &lt;!-- unmatched</p>` and leave the next link live.
+  _scaffold comment_unmatched
+  printf '# A\n' > "$tmp/comment_unmatched/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_unmatched/docs/guide/index.md"
+  printf 'prose <!-- unmatched\n\n[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/comment_unmatched/README.md"
+  _commit comment_unmatched
+  _case "an unmatched inline comment stays literal" 0 comment_unmatched
+
+  # 181. A closer on the far side of a BLANK LINE closes nothing — inline raw
+  #      HTML cannot contain one — so the opener is still literal.
+  _scaffold comment_across_blank
+  printf '# A\n' > "$tmp/comment_across_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_across_blank/docs/guide/index.md"
+  printf 'prose <!-- a\n\nb --> [Guide index](docs/guide/index.md)\n' \
+    > "$tmp/comment_across_blank/README.md"
+  _commit comment_across_blank
+  _case "a closer past a blank line closes nothing" 0 comment_across_blank
+
+  # 182. The other direction, so 180 cannot become "never blank a comment":
+  #      a comment closed on the NEXT line is still one paragraph, so it IS a
+  #      comment and its contents are not navigation. The index is reached
+  #      only by the link after `-->`.
+  _scaffold comment_next_line
+  printf '# A\n' > "$tmp/comment_next_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_next_line/docs/guide/index.md"
+  printf 'prose <!-- a\nb --> [Guide index](docs/guide/index.md)\n' \
+    > "$tmp/comment_next_line/README.md"
+  _commit comment_next_line
+  _case "a comment closed on the next line is a comment" 0 comment_next_line
+
+  # 183. And the case that proves 182 is not vacuous: when the ONLY link sits
+  #      INSIDE a properly closed comment, it is not navigation and the index
+  #      is unreachable.
+  _scaffold comment_hides_link
+  printf '# A\n' > "$tmp/comment_hides_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_hides_link/docs/guide/index.md"
+  printf 'prose <!-- [Guide index](docs/guide/index.md) --> tail\n' \
+    > "$tmp/comment_hides_link/README.md"
+  _commit comment_hides_link
+  _case "a link inside a closed comment is not a route" 1 comment_hides_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
