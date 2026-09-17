@@ -238,21 +238,110 @@ _CLOSE = r"(?:" + _WS1 + r"(?:" + _TITLE + r"))?" + _WS + r"\)"
 # under sub-bullets is told so by name rather than silently half-checked; that
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
-# Link TEXT, which may contain BALANCED brackets: `[A [advanced]](alpha.md)`
-# is an ordinary row, and a flat `[^\]]*` run stopped at the inner `]` and
-# rejected it — a false failure on a perfectly good index entry. The two
-# alternatives are disjoint (one excludes brackets, the other must start with
-# one), so there is no ambiguity for the engine to backtrack through.
-_TEXT = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
-# The same grammar with the inner text CAPTURED, for the reference forms
-# that need to read it back as a label.
-_TEXT_G = r"\[((?:[^\[\]]|\[[^\[\]]*\])*)\]"
+# Brackets nest to ANY depth, so link text is scanned rather than matched.
+#
+# A regex can express one level (`[A [x]]`), and a bounded expansion can
+# express a fixed few, but `- [A [one [two]]](alpha.md)` is an ordinary row
+# and every fixed bound is a false failure one level further down. The rest
+# of this file's grammar stays in regex; only the counting part moved out,
+# because counting is the part a regex cannot do.
+_TAIL = re.compile(r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
+# A reference LABEL, which — unlike text — may not contain unescaped
+# brackets, so it stays a flat run.
+_LABEL = re.compile(r"\[([^\]]*)\]")
 
-LINK = re.compile(r"(?<!!)" + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
+
+def bracket_pairs(text):
+    """Every `[` index mapped to its matching `]`, in ONE pass.
+
+    Scanning outward from each `[` instead was quadratic: a run of unclosed
+    brackets made every one of them scan to end of text, which took 3.1s on
+    5000 characters and is exactly the shape of input a gate should not hang
+    on. One stack pass makes the lookups free.
+    """
+    pairs, stack, j, n = {}, [], 0, len(text)
+    while j < n:
+        ch = text[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "[":
+            stack.append(j)
+        elif ch == "]" and stack:
+            pairs[stack.pop()] = j
+        j += 1
+    return pairs
+
+
+def bracket_span(text, pos, pairs=None):
+    """Index just past the balanced `[...]` beginning at `pos`, or None."""
+    if pairs is None:
+        pairs = bracket_pairs(text)
+    close = pairs.get(pos)
+    return None if close is None else close + 1
+
+
+def link_at(text, pos, pairs=None):
+    """`(end, destination)` for an INLINE link starting at `pos`, or None."""
+    if pos and text[pos - 1] == "!":
+        return None
+    close = bracket_span(text, pos, pairs)
+    if close is None:
+        return None
+    m = _TAIL.match(text, close)
+    if m is None:
+        return None
+    return m.end(), m.group(1)
+
+
+def ref_at(text, pos, pairs=None):
+    """`(end, label)` for a REFERENCE link starting at `pos`, or None.
+
+    Covers all three spellings: full `[text][label]`, collapsed `[text][]`
+    and shortcut `[label]`, which uses its own text as the label.
+    """
+    if pos and text[pos - 1] == "!":
+        return None
+    close = bracket_span(text, pos, pairs)
+    if close is None:
+        return None
+    inner = text[pos + 1:close - 1]
+    m = _LABEL.match(text, close)
+    if m is not None:
+        if text[m.end():m.end() + 1] in ("(", ":"):
+            return None
+        return m.end(), (m.group(1) or inner)
+    if text[close:close + 1] in ("[", "(", ":"):
+        return None
+    return close, inner
+
+
+def _scan(text, at):
+    """Every non-overlapping `at()` hit in `text`, left to right."""
+    pairs = bracket_pairs(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "[":
+            hit = at(text, i, pairs)
+            if hit is not None:
+                yield (i,) + hit
+                i = hit[0]
+                continue
+        i += 1
+
+
+def link_spans(text):
+    """`(start, end, destination)` for every inline link in `text`."""
+    return _scan(text, link_at)
+
+
+def ref_labels(text):
+    """Every reference LABEL used in `text`."""
+    return (label for _, _, label in _scan(text, ref_at))
 
 
 _ROW = r"^(?:- |\d{1,3}[.)] )"
-ENTRY = re.compile(_ROW + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
+ROW = re.compile(_ROW)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
 # shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
@@ -261,7 +350,7 @@ ENTRY = re.compile(_ROW + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r
 # page as listed nowhere, and — worse — an inline row plus a reference-style
 # row for the SAME page counted once, so the "listed exactly once" guarantee
 # silently did not hold. The duplicate is the entry that rots.
-ENTRY_REF = re.compile(_ROW + _TEXT_G + r"(?:\[([^\]]*)\])?(?![(:])")
+# Reference rows are read by `ref_at` at the row's content start.
 
 # A link reference DEFINITION, `[label]: target`.
 # The whitespace before the destination may include AT MOST one line ending.
@@ -315,7 +404,13 @@ def blank_links(text):
     MULTILINE definition scan anchors on, so a good definition below a
     multi-line link would stop counting.
     """
-    return LINK.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    out, last = [], 0
+    for start, end, _ in link_spans(text):
+        out.append(text[last:start])
+        out.append(_blank(text[start:end]))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 def blank_defns(text):
@@ -431,8 +526,21 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])\s+")
 # Quoted attribute values are matched as units, so a `>` inside one does not
 # end the tag: `<span title="a > b">` is one tag, and the text after that `>`
 # is still attribute text rather than prose.
+# Whitespace inside a tag, which may span a line ending but not a blank one.
+_TWS = r"""(?:[ \t]|\n(?!\s*\n))"""
+# One attribute: a name, optionally `= value` with the value bare, single- or
+# double-quoted. Quoted values are units, so a `>` inside one does not end the
+# tag.
+_ATTR = (r"(?:" + _TWS + r"+[a-zA-Z_:][a-zA-Z0-9_.:-]*"
+         r"(?:" + _TWS + r"*=" + _TWS + r"*"
+         r"""(?:[^ \t\n"'=<>`]+|'[^']*'|"[^"]*"))?)""")
+# An inline tag, matched against CommonMark's ACTUAL grammar rather than
+# "angle brackets with something between them". The loose version blanked
+# `<span = [catalog]>` — which is literal text, because `=` cannot begin an
+# attribute name — and took a real reference link with it.
 INLINE_TAG = re.compile(
-    r"""<[a-zA-Z/!?](?:"[^"]*"|'[^']*'|[^>'"\n]|\n(?!\s*\n))*>""")
+    r"<(?:[a-zA-Z][a-zA-Z0-9-]*" + _ATTR + r"*" + _TWS + r"*/?>"
+    r"|/[a-zA-Z][a-zA-Z0-9-]*" + _TWS + r"*>)")
 
 
 def _blank(s):
@@ -558,8 +666,7 @@ def readable(text):
             hm = HTML_OPEN.match(line)
             if hm and not auto:
                 tag = hm.group(2).lower()
-                alone = bool(re.fullmatch(r"\s*" + INLINE_TAG.pattern + r"\s*",
-                                          line, re.VERBOSE))
+                alone = bool(INLINE_TAG.fullmatch(line.strip()))
                 type7 = tag not in HTML_LITERAL and tag not in BLOCK_TAGS
                 # A type-7 tag opens a block only when it is alone on its
                 # line AND is not interrupting a paragraph. CommonMark lets
@@ -950,19 +1057,24 @@ def entries(text, base):
             section = None
             continue
         target = None
-        m = ENTRY.match(line)
-        if m:
-            target = m.group(1)
+        row = ROW.match(line)
+        if row is None:
+            continue
+        # The link must begin the row's CONTENT — that column-zero anchoring
+        # is what separates an index's rows from its prose, and it is why
+        # both forms are read at exactly `row.end()` rather than searched for.
+        hit = link_at(line, row.end())
+        if hit is not None and hit[1]:
+            target = hit[1]
         else:
-            r = ENTRY_REF.match(line)
-            if r:
+            ref = ref_at(line, row.end())
+            if ref is not None:
                 # `[text][label]` uses `label`; `[label][]` and the shortcut
                 # `[label]` use the text itself. An undefined label is not a
                 # link, so the row is not an entry and the page it meant to
                 # list is reported as listed nowhere — the safe direction,
                 # and the same one an unparseable inline row already takes.
-                key = label_key(r.group(2) or r.group(1))
-                target = defs.get(key)
+                target = defs.get(label_key(ref[1]))
         if target is None:
             continue
         path = normalise(target, base)
@@ -1069,8 +1181,8 @@ def reaches_index(text):
     # a link inside one's title is not navigation — it is not even text. The
     # inline pass therefore reads a copy with definition spans blanked, while
     # the reference pass below still needs them intact to resolve labels.
-    if any(normalise(m.group(1), "") == INDEX
-           for m in LINK.finditer(blank_defns(text))):
+    if any(normalise(dest, "") == INDEX
+           for _, _, dest in link_spans(blank_defns(text))):
         return True
     # Definitions, then the labels actually referenced by a full
     # (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
@@ -1095,10 +1207,7 @@ def reaches_index(text):
     # by a real reference link. `LINK` dropped this two rounds ago and these
     # two kept it, which is the same one-of-two-sites miss as four findings
     # before it; they are now the last of that shape in the file.
-    used = {label_key(m.group(2)) or label_key(m.group(1))
-            for m in re.finditer(r"(?<!!)" + _TEXT_G + r"\[([^\]]*)\]", text)}
-    used |= {label_key(m.group(1))
-             for m in re.finditer(r"(?<!!)" + _TEXT_G + r"(?![\[(:])", text)}
+    used = {label_key(label) for label in ref_labels(text)}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
 
@@ -2582,6 +2691,60 @@ self_test() {
   printf '<!foo> [Guide](docs/guide/index.md)\n' > "$tmp/decl_lowercase/README.md"
   _commit decl_lowercase
   _case "a lowercase <!foo> is not a declaration" 0 decl_lowercase
+
+  # 128. Brackets nest to ANY depth. The one-level grammar of case 121 was
+  #      a false failure one level further down, which is true of every
+  #      fixed bound — hence a scanner rather than a deeper regex.
+  _scaffold deep_nesting
+  printf '# A\n' > "$tmp/deep_nesting/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [one [two]]](alpha.md)\n' \
+    > "$tmp/deep_nesting/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/deep_nesting/README.md"
+  _commit deep_nesting
+  _case "brackets nest to any depth" 0 deep_nesting
+
+  # 129. ...and the same for a REFERENCE row, since the scanner replaced the
+  #      grammar at every site rather than the one that was reported.
+  _scaffold deep_nesting_ref
+  printf '# A\n' > "$tmp/deep_nesting_ref/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [one [two]]][alpha]\n\n[alpha]: alpha.md\n' \
+    > "$tmp/deep_nesting_ref/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/deep_nesting_ref/README.md"
+  _commit deep_nesting_ref
+  _case "a deep reference row is a row" 0 deep_nesting_ref
+
+  # 130. ...and the guard: brackets that never balance are not link text,
+  #      so the row is reported rather than half-read.
+  _scaffold unbalanced_deep
+  printf '# A\n' > "$tmp/unbalanced_deep/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [one [two](alpha.md)\n' \
+    > "$tmp/unbalanced_deep/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/unbalanced_deep/README.md"
+  _commit unbalanced_deep
+  _case "unbalanced nesting is not link text" 1 unbalanced_deep
+
+  # 131. Inline HTML is matched against CommonMark's tag grammar. `=` cannot
+  #      begin an attribute name, so `<span = [catalog]>` is literal text and
+  #      the reference in it is a real link.
+  _scaffold invalid_tag
+  printf '# A\n' > "$tmp/invalid_tag/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/invalid_tag/docs/guide/index.md"
+  printf '<span = [catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/invalid_tag/README.md"
+  _commit invalid_tag
+  _case "invalid tag syntax is literal text" 0 invalid_tag
+
+  # 132. ...and the guard: a VALID tag is still blanked, so a label inside
+  #      an attribute value is tag text rather than a reference.
+  _scaffold valid_tag_blanked
+  printf '# A\n' > "$tmp/valid_tag_blanked/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/valid_tag_blanked/docs/guide/index.md"
+  printf '<span title="[catalog]">\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/valid_tag_blanked/README.md"
+  _commit valid_tag_blanked
+  _case "a label inside an attribute is not a reference" 1 valid_tag_blanked
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
