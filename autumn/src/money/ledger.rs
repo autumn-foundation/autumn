@@ -226,11 +226,13 @@ pub enum LedgerError {
     /// one, so this is refused rather than run weakly. Wrap the call in
     /// [`Db::tx`](crate::db::Db::tx).
     NotInTransaction,
-    /// Another transaction is posting this idempotency key right now.
+    /// Another transaction claimed this idempotency key first.
     ///
-    /// Only reachable above `READ COMMITTED`, where this transaction's snapshot
-    /// cannot see the row the other one just committed. Retry the whole
-    /// transaction; [`Db::tx_with`](crate::db::Db::tx_with) does that for you.
+    /// Rare: the account locks serialize every poster over the same accounts,
+    /// so this needs a poster that shares the key but not the accounts, or a
+    /// snapshot above `READ COMMITTED` that cannot see the row. Retry the whole
+    /// transaction and the retry replays; [`Db::tx_with`](crate::db::Db::tx_with)
+    /// does that for you.
     Conflict {
         /// The key that is being posted elsewhere.
         key: String,
@@ -1202,11 +1204,21 @@ async fn lock_account(
 ///    posted: that transaction is returned as [`PostOutcome::Replayed`].
 /// 4. Any account that refuses a negative balance has the balance this
 ///    transaction *would* leave checked against the locked rows.
-/// 5. Only now is anything written: the transaction row with
-///    `ON CONFLICT DO NOTHING` on the key, then the postings.
+/// 5. Only now is anything written: the postings, then the transaction row
+///    they belong to, with `ON CONFLICT DO NOTHING` on the key.
 ///
 /// Every refusal happens before the first `INSERT`, so a rejected post leaves
 /// no row behind, and a failure after it rolls back with the transaction.
+///
+/// # Cancellation
+///
+/// Dropping this future part-way cannot half-write the books. The postings are
+/// written before the transaction row, behind a deferred foreign key, so a
+/// dropped `post` leaves the enclosing transaction holding postings with no
+/// parent — and the database refuses that COMMIT. A caller that races `post`
+/// against a timeout therefore loses the whole transaction rather than
+/// committing a transaction row with no postings, which the append-only tables
+/// could never repair.
 ///
 /// # Two posts in one transaction
 ///
@@ -1268,73 +1280,66 @@ pub async fn post(
 
     check_resulting_balances(conn, &accounts, transfer).await?;
 
-    // Two attempts, not a loop without a bound. The account locks serialize
-    // two posts over the same accounts, so the read above is normally the
-    // whole answer; `ON CONFLICT DO NOTHING` covers a poster that shares the
-    // key but not the accounts. It waits for the conflicting transaction to
-    // finish before it skips, so a conflict whose row is then missing means
-    // that transaction rolled back and the key is free again. One retry
-    // settles it.
-    for attempt in 0..2 {
-        let id = uuid::Uuid::new_v4().to_string();
-        let insert_sql = format!(
-            "INSERT INTO {TRANSACTIONS_TABLE} \
-               (id, idempotency_key, request_hash, currency, memo, posted_at) \
-             VALUES ({}, {}, {}, {}, {}, {NOW}) \
-             ON CONFLICT (idempotency_key) DO NOTHING",
-            ph(1),
-            ph(2),
-            ph(3),
-            ph(4),
-            ph(5)
-        );
-        let inserted = diesel::sql_query(insert_sql)
-            .bind::<Text, _>(id.clone())
-            .bind::<Text, _>(transfer.key().as_str())
-            .bind::<Text, _>(checked.request_hash().to_owned())
-            .bind::<Text, _>(checked.currency.code())
-            .bind::<Text, _>(transfer.memo_text())
-            .execute(conn)
-            .await?;
+    // The postings go in BEFORE the transaction row they belong to.
+    //
+    // That looks backwards, and it is what makes this cancellation-safe. The
+    // foreign key is `DEFERRABLE INITIALLY DEFERRED`, so a posting may name a
+    // transaction row that does not exist yet and the database checks that it
+    // does at COMMIT. If this future is dropped part-way — a caller racing
+    // `post` against a timeout inside its own transaction — the enclosing
+    // transaction is left holding postings with no parent and cannot commit.
+    // Written the other way round, a drop between the two could commit a
+    // transaction row with no postings, and the tables being append-only would
+    // make that unbalance permanent.
+    let id = uuid::Uuid::new_v4().to_string();
+    write_postings(conn, &id, transfer).await?;
 
-        if inserted == 0 {
-            match load_transaction(conn, transfer.key().as_str()).await? {
-                Some(existing) => {
-                    if existing.request_hash != *checked.request_hash() {
-                        return Err(LedgerError::KeyReuse {
-                            key: transfer.key().as_str().to_owned(),
-                        });
-                    }
-                    return Ok(PostOutcome::Replayed(existing.transaction));
-                }
-                // The other caller rolled back, and the key is free again.
-                None if attempt == 0 => continue,
-                // Twice in a row means the row is committed but this
-                // transaction's snapshot predates it, which only happens above
-                // READ COMMITTED. The caller must retry the transaction.
-                None => {
-                    return Err(LedgerError::Conflict {
-                        key: transfer.key().as_str().to_owned(),
-                    });
-                }
-            }
+    let insert_sql = format!(
+        "INSERT INTO {TRANSACTIONS_TABLE} \
+           (id, idempotency_key, request_hash, currency, memo, posted_at) \
+         VALUES ({}, {}, {}, {}, {}, {NOW}) \
+         ON CONFLICT (idempotency_key) DO NOTHING",
+        ph(1),
+        ph(2),
+        ph(3),
+        ph(4),
+        ph(5)
+    );
+    let inserted = diesel::sql_query(insert_sql)
+        .bind::<Text, _>(id.clone())
+        .bind::<Text, _>(transfer.key().as_str())
+        .bind::<Text, _>(checked.request_hash().to_owned())
+        .bind::<Text, _>(checked.currency.code())
+        .bind::<Text, _>(transfer.memo_text())
+        .execute(conn)
+        .await?;
+
+    if inserted == 0 {
+        // Someone took the key between the read above and here. The account
+        // locks serialize every poster over these accounts, so this is a
+        // poster that shares the key but not the accounts — or a snapshot
+        // above READ COMMITTED that could not see the row. Either way our
+        // postings are orphans now, so this transaction must not commit: both
+        // arms return an error, and the caller's retry replays cleanly off the
+        // read above.
+        if let Some(existing) = load_transaction(conn, transfer.key().as_str()).await?
+            && existing.request_hash != *checked.request_hash()
+        {
+            return Err(LedgerError::KeyReuse {
+                key: transfer.key().as_str().to_owned(),
+            });
         }
-
-        write_postings(conn, &id, transfer).await?;
-
-        // Read the row back, so the caller gets what the ledger stored: the
-        // database's own timestamp and the postings as written.
-        let stored = load_transaction(conn, transfer.key().as_str())
-            .await?
-            .ok_or(LedgerError::Database(diesel::result::Error::NotFound))?;
-        return Ok(PostOutcome::Posted(stored.transaction));
+        return Err(LedgerError::Conflict {
+            key: transfer.key().as_str().to_owned(),
+        });
     }
 
-    // Unreachable: the loop returns on every path but the first attempt's
-    // `continue`. Spelled out rather than left to a panic.
-    Err(LedgerError::Conflict {
-        key: transfer.key().as_str().to_owned(),
-    })
+    // Read the row back, so the caller gets what the ledger stored: the
+    // database's own timestamp and the postings as written.
+    let stored = load_transaction(conn, transfer.key().as_str())
+        .await?
+        .ok_or(LedgerError::Database(diesel::result::Error::NotFound))?;
+    Ok(PostOutcome::Posted(stored.transaction))
 }
 
 /// How deep the connection is in a transaction. Zero means autocommit.

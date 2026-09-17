@@ -1209,7 +1209,11 @@ Rules that matter:
   returns every currency's total, each of which must be zero — run it from a
   scheduled job or a health check.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
-  **control** database. Nothing to add to the app's `migrations/`.
+  **control** database. Nothing to add to the app's `migrations/`. They are
+  append-only by trigger — `UPDATE`, `DELETE` and `TRUNCATE` all abort.
+- `post` is cancellation-safe: it writes the postings before their transaction
+  row behind a deferred foreign key, so a dropped future costs the enclosing
+  transaction rather than half-writing the books.
 
 Out of scope in this slice: FX conversion, provider reconciliation, and a
 payment-provider client. See `docs/guide/money.md`.

@@ -650,6 +650,60 @@ async fn a_balance_that_would_leave_i64_is_refused() {
     assert_books_balance(&mut conn).await;
 }
 
+/// The mechanism behind cancellation safety: a posting whose transaction row
+/// never arrives makes the COMMIT fail.
+///
+/// `post` writes the postings first, so a future dropped part-way leaves
+/// exactly this state. The deferred foreign key turns it into a refused
+/// commit instead of a transaction row with no postings, which the append-only
+/// tables could never repair.
+#[tokio::test]
+async fn postings_with_no_transaction_row_cannot_commit() {
+    let pool = boot_pool("mlg_deferred_fk").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+
+    // BEGIN, write an orphan posting, COMMIT. The insert is accepted — the
+    // foreign key is deferred — and the commit is refused.
+    conn.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(
+        "INSERT INTO _autumn_money_postings            (transaction_id, seq, account_id, amount_minor, currency, posted_at)          VALUES ('no-such-transaction', 0, 'platform:cash', 100, 'USD', CURRENT_TIMESTAMP)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("a deferred foreign key accepts the orphan");
+
+    let committed = conn.batch_execute("COMMIT").await;
+    assert!(
+        committed.is_err(),
+        "a transaction holding an orphan posting must not commit"
+    );
+
+    // Nothing survived, and the books still balance.
+    let _ = conn.batch_execute("ROLLBACK").await;
+    assert_eq!(count_postings(&mut conn).await, 0);
+    assert_books_balance(&mut conn).await;
+}
+
+/// The same rule must not get in the way of an ordinary post: `post` writes
+/// the postings before the transaction row, and that commits.
+#[tokio::test]
+async fn the_deferred_foreign_key_still_lets_an_ordinary_post_commit() {
+    let pool = boot_pool("mlg_deferred_ok").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+
+    assert!(
+        post_tx(&mut conn, &charge(2500, "order:1"))
+            .await
+            .expect("post")
+            .is_posted()
+    );
+    assert_eq!(count_transactions(&mut conn).await, 1);
+    assert_eq!(count_postings(&mut conn).await, 2);
+    assert_books_balance(&mut conn).await;
+}
+
 // ── Counting helpers ────────────────────────────────────────────────────────
 
 #[derive(diesel::QueryableByName)]

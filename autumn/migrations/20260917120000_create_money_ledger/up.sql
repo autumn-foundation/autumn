@@ -33,8 +33,13 @@ CREATE TABLE IF NOT EXISTS _autumn_money_transactions (
 
 CREATE TABLE IF NOT EXISTS _autumn_money_postings (
     id             BIGSERIAL   PRIMARY KEY,
+    -- DEFERRABLE INITIALLY DEFERRED on purpose: `post` writes the postings
+    -- BEFORE the transaction row they belong to, so that a `post` whose future
+    -- is dropped part-way leaves the enclosing transaction holding postings
+    -- with no parent. The database then refuses the COMMIT, and nothing
+    -- half-written reaches the books.
     transaction_id TEXT        NOT NULL
-        REFERENCES _autumn_money_transactions(id),
+        REFERENCES _autumn_money_transactions(id) DEFERRABLE INITIALLY DEFERRED,
     seq            BIGINT      NOT NULL,
     account_id     TEXT        NOT NULL
         REFERENCES _autumn_money_accounts(id),
@@ -70,3 +75,19 @@ DROP TRIGGER IF EXISTS _autumn_money_postings_append_only
 CREATE TRIGGER _autumn_money_postings_append_only
     BEFORE UPDATE OR DELETE ON _autumn_money_postings
     FOR EACH ROW EXECUTE FUNCTION _autumn_money_append_only();
+
+-- A row trigger does not fire on TRUNCATE, so the pair above would let one
+-- operational `TRUNCATE` erase the books without raising anything. These are
+-- statement-level, which is the only level TRUNCATE has. (`DROP TABLE` is not
+-- covered by any trigger; `down.sql` relies on that.)
+DROP TRIGGER IF EXISTS _autumn_money_transactions_no_truncate
+    ON _autumn_money_transactions;
+CREATE TRIGGER _autumn_money_transactions_no_truncate
+    BEFORE TRUNCATE ON _autumn_money_transactions
+    FOR EACH STATEMENT EXECUTE FUNCTION _autumn_money_append_only();
+
+DROP TRIGGER IF EXISTS _autumn_money_postings_no_truncate
+    ON _autumn_money_postings;
+CREATE TRIGGER _autumn_money_postings_no_truncate
+    BEFORE TRUNCATE ON _autumn_money_postings
+    FOR EACH STATEMENT EXECUTE FUNCTION _autumn_money_append_only();

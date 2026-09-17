@@ -368,6 +368,73 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
     assert_books_balance(&pool).await;
 }
 
+/// A row trigger does not fire on `TRUNCATE`, so the append-only pair needs a
+/// statement-level counterpart. Postgres-only: SQLite has no `TRUNCATE`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_postgres_trigger_refuses_a_truncate() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        post_tx(&mut conn, &charge(2500, "order:1"))
+            .await
+            .expect("post");
+    }
+
+    for statement in [
+        "TRUNCATE _autumn_money_postings",
+        "TRUNCATE _autumn_money_transactions CASCADE",
+        "TRUNCATE _autumn_money_postings, _autumn_money_transactions",
+    ] {
+        let mut conn = pool.get().await.expect("conn");
+        let result = conn.batch_execute(statement).await;
+        assert!(
+            result.is_err(),
+            "the ledger must refuse `{statement}`, but it succeeded"
+        );
+    }
+
+    let mut conn = pool.get().await.expect("conn");
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:cash")
+            .await
+            .expect("balance")
+            .minor(),
+        2500
+    );
+    assert_books_balance(&pool).await;
+}
+
+/// The Postgres half of the cancellation-safety mechanism: the deferred
+/// foreign key turns an orphan posting into a refused COMMIT.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postings_with_no_transaction_row_cannot_commit_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    let mut conn = pool.get().await.expect("conn");
+
+    conn.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(
+        "INSERT INTO _autumn_money_postings \
+           (transaction_id, seq, account_id, amount_minor, currency, posted_at) \
+         VALUES ('no-such-transaction', 0, 'platform:cash', 100, 'USD', CURRENT_TIMESTAMP)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("a deferred foreign key accepts the orphan");
+
+    assert!(
+        conn.batch_execute("COMMIT").await.is_err(),
+        "a transaction holding an orphan posting must not commit"
+    );
+    let _ = conn.batch_execute("ROLLBACK").await;
+
+    assert_eq!(count_rows(&pool, "_autumn_money_postings").await, 0);
+    assert_books_balance(&pool).await;
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn an_unbalanced_transaction_never_reaches_postgres() {

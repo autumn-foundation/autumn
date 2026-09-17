@@ -1,7 +1,8 @@
 -- SQLite fork of the double-entry money ledger (issue #1837). See the Postgres
 -- copy under `migrations/` for what each table is for. Only the
 -- dialect differs: TEXT timestamps, INTEGER PRIMARY KEY for the row id, and
--- RAISE(ABORT) triggers in place of a plpgsql function.
+-- RAISE(ABORT) triggers in place of a plpgsql function. SQLite has no TRUNCATE
+-- statement, so it needs no counterpart to the Postgres TRUNCATE triggers.
 
 CREATE TABLE IF NOT EXISTS _autumn_money_accounts (
     id             TEXT    PRIMARY KEY,
@@ -21,8 +22,11 @@ CREATE TABLE IF NOT EXISTS _autumn_money_transactions (
 
 CREATE TABLE IF NOT EXISTS _autumn_money_postings (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Deferred on purpose; see the Postgres copy. SQLite checks a deferred
+    -- foreign key at COMMIT too, with PRAGMA foreign_keys = ON (the pool sets
+    -- it on every connection).
     transaction_id TEXT    NOT NULL
-        REFERENCES _autumn_money_transactions(id),
+        REFERENCES _autumn_money_transactions(id) DEFERRABLE INITIALLY DEFERRED,
     seq            BIGINT  NOT NULL,
     account_id     TEXT    NOT NULL
         REFERENCES _autumn_money_accounts(id),

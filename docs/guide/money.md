@@ -268,10 +268,21 @@ health check.
 | The same key posts once | `UNIQUE (idempotency_key)`, with `ON CONFLICT DO NOTHING` |
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
-| Nothing is rewritten | a database trigger on both backends |
+| Nothing is rewritten | a database trigger on both backends, `TRUNCATE` included |
+| A cancelled `post` writes nothing | the postings go in before their transaction row, behind a deferred foreign key |
 
-The last one matters most: `post` never updates or deletes a row, and a trigger
-aborts an `UPDATE` or `DELETE` that comes from anywhere else.
+The last two matter most.
+
+`post` never updates or deletes a row, and a trigger aborts an `UPDATE`, a
+`DELETE` or a `TRUNCATE` that comes from anywhere else.
+
+And `post` writes the postings **before** the transaction row they belong to.
+That looks backwards; it is what makes the call cancellation-safe. The foreign
+key is deferred, so the database checks it at `COMMIT` — and a `post` whose
+future is dropped part-way (a caller racing it against a timeout) leaves
+postings with no parent, which refuses the commit. The alternative order could
+commit a transaction row with no postings, and append-only tables could never
+repair that.
 
 ## Not in this slice
 
