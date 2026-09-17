@@ -577,7 +577,14 @@ def row_at(line):
 # pinned this for the INLINE spelling last round; the definition spelling
 # needed the same grammar, which `_ANGLE` already had.
 DEFN = re.compile(
-    r"""^ {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
+    # A BLOCK-QUOTE prefix may stand before the label. A definition inside a
+    # quote is a definition, and reference definitions are document-global —
+    # `> [catalog]: docs/guide/index.md` serves a `[Guide][catalog]` inside
+    # the quote AND one outside it, both of which cmark-gfm renders as live
+    # links. Anchoring at `^ {0,3}\[` missed every one of them and reported
+    # the index unreachable from a README that reaches it. (The list-item
+    # spelling already fitted, since its indent is inside the three spaces.)
+    r"""^(?: {0,3}(?:>[ \t]?)+)? {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
     r"""(""" + _ANGLE + r"""|\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
@@ -4449,6 +4456,52 @@ self_test() {
     > "$tmp/row_tab_wide_marker/README.md"
   _commit row_tab_wide_marker
   _case "tab padding depends on marker width" 1 row_tab_wide_marker
+
+  # 216. A definition inside a BLOCK QUOTE is a definition, and reference
+  #      definitions are document-global: `> [catalog]: docs/guide/index.md`
+  #      serves a use inside the quote and one outside it alike. Anchoring
+  #      at `^ {0,3}\[` missed every quoted definition and reported the index
+  #      unreachable from a README that reaches it.
+  _scaffold quoted_defn_inside
+  printf '# A\n' > "$tmp/quoted_defn_inside/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_defn_inside/docs/guide/index.md"
+  printf '> [catalog]: docs/guide/index.md\n>\n> [Guide][catalog]\n' \
+    > "$tmp/quoted_defn_inside/README.md"
+  _commit quoted_defn_inside
+  _case "a quoted definition defines" 0 quoted_defn_inside
+
+  # 217. ...and it reaches a use OUTSIDE the quote, which is the half that
+  #      shows definitions are document-global rather than container-scoped.
+  _scaffold quoted_defn_outside
+  printf '# A\n' > "$tmp/quoted_defn_outside/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_defn_outside/docs/guide/index.md"
+  printf '> [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/quoted_defn_outside/README.md"
+  _commit quoted_defn_outside
+  _case "a quoted definition reaches outside its quote" 0 quoted_defn_outside
+
+  # 218. The guard: glued to quoted PROSE it is that paragraph's second line
+  #      and defines nothing, exactly as it would unquoted.
+  _scaffold quoted_defn_glued
+  printf '# A\n' > "$tmp/quoted_defn_glued/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_defn_glued/docs/guide/index.md"
+  printf '> prose\n> [a]: docs/guide/index.md\n\n[Guide][a]\n' \
+    > "$tmp/quoted_defn_glued/README.md"
+  _commit quoted_defn_glued
+  _case "a definition glued to quoted prose defines nothing" 1 quoted_defn_glued
+
+  # 219. And inside a quoted FENCE it is code, so it defines nothing either.
+  _scaffold quoted_defn_fenced
+  printf '# A\n' > "$tmp/quoted_defn_fenced/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_defn_fenced/docs/guide/index.md"
+  printf '> ```\n> [a]: docs/guide/index.md\n> ```\n\n[Guide][a]\n' \
+    > "$tmp/quoted_defn_fenced/README.md"
+  _commit quoted_defn_fenced
+  _case "a definition in a quoted fence defines nothing" 1 quoted_defn_fenced
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
