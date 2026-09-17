@@ -4103,6 +4103,39 @@ self_test() {
   _commit quoted_comment_hides
   _case "a link inside a quoted comment is not a route" 1 quoted_comment_hides
 
+  # 198. NOT A BUG, pinned so it stays that way. Reported as one: that
+  #      `strip()`ping an angle destination "silently changes the URL",
+  #      because `[Guide](< docs/guide/index.md>)` supposedly renders with a
+  #      leading encoded space. It does not. cmark-gfm and markdown-it agree:
+  #
+  #        [Guide](< docs/guide/index.md>)  ->  <a href="docs/guide/index.md">
+  #        [Guide](<docs/guide/index.md >)  ->  <a href="docs/guide/index.md">
+  #
+  #      Leading and trailing whitespace inside `<>` is stripped by both, so
+  #      the index IS reached and this run must PASS. "Remove only the angle
+  #      delimiters" would have introduced the false failure it warned of.
+  _scaffold angle_pads
+  printf '# A\n' > "$tmp/angle_pads/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](< alpha.md>)\n' \
+    > "$tmp/angle_pads/docs/guide/index.md"
+  printf '[Guide](<docs/guide/index.md >)\n' > "$tmp/angle_pads/README.md"
+  _commit angle_pads
+  _case "angle destinations ignore their padding" 0 angle_pads
+
+  # 199. The property `strip()` must never break, and the half of the report
+  #      that IS true: an INNER space is preserved and percent-encoded
+  #      (`my%20file.md`) by both renderers, so a page whose name really
+  #      contains a space still has to resolve. `strip()` touches only the
+  #      ends, and `normalise` unquotes, so it does.
+  _scaffold angle_inner_space
+  printf '# A\n' > "$tmp/angle_inner_space/docs/guide/my file.md"
+  printf '# Guide\n\n## S\n\n- [A](<my file.md>)\n' \
+    > "$tmp/angle_inner_space/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/angle_inner_space/README.md"
+  _commit angle_inner_space
+  _case "a space inside a destination is part of the name" 0 angle_inner_space
+
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
 }
