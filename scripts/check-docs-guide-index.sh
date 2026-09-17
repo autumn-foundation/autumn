@@ -176,6 +176,10 @@ _FRAG = r"(?:#(?:[^()\s]|\([^()\s]*\))*)?"
 # this round's fragment handling rather than by a reader hitting it, but it is
 # the same false-failure class: ordinary markdown the gate rejected.
 _ANGLE = r"<[^<>\n]*>"
+
+# An ATX heading: one to six `#`, then whitespace or end of line. The trailing
+# requirement is the whole point — `#not-a-heading` is a paragraph.
+ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 # An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
 # and the required whitespace before one is what keeps a parenthesised title
 # from being read as more balanced destination.
@@ -222,7 +226,11 @@ ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(\s*(" + _ANGLE + r"|" + _DEST + r"+)" + 
 ENTRY_REF = re.compile(_ROW + r"\[([^\]]+)\](?:\[([^\]]*)\])?(?![(:])")
 
 # A link reference DEFINITION, `[label]: target`.
-DEFN = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)", re.MULTILINE)
+# The whitespace before the destination may include AT MOST one line ending.
+# `\s*` crossed blank lines, so `[a]:`, a blank line, then `alpha.md` resolved
+# — but CommonMark does not allow a definition to span a blank line, so that
+# row renders as plain text and the page it claimed to list was unfindable.
+DEFN = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*(?:\n[ \t]*)?(\S+)", re.MULTILINE)
 
 
 def label_key(raw):
@@ -448,7 +456,13 @@ def readable(text):
                 in_list = True
             # A heading or a fence line is not paragraph text, so an indented
             # line after one opens code.
-            in_paragraph = not (stripped.startswith("#")
+            #
+            # `ATX` rather than a `#` prefix test: CommonMark requires
+            # whitespace (or end of line) after the opening run, so
+            # `#not-a-heading` is an ordinary paragraph. Treating it as a
+            # heading let the next indented line open code and swallowed a
+            # link that a reader can click.
+            in_paragraph = not (ATX.match(line)
                                 or FENCE.match(line)
                                 or HTML_OPEN.match(line)
                                 # A thematic break (`---`, `***`, `___`) and a
@@ -1831,6 +1845,49 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/angle_fragment/README.md"
   _commit angle_fragment
   _case "an angled destination may carry a fragment" 0 angle_fragment
+
+  # 84. An ATX heading needs whitespace after its `#` run. `#not-a-heading`
+  #     is a paragraph, and reading it as a heading let the next indented
+  #     line open code and swallow a clickable link.
+  _scaffold atx_prefix
+  printf '# A\n' > "$tmp/atx_prefix/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/atx_prefix/docs/guide/index.md"
+  printf '#not-a-heading\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/atx_prefix/README.md"
+  _commit atx_prefix
+  _case "a bare # prefix is not a heading" 0 atx_prefix
+
+  # 85. ...and the guard: a REAL heading still ends the paragraph, so 84 is
+  #     not bought by forgetting that headings exist.
+  _scaffold atx_prefix_real
+  printf '# A\n' > "$tmp/atx_prefix_real/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/atx_prefix_real/docs/guide/index.md"
+  printf '# Heading\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/atx_prefix_real/README.md"
+  _commit atx_prefix_real
+  _case "a real heading still ends a paragraph" 1 atx_prefix_real
+
+  # 86. A reference definition may not cross a blank line. `\s*` did, so a
+  #     row resolved through text CommonMark renders as plain characters.
+  _scaffold defn_blank_line
+  printf '# A\n' > "$tmp/defn_blank_line/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]:\n\nalpha.md\n' \
+    > "$tmp/defn_blank_line/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_blank_line/README.md"
+  _commit defn_blank_line
+  _case "a definition cannot cross a blank line" 1 defn_blank_line
+
+  # 87. ...and the guard: ONE line ending between the colon and the
+  #     destination is allowed, and must still resolve.
+  _scaffold defn_one_newline
+  printf '# A\n' > "$tmp/defn_one_newline/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]:\nalpha.md\n' \
+    > "$tmp/defn_one_newline/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_one_newline/README.md"
+  _commit defn_one_newline
+  _case "a definition may use one line ending" 0 defn_one_newline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
