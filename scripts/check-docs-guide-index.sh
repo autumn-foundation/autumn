@@ -59,18 +59,23 @@
 #      catches an index pointing somewhere outside the corpus it indexes.
 #   3. Every entry sits under a `## ` section heading, so a page appended to
 #      the end of the file lands somewhere a reader is actually scanning.
-#      Entries inside a fenced code block or an HTML comment do not count: a
-#      fence showing what an entry looks like is documentation about the
-#      index, and a commented-out entry is one a reader can neither see nor
-#      follow. Parking an entry by commenting it out is an ordinary mid-edit
-#      move, and it must not keep an unlisted page green.
 #   4. `README.md` carries a markdown LINK whose target resolves to
 #      `docs/guide/index.md`. An index nobody can reach from the landing page
 #      is the very defect this gate exists to prevent, and it would otherwise
 #      be the one page the gate could not see. Checking for the literal path as
-#      a substring is not enough: a plain-text or inline-code mention satisfies
-#      it while getting the reader nowhere, so the README's link destinations
-#      are parsed and resolved.
+#      a substring is not enough: a plain-text mention satisfies it while
+#      getting the reader nowhere, so the README's link destinations are
+#      parsed and resolved.
+#
+# ONLY LINKS A READER CAN FOLLOW COUNT, everywhere links are extracted — in an
+# index and in `README.md` alike. `readable()` blanks fenced code (``` and ~~~),
+# HTML comments and inline code spans before anything is matched. Each of those
+# is a way an unlisted page was kept green while no reader could reach it: an
+# example of what an entry looks like, an entry parked behind `<!-- -->`, a
+# README whose only index link sat inside a fence. They arrived as three
+# separate review findings against three separate ad-hoc filters, which is why
+# the reduction now lives in ONE function that every caller goes through rather
+# than in a filter per caller.
 #
 # DELEGATION TO A SUB-INDEX. A subdirectory of `docs/guide/` that carries its
 # own `index.md` — `tutorial/` does — is represented in the TOP-LEVEL index by
@@ -120,24 +125,84 @@ LINK = re.compile(r"\[[^\]]*\]\(\s*([^)\s#]+)")
 
 # An HTML comment, to the closing `-->` or to end of file if it never closes.
 COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+# A fence opener or closer: three or more backticks or tildes, indented at most
+# three spaces, with whatever info string follows.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# An inline code span on one line. Multi-line spans are not matched; see the
+# note in `readable()`.
+INLINE_CODE = re.compile(r"`+[^`\n]*`+")
 
 
-def blank_comments(text):
-    """Blank every HTML comment, space for space, keeping line numbers intact.
+def _blank(s):
+    """`s` with every character replaced by a space, newlines preserved."""
+    return "".join("\n" if c == "\n" else " " for c in s)
 
-    A commented-out entry is not an entry: readers cannot see or follow it, so
-    it must not satisfy the completeness check. Parking an entry by commenting
-    it out is an ordinary thing to do mid-edit, and it would otherwise keep an
-    unlisted page green. `check-docs-orphans.sh` blanks the same way, and for
-    the same reason. Caught in review on the PR that added this gate.
 
-    An unterminated `<!--` blanks to end of file, so entries below it vanish
-    and the gate FAILS. That is the safe direction: a malformed comment makes
-    the gate loud rather than blind.
+def blank_fences(text):
+    """Blank fenced code blocks, backtick- and tilde-delimited alike.
+
+    An earlier revision toggled fence state on backticks only, so a valid
+    `~~~markdown` example counted its links as real entries. The close must use
+    the SAME character and be at least as long as the opener, which is what
+    keeps a ``` inside a ~~~ block from ending it.
     """
-    return COMMENT.sub(
-        lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)),
-        text,
+    out = []
+    fence = None
+    for line in text.split("\n"):
+        m = FENCE.match(line)
+        if fence is None:
+            # A backtick opener's info string may not itself contain a
+            # backtick (CommonMark), which keeps an inline span from opening
+            # a block.
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence = (m.group(1)[0], len(m.group(1)))
+                out.append(_blank(line))
+                continue
+            out.append(line)
+        else:
+            char, length = fence
+            if (m and m.group(1)[0] == char and len(m.group(1)) >= length
+                    and not m.group(2).strip()):
+                fence = None
+            out.append(_blank(line))
+    return "\n".join(out)
+
+
+def readable(text):
+    """The part of a markdown document a reader can actually see and click.
+
+    Everything blanked here is blanked SPACE FOR SPACE, so the line numbers in
+    reported defects stay accurate.
+
+    This function is the answer to a class of finding rather than to one
+    instance of it. Review of this gate turned up three separate ways to
+    satisfy the completeness check with a link no reader can follow — an entry
+    inside an HTML comment, an entry inside a tilde fence, and a README whose
+    only index link sat inside a fenced example. Each was a different hole in
+    ad-hoc, per-caller extraction. One reduction, applied at every place links
+    are extracted, closes all three and whatever the next spelling would have
+    been:
+
+      - fenced code, ``` or ~~~ — an example showing what an entry looks like
+        is documentation about the index, not a row of it
+      - HTML comments — parking an entry by commenting it out is an ordinary
+        mid-edit move, and it must not keep an unlisted page green
+      - inline code spans — `[A](a.md)` renders as literal text, not a link
+
+    Fences are blanked first, so a comment delimiter inside a code sample
+    cannot start a comment that swallows the rest of the file. Both remaining
+    unterminated cases — a fence or a comment that never closes — blank to end
+    of file, which makes entries below them vanish and the gate FAIL. That is
+    the safe direction: malformed markup should make the gate loud, not blind.
+
+    Known limit: an inline code span that wraps across lines is not blanked. A
+    link inside one would still count. Multi-line spans do not occur in this
+    corpus, and the conservative single-line pattern cannot run away on an
+    unmatched backtick.
+    """
+    return INLINE_CODE.sub(
+        lambda m: _blank(m.group(0)),
+        COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text)),
     )
 
 
@@ -218,18 +283,14 @@ def normalise(target, base):
 def entries(text, base):
     """Every guide-page link in a file, with the `##` section it sits under.
 
-    Links inside fenced code are not entries: a fence showing what an entry
-    looks like is documentation about the index, not a row of it.
+    Only links a reader can actually follow count; `readable()` says which
+    those are, and blanking rather than skipping is what keeps the reported
+    line numbers honest. A `## ` heading inside a fence does not open a
+    section, for the same reason.
     """
     out = []
     section = None
-    in_fence = False
-    for lineno, line in enumerate(blank_comments(text).split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
+    for lineno, line in enumerate(readable(text).split("\n"), 1):
         if line.startswith("## "):
             section = line[3:].strip()
             continue
@@ -313,13 +374,14 @@ for index_path, need in sorted(plan.items()):
 #    inline-code mention, which is not clickable and does not get the reader
 #    anywhere. Caught in review on the PR that added this gate.
 with open(f"{root}/{README}", encoding="utf-8") as fh:
-    readme = blank_comments(fh.read())
+    readme = readable(fh.read())
 if not any(normalise(m.group(1), "") == INDEX
            for m in LINK.finditer(readme)):
     defects.append(
         (README,
-         f"has no markdown link whose target resolves to {INDEX}; a "
-         "plain-text mention is not clickable, so the index is unfindable")
+         f"has no markdown link whose target resolves to {INDEX}; a mention "
+         "the reader cannot click — plain text, inline code, a fenced "
+         "example, or a commented-out link — leaves the index unfindable")
     )
 
 print(f"corpus: {len(pages)} pages under {GUIDE}")
@@ -501,6 +563,48 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/multiline/README.md"
   _commit multiline
   _case "multi-line commented entry does not count" 1 multiline
+
+  # 14. A tilde fence hides its links too. Fence state used to toggle on
+  #     backticks only, so a valid `~~~markdown` example counted as entries.
+  _scaffold tilde
+  printf '# A\n' > "$tmp/tilde/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/tilde/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n~~~markdown\n- [B](beta.md)\n~~~\n' \
+    > "$tmp/tilde/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/tilde/README.md"
+  _commit tilde
+  _case "tilde-fenced entry does not count" 1 tilde
+
+  # 15. A backtick fence nested inside a tilde fence must not close it early.
+  _scaffold nested_fence
+  printf '# A\n' > "$tmp/nested_fence/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/nested_fence/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n~~~markdown\n```\n- [B](beta.md)\n```\n~~~\n' \
+    > "$tmp/nested_fence/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/nested_fence/README.md"
+  _commit nested_fence
+  _case "backtick fence inside a tilde fence stays hidden" 1 nested_fence
+
+  # 16. The README link check reads the same reduction: a fenced example is
+  #     not a clickable link to the index.
+  _scaffold readme_fence
+  printf '# A\n' > "$tmp/readme_fence/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/readme_fence/docs/guide/index.md"
+  printf 'Docs\n\n```markdown\n[Guide](docs/guide/index.md)\n```\n' \
+    > "$tmp/readme_fence/README.md"
+  _commit readme_fence
+  _case "README link only inside a fence fails" 1 readme_fence
+
+  # 17. An inline code span is not a link either.
+  _scaffold inline
+  printf '# A\n' > "$tmp/inline/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/inline/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- write it as `[B](beta.md)`\n' \
+    > "$tmp/inline/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/inline/README.md"
+  _commit inline
+  _case "inline-code entry does not count" 1 inline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
