@@ -369,7 +369,7 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
 }
 
 /// A row trigger does not fire on `TRUNCATE`, so the append-only pair needs a
-/// statement-level counterpart. Postgres-only: SQLite has no `TRUNCATE`.
+/// statement-level counterpart. Postgres-only: `SQLite` has no `TRUNCATE`.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_postgres_trigger_refuses_a_truncate() {
