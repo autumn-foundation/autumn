@@ -57,7 +57,7 @@
 //! per-level recursion is deliberately bounded as defense in depth against
 //! pathological (adversarial or accidental) nesting, e.g. a runaway
 //! wrapper-per-iteration template bug or a recursively-rendered comment
-//! thread piped through [`Pdf::from_html`].
+//! thread piped through [`Pdf::from_html`](crate::pdf::Pdf::from_html).
 //!
 //! Content nested deeper than the cap is **omitted** from the PDF — never
 //! silently: every render that truncates anything emits one `tracing::warn!`

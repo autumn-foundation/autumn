@@ -33,7 +33,7 @@ thread_local! {
     /// Set while the current [`render_pages`] call is walking the tree if any
     /// walker dropped content past [`MAX_DEPTH`]. Per-thread so concurrent
     /// renders never share state; reset at the top of every render.
-    static TRUNCATED_DEPTH: Cell<bool> = Cell::new(false);
+    static TRUNCATED_DEPTH: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Record that a layout walker omitted content nested deeper than
