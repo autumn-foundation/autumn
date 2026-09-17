@@ -1554,4 +1554,26 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             "the client-auth arm must advertise the same ALPN"
         );
     }
+
+    // Regression (Codex P1 on PR #2780): advertising `h2` in ALPN is only
+    // safe while the serve stack can actually speak HTTP/2. `axum::serve`
+    // runs every connection through
+    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
+    // out unless hyper-util's `http2` feature is enabled (via `axum/http2`
+    // in the workspace Cargo.toml). Without it, a client that negotiates
+    // `h2` gets "HTTP/2 is not supported" and the connection dies instead
+    // of serving — the advertisement becomes a breakage, not an upgrade.
+    //
+    // `Builder::http2()` exists only under hyper-util's `http2` feature,
+    // so this test fails to COMPILE if the feature is ever dropped: that is
+    // the point. The dev-dependency deliberately does not enable `http2`
+    // itself (see the workspace Cargo.toml), so only `axum/http2` keeps
+    // this green.
+    #[test]
+    fn serve_stack_speaks_http2() {
+        let mut builder = hyper_util::server::conn::auto::Builder::new(
+            hyper_util::rt::TokioExecutor::new(),
+        );
+        let _ = builder.http2();
+    }
 }

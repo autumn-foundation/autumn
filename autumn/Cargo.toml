@@ -472,6 +472,10 @@ diesel = { version = "2", features = ["chrono", "postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
+# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
+# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
+# without `http2` — see the workspace dependency comment.
+hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
