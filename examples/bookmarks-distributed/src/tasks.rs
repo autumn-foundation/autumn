@@ -70,17 +70,30 @@ async fn process_shard(
 
     tracing::info!(shard, count = shard_alive.len(), "link-checker owns shard");
 
-    let mut dead_count = 0u32;
+    let mut dead_ids = Vec::new();
     for (id, url) in shard_alive {
         let reachable = probe_reachable(client, &url).await;
 
         if !reachable {
             tracing::warn!("link-checker: dead link id={id} url={url}");
-            if repo.mark_dead(id).await? {
-                dead_count += 1;
-            }
+            dead_ids.push(id);
         }
     }
+
+    let dead_count = if dead_ids.is_empty() {
+        0
+    } else {
+        let found = dead_ids.len();
+        let affected = repo.mark_dead_many(&dead_ids).await?;
+        if affected < found {
+            tracing::debug!(
+                shard,
+                stale = found - affected,
+                "link-checker skipped already-dead or concurrently-deleted rows"
+            );
+        }
+        u32::try_from(affected).expect("shard dead-link count must fit in u32")
+    };
 
     Ok((shard_checked_count, dead_count))
 }
@@ -252,6 +265,25 @@ mod tests {
 /// defect is exclusively statement *count* (one per dead link instead of
 /// one per shard), not plan shape, which is exactly what "elimination of
 /// an N+1" targets.
+///
+/// ## After (this same harness, against this PR's `mark_dead_many`/
+/// `process_shard`, same fixture, same session)
+///
+/// ```text
+/// calls=16     buffers=9535       UPDATE "bookmarks" SET "alive" = $1 WHERE (("bookmarks"."id" = ANY($2)) AND ("bookmarks"."alive" = $3))
+/// calls=16     buffers=2323       SELECT id, url FROM bookmarks WHERE alive = $3 AND (id % $1) = $2 ORDER BY id
+/// ```
+///
+/// **calls: 780 -> 16** (one `UPDATE` per shard that found a dead link this
+/// run, all 16 of them here, instead of one per dead link -- statement count
+/// no longer scales with how many links rotted). Buffers are essentially
+/// unchanged (9518 -> 9535): the batched form still reads/writes the same
+/// 780 rows, so buffer *count* was never the defect here -- eliminating the
+/// N+1 is the win, exactly as the impact floor's "statement count per unit
+/// of work" criterion describes. `EXPLAIN` on the batched shape (a 3-id
+/// sample) shows the same `Index Scan using bookmarks_pkey`, now with
+/// `Index Cond: (bookmarks.id = ANY (...))`, confirming the primary-key
+/// index still drives every row lookup -- no seq scan was introduced.
 #[cfg(test)]
 mod link_checker_batch_profile {
     use crate::db::create_dual_pools;
@@ -563,14 +595,14 @@ mod link_checker_batch_profile {
              ({buffers_pct:.1}% of {workload_buffers} total workload buffers) --"
         );
 
-        // Characterizes the CURRENT (pre-fix) defect: one `UPDATE` per dead
-        // link found, not one per shard. `LINK_CHECKER_SHARD_COUNT` (16) is
-        // the post-fix ceiling this same assertion will drop to.
-        assert_eq!(
-            target_calls,
-            i64::try_from(expected_dead_ids.len()).unwrap(),
-            "pre-fix: mark_dead issues exactly one UPDATE per dead link, not one per shard \
-             (post-fix ceiling is LINK_CHECKER_SHARD_COUNT = {LINK_CHECKER_SHARD_COUNT})"
+        // Post-fix: at most one UPDATE per shard (zero for a shard with no
+        // dead links this run), never one per dead link.
+        assert!(
+            target_calls <= i64::from(LINK_CHECKER_SHARD_COUNT),
+            "mark_dead_many issues at most one UPDATE per shard \
+             (LINK_CHECKER_SHARD_COUNT = {LINK_CHECKER_SHARD_COUNT}), got {target_calls} calls \
+             for {} dead links",
+            expected_dead_ids.len()
         );
 
         let final_dead_ids = ids(

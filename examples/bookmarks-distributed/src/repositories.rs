@@ -163,20 +163,6 @@ impl BookmarkRepository {
         })
     }
 
-    fn finish_mark_dead_result(affected: usize, id: i64) -> AutumnResult<bool> {
-        if affected == 0 {
-            // Replica lag or a concurrent delete can make this row disappear after the
-            // task observed it alive. Treat that as a benign no-op so one stale row does
-            // not abort the whole task run.
-            tracing::debug!(
-                bookmark_id = id,
-                "link-checker skipped stale dead-link update"
-            );
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
     pub async fn find_all(&self) -> AutumnResult<Vec<Bookmark>> {
         let mut conn = Self::conn(BookmarkOperation::FindAll).await?;
         bookmarks::table
@@ -248,14 +234,27 @@ impl BookmarkRepository {
         Ok(())
     }
 
-    pub async fn mark_dead(&self, id: i64) -> AutumnResult<bool> {
+    /// Mark every id in `ids` that is still alive as dead, in one round trip.
+    ///
+    /// Ids already dead -- replica lag, a concurrent probe, or a concurrent
+    /// delete can make a row disappear from `alive = true` after the task
+    /// observed it -- are silently skipped via the `alive = true` filter
+    /// rather than erroring; the caller gets back how many rows the batch
+    /// actually flipped.
+    pub async fn mark_dead_many(&self, ids: &[i64]) -> AutumnResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
-        let affected = diesel::update(bookmarks::table.find(id))
-            .set(bookmarks::alive.eq(false))
-            .execute(&mut conn)
-            .await
-            .map_err(AutumnError::from)?;
-        Self::finish_mark_dead_result(affected, id)
+        diesel::update(
+            bookmarks::table
+                .filter(bookmarks::id.eq_any(ids))
+                .filter(bookmarks::alive.eq(true)),
+        )
+        .set(bookmarks::alive.eq(false))
+        .execute(&mut conn)
+        .await
+        .map_err(AutumnError::from)
     }
 
     pub async fn count_all(&self) -> AutumnResult<i64> {
@@ -554,20 +553,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mark_dead_missing_rows_are_tolerated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(0, 99)
-            .expect("replica lag and concurrent deletes should not abort the task");
+    #[tokio::test]
+    async fn mark_dead_many_short_circuits_on_empty_ids_without_touching_the_pool() {
+        // No `DistributedState::global()` is installed in this test, so a
+        // real attempt to acquire a connection would panic with "distributed
+        // state is not installed". Reaching `Ok(0)` instead proves the empty
+        // case returns before `Self::conn(...)` is ever called.
+        let updated = BookmarkRepository
+            .mark_dead_many(&[])
+            .await
+            .expect("an empty batch must not error");
 
-        assert!(!updated);
-    }
-
-    #[test]
-    fn mark_dead_reports_success_when_a_row_was_updated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(1, 99)
-            .expect("affected rows should be reported as an applied update");
-
-        assert!(updated);
+        assert_eq!(updated, 0);
     }
 
     #[test]
