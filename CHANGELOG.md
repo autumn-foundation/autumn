@@ -56,8 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     application rows the money justifies: they commit or roll back together,
     and a rolled-back post frees its idempotency key again.
   - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
-    `DELETE` of a transaction or a posting, and a statement-level pair on
-    Postgres aborts a `TRUNCATE` (which row triggers do not see).
+    `DELETE` of a transaction or a posting, a statement-level pair on Postgres
+    aborts a `TRUNCATE` (which row triggers do not see), and a `BEFORE INSERT`
+    pair on SQLite aborts an `INSERT OR REPLACE` (whose implicit delete does
+    not fire `DELETE` triggers unless `PRAGMA recursive_triggers` is on).
     `ledger::balance` sums an account's postings; `ledger::trial_balance`
     makes the global zero-sum invariant queryable from a job or a health
     check.

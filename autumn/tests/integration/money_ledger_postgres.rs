@@ -348,6 +348,13 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
         "DELETE FROM _autumn_money_postings",
         "UPDATE _autumn_money_transactions SET memo = 'rewritten'",
         "DELETE FROM _autumn_money_transactions",
+        // Postgres answers `INSERT OR REPLACE` with this. It is an UPDATE, so
+        // the row trigger sees it, unlike the SQLite REPLACE the fork guards.
+        "INSERT INTO _autumn_money_transactions \
+             (id, idempotency_key, request_hash, currency, memo) \
+         SELECT id, idempotency_key, 'forged', currency, 'rewritten' \
+         FROM _autumn_money_transactions \
+         ON CONFLICT (idempotency_key) DO UPDATE SET memo = 'rewritten'",
     ] {
         let mut conn = pool.get().await.expect("conn");
         let result = conn.batch_execute(statement).await;

@@ -332,6 +332,65 @@ async fn the_ledger_refuses_to_be_rewritten() {
     assert_books_balance(&mut conn).await;
 }
 
+/// `INSERT OR REPLACE` is a rewrite in disguise, and it must be refused too.
+///
+/// `SQLite` satisfies a `REPLACE` conflict by deleting the row that is in the
+/// way, but it does not fire `DELETE` triggers for that deletion unless
+/// `PRAGMA recursive_triggers` is on. So the append-only `DELETE` trigger alone
+/// does not stop a `REPLACE`. Two things close the hole: `BEFORE INSERT` guards
+/// refuse an insert that collides on a row key, and the deferred foreign key
+/// fails the COMMIT when a collision on `idempotency_key` orphans the postings.
+#[tokio::test]
+async fn insert_or_replace_cannot_rewrite_the_ledger() {
+    let pool = boot_pool("mlg_replace").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("post");
+
+    for statement in [
+        // Collide on the posting row id.
+        "INSERT OR REPLACE INTO _autumn_money_postings \
+             (id, transaction_id, seq, account_id, amount_minor, currency) \
+         SELECT id, transaction_id, seq, account_id, 1, currency \
+         FROM _autumn_money_postings",
+        // Collide on (transaction_id, seq) instead, with a fresh row id.
+        "INSERT OR REPLACE INTO _autumn_money_postings \
+             (transaction_id, seq, account_id, amount_minor, currency) \
+         SELECT transaction_id, seq, account_id, 1, currency \
+         FROM _autumn_money_postings",
+        // Collide on the transaction row id.
+        "INSERT OR REPLACE INTO _autumn_money_transactions \
+             (id, idempotency_key, request_hash, currency, memo) \
+         SELECT id, idempotency_key, 'forged', currency, 'rewritten' \
+         FROM _autumn_money_transactions",
+        // Collide on the idempotency key instead, with a fresh transaction id.
+        "INSERT OR REPLACE INTO _autumn_money_transactions \
+             (id, idempotency_key, request_hash, currency, memo) \
+         SELECT 'forged-id', idempotency_key, 'forged', currency, 'rewritten' \
+         FROM _autumn_money_transactions",
+    ] {
+        let result = conn.batch_execute(statement).await;
+        assert!(
+            result.is_err(),
+            "the ledger must refuse `{statement}`, but it succeeded"
+        );
+    }
+
+    // And the books are untouched.
+    assert_eq!(count_transactions(&mut conn).await, 1);
+    assert_eq!(count_postings(&mut conn).await, 2);
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:cash")
+            .await
+            .expect("balance")
+            .minor(),
+        2500
+    );
+    assert_books_balance(&mut conn).await;
+}
+
 // ── Idempotency ─────────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -268,13 +268,20 @@ health check.
 | The same key posts once | `UNIQUE (idempotency_key)`, with `ON CONFLICT DO NOTHING` |
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
-| Nothing is rewritten | a database trigger on both backends, `TRUNCATE` included |
+| Nothing is rewritten | database triggers on both backends, `TRUNCATE` and SQLite `REPLACE` included |
 | A cancelled `post` never half-writes | the postings go in before their transaction row, behind a deferred foreign key |
 
 The last two matter most.
 
 `post` never updates or deletes a row, and a trigger aborts an `UPDATE`, a
 `DELETE` or a `TRUNCATE` that comes from anywhere else.
+
+`INSERT OR REPLACE` needs its own guard on SQLite. SQLite answers the conflict
+by deleting the row that is in the way, and it does not fire `DELETE` triggers
+for that deletion unless `PRAGMA recursive_triggers` is on. So the SQLite
+migration also refuses an insert that collides with a row that is already
+there. Postgres answers the same statement with `ON CONFLICT DO UPDATE`, which
+is an `UPDATE`, so the trigger above already sees it.
 
 And `post` writes the postings **before** the transaction row they belong to.
 That looks backwards; it is what keeps a cancelled call from half-writing the

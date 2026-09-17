@@ -1210,7 +1210,8 @@ Rules that matter:
   scheduled job or a health check.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are
-  append-only by trigger — `UPDATE`, `DELETE` and `TRUNCATE` all abort.
+  append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
+  `INSERT OR REPLACE` all abort.
 - A cancelled `post` never half-writes: it writes the postings before their
   transaction row behind a deferred foreign key, so the ledger ends up with
   nothing or one complete transaction. Which one is not knowable from the
