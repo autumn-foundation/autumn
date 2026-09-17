@@ -1464,9 +1464,12 @@ def readable(text, resolved=None):
     # indented continuation line stay part of its paragraph.
     in_paragraph = False
     in_list = False
-    # The content column of the innermost open list item. Zero outside a
-    # list, which makes every threshold below read exactly as it did before
-    # list columns were tracked at all.
+    # The content columns of the OPEN list items, outermost first, and the
+    # innermost of them. Zero outside a list, which makes every threshold
+    # below read exactly as it did before list columns were tracked at all.
+    # A stack rather than one number because a line that dedents out of a
+    # nested item lands in the enclosing one, not at the margin.
+    list_cols = []
     list_col = 0
 
     def blank_to(start, stop):
@@ -1532,15 +1535,19 @@ def readable(text, resolved=None):
                 in_paragraph = False
                 i = eol + 1 if eol < n else n
                 continue
-            # A line that falls BELOW the content column leaves the item, so
-            # the threshold goes back to the margin. With a wide marker the
-            # two differ: `100. item` puts content at column five, and a
-            # four-space line under it is outside the item and is therefore
-            # ordinary indented code — which a fixed `indent == 0` test
-            # never noticed, because four is not zero.
-            if (indent == 0 or indent < list_col) and not LIST_ITEM.match(content):
-                in_list = False
-                list_col = 0
+            # A line that falls BELOW the content column leaves that item —
+            # but it lands in the ENCLOSING one, not at the margin. After
+            # `100. outer` and a nested `- inner`, a five-space line has
+            # left the inner item and is back at the outer item's content
+            # column, where it is a paragraph and its link is a route.
+            # Resetting straight to zero called it margin-relative code and
+            # rejected a valid README, because one column cannot describe
+            # two open containers. The columns are a STACK.
+            if not LIST_ITEM.match(content):
+                while list_cols and indent < list_cols[-1]:
+                    list_cols.pop()
+                list_col = list_cols[-1] if list_cols else 0
+                in_list = bool(list_cols)
             # A block inside a list item is measured from the item's CONTENT
             # column too, not from the margin: under `100. Example:` the
             # content column is five, so a five-space `~~~md` is a fence at
@@ -1549,13 +1556,16 @@ def readable(text, resolved=None):
             # margin, so it saw five and opened nothing — leaving the sample
             # inside readable and its link counted as a route.
             #
-            # Stripped once here, the way the quote prefix is, so the fence
-            # tests below agree with each other. KNOWN GAP: only the fence
-            # tests use this. `ATX`, `THEMATIC` and `SETEXT` on the same
-            # line still measure from the margin, so a heading indented to a
-            # wide item's content column is not seen as one. That affects
-            # paragraph state rather than reachability, and widening it is
-            # the container-tracking question, not a patch.
+            # Stripped once here, the way the quote prefix is, so every
+            # block test below agrees with the others — fences, raw HTML,
+            # comments, declarations, headings, thematic breaks and Setext
+            # underlines alike. Round 63 gave this to the fence tests only
+            # and recorded the rest as a known gap on the grounds that they
+            # "affect paragraph state rather than reachability". That was
+            # wrong, and both halves of the list were reported as bugs:
+            # paragraph state is what gates indented code, so an unseen
+            # heading keeps the paragraph open and turns a code block after
+            # it into prose with a live link in it.
             rel = content
             if list_col and indent >= list_col and content == expanded:
                 rel = content[list_col:]
@@ -1586,6 +1596,11 @@ def readable(text, resolved=None):
                 continue
             col = list_content_col(expanded)
             if col is not None:
+                # A new item at or inside the current column NESTS; one
+                # further left closes the items it has dedented out of.
+                while list_cols and indent < list_cols[-1]:
+                    list_cols.pop()
+                list_cols.append(col)
                 in_list = True
                 list_col = col
                 # An OVERPADDED marker puts code on the marker's own line.
@@ -1668,15 +1683,22 @@ def readable(text, resolved=None):
             # keeps `===` as paragraph text there and indented code cannot
             # interrupt a paragraph, so the link is live. `_starts_block`
             # was given this rule in round 40 and this site was not.
-            setext = SETEXT.match(content) and was_paragraph
-            in_paragraph = not (ATX.match(content)
+            # All of these read the CONTENT-relative line, the last three
+            # having been the documented gap until now. That note claimed
+            # they "affect paragraph state rather than reachability", which
+            # was wrong: paragraph state is exactly what gates indented
+            # code, so a `# heading` at a wide item's content column went
+            # unseen, the paragraph stayed open, and the code block after it
+            # was read as prose with a live link in it.
+            setext = SETEXT.match(rel) and was_paragraph
+            in_paragraph = not (ATX.match(rel)
                                 or opens_fence(rel)
                                 or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
                                 # paragraph, so an indented line after one is
                                 # code.
-                                or THEMATIC.match(content)
+                                or THEMATIC.match(rel)
                                 or setext)
 
             # Fence detection runs on the QUOTE-STRIPPED content computed
@@ -5735,6 +5757,47 @@ self_test() {
     > "$tmp/comment_block_real/README.md"
   _commit comment_block_real
   _case "a real block comment still hides its link" 1 comment_block_real
+
+  # 279. A line that dedents out of a NESTED item lands in the enclosing
+  #      one, not at the margin. After `100. outer` and a five-space
+  #      `- inner`, a five-space line is back at the outer item's content
+  #      column, where it is a paragraph and its link is a route. One
+  #      column cannot describe two open containers, so they are a stack.
+  _scaffold list_nested_dedent
+  printf '# A\n' > "$tmp/list_nested_dedent/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_nested_dedent/docs/guide/index.md"
+  printf '100. outer\n\n     - inner\n\n     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_nested_dedent/README.md"
+  _commit list_nested_dedent
+  _case "a dedent lands in the enclosing item" 0 list_nested_dedent
+
+  # 280. ...but a line below the OUTERMOST column still leaves the list
+  #      entirely, so four spaces under `100. item` is margin code. The
+  #      stack must pop, not merely be remembered.
+  _scaffold list_stack_pops
+  printf '# A\n' > "$tmp/list_stack_pops/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_stack_pops/docs/guide/index.md"
+  printf '100. item\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_stack_pops/README.md"
+  _commit list_stack_pops
+  _case "a dedent past the outermost column leaves the list" 1 list_stack_pops
+
+  # 281. A HEADING at a wide item's content column is a heading, so the
+  #      paragraph ends and the nine-space line after it is code. Testing
+  #      `ATX` against the margin missed it, left the paragraph open, and
+  #      read that code block as prose with a live link in it — which is
+  #      why the round-63 note calling this "paragraph state rather than
+  #      reachability" was wrong.
+  _scaffold heading_list_col
+  printf '# A\n' > "$tmp/heading_list_col/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/heading_list_col/docs/guide/index.md"
+  printf '100. item\n\n     # heading\n\n         [Guide](docs/guide/index.md)\n' \
+    > "$tmp/heading_list_col/README.md"
+  _commit heading_list_col
+  _case "a heading at the content column ends the paragraph" 1 heading_list_col
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
