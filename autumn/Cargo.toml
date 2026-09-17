@@ -935,6 +935,22 @@ path = "tests/sqlite_commit_hook_worker.rs"
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
 
+# Snag QA probe (#1771): runs the `#[repository]`-generated
+# `find_by_body_bidx` finder against real data (many owners, some sharing
+# plaintext) on a tempfile SQLite pool, which nothing in the existing
+# confidential-fields suite does (`confidential_model.rs` queries the
+# blind-index column with a raw Diesel `.filter(...)`, and
+# `tests/compile-pass/confidential_blind_index_finder.rs` only proves the
+# generated finder compiles). Isolated for the same feature-unification
+# reason as `sqlite_jobs_scheduler_e2e` above: `sqlite` flips
+# `db::RuntimeConnection` for the whole build graph, so it cannot share the
+# consolidated `integration_tests` binary with the Postgres-assuming `db`
+# suite. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test confidential_repository_bidx`.
+[[test]]
+name = "confidential_repository_bidx"
+path = "tests/confidential_repository_bidx.rs"
+
 # FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
 # (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,
 # commit-hook queue, version history, runtime config, feature flags,

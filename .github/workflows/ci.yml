@@ -2053,6 +2053,7 @@ jobs:
             --test sim_chaos \
             --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \
+            --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
             --test sim_chaos_crash
