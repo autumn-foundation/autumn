@@ -419,7 +419,7 @@ def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
     # content. `decode_char_refs` is the same decode `normalise` applies to
     # a destination, asked here of the text — semicolon-terminated only, as
     # CommonMark requires.
-    if not decode_char_refs(text[pos + 1:close - 1]).strip():
+    if not strip_emphasis(decode_char_refs(text[pos + 1:close - 1])).strip():
         return False
     for q in range(pos + 1, close - 1):
         if text[q] != "[" or (q and text[q - 1] == "!"):
@@ -733,6 +733,45 @@ CHAR_REF = re.compile(
 
 def decode_char_refs(s):
     return CHAR_REF.sub(lambda m: html.unescape(m.group(0)), s)
+
+
+# `*`, `_` and `~` when they form emphasis, strong emphasis or strikethrough.
+_DELIMS = "*_~"
+
+
+def strip_emphasis(s):
+    """`s` with MATCHED outer emphasis delimiters removed.
+
+    Emphasis delimiters that pair up render as markup and vanish, so
+    `[*&#32;*](alpha.md)` is an anchor holding one space — nothing a reader
+    can read or aim at — while the source looks like three characters of
+    content. Asking `.strip()` of the decoded source counted the asterisks
+    as visible and passed an index whose navigation is invisible.
+
+    Only OUTER matched pairs come off, and only when the leading and
+    trailing runs are distinct. Delimiters that pair with nothing are
+    literal text a reader can see: `[*](x.md)` renders `*` and
+    `[***](x.md)` renders `***`, both verified in both renderers. Stripping
+    those would reject a link with visible text, which is the costlier
+    error of the two, so the rule stops at what it can prove.
+
+    `~~` is GFM rather than CommonMark, so markdown-it in plain CommonMark
+    mode leaves `~~ ~~` literal while cmark-gfm renders `<del> </del>`.
+    These pages render on GitHub, so cmark-gfm is the authority here and
+    the delimiter is included.
+    """
+    while len(s) >= 2:
+        ch = s[0]
+        if ch not in _DELIMS or s[-1] != ch:
+            break
+        lead = len(s) - len(s.lstrip(ch))
+        tail = len(s) - len(s.rstrip(ch))
+        # One run, not two: `***` is three literal asterisks, not emphasis
+        # wrapped around nothing.
+        if lead + tail >= len(s):
+            break
+        s = s[1:-1]
+    return s
 
 
 IMAGE_MARK = "\ufffc"
@@ -5477,6 +5516,51 @@ self_test() {
     > "$tmp/image_span_label/README.md"
   _commit image_span_label
   _case "a code span does not close an image label" 1 image_span_label
+
+  # 266. Emphasis delimiters that PAIR UP render as markup and vanish, so
+  #      `[*&#32;*](x)` is an anchor holding one space — nothing a reader
+  #      can read or aim at — while the source looks like content.
+  _scaffold emph_blank_label
+  printf '# A\n' > "$tmp/emph_blank_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/emph_blank_label/docs/guide/index.md"
+  printf '[*&#32;*](docs/guide/index.md)\n' \
+    > "$tmp/emph_blank_label/README.md"
+  _commit emph_blank_label
+  _case "paired emphasis around a space renders nothing" 1 emph_blank_label
+
+  # 267. The same on the INDEX side, where a row whose only text is
+  #      invisible lists a page a reader cannot see listed.
+  _scaffold emph_blank_row
+  printf '# A\n' > "$tmp/emph_blank_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [*&#32;*](alpha.md)\n' \
+    > "$tmp/emph_blank_row/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/emph_blank_row/README.md"
+  _commit emph_blank_row
+  _case "an invisible row lists nothing" 1 emph_blank_row
+
+  # 268. A delimiter that pairs with NOTHING is literal text a reader can
+  #      see. `[***](x)` renders `***`, verified in both renderers, so
+  #      stripping it would reject a link with visible text — the costlier
+  #      error, and the reason the rule stops at matched outer runs.
+  _scaffold emph_literal_run
+  printf '# A\n' > "$tmp/emph_literal_run/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/emph_literal_run/docs/guide/index.md"
+  printf '[***](docs/guide/index.md)\n' \
+    > "$tmp/emph_literal_run/README.md"
+  _commit emph_literal_run
+  _case "an unpaired delimiter run is visible text" 0 emph_literal_run
+
+  # 269. And a single delimiter is too, which is the narrower half of the
+  #      same boundary: one run cannot be two.
+  _scaffold emph_lone_star
+  printf '# A\n' > "$tmp/emph_lone_star/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/emph_lone_star/docs/guide/index.md"
+  printf '[*](docs/guide/index.md)\n' > "$tmp/emph_lone_star/README.md"
+  _commit emph_lone_star
+  _case "a lone delimiter is visible text" 0 emph_lone_star
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
