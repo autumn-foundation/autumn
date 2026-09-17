@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **🧭 Wayfinder: `examples/reddit-clone`'s create-community name field no
-  longer rejects valid names client-side (#2441/#2454 item 3):** the name
+  longer rejects valid names client-side (#2441/#2454 item 3) [no-plugin]:**
+  the name
   input carried `pattern="[a-zA-Z0-9_]+"` plus `minlength="2"
   maxlength="32"`, all narrower than `validate_community_name`'s actual rule
   (2-32 *characters*, any script, needs at least one letter or number).
