@@ -133,6 +133,7 @@ Looking for the API reference instead? That is
 - [Realtime Channels, SSE and htmx Broadcasts](realtime.md) — pushing an update to a connected page
 - [WebSockets](websockets.md) — `#[ws]` handlers and connection lifecycle
 - [Distributed Presence](presence.md) — who is online, across replicas
+- [Collaborative Fields](collaboration.md) — two people editing the same text at once, without losing a character
 - [Web Push](web-push.md) — browser notifications to a user who has closed the tab
 - [In-App Notifications](notifications.md) — a notification centre inside your own UI
 

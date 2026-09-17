@@ -797,6 +797,23 @@ def definitions(text):
 # own extent, which is the precedence CommonMark actually gives them. Nothing
 # downstream can reinterpret what an earlier construct already swallowed.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# A BLOCK-QUOTE marker, carrying up to three spaces of indentation. Same
+# pattern, same bound and same reason as `check-docs-links.sh`, which had
+# this right: allowing four would let `    > ``` ` — an INDENTED CODE line
+# that merely begins with a quote marker — lose both its marker and its four
+# spaces and become a column-zero fence.
+#
+# `> ```rust ` is still a fence, and this corpus writes them: ten of them
+# live in `docs/guide/` today, in openapi.md, mcp.md and fleet-deploys.md.
+# Fence detection ran on the raw line, so a quoted fence opened nothing and
+# an index row or README link inside a quoted EXAMPLE counted as navigation.
+BLOCKQUOTE = re.compile(r"^ {0,3}(?:>[ \t]?)+")
+
+
+def quote_depth(line):
+    """How many block-quote markers open this line (0 if it is not quoted)."""
+    m = BLOCKQUOTE.match(line)
+    return m.group(0).count(">") if m else 0
 # A raw HTML block opener at line start. `<pre>`/`<script>`/`<style>`/
 # `<textarea>` run to their closing tag; any other tag ends at a blank line.
 #
@@ -1020,8 +1037,15 @@ def readable(text, resolved=None):
             # `#not-a-heading` is an ordinary paragraph. Treating it as a
             # heading let the next indented line open code and swallowed a
             # link that a reader can click.
+            # Quote-stripped content, computed once for BOTH fence tests
+            # below. Testing `opens_fence` on the raw line here and on the
+            # stripped one further down would be two callers disagreeing
+            # about one line, which is the shape of most findings on this
+            # gate.
+            depth = quote_depth(line)
+            content = BLOCKQUOTE.sub("", line) if depth else line
             in_paragraph = not (ATX.match(line)
-                                or opens_fence(line)
+                                or opens_fence(content)
                                 or hm
                                 # A thematic break (`---`, `***`, `___`) and a
                                 # Setext underline (`===`, `---`) both end the
@@ -1030,13 +1054,29 @@ def readable(text, resolved=None):
                                 or THEMATIC.match(line)
                                 or SETEXT.match(line))
 
-            m = FENCE.match(line)
-            if opens_fence(line):
+            # Fence detection runs on the QUOTE-STRIPPED content computed
+            # above, so `> ```md` opens a fence like ```` ```md ```` does.
+            # Only the detection is stripped; the text itself is untouched
+            # and still blanked space for space, so reported line numbers
+            # stay accurate.
+            m = FENCE.match(content)
+            if opens_fence(content):
                 char, length = m.group(1)[0], len(m.group(1))
                 j = eol + 1
                 while j <= n:
                     stop = line_end(j)
-                    c = FENCE.match(text[j:stop])
+                    seg = text[j:stop]
+                    # A fence opened INSIDE a quote ends when the quote does.
+                    # Without this an unclosed `> ```md` would blank every
+                    # link in the rest of the file — the same
+                    # run-to-end-of-file false failure the unmatched `<!--`
+                    # had, and the reason that one is now bounded too. A
+                    # blank line ends the quote, so it ends the fence.
+                    if depth and quote_depth(seg) < depth:
+                        blank_to(i, j)
+                        i = j
+                        break
+                    c = FENCE.match(BLOCKQUOTE.sub("", seg) if depth else seg)
                     if (c and c.group(1)[0] == char
                             and len(c.group(1)) >= length
                             and not c.group(2).strip()):
@@ -3792,6 +3832,59 @@ self_test() {
     > "$tmp/comment_hides_link/README.md"
   _commit comment_hides_link
   _case "a link inside a closed comment is not a route" 1 comment_hides_link
+
+  # 184. A fence inside a BLOCK QUOTE is still a fence. Detection ran on the
+  #      raw line, so `> ```markdown` opened nothing and a README link inside
+  #      a quoted EXAMPLE counted as navigation. This corpus writes quoted
+  #      fences — ten of them live in docs/guide/ — so the spelling is not
+  #      hypothetical. cmark-gfm renders the link as `<pre><code>`.
+  #
+  #      The three-backtick case happened to fail already, by accident: the
+  #      code-span scan paired its equal backtick runs. The unequal, tilde
+  #      and unclosed spellings did not, which is why 185 exists.
+  _scaffold quoted_fence
+  printf '# A\n' > "$tmp/quoted_fence/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_fence/docs/guide/index.md"
+  printf '> ~~~markdown\n> [Guide index](docs/guide/index.md)\n> ~~~\n' \
+    > "$tmp/quoted_fence/README.md"
+  _commit quoted_fence
+  _case "a quoted fence is a fence" 1 quoted_fence
+
+  # 185. The same, with an opener LONGER than its closer — the spelling the
+  #      accidental code-span pairing could not cover.
+  _scaffold quoted_fence_uneven
+  printf '# A\n' > "$tmp/quoted_fence_uneven/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_fence_uneven/docs/guide/index.md"
+  printf '> ````markdown\n> [Guide index](docs/guide/index.md)\n> ```\n' \
+    > "$tmp/quoted_fence_uneven/README.md"
+  _commit quoted_fence_uneven
+  _case "a quoted fence outlives a short closer" 1 quoted_fence_uneven
+
+  # 186. The FALSE-FAILURE direction, and the reason this fix is bounded: an
+  #      unclosed quoted fence ends where the QUOTE ends. Running it to end
+  #      of file would blank every link after it — the same mistake the
+  #      unmatched `<!--` used to make. cmark-gfm keeps this link live.
+  _scaffold quoted_fence_unclosed
+  printf '# A\n' > "$tmp/quoted_fence_unclosed/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_fence_unclosed/docs/guide/index.md"
+  printf '> ```md\n> x\n\n[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/quoted_fence_unclosed/README.md"
+  _commit quoted_fence_unclosed
+  _case "an unclosed quoted fence ends with its quote" 0 quoted_fence_unclosed
+
+  # 187. And a link in quoted PROSE is an ordinary link — the fix must not
+  #      turn "quoted" into "invisible".
+  _scaffold quoted_prose_link
+  printf '# A\n' > "$tmp/quoted_prose_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_prose_link/docs/guide/index.md"
+  printf '> see [Guide index](docs/guide/index.md)\n' \
+    > "$tmp/quoted_prose_link/README.md"
+  _commit quoted_prose_link
+  _case "a link in quoted prose is a link" 0 quoted_prose_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
