@@ -392,8 +392,12 @@ def readable(text):
                     idx = text.lower().find(closer, i)
                     stop = n if idx < 0 else idx + len(closer)
                 else:
-                    blank = text.find("\n\n", i)
-                    stop = n if blank < 0 else blank
+                    # CommonMark ends the block at a blank line, and a line of
+                    # spaces or tabs IS blank. Searching for a literal "\n\n"
+                    # missed those and ran the block to end of file, blanking
+                    # every link after it.
+                    m_blank = re.compile(r"\n[ \t]*\n").search(text, i)
+                    stop = n if not m_blank else m_blank.start()
                 blank_to(i, stop)
                 i = stop
                 continue
@@ -473,6 +477,18 @@ def readable(text):
             continue
 
         if text[i] == "<":
+            # A `<…>` opening a LINK DESTINATION is not a tag:
+            # `[A](<alpha.md>)` is a valid link, and blanking the angle form
+            # as inline HTML made the destination unresolvable, so a clickable
+            # link and a real index row written that way were reported missing.
+            back = i - 1
+            while back >= 0 and text[back] in " \t":
+                back -= 1
+            if back >= 1 and text[back] == "(" and text[back - 1] == "]":
+                close = text.find(">", i)
+                if 0 <= close < line_end(i):
+                    i = close + 1
+                    continue
             auto = AUTOLINK.match(text, i)
             if auto:
                 i = auto.end()
@@ -543,7 +559,13 @@ def normalise(target, base):
     page exists, so a link to a page that was deleted is reported as a defect
     rather than quietly ignored.
     """
-    target = target.strip().rstrip("/")
+    target = target.strip()
+    # `[A](<alpha.md>)` is a valid destination form. Capturing the brackets
+    # made the path unresolvable, so a clickable link — and a real index row
+    # written that way — was reported as missing.
+    if len(target) > 1 and target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    target = target.rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
         return None
     if target.startswith("./"):
@@ -694,14 +716,19 @@ def reaches_index(text):
     # `[label]: target` definitions, then the labels actually referenced by a
     # full (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
     # reference. A definition nothing references is not a link.
-    defs = {m.group(1).strip().lower(): m.group(2)
+    def label_key(raw):
+        """Markdown reference labels fold case and collapse whitespace, so
+        `[guide   catalog]` and `[Guide Catalog]` are the same label."""
+        return " ".join(raw.split()).lower()
+
+    defs = {label_key(m.group(1)): m.group(2)
             for m in re.finditer(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)",
                                  text, re.MULTILINE)}
     if not defs:
         return False
-    used = {m.group(1).strip().lower() or m.group(2).strip().lower()
+    used = {label_key(m.group(2)) or label_key(m.group(1))
             for m in re.finditer(r"(?<![!\\])\[([^\]]*)\]\[([^\]]*)\]", text)}
-    used |= {m.group(1).strip().lower()
+    used |= {label_key(m.group(1))
              for m in re.finditer(r"(?<![!\\])\[([^\]]+)\](?![\[(:])", text)}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
@@ -1377,6 +1404,48 @@ self_test() {
     > "$tmp/span_close_escape/README.md"
   _commit span_close_escape
   _case "backslash before a span closer still closes it" 1 span_close_escape
+
+  # 58. `[A](<alpha.md>)` is a valid destination form. The angle form was
+  #     blanked as inline HTML, so a clickable link — and a real index ROW
+  #     written that way — was reported missing.
+  _scaffold angle_dest_row
+  printf '# A\n' > "$tmp/angle_dest_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](<alpha.md>)\n' \
+    > "$tmp/angle_dest_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/angle_dest_row/README.md"
+  _commit angle_dest_row
+  _case "angle-bracketed destination resolves in a row" 0 angle_dest_row
+
+  # 59. ...and in README.
+  _scaffold angle_dest_readme
+  printf '# A\n' > "$tmp/angle_dest_readme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/angle_dest_readme/docs/guide/index.md"
+  printf 'See [Guide](<docs/guide/index.md>)\n' \
+    > "$tmp/angle_dest_readme/README.md"
+  _commit angle_dest_readme
+  _case "angle-bracketed destination resolves in README" 0 angle_dest_readme
+
+  # 60. A reference label folds case AND collapses internal whitespace.
+  _scaffold ref_label_ws
+  printf '# A\n' > "$tmp/ref_label_ws/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_label_ws/docs/guide/index.md"
+  printf 'See [Guide][guide   catalog].\n\n[guide catalog]: docs/guide/index.md\n' \
+    > "$tmp/ref_label_ws/README.md"
+  _commit ref_label_ws
+  _case "reference label collapses whitespace" 0 ref_label_ws
+
+  # 61. An HTML block ends at ANY blank line, including one of spaces. Looking
+  #     for a literal "\n\n" ran the block to EOF and blanked the link after it.
+  _scaffold html_ws_blank
+  printf '# A\n' > "$tmp/html_ws_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/html_ws_blank/docs/guide/index.md"
+  printf '<div>\nsome html\n   \n[Guide](docs/guide/index.md)\n' \
+    > "$tmp/html_ws_blank/README.md"
+  _commit html_ws_blank
+  _case "HTML block ends at a whitespace-only line" 0 html_ws_blank
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
