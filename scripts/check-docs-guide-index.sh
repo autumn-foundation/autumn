@@ -216,8 +216,11 @@ DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
 # and it can never be an index row or a link to a `.md` page anyway.
 AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*>"
                       r"|<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>")
-# A well-formed inline HTML tag, whose ATTRIBUTES are not links.
-INLINE_TAG = re.compile(r"<[a-zA-Z/!?][^>\n]*>")
+# A well-formed inline HTML tag, whose ATTRIBUTES are not links. A tag may
+# wrap across lines — `<span\ntitle="…">` is one tag — but never across a
+# BLANK line, which bounds the damage a stray `<` can do: with no `>` before
+# the next blank line there is no match at all, and nothing is blanked.
+INLINE_TAG = re.compile(r"<[a-zA-Z/!?](?:[^>\n]|\n(?!\s*\n))*>")
 
 
 def _blank(s):
@@ -367,8 +370,19 @@ def readable(text):
                 return None if depth else k
 
             label = balanced(i + 1, "[", "]")
-            if label is not None and label < n and text[label] == "(":
-                end = balanced(label, "(", ")")
+            # An image is `![alt](target)` or the reference forms
+            # `![alt][ref]` / `![alt][]`. All three render a picture, so a
+            # link written inside the label is alt text either way.
+            #
+            # The bare SHORTCUT form `![alt]` is deliberately not treated as
+            # an image: it is only one if a matching reference definition
+            # exists, and without one CommonMark renders `![alt [x](a.md)]`
+            # as literal text around a REAL link. Blanking it unconditionally
+            # would delete that link — the over-blanking direction — so a
+            # shortcut image is left alone.
+            if label is not None and label < n and text[label] in "([":
+                close = ")" if text[label] == "(" else "]"
+                end = balanced(label, text[label], close)
                 if end is not None:
                     blank_to(i, end)
                     i = end
@@ -1111,6 +1125,51 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/div_block/README.md"
   _commit div_block
   _case "div still opens an HTML block" 1 div_block
+
+  # 45. A reference-style image is still an image, so a link in its label is
+  #     alt text: `![alt [Guide](x)][ref]`.
+  _scaffold ref_image
+  printf '# A\n' > "$tmp/ref_image/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_image/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)][preview]\n\n[preview]: p.png\n' \
+    > "$tmp/ref_image/README.md"
+  _commit ref_image
+  _case "link inside a reference image label is not a link" 1 ref_image
+
+  # 46. ...but a bare SHORTCUT `![alt [x](a.md)]` is only an image when a
+  #     reference definition exists. Without one it renders as literal text
+  #     around a REAL link, so blanking it would delete that link.
+  _scaffold shortcut_image
+  printf '# A\n' > "$tmp/shortcut_image/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/shortcut_image/docs/guide/index.md"
+  printf '![see [Guide](docs/guide/index.md)]\n' \
+    > "$tmp/shortcut_image/README.md"
+  _commit shortcut_image
+  _case "shortcut image label keeps its real link" 0 shortcut_image
+
+  # 47. An inline tag may wrap across lines; its attributes are still not
+  #     links.
+  _scaffold multiline_tag
+  printf '# A\n' > "$tmp/multiline_tag/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/multiline_tag/docs/guide/index.md"
+  printf 'Docs <span\ntitle="[Guide](docs/guide/index.md)">here</span>\n' \
+    > "$tmp/multiline_tag/README.md"
+  _commit multiline_tag
+  _case "multi-line inline tag hides its attributes" 1 multiline_tag
+
+  # 48. ...and a stray `<` with no `>` before the next blank line blanks
+  #     nothing, so the link after it survives.
+  _scaffold stray_lt
+  printf '# A\n' > "$tmp/stray_lt/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/stray_lt/docs/guide/index.md"
+  printf 'A <b is unfinished\n\nSee [Guide](docs/guide/index.md).\n' \
+    > "$tmp/stray_lt/README.md"
+  _commit stray_lt
+  _case "unterminated tag blanks nothing" 0 stray_lt
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
