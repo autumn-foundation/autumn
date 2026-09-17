@@ -1212,7 +1212,10 @@ Rules that matter:
   **control** database. Nothing to add to the app's `migrations/`. They are
   append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
   `INSERT OR REPLACE` all abort. An account's currency is fixed the same way;
-  only `allow_negative` stays editable.
+  only `allow_negative` stays editable. The SQLite half needs
+  `PRAGMA recursive_triggers = ON`, which Autumn's pool sets on every
+  connection: without it SQLite skips `DELETE` triggers for the row a `REPLACE`
+  removes.
 - A cancelled `post` never half-writes: it writes the postings before their
   transaction row behind a deferred foreign key, so the ledger ends up with
   nothing or one complete transaction. Which one is not knowable from the

@@ -73,6 +73,13 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
     pool
 }
 
+/// Row shape for `PRAGMA recursive_triggers`.
+#[derive(diesel::QueryableByName)]
+struct RecursiveTriggers {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    recursive_triggers: i32,
+}
+
 const fn usd(minor: i64) -> Money<Usd> {
     Money::<Usd>::from_minor(minor)
 }
@@ -429,6 +436,92 @@ async fn an_account_currency_cannot_change_out_of_band() {
         .await
         .expect("balance");
     assert_eq!(cash.currency().code(), "USD", "the currency is unchanged");
+    assert_eq!(cash.minor(), 2500);
+    assert_books_balance(&mut conn).await;
+}
+
+/// A `REPLACE` that collides on the idempotency key, laundered.
+///
+/// The deferred foreign key is not enough on its own: an attacker can put the
+/// deleted row's id back before `COMMIT`, which satisfies it and leaves the
+/// real postings under forged transaction metadata. The pool sets
+/// `PRAGMA recursive_triggers = ON`, so the append-only `DELETE` trigger fires
+/// for the row the `REPLACE` removes and the whole attempt aborts.
+#[tokio::test]
+async fn a_replace_cannot_be_laundered_through_a_reinserted_id() {
+    let pool = boot_pool("mlg_launder").await;
+    let mut conn = pool.get().await.expect("checkout");
+
+    // The pragma is what closes this. Pin it, so removing it fails here.
+    let modes: Vec<RecursiveTriggers> = diesel::sql_query("PRAGMA recursive_triggers")
+        .load(&mut conn)
+        .await
+        .expect("pragma");
+    assert_eq!(
+        modes.into_iter().next().map(|row| row.recursive_triggers),
+        Some(1),
+        "the pool must set recursive_triggers = ON"
+    );
+
+    open_accounts(&mut conn).await;
+    let transfer = charge(2500, "order:1");
+    let posted = post_tx(&mut conn, &transfer).await.expect("post");
+    let real_id = posted.transaction().id().to_owned();
+
+    let laundered = format!(
+        "INSERT OR REPLACE INTO _autumn_money_transactions \
+             (id, idempotency_key, request_hash, currency, memo) \
+         SELECT 'forged-id', idempotency_key, 'forged', currency, 'rewritten' \
+         FROM _autumn_money_transactions; \
+         INSERT INTO _autumn_money_transactions \
+             (id, idempotency_key, request_hash, currency, memo) \
+         VALUES ('{real_id}', 'other-key', 'forged', 'USD', 'rewritten');"
+    );
+    assert!(
+        conn.batch_execute(&laundered).await.is_err(),
+        "a laundered REPLACE must not reach the books"
+    );
+
+    // One transaction, still the real one, still balanced.
+    assert_eq!(count_transactions(&mut conn).await, 1);
+    let stored = ledger::transaction_by_key(&mut conn, transfer.key())
+        .await
+        .expect("lookup")
+        .expect("the real transaction is still there");
+    assert_eq!(stored.id(), real_id);
+    assert_eq!(stored.memo(), "charge for order:1");
+    assert_books_balance(&mut conn).await;
+}
+
+/// `ensure_account` keeps reporting a currency mismatch as `AccountCurrency`,
+/// even once the account has postings.
+///
+/// The refusal must not sit on the `INSERT`: `ensure_account` writes with
+/// `ON CONFLICT (id) DO NOTHING` and reads the row back, and a `BEFORE INSERT`
+/// trigger fires first, which would turn a named 422 into an opaque 500.
+#[tokio::test]
+async fn ensure_account_reports_a_currency_mismatch_on_an_account_in_use() {
+    use autumn_web::money::Eur;
+
+    let pool = boot_pool("mlg_mismatch_in_use").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("post");
+
+    let error = ledger::ensure_account(&mut conn, Account::new("platform:cash", Eur::currency()))
+        .await
+        .expect_err("an account in use keeps its currency");
+    assert!(
+        matches!(error, LedgerError::AccountCurrency { .. }),
+        "expected AccountCurrency, got {error}"
+    );
+
+    let cash = ledger::balance(&mut conn, "platform:cash")
+        .await
+        .expect("balance");
+    assert_eq!(cash.currency().code(), "USD");
     assert_eq!(cash.minor(), 2500);
     assert_books_balance(&mut conn).await;
 }

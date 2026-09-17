@@ -1301,6 +1301,12 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 /// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
 ///   WAL` and `synchronous` both write, and would fail connection setup with
 ///   "attempt to write a readonly database", taking the whole pool 503.
+/// * `recursive_triggers = ON` everywhere. `SQLite` defaults it off, and with it
+///   off a `DELETE` trigger does **not** fire for the row an `INSERT OR REPLACE`
+///   deletes to settle a conflict. The money ledger (#1837) is append-only by
+///   `DELETE` trigger, so with the default a `REPLACE` rewrites the books
+///   silently. Postgres has no `REPLACE`, so this also makes the two backends
+///   agree.
 /// * When **replication is active** (#1628), `wal_autocheckpoint = 0` is added so
 ///   the replicator is the only component that ever checkpoints. An
 ///   auto-checkpoint rewrites the main database file, which would tear a base
@@ -1310,18 +1316,21 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
-         PRAGMA foreign_keys = ON;"
+         PRAGMA foreign_keys = ON; \
+         PRAGMA recursive_triggers = ON;"
     } else if replicating {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA journal_mode = WAL; \
          PRAGMA wal_autocheckpoint = 0; \
          PRAGMA synchronous = NORMAL; \
-         PRAGMA foreign_keys = ON;"
+         PRAGMA foreign_keys = ON; \
+         PRAGMA recursive_triggers = ON;"
     } else {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL; \
-         PRAGMA foreign_keys = ON;"
+         PRAGMA foreign_keys = ON; \
+         PRAGMA recursive_triggers = ON;"
     }
 }
 
@@ -3717,6 +3726,10 @@ mod tests {
             assert!(pragmas.contains("journal_mode = WAL"));
             assert!(pragmas.contains("foreign_keys = ON"));
             assert!(pragmas.contains("busy_timeout = 5000"));
+            // The money ledger (#1837) is append-only by DELETE trigger, and
+            // SQLite skips those for the row an INSERT OR REPLACE removes
+            // unless this is on. Removing it reopens a silent rewrite.
+            assert!(pragmas.contains("recursive_triggers = ON"));
         }
 
         // A read-only target still gets no writing pragmas — including under
@@ -3726,6 +3739,7 @@ mod tests {
             assert!(!read_only.contains("journal_mode"));
             assert!(!read_only.contains("wal_autocheckpoint"));
             assert!(read_only.contains("foreign_keys = ON"));
+            assert!(read_only.contains("recursive_triggers = ON"));
         }
     }
 

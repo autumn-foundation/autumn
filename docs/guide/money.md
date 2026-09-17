@@ -282,12 +282,22 @@ checks a posting against, so a change would relabel every stored minor unit and
 let the next posting in the new currency pass that check — two currencies in
 one account. `set_allow_negative` still works; only the currency is frozen.
 
-`INSERT OR REPLACE` needs its own guard on SQLite. SQLite answers the conflict
-by deleting the row that is in the way, and it does not fire `DELETE` triggers
-for that deletion unless `PRAGMA recursive_triggers` is on. So the SQLite
-migration also refuses an insert that collides with a row that is already
-there. Postgres answers the same statement with `ON CONFLICT DO UPDATE`, which
-is an `UPDATE`, so the trigger above already sees it.
+`INSERT OR REPLACE` is the same rewrite in disguise, and SQLite needs two
+things to refuse it. SQLite settles the conflict by deleting the row that is in
+the way, and it skips `DELETE` triggers for that deletion unless
+`PRAGMA recursive_triggers` is on. Autumn's pool therefore sets that pragma on
+every SQLite connection, which puts the append-only triggers back in the path.
+The migration also refuses an insert that collides with a posting's row keys,
+which holds even on a connection that does not set the pragma.
+
+Both are needed. The deferred foreign key is **not** enough on its own: a
+`REPLACE` that collides on the idempotency key can put the deleted row's id
+back before `COMMIT`, which satisfies the foreign key and leaves the real
+postings under forged transaction metadata. Only the `DELETE` trigger, reached
+through the pragma, stops that.
+
+Postgres needs neither. It has no `REPLACE`, and it answers the same statement
+with `ON CONFLICT DO UPDATE`, which is an `UPDATE` the trigger above sees.
 
 And `post` writes the postings **before** the transaction row they belong to.
 That looks backwards; it is what keeps a cancelled call from half-writing the

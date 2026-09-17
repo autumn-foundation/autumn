@@ -1,3 +1,7 @@
+DROP TRIGGER IF EXISTS _autumn_money_accounts_no_delete;
+DROP TRIGGER IF EXISTS _autumn_money_accounts_currency_fixed;
+DROP TRIGGER IF EXISTS _autumn_money_postings_no_replace;
+DROP TRIGGER IF EXISTS _autumn_money_transactions_no_replace;
 DROP TRIGGER IF EXISTS _autumn_money_postings_no_delete;
 DROP TRIGGER IF EXISTS _autumn_money_postings_no_update;
 DROP TRIGGER IF EXISTS _autumn_money_transactions_no_delete;

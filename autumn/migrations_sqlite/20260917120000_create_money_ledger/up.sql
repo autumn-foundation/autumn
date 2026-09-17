@@ -117,21 +117,22 @@ BEGIN
 END;
 
 -- And the REPLACE form of the same edit, which the UPDATE trigger never sees.
+-- `PRAGMA recursive_triggers = ON` (the pool sets it on every connection) makes
+-- SQLite fire this DELETE trigger for the row a REPLACE removes to settle its
+-- conflict, which is what the default `OFF` suppresses.
 --
--- This one asks for postings as well, and the two guards above do not. An
--- account with no postings has nothing to relabel, and that is the case
--- `ensure_account` reports as `AccountCurrency`: it inserts with
--- `ON CONFLICT (id) DO NOTHING`, reads the row back and compares. A BEFORE
--- INSERT trigger fires before that clause, so an unconditional guard would
--- turn a named error into a database failure.
-CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_no_replace
-    BEFORE INSERT ON _autumn_money_accounts
+-- A DELETE trigger, not a BEFORE INSERT guard: an insert guard fires before
+-- `ON CONFLICT (id) DO NOTHING`, so it would turn `ensure_account`'s documented
+-- `AccountCurrency` error into an opaque database failure.
+--
+-- An account with no postings has nothing to relabel, so removing one is still
+-- allowed. The postings foreign key already refuses a plain DELETE of an
+-- account in use; this covers the REPLACE that foreign key does not see.
+CREATE TRIGGER IF NOT EXISTS _autumn_money_accounts_no_delete
+    BEFORE DELETE ON _autumn_money_accounts
     WHEN EXISTS (
-        SELECT 1 FROM _autumn_money_accounts
-        WHERE id = NEW.id AND currency <> NEW.currency
-    ) AND EXISTS (
-        SELECT 1 FROM _autumn_money_postings WHERE account_id = NEW.id
+        SELECT 1 FROM _autumn_money_postings WHERE account_id = OLD.id
     )
 BEGIN
-    SELECT RAISE(ABORT, 'autumn money ledger: an account cannot change currency');
+    SELECT RAISE(ABORT, 'autumn money ledger: an account with postings cannot be removed or replaced');
 END;

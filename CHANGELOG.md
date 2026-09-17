@@ -56,10 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     application rows the money justifies: they commit or roll back together,
     and a rolled-back post frees its idempotency key again.
   - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
-    `DELETE` of a transaction or a posting, a statement-level pair on Postgres
-    aborts a `TRUNCATE` (which row triggers do not see), and a `BEFORE INSERT`
-    pair on SQLite aborts an `INSERT OR REPLACE` (whose implicit delete does
-    not fire `DELETE` triggers unless `PRAGMA recursive_triggers` is on).
+    `DELETE` of a transaction or a posting, and a statement-level pair on
+    Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
+    `INSERT OR REPLACE` is refused too: its implicit delete skips `DELETE`
+    triggers unless `PRAGMA recursive_triggers` is on, so Autumn's pool now
+    sets that pragma on every SQLite connection, and the migration adds
+    `BEFORE INSERT` guards on the posting row keys for connections that do not.
     `ledger::balance` sums an account's postings; `ledger::trial_balance`
     makes the global zero-sum invariant queryable from a job or a health
     check.
@@ -1053,6 +1055,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fifth unwatched spelling is how that recurs.
 
 ### Changed
+
+- **`SQLite` connections now set `PRAGMA recursive_triggers = ON`.** `SQLite`
+  defaults it off, and with it off a `DELETE` trigger does not fire for the row
+  an `INSERT OR REPLACE` deletes to settle a conflict. The money ledger is
+  append-only by `DELETE` trigger, so the default let a `REPLACE` rewrite the
+  books silently. An application trigger on `DELETE` now also fires for such a
+  row, which is what Postgres already does.
 
 - **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
   `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL
