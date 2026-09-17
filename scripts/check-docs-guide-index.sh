@@ -207,6 +207,21 @@ HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
+def blank_inline_tags(text):
+    """Blank inline HTML tags, so their ATTRIBUTES cannot look like links.
+
+    `<span title="[Guide](index.md)">` renders as a span with attribute text;
+    the browser offers no navigation to the index, so the bracket pair inside
+    the tag is not a link. `blank_html_blocks()` handles HTML at BLOCK level —
+    this is the same content appearing mid-sentence.
+
+    Only a well-formed tag is blanked: `<`, a name or `/name`, then everything
+    to the matching `>`. Prose arithmetic (`a < b`) does not match, and an
+    unterminated `<span` blanks nothing rather than running to end of file.
+    """
+    return re.sub(r"<[a-zA-Z/!?][^>\n]*>", lambda m: _blank(m.group(0)), text)
+
+
 def blank_images(text):
     """Blank whole image constructs, `![alt](target)`, label and all.
 
@@ -437,10 +452,12 @@ def readable(text):
     vanish and the gate FAIL. That is the safe direction: malformed markup
     should make the gate loud, not blind.
     """
-    return blank_images(
-        blank_code_spans(
+    return blank_inline_tags(
+        blank_images(
+            blank_code_spans(
             blank_html_blocks(
                 COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
+                )
             )
         )
     )
@@ -1101,6 +1118,27 @@ self_test() {
     > "$tmp/badge_link/README.md"
   _commit badge_link
   _case "badge link wrapping an image still counts" 0 badge_link
+
+  # 39. An inline HTML attribute is attribute text, not a link.
+  _scaffold inline_tag
+  printf '# A\n' > "$tmp/inline_tag/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/inline_tag/docs/guide/index.md"
+  printf 'Docs <span title="[Guide](docs/guide/index.md)">here</span>.\n' \
+    > "$tmp/inline_tag/README.md"
+  _commit inline_tag
+  _case "link in an inline HTML attribute is not an index link" 1 inline_tag
+
+  # 40. ...but a real link sitting NEXT TO inline HTML still counts. Blanking
+  #     a tag must not take the sentence around it.
+  _scaffold inline_tag_ok
+  printf '# A\n' > "$tmp/inline_tag_ok/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/inline_tag_ok/docs/guide/index.md"
+  printf 'See <b>the</b> [Guide index](docs/guide/index.md) for everything.\n' \
+    > "$tmp/inline_tag_ok/README.md"
+  _commit inline_tag_ok
+  _case "link beside inline HTML still counts" 0 inline_tag_ok
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
