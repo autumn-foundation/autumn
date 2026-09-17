@@ -451,6 +451,35 @@ pub(super) fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Forms",
+            "Translated transition controls",
+            {
+                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
+
+                // Same shape as "Transition controls", with the group label and
+                // one button text overridden. A target state left out of
+                // `.buttons(...)` keeps the default "Mark as {state}" text —
+                // here that is the untranslated "archived" edge.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                let labels = TransitionLabels::new()
+                    .group("Estado del pedido")
+                    .buttons(&[("published", "Publicar")]);
+                transition_controls_with_labels(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                    &labels,
+                )
+            }
+        },
+        story! {
             "Display",
             "Comment thread",
             {

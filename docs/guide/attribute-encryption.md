@@ -330,3 +330,17 @@ microsecond), so the budget is met comfortably.
 * No KMS integration, no per-row data keys, no searchable encryption beyond
   deterministic equality, no format-preserving encryption. See the issue's
   "Out of Scope" for the roadmap.
+
+## When the operator must not read the value
+
+Attribute encryption protects a column against a stolen disk or a database dump.
+It does **not** protect it against the operator: the server holds the keys, so it
+can read every encrypted column it serves.
+
+For the fields where "trust the host" is the adoption blocker — health, legal,
+financial or messaging data — see
+[confidential fields](confidential-fields.md). A `#[confidential]` column is
+sealed client side under a key the server never receives, so a breach, a
+subpoena or a leaked backup exposes only ciphertext. The two compose by column:
+encrypt the fields the application's own logic needs, and seal the fields it
+does not.
