@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **💵 Money as a framework primitive: typed `Money<C>` and an enforced
+  double-entry ledger (issue #1837):** currency lived only in the view layer
+  (`format::number_to_currency` formats a bare `Decimal`), idempotency stopped
+  at the HTTP door (`idempotency.rs` is an `Idempotency-Key` middleware), and
+  there was no ledger at all — so every app that moved money hand-rolled one.
+  `autumn_web::money` adds the primitive, with **zero new dependencies**.
+  - `Money<C>` is an amount in one currency, held as an `i64` count of minor
+    units. The currency is a type parameter, so adding `Money<Usd>` to
+    `Money<Eur>` does not compile. There is **no `f64`** in the value or in any
+    operation on it, and a unit test reads the module source to keep it that
+    way. There are no `+`/`-` operators, because an operator cannot report an
+    overflow: `checked_add`, `checked_sub`, `checked_neg`, `checked_abs`,
+    `checked_mul` and `try_sum` each return `Result<_, MoneyError>`.
+  - `AnyMoney` is the same value with the currency carried as data, for a
+    ledger row whose currency is a `TEXT` column. It rejects what `Money<C>`
+    refuses to compile, with `MoneyError::CurrencyMismatch`.
+  - Rounding is never implicit. `Money::from_decimal` names one of `HalfUp`,
+    `HalfEven`, `HalfDown`, `TowardZero`, `AwayFromZero`, `Floor` or `Ceiling`;
+    `from_decimal_exact` refuses to round at all. `allocate` splits by weights
+    with the largest-remainder method, so the parts always sum back to the
+    whole — a dollar in three is 34/33/33, not 33/33/33 and a lost cent.
+  - 34 ISO 4217 currencies, covering 0, 2 and 3 minor digits.
+  - `autumn_web::money::ledger` is an append-only, double-entry store over
+    three `_autumn_ledger_*` tables. `post` refuses a transaction whose debits
+    do not equal its credits **before its first `INSERT`**, and also refuses
+    mixed currencies, a one-sided transaction, one that moves nothing, a
+    posting whose currency the account does not hold, and a negative amount
+    (the sign belongs to the side, which keeps `i64::MIN` out of the ledger).
+  - Posting twice posts once. Each transaction carries an idempotency key with
+    a `UNIQUE` index behind it; the second call returns
+    `PostOutcome::Replayed` carrying the first call's transaction. The key can
+    be one you already have (`IdempotencyKey::new`) or **derived from the
+    postings themselves** (`IdempotencyKey::derive`), which is what makes a
+    retry collapse with nothing for the caller to remember. The same key for
+    *different* money is a `KeyReuse` conflict, not a silent wrong replay —
+    a stored request hash over the normalized postings is what tells them
+    apart.
+  - `post` takes the connection, so it runs inside `Db::tx` with the
+    application rows the money justifies: they commit or roll back together,
+    and a rolled-back post frees its idempotency key again.
+  - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
+    `DELETE` of a transaction or a posting. `ledger::balance` sums an
+    account's postings; `ledger::trial_balance` makes the global zero-sum
+    invariant queryable from a job or a health check.
+  - One configurable policy per account: `Account::disallow_negative()`. The
+    check reads the balance under `SELECT ... FOR UPDATE`, so two concurrent
+    postings cannot both pass it.
+  - `MoneyError` and `LedgerError` map to real statuses through `AutumnError` —
+    422 for a refused value or posting, 409 for a reused key or a refused
+    negative balance.
+  - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
+    runs Docker-free on every push; it includes the issue's fault-injection
+    metric — 64 logical charges, each submitted two to four times with a share
+    of the attempts killed mid-post, ending with exactly one balanced
+    transaction per charge and `sum(debits) == sum(credits)` globally.
+    `tests/integration/money_ledger_postgres.rs` proves the Postgres fork and
+    the races only it can show: eight connections posting the same charge at
+    once collapse to one transaction, and two concurrent payouts from a float
+    that covers one leave exactly one. See `docs/guide/money.md`.
 - **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
   `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
   rollout halts. `autumn deploy status --strict` sends one when it finds

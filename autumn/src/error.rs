@@ -255,6 +255,19 @@ where
             status = constela_err.http_status();
         }
 
+        // Money (#1837). A value that cannot be built or combined, and a
+        // posting the double-entry rules refuse, are both malformed input
+        // rather than a server fault. A reused idempotency key and a refused
+        // negative balance are state conflicts, so they take 409. Mapped by
+        // downcast for the reason given on the Constela arm above.
+        if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
+            status = money_err.http_status();
+        }
+        #[cfg(feature = "db")]
+        if let Some(ledger_err) = any_err.downcast_ref::<crate::money::ledger::LedgerError>() {
+            status = ledger_err.http_status();
+        }
+
         if matches!(
             any_err.downcast_ref::<crate::lock::LockError>(),
             Some(

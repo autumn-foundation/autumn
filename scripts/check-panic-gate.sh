@@ -129,6 +129,10 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
   autumn/src/search.rs:db
+  # Money and the double-entry ledger (#1837). A posting runs in a request
+  # handler, and a panic there is a half-written charge.
+  autumn/src/money/mod.rs:default
+  autumn/src/money/ledger.rs:db
   autumn/src/cluster/mod.rs:default
   autumn/src/cluster/counter.rs:default
   autumn/src/cluster/membership.rs:default
