@@ -1352,7 +1352,13 @@ def readable(text, resolved=None):
                 in_paragraph = False
                 i = eol + 1 if eol < n else n
                 continue
-            if indent == 0 and not LIST_ITEM.match(content):
+            # A line that falls BELOW the content column leaves the item, so
+            # the threshold goes back to the margin. With a wide marker the
+            # two differ: `100. item` puts content at column five, and a
+            # four-space line under it is outside the item and is therefore
+            # ordinary indented code — which a fixed `indent == 0` test
+            # never noticed, because four is not zero.
+            if (indent == 0 or indent < list_col) and not LIST_ITEM.match(content):
                 in_list = False
                 list_col = 0
             # Code opens four columns past the CONTENT column, which is the
@@ -5143,6 +5149,19 @@ self_test() {
     > "$tmp/margin_code_four/README.md"
   _commit margin_code_four
   _case "four spaces at the margin is still code" 1 margin_code_four
+
+  # 251. A WIDE marker puts the content column past four, so a four-space
+  #      line under `100. item` is below it, leaves the item, and is
+  #      ordinary indented code at the margin. Testing `indent == 0` for
+  #      the end of a list never saw this, because four is not zero.
+  _scaffold list_wide_marker
+  printf '# A\n' > "$tmp/list_wide_marker/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_wide_marker/docs/guide/index.md"
+  printf '100. item\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/list_wide_marker/README.md"
+  _commit list_wide_marker
+  _case "a line below the content column leaves the item" 1 list_wide_marker
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
