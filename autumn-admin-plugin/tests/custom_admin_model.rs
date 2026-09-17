@@ -45,6 +45,9 @@ use autumn_admin_plugin::{
     AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, AdminPlugin, ListParams,
     ListResult, SortDirection,
 };
+use autumn_web::confidential::{BlindIndex, FieldContext, RootKey, Sealed};
+use autumn_web::prelude::*;
+use autumn_web::test::{TestApp, TestClient};
 use diesel_async::pooled_connection::deadpool::Pool;
 use serde_json::Value;
 
@@ -549,4 +552,349 @@ async fn every_built_in_model_method_refuses_on_sqlite() {
             );
         }},
     }
+}
+
+// ── #1771: `#[confidential]` columns stay masked across the admin HTTP surface ──
+//
+// `render_cell_value`, `render_detail_value`, `render_form_widget` and
+// `csv_export_columns` in `autumn-admin-plugin` all special-case a registered
+// `#[confidential]` column by name (see `templates.rs`, `traits.rs` and
+// `routes.rs`) — but nothing in this crate's own test suite drove that through
+// the real admin routes. `token_admin_db.rs` et al. call `AdminModel` methods
+// directly; `custom_admin_model.rs`'s own tests above never touch HTTP either.
+// This proves the redaction contract holds for an application-registered model
+// with a real `Sealed`/`BlindIndex` pair, over the router `AdminPlugin` builds.
+
+diesel::table! {
+    admin_sealed_notes (id) {
+        id -> BigInt,
+        owner_id -> Text,
+        title -> Text,
+        sealed_body -> Text,
+        sealed_body_bidx -> Text,
+    }
+}
+
+/// Registers `sealed_body` as a confidential column in this binary's
+/// `inventory` registry — the same mechanism
+/// `autumn/tests/integration/confidential_model.rs` relies on, just declared
+/// on an application-owned table instead of a framework one. Never queried
+/// through its own generated methods (the admin model below reads the table
+/// directly), so it exists only for this registration.
+#[autumn_web::model(table = "admin_sealed_notes")]
+pub struct AdminSealedNote {
+    pub id: i64,
+    pub owner_id: String,
+    pub title: String,
+    #[confidential(blind_index)]
+    pub sealed_body: Sealed,
+    pub sealed_body_bidx: BlindIndex,
+}
+
+/// The application's admin registration for `admin_sealed_notes`.
+#[derive(Debug, Default, Clone)]
+struct SealedNoteAdminModel;
+
+/// One row read back for the list/detail views.
+#[derive(diesel::QueryableByName)]
+struct SealedNoteRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    owner_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    title: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    sealed_body: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    sealed_body_bidx: String,
+}
+
+impl SealedNoteRow {
+    fn into_json(self) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "owner_id": self.owner_id,
+            "title": self.title,
+            "sealed_body": self.sealed_body,
+            "sealed_body_bidx": self.sealed_body_bidx,
+        })
+    }
+}
+
+impl AdminModel for SealedNoteAdminModel {
+    fn slug(&self) -> &'static str {
+        "admin_sealed_notes"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Sealed Note"
+    }
+
+    fn display_name_plural(&self) -> &'static str {
+        "Sealed Notes"
+    }
+
+    fn fields(&self) -> Vec<AdminField> {
+        vec![
+            AdminField::new("owner_id", AdminFieldKind::Text),
+            AdminField::new("title", AdminFieldKind::Text).searchable(),
+            // Neither confidential column is marked `.encrypted()` — that flag
+            // is for `#[encrypted]`. The masking under test here is driven
+            // entirely by the name-based `confidential::is_confidential_column_name`
+            // lookup, not by anything set on `AdminField`.
+            AdminField::new("sealed_body", AdminFieldKind::Text),
+            AdminField::new("sealed_body_bidx", AdminFieldKind::Text),
+        ]
+    }
+
+    fn supports_csv_export(&self) -> bool {
+        true
+    }
+
+    fn list(&self, pool: &AdminPool, params: ListParams) -> AdminFuture<'_, ListResult> {
+        use diesel_async::RunQueryDsl;
+
+        let pool = pool.clone();
+        Box::pin(async move {
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+            let (offset, limit) = params.sql_offset_limit();
+            let rows: Vec<SealedNoteRow> = diesel::sql_query(
+                "SELECT id, owner_id, title, sealed_body, sealed_body_bidx \
+                 FROM admin_sealed_notes ORDER BY id LIMIT $1 OFFSET $2",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .bind::<diesel::sql_types::BigInt, _>(offset)
+            .load(&mut conn)
+            .await
+            .map_err(|e| AdminError::Database(e.to_string()))?;
+            let total = rows.len() as u64;
+            Ok(ListResult {
+                total,
+                page: params.page,
+                per_page: params.per_page,
+                records: rows.into_iter().map(SealedNoteRow::into_json).collect(),
+            })
+        })
+    }
+
+    fn get(&self, pool: &AdminPool, id: i64) -> AdminFuture<'_, Option<Value>> {
+        use diesel::OptionalExtension;
+        use diesel_async::RunQueryDsl;
+
+        let pool = pool.clone();
+        Box::pin(async move {
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+            diesel::sql_query(
+                "SELECT id, owner_id, title, sealed_body, sealed_body_bidx \
+                 FROM admin_sealed_notes WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .get_result::<SealedNoteRow>(&mut conn)
+            .await
+            .optional()
+            .map(|r| r.map(SealedNoteRow::into_json))
+            .map_err(|e| AdminError::Database(e.to_string()))
+        })
+    }
+
+    fn create(&self, _pool: &AdminPool, _data: Value) -> AdminFuture<'_, Value> {
+        Box::pin(async move { Err(AdminError::Other("not supported by this fixture".into())) })
+    }
+
+    fn update(&self, _pool: &AdminPool, _id: i64, _data: Value) -> AdminFuture<'_, Value> {
+        Box::pin(async move { Err(AdminError::Other("not supported by this fixture".into())) })
+    }
+
+    fn delete(&self, _pool: &AdminPool, _id: i64) -> AdminFuture<'_, ()> {
+        Box::pin(async move { Err(AdminError::Other("not supported by this fixture".into())) })
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "one backend arm is dropped in any given build; the other uses this"
+)]
+const SEALED_PG_DDL: &str = "CREATE TABLE admin_sealed_notes ( \
+     id BIGSERIAL PRIMARY KEY, \
+     owner_id TEXT NOT NULL, \
+     title TEXT NOT NULL, \
+     sealed_body TEXT NOT NULL, \
+     sealed_body_bidx TEXT NOT NULL \
+ )";
+#[allow(
+    dead_code,
+    reason = "one backend arm is dropped in any given build; the other uses this"
+)]
+const SEALED_SQLITE_DDL: &str = "CREATE TABLE admin_sealed_notes ( \
+     id INTEGER PRIMARY KEY AUTOINCREMENT, \
+     owner_id TEXT NOT NULL, \
+     title TEXT NOT NULL, \
+     sealed_body TEXT NOT NULL, \
+     sealed_body_bidx TEXT NOT NULL \
+ )";
+
+/// Build a pool with an `admin_sealed_notes` table on the active backend.
+async fn setup_sealed() -> (AdminPool, Box<dyn std::any::Any + Send>) {
+    ::autumn_web::backend_select! {
+        pg => {{
+            let fixture = pg_fixture::setup(SEALED_PG_DDL).await;
+            (fixture.pool.clone(), Box::new(fixture) as Box<dyn std::any::Any + Send>)
+        }},
+        sqlite => {{
+            use diesel_async::RunQueryDsl;
+
+            let n = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let config = ::autumn_web::config::DatabaseConfig {
+                url: Some(format!(
+                    "sqlite://file:admin_sealed_notes_{n}?mode=memory&cache=shared"
+                )),
+                primary_pool_size: Some(1),
+                ..Default::default()
+            };
+            let pool: AdminPool = ::autumn_web::db::create_pool(&config)
+                .expect("build a sqlite pool")
+                .expect("a url is configured");
+            {
+                let mut conn = pool.get().await.expect("checkout a sqlite connection");
+                diesel::sql_query(SEALED_SQLITE_DDL)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("create admin_sealed_notes");
+            }
+            (pool.clone(), Box::new(pool) as Box<dyn std::any::Any + Send>)
+        }},
+    }
+}
+
+/// Insert one row and return the envelope and blind-index token it carries.
+async fn seed_sealed_note(pool: &AdminPool) -> (String, String) {
+    use diesel_async::RunQueryDsl;
+
+    let key = RootKey::generate();
+    let ctx = FieldContext::new("admin_sealed_notes", "sealed_body", "user-9");
+    let plaintext = "AUTUMN-CONFIDENTIAL-ADMIN-MARKER-diagnosis-pending";
+    let envelope = key
+        .seal(&ctx, plaintext)
+        .expect("seal")
+        .as_envelope()
+        .to_owned();
+    let token = key.blind_index(&ctx, plaintext).as_token().to_owned();
+
+    let mut conn = pool.get().await.expect("checkout a connection");
+    diesel::sql_query(
+        "INSERT INTO admin_sealed_notes (owner_id, title, sealed_body, sealed_body_bidx) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind::<diesel::sql_types::Text, _>("user-9")
+    .bind::<diesel::sql_types::Text, _>("checkup notes")
+    .bind::<diesel::sql_types::Text, _>(&envelope)
+    .bind::<diesel::sql_types::Text, _>(&token)
+    .execute(&mut conn)
+    .await
+    .expect("insert the seeded row");
+
+    (envelope, token)
+}
+
+#[autumn_web::post("/login-admin")]
+async fn login_admin_for_sealed_notes(session: Session) -> &'static str {
+    session.insert("user_id", "admin-1").await;
+    session.insert("role", "admin").await;
+    "ok"
+}
+
+fn build_sealed_notes_client(pool: AdminPool) -> TestClient {
+    TestApp::new()
+        .routes(routes![login_admin_for_sealed_notes])
+        .with_db(pool)
+        .plugin(
+            AdminPlugin::new()
+                .require_role("admin".to_owned())
+                .register(SealedNoteAdminModel),
+        )
+        .build()
+}
+
+#[tokio::test]
+#[ignore = "needs a database: SQLite under --features autumn-web/sqlite, else Postgres"]
+async fn confidential_columns_stay_masked_across_the_admin_http_surface() {
+    let (pool, _guard) = setup_sealed().await;
+    let (envelope, token) = seed_sealed_note(&pool).await;
+    let client = build_sealed_notes_client(pool);
+    client.post("/login-admin").send().await.assert_ok();
+
+    let list_html = client.get("/admin/admin_sealed_notes").send().await.text();
+    assert!(
+        !list_html.contains(&envelope),
+        "list view must not leak the sealed envelope: {list_html}"
+    );
+    assert!(
+        !list_html.contains(&token),
+        "list view must not leak the blind-index token: {list_html}"
+    );
+    assert!(
+        list_html.contains("sealed for its owner"),
+        "list view must show the confidential-field mask: {list_html}"
+    );
+    assert!(
+        list_html.contains("checkup notes"),
+        "a non-confidential column must still render normally: {list_html}"
+    );
+
+    let detail_html = client
+        .get("/admin/admin_sealed_notes/1")
+        .send()
+        .await
+        .text();
+    assert!(
+        !detail_html.contains(&envelope),
+        "detail view must not leak the sealed envelope: {detail_html}"
+    );
+    assert!(
+        !detail_html.contains(&token),
+        "detail view must not leak the blind-index token: {detail_html}"
+    );
+    assert!(
+        detail_html.contains("sealed for its owner"),
+        "detail view must show the confidential-field mask: {detail_html}"
+    );
+
+    let edit_html = client
+        .get("/admin/admin_sealed_notes/1/edit")
+        .send()
+        .await
+        .text();
+    assert!(
+        !edit_html.contains(&envelope),
+        "edit form must not pre-fill the sealed envelope: {edit_html}"
+    );
+    assert!(
+        !edit_html.contains(&token),
+        "edit form must not pre-fill the blind-index token: {edit_html}"
+    );
+
+    let csv = client
+        .get("/admin/admin_sealed_notes/export.csv")
+        .send()
+        .await
+        .text();
+    assert!(
+        !csv.contains(&envelope),
+        "CSV export must not leak the sealed envelope: {csv}"
+    );
+    assert!(
+        !csv.contains(&token),
+        "CSV export must not leak the blind-index token: {csv}"
+    );
+    assert!(
+        !csv.contains("sealed_body"),
+        "CSV header must drop the confidential column and its blind-index companion: {csv}"
+    );
 }
