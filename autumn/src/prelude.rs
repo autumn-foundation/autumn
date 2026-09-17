@@ -36,6 +36,14 @@ pub use autumn_macros::{
     scheduled, secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 
+/// Service-to-service wire contracts (#1755): mark an endpoint, derive a DTO's
+/// wire shape, and check a caller's call sites against the callee.
+pub use crate::wire::NoBody;
+/// Generate a typed client for another Autumn service (#1755).
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
+pub use autumn_macros::{WireShape, contract_checked, endpoint};
+
 /// Declare a named agent authority envelope (#1691).
 pub use crate::authority_grant;
 /// Declare a handler agent-operable and check its effects against a grant (#1691).
@@ -70,6 +78,10 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Lazy database connection extractor. Use instead of `Db` alongside a body
+/// extractor. See [`crate::db::LazyDb`].
+#[cfg(feature = "db")]
+pub use crate::db::LazyDb;
 /// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
 #[cfg(feature = "db")]
 pub use crate::db::{IsolationLevel, TxOptions};

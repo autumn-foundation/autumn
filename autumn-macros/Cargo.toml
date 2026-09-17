@@ -31,6 +31,11 @@ syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
 proc-macro-crate.workspace = true
+# Wire-contract descriptors (issue #1755). `#[endpoint]` writes one JSON file
+# per service endpoint as a build artifact, and `#[contract_checked]` reads it
+# back to name the offending field in a diagnostic. Both are build-time only.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

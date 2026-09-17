@@ -74,7 +74,7 @@ use crate::state::AppState;
 /// ```
 #[must_use]
 pub fn app() -> AppBuilder {
-    AppBuilder {
+    let builder = AppBuilder {
         routes: Vec::new(),
         api_versions: Vec::new(),
         route_sources: Vec::new(),
@@ -162,6 +162,105 @@ pub fn app() -> AppBuilder {
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
         inbound_mail_router: None,
+    };
+    // Strip the edge lane's internal fallthrough-sentinel header from every
+    // outbound response, for every app — not only apps that call
+    // `with_edge_kv`. `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) sets
+    // this header on its 500 so the EDGE CAPSULE runtime knows to fall
+    // through to the origin; the same handler code also runs at the origin,
+    // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
+    // bug — hits that same 500 at the origin. Without this layer the internal
+    // header would leak straight to a real HTTP client. See
+    // `StripEdgeFallthroughSentinelLayer` below.
+    #[cfg(feature = "edge")]
+    let builder = builder.layer(StripEdgeFallthroughSentinelLayer);
+    builder
+}
+
+/// Removes [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
+///
+/// `autumn-edge` is substrate-agnostic on purpose: `extract.rs` cannot tell
+/// whether it is running at the edge or at the origin, so it always sets the
+/// sentinel on an `EdgeCacheUnavailable` response. Only the origin knows it is
+/// the origin, so only the origin strips the header before a real client ever
+/// sees it. The response body's actionable message is left untouched — only
+/// the internal signaling header is removed.
+///
+/// A bespoke `tower::Layer`, not `axum::middleware::from_fn`: this type's
+/// `TypeId` is what `router::is_idempotency_transparent_app_layer` matches
+/// on to recognize this one framework-owned registration without forcing
+/// fail-closed idempotency on every app built with the `edge` feature. A
+/// name (even a function's) is not unique enough for that — a user's own
+/// `from_fn` middleware could share it by coincidence; a crate-private type
+/// cannot.
+#[cfg(feature = "edge")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StripEdgeFallthroughSentinelLayer;
+
+#[cfg(feature = "edge")]
+impl<S> tower::Layer<S> for StripEdgeFallthroughSentinelLayer {
+    type Service = StripEdgeFallthroughSentinelService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StripEdgeFallthroughSentinelService { inner }
+    }
+}
+
+/// `true` for a `custom_layers` registration that [`app()`] installs itself
+/// rather than a user calling [`AppBuilder::layer`] — [`get_layer_types`](AppBuilder::get_layer_types)
+/// filters these out to keep its documented "user-installed only" contract,
+/// even though they share the same underlying `custom_layers` vector as a
+/// real user layer (needed so the router-build step applies them the same
+/// way, in the same registration-order pass).
+#[cfg(feature = "edge")]
+fn is_framework_owned_layer(type_id: TypeId) -> bool {
+    type_id == TypeId::of::<StripEdgeFallthroughSentinelLayer>()
+}
+
+#[cfg(not(feature = "edge"))]
+const fn is_framework_owned_layer(_type_id: TypeId) -> bool {
+    false
+}
+
+/// Tower [`Service`](tower::Service) produced by
+/// [`StripEdgeFallthroughSentinelLayer`].
+#[cfg(feature = "edge")]
+#[derive(Clone, Debug)]
+pub(crate) struct StripEdgeFallthroughSentinelService<S> {
+    inner: S,
+}
+
+#[cfg(feature = "edge")]
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>>
+    for StripEdgeFallthroughSentinelService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let response = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = response.await?;
+            response
+                .headers_mut()
+                .remove(autumn_edge::FALLTHROUGH_SENTINEL);
+            Ok(response)
+        })
     }
 }
 
@@ -1231,12 +1330,16 @@ impl AppBuilder {
     /// Returns the registered custom layer types in registration order.
     ///
     /// This includes only user-installed layers from
-    /// [`AppBuilder::layer`], not framework-managed middleware.
+    /// [`AppBuilder::layer`], not framework-managed middleware — even one
+    /// installed through this same `custom_layers` vector internally, such
+    /// as the `edge` feature's own sentinel-strip layer, which this filters
+    /// back out.
     #[must_use]
     pub fn get_layer_types(&self) -> Vec<TypeId> {
         self.custom_layers
             .iter()
             .map(|registered| registered.type_id)
+            .filter(|type_id| !is_framework_owned_layer(*type_id))
             .collect()
     }
 
@@ -4584,6 +4687,11 @@ impl AppBuilder {
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
         let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
+        // The mTLS trust-store reloader (#1640), when
+        // `[server.tls.client_auth]` is active. Spawned beside the certificate
+        // reloader below so a CA rotation lands without a restart.
+        #[cfg(feature = "tls")]
+        let mut client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader> = None;
 
         // Carries the ACME challenge listener + renewal task wiring from the TLS
         // bind path to the sibling tasks spawned once `server_shutdown` exists.
@@ -4753,8 +4861,9 @@ impl AppBuilder {
                         }
                     } else {
                         match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                            Ok((tls_listener, reload)) => {
+                            Ok((tls_listener, reload, client_reload)) => {
                                 tls_reload_state = Some(reload);
+                                client_trust_reload = client_reload;
                                 (
                                     BoundListener::Tls(tls_listener),
                                     format!("https://{addr}"),
@@ -4771,8 +4880,9 @@ impl AppBuilder {
                     }
                     #[cfg(not(feature = "acme"))]
                     match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                        Ok((tls_listener, reload)) => {
+                        Ok((tls_listener, reload, client_reload)) => {
                             tls_reload_state = Some(reload);
+                            client_trust_reload = client_reload;
                             (
                                 BoundListener::Tls(tls_listener),
                                 format!("https://{addr}"),
@@ -4998,6 +5108,18 @@ impl AppBuilder {
             });
         }
 
+        // mTLS trust-store hot reload (#1640): poll the client-CA bundle and
+        // CRL and swap the verifier when either changes, so a CA rotation — or
+        // a newly published revocation — lands without a restart and without
+        // dropping established connections.
+        #[cfg(feature = "tls")]
+        if let Some(reload) = client_trust_reload.take() {
+            let reload_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                reload.run(reload_shutdown).await;
+            });
+        }
+
         // ACME (issue #1608): bind the `:80` HTTP-01 challenge + HTTP→HTTPS
         // redirect listener and spawn the renewal loop, each a child of
         // `server_shutdown` so they tear down with the main server. The renewal
@@ -5013,9 +5135,21 @@ impl AppBuilder {
                 https_port,
                 dns01,
                 custom_domains,
+                client_trust_reload: acme_client_trust_reload,
             } = bind_state;
             // Read before `custom_domains` is moved into the spawn below.
             let custom_domains_enabled = custom_domains.is_some();
+            // The mTLS trust store rotates on this arm too (#1640). Spawned
+            // HERE, not hoisted into the slot the static-cert arm fills: that
+            // slot is drained above this block, so an assignment to it would
+            // never be read and the ACME arm's reloader would never run.
+            #[cfg(feature = "tls")]
+            if let Some(reload) = acme_client_trust_reload {
+                let reload_shutdown = server_shutdown.child_token();
+                tokio::spawn(async move {
+                    reload.run(reload_shutdown).await;
+                });
+            }
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -5258,21 +5392,33 @@ impl AppBuilder {
                         .await
                 })
             }
-            // HTTPS arm: mirrors the TCP arm. The peer is a real TCP
-            // `SocketAddr`, so the same `ConnectInfo<SocketAddr>`,
-            // `TrustedProxiesLayer`/`ClientAddr` resolution, SSE and wss
-            // streaming, and shutdown wiring apply unchanged; only the rustls
-            // handshake inside the listener's `accept` differs. The no-op `tap_io`
-            // wrapper lets axum's blanket `Connected<IncomingStream<TapIo<L, F>>>
-            // for L::Addr` supply the peer `SocketAddr`, because the concrete
-            // `SocketAddr: Connected` impl exists only for `tokio::net::TcpListener`.
+            // HTTPS arm: mirrors the TCP arm. The connect info is
+            // `TlsConnectInfo` rather than a bare `SocketAddr` so the verified
+            // mTLS client identity (#1640) rides along with the peer address;
+            // `ClientIdentityLayer` immediately re-stamps
+            // `ConnectInfo<SocketAddr>` from it, so `TrustedProxiesLayer` /
+            // `ClientAddr` resolution, SSE and wss streaming, rate limiting and
+            // shutdown wiring all behave exactly as on plain TCP. Only the
+            // rustls handshake inside the listener's `accept` differs.
             #[cfg(feature = "tls")]
             BoundListener::Tls(listener) => {
-                use axum::serve::ListenerExt as _;
-                let listener = listener.tap_io(|_io| {});
+                // Applied inside the connect-info layer (which
+                // `into_make_service_with_connect_info` installs outermost), so
+                // this sees `ConnectInfo<TlsConnectInfo>` and everything below
+                // it sees `ConnectInfo<SocketAddr>` plus the identity.
+                //
+                // The route-level mTLS requirement (#1640) is deliberately NOT
+                // applied here. It lives inside the router
+                // (`build_client_cert_requirement_layer`), so the MCP dispatch
+                // clone traverses it and a rejection flows through the rest of
+                // the response stack. Only the identity plumbing belongs at
+                // this boundary, because `ConnectInfo<TlsConnectInfo>` exists
+                // nowhere else.
+                let service =
+                    tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                        std::net::SocketAddr,
+                        crate::tls::TlsConnectInfo,
                     >(service);
                 tokio::spawn(async move {
                     axum::serve(listener, make_service)
@@ -9217,7 +9363,14 @@ fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, crate::tls::CertReloader), crate::tls::TlsError> {
+) -> Result<
+    (
+        crate::tls::TlsListener,
+        crate::tls::CertReloader,
+        Option<crate::tls::client_auth::ClientTrustReloader>,
+    ),
+    crate::tls::TlsError,
+> {
     let provider = crate::tls::crypto_provider();
     // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
     // static-cert mode (the only mode that reaches this function; ACME mode is
@@ -9242,15 +9395,62 @@ fn build_tls_listener(
         // A zero interval would busy-loop; clamp to at least one second.
         std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
     )?;
-    let server_config = crate::tls::build_server_config(
+    let (client_verifier, client_reload) = build_client_auth(cfg, &provider)?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver),
+        std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+        client_verifier,
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
     // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    Ok((listener, reload))
+    Ok((listener, reload, client_reload))
+}
+
+/// The mTLS wiring `build_client_auth` hands back: the verifier the listener
+/// enforces, and the reloader that rotates its trust store. Both `None` when
+/// client auth is off.
+#[cfg(feature = "tls")]
+type ClientAuthWiring = (
+    Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    Option<crate::tls::client_auth::ClientTrustReloader>,
+);
+
+/// Build the mTLS client-certificate verifier and its trust-store reloader from
+/// `[server.tls.client_auth]` (issue #1640).
+///
+/// `(None, None)` — the identical #1603 server-only path — whenever the section
+/// is absent or `mode = "off"`. Any problem with the bundle or CRL is returned
+/// so the caller fails fast at boot with the path in the message.
+#[cfg(feature = "tls")]
+fn build_client_auth(
+    cfg: &crate::config::TlsConfig,
+    provider: &std::sync::Arc<rustls::crypto::CryptoProvider>,
+) -> Result<ClientAuthWiring, crate::tls::TlsError> {
+    if !cfg.client_auth_active() {
+        return Ok((None, None));
+    }
+    // `client_auth_active()` is true only for a present section with a mode
+    // other than `off`, and `ClientAuthConfig::validate()` (run pre-bind)
+    // guarantees such a section names a bundle.
+    let client_auth = cfg
+        .client_auth
+        .as_ref()
+        .expect("validated: an active client_auth section is present");
+    let bundle = client_auth
+        .ca_bundle_path
+        .clone()
+        .expect("validated: an active client_auth section sets ca_bundle_path");
+    let (verifier, reloader) = crate::tls::client_auth::ClientTrustReloader::load(
+        bundle,
+        client_auth.crl_path.clone(),
+        client_auth.mode,
+        std::sync::Arc::clone(provider),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(client_auth.reload_interval_secs.max(1)),
+    )?;
+    Ok((Some(verifier), Some(reloader)))
 }
 
 /// Carries the ACME challenge-listener + renewal-task wiring from the bind path
@@ -9268,6 +9468,10 @@ struct AcmeBindState {
     /// The tenant custom-domain wiring (#1635), present exactly when
     /// `[server.tls.acme.custom_domains] enabled = true`.
     custom_domains: Option<CustomDomainBindState>,
+    /// The mTLS trust-store reloader (#1640), present exactly when
+    /// `[server.tls.client_auth]` is active. Spawned beside the ACME renewal
+    /// task, so a CA rotation lands without a restart on this arm too.
+    client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader>,
 }
 
 /// Everything the custom-domain orchestrator needs, built at bind time so the
@@ -9443,9 +9647,17 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    let server_config = crate::tls::build_server_config_with_resolver(
+    // Client auth is orthogonal to how the SERVER's certificate is provisioned
+    // (#1640), so the ACME arm wires the same verifier the static-cert arm does.
+    // Without this a `[server.tls.client_auth] mode = "required"` deployment on
+    // ACME would boot, report healthy, and never request a certificate — the
+    // one misconfiguration that fails OPEN.
+    let (client_verifier, client_reload) =
+        build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
         cert_resolver,
+        client_verifier,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9484,6 +9696,7 @@ async fn build_acme_tls_listener(
             https_port,
             dns01: acme_cfg.dns.is_some(),
             custom_domains,
+            client_trust_reload: client_reload,
         },
     ))
 }
@@ -16602,6 +16815,186 @@ mod tests {
                 "Accept-Language: {accept_language}"
             );
         }
+    }
+
+    // ── The origin never leaks the edge lane's internal sentinel (issue
+    //    #2244, item 4) ────────────────────────────────────────────────────
+    //
+    // `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) answers with the
+    // fallthrough sentinel header so the EDGE CAPSULE runtime knows to fall
+    // through to the origin. The same handler code also runs at the origin —
+    // `extract.rs` cannot special-case which substrate it is on — so an app
+    // that forgets to call `with_edge_kv` (a wiring bug) hits this same 500
+    // at the origin, and a real HTTP client must never see the internal
+    // header.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn an_uninjected_edge_seam_never_leaks_the_fallthrough_sentinel_to_a_real_client() {
+        async fn note(_cache: autumn_edge::EdgeCache) -> &'static str {
+            "never reached: extraction fails first"
+        }
+
+        // The real `app()` entry point, `with_edge_kv` NEVER called — the
+        // wiring bug this test is about.
+        let custom_layers = app().custom_layers;
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/edge/note",
+                handler: axum::routing::get(note),
+                name: "note",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/edge/note",
+                    operation_id: "note",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &AutumnConfig::default(),
+            AppState::for_test(),
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        let request = axum::http::Request::builder()
+            .uri("/edge/note")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.expect("response");
+
+        // Existing behavior, unchanged: still a 500 with an actionable body.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The fix: the internal sentinel never reaches a real client.
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL),
+            "the origin must strip the internal fallthrough sentinel: {:?}",
+            response.headers()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("with_edge_kv"),
+            "the actionable message must survive: {body}"
+        );
+    }
+
+    /// `app()` registers the sentinel-strip layer through the ordinary
+    /// `AppBuilder::layer` path, which the idempotency machinery otherwise
+    /// treats as "opaque" (forcing fail-closed replay) for any custom layer
+    /// it does not specifically recognize — see
+    /// `router::is_idempotency_transparent_app_layer`. Without that
+    /// recognition, every app built with the `edge` feature on would force
+    /// fail-closed idempotency, whether or not it ever calls `with_edge_kv`.
+    /// This pins the real registration's `type_name` against the substring
+    /// that recognizer matches on, so the two sides cannot drift apart.
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
+        let registration = &app().custom_layers[0];
+        assert_eq!(
+            registration.type_id,
+            std::any::TypeId::of::<StripEdgeFallthroughSentinelLayer>(),
+            "the real registration's type_id no longer matches what \
+             router::is_idempotency_transparent_app_layer looks for"
+        );
+    }
+
+    /// `get_layer_types()` documents "only user-installed layers", but the
+    /// sentinel-strip layer above shares its underlying storage
+    /// (`custom_layers`) with real `AppBuilder::layer` calls so the
+    /// router-build step applies both the same way. Without filtering it
+    /// back out, a plugin (or a test like
+    /// `middleware_introspection::get_layer_types_returns_registration_order`)
+    /// asserting an exact layer list sees this internal registration leak in
+    /// as an unexpected leading entry (Codex review on #2739, round 6, P1).
+    #[cfg(feature = "edge")]
+    #[test]
+    fn get_layer_types_excludes_the_framework_owned_sentinel_strip_layer() {
+        #[derive(Clone, Copy)]
+        struct UserLayer;
+        impl<S> tower::Layer<S> for UserLayer {
+            type Service = S;
+            fn layer(&self, inner: S) -> S {
+                inner
+            }
+        }
+
+        let builder = app().layer(UserLayer);
+        assert_eq!(
+            builder.get_layer_types(),
+            vec![std::any::TypeId::of::<UserLayer>()],
+            "the framework's own sentinel-strip registration must not appear \
+             in the user-facing layer list"
+        );
+    }
+
+    /// The header-stripping behavior itself, independent of the router-level
+    /// idempotency classification test above.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn the_sentinel_strip_service_removes_the_header_and_keeps_the_body() {
+        use axum::response::IntoResponse as _;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let inner = tower::service_fn(|_req: axum::extract::Request| async move {
+            Ok::<_, std::convert::Infallible>(
+                (
+                    [(autumn_edge::FALLTHROUGH_SENTINEL, "missing_capability")],
+                    "actionable message",
+                )
+                    .into_response(),
+            )
+        });
+        let mut service = StripEdgeFallthroughSentinelLayer.layer(inner);
+        let request = axum::extract::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response: axum::response::Response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("infallible");
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, b"actionable message".as_slice());
     }
 
     #[cfg(feature = "i18n")]

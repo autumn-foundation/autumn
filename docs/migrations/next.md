@@ -108,6 +108,79 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### TLS: `TlsConfig`, `TlsError` and `SecurityDump` gain mTLS members (#1640)
+
+**Why:** mutual TLS needs a trust store in `[server.tls]`, error variants that
+name what went wrong with it, and a posture-manifest field for the routes that
+require it. Each is additive at the *config* and *document* level — an absent
+`[server.tls.client_auth]` section and a v3 manifest both behave exactly as
+before — but each also widens a Rust type that user code can name.
+
+Three types moved. You are affected only if your code constructs or matches one
+of them exhaustively; none of them changes meaning.
+
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // an exhaustive match over every variant
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+    client_auth: None,   // new: no client-certificate verification
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // `TlsError` is now `#[non_exhaustive]`; add a catch-all arm
+    _ => …,
+}
+```
+
+`autumn_web::route_listing::SecurityDump` gains `client_auth`, the snapshot the
+security-posture manifest reads. Fill it with `ClientAuthDump::off()` unless you
+are modelling an mTLS deployment. The type exists to carry the dump across the
+`autumn routes audit` boundary, so a literal construction is rare outside tests.
+
+`TlsError`, `ClientAuthMode`, `RejectionReason`, `CaInspection` and
+`CrlInspection` are all `#[non_exhaustive]` from this release, so the next
+variant or field added to any of them will not break you again.
+
+**Automation:** `manual` — the fix is a field initializer or a match arm whose
+correct value depends on what the surrounding code is modelling, so no codemod
+can choose it. Both shapes surface as a compiler error (`E0063` for the missing
+field, `E0004` for the non-exhaustive match), never as a silent behaviour change.
+
 ### Audit: `AuditEvent` gains a `metadata` field
 
 **Why:** A retention sweep has to record three facts — which dataset, what
@@ -167,6 +240,64 @@ Also additive, and requiring no change: `AuditSink` gains a **provided**
 sink stores audit events somewhere that can be pruned in place and you want
 `retention.audit_archives` to reach it — see
 [Data Retention for Framework-Owned Data](../guide/data-retention.md).
+
+### openapi: `Parameter` gains a `description` field
+
+**Why:** A `Query<T>` field that decodes as an array of objects
+(`?items[0][sku]=A-1`) has no OpenAPI `style` that describes it — neither
+RFC 6570 nor OAS 3.x define one. `Parameter` now carries a `description` so
+the generated spec names that encoding instead of staying silent about it
+(issue #2251).
+
+Only code that constructs a `Parameter` *by struct literal*, outside this
+crate, has to change. Every route macro and the OpenAPI generator itself
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+    description: None,
+};
+
+// …or, now that `Parameter` derives `Default`:
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    ..Default::default()
+};
+```
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+`..Default::default()`), which no mechanical rewrite can choose safely.
 
 ### SSG: `ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`, and generated pages carry their declared `Content-Type`
 
@@ -503,6 +634,42 @@ implementations. There is no default body on purpose: a store that silently did
 nothing would let the reaper evict live participants.
 
 **Automation:** `manual` — the body depends on how the store holds its state.
+
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
 
 ### Capacity contracts: three metadata structs gain fields
 
@@ -883,6 +1050,66 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### repository: `owner = column` next to `api = "..."` now requires `policy`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them. Declared on its own
+next to `api = "..."`, `owner` therefore compiled to a fully public REST API
+that read, at the declaration site, like a per-owner-scoped one: `GET <api>`
+returned every user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any
+authenticated caller read, overwrite, or delete any other user's row by id.
+
+`scope = Type` does not close this on its own either: it only filters `GET
+<api>`'s SQL query (a performance optimization for the list endpoint), and
+has no effect on `_api_get`/`_api_update`/`_api_delete` — only `policy =
+Type` gates those (`can_show`/`can_update`/`can_delete`). An initial version
+of this fix accepted `scope` as an alternative to `policy`, which still left
+every single-record route unguarded; that gap was caught in review before
+merge, so the gate now requires `policy` unconditionally.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes. So
+did adding `scope = Type` alone: the list endpoint would then filter
+correctly, but `GET`/`PUT`/`DELETE /api/notes/{id}` stayed wide open.
+
+**After (`{X.Z}`):** add `policy = Type`, comparing `ctx.user_id_i64()`
+against the owner column in `can_show`/`can_update`/`can_delete`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Keep `scope = Type` alongside `policy` if you also want the list endpoint's
+cheaper SQL-level filter instead of `policy`'s in-memory `can_show` sweep —
+`scope` is accepted as an addition to `policy`, never as a replacement for
+it. Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — what the policy actually checks is an application
+decision no codemod can make.
+
 ### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
 
 **Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and
@@ -1083,6 +1310,26 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
+**New `[server.tls.client_auth]` section** (additive; absent means the listener
+requests no client certificate, exactly as before). It turns #1603's TLS
+listener into a mutual-TLS one, verifying the caller against a PEM bundle of
+client CAs:
+
+```toml
+[server.tls.client_auth]
+mode           = "required"                          # off (default) | optional | required
+ca_bundle_path = "/etc/autumn/tls/client-ca.pem"     # one or more PEM CAs
+crl_path       = "/etc/autumn/tls/client-ca.crl.pem" # optional revocation list
+required_paths = ["/internal/"]                      # routes that demand a certificate
+```
+
+Startup fails, naming the path, when the bundle or CRL is missing, unparseable
+or empty; when `mode` is not `off` and no `ca_bundle_path` is set; and when
+`required_paths` is non-empty under `mode = "off"` (those routes would reject
+every request). Like the sibling `[server.tls.acme]` table, these keys have no
+`AUTUMN_SERVER__TLS__*` environment override. See the
+[TLS guide](../guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+
 **New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
 as before). It names a DNS provider and the *credentials-store key* holding that
 provider's API credential — never the credential itself. The section is
@@ -1141,6 +1388,36 @@ how fast an idle worker sees work another process enqueued. See
 `scheduler.lease_ttl_secs` and `scheduler.key_prefix`.
 
 ## Behavior changes
+
+### HTTPS: the listener's connect-info type changed (#1640)
+
+Only the **in-process TLS listener** (`[server.tls]`) is affected; the plain-TCP
+and Unix-socket paths are untouched.
+
+The HTTPS serve arm now hands axum a `TlsConnectInfo` (peer address plus the
+verified client identity, when there is one) instead of a bare `SocketAddr`, and
+a new framework layer immediately re-stamps `ConnectInfo<SocketAddr>` from it.
+So `ClientAddr`, trusted-proxy resolution, IP-keyed rate limiting, SSE and
+`wss://` all behave exactly as before, and a handler extracting
+`ConnectInfo<SocketAddr>` keeps compiling and keeps resolving the real peer.
+
+One case needs a change: a handler that extracted the HTTPS connect-info by some
+other route — say a custom layer reading `ConnectInfo<SocketAddr>` *outside* the
+framework stack, or a test that wires `axum::serve` over
+`autumn_web::tls::TlsListener` by hand. Wire such a test the way the framework
+does:
+
+```rust
+use autumn_web::tls::{TlsConnectInfo, client_auth::ClientIdentityLayer};
+
+let service = tower::Layer::layer(&ClientIdentityLayer, router);
+let make_service =
+    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+        TlsConnectInfo,
+    >(service);
+```
+
+The previous `listener.tap_io(|_io| {})` wrapper is no longer needed.
 
 ### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
 

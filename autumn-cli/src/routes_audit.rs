@@ -17,8 +17,8 @@
 use std::process::Command;
 
 use autumn_web::route_listing::{
-    AuthorizeBindingInfo, CsrfDump, HeadersDump, OMITTED_ROUTES_MARKER, SECURITY_CONFIG_MARKER,
-    SecurityDump,
+    AuthorizeBindingInfo, ClientAuthDump, CsrfDump, HeadersDump, OMITTED_ROUTES_MARKER,
+    SECURITY_CONFIG_MARKER, SecurityDump,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +39,13 @@ use crate::routes;
 /// `excluded` keeps `policy_registration` for that runtime fact and gains
 /// `repository_policy_bindings` for the auto-API guards whose policy type the
 /// macro discards. The v2 dimensions are unchanged.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 (#1640) appends the `mtls` dimension: which routes demand a verified
+/// client certificate, and the listener mode behind them, read from
+/// `[server.tls.client_auth]`. Purely additive — every v3 dimension keeps its
+/// shape, and a v3 document reads as "no route requires mTLS" rather than
+/// failing the differ.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 /// Options controlling `autumn routes audit`.
 pub struct AuditOptions<'a> {
@@ -103,7 +109,7 @@ impl AuditRoute {
     }
 }
 
-// ── Manifest document (schema v3, #1627) ────────────────────────────────────
+// ── Manifest document (schema v4, #1627, #1640) ─────────────────────────────
 
 /// Provenance class of a manifest dimension. A small closed enum serialized to
 /// the exact lowercase tags used throughout the manifest.
@@ -122,7 +128,7 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v3).
+/// Top-level security manifest (schema v4).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -133,15 +139,47 @@ pub struct Manifest {
 }
 
 /// Manifest dimensions. Order is fixed (`routes`, then `csrf`, then
-/// `security_headers`, then `authorization_policies`) so the serialized
-/// document is diff-stable. New dimensions append, keeping the v2 keys in
-/// place.
+/// `security_headers`, then `authorization_policies`, then `mtls`) so the
+/// serialized document is diff-stable. New dimensions append, keeping the v2
+/// keys in place.
 #[derive(Debug, Serialize)]
 pub struct Dimensions {
     pub routes: RoutesDimension,
     pub csrf: CsrfDimension,
     pub security_headers: HeadersDimension,
     pub authorization_policies: AuthorizationPoliciesDimension,
+    pub mtls: MtlsDimension,
+}
+
+/// The `mtls` dimension (schema v4, issue #1640): which routes demand a
+/// verified client certificate, and the listener mode behind them.
+///
+/// Declared, not provable: the requirement is read from
+/// `[server.tls.client_auth]`, so the manifest reports what was *configured*,
+/// not that the handshake honors it.
+#[derive(Debug, Serialize)]
+pub struct MtlsDimension {
+    pub provenance: Provenance,
+    pub source: &'static str,
+    /// Listener requirement level: `off`, `optional`, or `required`.
+    pub mode: String,
+    /// Configured route prefixes that demand a certificate (sorted).
+    pub required_paths: Vec<String>,
+    pub entries: Vec<MtlsEntry>,
+}
+
+/// One mTLS entry: a route and whether it demands a verified client
+/// certificate.
+///
+/// `mtls_required` is `true` when the listener requests certificates at all AND
+/// the route matches a configured `required_paths` prefix — mirroring the
+/// runtime `RequireClientCert` predicate. A route dropping this flag is exactly
+/// the regression the posture diff exists to catch.
+#[derive(Debug, Serialize)]
+pub struct MtlsEntry {
+    pub path: String,
+    pub method: String,
+    pub mtls_required: bool,
 }
 
 /// The `routes` dimension: provable auth posture per mounted route.
@@ -542,7 +580,79 @@ const fn empty_headers_dimension() -> HeadersDimension {
     }
 }
 
-/// Build a stable-ordered security manifest (schema v3) from the audited routes
+/// The `mtls` dimension emitted when no security config was reported: `off`,
+/// with no route requiring a certificate.
+fn empty_mtls_dimension() -> MtlsDimension {
+    MtlsDimension {
+        provenance: Provenance::Declared,
+        source: MTLS_DIMENSION_SOURCE,
+        mode: "off".to_owned(),
+        required_paths: Vec::new(),
+        entries: Vec::new(),
+    }
+}
+
+/// Where the `mtls` dimension is read from.
+const MTLS_DIMENSION_SOURCE: &str = "config:server.tls.client_auth";
+
+/// Whether `path` falls under one of the configured mTLS `required_paths`.
+///
+/// Mirrors the RUNTIME matcher
+/// (`autumn_web::tls::client_auth::path_matches_any`), which deliberately
+/// differs from the CSRF exemption rule this file's `path_is_exempt`
+/// implements: a requirement prefix written with a trailing slash ALSO covers
+/// the bare path, so `/internal/` covers a route mounted at exactly
+/// `/internal`. Reusing `path_is_exempt` here made the manifest report
+/// `mtls_required: false` for a route the live listener protects — an audit
+/// that disagrees with the listener is worse than no audit.
+fn path_requires_mtls(path: &str, required_paths: &[String]) -> bool {
+    required_paths.iter().any(|prefix| {
+        let bare = prefix.strip_suffix('/').unwrap_or(prefix);
+        if path == bare {
+            true
+        } else if let Some(rest) = path.strip_prefix(bare) {
+            rest.starts_with('/')
+        } else {
+            false
+        }
+    })
+}
+
+/// Build the `mtls` dimension (declared): one entry per route, flagged when the
+/// listener requests certificates AND the route matches a `required_paths`
+/// prefix.
+///
+/// Every route gets an entry, not just the required ones: the diff's job is to
+/// notice a route that *stopped* requiring mTLS, which needs the negative rows
+/// too.
+fn build_mtls_dimension(routes: &[AuditRoute], client_auth: &ClientAuthDump) -> MtlsDimension {
+    let mut required_paths = client_auth.required_paths.clone();
+    required_paths.sort();
+    required_paths.dedup();
+    // `mode = "off"` never requests a certificate, so no route can require one
+    // — mirroring `ClientAuthMode::requests_certificate`.
+    let listener_requests = client_auth.mode != "off";
+
+    let mut entries: Vec<MtlsEntry> = routes
+        .iter()
+        .map(|r| MtlsEntry {
+            path: r.path.clone(),
+            method: r.method.clone(),
+            mtls_required: listener_requests && path_requires_mtls(&r.path, &required_paths),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+
+    MtlsDimension {
+        provenance: Provenance::Declared,
+        source: MTLS_DIMENSION_SOURCE,
+        mode: client_auth.mode.clone(),
+        required_paths,
+        entries,
+    }
+}
+
+/// Build a stable-ordered security manifest (schema v4) from the audited routes
 /// and the resolved security configuration.
 ///
 /// When `security` is `None` (an older dump with no security-config marker) the
@@ -556,12 +666,19 @@ const fn empty_headers_dimension() -> HeadersDimension {
 #[must_use]
 pub fn build_manifest(routes: &[AuditRoute], security: Option<&SecurityDump>) -> Manifest {
     let routes_dim = build_routes_dimension(routes);
-    let (csrf, security_headers) = security.map_or_else(
-        || (empty_csrf_dimension(), empty_headers_dimension()),
+    let (csrf, security_headers, mtls) = security.map_or_else(
+        || {
+            (
+                empty_csrf_dimension(),
+                empty_headers_dimension(),
+                empty_mtls_dimension(),
+            )
+        },
         |s| {
             (
                 build_csrf_dimension(routes, &s.csrf),
                 build_headers_dimension(&s.headers),
+                build_mtls_dimension(routes, &s.client_auth),
             )
         },
     );
@@ -573,6 +690,7 @@ pub fn build_manifest(routes: &[AuditRoute], security: Option<&SecurityDump>) ->
             csrf,
             security_headers,
             authorization_policies: build_authorization_policies_dimension(routes),
+            mtls,
         },
         excluded: excluded_dimensions(),
     }
@@ -923,7 +1041,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -1002,6 +1120,7 @@ mod tests {
                 hsts_include_subdomains: true,
                 csp_nonce: false,
             },
+            client_auth: ClientAuthDump::off(),
         }
     }
 
@@ -1010,7 +1129,7 @@ mod tests {
         serde_json::from_str(&manifest_json(m)).unwrap()
     }
 
-    /// AC-1: the top-level document is schema v3, carries the four dimensions
+    /// AC-1: the top-level document is schema v4, carries the five dimensions
     /// with the correct provenance labels, and the `excluded` list with its
     /// closed provenance enum values.
     #[test]
@@ -1022,7 +1141,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -1037,6 +1156,11 @@ mod tests {
         assert_eq!(
             json["dimensions"]["security_headers"]["source"],
             "config:security.headers"
+        );
+        assert_eq!(json["dimensions"]["mtls"]["provenance"], "declared");
+        assert_eq!(
+            json["dimensions"]["mtls"]["source"],
+            "config:server.tls.client_auth"
         );
         assert_eq!(
             json["dimensions"]["authorization_policies"]["provenance"],
@@ -1086,6 +1210,161 @@ mod tests {
             .find(|e| e["dimension"] == "serve_path_routers")
             .expect("serve_path_routers excluded");
         assert_eq!(serve_path["eventual_provenance"], "provable");
+    }
+
+    // ── mtls dimension (#1640) ───────────────────────────────────────────────
+
+    /// A [`SecurityDump`] with client auth configured, for the mTLS tests.
+    fn security_dump_with_mtls(mode: &str, required_paths: &[&str]) -> SecurityDump {
+        let mut dump = security_dump(true, &[]);
+        dump.client_auth = ClientAuthDump {
+            mode: mode.to_owned(),
+            required_paths: required_paths.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        dump
+    }
+
+    #[test]
+    fn mtls_dimension_is_declared_and_names_its_source() {
+        let routes = vec![route("GET", "/internal/keys", "keys", "gated")];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("required", &["/internal/"])),
+        ));
+        let dim = &json["dimensions"]["mtls"];
+        assert_eq!(dim["provenance"], "declared");
+        assert_eq!(dim["source"], "config:server.tls.client_auth");
+        assert_eq!(dim["mode"], "required");
+        assert_eq!(dim["required_paths"][0], "/internal/");
+    }
+
+    #[test]
+    fn mtls_entry_shape_is_exactly_route_plus_requirement() {
+        let routes = vec![route("GET", "/internal/keys", "keys", "gated")];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("required", &["/internal/"])),
+        ));
+        let entry = &json["dimensions"]["mtls"]["entries"][0];
+        let obj = entry.as_object().expect("entry object");
+        let keys = ["path", "method", "mtls_required"];
+        for key in keys {
+            assert!(obj.contains_key(key), "entry missing `{key}`: {entry}");
+        }
+        assert_eq!(obj.len(), keys.len(), "unexpected extra keys: {entry}");
+        assert_eq!(entry["mtls_required"], true);
+    }
+
+    #[test]
+    fn mtls_flags_only_routes_under_a_required_prefix() {
+        let routes = vec![
+            route("GET", "/internal/keys", "keys", "gated"),
+            // Not a match: `/internal` must not capture `/internal-tools`.
+            route("GET", "/internal-tools", "tools", "public"),
+            route("GET", "/health", "health", "framework"),
+        ];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("optional", &["/internal"])),
+        ));
+        let entries = json["dimensions"]["mtls"]["entries"]
+            .as_array()
+            .expect("entries");
+        let required: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["mtls_required"] == true)
+            .map(|e| e["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(required, vec!["/internal/keys"]);
+        // Every route gets a row, including the negative ones — the diff needs
+        // them to notice a route that STOPPED requiring a certificate.
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn mtls_off_requires_nothing_even_with_configured_prefixes() {
+        // `mode = "off"` never requests a certificate, so no route can require
+        // one — mirroring `ClientAuthMode::requests_certificate`.
+        let routes = vec![route("GET", "/internal/keys", "keys", "gated")];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("off", &["/internal/"])),
+        ));
+        assert_eq!(
+            json["dimensions"]["mtls"]["entries"][0]["mtls_required"],
+            false
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_prefix_covers_the_bare_route_like_the_runtime() {
+        // The runtime's `path_matches_any` strips the trailing slash before
+        // matching; reusing the CSRF exemption rule here reported
+        // `mtls_required: false` for a route the live listener protects.
+        let routes = vec![
+            route("GET", "/internal", "index", "gated"),
+            route("GET", "/internal/keys", "keys", "gated"),
+            route("GET", "/internal-tools", "tools", "public"),
+        ];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("optional", &["/internal/"])),
+        ));
+        let required: Vec<&str> = json["dimensions"]["mtls"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|e| e["mtls_required"] == true)
+            .map(|e| e["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(required, vec!["/internal", "/internal/keys"]);
+    }
+
+    #[test]
+    fn mtls_dimension_defaults_to_off_without_a_security_dump() {
+        let routes = vec![route("GET", "/a", "a", "gated")];
+        let json = manifest_value(&build_manifest(&routes, None));
+        assert_eq!(json["dimensions"]["mtls"]["mode"], "off");
+        assert!(
+            json["dimensions"]["mtls"]["entries"]
+                .as_array()
+                .expect("entries")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dropping_a_required_prefix_flips_only_the_mtls_dimension() {
+        // The falsifiability claim: unlocking an internal route moves this
+        // dimension and nothing else.
+        let routes = vec![
+            route("GET", "/health", "health", "framework"),
+            route("GET", "/internal/keys", "keys", "gated"),
+        ];
+        let locked = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("optional", &["/internal/"])),
+        ));
+        let unlocked = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("optional", &[])),
+        ));
+
+        for dimension in [
+            "routes",
+            "csrf",
+            "security_headers",
+            "authorization_policies",
+        ] {
+            assert_eq!(
+                locked["dimensions"][dimension], unlocked["dimensions"][dimension],
+                "`{dimension}` must not move when only the mTLS requirement does"
+            );
+        }
+        assert_ne!(
+            locked["dimensions"]["mtls"], unlocked["dimensions"]["mtls"],
+            "the mtls dimension must record the dropped requirement"
+        );
     }
 
     // ── authorization_policies dimension (#1627 slice 2) ─────────────────────

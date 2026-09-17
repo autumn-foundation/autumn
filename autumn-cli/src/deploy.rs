@@ -32,10 +32,13 @@ pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 use autumn_web::config::{AutumnConfig, DeployConfig, Env};
 use proxy::ProxyController;
+use serde::Deserialize;
 
 /// Bounded timeout for the SSH-reachability preflight probe. Kept short so the
 /// check fails fast on an unreachable host instead of hanging on a dropped SYN.
@@ -1776,13 +1779,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
         ),
         DeployAction::Rollback => run_rollback(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
@@ -1799,7 +1802,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
             // production setting must not take it offline mid-incident. See
             // `status_public_port`.
             let port = status_public_port(&resolved)?;
-            run_status(&port, &resolved.profile, &fleet, options)
+            run_status(
+                &port,
+                &resolved.app_name,
+                &resolved.profile,
+                &fleet,
+                options,
+            )
         }
         DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
@@ -1826,7 +1835,7 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
-                &load_runtime_config(&resolved)?,
+                &load_runtime_config(&resolved.profile)?,
                 &resolved,
                 &targets,
                 host_list.len(),
@@ -2075,7 +2084,10 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 ///
 /// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
 /// profile (`resolved.profile`), and this reload then resolves the full config
-/// under it. The `.env.<profile>` overlay is selected via
+/// under it. Takes the RAW profile string rather than the whole
+/// [`ResolvedDeployConfig`] — that field is all this needs, and issue #2267's
+/// alert path reloads by profile alone, with no `ResolvedDeployConfig` at
+/// hand. The `.env.<profile>` overlay is selected via
 /// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
 /// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
 /// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
@@ -2083,14 +2095,14 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
 /// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
 /// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
-/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// to the RAW profile so the loader layers `[profile.<profile>]` /
 /// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
 /// env vars still win over `.env` (the
 /// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
-fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
-    let forced = deploy_profile_env_overlay(&resolved.profile)?;
+fn load_runtime_config(profile: &str) -> Result<AutumnConfig, DeployError> {
+    let forced = deploy_profile_env_overlay(profile)?;
     // Lenient unknown top-level roots (#2063): keep strict validation of the
     // core sections the CLI knows while accepting plugin-owned roots (e.g.
     // `[media]`) as opaque — app boot stays the authoritative strict gate.
@@ -2135,7 +2147,7 @@ struct StatusPort {
 /// upload runtime VALUES (the signing secret, the DB URL), so an invalid config
 /// must stop them. `plan` never loads the runtime config at all.
 fn status_public_port(resolved: &ResolvedDeployConfig) -> Result<StatusPort, DeployError> {
-    let loaded = load_runtime_config(resolved);
+    let loaded = load_runtime_config(&resolved.profile);
     status_public_port_with(&manifest_project_dirs(), &resolved.profile, loaded)
 }
 
@@ -2816,6 +2828,20 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     }
     eprintln!();
     failed
+}
+
+/// Refuse the rollout if any preflight check failed (issue #1621, AC-7).
+///
+/// `run_up` calls this right after `collect_fleet_preflight`, before it
+/// builds any executor. A failing host stops the rollout before it
+/// touches a server. Split into its own function so a test can drive
+/// this exact decision with no disk and no network (issue #2269).
+fn refuse_if_preflight_failed(checks: &[PreflightCheck]) -> Result<(), DeployError> {
+    let failed = report_preflight(checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+    Ok(())
 }
 
 /// Run the preflight over EVERY configured host and report it (issue #1621, AC-7).
@@ -3646,10 +3672,7 @@ fn run_up(
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
     let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
-    let failed = report_preflight(&checks);
-    if failed > 0 {
-        return Err(DeployError::PreflightFailed(failed));
-    }
+    refuse_if_preflight_failed(&checks)?;
 
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
@@ -3677,6 +3700,8 @@ fn run_up(
 
     run_up_with(
         &FleetUpInput {
+            app_name: &resolved.app_name,
+            profile: &resolved.profile,
             fleet: &fleet,
             proxy: &proxy,
             checks: &checks,
@@ -3743,6 +3768,14 @@ struct FleetDatabaseFacts {
 /// is what makes the loop testable: nothing here reads the clock, the filesystem,
 /// or a socket.
 struct FleetUpInput<'a, P: ProxyController> {
+    /// The app's stable name (e.g. `"myapp"`, from `Cargo.toml`). A halt
+    /// alert's dedup key includes this (issue #2267), so two different apps
+    /// sharing one alert destination never fold into one incident.
+    app_name: &'a str,
+    /// The TARGET deploy profile (e.g. `"prod"`). A halt reloads `[alerts]`
+    /// under this profile (issue #2267), never the operator's ambient shell
+    /// profile.
+    profile: &'a str,
     /// The rollout targets, in order. Never empty.
     fleet: &'a ResolvedFleet,
     /// The proxy controller. kamal-proxy is PER HOST (it binds that host's public
@@ -4388,13 +4421,13 @@ where
         for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
             eprintln!("{line}");
         }
-        return Err(fleet_halted(
-            &plan,
-            &outcomes,
-            &degraded,
-            failed_host,
-            failed_step,
-        ));
+        let error = fleet_halted(&plan, &outcomes, &degraded, failed_host, failed_step);
+        // #2267: send a #1610 alert for the halt. This is best-effort. It
+        // does not change `error` below.
+        if let DeployError::FleetHalted(ref halt) = error {
+            emit_fleet_halted_alert(halt, input.app_name, input.profile);
+        }
+        return Err(error);
     }
 
     // App deploy is committed on every host here: the cutovers succeeded and there
@@ -4620,6 +4653,349 @@ fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::Ho
         eprintln!("{line}");
     }
     fleet::HostOutcome::Manual { reason }
+}
+
+// ── #2267: send a #1610 alert on a halted rollout or on drift ───────────────
+//
+// AC-6 of #1621 asks for this. Do not make the operator poll a non-zero exit
+// code for it. Follow the `db::backup` pattern from issue #1743: load the
+// config, build the same channels `autumn alert test` uses, and deliver
+// directly. This is best-effort. It never changes the command's exit code.
+
+/// Build alert channels from `alerts`/`http`, already resolved.
+///
+/// Check `[alerts] enabled` first, the master switch (review finding on
+/// #2267: a disabled config with transport credentials left in place must
+/// send nothing). `is_active()` checks `enabled` AND a set destination.
+/// Return an empty list when either check fails. An empty list is a no-op
+/// downstream.
+fn alert_channels_for(
+    alerts: &autumn_web::alerts::AlertConfig,
+    http: &autumn_web::config::HttpConfig,
+) -> Vec<Arc<dyn AlertChannel>> {
+    if !alerts.is_active() {
+        return Vec::new();
+    }
+    let client = autumn_web::http::Client::from_config(&http.client);
+    crate::alert::configured_http_channels(alerts, &client)
+}
+
+/// Read `[alerts]` and `[http]` from the raw project TOML layers alone — no
+/// env-var overlay yet (the caller applies one — see
+/// [`apply_alert_env_overrides`]), no full [`AutumnConfig`] deserialize.
+/// Mirrors [`declared_server_port_in`]'s own merge of base `autumn.toml` ←
+/// inline `[profile.<name>]` ← `autumn-<profile>.toml`.
+///
+/// Review finding on #2267: [`load_runtime_config`] can fail on a section
+/// this command does not even use (a bad `[scheduler]`/`[database]` value),
+/// the exact case [`status_public_port`] already degrades gracefully for
+/// the port. Without this, that same failure would ALSO silence a valid
+/// `[alerts]` destination — exactly the incident an operator most needs to
+/// hear about. Deserializing only `alerts`/`http` out of the merged TOML
+/// ignores every other top-level key, so a bad value there can not break
+/// this the way it breaks the full `AutumnConfig` deserialize.
+fn declared_alert_config_in(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+) -> Option<(
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+)> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct AlertsHttpTomlRoot {
+        alerts: autumn_web::alerts::AlertConfig,
+        http: autumn_web::config::HttpConfig,
+    }
+
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    let base_toml: Option<toml::Value> = first_dir_with_file(dirs, "autumn.toml")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    if let Some(base) = &base_toml {
+        deep_merge_toml(&mut merged, base.clone());
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
+        }
+    }
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let Some(path) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) else {
+            continue;
+        };
+        // Review finding on #2267: an unreadable or malformed override file
+        // must fail this whole read, not be silently skipped in favor of
+        // the base/inline config. A `[profile.prod]` override exists to
+        // CHANGE or disable a destination — silently falling back to a
+        // lower-priority layer could page using a destination the override
+        // was meant to replace.
+        let text = std::fs::read_to_string(&path).ok()?;
+        let overlay: toml::Value = toml::from_str(&text).ok()?;
+        deep_merge_toml(&mut merged, overlay);
+        break;
+    }
+
+    // Review finding on #2267: `strict_config` hard-fails `load_runtime_config`
+    // on a typo'd key inside `[alerts]`/`[http]` (e.g. `enabeld` for
+    // `enabled`) — the exact scenario landing here. Plain deserialize
+    // ignores an unrecognized field silently, which would default a
+    // mistyped `enabled` switch back to `true`. Reject it instead, using
+    // the SAME schema the primary path checks against.
+    if merged_alerts_or_http_has_unknown_key(&merged) {
+        return None;
+    }
+
+    let root: AlertsHttpTomlRoot = merged.try_into().ok()?;
+    Some((root.alerts, root.http))
+}
+
+/// Whether `merged` has an unrecognized key under `alerts` or `http`.
+///
+/// Reuses [`AutumnConfig::validate_toml`]/[`AutumnConfig::get_schema_keys`]
+/// — the same schema check `strict_config` runs on the primary path —
+/// filtered to `alerts`/`http` paths only, so an unrelated unknown
+/// top-level root (a plugin-owned table) is never mistaken for our own
+/// error.
+fn merged_alerts_or_http_has_unknown_key(merged: &toml::Value) -> bool {
+    let Ok(toml_str) = toml::to_string(merged) else {
+        return false;
+    };
+    let schema = AutumnConfig::get_schema_keys();
+    AutumnConfig::validate_toml(&toml_str, &schema)
+        .iter()
+        .any(|(path, _)| {
+            path == "alerts"
+                || path.starts_with("alerts.")
+                || path == "http"
+                || path.starts_with("http.")
+        })
+}
+
+/// Load `[alerts]` under the TARGET deploy profile. Build its channels.
+///
+/// Review finding on #2267: the ambient ("ambient" means the operator's
+/// shell) profile can differ from the deploy profile, so a plain
+/// `AutumnConfig::load()` can miss a production-only destination or send a
+/// production incident to a dev one. Use [`load_runtime_config`] instead —
+/// the same forced-profile load `run` uses for `check`/`rollback`/`up`. On
+/// failure, fall back to [`declared_alert_config_in`] rather than giving up:
+/// see its own doc for why and its narrower limitation.
+fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>> {
+    if let Ok(config) = load_runtime_config(profile) {
+        return alert_channels_for(&config.alerts, &config.http);
+    }
+    let Some((alerts, http)) = declared_alert_config_in(&manifest_project_dirs(), profile) else {
+        eprintln!("  \u{26A0} alert skipped: could not load configuration for profile {profile}");
+        return Vec::new();
+    };
+    // Review finding on #2267: the TOML-only fallback above must still see
+    // `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides, or a destination
+    // set only via env var (the documented, recommended way to supply a
+    // secret) gets nothing here, and an `AUTUMN_ALERTS__ENABLED=false`
+    // meant to silence a TOML-configured destination is ignored.
+    //
+    // If the `.env.<profile>` overlay itself fails to build (unreadable or
+    // malformed), fall back to bare OS env rather than skipping the env
+    // layer outright (review finding on #2267): real OS env vars are the
+    // HIGHEST-priority layer regardless of `.env.<profile>`, so an
+    // `AUTUMN_ALERTS__ENABLED=false` set directly in the process
+    // environment must still apply even when the dotenv file can not be
+    // read. Only the lower-priority `.env.<profile>` layer is lost here.
+    let (alerts, http) = match deploy_profile_env_overlay(profile) {
+        Ok(env) => apply_alert_env_overrides(alerts, http, &env),
+        Err(_) => apply_alert_env_overrides(alerts, http, &autumn_web::config::OsEnv),
+    };
+    alert_channels_for(&alerts, &http)
+}
+
+/// Apply the same `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides the
+/// primary [`load_runtime_config`] path applies (issue #2267 review).
+///
+/// Reuses [`AutumnConfig::apply_env_overrides_with_env`] verbatim on a
+/// scratch value — the exact method `AutumnConfig::load_with_env` itself
+/// calls — so this can never drift from the primary path's env semantics.
+/// Every OTHER section of the scratch value is a throwaway default; only
+/// `alerts`/`http` are read back out.
+fn apply_alert_env_overrides(
+    alerts: autumn_web::alerts::AlertConfig,
+    http: autumn_web::config::HttpConfig,
+    env: &dyn Env,
+) -> (
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+) {
+    let mut scratch = AutumnConfig {
+        alerts: Box::new(alerts),
+        http,
+        ..AutumnConfig::default()
+    };
+    scratch.apply_env_overrides_with_env(env);
+    (*scratch.alerts, scratch.http)
+}
+
+/// Send `alert` to every channel in `channels`.
+///
+/// Use a short-lived runtime, like `autumn alert test` does. Log a failed
+/// delivery. Do not stop for it. This must never change the command's exit
+/// code. Do nothing when `channels` is empty. This happens when `[alerts]`
+/// has no channel set.
+fn deliver_alert(channels: &[Arc<dyn AlertChannel>], alert: &Alert) {
+    if channels.is_empty() {
+        return;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("  \u{26A0} alert not sent: could not start async runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(alert).await {
+                eprintln!(
+                    "  \u{26A0} alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
+}
+
+/// Join host names into one alert-detail value. Return an empty string for
+/// an empty list — for example, when no host was torn down.
+fn join_hosts(hosts: &[String]) -> String {
+    hosts.join(", ")
+}
+
+/// Join `(host, reason)` pairs into one alert-detail value.
+fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
+    pairs
+        .iter()
+        .map(|(host, reason)| format!("{host}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Build the alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. So a test can call it directly.
+/// It reuses the `ScheduledTaskFailure` condition. It does not add a new
+/// `AlertCondition` variant. Issue #1743 made the same choice for a failed
+/// backup upload. A halted rollout is also a task the framework runs, and
+/// it did not finish.
+///
+/// Every field on `halt` is a host name or a fixed operation label (see
+/// [`FleetHalt`]). So this alert can never carry a shell line or a raw
+/// driver error.
+///
+/// Its dedup key includes `app_name` and `profile`, so a halt on staging
+/// and a halt on production never merge into one incident, and neither do
+/// two different apps' `prod` halts, even when they share a `PagerDuty`
+/// routing key (review findings on #2267 — matches [`build_drift_alert`]'s
+/// existing scoping, extended with the app name).
+///
+/// Sets its own `where_to_look` (review finding on #2267): the
+/// `ScheduledTaskFailure` default is `/actuator/tasks`, an app runtime
+/// endpoint with no fleet or rollout data. `autumn deploy status` is the
+/// command that shows the fleet's actual state.
+fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-fleet-halted:{app_name}:{profile}"),
+    )
+    .title("Fleet rollout halted")
+    .summary(halt.to_string())
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("failed_host", halt.failed_host.clone())
+    .detail("failed_step", halt.failed_step)
+    .detail("rolled_back", join_hosts(&halt.rolled_back))
+    .detail("torn_down", join_hosts(&halt.torn_down))
+    .detail("still_on_new", join_hosts(&halt.still_on_new))
+    .detail("degraded", join_host_reasons(&halt.degraded))
+    .detail("manual", join_host_reasons(&halt.manual))
+    .build()
+}
+
+/// Send an alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This runs on any halt, if `[alerts]`
+/// names a channel there. If no channel is set, this does nothing. So an
+/// operator with no alert channel sees the same behavior as before. They
+/// see a message and a non-zero exit.
+fn emit_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(
+        &channels,
+        &build_fleet_halted_alert(halt, app_name, profile),
+    );
+}
+
+/// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
+fn drift_alert_summary(report: &fleet::DriftReport) -> String {
+    let mut parts = Vec::new();
+    if report.version_drift {
+        parts.push(format!(
+            "{} known release(s) are live at once",
+            report.known_releases().len()
+        ));
+    }
+    if !report.state_drift.is_empty() {
+        parts.push(format!(
+            "{} host(s) have state drift",
+            report.state_drift.len()
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Build the alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. Its dedup key includes
+/// `app_name` and `profile`, so drift on staging and drift on production
+/// never merge into one alert, and neither do two different apps' `prod`
+/// drift (review finding on #2267).
+///
+/// It carries the same reason strings `fleet::fleet_drift` already prints —
+/// never a raw driver error. So it needs no secrets check beyond what
+/// `DriftReport` already gives.
+///
+/// Sets its own `where_to_look`, same reason as [`build_fleet_halted_alert`]
+/// (review finding on #2267).
+fn build_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-drift:{app_name}:{profile}"),
+    )
+    .title("Fleet drift detected")
+    .summary(drift_alert_summary(report))
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("version_drift", report.version_drift.to_string())
+    .detail("state_drift", join_host_reasons(&report.state_drift))
+    .build()
+}
+
+/// Send an alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621). This is the cron path in `docs/guide/fleet-deploys.md`.
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This does nothing if `[alerts]` has no
+/// channel set there. The caller must call this only in `--strict` mode. A
+/// plain `deploy status` check must never page anyone.
+fn emit_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(&channels, &build_drift_alert(report, app_name, profile));
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -5186,6 +5562,7 @@ fn warn_degraded_port(port: &StatusPort, profile: &str, continues: &str) {
 
 fn run_status(
     port: &StatusPort,
+    app_name: &str,
     profile: &str,
     fleet: &ResolvedFleet,
     options: &DeployOptions,
@@ -5222,6 +5599,10 @@ fn run_status(
         }
     }
     if options.strict && report.drifted() {
+        // #2267: send a #1610 alert for the drift. This runs only in
+        // `--strict` mode. An interactive `deploy status` must not page
+        // anyone.
+        emit_drift_alert(&report, app_name, profile);
         return Err(DeployError::DriftDetected);
     }
     Ok(())
@@ -9311,6 +9692,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 fleet,
                 proxy: &self.proxy,
                 checks: &[],
@@ -9340,6 +9723,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 auto_rollback: false,
                 ..self.input(fleet)
             }
@@ -9461,6 +9846,366 @@ mod tests {
                 "FleetHalted must never carry `{secret}`: {rendered}"
             );
         }
+    }
+
+    // ── #2267: a halted rollout or drift sends a #1610 operator alert ───────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    fn sample_halt() -> FleetHalt {
+        FleetHalt {
+            failed_host: "web-b".to_owned(),
+            failed_step: "migrate",
+            rolled_back: vec!["web-a".to_owned()],
+            torn_down: vec![],
+            still_on_new: vec![],
+            degraded: vec![("web-a".to_owned(), "prune")],
+            manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+        }
+    }
+
+    #[test]
+    fn alert_channels_for_respects_the_enabled_master_switch() {
+        // Review finding on #2267: `[alerts] enabled = false` must silence a
+        // deploy alert, even when a transport is still configured.
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: false,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert!(
+            alert_channels_for(&alerts, &http).is_empty(),
+            "a disabled [alerts] config must build no channel"
+        );
+    }
+
+    #[test]
+    fn alert_channels_for_builds_channels_when_active() {
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: true,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert_eq!(
+            alert_channels_for(&alerts, &http).len(),
+            1,
+            "an enabled [alerts] config with a destination must build a channel"
+        );
+    }
+
+    #[test]
+    fn deploy_alert_channels_for_profile_is_empty_without_a_configured_destination() {
+        // No fixture project directory is set up for this test, so the
+        // profile load resolves to defaults (or fails) either way — this
+        // must never panic, and with no [alerts] destination it must
+        // deliver nothing.
+        assert!(deploy_alert_channels_for_profile("prod").is_empty());
+    }
+
+    #[test]
+    fn declared_alert_config_in_reads_the_target_profile_section() {
+        // Review finding on #2267: this fallback must resolve the SAME
+        // target-profile layering `load_runtime_config` would, so a
+        // production-only destination is still found on this path too.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [profile.prod.alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("the merged [alerts] subtree deserializes");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_ignores_an_unrelated_bad_section() {
+        // The exact failure this fallback exists for: a malformed OTHER
+        // section must not stop `[alerts]` from being read.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [scheduler]\nbackend = 12345\n\n\
+             [alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("a bad [scheduler] value must not break the [alerts] read");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unreadable_profile_override() {
+        // Review finding on #2267: a malformed `autumn-prod.toml` must fail
+        // this whole read, not be silently skipped in favor of the
+        // base/inline config -- that could page using a destination the
+        // profile override was meant to change or disable.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\npagerduty_routing_key = \"base-key\"\n",
+        )
+        .expect("write autumn.toml");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "not valid toml")
+            .expect("write autumn-prod.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a malformed profile override file must fail closed, not fall back to base config"
+        );
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unknown_alerts_key() {
+        // Review finding on #2267: `strict_config` would hard-fail
+        // `load_runtime_config` on a typo'd `[alerts]` key (`enabeld` for
+        // `enabled`), landing here. Plain deserialize would silently drop
+        // it and default the switch back to `true` -- exactly the
+        // operator's mistyped attempt to turn it off.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\nenabeld = false\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a typo'd [alerts] key must fail closed, not silently default enabled back to true"
+        );
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_reads_autumn_alerts_env_vars() {
+        // Review finding on #2267: a destination set ONLY via env var (the
+        // documented, recommended way to supply a secret) must still fire
+        // on the TOML-only degraded-status fallback.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig::default();
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY", "R9999");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R9999"));
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_can_disable_a_toml_configured_destination() {
+        // The other half of the same finding: AUTUMN_ALERTS__ENABLED=false
+        // must still silence a destination the TOML-only read already found.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig {
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__ENABLED", "false");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert!(!alerts.is_active());
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scheduled_task_failure() {
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet rollout halted");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-fleet-halted:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("web-b") && alert.summary.contains("migrate"),
+            "the alert must name the failing host and step: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_profile_for_dedup() {
+        // Review finding on #2267: a halt on staging and a halt on
+        // production must never merge into one incident, even sharing one
+        // PagerDuty routing key.
+        let staging = build_fleet_halted_alert(&sample_halt(), "myapp", "staging");
+        let production = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` halts into one incident.
+        let app_one = build_fleet_halted_alert(&sample_halt(), "app-one", "production");
+        let app_two = build_fleet_halted_alert(&sample_halt(), "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_carries_only_host_names_and_static_labels() {
+        // This check matches `FleetHalted`'s own secrets check. This
+        // alert comes only from its fields, so it can carry no more.
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        let rendered = format!("{alert:?}");
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "systemd-run",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a fleet-halted alert must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_fleet_halted_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_alert(
+            &channels,
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        assert_eq!(delivered[0].condition, AlertCondition::ScheduledTaskFailure);
+    }
+
+    #[test]
+    fn deliver_alert_is_noop_without_channels() {
+        // No `[alerts]` set means no channels. This must not panic. It
+        // must deliver nothing and change no behavior.
+        deliver_alert(
+            &[],
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scheduled_task_failure_scoped_to_profile() {
+        let report = fleet::DriftReport {
+            releases: vec![
+                ("web-a".to_owned(), fleet::ReleaseId::Known("r1".to_owned())),
+                ("web-b".to_owned(), fleet::ReleaseId::Known("r2".to_owned())),
+            ],
+            version_drift: true,
+            state_drift: vec![("web-b".to_owned(), fleet::DRIFT_HOST_NOT_DEPLOYED)],
+        };
+
+        let alert = build_drift_alert(&report, "myapp", "production");
+
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet drift detected");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("release"),
+            "version drift must be named in the summary: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_profile_for_dedup() {
+        // Drift on staging and drift on production must stay two alerts.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let staging = build_drift_alert(&report, "myapp", "staging");
+        let production = build_drift_alert(&report, "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` drift into one incident.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let app_one = build_drift_alert(&report, "app-one", "production");
+        let app_two = build_drift_alert(&report, "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn deliver_drift_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        deliver_alert(&channels, &build_drift_alert(&report, "myapp", "staging"));
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:staging"
+        );
     }
 
     #[test]
@@ -10436,6 +11181,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             db: FleetDatabaseFacts {
                 sqlite: true,
                 ..FleetDatabaseFacts::default()
@@ -10519,6 +11266,85 @@ mod tests {
     }
 
     #[test]
+    fn up_refuses_the_whole_fleet_when_one_host_fails_preflight() {
+        // #2269 (#1621 AC-7 follow-up). `run_up_with` assumes checks are
+        // already graded; it never re-checks them. The real gate is
+        // `refuse_if_preflight_failed`, called by `run_up` before any
+        // executor is built. This test drives that gate directly, then
+        // calls `run_up_with` only on success. Mirrors
+        // `preflight_failure_aborts_before_any_executor_call` (exec.rs) one
+        // level up.
+        //
+        // This alone cannot prove `run_up` still calls the gate before the
+        // hand-off — `and_then` short-circuits regardless. See
+        // `up_calls_the_preflight_gate_before_handing_off_to_run_up_with`
+        // right below, which asserts that ordering in `run_up`'s own source.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let checks = vec![
+            PreflightCheck::pass("signing_secret", "ok"),
+            PreflightCheck::fail("ssh_reachability", "unreachable", "check the network")
+                .scoped(Some("web-b".to_owned())),
+        ];
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let executor_builds = std::cell::Cell::new(0_usize);
+
+        let err = refuse_if_preflight_failed(&checks)
+            .and_then(|()| {
+                run_up_with(&fixture.input(&fleet), |cfg| {
+                    executor_builds.set(executor_builds.get() + 1);
+                    Ok(recorder.executor(cfg))
+                })
+            })
+            .expect_err("a failing host must refuse the whole rollout");
+
+        assert!(
+            matches!(err, DeployError::PreflightFailed(1)),
+            "expected PreflightFailed(1), got {err:?}"
+        );
+        assert_eq!(
+            executor_builds.get(),
+            0,
+            "no executor may be built for any host when preflight fails"
+        );
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn up_calls_the_preflight_gate_before_handing_off_to_run_up_with() {
+        // #2269. The test above proves the GATE refuses correctly, but it
+        // composes `refuse_if_preflight_failed` and `run_up_with` by hand — it
+        // cannot prove `run_up` itself still calls them in that order. This
+        // checks the SOURCE order inside `run_up`, mirroring
+        // `media_provisioning_is_deferred_past_app_cutover_in_up`: a refactor
+        // that moved the gate after the `run_up_with` hand-off, or dropped it,
+        // fails this test even though the gate function still works on its
+        // own.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let gate_at = up_body
+            .find("refuse_if_preflight_failed(&checks)")
+            .expect("the preflight gate call present on the up path");
+        let handoff_at = up_body
+            .find("run_up_with(")
+            .expect("the run_up_with hand-off present on the up path");
+
+        assert!(
+            gate_at < handoff_at,
+            "run_up must call the preflight gate BEFORE handing off to run_up_with",
+        );
+    }
+
+    #[test]
     fn the_refusals_grade_the_configured_topology_not_the_narrowed_rollout() {
         // #1621 (§4.8). `--only` narrows which hosts a run TOUCHES; it does not
         // change the topology. A three-host sqlite fleet is just as broken when one
@@ -10528,6 +11354,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             db: FleetDatabaseFacts {
                 sqlite: true,
@@ -10693,6 +11521,8 @@ mod tests {
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -10730,6 +11560,8 @@ mod tests {
             .fail("web-b", "readiness-gate");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -10757,6 +11589,8 @@ mod tests {
             .script("web-b", "probe-release-dir", "present");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&narrowed)
         };

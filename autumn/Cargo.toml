@@ -427,7 +427,13 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+# `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
+# drops. It matters on the client side of `#[confidential]` (#1771), where a
+# crash dump would otherwise expose material the field key is derived from.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Deterministic wipe of the client root key used by `#[confidential]` (#1771).
+# Adds NO new crate to the graph: `aes-gcm` and `secrecy` already resolve it.
+zeroize = "1"
 # NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
 # (RFC 8292) and the ECDH half of RFC 8291 payload encryption. Adds NO new
 # crate to the graph — `jsonwebtoken` (a non-optional dependency above) already
@@ -572,6 +578,17 @@ required-features = ["db"]
 # exact commands.
 [[bench]]
 name = "csrf_verify"
+harness = false
+
+# Bot-protection / CAPTCHA workload for profilers: drives real GET traffic
+# through `security::BotProtectionService`'s safe-method exempt branch — the
+# branch every GET takes when bot protection is enabled — so its per-request
+# cost is attributable in a profiler. Does not exercise the token-verification
+# path (no `AutumnConfig`-driven way to inject a non-network-calling provider
+# there; see the file header for detail). Asserts nothing — see the file
+# header for the exact commands.
+[[bench]]
+name = "captcha_check"
 harness = false
 
 # Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
@@ -758,6 +775,21 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# `unique_violation_field` against a real SQLite unique-violation (issue
+# #2698): diesel boxes SQLite's DatabaseErrorInformation as a bare String,
+# whose constraint_name() is always None, so the Postgres-only
+# constraint-name match left every generated app's friendly-conflict
+# handling for a `--unique` column dead on SQLite. Boots an in-memory pool,
+# triggers a genuine duplicate-insert UniqueViolation, and proves the fix
+# resolves it to the mapped field/message the same way Postgres already does.
+# Only meaningful under `--features sqlite`; the file is `#![cfg(feature =
+# "sqlite")]` so a default `cargo test` compiles it to an empty (passing)
+# binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_unique_violation_field`.
+[[test]]
+name = "sqlite_unique_violation_field"
+path = "tests/sqlite_unique_violation_field.rs"
+
 # SQLite model-field type conversions (issue #1924): proves a `#[model]` carrying
 # a `DateTime<Utc>` (-> TimestamptzSqlite), a `NaiveDateTime` (-> Timestamp), and
 # an `Option<Blob>` attachment (-> Text/JSON) compiles AND round-trips on an
@@ -895,6 +927,19 @@ path = "tests/sqlite_commit_hook_worker.rs"
 [[test]]
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
+
+# FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
+# (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,
+# commit-hook queue, version history, runtime config, feature flags,
+# experiments, migration checksums and the ledger tables are created; tables
+# another module self-manages (jobs, job tracking, shard directory/map) are
+# not. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
+# empty (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_framework_migrations`.
+[[test]]
+name = "sqlite_framework_migrations"
+path = "tests/sqlite_framework_migrations.rs"
 
 # SQLite searchable-repository fallback proof (issue #1996). Drives
 # `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
@@ -1202,3 +1247,11 @@ path = "tests/loom_models.rs"
 
 [lints]
 workspace = true
+
+# mTLS rejection counters (#1640). Its own binary because the metric registry is
+# a process-global singleton with a bounded instrument count: sharing the
+# consolidated `integration_tests` process would evict the instruments this
+# suite asserts on before it ever read them.
+[[test]]
+name = "tls_client_auth_metrics"
+path = "tests/tls_client_auth_metrics.rs"

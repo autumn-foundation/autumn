@@ -47,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -300,6 +300,40 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
+- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+  marks a column **operator-blind**: the value is sealed on the client under a
+  key the server never receives, so the server holds only ciphertext. Unlike
+  `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
+  Rust), the field is declared as `autumn_web::confidential::Sealed` — an opaque
+  envelope with no `Display`, no `Deref` and no accessor that yields plaintext.
+  Every generated struct (`NewX`/`UpdateX`/`Changeset`/`XFactory`/JSON view)
+  therefore carries ciphertext, and the database, `autumn db backup` output, the
+  access and error log, replay capsules, record version history, the admin UI and
+  its CSV export hold only that.
+  Client side: `RootKey::generate()` / `::from_hex` / `::from_bytes` (no
+  `Serialize`, no `Display`, no byte accessor, zeroizes on drop, never built from
+  config or the credentials store),
+  `FieldContext::for_record(table, column, owner, record)` (or `::new` without
+  the record, which leaves rows interchangeable), then
+  `key.seal(&ctx, plaintext)? -> Sealed` and `key.unseal(&ctx, &sealed)?`.
+  Equality: `#[confidential(blind_index)]` requires a companion
+  `<field>_bidx: autumn_web::confidential::BlindIndex` column; the client sends
+  `key.blind_index(&ctx, plaintext)` and the server compares the token
+  (constant-time `PartialEq`, fixed 32 hex characters, so no length leak).
+  Refused at **build time**: `#[encrypted]`, `#[classified]`, `#[searchable]`,
+  `#[unique]`, `#[indexed]`, `#[references]`, `#[normalize]`, `#[translatable]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `#[default]`, a
+  `tenant_id` column, `#[serde(rename)]` / `rename_all`,
+  `#[diesel(column_name)]`, the model's shard key, a non-`Sealed` field type —
+  and, through the `Model::__AUTUMN_CONFIDENTIAL_COLUMNS` list `#[model]`
+  publishes, a `#[repository]` `find_by_<field>` / `count_by_` / `delete_by_` /
+  `exists_by_`, `find_or_create_by_<field>`, `cursor_key = <field>` or grouped
+  aggregate. Query the `_bidx` companion instead. Generated: a type assertion
+  proving the field really is `Sealed`, a
+  `confidential::ConfidentialColumnDescriptor` inventory registration, and
+  `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
+  `docs/guide/confidential-fields.md` for the threat model, including what
+  sealing does not hide.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -601,6 +635,20 @@ Free functions rendering changeset-aware, accessible inputs:
   `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+- `rich_text_area(&changeset, field, label)` (#1255) renders a Markdown
+  `<textarea>` with a syntax toolbar, a hint line, and (via
+  `rich_text_area_htmx`/`rich_text_area_htmx_with_token_field`) an htmx live
+  preview pane. `required_*` variants add the required signal. `RichTextLabels`
+  (#2227) overrides the toolbar's chrome text: `.toolbar_group(label)`,
+  `.controls(&[(name, syntax)])`, `.hint(text)`, `.preview_heading(text)`. Pass
+  one to the matching `*_with_labels` sibling (e.g.
+  `rich_text_area_htmx_with_token_field_with_labels`); the plain functions
+  keep rendering the English default.
+- `IntoChangeset::into_changeset_with(resolve)` (#2227) is
+  `into_changeset`'s sibling: `resolve: impl Fn(field, code) -> Option<String>`
+  supplies a message for a `#[validate(...)]` rule that has no explicit
+  `message`. Return `None` to keep the default `"validation failed: {code}"`.
+  An explicit `message` on the rule always wins and skips the resolver.
 
 ## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.6.0, #1706)
 
@@ -685,6 +733,12 @@ Per-primitive setters (in addition to the shared set):
   Option<guard>)]`) and `can` is `|to| record.can_transition_<field>_to(to)`;
   a legal edge whose guard currently fails still renders but as a `disabled`
   button. CSS hooks `.autumn-transition-controls` / `.autumn-transition`.
+  `transition_controls_with_labels(..., &TransitionLabels)` (#2227) takes the
+  same arguments plus a trailing `TransitionLabels` builder: `.group(label)`
+  overrides the `"{field} transitions"` aria-label, `.buttons(&[(state,
+  label)])` overrides `"Mark as {state}"` per target state. A state not
+  listed keeps the default text. `transition_controls` still renders the
+  same default text as before.
 - `autumn_web::widgets::{ReactionControls, reaction_controls}` (#1362) — the
   view half of `#[votable]`. `ReactionControls::votes(dom_id, up_action,
   down_action)` (signed up/down, `aggregate = sum`) or
@@ -1043,7 +1097,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,
@@ -1583,6 +1637,42 @@ In-process HTTPS termination on the same host:port (off by default).
   `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
+
+### `[server.tls.client_auth]` (feature `tls`, unreleased, #1640)
+
+Mutual TLS: verify the *caller's* certificate, not just prove the server's.
+Absent, the handshake is byte-for-byte the server-only TLS above.
+
+- `mode` — `off` (default), `optional` (certificate requested; verified when
+  presented), `required` (no valid certificate, no handshake). `optional` still
+  verifies a certificate that IS offered; the option is whether offering one is
+  mandatory.
+- `ca_bundle_path` (required unless `off`) — PEM bundle of one or more client
+  CAs. `crl_path` — optional PEM revocation list. Both hot-reload on their own
+  `reload_interval_secs` (default `60`) poll, so a CA rotation (ship old+new in
+  one bundle, later drop old) needs no restart and drops no established
+  connection.
+- `required_paths` — rooted path prefixes whose routes demand a certificate,
+  matched against the raw request path and the normalized one (either match
+  requires a certificate, so normalization cannot drop a requirement). A trailing-slash prefix also
+  covers the bare route: `/internal/` covers `/internal`. A request reaching one
+  over an uncertified connection gets `403` with the standard problem+json body.
+- Handlers extract `autumn_web::tls::client_auth::ClientCert` (rejects `403`) or
+  `OptionalClientCert`. `ClientIdentity` carries `subject`, `issuer`, `sans`
+  (`DNS:`/`URI:`/`IP:`/`email:` prefixed), `fingerprint`, `serial` and
+  `common_name()`. **Authorize on `common_name()` / `has_san()`, never by
+  string-searching `subject`:** DN rendering does not escape attribute values.
+- Policies read the same identity: `ctx.client_identity()`,
+  `ctx.has_client_identity()`, `ctx.client_has_san("URI:spiffe://…")`. It is
+  ambient to the request task, so a `tokio::spawn`ed check sees `None`.
+- `RequireClientCertLayer::new()` locks a sub-router in code.
+- Rejections: `tls_client_auth_rejected_total{reason}` (`no_certificate`,
+  `untrusted_ca`, `expired`, `not_yet_valid`, `revoked`,
+  `unknown_revocation`, `invalid`) and `tls_client_auth_route_rejected_total`,
+  plus a rate-limited operator log. The client sees only the TLS alert.
+- Fail-fast at startup on a missing / unparseable / empty bundle or CRL, on a
+  non-`off` mode with no `ca_bundle_path`, on `required_paths` under
+  `mode = "off"`, and on a noncanonical prefix (`//`, `.` or `..` segment). Revocation is CRL-only — no OCSP. See `docs/guide/tls.md`.
 
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 

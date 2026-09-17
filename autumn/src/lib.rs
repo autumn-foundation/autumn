@@ -159,6 +159,7 @@ pub mod consent;
 // `classify` carry one: an outer `///` here is merged with the module's own
 // `//!` docs, and the whole block then resolves its intra-doc links in *this*
 // scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
 pub mod credentials;
@@ -335,11 +336,13 @@ pub mod route_listing;
 /// [`state_migration!`](crate::state_migration) between shapes.
 pub mod upgrade;
 
-/// Inbound (server-side) TLS support (issue #1603).
+/// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
 /// Load and validate a certificate + key, build a reloadable rustls
-/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
-/// off-by-default `tls` feature.
+/// `ServerConfig`, inspect leaf-certificate expiry, and — through
+/// [`tls::client_auth`] — verify client certificates and hand the verified
+/// machine identity to handlers and policies. Gated behind the off-by-default
+/// `tls` feature.
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -520,6 +523,7 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
@@ -559,6 +563,11 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Build-checked typed contracts between two Autumn services (issue #1755).
+///
+/// See the [`wire`] module for the mechanism and `docs/guide/wire-contracts.md`
+/// for the guide.
+pub mod wire;
 // Declared bare, like `notifications`: the module carries its own `//!` docs,
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
@@ -823,6 +832,16 @@ pub use db::Db;
 /// helper for [`Db::tx_with`]. See [`db::TxOptions`].
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
+
+/// Lazy database connection extractor.
+///
+/// Use `LazyDb` instead of `Db` in a handler that also takes a body
+/// extractor (`Form`, `Json`, `Multipart`, ...). `Db` checks out a pooled
+/// connection before the body is read. `LazyDb` waits until the handler
+/// calls [`db::LazyDb::checkout`]. See [`db::LazyDb`] for the full contract
+/// and an example.
+#[cfg(feature = "db")]
+pub use db::LazyDb;
 
 /// The runtime database connection type (Postgres by default; `SQLite` under the
 /// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
@@ -1173,6 +1192,34 @@ pub use autumn_macros::repository;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::service;
+
+/// Mark a typed handler as a service endpoint (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// See the [`wire`] module for the mechanism and
+/// `docs/guide/wire-contracts.md` for the guide.
+pub use autumn_macros::endpoint;
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::contract_checked;
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::WireShape;
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// The generated methods call through [`http_client::Client`], so this needs
+/// the `http-client` feature.
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
 
 /// Annotate an async function as a `PATCH` route handler.
 ///

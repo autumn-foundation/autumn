@@ -34,6 +34,7 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+tokio-util = { workspace = true }
 
 [features]
 default = ["db"]
@@ -46,6 +47,14 @@ path = "tests/integration.rs"
 [[test]]
 name = "mirror_db"
 path = "tests/mirror_db.rs"
+
+[[test]]
+name = "dunning_close_scan_profile"
+path = "tests/dunning_close_scan_profile.rs"
+
+[[test]]
+name = "dunning_rearm_pending_profile"
+path = "tests/dunning_rearm_pending_profile.rs"
 
 [lints]
 workspace = true
