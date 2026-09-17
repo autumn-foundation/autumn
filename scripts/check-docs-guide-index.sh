@@ -1177,8 +1177,18 @@ DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
 # raw HTML, so treating it as a block opener blanked every row up to the next
 # blank line. It is skipped rather than blanked: it is visible to the reader,
 # and it can never be an index row or a link to a `.md` page anyway.
-AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*>"
-                      r"|<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>")
+#
+# Both halves follow CommonMark's grammar rather than approximating it,
+# because this pattern BLANKS what it matches: anything it accepts wrongly
+# is a link the reader can see and the gate cannot. A scheme is 2 to 32
+# characters, so `<x:...>` is not an autolink and its contents stay live;
+# an email local part has no brackets in it, so `<x[a][b]@e.co>` is not one
+# either. Both spellings were being blanked, and each hid a real reference
+# link behind a false failure.
+AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*>"
+                      r"|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
+                      r"@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                      r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*>")
 # A thematic break and a Setext heading underline. Neither is
 # paragraph text, so indented code may open straight after one.
 THEMATIC = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
@@ -1243,6 +1253,68 @@ _ATTR = (r"(?:" + _TWS + r"+[a-zA-Z_:][a-zA-Z0-9_.:-]*"
 INLINE_TAG = re.compile(
     r"<(?:[a-zA-Z][a-zA-Z0-9-]*" + _ATTR + r"*" + _TWS + r"*/?>"
     r"|/[a-zA-Z][a-zA-Z0-9-]*" + _TWS + r"*>)")
+# A DECLARATION, the third non-tag spelling of inline raw HTML.
+INLINE_DECL = re.compile(r"<![A-Za-z][^>]*>")
+
+
+def inline_raw_at(text, pos, limit):
+    """End of a NON-TAG inline raw HTML construct at `pos`, or None.
+
+    Inline raw HTML is not only tags. A processing instruction, a CDATA
+    section and a declaration are raw HTML too, and markdown inside one is
+    not markdown: `prose <?x [Guide](x.md)?>` renders no link in either
+    reference implementation, and the gate was counting that link as a
+    route to the index. The line-initial spellings have been handled by
+    `DECL` since the start; only the mid-line ones were missing.
+
+    `limit` is the end of the paragraph. Inline raw HTML cannot contain a
+    blank line, and an unclosed construct must not blank every link after
+    it — the run-to-end-of-file false failure this scan has produced four
+    times, and the reason the comment branch is bounded the same way.
+    """
+    for opener, closer in (("<![CDATA[", "]]>"), ("<?", "?>")):
+        if text.startswith(opener, pos):
+            end = text.find(closer, pos + len(opener), limit)
+            return None if end < 0 else end + len(closer)
+    m = INLINE_DECL.match(text, pos)
+    return m.end() if m is not None and m.end() <= limit else None
+
+
+def code_span_at(text, pos, n):
+    """`(closer_start, end)` for the code span opening at `pos`, or None.
+
+    `pos` sits on the first backtick of the opening run. A span closes on a
+    run of the SAME length and cannot cross a blank line: the paragraph
+    ends there and the backticks are literal on both sides of it. Backslash
+    escapes do not apply inside a span, so a closer preceded by a backslash
+    still closes it — only the opener can be escaped away.
+
+    One spelling, two callers. The scan blanks what this finds; the image
+    label walk skips it. While they each had their own idea of where a span
+    ends they disagreed, and the label walk closed the label at a `]` that
+    CommonMark keeps inside the span — turning a whole image into an
+    apparent link and counting its alt text as a route.
+    """
+    j = pos
+    while j < n and text[j] == "`":
+        j += 1
+    run = j - pos
+    while j < n:
+        if text[j] == "\n":
+            k = j + 1
+            while k < n and text[k] in " \t":
+                k += 1
+            if k >= n or text[k] == "\n":
+                return None
+        if text[j] != "`":
+            j += 1
+            continue
+        cstart = j
+        while j < n and text[j] == "`":
+            j += 1
+        if j - cstart == run:
+            return cstart, j
+    return None
 
 
 def _blank(s):
@@ -1628,15 +1700,26 @@ def readable(text, resolved=None):
             # A line-initial `<!--` is a different construct — HTML block
             # type 2, which DOES run to its closer across blank lines — and
             # is handled by `COMMENT_BLOCK` above, not here.
-            para = re.compile(r"\n[ \t]*\n").search(text, i)
-            limit = n if para is None else para.start()
-            close = text.find("-->", i + 4, limit)
-            if close < 0:
-                i += 1
-                continue
-            stop = close + 3
-            blank_to(i, stop)
-            i = stop
+            # `<!-->` and `<!--->` are COMPLETE comments in their own right,
+            # not openers looking for a closer. Searching past them for a
+            # later `-->` swallowed everything between — including a live
+            # link — and left the trailing `-->`, which renders as literal
+            # text, doing the closing. Both renderers keep the link.
+            for short in ("<!--->", "<!-->"):
+                if text.startswith(short, i):
+                    blank_to(i, i + len(short))
+                    i += len(short)
+                    break
+            else:
+                para = re.compile(r"\n[ \t]*\n").search(text, i)
+                limit = n if para is None else para.start()
+                close = text.find("-->", i + 4, limit)
+                if close < 0:
+                    i += 1
+                    continue
+                stop = close + 3
+                blank_to(i, stop)
+                i = stop
             continue
 
         if text[i] == "\\":
@@ -1668,49 +1751,25 @@ def readable(text, resolved=None):
             while i < n and text[i] == "`":
                 i += 1
             run = i - start
-            j = i
-            closed = False
-            while j < n:
-                # A code span cannot cross a BLANK line: the paragraph ends
-                # there and the backticks are literal on both sides of it.
-                # Searching past one paired an opener with a backtick in a
-                # later paragraph and blanked every link between them.
-                if text[j] == "\n":
-                    k = j + 1
-                    while k < n and text[k] in " \t":
-                        k += 1
-                    if k >= n or text[k] == "\n":
-                        break
-                # CommonMark does not process backslash escapes INSIDE a
-                # code span, so a closer preceded by `\` still closes it.
-                # Only the OPENER can be escaped away.
-                if text[j] != "`":
-                    j += 1
-                    continue
-                cstart = j
-                while j < n and text[j] == "`":
-                    j += 1
-                if j - cstart == run:
-                    # A code span RENDERS. `[`Guide`](docs/guide/index.md)`
-                    # is `<a href="…"><code>Guide</code></a>` — visible,
-                    # clickable text — but blanking every character of the
-                    # label left `_text_renders` with nothing and the link
-                    # was rejected as empty. That is a false failure on
-                    # ordinary documentation: an index row naming a module
-                    # or a command in code font is a normal way to write
-                    # one. So a span with visible content leaves the same
-                    # kind of sentinel an image does; a span whose content
-                    # is blank renders an empty element and leaves none.
-                    blank_to(start, j)
-                    if text[start + run:cstart].strip():
-                        out[start] = CODE_MARK
-                    i = j
-                    closed = True
-                    break
+            hit = code_span_at(text, start, n)
             # Unmatched: the backticks are literal, and `i` already sits past
             # them, so scanning simply continues.
-            if not closed:
+            if hit is None:
                 continue
+            cstart, j = hit
+            # A code span RENDERS. `[`Guide`](docs/guide/index.md)` is
+            # `<a href="..."><code>Guide</code></a>` — visible, clickable
+            # text — but blanking every character of the label left
+            # `_text_renders` with nothing and the link was rejected as
+            # empty. That is a false failure on ordinary documentation: an
+            # index row naming a module or a command in code font is a
+            # normal way to write one. So a span with visible content
+            # leaves the same kind of sentinel an image does; a span whose
+            # content is blank renders an empty element and leaves none.
+            blank_to(start, j)
+            if text[start + run:cstart].strip():
+                out[start] = CODE_MARK
+            i = j
             continue
 
         # `_escaped` counts the backslash RUN, not just the character before.
@@ -1741,6 +1800,17 @@ def readable(text, resolved=None):
                             t += 1
                         if t >= n or text[t] == "\n":
                             return None
+                    # A bracket inside a CODE SPAN is code, not a bracket.
+                    # ``![alt `]` [Guide](x.md)](pic.png)`` closes its label
+                    # at the final `]`, not at the one between backticks —
+                    # so the whole construct is one image and the Guide
+                    # link is alt text. Closing the label early left the
+                    # image unmasked and counted that alt text as a route.
+                    if text[k] == "`":
+                        span = code_span_at(text, k, n)
+                        if span is not None:
+                            k = span[1]
+                            continue
                     if text[k] == opener:
                         depth += 1
                     elif text[k] == closer:
@@ -1835,6 +1905,12 @@ def readable(text, resolved=None):
             if tag:
                 blank_to(i, tag.end())
                 i = tag.end()
+                continue
+            para = re.compile(r"\n[ \t]*\n").search(text, i)
+            raw = inline_raw_at(text, i, n if para is None else para.start())
+            if raw is not None:
+                blank_to(i, raw)
+                i = raw
                 continue
 
         i += 1
@@ -5329,6 +5405,78 @@ self_test() {
     > "$tmp/fence_list_closes/README.md"
   _commit fence_list_closes
   _case "a fence in a list item closes at that column" 0 fence_list_closes
+
+  # 260. An autolink SCHEME is two to thirty-two characters, so `<x:...>`
+  #      is not an autolink: the angles render literally and the reference
+  #      link inside them is live. Blanking the span hid it.
+  _scaffold autolink_short_scheme
+  printf '# A\n' > "$tmp/autolink_short_scheme/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/autolink_short_scheme/docs/guide/index.md"
+  printf '<x:[Guide][catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/autolink_short_scheme/README.md"
+  _commit autolink_short_scheme
+  _case "a one-character scheme is not an autolink" 0 autolink_short_scheme
+
+  # 261. An email autolink's local part has no BRACKETS in it, so
+  #      `<x[Guide][catalog]@e.co>` is not one either and the reference
+  #      link inside it renders.
+  _scaffold autolink_bad_email
+  printf '# A\n' > "$tmp/autolink_bad_email/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/autolink_bad_email/docs/guide/index.md"
+  printf '<x[Guide][catalog]@e.co>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/autolink_bad_email/README.md"
+  _commit autolink_bad_email
+  _case "brackets disqualify an email autolink" 0 autolink_bad_email
+
+  # 262. A REAL autolink must still be blanked, or loosening the grammar
+  #      above would trade one over-acceptance for another.
+  _scaffold autolink_real
+  printf '# A\n' > "$tmp/autolink_real/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/autolink_real/docs/guide/index.md"
+  printf '<https://e.co/[catalog]>\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/autolink_real/README.md"
+  _commit autolink_real
+  _case "a real autolink still hides its brackets" 1 autolink_real
+
+  # 263. `<!-->` is a COMPLETE comment, not an opener. Searching past it for
+  #      a later closer swallowed a live link and let the trailing `-->`,
+  #      which is literal text, do the closing.
+  _scaffold comment_short
+  printf '# A\n' > "$tmp/comment_short/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_short/docs/guide/index.md"
+  printf 'prose <!--> [Guide](docs/guide/index.md) -->\n' \
+    > "$tmp/comment_short/README.md"
+  _commit comment_short
+  _case "a short comment closes itself" 0 comment_short
+
+  # 264. Inline raw HTML is not only tags: a PROCESSING INSTRUCTION is raw
+  #      HTML too, and markdown inside one is not markdown. The
+  #      line-initial spelling was handled from the start; the mid-line one
+  #      was not, so its contents counted as a route.
+  _scaffold inline_pi
+  printf '# A\n' > "$tmp/inline_pi/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/inline_pi/docs/guide/index.md"
+  printf 'prose <?x [Guide](docs/guide/index.md)?>\n' \
+    > "$tmp/inline_pi/README.md"
+  _commit inline_pi
+  _case "a processing instruction hides its contents" 1 inline_pi
+
+  # 265. A bracket inside a CODE SPAN is code, not a bracket, so an image
+  #      label closes at the bracket outside the span. Closing it early
+  #      made one image look like a link and counted its alt text.
+  _scaffold image_span_label
+  printf '# A\n' > "$tmp/image_span_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_span_label/docs/guide/index.md"
+  printf '![alt `]` [Guide](docs/guide/index.md)](pic.png)\n' \
+    > "$tmp/image_span_label/README.md"
+  _commit image_span_label
+  _case "a code span does not close an image label" 1 image_span_label
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
