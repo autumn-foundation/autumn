@@ -185,6 +185,14 @@ ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 # end of line. `#`, `# Appendix` and `#\tAppendix` are all level-one headings;
 # matching the literal prefix `"# "` saw only the middle one.
 ATX_H1 = re.compile(r"^ {0,3}#(?:[ \t].*)?$")
+# A level-TWO heading, with the same rules. The section scan tested
+# `line.startswith("## ")`, which misses `   ## Section` (up to three spaces
+# of indent are allowed) and `##\tSection` (a tab separates just as well) —
+# both of which cmark-gfm renders as `<h2>Section</h2>`. Every row beneath
+# such a heading was then reported as sitting outside a section, failing a
+# correct index. The level-one test three lines below had already been given
+# all of this; the level-two one directly above it had not.
+ATX_H2 = re.compile(r"^ {0,3}##(?:[ \t](.*))?$")
 # A level-one SETEXT underline. It only forms a heading when a paragraph line
 # sits directly above it, which is why the caller checks that rather than
 # treating a bare `===` — which is just a paragraph — as a heading.
@@ -693,6 +701,31 @@ def blank_links(text):
     return "".join(out)
 
 
+def _prefix_ok(prefix):
+    """True when a definition's line PREFIX really leaves it a definition.
+
+    Columns, not characters. `-\t\t[a]: x` is two tabs to column eight —
+    seven columns of padding after the marker — which is indented CODE
+    inside the list item, so it defines nothing and a later `[a]` reference
+    stays literal. Counting each tab as one padding character accepted it.
+
+    This is the second time on this branch that tab padding was written as a
+    character count: `row_at` was corrected the same way three commits ago,
+    and the prefix added for list-contained definitions repeated it. The
+    arithmetic is the same one `row_at` does, which is why it reads the same.
+    """
+    m = re.search(r"(?:[-*+]|\d{1,9}[.)])(?=[ \t])", prefix)
+    if m is None:
+        return True
+    col = 0
+    for ch in prefix[:m.end()]:
+        col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
+    base = col
+    for ch in prefix[m.end():]:
+        col = (col // 4 + 1) * 4 if ch == "\t" else col + 1
+    return 1 <= col - base <= 4
+
+
 def _defn_entries(body, origin=None):
     """Every REAL reference definition in `body`, as `(match, label, dest)`.
 
@@ -748,6 +781,8 @@ def _defn_entries(body, origin=None):
     blocks = body if origin is None else origin
     for m in DEFN.finditer(body):
         if not _starts_block(blocks, m.start()):
+            continue
+        if not _prefix_ok(body[m.start():m.start(1) - 1]):
             continue
         key = label_key(m.group(1))
         if key is None:
@@ -1706,8 +1741,9 @@ def entries(text, base):
         # bookkeeping. Only the Setext test needs it, and getting this wrong
         # would make that test read whichever line last fell through.
         prev, line_above = line, prev
-        if line.startswith("## "):
-            section = line[3:].strip()
+        h2 = ATX_H2.match(line)
+        if h2 is not None:
+            section = (h2.group(1) or "").strip()
             continue
         # A new LEVEL-ONE heading ends the section. Rows appended after one
         # are under no `## ` at all, and carrying the previous section name
@@ -4541,6 +4577,55 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/list_defn_not/README.md"
   _commit list_defn_not
   _case "a shortcut row survives the list prefix" 0 list_defn_not
+
+  # 222. Definition padding is counted in COLUMNS too. `-<TAB><TAB>[a]: x`
+  #      is seven columns past the marker — indented code inside the item —
+  #      so it defines nothing and a later reference stays literal. The
+  #      prefix added for list-contained definitions counted each tab as one
+  #      character, which is the same mistake `row_at` was corrected for
+  #      three commits earlier, repeated in a new place.
+  _scaffold defn_tab_overflow
+  printf '# A\n' > "$tmp/defn_tab_overflow/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_tab_overflow/docs/guide/index.md"
+  printf -- '-\t\t[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_tab_overflow/README.md"
+  _commit defn_tab_overflow
+  _case "a definition past column four is code" 1 defn_tab_overflow
+
+  # 223. ONE tab is three columns, so that one really is a definition.
+  _scaffold defn_tab_fits
+  printf '# A\n' > "$tmp/defn_tab_fits/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/defn_tab_fits/docs/guide/index.md"
+  printf -- '-\t[catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/defn_tab_fits/README.md"
+  _commit defn_tab_fits
+  _case "a definition one tab in still defines" 0 defn_tab_fits
+
+  # 224. A level-TWO heading may carry up to three spaces of indent or use a
+  #      tab after the hashes; cmark-gfm renders both as `<h2>`. The section
+  #      scan tested `startswith("## ")`, so every row beneath such a heading
+  #      was reported as outside a section — failing a correct index. The
+  #      level-ONE test a few lines below already had all of this.
+  _scaffold h2_spellings
+  printf '# A\n' > "$tmp/h2_spellings/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/h2_spellings/docs/guide/beta.md"
+  printf '# Guide\n\n   ## Indented\n\n- [A](alpha.md)\n\n##\tTabbed\n\n- [B](beta.md)\n' \
+    > "$tmp/h2_spellings/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/h2_spellings/README.md"
+  _commit h2_spellings
+  _case "every level-two heading opens a section" 0 h2_spellings
+
+  # 225. And the guard: `### ` is a SUBheading, not a section, so a row under
+  #      one with no `## ` above it is still outside a section.
+  _scaffold h3_not_section
+  printf '# A\n' > "$tmp/h3_not_section/docs/guide/alpha.md"
+  printf '# Guide\n\n### Sub\n\n- [A](alpha.md)\n' \
+    > "$tmp/h3_not_section/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/h3_not_section/README.md"
+  _commit h3_not_section
+  _case "a level-three heading opens no section" 1 h3_not_section
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
