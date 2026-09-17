@@ -157,7 +157,23 @@ README = "README.md"
 # `(?<![!\\])` rejects two things that share every other character with a link
 # and navigate nowhere: an image (`![alt](page.md)` renders a picture) and an
 # escaped bracket (`\[Guide](page.md)` renders literal text).
-LINK = re.compile(r'''(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^\s)]*(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)''')
+# A link destination may contain BALANCED parentheses — `other(foo).md` is an
+# ordinary path — so it is not "everything up to the first `)`". Reading it
+# that way ended the span early and left the rest of the link, title included,
+# for the reference scan to misread as navigation.
+#
+# `_FRAG` is deliberately gated behind a literal `#`. Its only job is to eat a
+# fragment, and writing it as a second open-ended run would let it and `_DEST`
+# match the same characters — an ambiguity the engine explores by backtracking,
+# which is a quiet way to turn a 1000-line corpus into a hang.
+_DEST = r"(?:[^()\s#]|\([^()\s]*\))"
+_FRAG = r"(?:#(?:[^()\s]|\([^()\s]*\))*)?"
+# An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
+# and the required whitespace before one is what keeps a parenthesised title
+# from being read as more balanced destination.
+_CLOSE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)'''
+
+LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _DEST + r"*)" + _FRAG + _CLOSE)
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -185,7 +201,31 @@ LINK = re.compile(r'''(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]*)[^\s)]*(?:\s+(?:"[^"]*"
 # under sub-bullets is told so by name rather than silently half-checked; that
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
-ENTRY = re.compile(r'''^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)[^\s)]*(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)''')
+_ROW = r"^(?:- |\d{1,3}[.)] )"
+ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(\s*(" + _DEST + r"+)" + _FRAG + _CLOSE)
+
+# The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
+# shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
+# These are ordinary markdown rows, and recognising only the inline spelling
+# was wrong in both directions at once: a reference-style row reported its
+# page as listed nowhere, and — worse — an inline row plus a reference-style
+# row for the SAME page counted once, so the "listed exactly once" guarantee
+# silently did not hold. The duplicate is the entry that rots.
+ENTRY_REF = re.compile(_ROW + r"\[([^\]]+)\](?:\[([^\]]*)\])?(?![(:])")
+
+# A link reference DEFINITION, `[label]: target`.
+DEFN = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)", re.MULTILINE)
+
+
+def label_key(raw):
+    """Markdown reference labels fold case and collapse whitespace, so
+    `[guide   catalog]` and `[Guide Catalog]` are the same label.
+
+    Shared by the index-entry scan and the README reachability scan. They read
+    different files, but a label is a label in both, and the two callers want
+    exactly the same folding — the reason this is shared rather than copied.
+    """
+    return " ".join(raw.split()).lower()
 
 # One left-to-right scan replaces what used to be six sequential passes.
 #
@@ -628,14 +668,32 @@ def entries(text, base):
     """
     out = []
     section = None
-    for lineno, line in enumerate(readable(text).split("\n"), 1):
+    body = readable(text)
+    # Definitions are collected from the whole file first: a reference-style
+    # row may sit above the `[label]: target` line that resolves it, which is
+    # the usual way people write them.
+    defs = {label_key(m.group(1)): m.group(2) for m in DEFN.finditer(body)}
+    for lineno, line in enumerate(body.split("\n"), 1):
         if line.startswith("## "):
             section = line[3:].strip()
             continue
+        target = None
         m = ENTRY.match(line)
-        if not m:
+        if m:
+            target = m.group(1)
+        else:
+            r = ENTRY_REF.match(line)
+            if r:
+                # `[text][label]` uses `label`; `[label][]` and the shortcut
+                # `[label]` use the text itself. An undefined label is not a
+                # link, so the row is not an entry and the page it meant to
+                # list is reported as listed nowhere — the safe direction,
+                # and the same one an unparseable inline row already takes.
+                key = label_key(r.group(2) or r.group(1))
+                target = defs.get(key)
+        if target is None:
             continue
-        path = normalise(m.group(1), base)
+        path = normalise(target, base)
         if path is not None:
             out.append((path, lineno, section))
     return out
@@ -755,14 +813,7 @@ def reaches_index(text):
     # `[label]: target` definitions, then the labels actually referenced by a
     # full (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
     # reference. A definition nothing references is not a link.
-    def label_key(raw):
-        """Markdown reference labels fold case and collapse whitespace, so
-        `[guide   catalog]` and `[Guide Catalog]` are the same label."""
-        return " ".join(raw.split()).lower()
-
-    defs = {label_key(m.group(1)): m.group(2)
-            for m in re.finditer(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)",
-                                 text, re.MULTILINE)}
+    defs = {label_key(m.group(1)): m.group(2) for m in DEFN.finditer(text)}
     if not defs:
         return False
     used = {label_key(m.group(2)) or label_key(m.group(1))
@@ -1606,6 +1657,73 @@ self_test() {
     > "$tmp/ref_multiline_link/README.md"
   _commit ref_multiline_link
   _case "a definition after a multiline link survives" 0 ref_multiline_link
+
+  # 73. A destination may carry BALANCED parentheses. Ending the span at the
+  #     first `)` left the title for the reference scan to misread.
+  _scaffold balanced_dest
+  printf '# A\n' > "$tmp/balanced_dest/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/balanced_dest/docs/guide/index.md"
+  printf '[Other](other(foo).md "see [Guide][catalog]")\n\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/balanced_dest/README.md"
+  _commit balanced_dest
+  _case "balanced parens do not end a link early" 1 balanced_dest
+
+  # 74. ...and the guard: a real link whose destination carries balanced
+  #     parens is still a link, so case 73 is not bought by rejecting them.
+  _scaffold balanced_dest_real
+  printf '# A\n' > "$tmp/balanced_dest_real/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha(1).md)\n' \
+    > "$tmp/balanced_dest_real/docs/guide/index.md"
+  mv "$tmp/balanced_dest_real/docs/guide/alpha.md" \
+     "$tmp/balanced_dest_real/docs/guide/alpha(1).md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/balanced_dest_real/README.md"
+  _commit balanced_dest_real
+  _case "a balanced-paren destination still resolves" 0 balanced_dest_real
+
+  # 75. A REFERENCE-style row is a row. Recognising only the inline spelling
+  #     reported the page as listed nowhere — a false failure on a perfectly
+  #     ordinary index.
+  _scaffold ref_row
+  printf '# A\n' > "$tmp/ref_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][alpha]\n\n[alpha]: alpha.md\n' \
+    > "$tmp/ref_row/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ref_row/README.md"
+  _commit ref_row
+  _case "a reference-style row is an entry" 0 ref_row
+
+  # 76. The reason 75 matters more than convenience: an inline row and a
+  #     reference row for the SAME page are two entries, and the "listed
+  #     exactly once" guarantee has to see both.
+  _scaffold ref_row_dup
+  printf '# A\n' > "$tmp/ref_row_dup/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- [A again][alpha]\n\n[alpha]: alpha.md\n' \
+    > "$tmp/ref_row_dup/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ref_row_dup/README.md"
+  _commit ref_row_dup
+  _case "inline plus reference row is a duplicate" 1 ref_row_dup
+
+  # 77. An UNDEFINED label is not a link, so the row is not an entry and the
+  #     page is reported unlisted — the safe direction, and the one an
+  #     unparseable inline row already takes.
+  _scaffold ref_row_undef
+  printf '# A\n' > "$tmp/ref_row_undef/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][nosuch]\n' \
+    > "$tmp/ref_row_undef/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ref_row_undef/README.md"
+  _commit ref_row_undef
+  _case "an undefined label is not an entry" 1 ref_row_undef
+
+  # 78. A row whose link does not start the content is prose, not an entry.
+  #     Reference rows must not widen what counts as a row.
+  _scaffold ref_row_prose
+  printf '# A\n' > "$tmp/ref_row_prose/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n- see the [alpha] page\n\n[alpha]: alpha.md\n' \
+    > "$tmp/ref_row_prose/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ref_row_prose/README.md"
+  _commit ref_row_prose
+  _case "a mid-row reference is prose, not an entry" 0 ref_row_prose
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
