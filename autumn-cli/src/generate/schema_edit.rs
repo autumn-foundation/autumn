@@ -2013,9 +2013,9 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
 /// Rules, applied per line:
 /// - Only a bare `mod <name>;` or `pub mod <name>;` — the two forms
 ///   [`has_mod_declaration`] recognises — is qualified.
-/// - A declaration that already carries an attribute on the line above
-///   (the generator's own `#[path = …]` block, a hand-written `#[path]`, a
-///   `#[cfg]`, …) is left untouched.
+/// - A declaration that already carries an attribute (a hand-written
+///   `#[path]`, a `#[cfg]`, …), even one separated from the declaration by
+///   blank lines or comments, is left untouched.
 /// - The attribute goes on its own line directly above the declaration,
 ///   reusing the declaration's indentation. Visibility is preserved.
 /// - Idempotent: a qualified declaration carries the canonical attribute, so
@@ -2050,23 +2050,42 @@ fn qualify_plain_mod(existing: &str, name: &str, path_attr: &str) -> String {
     out
 }
 
-/// Whether the `mod` declaration on `lines[i]` already carries an attribute on
-/// the line directly above it (`#[path = …]`, `#[cfg(…)]`, …). Such a
-/// declaration is not "plain" and is never qualified by
-/// [`qualify_plain_mod`].
+/// Whether the `mod` declaration on `lines[i]` already carries an attribute
+/// (`#[path = …]`, `#[cfg(…)]`, …). Such a declaration is not "plain" and is
+/// never qualified by [`qualify_plain_mod`].
+///
+/// Rust attaches an attribute to its item even across intervening blank lines
+/// and comments, so the scan skips blank lines and `//` comment lines looking
+/// upward: the declaration counts as attribute-carrying only when the first
+/// line above that is neither blank nor a comment starts with `#[`. Without
+/// the skip, a custom `#[path]` separated from its `mod` by a comment would be
+/// treated as plain and get a second, conflicting `#[path]` — and at destroy
+/// time the unlinker would remove that canonical block together with the
+/// declaration, leaving the original attribute dangling and disconnecting the
+/// custom module.
 fn carries_attribute(lines: &[&str], i: usize) -> bool {
-    i > 0 && lines[i - 1].trim_start().starts_with("#[")
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        let t = lines[j].trim_start();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        return t.starts_with("#[");
+    }
+    false
 }
 
 /// Remove the `#[path]`-qualified `mod schema;` / `mod models;` declarations
-/// that [`link_models_into_seed_bin`] injected into `src/bin/seed.rs`, the
-/// destroy-time inverse of that link (issue #1718 follow-up).
+/// (private and `pub` forms) that [`link_models_into_seed_bin`] injected into
+/// `src/bin/seed.rs`, the destroy-time inverse of that link (issue #1718
+/// follow-up).
 ///
 /// `autumn destroy` deletes `src/schema.rs` and `src/models/mod.rs` once the
 /// last model's `SchemaTable`/`ModDecl` reverts empty them, so the seed
 /// binary's `#[path = "../schema.rs"] mod schema;` /
 /// `#[path = "../models/mod.rs"] mod models;` links would then point at missing
-/// files and fail `cargo check --bins`. This strips exactly those two injected
+/// files and fail `cargo check --bins`. This strips exactly the injected
 /// two-line blocks (attribute + `mod` declaration), matched on trimmed content
 /// so only this generator's own `#[path]`-qualified form is touched — a
 /// hand-written plain `mod schema;` without the injected attribute is left
@@ -2074,20 +2093,26 @@ fn carries_attribute(lines: &[&str], i: usize) -> bool {
 /// the removal seam are collapsed so the reverted file stays tidy.
 ///
 /// A hand-written plain declaration that linking qualified (issue #2669) is
-/// removed as one block too: the bare `mod schema;` points at
-/// `src/bin/schema.rs`, which does not exist, so keeping it would break
-/// `cargo check --bins` exactly like a dangling `#[path]` would.
-/// the removal seam are collapsed so the reverted file stays tidy.
+/// removed as one block too, in both the `mod` and `pub mod` forms: the bare
+/// `mod schema;` points at `src/bin/schema.rs`, which does not exist, so
+/// keeping it would break `cargo check --bins` exactly like a dangling
+/// `#[path]` would. Without the `pub mod` entries, a hand-written
+/// `pub mod schema;` qualified at link time would keep its canonical `#[path]`
+/// block after the last model is destroyed and fail `cargo check --bins`.
 ///
 /// This is gated by [`Revert::SeedBinLinks`](crate::generate::emit::Revert::SeedBinLinks)'s `owner_dir` (`src/models`) so it
 /// only runs when the *last* model is destroyed — destroying one of several
 /// models leaves the links in place, matching the surviving `models/mod.rs`.
 #[must_use]
 pub fn unlink_models_from_seed_bin(existing: &str) -> String {
-    // (attribute line, declaration line) for each injected block.
-    let blocks: [[&str; 2]; 2] = [
+    // (attribute line, declaration line) for each injected block, in both the
+    // private and `pub` declaration forms (issue #2669 qualifies `pub mod`
+    // too).
+    let blocks: [[&str; 2]; 4] = [
         ["#[path = \"../schema.rs\"]", "mod schema;"],
+        ["#[path = \"../schema.rs\"]", "pub mod schema;"],
         ["#[path = \"../models/mod.rs\"]", "mod models;"],
+        ["#[path = \"../models/mod.rs\"]", "pub mod models;"],
     ];
     let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
     for [attr, decl] in blocks {
@@ -7821,6 +7846,72 @@ use autumn_web::seed::SeedContext;
         assert!(
             unlinked.contains("use autumn_web::seed::SeedContext;"),
             "the original seed-binary items must be preserved:\n{unlinked}"
+        );
+    }
+
+    #[test]
+    fn unlink_seed_bin_removes_qualified_pub_mods() {
+        // Destroy-time inverse of qualifying a hand-written `pub mod`:
+        // linking qualifies `pub mod schema;` / `pub mod models;` too, so the
+        // unlinker must strip those canonical blocks — otherwise the
+        // `#[path]` attribute dangles at the deleted `src/schema.rs` /
+        // `src/models/mod.rs` and `cargo check --bins` fails (issue #2669,
+        // Codex review on #2824).
+        let existing = "\
+//! seed
+pub mod schema;
+    pub mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(
+            linked.contains("#[path = \"../schema.rs\"]\npub mod schema;"),
+            "link must qualify `pub mod schema;`:\n{linked}"
+        );
+        let unlinked = unlink_models_from_seed_bin(&linked);
+        assert!(
+            !unlinked.contains("mod schema;")
+                && !unlinked.contains("mod models;")
+                && !unlinked.contains("../schema.rs")
+                && !unlinked.contains("../models/mod.rs"),
+            "both qualified `pub mod` blocks must be fully removed:\n{unlinked}"
+        );
+        assert!(
+            unlinked.contains("use autumn_web::seed::SeedContext;"),
+            "the original seed-binary items must be preserved:\n{unlinked}"
+        );
+        assert_eq!(
+            unlink_models_from_seed_bin(&unlinked),
+            unlinked,
+            "unlinking is idempotent"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_qualify_skips_comment_separated_attribute() {
+        // Rust attaches an attribute to its item even across blank lines and
+        // comments, so a hand-written `#[path]` separated from its `mod` by a
+        // comment or blank line is not "plain" and must be left untouched.
+        // Qualifying it would add a second, conflicting `#[path]` — and at
+        // destroy time the unlinker would remove the canonical block together
+        // with the declaration, leaving the original attribute dangling and
+        // disconnecting the custom module (issue #2669, Codex review on
+        // #2824).
+        let existing = "\
+//! seed
+#[path = \"custom/schema.rs\"]
+// points at the hand-maintained schema
+mod schema;
+
+#[path = \"custom/models/mod.rs\"]
+
+mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert_eq!(
+            linked, existing,
+            "attribute-carrying declarations separated by comments/blank lines must be untouched:\n{linked}"
         );
     }
 
