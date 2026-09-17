@@ -196,15 +196,21 @@ _WS = r"[ \t]*(?:\n[ \t]*)?"
 _WS1 = r"(?:[ \t]+|[ \t]*\n[ \t]*)"
 # A title body, which may span a line ending but not a blank one, for the
 # same reason.
-_TITLE = (r'''"(?:[^"\n]|\n(?!\s*\n))*"'''
-          r"""|'(?:[^'\n]|\n(?!\s*\n))*'"""
-          r"""|\((?:[^)\n]|\n(?!\s*\n))*\)""")
+# A title's own delimiter may be backslash-escaped and is then CONTENT, so
+# each body consumes `\x` as one unit before considering the closer. Without
+# that, `"title \" ) [Guide](x.md)"` ended at the escaped quote and handed the
+# rest of the title back as markdown, exposing a link that renders nowhere.
+#
+# The parenthesised form additionally rejects an unescaped `(`: CommonMark
+# allows parens in a `(...)` title only when escaped or balanced, and treating
+# the first `)` as the end was the same premature-close bug in another suit.
+_TITLE = (r'''"(?:\\[^\n]|[^"\\\n]|\n(?!\s*\n))*"'''
+          r"""|'(?:\\[^\n]|[^'\\\n]|\n(?!\s*\n))*'"""
+          r"""|\((?:\\[^\n]|[^()\\\n]|\n(?!\s*\n))*\)""")
 # An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
 # and the required whitespace before one is what keeps a parenthesised title
 # from being read as more balanced destination.
 _CLOSE = r"(?:" + _WS1 + r"(?:" + _TITLE + r"))?" + _WS + r"\)"
-
-LINK = re.compile(r"(?<!!)\[[^\]]*\]\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -232,8 +238,18 @@ LINK = re.compile(r"(?<!!)\[[^\]]*\]\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r
 # under sub-bullets is told so by name rather than silently half-checked; that
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
+# Link TEXT, which may contain BALANCED brackets: `[A [advanced]](alpha.md)`
+# is an ordinary row, and a flat `[^\]]*` run stopped at the inner `]` and
+# rejected it — a false failure on a perfectly good index entry. The two
+# alternatives are disjoint (one excludes brackets, the other must start with
+# one), so there is no ambiguity for the engine to backtrack through.
+_TEXT = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+
+LINK = re.compile(r"(?<!!)" + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
+
+
 _ROW = r"^(?:- |\d{1,3}[.)] )"
-ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
+ENTRY = re.compile(_ROW + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
 # shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
@@ -2485,6 +2501,51 @@ self_test() {
     > "$tmp/unescaped_angle/README.md"
   _commit unescaped_angle
   _case "an unescaped < still opens an autolink" 1 unescaped_angle
+
+  # 121. Link TEXT may contain BALANCED brackets. A flat run stopped at the
+  #      inner `]`, so `- [A [advanced]](alpha.md)` — an ordinary row —
+  #      reported its page as listed nowhere.
+  _scaffold nested_brackets
+  printf '# A\n' > "$tmp/nested_brackets/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [advanced]](alpha.md)\n' \
+    > "$tmp/nested_brackets/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/nested_brackets/README.md"
+  _commit nested_brackets
+  _case "balanced brackets in link text are a row" 0 nested_brackets
+
+  # 122. ...and the guard: brackets that do NOT balance are not link text,
+  #      so the row is reported rather than quietly half-read.
+  _scaffold unbalanced_brackets
+  printf '# A\n' > "$tmp/unbalanced_brackets/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [x](alpha.md)\n' \
+    > "$tmp/unbalanced_brackets/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/unbalanced_brackets/README.md"
+  _commit unbalanced_brackets
+  _case "unbalanced brackets are not link text" 1 unbalanced_brackets
+
+  # 123. A title's own delimiter may be ESCAPED and is then content. Ending
+  #      at it handed the rest of the title back as markdown, exposing a
+  #      link that renders nowhere.
+  _scaffold escaped_title_delim
+  printf '# A\n' > "$tmp/escaped_title_delim/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/escaped_title_delim/docs/guide/index.md"
+  printf '[Other](other.md "title \\" ) [Guide](docs/guide/index.md)")\n' \
+    > "$tmp/escaped_title_delim/README.md"
+  _commit escaped_title_delim
+  _case "an escaped delimiter is title content" 1 escaped_title_delim
+
+  # 124. ...and the guard: an ordinary title still closes at its own
+  #      unescaped delimiter, so 123 is not bought by swallowing the line.
+  _scaffold plain_title_closes
+  printf '# A\n' > "$tmp/plain_title_closes/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/plain_title_closes/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md "T") and more text\n' \
+    > "$tmp/plain_title_closes/README.md"
+  _commit plain_title_closes
+  _case "an ordinary title still closes" 0 plain_title_closes
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
