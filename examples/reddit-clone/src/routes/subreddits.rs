@@ -136,7 +136,6 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
 /// changeset round-trip: the author's typed name and description come back in
 /// the fields alongside a message per field, instead of the framework's
 /// generic 422 page silently discarding the draft.
-///
 fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     let input_class = "flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
                        focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -155,7 +154,6 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
                     div class="flex items-center" {
                         span class="text-gray-400 mr-1" { "r/" }
                         input type="text" id="name" name="name" required
-                              minlength="2" maxlength="32"
                               placeholder="rustlang"
                               value=(form.field_value("name").unwrap_or_default())
                               aria-describedby="name-error"
@@ -708,26 +706,58 @@ mod tests {
 
     // ── Client/server rule drift (#2441/#2454 item 3) ────────────────
 
-    /// Regression guard for the mismatch itself: a `pattern` attribute here
-    /// would make the browser reject `validate_community_name`-valid input
-    /// (a space, a non-Latin letter) before any request is sent — no 422, no
-    /// error message, nothing the error-path tests above could ever catch.
+    /// Regression guard for the mismatch itself: a `pattern`, `minlength`, or
+    /// `maxlength` attribute here can only be narrower than
+    /// `validate_community_name`. That rule counts Unicode *scalar values*
+    /// (`chars().count()`); the browser's native `minlength`/`maxlength`
+    /// count UTF-16 *code units* instead, so a supplementary-plane name (one
+    /// `char`, two UTF-16 units) would be silently blocked at half its real
+    /// length — no 422, no error message, nothing the error-path tests above
+    /// could ever catch. See
+    /// `a_supplementary_plane_name_within_the_character_limit_is_accepted`
+    /// for the concrete case a `maxlength="32"` would have broken.
     #[test]
-    fn the_rendered_name_field_carries_no_pattern_narrower_than_the_server_rule() {
+    fn the_rendered_name_field_carries_no_native_constraint_narrower_than_the_server_rule() {
         let blank = ChangesetForm::blank(CreateSubredditForm::default(), "tok-123");
         let rendered = create_form_markup(&blank).into_string();
 
-        assert!(
-            !rendered.contains("pattern="),
-            "a `pattern` attribute here can only be narrower than \
-             `validate_community_name`, since that rule (2-32 characters, any \
-             script, needs one letter or number) has no HTML pattern \
-             equivalent; rendered: {rendered}"
-        );
+        for attr in ["pattern=", "minlength=", "maxlength="] {
+            assert!(
+                !rendered.contains(attr),
+                "`{attr}` here can only be narrower than `validate_community_name` \
+                 (2-32 *characters*, any script, needs one letter or number): no \
+                 character-class or UTF-16-code-unit-counted constraint can \
+                 express that Unicode-scalar-value rule; rendered: {rendered}"
+            );
+        }
         assert!(
             rendered.contains("at least one letter or number"),
             "the visible hint must describe the rule the server actually \
              enforces, not a narrower one; rendered: {rendered}"
+        );
+    }
+
+    /// The specific failure a `maxlength="32"` would reintroduce: 17 Deseret
+    /// letters (`U+10400`, outside the Basic Multilingual Plane) are 17
+    /// `char`s — well within the server's 32-character limit — but 34 UTF-16
+    /// code units, over what a `maxlength="32"` counts and would have
+    /// rejected in the browser before the request was ever sent.
+    #[test]
+    fn a_supplementary_plane_name_within_the_character_limit_is_accepted() {
+        let name: String = std::iter::repeat('\u{10400}').take(17).collect();
+        assert_eq!(
+            name.chars().count(),
+            17,
+            "the server's rule counts characters"
+        );
+        assert_eq!(
+            name.encode_utf16().count(),
+            34,
+            "each supplementary-plane char is a surrogate pair in UTF-16"
+        );
+        assert!(
+            validate_community_name(&name).is_ok(),
+            "17 characters is within the 2-32 character rule regardless of UTF-16 length"
         );
     }
 }
