@@ -1,4 +1,4 @@
-# 🛣️ Onramp: dev-profile debug info is a real cold-start lever, but it collides with documented backtrace behavior (findings, needs a human decision)
+# 🛣️ Onramp: dev-profile debug info is a real cold-start lever, but it costs backtrace quality (findings, needs a human decision)
 
 ## 🎯 Journey
 
@@ -53,21 +53,37 @@ maud,htmx,tailwind,reporting`:
 | `coherence_checking` | 3.34s |
 | `macro_expand_crate` | 3.86s |
 
-(total unit time 46.15s on this run). This contradicts the framing in #2795
-and PR #2817 that frontend (type-check/borrowck) time dominates over codegen
-for this crate: backend work (`LLVM_passes` + `codegen_crate` +
-`codegen_to_LLVM_IR` + `monomorphization_collector_graph_walk` ≈ 42.4s of
-overlapping/parallel work) is at least as large as frontend work
-(`type_check_crate` + `MIR_borrow_checking` + `coherence_checking` +
-`macro_expand_crate` ≈ 25.7s) on this box, for this feature set. That
-redirected this report toward the backend/codegen side rather than more
-per-module frontend attribution, since `-Z self-profile` (frontend-focused,
-and blocked anyway) was the wrong tool for that half regardless of network
-access.
+(total unit time 46.15s on this run).
 
-`LLVM_passes` + debug-info emission inside `codegen_to_LLVM_IR` are both
-driven by how much debug metadata rustc asks LLVM to generate, which is
-controlled by `-C debuginfo` (Cargo's `[profile.dev] debug` key). Neither this
+**Correction (thanks to review on PR #2829): an earlier draft of this
+paragraph summed `LLVM_passes` + `codegen_crate` + `codegen_to_LLVM_IR` +
+`monomorphization_collector_graph_walk` into a ~42.4s "backend total" and
+compared it against a ~25.7s frontend sum to claim backend work is at least
+as large as frontend work. That comparison is invalid and has been retracted:
+`codegen_to_LLVM_IR` and `LLVM_passes` are not siblings of `codegen_crate`,
+they run *inside* it (per-codegen-unit, potentially across multiple threads
+in parallel), so adding all three double- or triple-counts the same wall-clock
+window rather than measuring three disjoint spans. The numbers make this
+visible on inspection: `codegen_to_LLVM_IR` (11.45s) + `LLVM_passes` (12.75s)
+alone already exceeds `codegen_crate`'s own reported 11.86s, which is only
+possible if the "children" are concurrent work being separately accounted,
+not sequential sub-phases that sum to their parent. `-Z time-passes`'s flat,
+unindented output does not distinguish nested/parallel timers from disjoint
+ones, so it cannot support a "frontend vs. backend dominance" claim on its
+own — that would need `-Z self-profile`'s query-level accounting (blocked in
+this sandbox, see above) or manually identifying which timers are mutually
+exclusive. The individual numbers above are still real per-pass wall times,
+just not addable into the totals the first draft claimed.
+
+What still motivates looking at `-C debuginfo` specifically, independent of
+that retracted comparison: `LLVM_passes` (12.75s) and `codegen_to_LLVM_IR`
+(11.45s) are each, individually, a large fraction of the 46.15s unit total,
+and both are partly driven by how much debug metadata rustc asks LLVM to
+generate — controlled by `-C debuginfo` (Cargo's `[profile.dev] debug` key).
+That is a concrete, directly testable lever regardless of how the phases
+decompose, which is what **🧪 Apparatus**/**📊 Assay** below measure directly
+by A/B'ing the flag rather than relying on any further inference from
+`time-passes` output. Neither this
 workspace's root `Cargo.toml` nor `autumn-cli`'s generated-project templates
 (`autumn-cli/src/templates/Cargo.toml.tmpl`, `Cargo.api.toml.tmpl`) set
 `[profile.dev]` at all, so every `cargo build` — the real gate's included —
@@ -149,26 +165,40 @@ either side of 20%. That alone would call for one more round of measurement
 before shipping, on a dedicated or CI-caliber box rather than this shared
 sandbox.
 
-But the bigger reason this isn't a change to ship autonomously: **Autumn's
-own documented error-reporting behavior depends on debug info being present.**
-`docs/guide/error-reporting.md` documents that `panic.backtrace` (via
-`RUST_BACKTRACE=1`) is a first-class field of the framework's structured error
-payload — this is not an incidental capability, it's advertised developer-
-facing behavior. Backtrace symbolication (resolving each frame to a
-file:line) depends on `-C debuginfo` being at least line-tables-only;
-`-C debuginfo=0` would visibly degrade the exact debugging signal that guide
-documents Autumn surfacing, for every developer, on every build, forever —
-not just the one-time cold-start build the gate measures. (Rust's separate
-`#[track_caller]`-based panic-location string — the `"thread panicked at
-src/foo.rs:42"` line itself — is unaffected by `-C debuginfo`; what's lost is
-the *rest* of the call stack a backtrace shows, which `error-reporting.md`'s
-documented `panic.backtrace` field is specifically about.)
+But the bigger reason this isn't a change to ship autonomously: **it degrades
+the quality of a real, developer-facing debugging feature, even though it
+doesn't break its documented contract.**
 
-That is squarely a value trade-off — compile speed vs. a documented debugging
-feature — not a mechanical defect fix, so it goes to a human rather than
-shipping as a default change. Two additional gaps would need closing before
-anyone could safely turn either level into the templates' default regardless
-of that decision:
+**Correction (thanks to review on PR #2829): the first draft of this section
+overstated this as "regressing a documented field," which doesn't hold up
+against the actual doc text.** `docs/guide/error-reporting.md:74-75` promises
+only that `panic.backtrace` "is populated only when `RUST_BACKTRACE` is set,"
+and `autumn/src/reporting.rs:413-417`'s panic hook calls
+`Backtrace::capture()` unconditionally on that env var — nothing there checks
+or depends on `-C debuginfo`, so the field stays populated exactly as
+documented at every debuginfo level. What actually changes is quality, not
+presence, and it's real: I built a throwaway two-function binary and compared
+`std::backtrace::Backtrace::force_capture()` output at default debuginfo vs.
+`-C debuginfo=0`. At default, every frame — including the crate's own
+`inner`/`main` — prints `at src/main.rs:LINE:COL`. At `debuginfo=0`, the
+crate's own frames print as bare function names with no `at ...` line at all
+(`0: btcheck::inner`, no location), while precompiled standard-library frames
+still resolve their location (they ship their own separately-built debug
+info, unaffected by the local crate's flag). So under `-C debuginfo=0`,
+`panic.backtrace` for a real Autumn app would still show the call stack's
+function names — you'd still see *that* `my_app::handlers::checkout` panicked
+and what called it — just without the file:line for any of the application's
+own frames, which is real information developers use ("which of these three
+call sites hit this branch") and today get for free. `#[track_caller]`'s own
+panic-location string (`"thread panicked at src/foo.rs:42"`) is separate from
+`Backtrace` entirely and is unaffected either way.
+
+This is an undocumented quality trade-off, not a contract violation — but
+it's still a real cost for every developer, on every build, forever, not just
+the one-time cold-start build the gate measures, so it still belongs in front
+of a human rather than shipped as a silent default change. Two additional
+gaps would need closing before anyone could safely turn either level into the
+templates' default regardless of that decision:
 
 1. **This apparatus measured `-p autumn-web` in isolation**, not the actual
    `autumn new` no-DB daemon project `cold_start_driver.rs` builds (same
@@ -187,11 +217,12 @@ If a human wants to pursue this: pick a debug-info level for the generated
 project templates' `[profile.dev]` (currently unset, so `debug = true`/full):
 
 - `debug = 0` — larger win (~18%, pending re-measurement above the noise
-  floor and against the real harness), but removes backtrace file:line
-  resolution entirely, directly regressing `error-reporting.md`'s documented
-  `panic.backtrace` field.
-- `debug = "line-tables-only"` — keeps backtrace resolution intact, but only
-  ~8.7% on this apparatus, short of the impact floor on its own.
+  floor and against the real harness), but drops file:line resolution for the
+  application's own stack frames in every panic backtrace (function names
+  still show; see the empirical check above) — a quality cost, not a broken
+  contract, but a real and permanent one.
+- `debug = "line-tables-only"` — keeps backtrace file:line resolution intact,
+  but only ~8.7% on this apparatus, short of the impact floor on its own.
 - Do nothing, and let #2795's next attempt keep looking at the frontend/
   per-module side instead (would need `measureme`/`summarize` either
   pre-installed in CI's runner image or vendored, since `-Z self-profile`'s
