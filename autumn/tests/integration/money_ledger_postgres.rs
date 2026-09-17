@@ -378,7 +378,7 @@ async fn the_postgres_trigger_refuses_a_rewrite() {
 /// An account's currency is what `post` checks a posting against, so it must
 /// not move under the postings that already refer to it.
 ///
-/// `INSERT ... ON CONFLICT DO UPDATE` is Postgres's answer to an SQLite
+/// `INSERT ... ON CONFLICT DO UPDATE` is Postgres's answer to an `SQLite`
 /// `REPLACE`, and it is an `UPDATE`, so the same trigger sees it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
