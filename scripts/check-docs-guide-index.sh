@@ -187,144 +187,37 @@ LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*([^)\s#]+)")
 # retiring an open-ended parser.
 ENTRY = re.compile(r"^(?:- |\d{1,3}[.)] )\[[^\]]+\]\(\s*([^)\s#]+)\)")
 
-# An HTML comment, to the closing `-->` or to end of file if it never closes.
-COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
-# A fence opener or closer: three or more backticks or tildes, indented at most
-# three spaces, with whatever info string follows.
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-# A raw HTML block opener. CommonMark's `<pre>`/`<script>`/`<style>`/
-# `<textarea>` run to their closing tag; every other block ends at a blank
-# line. Both are literal text to the reader, so neither can hold an entry.
+# One left-to-right scan replaces what used to be six sequential passes.
 #
-# The ` {0,3}` is the same allowance `FENCE` carries, and for the same reason:
-# CommonMark lets a block opener be indented up to three spaces before it
-# becomes indented code. Requiring column zero here meant ` <pre>` opened no
-# block, so a row-shaped line inside it was still read as an entry.
+# WHY: the passes corrupted each other's input, and no ordering fixes it.
+# Comments before code spans meant a literal `` `<!--` `` in prose opened an
+# unterminated comment that blanked the rest of the file. Code spans before
+# comments means a lone backtick INSIDE a comment pairs with one after it and
+# blanks across the gap. Both delete real rows, so the gate fails on a
+# perfectly good index — the over-blanking direction, and the one that makes
+# this gate wrong rather than merely lenient. Review found the first of those;
+# the second is its mirror and would have arrived next.
+#
+# Scanning once fixes the class: whichever construct OPENS FIRST consumes its
+# own extent, which is the precedence CommonMark actually gives them. Nothing
+# downstream can reinterpret what an earlier construct already swallowed.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# A raw HTML block opener at line start. `<pre>`/`<script>`/`<style>`/
+# `<textarea>` run to their closing tag; any other tag ends at a blank line.
 HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
-# CommonMark's declaration-style block openers, each with its own terminator:
-# `<?…?>`, `<![CDATA[…]]>` and `<!DOCTYPE …>`. `<!--` is handled by `COMMENT`.
-# `HTML_OPEN` matches a tag NAME, so none of these looked like a block at all.
+HTML_LITERAL = ("pre", "script", "style", "textarea")
+# Declaration-style blocks, each with its own terminator.
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
-def blank_inline_tags(text):
-    """Blank inline HTML tags, so their ATTRIBUTES cannot look like links.
-
-    `<span title="[Guide](index.md)">` renders as a span with attribute text;
-    the browser offers no navigation to the index, so the bracket pair inside
-    the tag is not a link. `blank_html_blocks()` handles HTML at BLOCK level —
-    this is the same content appearing mid-sentence.
-
-    Only a well-formed tag is blanked: `<`, a name or `/name`, then everything
-    to the matching `>`. Prose arithmetic (`a < b`) does not match, and an
-    unterminated `<span` blanks nothing rather than running to end of file.
-    """
-    return re.sub(r"<[a-zA-Z/!?][^>\n]*>", lambda m: _blank(m.group(0)), text)
-
-
-def blank_images(text):
-    """Blank whole image constructs, `![alt](target)`, label and all.
-
-    An image navigates nowhere, and its ALT TEXT is plain text however it is
-    written — so `![alt [Guide](index.md)](preview.png)` is one image, and the
-    inner `[Guide](index.md)` is not a link a reader can click. The `(?<![!\\])`
-    on `LINK` only rejects a bracket immediately after `!`, so it saw that
-    inner one as real.
-
-    Brackets and parentheses are matched with a depth counter rather than a
-    regex, because that inner label is exactly the nesting a regex cannot
-    follow. Anything unbalanced is left alone: a stray `![` blanks nothing,
-    which keeps this out of the over-blanking direction that deletes real
-    rows.
-
-    A badge — `[![CI](badge.svg)](https://ci.example)` — keeps working: the
-    image inside it is blanked and the surrounding link is untouched, so the
-    link still counts. README.md carries five of those.
-    """
-
-    def balanced(start, opener, closer):
-        """Index just past the matching `closer`, or None if unbalanced."""
-        depth = 1
-        i = start + 1
-        while i < len(text) and depth:
-            if text[i] == "\\":
-                i += 2
-                continue
-            if text[i] == opener:
-                depth += 1
-            elif text[i] == closer:
-                depth -= 1
-            i += 1
-        return None if depth else i
-
-    out = list(text)
-    i = 0
-    while i < len(text) - 1:
-        if text[i] != "!" or text[i + 1] != "[" or (i and text[i - 1] == "\\"):
-            i += 1
-            continue
-        label = balanced(i + 1, "[", "]")
-        if label is None or label >= len(text) or text[label] != "(":
-            i += 1
-            continue
-        end = balanced(label, "(", ")")
-        if end is None:
-            i += 1
-            continue
-        for k in range(i, end):
-            if out[k] != "\n":
-                out[k] = " "
-        i = end
-    return "".join(out)
-
-
-def blank_code_spans(text):
-    """Blank inline code spans, including ones that wrap across lines.
-
-    `[Guide](x.md)` inside backticks renders as literal text, so it is not a
-    link — which matters for the README scan, the one caller that still
-    matches links rather than the `ENTRY` shape.
-
-    CommonMark's rule is followed exactly rather than approximated, because
-    the approximation is dangerous in the direction that hurts. A run of N
-    backticks opens a span only if a run of EXACTLY N appears later; if none
-    does, the backticks are literal text and nothing is blanked. That is what
-    makes an unmatched backtick harmless here — a greedy "backtick to
-    backtick" pattern would instead swallow whatever followed it and DELETE
-    real entries, leaving the gate quieter rather than louder.
-
-    Fences are blanked before this runs, so the only backticks reachable here
-    are the ones outside them.
-    """
-    out = list(text)
-    n = len(text)
-    i = 0
-    while i < n:
-        if text[i] != "`":
-            i += 1
-            continue
-        start = i
-        while i < n and text[i] == "`":
-            i += 1
-        run = i - start
-        j = i
-        while j < n:
-            if text[j] != "`":
-                j += 1
-                continue
-            close = j
-            while j < n and text[j] == "`":
-                j += 1
-            if j - close == run:
-                for k in range(start, j):
-                    if out[k] != "\n":
-                        out[k] = " "
-                i = j
-                break
-        # No closing run of the same length: the opening backticks are
-        # literal, and scanning simply continues after them.
-    return "".join(out)
-HTML_LITERAL = ("pre", "script", "style", "textarea")
+# A URI or email autolink. `<https://example.com>` renders as a LINK, not as
+# raw HTML, so treating it as a block opener blanked every row up to the next
+# blank line. It is skipped rather than blanked: it is visible to the reader,
+# and it can never be an index row or a link to a `.md` page anyway.
+AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*>"
+                      r"|<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>")
+# A well-formed inline HTML tag, whose ATTRIBUTES are not links.
+INLINE_TAG = re.compile(r"<[a-zA-Z/!?][^>\n]*>")
 
 
 def _blank(s):
@@ -332,135 +225,171 @@ def _blank(s):
     return "".join("\n" if c == "\n" else " " for c in s)
 
 
-def blank_fences(text):
-    """Blank fenced code blocks, backtick- and tilde-delimited alike.
-
-    An earlier revision toggled fence state on backticks only, so a valid
-    `~~~markdown` example counted its links as real entries. The close must use
-    the SAME character and be at least as long as the opener, which is what
-    keeps a ``` inside a ~~~ block from ending it.
-    """
-    out = []
-    fence = None
-    for line in text.split("\n"):
-        m = FENCE.match(line)
-        if fence is None:
-            # A backtick opener's info string may not itself contain a
-            # backtick (CommonMark), which keeps an inline span from opening
-            # a block.
-            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                fence = (m.group(1)[0], len(m.group(1)))
-                out.append(_blank(line))
-                continue
-            out.append(line)
-        else:
-            char, length = fence
-            if (m and m.group(1)[0] == char and len(m.group(1)) >= length
-                    and not m.group(2).strip()):
-                fence = None
-            out.append(_blank(line))
-    return "\n".join(out)
-
-
-def blank_html_blocks(text):
-    """Blank raw HTML blocks, whose contents are literal text to the reader.
-
-    Three shapes, each with its own terminator:
-
-      - `<pre>`, `<script>`, `<style>`, `<textarea>` — to their closing tag
-      - `<?…?>`, `<![CDATA[…]]>`, `<!DOCTYPE …>` — to their own closer. These
-        are not tags, so the tag-name pattern did not see them as blocks at
-        all, and a row inside one still counted.
-      - any other tag — to the next blank line, which is what CommonMark says
-        and what keeps this from swallowing a document that merely opens with
-        a `<div>` or a `<details>`
-
-    `literal` holds the terminator string, whichever shape opened the block,
-    so a one-line `<pre>…</pre>` closes on its own line.
-    """
-    out = []
-    literal = None
-    in_block = False
-    for line in text.split("\n"):
-        if literal is not None:
-            out.append(_blank(line))
-            if literal in line.lower():
-                literal = None
-            continue
-        decl = next((end for pat, end in DECL if pat.match(line)), None)
-        if decl is not None:
-            literal = decl
-            out.append(_blank(line))
-            if decl in line:
-                literal = None
-            continue
-        if in_block:
-            if not line.strip():
-                in_block = False
-                out.append(line)
-                continue
-            out.append(_blank(line))
-            continue
-        m = HTML_OPEN.match(line)
-        if m:
-            tag = m.group(2).lower()
-            if tag in HTML_LITERAL and not m.group(1):
-                closer = f"</{tag}>"
-                out.append(_blank(line))
-                # A one-line `<pre>…</pre>` closes on the line that opened it.
-                literal = None if closer in line.lower() else closer
-                continue
-            in_block = True
-            out.append(_blank(line))
-            continue
-        out.append(line)
-    return "\n".join(out)
-
-
 def readable(text):
     """The part of a markdown document a reader can actually see and click.
 
-    Everything blanked here is blanked SPACE FOR SPACE, so the line numbers in
+    Everything blanked is blanked SPACE FOR SPACE, so the line numbers in
     reported defects stay accurate.
 
-    With `ENTRY` stating the shape of a row, this only has to handle the
-    constructs that can put a line at COLUMN ZERO that still looks like one —
-    the multi-line regions:
+    With `ENTRY` stating the shape of a row, this only has to remove the
+    places a row-shaped line or a link can appear without being one:
 
-      - fenced code, ``` or ~~~ — an example of what an entry looks like is
+      - fenced code, ``` and ~~~ — an example of what an entry looks like is
         documentation about the index, not a row of it
-      - HTML comments — parking an entry by commenting it out is an ordinary
-        mid-edit move, and it must not keep an unlisted page green
-      - raw HTML blocks — `<pre>` and friends render their contents literally
+      - HTML comments — parking a row behind `<!-- -->` must not keep an
+        unlisted page green
+      - raw HTML blocks and declarations — `<pre>`, `<![CDATA[` and friends
+        render their contents literally
+      - inline code spans, including ones wrapping across lines
+      - images, label and all: `![alt [x](a.md)](p.png)` is one image and its
+        alt text is plain
+      - inline HTML tags, whose attributes are attribute text
 
-    Inline code spans are blanked too, and that is about the README rather
-    than about entries. `ENTRY` rejects `` - `[A](a.md)` `` on its own, so the
-    redesign dropped this pass — but the README check is the one caller that
-    still matches LINKS rather than the entry shape, and dropping it let a
-    README whose only occurrence was `` `[Guide](docs/guide/index.md)` ``
-    satisfy reachability with nothing clickable on the page. A regression of
-    the redesign, caught in review.
-
-    Everything else that used to live here is gone, because `ENTRY` rejects it
-    without a rule: four-space indented blocks, blocks indented relative to an
-    enclosing list item, tab indentation, images and escaped brackets all fail
-    to match a column-zero `- [text](target)`.
-
-    Fences are blanked first, so a comment delimiter or a `<pre>` inside a code
-    sample cannot open a region that swallows the rest of the file. Every
-    unterminated case blanks to end of file, which makes entries below it
-    vanish and the gate FAIL. That is the safe direction: malformed markup
-    should make the gate loud, not blind.
+    ONE SCAN, not a pass per construct. Whichever construct opens first
+    consumes its own extent, so nothing downstream can reinterpret what an
+    earlier one swallowed. Everything unterminated is left LITERAL rather than
+    run to end of file, because the alternative deletes real rows and makes
+    this gate fail on a good index.
     """
-    return blank_inline_tags(
-        blank_images(
-            blank_code_spans(
-            blank_html_blocks(
-                COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
-                )
-            )
-        )
-    )
+    out = list(text)
+    n = len(text)
+    i = 0
+
+    def blank_to(start, stop):
+        for k in range(start, min(stop, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    def line_end(pos):
+        nl = text.find("\n", pos)
+        return n if nl < 0 else nl
+
+    while i < n:
+        at_line_start = i == 0 or text[i - 1] == "\n"
+        eol = line_end(i)
+        line = text[i:eol]
+
+        if at_line_start:
+            m = FENCE.match(line)
+            # A backtick opener's info string may not contain a backtick.
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                char, length = m.group(1)[0], len(m.group(1))
+                j = eol + 1
+                while j <= n:
+                    stop = line_end(j)
+                    c = FENCE.match(text[j:stop])
+                    if (c and c.group(1)[0] == char
+                            and len(c.group(1)) >= length
+                            and not c.group(2).strip()):
+                        blank_to(i, stop)
+                        i = stop
+                        break
+                    if stop >= n:
+                        blank_to(i, n)
+                        i = n
+                        break
+                    j = stop + 1
+                else:
+                    blank_to(i, n)
+                    i = n
+                continue
+
+            decl = next((end for pat, end in DECL if pat.match(line)), None)
+            if decl is not None:
+                close = text.find(decl, i + 2)
+                stop = n if close < 0 else close + len(decl)
+                blank_to(i, stop)
+                i = stop
+                continue
+
+            # An autolink is a link, not a block opener. Checked BEFORE
+            # `HTML_OPEN`, whose tag-name pattern happily matches `https`.
+            auto = AUTOLINK.match(line)
+            hm = HTML_OPEN.match(line)
+            if hm and not auto:
+                tag = hm.group(2).lower()
+                if tag in HTML_LITERAL and not hm.group(1):
+                    closer = f"</{tag}>"
+                    idx = text.lower().find(closer, i)
+                    stop = n if idx < 0 else idx + len(closer)
+                else:
+                    blank = text.find("\n\n", i)
+                    stop = n if blank < 0 else blank
+                blank_to(i, stop)
+                i = stop
+                continue
+
+        if text.startswith("<!--", i):
+            close = text.find("-->", i + 4)
+            stop = n if close < 0 else close + 3
+            blank_to(i, stop)
+            i = stop
+            continue
+
+        if text[i] == "`":
+            start = i
+            while i < n and text[i] == "`":
+                i += 1
+            run = i - start
+            j = i
+            closed = False
+            while j < n:
+                if text[j] != "`":
+                    j += 1
+                    continue
+                cstart = j
+                while j < n and text[j] == "`":
+                    j += 1
+                if j - cstart == run:
+                    blank_to(start, j)
+                    i = j
+                    closed = True
+                    break
+            # Unmatched: the backticks are literal, and `i` already sits past
+            # them, so scanning simply continues.
+            if not closed:
+                continue
+            continue
+
+        if text[i] == "!" and i + 1 < n and text[i + 1] == "[" and (
+                i == 0 or text[i - 1] != "\\"):
+            def balanced(pos, opener, closer):
+                depth, k = 1, pos + 1
+                while k < n and depth:
+                    if text[k] == "\\":
+                        k += 2
+                        continue
+                    if text[k] == opener:
+                        depth += 1
+                    elif text[k] == closer:
+                        depth -= 1
+                    k += 1
+                return None if depth else k
+
+            label = balanced(i + 1, "[", "]")
+            if label is not None and label < n and text[label] == "(":
+                end = balanced(label, "(", ")")
+                if end is not None:
+                    blank_to(i, end)
+                    i = end
+                    continue
+            i += 1
+            continue
+
+        if text[i] == "<":
+            auto = AUTOLINK.match(text, i)
+            if auto:
+                i = auto.end()
+                continue
+            tag = INLINE_TAG.match(text, i)
+            if tag:
+                blank_to(i, tag.end())
+                i = tag.end()
+                continue
+
+        i += 1
+
+    return "".join(out)
 
 
 def tracked(root):
@@ -1139,6 +1068,49 @@ self_test() {
     > "$tmp/inline_tag_ok/README.md"
   _commit inline_tag_ok
   _case "link beside inline HTML still counts" 0 inline_tag_ok
+
+  # 41. A literal comment opener inside a code span is code, not a comment.
+  #     Blanking comments before code spans let it swallow the rows after it
+  #     and fail a perfectly good index.
+  _scaffold comment_in_span
+  printf '# A\n' > "$tmp/comment_in_span/docs/guide/alpha.md"
+  printf '# Guide\n\nWrite `<!--` literally.\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/comment_in_span/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/comment_in_span/README.md"
+  _commit comment_in_span
+  _case "comment opener inside a code span is not a comment" 0 comment_in_span
+
+  # 42. ...and the mirror, which nobody reported: a lone backtick INSIDE a
+  #     comment must not pair with one after it. Blanking code spans first
+  #     would have broken this exactly as badly.
+  _scaffold backtick_in_comment
+  printf '# A\n' > "$tmp/backtick_in_comment/docs/guide/alpha.md"
+  printf '# Guide\n\n<!-- note: ` -->\n\n## S\n\n- [A](alpha.md)\n\nsee `x` here\n' \
+    > "$tmp/backtick_in_comment/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/backtick_in_comment/README.md"
+  _commit backtick_in_comment
+  _case "backtick inside a comment does not open a span" 0 backtick_in_comment
+
+  # 43. A URI autolink renders as a LINK, not a raw HTML block. Treating it as
+  #     a block opener blanked every row to the next blank line.
+  _scaffold autolink
+  printf '# A\n' > "$tmp/autolink/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n<https://example.com>\n- [A](alpha.md)\n' \
+    > "$tmp/autolink/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/autolink/README.md"
+  _commit autolink
+  _case "autolink is not an HTML block opener" 0 autolink
+
+  # 44. ...but a real `<div>` at line start still opens one.
+  _scaffold div_block
+  printf '# A\n' > "$tmp/div_block/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/div_block/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n<div>\n- [B](beta.md)\n</div>\n' \
+    > "$tmp/div_block/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/div_block/README.md"
+  _commit div_block
+  _case "div still opens an HTML block" 1 div_block
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
