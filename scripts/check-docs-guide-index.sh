@@ -59,6 +59,11 @@
 #      catches an index pointing somewhere outside the corpus it indexes.
 #   3. Every entry sits under a `## ` section heading, so a page appended to
 #      the end of the file lands somewhere a reader is actually scanning.
+#      Entries inside a fenced code block or an HTML comment do not count: a
+#      fence showing what an entry looks like is documentation about the
+#      index, and a commented-out entry is one a reader can neither see nor
+#      follow. Parking an entry by commenting it out is an ordinary mid-edit
+#      move, and it must not keep an unlisted page green.
 #   4. `README.md` carries a markdown LINK whose target resolves to
 #      `docs/guide/index.md`. An index nobody can reach from the landing page
 #      is the very defect this gate exists to prevent, and it would otherwise
@@ -112,6 +117,28 @@ README = "README.md"
 # both are accepted so the gate never argues with `check-docs-links.sh` about
 # relative depth — that is its sibling's job, not this one's.
 LINK = re.compile(r"\[[^\]]*\]\(\s*([^)\s#]+)")
+
+# An HTML comment, to the closing `-->` or to end of file if it never closes.
+COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+
+
+def blank_comments(text):
+    """Blank every HTML comment, space for space, keeping line numbers intact.
+
+    A commented-out entry is not an entry: readers cannot see or follow it, so
+    it must not satisfy the completeness check. Parking an entry by commenting
+    it out is an ordinary thing to do mid-edit, and it would otherwise keep an
+    unlisted page green. `check-docs-orphans.sh` blanks the same way, and for
+    the same reason. Caught in review on the PR that added this gate.
+
+    An unterminated `<!--` blanks to end of file, so entries below it vanish
+    and the gate FAILS. That is the safe direction: a malformed comment makes
+    the gate loud rather than blind.
+    """
+    return COMMENT.sub(
+        lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)),
+        text,
+    )
 
 
 def tracked(root):
@@ -197,7 +224,7 @@ def entries(text, base):
     out = []
     section = None
     in_fence = False
-    for lineno, line in enumerate(text.split("\n"), 1):
+    for lineno, line in enumerate(blank_comments(text).split("\n"), 1):
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
@@ -286,7 +313,7 @@ for index_path, need in sorted(plan.items()):
 #    inline-code mention, which is not clickable and does not get the reader
 #    anywhere. Caught in review on the PR that added this gate.
 with open(f"{root}/{README}", encoding="utf-8") as fh:
-    readme = fh.read()
+    readme = blank_comments(fh.read())
 if not any(normalise(m.group(1), "") == INDEX
            for m in LINK.finditer(readme)):
     defects.append(
@@ -452,6 +479,28 @@ self_test() {
     > "$tmp/mention/README.md"
   _commit mention
   _case "README mention without a link fails" 1 mention
+
+  # 12. An entry commented out in HTML is not an entry — readers cannot see or
+  #     follow it. Parking one this way used to keep an unlisted page green.
+  _scaffold commented
+  printf '# A\n' > "$tmp/commented/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/commented/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n<!-- - [B](beta.md) -->\n' \
+    > "$tmp/commented/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/commented/README.md"
+  _commit commented
+  _case "commented-out entry does not count" 1 commented
+
+  # 13. A multi-line comment blanks without shifting the line numbers the
+  #     remaining defects are reported at.
+  _scaffold multiline
+  printf '# A\n' > "$tmp/multiline/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/multiline/docs/guide/beta.md"
+  printf '# Guide\n\n<!--\nparked:\n- [B](beta.md)\n-->\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/multiline/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/multiline/README.md"
+  _commit multiline
+  _case "multi-line commented entry does not count" 1 multiline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
