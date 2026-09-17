@@ -256,9 +256,20 @@ ENTRY_REF = re.compile(_ROW + r"\[([^\]]+)\](?:\[([^\]]*)\])?(?![(:])")
 # A title on the FOLLOWING line is still fine: this stops at the end of the
 # destination's line, which leaves the definition valid and the title line to
 # be read as the prose it resembles.
+#
+# The title may begin on the LINE AFTER the destination, and the span has to
+# cover it. Ending at the destination left the title to be scanned as ordinary
+# markdown, so a row-shaped line inside a multi-line title counted as an index
+# entry — listing a page with definition metadata that renders nowhere. `_WS1`
+# allows exactly one line ending, so a BLANK line still ends the definition.
+#
+# The title bodies are `_TITLE`, the same ones a link uses. They were spelled
+# differently here, which meant a definition title could straddle a blank line
+# when a link's could not; two grammars for one construct is how most of this
+# file's findings started.
 DEFN = re.compile(
     r"""^ {0,3}\[([^\]]+)\]:[ \t]*(?:\n[ \t]*)?(\S+)"""
-    r"""(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$""",
+    r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
 
 
@@ -1032,10 +1043,16 @@ def reaches_index(text):
     text = blank_links(text)
     if not defs:
         return False
+    # No `\\` in these lookbehinds. `readable()` already resolved escape
+    # PARITY and blanked any `[` a live escape applies to, so re-testing one
+    # character here rejected `\\[Guide][]` — an escaped backslash followed
+    # by a real reference link. `LINK` dropped this two rounds ago and these
+    # two kept it, which is the same one-of-two-sites miss as four findings
+    # before it; they are now the last of that shape in the file.
     used = {label_key(m.group(2)) or label_key(m.group(1))
-            for m in re.finditer(r"(?<![!\\])\[([^\]]*)\]\[([^\]]*)\]", text)}
+            for m in re.finditer(r"(?<!!)\[([^\]]*)\]\[([^\]]*)\]", text)}
     used |= {label_key(m.group(1))
-             for m in re.finditer(r"(?<![!\\])\[([^\]]+)\](?![\[(:])", text)}
+             for m in re.finditer(r"(?<!!)\[([^\]]+)\](?![\[(:])", text)}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
 
@@ -2324,6 +2341,53 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/row_in_defn_title/README.md"
   _commit row_in_defn_title
   _case "a row inside a definition title is not a row" 1 row_in_defn_title
+
+  # 111. A definition's title may begin on the LINE AFTER its destination,
+  #      and the span must cover it. Ending at the destination left the
+  #      title to be read as markdown, so a row inside it listed a page.
+  _scaffold defn_next_line_title
+  printf '# A\n' > "$tmp/defn_next_line_title/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/defn_next_line_title/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n\n[c]: other.md\n"title\n- [B](beta.md)\n"\n' \
+    > "$tmp/defn_next_line_title/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/defn_next_line_title/README.md"
+  _commit defn_next_line_title
+  _case "a next-line title belongs to the definition" 1 defn_next_line_title
+
+  # 112. ...and the guard: a BLANK line ends the definition, so a quoted
+  #      line after one is ordinary text and the definition still resolves.
+  _scaffold defn_blank_before_title
+  printf '# A\n' > "$tmp/defn_blank_before_title/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/defn_blank_before_title/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n- [B](beta.md)\n\n[a]: alpha.md\n\n"T"\n' \
+    > "$tmp/defn_blank_before_title/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/defn_blank_before_title/README.md"
+  _commit defn_blank_before_title
+  _case "a blank line ends the definition" 0 defn_blank_before_title
+
+  # 113. Escape parity for REFERENCE openers. `readable()` already resolved
+  #      the run, so re-testing one character rejected `\\[Guide][]` — an
+  #      escaped backslash followed by a real reference link.
+  _scaffold ref_escape_parity
+  printf '# A\n' > "$tmp/ref_escape_parity/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_escape_parity/docs/guide/index.md"
+  printf '\\\\[Guide][]\n\n[Guide]: docs/guide/index.md\n' \
+    > "$tmp/ref_escape_parity/README.md"
+  _commit ref_escape_parity
+  _case "two backslashes leave a live reference" 0 ref_escape_parity
+
+  # 114. ...and the guard: one backslash still escapes it away.
+  _scaffold ref_escape_single
+  printf '# A\n' > "$tmp/ref_escape_single/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/ref_escape_single/docs/guide/index.md"
+  printf '\\[Guide][]\n\n[Guide]: docs/guide/index.md\n' \
+    > "$tmp/ref_escape_single/README.md"
+  _commit ref_escape_single
+  _case "one backslash escapes a reference opener" 1 ref_escape_single
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
