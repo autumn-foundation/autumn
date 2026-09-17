@@ -244,6 +244,9 @@ _CLOSE = r"(?:" + _WS1 + r"(?:" + _TITLE + r"))?" + _WS + r"\)"
 # alternatives are disjoint (one excludes brackets, the other must start with
 # one), so there is no ambiguity for the engine to backtrack through.
 _TEXT = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+# The same grammar with the inner text CAPTURED, for the reference forms
+# that need to read it back as a label.
+_TEXT_G = r"\[((?:[^\[\]]|\[[^\[\]]*\])*)\]"
 
 LINK = re.compile(r"(?<!!)" + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
 
@@ -258,7 +261,7 @@ ENTRY = re.compile(_ROW + _TEXT + r"\(" + _WS + r"(" + _ANGLE + r"|" + _DEST + r
 # page as listed nowhere, and — worse — an inline row plus a reference-style
 # row for the SAME page counted once, so the "listed exactly once" guarantee
 # silently did not hold. The duplicate is the entry that rots.
-ENTRY_REF = re.compile(_ROW + r"\[([^\]]+)\](?:\[([^\]]*)\])?(?![(:])")
+ENTRY_REF = re.compile(_ROW + _TEXT_G + r"(?:\[([^\]]*)\])?(?![(:])")
 
 # A link reference DEFINITION, `[label]: target`.
 # The whitespace before the destination may include AT MOST one line ending.
@@ -406,7 +409,7 @@ COMMENT_BLOCK = re.compile(r"^ {0,3}<!--")
 ESCAPABLE = "[]!<`"
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
-        (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
+        (re.compile(r"^ {0,3}<![A-Z]"), ">"))
 # A URI or email autolink. `<https://example.com>` renders as a LINK, not as
 # raw HTML, so treating it as a block opener blanked every row up to the next
 # blank line. It is skipped rather than blanked: it is visible to the reader,
@@ -1093,9 +1096,9 @@ def reaches_index(text):
     # two kept it, which is the same one-of-two-sites miss as four findings
     # before it; they are now the last of that shape in the file.
     used = {label_key(m.group(2)) or label_key(m.group(1))
-            for m in re.finditer(r"(?<!!)\[([^\]]*)\]\[([^\]]*)\]", text)}
+            for m in re.finditer(r"(?<!!)" + _TEXT_G + r"\[([^\]]*)\]", text)}
     used |= {label_key(m.group(1))
-             for m in re.finditer(r"(?<!!)\[([^\]]+)\](?![\[(:])", text)}
+             for m in re.finditer(r"(?<!!)" + _TEXT_G + r"(?![\[(:])", text)}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
 
@@ -2546,6 +2549,39 @@ self_test() {
     > "$tmp/plain_title_closes/README.md"
   _commit plain_title_closes
   _case "an ordinary title still closes" 0 plain_title_closes
+
+  # 125. Balanced text in a REFERENCE row. Case 121 gave inline rows this
+  #      grammar and left `ENTRY_REF` on a flat run, so the reference
+  #      spelling of the same row still reported its page unlisted.
+  _scaffold nested_brackets_ref
+  printf '# A\n' > "$tmp/nested_brackets_ref/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [advanced]][alpha]\n\n[alpha]: alpha.md\n' \
+    > "$tmp/nested_brackets_ref/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/nested_brackets_ref/README.md"
+  _commit nested_brackets_ref
+  _case "balanced text in a reference row is a row" 0 nested_brackets_ref
+
+  # 126. ...and the guard: a link LABEL may not hold unescaped brackets, so
+  #      an undefined one is still not an entry. Text nests; labels do not.
+  _scaffold nested_label_undefined
+  printf '# A\n' > "$tmp/nested_label_undefined/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A [advanced]][nosuch]\n' \
+    > "$tmp/nested_label_undefined/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/nested_label_undefined/README.md"
+  _commit nested_label_undefined
+  _case "a nested-text row with no definition is not an entry" 1 nested_label_undefined
+
+  # 127. A declaration opener is UPPERCASE. `<!foo>` is ordinary text, and
+  #      blanking its line as a raw block swallowed a clickable link.
+  _scaffold decl_lowercase
+  printf '# A\n' > "$tmp/decl_lowercase/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/decl_lowercase/docs/guide/index.md"
+  printf '<!foo> [Guide](docs/guide/index.md)\n' > "$tmp/decl_lowercase/README.md"
+  _commit decl_lowercase
+  _case "a lowercase <!foo> is not a declaration" 0 decl_lowercase
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
