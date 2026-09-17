@@ -119,6 +119,14 @@ before — but each also widens a Rust type that user code can name.
 Three types moved. You are affected only if your code constructs or matches one
 of them exhaustively; none of them changes meaning.
 
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
 **Before (`{X.Y}`):**
 
 ```rust
@@ -243,7 +251,10 @@ the generated spec names that encoding instead of staying silent about it
 
 Only code that constructs a `Parameter` *by struct literal*, outside this
 crate, has to change. Every route macro and the OpenAPI generator itself
-already build one field at a time and are unaffected.
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
 
 **Before (`{X.Y}`):**
 
@@ -623,6 +634,42 @@ implementations. There is no default body on purpose: a store that silently did
 nothing would let the reaper evict live participants.
 
 **Automation:** `manual` — the body depends on how the store holds its state.
+
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
 
 ### Capacity contracts: three metadata structs gain fields
 

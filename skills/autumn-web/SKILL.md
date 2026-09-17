@@ -1489,7 +1489,15 @@ this is *provider-reported* failure.
   store. `with_mail_suppression_store` takes a store *by value* and wraps it in
   a fresh handle internally, so build **one** `InMemorySuppressionStore` and
   hand out `.clone()`s of it — the clone shares the same `Arc<Mutex<…>>` state
-  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`):
+  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`).
+
+  The receiving half needs the non-default `inbound-mail` feature on top of
+  `mail` — `record_inbound` and `InboundMailRouter` are both behind it, while
+  the store and `with_mail_suppression_store` above are not:
+
+  ```toml
+  autumn-web = { version = "0.7", features = ["mail", "inbound-mail"] }
+  ```
 
   ```rust
   use std::sync::OnceLock;
@@ -3657,6 +3665,11 @@ exits non-zero under `--strict`.
 / `torn down` + the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
 never rewrites it, so it is never a verdict on the last rollout, and it is
 reported, not drift.
+
+A halted `deploy up` and drift found by `deploy status --strict` each raise a
+`ScheduledTaskFailure` operator alert through the same outbound-HTTP `[alerts]`
+channel used by the offsite-upload alert above — email is not notified, same
+rule as issue #1743 (issue #2267).
 
 The **maintenance cell is three-valued** — `maintenance ON` / `maintenance off` /
 `maintenance ?` — and reports the flag file the host's RUNNING slot unit polls,

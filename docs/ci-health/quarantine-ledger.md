@@ -352,6 +352,96 @@ _None as of 2026-09-05._
   then the wrong window end-point and the conflation of independent
   diagnoses with reactive cleanup commits.
 
+### Escape: RUSTSEC-2026-0285 (rustls) failed the required `Supply chain (cargo-deny)` gate on any PR whose run reached the advisory audit with the pinned dependency, for ~7 hours, until fixed in passing by an unrelated PR
+
+- **Not a flake, not a product bug — a real, externally-disclosed
+  vulnerability, caught by the exact mechanism built to catch it.** RUSTSEC-2026-0285
+  ("TLS 1.3 handshake messages incorrectly accepted across encryption level
+  boundaries", `rustls` <0.23.45) landed in the advisory database sometime
+  before 2026-09-14T16:15:15Z (the earliest observed failure this pass's
+  sampling found — not confirmed as the true start, since the window before
+  that wasn't re-sampled). `rustls 0.23.43` was pinned in the root
+  `Cargo.lock`, pulled in transitively through `hyper-rustls`,
+  `tokio-rustls`, `tonic`, `reqwest`, `redis`, `lettre`, and
+  `tokio-postgres-rustls` — most of the workspace's own network stack, not
+  one narrow edge — so `cargo-deny`'s advisory check failed the required
+  `Supply chain (cargo-deny)` job on any open PR whose `Cargo.lock` carried
+  that pin and whose `check-advisories.sh` run actually reached the audit
+  step (carrying the pin was necessary but not sufficient — see the
+  `validator-0.21.0` counterexample below, whose run carried the same pin
+  but exited earlier on its own unrelated `fuzz/Cargo.lock` mismatch,
+  never reaching the audit), independent of that PR's own diff otherwise.
+  **Correction: not via the
+  `test-gate`/`Test suite` aggregator** — `.github/workflows/ci.yml`'s
+  `test-gate.needs` is exactly `[test, trybuild, test-features,
+  test-docker]` and does not include `supply-chain`, so a cargo-deny failure
+  fails its own separate check, not that aggregator. It is still blocking in
+  its own right: CONTRIBUTING.md's "Supply chain (cargo-deny)" section
+  states plainly that the job is fully blocking ("a PR that introduces a new
+  advisory... fails CI").
+- **Mechanism classification**: unpinned/newly-disclosed external
+  vulnerability data, the same structural shape as the MinIO/Docker-Hub
+  outage above (a lockfile- or registry-level fact outside this repo's own
+  diff failing every PR simultaneously), just triggered by a security
+  advisory publishing instead of an image disappearing. Neither a test
+  defect nor a product defect in this repo's own code.
+- **Impact, measured**: 5 run-level `Supply chain (cargo-deny)` failures
+  observed in the ~25.6h window sampled by the 2026-09-15 follow-up pass,
+  spanning 2026-09-14T16:15:15Z–18:45:27Z (dependabot PRs opened before the
+  bump landed would carry it too, but weren't separately confirmed beyond
+  this window): `claude/compassionate-euler-hfl9hp` (16:15:15Z),
+  `claude/epic-meitner-ftohjq` (17:51:24Z),
+  `dependabot/github_actions/taiki-e/install-action-2.87.11` (18:35:30Z),
+  `dependabot/cargo/rust-deps-8077afb676` (18:44:48Z), and
+  `dependabot/cargo/diesel-ecosystem-1a91744208` (18:45:27Z). Two of the five
+  (`compassionate-euler-hfl9hp`, `epic-meitner-ftohjq`) were confirmed by log
+  content showing the advisory ID and `rustls 0.23.43` pin explicitly; the
+  other three show the identical dependency-tree shape and identical
+  `advisories FAILED` / exit-1 pattern, strongly consistent but not
+  independently confirmed by the advisory-ID text (truncated out of the
+  fetched tail). **Not universal**: run 34871417092
+  (`claude/nifty-pascal-nebhrs`, 16:54:08Z, inside the failure window) passed
+  `Supply chain (cargo-deny)` cleanly — whether a given PR hit this depended
+  on whether its own `Cargo.lock` carried the exact `rustls 0.23.43` pin, not
+  on every concurrently-open PR failing. `dependabot/cargo/validator-0.21.0`'s
+  own `Supply chain (cargo-deny)` failure in the same window (23:11:06Z) is a
+  separate, pre-existing, unrelated `fuzz/Cargo.lock` `--locked` mismatch
+  (already documented in the 2026-09-14 report), not this advisory.
+- **Fix**: PR #2790 (`2acf14d`, merged 2026-09-14T23:07:59Z — ~6h53m after
+  the earliest failure logged above), whose primary subject is an unrelated
+  `examples/cms` editor UX fix, carries a second commit titled "fix: bump
+  rustls to 0.23.45 to close RUSTSEC-2026-0285": `cargo update -p rustls
+  --precise 0.23.45` (patch-level, no API break) against the root workspace
+  `Cargo.lock`, plus a follow-up commit applying the identical bump to
+  `fuzz/`'s own separate excluded-workspace `Cargo.lock` (cargo-deny's
+  "satellite advisories" lane checks that lockfile independently and would
+  not have been covered by the root bump alone). Root-caused via the
+  advisory's own stated solution, not tolerance-widened or suppressed.
+  **Found and fixed independent of this ledger's own tracking** — this entry
+  records it after the fact, the same posture as the MinIO escape above —
+  consistent with this repo's "red CI is work now" convention: whoever hit
+  the failure on their own PR fixed it in place.
+- **Verification**: CI-native, not just local — with one caveat. Every
+  `Supply chain (cargo-deny)` run sampled that actually carried the updated
+  lockfile passed: `dependabot/cargo/diesel-ecosystem` re-run at 23:11:34Z,
+  `claude/compassionate-euler-hfl9hp` re-run at 23:19:49Z,
+  `dependabot/cargo/rust-deps` re-run at 23:23:44Z. **Time alone is not the
+  boundary**: `dependabot/cargo/validator-0.21.0`'s own `Supply chain
+  (cargo-deny)` job failed again at 23:11:06Z, after 23:07:59Z — but that
+  failure is the separate, pre-existing `fuzz/Cargo.lock` `--locked`
+  mismatch on a stale branch whose lockfile never picked up the rustls
+  bump, not a recurrence of this advisory. Revert check: not
+  applicable in the usual sense (nothing in this repo's own logic changed —
+  the defect was an external vulnerability disclosure against a pinned
+  version, not a bug in this repo's code), but the failure this fix removes
+  is fully reproducible pre-fix (the five run IDs above) and specific to the
+  `rustls` version pinned, not anything else in the check, so reverting the
+  `Cargo.lock`/`fuzz/Cargo.lock` bump would reproduce the identical advisory
+  failure immediately.
+- **Closed**: 2026-09-15 (🚦 Semaphore), recorded after the fact — the
+  outage resolved itself via PR #2790 (merged 2026-09-14T23:07:59Z) before
+  this pass began sampling.
+
 ## Under active investigation, not yet quarantined
 
 These are tracked here because they are the subject of an open rerun
@@ -739,6 +829,140 @@ without also filling in the intake form above.
   `workflow_dispatch` runs, checked 2026-09-14T~08:0xZ — unchanged for a
   6th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
   ~137 hours idle).
+- **2026-09-15 update — 7th consecutive pass, harness still undispatched;
+  zero new organic hits on any of `live_upgrade`'s three signatures across
+  the ~25.6h window sampled this pass (2026-09-14T08:00:19Z, exclusive, to
+  2026-09-15T09:39:00Z — exclusive so as not to double-count run 34820504735,
+  already in the 2026-09-14 report's own success list at that exact boundary
+  timestamp — 67 runs: 50 cancelled/10 success/7 failure).** All 7 run-level failures
+  triaged (see `docs/reports/2026-09-15-semaphore-ci-health-followup.md`):
+  5 were the new RUSTSEC-2026-0285 `Supply chain (cargo-deny)` escape (its
+  own new closed entry above), 1 was a pre-existing, unrelated
+  `fuzz/Cargo.lock` staleness on the `validator-0.21.0` dependabot PR, and 1
+  was a second organic hit on `job_tracking_stores_integration` (its own
+  entry below) — none matched `live_upgrade`. This pass did **not** repeat
+  the 2026-09-14 pass's cancelled-run job-level sampling (checking whether a
+  `cancelled`-overall run hid a job-level `failure`), so — per that same
+  caveat — this is not a proven-exhaustive zero-hit finding across the full
+  67-run window, only across the 17 runs that resolved to `success`/`failure`
+  and were actually inspected. `manual-macos-contention-check.yml`: still
+  `total_count: 0` against `workflow_dispatch` runs, checked
+  2026-09-15T~09:5xZ — unchanged for a 7th straight pass since it became
+  dispatchable 2026-09-08T15:07:44Z (now ~162.5 hours idle, a full week).
+- **2026-09-16 update — 8th consecutive pass, harness still undispatched;
+  TWO organic hits in a single ~24h window, breaking a three-pass zero-hit
+  streak, one of them a brand-new signature.** Sampled `ci.yml`
+  `pull_request` runs from the 2026-09-15 report's own cutoff
+  (2026-09-15T09:39:00Z, exclusive) to 2026-09-16T09:40:05Z (~24h, two
+  `perPage=100` pages: page 1 covered 2026-09-15T16:38:14Z–09:40:05Z, page 2
+  covered back to 2026-09-14T07:25:10Z with margin past the window's near
+  edge) — 119 runs: 88 cancelled/18 success/13 failure. All 13 run-level
+  failures triaged by job/log inspection: **correction (post-review, via a
+  Codex review comment on PR #2823): the original pass of this ledger entry
+  said 11 `Clippy`/`Lint` failures, which double-counted one run and made
+  the categories sum to 15 against a 13-run total — it is 9.** 9 were a WIP
+  branch's own `Clippy`/`Lint` failure (`claude/determined-bardeen-unefhv`
+  alone accounts for 4 of these, iterating on the same fix across pushes;
+  `claude/eager-turing-gqo7ng` 2; `claude/inspiring-ramanujan-95ccd6`,
+  `vesper/bugbash-2801-pdf-depth-warn`, and
+  `vesper/bugbash-2370-dump-cache-coherence-env` 1 each), 1 was
+  `vesper/macro-crate-split`'s own multi-job break (Lint, MSRV,
+  Plugin API contract, SQLite runtime, Edge capsule conformance, Sim sweep,
+  Supply chain, and a `Markdown link gate` failure all on the same run,
+  consistent with an in-progress crate-split refactor rather than a CI
+  health issue), and 1 was `claude/inspiring-ramanujan-95ccd6`'s own
+  `pg_relative_delay_ci_coverage::pg_relative_delay_tests_are_named_in_ci`
+  repo-hygiene self-check failing on `Test (windows-latest)`
+  (`"job.rs no longer has a \`mod pg\` block inside \`mod tests\`"` —
+  the same shape as this ledger's own repo-hygiene self-checks
+  elsewhere, and clearly this branch's own in-progress `job.rs` edit, not
+  a CI infra issue).
+
+  **The remaining 2 are both `live_upgrade`, both on `Coverage (workspace)`,
+  both organic (neither triggering branch touches hot-upgrade code):**
+  1. Run 35044877808 (branch `claude/charming-planck-ag3glz`, completed
+     2026-09-16T03:36:41Z): panic at
+     `examples/hot-upgrade/tests/live_upgrade.rs:714:5`: `"the new build
+     must accept writes after the cutover"` — **a signature not previously
+     recorded in this entry.** The counter line printed immediately above
+     it reads `"connection failures across cutover: refused=0
+     hard_failures_after_retry=0 mid_flight_resets_retried=0
+     startup_barrier_hits_retried=0"`. **Correction (post-review, via a
+     Codex review comment on PR #2823): these four counters do not clear
+     all three of PR #2645's named mechanisms.** `refused` and
+     `hard_failures_after_retry` are connection-outcome counters this
+     ledger already attributes to PR #2510, not #2645 (see that entry's
+     "refused == 0 / hard == 0 split" note above); `mid_flight_resets_retried`
+     predates #2645 too, via the pre-existing `with_reset_retry` path. Of
+     #2645's own three mechanisms, only the third (the startup-barrier
+     retry) has a dedicated counter — `startup_barrier_hits_retried`,
+     clean here, ruling that one out for this occurrence. The other two
+     (the `wait_until_ready` startup-barrier poll, and the adaptive
+     post-cutover wait that replaced the old fixed 3.5s window) have no
+     counter at all, so whether either was active is unknown from this log
+     alone. **Second correction (post-review, via a further Codex review
+     comment on PR #2823): "the write was rejected" overstates what the
+     assertion actually checks.** Read against the test source
+     (`examples/hot-upgrade/tests/live_upgrade.rs:706-718`): the panic
+     fires when no element of `writes` has `status == 200 &&
+     parse_line(&w.body).is_some_and(|r| r.version == "v2")` — i.e. no
+     recorded post-cutover write observation was a parseable, v2-tagged
+     200. The preceding loop in the same test already permits `status ==
+     503` as an explicitly-allowed "refused as retryable" outcome, so this
+     failure is equally consistent with every post-cutover write getting a
+     503, a `v1`-tagged 200 (stale, not literally rejected), or a 200 with
+     an unparseable body — not only an outright rejection. Recorded as "no
+     post-cutover write observation matched 200+parseable+v2," not as a
+     confirmed write rejection.
+     `test result: FAILED. 5 passed; 1 failed`, same as every other hit
+     on this test. Undiagnosed — a fourth distinct assertion on this test
+     (after the macOS connection-error cluster, the Linux line-567
+     "new build never served," and the line-686 `status: 0`/empty-body
+     signature below), not yet folded into any existing hypothesis.
+  2. Run 35069353632 (branch `claude/friendly-ritchie-wol314`, completed
+     2026-09-16T09:15:56Z): panic at `./tests/live_upgrade.rs:686:5`,
+     `test result: FAILED. 5 passed; 1 failed` — same line number and same
+     pass/fail shape as the 2026-09-11 `status: 0` hit (run 34591670807)
+     already logged above. The tail fetched for this run's log (220 lines)
+     captured the backtrace and the preceding request-log spam but not the
+     `thread '...' panicked at ...:686:5: <message>` banner line itself —
+     it fell outside even that window, so the exact assertion text is
+     **not independently re-confirmed this pass**; recorded as "consistent
+     with, not confirmed as" the same `status: 0` signature, on line number
+     and result shape alone. A wider tail or the raw log blob URL would be
+     needed to confirm the message text exactly, per the same truncation
+     caveat the 2026-09-11 entry already flagged for this job type.
+
+  **Correction (post-review, via a further Codex review comment on PR
+  #2823): "six straight passes (2026-09-09 through 2026-09-15)" of zero
+  organic hits is wrong — this entry's own 2026-09-10 and 2026-09-11 dated
+  updates above record organic hits (2026-09-09T13:59Z and
+  2026-09-11T11:51:57Z respectively), so that range was not hit-free.**
+  Only three consecutive passes are explicitly documented as zero-hit
+  immediately before today: 2026-09-13, 2026-09-14, and 2026-09-15. Two
+  hits in one day, breaking that three-pass zero-hit streak, is itself
+  worth noting even though neither hit alone clears this role's own
+  rerun-rate bar. **Second correction (post-review, via a further Codex
+  review comment on PR #2823): line-552 and line-686 are the same `status: 0`
+  signature at two different line numbers (the file was refactored between
+  2026-09-09 and 2026-09-11), not two separate n=1 signatures — the
+  2026-09-11 update above already states this explicitly ("now two
+  occurrences of this exact signature").** Still not campaigned — n counts
+  per signature now stand at: `status: 0` (line-552 2026-09-09 + line-686
+  2026-09-11 = 2 confirmed occurrences before this pass; today's line-686
+  hit would make 3 if its unconfirmed message text is later verified to
+  match), line-567 (n=1, fixed by #2645's mechanism 2), and line-714 (n=1,
+  new). `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-16T~09:5xZ — unchanged for an
+  8th straight pass since it became dispatchable 2026-09-08T15:07:44Z (now
+  ~186.5 hours idle, well over a week). The recommendation to dispatch it
+  is now materially more urgent than a restatement: this pass found a
+  brand-new failure signature (no post-cutover write observed as a
+  parseable, v2-tagged 200 — not merely a read/connection issue) on a test
+  covering exactly the hot-upgrade handoff path, and the harness that could
+  start separating "timing-sensitive test" from "product race" has sat
+  unexercised for over a week while the signature count on this one test
+  keeps growing.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -805,6 +1029,10 @@ without also filling in the intake form above.
   `live_upgrade` above (still undispatched).
 - **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
   the `live_upgrade` entry's dated update above for the window and method).
+- **2026-09-15 update**: no repeat in the ~25.6h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-15 dated update above for the
+  window and method — including the caveat that cancelled-run job-level
+  sampling was not repeated this pass).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -818,6 +1046,14 @@ without also filling in the intake form above.
 - **2026-09-14 update**: no repeat in the ~23h window sampled this pass (see
   the `live_upgrade` entry's dated update above for the window and method).
   Still n=1, still not campaigned.
+- **2026-09-15 update**: no repeat in the ~25.6h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-15 dated update above for the
+  window and method — including the caveat that cancelled-run job-level
+  sampling was not repeated this pass). A related sibling test with a
+  different name, `sim_fault_plan_pg::fail_db_checkout_fires_on_the_target_ordinal_under_transactional_isolation`,
+  passed in the same `Test (Docker)` run that hit the
+  `job_tracking_stores_integration` repeat below — positive evidence, not
+  absence, for that one run. Still n=1, still not campaigned.
 
 ### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
 
@@ -968,13 +1204,38 @@ without also filling in the intake form above.
   isolating experiment (e.g. asserting on `updated_at` to see which write,
   if either, actually fired), so treat the verdict as provisional per this
   role's own bar.
-- **Status**: n=1, not campaigned. Logged here for recognition per this
-  role's standard for a first hit; escalate to a rerun campaign only if a
-  repeat signature appears. Not quarantined — the Docker sweep is
-  unmodified and this test keeps running on every sweep.
+- **Status**: n=2 as of 2026-09-15 (see that dated update below) — escalated
+  out of "n=1, not campaigned" per this entry's own stated trigger, a repeat
+  signature. Not yet campaigned: a same-commit rerun-rate harness is
+  recommended (see the 2026-09-15 update) but not yet built. Not
+  quarantined — the Docker sweep is unmodified and this test keeps running
+  on every sweep.
 - **2026-09-13 update**: no repeat in the ~19h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
 - **2026-09-14 update**: no repeat in the ~23h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
+- **2026-09-15 update — n=1→n=2: a repeat, same exact signature, this
+  entry's own stated escalation trigger.** Run 34934228774 (branch
+  `claude/wizardly-wright-pkv2ly`, an unrelated AES-256-GCM cipher-cache PR,
+  job `Test (Docker)`, completed 2026-09-15T07:08:43Z): `test result:
+  FAILED. 378 passed; 1 failed` in the same consolidated `integration_tests`
+  binary, panic at the identical site,
+  `autumn/tests/integration/job_tracking_stores_integration.rs:264:5`:
+  `"record should be past its configured TTL"` — same message, same line, as
+  the 2026-09-11 first occurrence (run 34517281816). ~4 days apart, both
+  organic, neither triggering PR touches job-tracking code. This does not by
+  itself distinguish between the two candidate mechanisms already recorded
+  above (demoted clock-step vs. the better-supported worker-refresh race);
+  it only confirms the signature repeats, which is exactly the condition
+  this entry names for moving out of "n=1, not campaigned." **Recommendation
+  (2026-09-15-semaphore-ci-health-followup.md)**: a dedicated rerun harness
+  — ≥20 iterations of `postgres_backend_persists_tracked_job_and_expires_it`
+  alone against a real testcontainers Postgres — is needed to get a
+  same-commit rerun-rate baseline before any fix is attempted; unlike the
+  macOS cluster this doesn't need a human-gated CI-spend decision, since it's
+  already a Docker-Postgres test running in the existing sweep and can be
+  reran locally with the repo's own tooling. Not built this pass. Still not
+  campaigned — n=2 organic is a trigger for escalation, not a rerun-rate
+  measurement in its own right.
