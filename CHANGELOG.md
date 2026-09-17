@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `oauth.md`. A cold retrieval test over the README list found the
   answering page absent for 11 of 15 ordinary reader questions, while every
   drift gate was green over those same pages: the answers were correct and
-  unfindable. Added `docs/guide/index.md`, which lists all 149 entries grouped
+  unfindable. Added `docs/guide/index.md`, which lists every guide page grouped
   by reader task and carries no answers of its own, and
   `scripts/check-docs-guide-index.sh`, which fails the build when a guide page
   is missing from the index, listed twice, linked to nothing, placed outside a

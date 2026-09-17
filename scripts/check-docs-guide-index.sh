@@ -508,8 +508,16 @@ ROW = re.compile(_ROW)
 # differently here, which meant a definition title could straddle a blank line
 # when a link's could not; two grammars for one construct is how most of this
 # file's findings started.
+# The ANGLE form is tried FIRST, because it is the one destination that may
+# contain spaces. `\S+` alone took only `<my` out of `[a]: <my file.md>` and
+# the rest of the line then stopped the pattern matching at all, so a page
+# whose name contains a space was reported as listed nowhere — a false
+# failure on a definition both renderers resolve to `my%20file.md`. Case 199
+# pinned this for the INLINE spelling last round; the definition spelling
+# needed the same grammar, which `_ANGLE` already had.
 DEFN = re.compile(
-    r"""^ {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?(\S+)"""
+    r"""^ {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
+    r"""(""" + _ANGLE + r"""|\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
 
@@ -529,6 +537,11 @@ URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 ESCAPED_PUNCT = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 IMAGE_MARK = "\ufffc"
+# The same idea for a CODE SPAN, which also renders something a reader can
+# see and click. Distinct from `IMAGE_MARK` only so the two are legible
+# apart in a dump; nothing tests which one it is, both simply mean "visible
+# content stood here".
+CODE_MARK = "\ufffc"
 
 LABEL_LIMIT = 999
 
@@ -1283,7 +1296,19 @@ def readable(text, resolved=None):
                 while j < n and text[j] == "`":
                     j += 1
                 if j - cstart == run:
+                    # A code span RENDERS. `[`Guide`](docs/guide/index.md)`
+                    # is `<a href="…"><code>Guide</code></a>` — visible,
+                    # clickable text — but blanking every character of the
+                    # label left `_text_renders` with nothing and the link
+                    # was rejected as empty. That is a false failure on
+                    # ordinary documentation: an index row naming a module
+                    # or a command in code font is a normal way to write
+                    # one. So a span with visible content leaves the same
+                    # kind of sentinel an image does; a span whose content
+                    # is blank renders an empty element and leaves none.
                     blank_to(start, j)
+                    if text[start + run:cstart].strip():
+                        out[start] = CODE_MARK
                     i = j
                     closed = True
                     break
@@ -4169,6 +4194,44 @@ self_test() {
     > "$tmp/defn_after_html_reaches/README.md"
   _commit defn_after_html_reaches
   _case "a reference after an html block reaches" 0 defn_after_html_reaches
+
+  # 202. A link whose whole label is a CODE SPAN renders visible, clickable
+  #      text — `<a href="…"><code>Guide</code></a>` — but blanking every
+  #      character of the label left `_text_renders` with nothing, so the
+  #      gate rejected it. The most ordinary false failure this gate has
+  #      had: naming a module or a command in code font is a normal way to
+  #      write an index row.
+  _scaffold code_span_label
+  printf '# A\n' > "$tmp/code_span_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [`alpha`](alpha.md)\n' \
+    > "$tmp/code_span_label/docs/guide/index.md"
+  printf '[`Guide`](docs/guide/index.md)\n' > "$tmp/code_span_label/README.md"
+  _commit code_span_label
+  _case "a code span is visible link text" 0 code_span_label
+
+  # 203. The other direction: a code span containing only a space renders an
+  #      element with nothing to read or aim at, so it is still not content.
+  _scaffold code_span_blank
+  printf '# A\n' > "$tmp/code_span_blank/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/code_span_blank/docs/guide/index.md"
+  printf '[` `](docs/guide/index.md)\n' > "$tmp/code_span_blank/README.md"
+  _commit code_span_blank
+  _case "a blank code span is not content" 1 code_span_blank
+
+  # 204. An ANGLE definition destination may contain spaces. `\S+` took only
+  #      `<my` and the rest of the line then stopped the pattern matching at
+  #      all, so a page whose name contains a space was listed nowhere —
+  #      while both renderers resolve the row to `my%20file.md`. Case 199
+  #      pinned this for the inline spelling; this is the definition one.
+  _scaffold angle_defn_space
+  printf '# A\n' > "$tmp/angle_defn_space/docs/guide/my file.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: <my file.md>\n' \
+    > "$tmp/angle_defn_space/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' \
+    > "$tmp/angle_defn_space/README.md"
+  _commit angle_defn_space
+  _case "an angle definition may hold a space" 0 angle_defn_space
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
