@@ -215,6 +215,42 @@ fn empty_and_over_long_text_is_refused() {
     ));
 }
 
+/// A NUL byte is refused in validation, on every backend.
+///
+/// Postgres `TEXT` cannot hold one, so binding it fails as a database error —
+/// a 500 for what is a bad request. `SQLite` stores it happily, so the two
+/// backends would disagree. Validation refuses it first, and both answer 422.
+#[test]
+fn a_nul_byte_in_text_is_refused() {
+    assert!(matches!(
+        IdempotencyKey::new("order\u{0}1"),
+        Err(LedgerError::InvalidText {
+            field: "idempotency key",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Transaction::new(
+            key("k1"),
+            vec![
+                Posting::debit("cash\u{0}", usd(100)),
+                Posting::credit("b", usd(100)),
+            ],
+        )
+        .validate(),
+        Err(LedgerError::InvalidText {
+            field: "account id",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Transaction::new(key("k1"), balanced())
+            .memo("paid\u{0}up")
+            .validate(),
+        Err(LedgerError::InvalidText { field: "memo", .. })
+    ));
+}
+
 // ── Sides ───────────────────────────────────────────────────────────────────
 
 #[test]

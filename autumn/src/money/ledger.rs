@@ -235,7 +235,7 @@ pub enum LedgerError {
         /// The account the posting names.
         account: String,
     },
-    /// An identifier, key or memo is empty or too long.
+    /// An identifier, key or memo is empty, too long, or holds a NUL byte.
     InvalidText {
         /// Which field is wrong.
         field: &'static str,
@@ -587,8 +587,8 @@ impl IdempotencyKey {
     ///
     /// # Errors
     ///
-    /// [`LedgerError::InvalidText`] when the key is empty or longer than 255
-    /// bytes.
+    /// [`LedgerError::InvalidText`] when the key is empty, longer than 255
+    /// bytes, or holds a NUL byte.
     pub fn new(key: impl Into<String>) -> Result<Self, LedgerError> {
         let key = key.into();
         check_text("idempotency key", &key, MAX_IDEMPOTENCY_KEY)?;
@@ -685,8 +685,8 @@ impl Transaction {
     /// * [`LedgerError::OneSided`] — no debit, or no credit.
     /// * [`LedgerError::ZeroPosting`] — a line that moves nothing.
     /// * [`LedgerError::Unbalanced`] — the debits do not equal the credits.
-    /// * [`LedgerError::InvalidText`] — an empty or over-long account id, key
-    ///   or memo.
+    /// * [`LedgerError::InvalidText`] — an empty, over-long, or NUL-carrying
+    ///   account id, key or memo.
     /// * [`LedgerError::Money`] — the postings sum past `i64`.
     pub fn validate(&self) -> Result<Validated, LedgerError> {
         check_text("idempotency key", self.key.as_str(), MAX_IDEMPOTENCY_KEY)?;
@@ -696,6 +696,8 @@ impl Transaction {
                 reason: "is too long",
             });
         }
+        // Not `check_text`: an empty memo is allowed.
+        check_no_nul("memo", &self.memo)?;
         if self.postings.len() < 2 || self.postings.len() > MAX_POSTINGS {
             return Err(LedgerError::PostingCount {
                 count: self.postings.len(),
@@ -967,7 +969,7 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-const fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), LedgerError> {
+fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), LedgerError> {
     if value.is_empty() {
         return Err(LedgerError::InvalidText {
             field,
@@ -978,6 +980,22 @@ const fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), 
         return Err(LedgerError::InvalidText {
             field,
             reason: "is too long",
+        });
+    }
+    check_no_nul(field, value)
+}
+
+/// Refuse a NUL byte.
+///
+/// Postgres `TEXT` cannot hold one, so the bind fails as a database error — a
+/// 500 for what is a bad request. `SQLite` stores it. Refusing it here answers
+/// 422 on both, and keeps a key that reads one way and compares another out of
+/// the idempotency index.
+fn check_no_nul(field: &'static str, value: &str) -> Result<(), LedgerError> {
+    if value.as_bytes().contains(&0) {
+        return Err(LedgerError::InvalidText {
+            field,
+            reason: "holds a NUL byte",
         });
     }
     Ok(())
