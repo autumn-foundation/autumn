@@ -168,12 +168,20 @@ README = "README.md"
 # which is a quiet way to turn a 1000-line corpus into a hang.
 _DEST = r"(?:[^()\s#]|\([^()\s]*\))"
 _FRAG = r"(?:#(?:[^()\s]|\([^()\s]*\))*)?"
+# `[A](<alpha.md#top>)` is a valid destination, and the bare form above cannot
+# read it: `_DEST` stops at the `#`, capturing `<alpha.md` — an unbalanced
+# fragment of a path that resolves to nothing, so a real row written that way
+# was reported as listed nowhere. The angled form is therefore its own
+# alternative, matched first and handed to `normalise` whole. Found by probing
+# this round's fragment handling rather than by a reader hitting it, but it is
+# the same false-failure class: ordinary markdown the gate rejected.
+_ANGLE = r"<[^<>\n]*>"
 # An optional title, then the close. Titles are `"..."`, `'...'` or `(...)`,
 # and the required whitespace before one is what keeps a parenthesised title
 # from being read as more balanced destination.
 _CLOSE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)'''
 
-LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _DEST + r"*)" + _FRAG + _CLOSE)
+LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _ANGLE + r"|" + _DEST + r"*)" + _FRAG + _CLOSE)
 
 # An index ENTRY, and the reason this gate no longer tries to parse markdown.
 #
@@ -202,7 +210,7 @@ LINK = re.compile(r"(?<![!\\])\[[^\]]*\]\(\s*(" + _DEST + r"*)" + _FRAG + _CLOSE
 # is a constraint on 161 lines this gate also owns, and a cheap one for
 # retiring an open-ended parser.
 _ROW = r"^(?:- |\d{1,3}[.)] )"
-ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(\s*(" + _DEST + r"+)" + _FRAG + _CLOSE)
+ENTRY = re.compile(_ROW + r"\[[^\]]+\]\(\s*(" + _ANGLE + r"|" + _DEST + r"+)" + _FRAG + _CLOSE)
 
 # The same row, written as a REFERENCE link: `- [A][alpha]`, `- [A][]` or the
 # shortcut `- [A]`, with `[alpha]: alpha.md` defined elsewhere in the index.
@@ -226,6 +234,49 @@ def label_key(raw):
     exactly the same folding — the reason this is shared rather than copied.
     """
     return " ".join(raw.split()).lower()
+
+
+def blank_links(text):
+    """Blank every complete inline-link span, space for space.
+
+    The inline pass has already accounted for those spans, so a later pass
+    must not read back inside one: a link's TITLE is ordinary text to
+    CommonMark, not navigation, and not markup either.
+
+    Newlines survive. A link span can straddle lines, and turning its newline
+    into a space would join the next line to it — dropping the `^` that the
+    MULTILINE definition scan anchors on, so a good definition below a
+    multi-line link would stop counting.
+    """
+    return LINK.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def definitions(text):
+    """Every `[label]: target` definition in `text`, as {folded label: target}.
+
+    Shared deliberately. Three findings on this gate have come from two
+    callers doing almost-the-same thing slightly differently, and the last
+    one was this exact scan: the README side blanked inline-link spans first
+    and the entry side, written one round later, did not. A helper both sides
+    call cannot drift like that; a convention that they should each remember
+    to has now failed three times.
+
+    Each rule below was wrong when this was a dict comprehension per caller:
+
+    - **Inline-link spans are blanked first.** A multi-line title can contain
+      a line that looks exactly like a definition, and reading it as one let
+      an undefined reference resolve — leaving a page unfindable while the
+      gate passed.
+    - **The FIRST definition of a label wins.** CommonMark resolves against
+      the first; keeping the last let a row or a README link resolve to a
+      target the reader never actually reaches.
+    - **Fragments are stripped** by `normalise`, so `[a]: alpha.md#section`
+      names the page `alpha.md` rather than a file that does not exist.
+    """
+    out = {}
+    for m in DEFN.finditer(blank_links(text)):
+        out.setdefault(label_key(m.group(1)), m.group(2))
+    return out
 
 # One left-to-right scan replaces what used to be six sequential passes.
 #
@@ -545,10 +596,15 @@ def readable(text):
             # `[A](<alpha.md>)` is a valid link, and blanking the angle form
             # as inline HTML made the destination unresolvable, so a clickable
             # link and a real index row written that way were reported missing.
+            #
+            # A reference DEFINITION's target is the same thing after `]:`
+            # rather than `](` — `[a]: <alpha.md>`. That spelling only became
+            # reachable once rows could be reference links, and it was blanked
+            # the same way, so the row above it resolved to nothing.
             back = i - 1
             while back >= 0 and text[back] in " \t":
                 back -= 1
-            if back >= 1 and text[back] == "(" and text[back - 1] == "]":
+            if back >= 1 and text[back] in "(:" and text[back - 1] == "]":
                 close = text.find(">", i)
                 if 0 <= close < line_end(i):
                     i = close + 1
@@ -629,6 +685,12 @@ def normalise(target, base):
     # written that way — was reported as missing.
     if len(target) > 1 and target.startswith("<") and target.endswith(">"):
         target = target[1:-1].strip()
+    # `alpha.md#section` names the page `alpha.md`. Inline destinations are
+    # already split by `_FRAG`, but a REFERENCE definition arrives whole, and
+    # comparing the fragment as part of the filename rejected valid rows and
+    # valid README links. Stripping here rather than at each call site is the
+    # point: a caller cannot forget it.
+    target = target.split("#", 1)[0].rstrip()
     target = target.rstrip("/")
     if not target or target.startswith(("http://", "https://", "mailto:")):
         return None
@@ -672,7 +734,7 @@ def entries(text, base):
     # Definitions are collected from the whole file first: a reference-style
     # row may sit above the `[label]: target` line that resolves it, which is
     # the usual way people write them.
-    defs = {label_key(m.group(1)): m.group(2) for m in DEFN.finditer(body)}
+    defs = definitions(body)
     for lineno, line in enumerate(body.split("\n"), 1):
         if line.startswith("## "):
             section = line[3:].strip()
@@ -795,25 +857,15 @@ def reaches_index(text):
     """
     if any(normalise(m.group(1), "") == INDEX for m in LINK.finditer(text)):
         return True
-    # The inline pass above has already accounted for every complete inline
-    # link, so the reference passes below must not read back inside one. A
-    # link's TITLE is ordinary text to CommonMark, not navigation: in
-    # `[Other](other.md "see [Guide][catalog]")` the `[Guide][catalog]` is
-    # part of the title and renders as characters, yet the reference scan
-    # collected it and reported the index as reachable when nothing on the
-    # page reached it. Blanking the spans keeps the same rule the single
-    # scan in `readable()` uses — whichever construct opens first consumes
-    # its own extent — across the two passes of this function.
-    # Newlines survive the blanking. A link span can straddle lines, and
-    # replacing its newline with a space would join the following line to it
-    # — dropping the `^` that the MULTILINE definition scan below anchors on,
-    # so a perfectly good `[catalog]: ...` definition would stop counting.
-    text = LINK.sub(
-        lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
-    # `[label]: target` definitions, then the labels actually referenced by a
-    # full (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
+    # Definitions, then the labels actually referenced by a full
+    # (`[text][label]`), collapsed (`[label][]`) or shortcut (`[label]`)
     # reference. A definition nothing references is not a link.
-    defs = {label_key(m.group(1)): m.group(2) for m in DEFN.finditer(text)}
+    #
+    # `definitions()` blanks inline-link spans itself; the USES below are
+    # scanned over the same blanked text, since a `[Guide][catalog]` sitting
+    # inside a link's title is title text and reaches nothing.
+    defs = definitions(text)
+    text = blank_links(text)
     if not defs:
         return False
     used = {label_key(m.group(2)) or label_key(m.group(1))
@@ -1724,6 +1776,61 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/ref_row_prose/README.md"
   _commit ref_row_prose
   _case "a mid-row reference is prose, not an entry" 0 ref_row_prose
+
+  # 79. A definition-looking line inside a multi-line link TITLE is title
+  #     text. Reading it as a definition let an undefined reference resolve,
+  #     leaving the page unfindable while the gate passed.
+  _scaffold defn_in_title
+  printf '# A\n' > "$tmp/defn_in_title/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[Other](other.md "title\n[a]: alpha.md\n")\n' \
+    > "$tmp/defn_in_title/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_in_title/README.md"
+  _commit defn_in_title
+  _case "a definition inside a title is not a definition" 1 defn_in_title
+
+  # 80. CommonMark resolves a reference against the FIRST definition of a
+  #     label. Keeping the last let a row resolve to a target the reader
+  #     never reaches.
+  _scaffold defn_first_wins
+  printf '# A\n' > "$tmp/defn_first_wins/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: ghost.md\n[a]: alpha.md\n' \
+    > "$tmp/defn_first_wins/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_first_wins/README.md"
+  _commit defn_first_wins
+  _case "the first definition of a label wins" 1 defn_first_wins
+
+  # 81. ...and the guard: one definition, and a second that is merely later,
+  #     must still resolve. Case 80 is not bought by rejecting duplicates.
+  _scaffold defn_first_good
+  printf '# A\n' > "$tmp/defn_first_good/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: alpha.md\n[a]: ghost.md\n' \
+    > "$tmp/defn_first_good/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_first_good/README.md"
+  _commit defn_first_good
+  _case "a later duplicate definition is ignored" 0 defn_first_good
+
+  # 82. `[a]: alpha.md#section` names the page `alpha.md`. Comparing the
+  #     fragment as part of the filename rejected a valid row.
+  _scaffold defn_fragment
+  printf '# A\n' > "$tmp/defn_fragment/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A][a]\n\n[a]: alpha.md#section\n' \
+    > "$tmp/defn_fragment/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/defn_fragment/README.md"
+  _commit defn_fragment
+  _case "a fragment in a definition is stripped" 0 defn_fragment
+
+  # 83. An angle-bracketed destination may carry a fragment, and a
+  #     definition's target may be angle-bracketed at all. Both were read as
+  #     inline HTML and blanked, so the row resolved to nothing. Neither was
+  #     reported by review — this pins what probing turned up.
+  _scaffold angle_fragment
+  printf '# A\n' > "$tmp/angle_fragment/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/angle_fragment/docs/guide/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](<alpha.md#top>)\n- [B][b]\n\n[b]: <beta.md#top>\n' \
+    > "$tmp/angle_fragment/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/angle_fragment/README.md"
+  _commit angle_fragment
+  _case "an angled destination may carry a fragment" 0 angle_fragment
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
