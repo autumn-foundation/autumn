@@ -546,9 +546,18 @@ def link_spans(text, resolved=frozenset()):
     return _scan(text, link_at, resolved)
 
 
-def ref_labels(text):
-    """Every reference LABEL used in `text`."""
-    return (label for _, _, label in _scan(text, ref_at))
+def ref_labels(text, resolved=frozenset()):
+    """Every reference LABEL used in `text`.
+
+    `resolved` is the set of labels the document defines, and it is what
+    tells an OUTER reference that its text already holds a link. A link may
+    not contain a link, so in `[outer [B][beta]][catalog]` the inner
+    reference renders and the outer one does not — which means `catalog` is
+    not used as a label at all. Scanning with nothing resolved could not see
+    that the inner pair was a link, recorded `catalog`, and credited a
+    definition the reader never follows.
+    """
+    return (label for _, _, label in _scan(text, ref_at, resolved))
 
 
 # An index ROW is a top-level list item. Every marker CommonMark allows is
@@ -2257,7 +2266,7 @@ def entries(text, base):
         if hit is not None and hit[1]:
             target = hit[1]
         else:
-            ref = ref_at(rows, start + row, pairs)
+            ref = ref_at(rows, start + row, pairs, resolved)
             if ref is not None:
                 # `[text][label]` uses `label`; `[label][]` and the shortcut
                 # `[label]` use the text itself. An undefined label is not a
@@ -2399,7 +2408,7 @@ def reaches_index(text):
     # by a real reference link. `LINK` dropped this two rounds ago and these
     # two kept it, which is the same one-of-two-sites miss as four findings
     # before it; they are now the last of that shape in the file.
-    used = {key for key in (label_key(l) for l in ref_labels(text))
+    used = {key for key in (label_key(l) for l in ref_labels(text, set(defs)))
             if key is not None}
     return any(normalise(defs[label], "") == INDEX
                for label in used if label in defs)
@@ -5798,6 +5807,49 @@ self_test() {
     > "$tmp/heading_list_col/README.md"
   _commit heading_list_col
   _case "a heading at the content column ends the paragraph" 1 heading_list_col
+
+  # 282. A link may not contain a link, so in `[outer [B][beta]][catalog]`
+  #      the INNER reference renders and the outer does not — which means
+  #      `catalog` is the label of a trailing SHORTCUT, and the index is
+  #      reached. Scanning with nothing resolved could not see the inner
+  #      pair was a link; it still lands on the right answer here.
+  _scaffold nested_ref_reaches
+  printf '# A\n' > "$tmp/nested_ref_reaches/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/nested_ref_reaches/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/nested_ref_reaches/docs/guide/index.md"
+  printf '[outer [B][beta]][catalog]\n\n[beta]: beta.md\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/nested_ref_reaches/README.md"
+  _commit nested_ref_reaches
+  _case "a deactivated outer leaves a live shortcut" 0 nested_ref_reaches
+
+  # 283. ...but when a SECOND label follows, that shortcut cannot form:
+  #      `[catalog][beta]` is a full reference using `beta`, so it links
+  #      beta.md and nothing reaches the index. Recording `catalog` as used
+  #      credited a definition the reader never follows — which is why the
+  #      resolved set has to reach this scan.
+  _scaffold nested_ref_blocked
+  printf '# A\n' > "$tmp/nested_ref_blocked/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/nested_ref_blocked/beta.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/nested_ref_blocked/docs/guide/index.md"
+  printf '[outer [B][beta]][catalog][beta]\n\n[beta]: beta.md\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/nested_ref_blocked/README.md"
+  _commit nested_ref_blocked
+  _case "a second label blocks the shortcut" 1 nested_ref_blocked
+
+  # 284. And an inline tail blocks it the same way, which the `(` guard in
+  #      `ref_at` already handled — pinned so the two stay together.
+  _scaffold nested_ref_inline
+  printf '# A\n' > "$tmp/nested_ref_inline/docs/guide/alpha.md"
+  printf '# B\n' > "$tmp/nested_ref_inline/beta.md"
+  printf '# O\n' > "$tmp/nested_ref_inline/other.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/nested_ref_inline/docs/guide/index.md"
+  printf '[outer [B][beta]][catalog](other.md)\n\n[beta]: beta.md\n[catalog]: docs/guide/index.md\n' \
+    > "$tmp/nested_ref_inline/README.md"
+  _commit nested_ref_inline
+  _case "an inline tail blocks the shortcut" 1 nested_ref_inline
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
