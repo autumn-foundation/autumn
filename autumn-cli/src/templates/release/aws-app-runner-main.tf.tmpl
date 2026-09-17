@@ -550,7 +550,9 @@ resource "aws_apprunner_service" "this" {
     memory             = var.instance_memory
     # Do not give the public bootstrap image the secret-reading runtime
     # role. The real-image cutover attaches it in the same update-service
-    # operation that supplies RuntimeEnvironmentSecrets.
+    # operation that supplies RuntimeEnvironmentSecrets. The `lifecycle`
+    # block below ignores drift on this field only — cpu and memory stay
+    # under Terraform's control.
   }
 
   network_configuration {
@@ -591,6 +593,13 @@ resource "aws_apprunner_service" "this" {
     # too, a later `terraform apply` would see that as drift from this
     # resource's own declared "/" and revert it — breaking the real app's
     # health check the moment anyone re-applies.
-    ignore_changes = [source_configuration, instance_configuration, health_check_configuration]
+    #
+    # instance_configuration: ignore only instance_role_arn, not the whole
+    # block. The cutover call sets that field outside Terraform (see the
+    # instance_configuration comment above). Cutover never touches cpu or
+    # memory, so keep them out of this list — `terraform apply` must still
+    # resize the service after an operator changes var.instance_cpu or
+    # var.instance_memory.
+    ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]
   }
 }

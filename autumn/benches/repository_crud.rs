@@ -44,15 +44,15 @@
 //! `benches/request_pipeline.rs` uses for its trivial-handler ingress
 //! workload, here run against the real write/read-by-id/list paths instead.
 //!
-//! `--fast-recycle` switches the pool's `ManagerConfig::recycling_method`
-//! from diesel-async's default (`Verified`, a `SELECT 1` round trip on every
-//! checkout) to `Fast` (no round trip). It exists to reproduce the finding
-//! recorded in issue-tracking for this harness: `autumn::db::create_pool`
-//! never overrides `recycling_method` away from that default, and
+//! `--fast-recycle` switches this harness's own pool from diesel-async's
+//! `Verified` recycling (a `SELECT 1` round trip on every checkout) to `Fast`
+//! (no round trip) — this bench builds its pool directly, not through
+//! `autumn::db::create_pool`, so it needs its own flag to compare the two.
+//! `autumn::db::create_pool` itself now sets `Fast` by default (issue #2485):
 //! `#[repository]`'s generated `__autumn_acquire_from` already issues its own
-//! round trip (`SET statement_timeout`) on every checkout, so every
-//! repository call in a deployed app currently pays for two liveness-style
-//! round trips where one would do. Compare with/without to reproduce:
+//! round trip (`SET statement_timeout`) on every checkout, so the pool's own
+//! `Verified` ping was a second, redundant one. Compare with/without to
+//! reproduce the before/after this fix:
 //!
 //! ```sh
 //! valgrind --tool=callgrind --callgrind-out-file=verified.out "$BIN" --iterations 5000
