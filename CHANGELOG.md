@@ -466,7 +466,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the cached response at request time, which also ends the old
   double-application (once at generation, once per request) for any
   body-rewriting layer. Apps without a `Content-Type`-rewriting layer are
-  unaffected: build and ISR already agreed on the type.
+  unaffected: build and ISR already agreed on the type. The i18n
+  `AmbientLocaleLayer` and its bundle `Extension` stay on the pre-layer router
+  (the extension is what `Locale::from_request_parts` reads the bundle from),
+  so translated `#[static_get]` handlers still render localized text rather
+  than raw translation keys.
 
 - **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
   `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of

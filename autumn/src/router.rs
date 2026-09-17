@@ -5696,7 +5696,13 @@ pub fn try_build_router_with_static(
 /// Returns `(session_scoped, drained)`:
 /// - `session_scoped`: layers that must stay on the inner (pre-layer) router —
 ///   the i18n ambient-locale layer, which reads the session and therefore
-///   cannot run outside the static-first middleware (see #1384).
+///   cannot run outside the static-first middleware (see #1384), and the i18n
+///   bundle `Extension`, which `Locale::from_request_parts` reads the bundle
+///   from exclusively. The build drops the drained set outright, so draining
+///   the bundle would make translated `#[static_get]` handlers write
+///   translation keys into `dist`. The extension inserts no headers and
+///   rewrites nothing, so keeping it does not disturb the recorded
+///   `Content-Type`.
 /// - `drained`: everything else — the user layers the SSG serve path applies
 ///   outside the static-first middleware, to the cached response, at request
 ///   time.
@@ -5709,7 +5715,7 @@ pub fn try_build_router_with_static(
 /// regeneration for an app with a `Content-Type`-rewriting layer, freezing
 /// the route until the next build.
 #[cfg(feature = "i18n")]
-pub(crate) fn partition_custom_layers_for_static_render(
+pub fn partition_custom_layers_for_static_render(
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
 ) -> (
     Vec<crate::app::CustomLayerRegistration>,
@@ -5724,15 +5730,28 @@ pub(crate) fn partition_custom_layers_for_static_render(
     // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
     // A handler that deliberately takes no `Locale` argument — the point of the
     // feature — never runs an extractor later to correct it.
+    //
+    // The i18n bundle `Extension` stays with it. `Locale::from_request_parts`
+    // obtains the bundle exclusively from the request extension that
+    // `install_i18n_bundle_layer` installs as a custom layer; the build drops
+    // the drained set, and without the extension the locale would carry no
+    // bundle, so `t()` would return the raw translation keys into the
+    // pre-rendered output. Registration order (Extension outermost) is
+    // preserved by the stable `partition`, so the ambient layer still reads
+    // the bundle exactly as on the fully-dynamic path.
+    let keep_type_ids = [
+        std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+        std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+    ];
     custom_layers
         .into_iter()
-        .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>())
+        .partition(|r| keep_type_ids.contains(&r.type_id))
 }
 
 /// The same partition with the `i18n` feature off: nothing is session-scoped,
 /// so every custom layer drains.
 #[cfg(not(feature = "i18n"))]
-pub(crate) fn partition_custom_layers_for_static_render(
+pub const fn partition_custom_layers_for_static_render(
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
 ) -> (
     Vec<crate::app::CustomLayerRegistration>,
@@ -5819,8 +5838,13 @@ pub fn try_build_router_with_static_inner(
 
     // The ambient-locale layer stays on the inner router's context, which
     // lands it in `apply_middleware`'s merged tuple — inside `session_layer`
-    // on both this path and the fully-dynamic one. The bundle `Extension`
-    // still drains out and stays outer, so the layer can read it. Shared with
+    // on both this path and the fully-dynamic one. The i18n bundle
+    // `Extension` stays on the inner router too: the build drops the drained
+    // set outright, and `Locale::from_request_parts` reads the bundle from
+    // that extension exclusively, so draining it would leave translated
+    // `#[static_get]` handlers writing translation keys into `dist`. The
+    // partition is stable, so registration order (Extension outermost) is
+    // preserved and the ambient layer still reads the bundle. Shared with
     // the static build (`App::run_build_mode`), which renders through the
     // same pre-layer composition — see
     // [`partition_custom_layers_for_static_render`].
@@ -14100,7 +14124,12 @@ mod trusted_host_tests {
 
     /// The ambient-locale layer reads the session, so it must stay on the
     /// inner (pre-layer) router even though every other custom layer drains
-    /// (#1384). Only its `TypeId` matters to the partition.
+    /// (#1384). The i18n bundle `Extension` must stay too:
+    /// `Locale::from_request_parts` reads the bundle from that extension
+    /// exclusively, and the static build drops the drained set outright, so
+    /// draining it would make translated `#[static_get]` handlers write raw
+    /// translation keys into `dist`. Only the `TypeId`s matter to the
+    /// partition.
     #[cfg(feature = "i18n")]
     #[test]
     fn static_render_partition_keeps_the_ambient_locale_layer() {
@@ -14113,10 +14142,27 @@ mod trusted_host_tests {
                 },
             )),
         };
-        let (kept, drained) =
-            partition_custom_layers_for_static_render(vec![redirect_gate_registration(), ambient]);
-        assert_eq!(kept.len(), 1, "the ambient-locale layer must stay");
-        assert_eq!(kept[0].type_name, "ambient_locale");
+        let bundle_ext = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+            type_name: "i18n_bundle_extension",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let (kept, drained) = partition_custom_layers_for_static_render(vec![
+            redirect_gate_registration(),
+            bundle_ext,
+            ambient,
+        ]);
+        assert_eq!(
+            kept.len(),
+            2,
+            "the ambient-locale layer and the i18n bundle extension must stay"
+        );
+        assert_eq!(kept[0].type_name, "i18n_bundle_extension");
+        assert_eq!(kept[1].type_name, "ambient_locale");
         assert_eq!(drained.len(), 1, "the user layer must drain");
         assert_eq!(drained[0].type_name, "redirect_gate");
     }
