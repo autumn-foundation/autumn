@@ -1079,13 +1079,14 @@ fn workflow_commands(body: &str) -> Vec<String> {
     for line in strip_yaml_comments(body).lines() {
         let indent = line.len() - line.trim_start().len();
         let trimmed = line.trim();
-        if let Some(ri) = run_indent {
-            if !trimmed.is_empty() && indent <= ri {
-                if !pending.is_empty() {
-                    commands.push(std::mem::take(&mut pending));
-                }
-                run_indent = None;
+        if let Some(ri) = run_indent
+            && !trimmed.is_empty()
+            && indent <= ri
+        {
+            if !pending.is_empty() {
+                commands.push(std::mem::take(&mut pending));
             }
+            run_indent = None;
         }
         if let Some(tail) = run_key_tail(trimmed) {
             run_indent = Some(indent);
@@ -1113,7 +1114,7 @@ fn workflow_commands_ignores_non_run_lines() {
     // Issue #2574: a step whose `name:` (or any non-`run:` field) contains a
     // full `cargo test --features sqlite --test <target>` string must NOT
     // count as coverage for `<target>`.
-    let yaml = r#"
+    let yaml = r"
 jobs:
   sqlite:
     steps:
@@ -1126,7 +1127,7 @@ jobs:
         env:
           CMD: cargo test --features sqlite --test sqlite_env_decoy
       - run: cargo test -p autumn-web --features sqlite --test sqlite_inline
-"#;
+";
     let commands = workflow_commands(yaml);
     let is_credited = |target: &str| {
         commands.iter().any(|command| {
@@ -1167,13 +1168,13 @@ jobs:
 
 #[test]
 fn workflow_commands_ignores_commented_invocations() {
-    let yaml = r#"
+    let yaml = r"
     steps:
       - name: sqlite suite
         # run: cargo test -p autumn-web --features sqlite --test sqlite_commented
         run: |
           cargo test -p autumn-web --features sqlite --test sqlite_live
-"#;
+";
     let commands = workflow_commands(yaml);
     let text = commands.join("\n");
     assert!(
