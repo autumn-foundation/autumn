@@ -584,7 +584,20 @@ DEFN = re.compile(
     # links. Anchoring at `^ {0,3}\[` missed every one of them and reported
     # the index unreachable from a README that reaches it. (The list-item
     # spelling already fitted, since its indent is inside the three spaces.)
-    r"""^(?: {0,3}(?:>[ \t]?)+)? {0,3}\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
+    # ...and a LIST MARKER may stand there too, for the same reason: a
+    # definition written as a list item's content is still document-global,
+    # so `- [catalog]: docs/guide/index.md` defines `catalog` for a
+    # `[Guide][catalog]` anywhere below it, and cmark-gfm renders the item
+    # itself empty.
+    #
+    # Leaving this out made the file disagree with ITSELF: round 49 taught
+    # `ref_at` to recognise exactly this shape (via `_DEFN_AT`) so that such
+    # a row is not counted as an entry, while `definitions` could not record
+    # the label it defines. The gate therefore said both "that row is a
+    # definition, not an entry" and "that label is undefined".
+    r"""^(?: {0,3}(?:>[ \t]?)+)? {0,3}"""
+    r"""(?:(?:[-*+]|\d{1,9}[.)])[ \t]{1,4})?"""
+    r"""\[((?:\\.|[^\[\]\n])+)\]:[ \t]*(?:\n[ \t]*)?"""
     r"""(""" + _ANGLE + r"""|\S+)"""
     r"""(?:""" + _WS1 + r"""(?:""" + _TITLE + r"""))?[ \t]*$""",
     re.MULTILINE)
@@ -4502,6 +4515,32 @@ self_test() {
     > "$tmp/quoted_defn_fenced/README.md"
   _commit quoted_defn_fenced
   _case "a definition in a quoted fence defines nothing" 1 quoted_defn_fenced
+
+  # 220. A definition written as a LIST ITEM's content is document-global
+  #      too, so `- [catalog]: docs/guide/index.md` defines `catalog` for a
+  #      use below it and cmark-gfm renders the item itself empty. Leaving
+  #      this out made the file disagree with itself: round 49 taught
+  #      `ref_at` to recognise exactly this shape so such a row is not an
+  #      entry, while `definitions` could not record the label it defines.
+  _scaffold list_defn_global
+  printf '# A\n' > "$tmp/list_defn_global/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/list_defn_global/docs/guide/index.md"
+  printf -- '- [catalog]: docs/guide/index.md\n\n[Guide][catalog]\n' \
+    > "$tmp/list_defn_global/README.md"
+  _commit list_defn_global
+  _case "a list-item definition defines" 0 list_defn_global
+
+  # 221. Round 49's guard, re-pinned against this widening: `the page` is no
+  #      destination, so THAT row is not a definition and stays a live link
+  #      listing its page.
+  _scaffold list_defn_not
+  printf '# A\n' > "$tmp/list_defn_not/docs/guide/alpha.md"
+  printf -- '# Guide\n\n## S\n\n- [Alpha]: the page\n\n[Alpha]: alpha.md\n' \
+    > "$tmp/list_defn_not/docs/guide/index.md"
+  printf '[Guide index](docs/guide/index.md)\n' > "$tmp/list_defn_not/README.md"
+  _commit list_defn_not
+  _case "a shortcut row survives the list prefix" 0 list_defn_not
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
