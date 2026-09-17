@@ -207,6 +207,62 @@ HTML_OPEN = re.compile(r"^ {0,3}<(/?)([a-zA-Z][a-zA-Z0-9-]*)")
 DECL = ((re.compile(r"^ {0,3}<\?"), "?>"),
         (re.compile(r"^ {0,3}<!\[CDATA\["), "]]>"),
         (re.compile(r"^ {0,3}<![a-zA-Z]"), ">"))
+def blank_images(text):
+    """Blank whole image constructs, `![alt](target)`, label and all.
+
+    An image navigates nowhere, and its ALT TEXT is plain text however it is
+    written — so `![alt [Guide](index.md)](preview.png)` is one image, and the
+    inner `[Guide](index.md)` is not a link a reader can click. The `(?<![!\\])`
+    on `LINK` only rejects a bracket immediately after `!`, so it saw that
+    inner one as real.
+
+    Brackets and parentheses are matched with a depth counter rather than a
+    regex, because that inner label is exactly the nesting a regex cannot
+    follow. Anything unbalanced is left alone: a stray `![` blanks nothing,
+    which keeps this out of the over-blanking direction that deletes real
+    rows.
+
+    A badge — `[![CI](badge.svg)](https://ci.example)` — keeps working: the
+    image inside it is blanked and the surrounding link is untouched, so the
+    link still counts. README.md carries five of those.
+    """
+
+    def balanced(start, opener, closer):
+        """Index just past the matching `closer`, or None if unbalanced."""
+        depth = 1
+        i = start + 1
+        while i < len(text) and depth:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == opener:
+                depth += 1
+            elif text[i] == closer:
+                depth -= 1
+            i += 1
+        return None if depth else i
+
+    out = list(text)
+    i = 0
+    while i < len(text) - 1:
+        if text[i] != "!" or text[i + 1] != "[" or (i and text[i - 1] == "\\"):
+            i += 1
+            continue
+        label = balanced(i + 1, "[", "]")
+        if label is None or label >= len(text) or text[label] != "(":
+            i += 1
+            continue
+        end = balanced(label, "(", ")")
+        if end is None:
+            i += 1
+            continue
+        for k in range(i, end):
+            if out[k] != "\n":
+                out[k] = " "
+        i = end
+    return "".join(out)
+
+
 def blank_code_spans(text):
     """Blank inline code spans, including ones that wrap across lines.
 
@@ -381,9 +437,11 @@ def readable(text):
     vanish and the gate FAIL. That is the safe direction: malformed markup
     should make the gate loud, not blind.
     """
-    return blank_code_spans(
-        blank_html_blocks(
-            COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
+    return blank_images(
+        blank_code_spans(
+            blank_html_blocks(
+                COMMENT.sub(lambda m: _blank(m.group(0)), blank_fences(text))
+            )
         )
     )
 
@@ -1019,6 +1077,30 @@ self_test() {
   printf '[Guide index](docs/guide/index.md)\n' > "$tmp/stray_backtick/README.md"
   _commit stray_backtick
   _case "unmatched backtick blanks nothing" 0 stray_backtick
+
+  # 37. A link nested in image ALT TEXT is plain text, not a link. The `!`
+  #     lookbehind could not see it, because the inner bracket does not follow
+  #     a `!`.
+  _scaffold image_alt
+  printf '# A\n' > "$tmp/image_alt/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/image_alt/docs/guide/index.md"
+  printf '![alt [Guide](docs/guide/index.md)](preview.png)\n' \
+    > "$tmp/image_alt/README.md"
+  _commit image_alt
+  _case "link inside image alt text is not an index link" 1 image_alt
+
+  # 38. ...but a badge — a link WRAPPING an image — still counts. README.md
+  #     carries five of those, so blanking the image must leave the enclosing
+  #     link alone.
+  _scaffold badge_link
+  printf '# A\n' > "$tmp/badge_link/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/badge_link/docs/guide/index.md"
+  printf '[![CI](badge.svg)](https://ci.example)\n\n[![docs](d.svg)](docs/guide/index.md)\n' \
+    > "$tmp/badge_link/README.md"
+  _commit badge_link
+  _case "badge link wrapping an image still counts" 0 badge_link
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
