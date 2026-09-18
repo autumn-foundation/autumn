@@ -137,8 +137,13 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
 /// the fields alongside a message per field, instead of the framework's
 /// generic 422 page silently discarding the draft.
 ///
-/// The name input stays hand-written rather than `autumn_web::a11y::TextField`
-/// so it can keep its `pattern` attribute, which that widget does not support.
+/// The name input carries no native HTML constraints: the server rule is
+/// "2-32 Unicode characters, any script, with at least one letter or number",
+/// and no `pattern` expresses the content check while `minlength`/`maxlength`
+/// count UTF-16 code units instead of characters (#2838) — so any of them
+/// would silently block server-valid names before the round trip below runs.
+/// The input stays hand-written rather than `autumn_web::a11y::TextField`;
+/// swapping to it is a separate variable and out of scope here.
 fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     let input_class = "flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
                        focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -157,9 +162,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
                     div class="flex items-center" {
                         span class="text-gray-400 mr-1" { "r/" }
                         input type="text" id="name" name="name" required
-                              minlength="2" maxlength="32"
                               placeholder="rustlang"
-                              pattern="[a-zA-Z0-9_]+"
                               value=(form.field_value("name").unwrap_or_default())
                               aria-describedby="name-error"
                               aria-invalid=[name_invalid.then(|| "true")]
@@ -167,7 +170,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
                     }
                     (field_errors("name", form))
                     p class="text-xs text-gray-400 mt-1" {
-                        "Letters, numbers, and underscores only"
+                        "2-32 characters, with at least one letter or number"
                     }
                 }
                 div {
@@ -606,11 +609,11 @@ mod tests {
         }
     }
 
-    /// These are the *server's* rules. The shipped form is deliberately
-    /// narrower — `create_form`'s input carries `pattern="[a-zA-Z0-9_]+"`, so
-    /// a browser will not send `"web dev"` or `"日本語"` in the first place.
-    /// Widening that pattern is a separate UI change; what matters here is
-    /// that the server does not reject real text out of hand.
+    /// These are the *server's* rules, and the shipped form no longer narrows
+    /// them: the name input carries no native constraints (#2838), so these
+    /// names now reach `create` instead of dying on client-side validation.
+    /// What matters here is that the server does not reject real text out
+    /// of hand.
     #[test]
     fn a_community_name_with_a_letter_or_number_in_any_script_is_accepted() {
         for name in ["rust", "web dev", "42", "日本語", "Привет"] {
@@ -619,6 +622,48 @@ mod tests {
                 "{name:?} must be accepted"
             );
         }
+    }
+
+    /// The rendered form must carry no native constraint narrower than the
+    /// server rule (#2838): no `pattern` expresses "contains a letter or
+    /// number in any script", and `minlength`/`maxlength` count UTF-16 code
+    /// units while the server counts characters — so any of them would
+    /// silently block server-valid names before the round trip runs.
+    #[test]
+    fn the_rendered_name_field_carries_no_native_constraint_narrower_than_the_server_rule() {
+        let rendered = create_form_markup(&ChangesetForm::blank(
+            CreateSubredditForm {
+                name: String::new(),
+                description: String::new(),
+            },
+            "tok-123",
+        ))
+        .into_string();
+
+        for attr in ["pattern=", "minlength=", "maxlength="] {
+            assert!(
+                !rendered.contains(attr),
+                "the name field must not carry {attr:?}; rendered: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("2-32 characters, with at least one letter or number"),
+            "the hint must state the actual server rule; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_supplementary_plane_name_within_the_character_limit_is_accepted() {
+        // 17 Deseret letters (U+10400): 17 Unicode characters, 34 UTF-16
+        // code units. A native `maxlength="32"` counts code units and would
+        // reject this; the server counts characters and accepts it (#2838).
+        let name: String = (0..17).map(|_| '\u{10400}').collect();
+        assert_eq!(name.chars().count(), 17);
+        assert_eq!(name.encode_utf16().count(), 34);
+        assert!(
+            validate_community_name(&name).is_ok(),
+            "{name:?} is within the 32-character limit"
+        );
     }
 
     #[test]

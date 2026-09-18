@@ -73,6 +73,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🧭 Wayfinder: reddit-clone's create-community name field no longer
+  carries native constraints narrower than the server rule (#2838):**
+  the name `<input>` dropped `pattern="[a-zA-Z0-9_]+"` plus `minlength="2"`
+  and `maxlength="32"`, which silently blocked server-valid names before the
+  form's error round-trip could run — non-Latin names (`日本語`, `Привет`),
+  names with spaces (`web dev`), and supplementary-plane names the server
+  counts as 17 characters but `maxlength` counts as 34 UTF-16 code units.
+  No `pattern` can express "contains at least one letter or number in any
+  script", and native length attributes count code units, so the field now
+  states the real rule in its hint ("2-32 characters, with at least one
+  letter or number") and lets the server's `ChangesetForm` round-trip
+  enforce it.
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —
