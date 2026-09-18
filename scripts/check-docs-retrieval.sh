@@ -225,6 +225,8 @@ def is_paragraph(line):
     if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
         return False            # thematic break
     if re.match(r'^\[[^\]]*\]:', stripped):
+        # (A bare `[label]:` with the destination on the NEXT line is handled
+        # by the caller, which has to carry state across lines.)
         # A link-reference definition renders as NOTHING — it only defines a
         # target for `[text][ref]` elsewhere. Treating it as setext text put
         # its raw destination (`/secret-runtime-logger.md`) into the index as
@@ -393,6 +395,7 @@ def index():
         fence = None
         comment = False
         html_block = None
+        pending_defn = False
         para = []
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
@@ -441,6 +444,12 @@ def index():
             if html_block is not None:
                 if html_block == '#pi':
                     if '?>' in line:
+                        html_block = None
+                elif html_block == '#cdata':
+                    if ']]>' in line:
+                        html_block = None
+                elif html_block == '#decl':
+                    if '>' in line:
                         html_block = None
                 elif html_block == '#blank':
                     if not line.strip():
@@ -506,7 +515,7 @@ def index():
                 para = []
                 continue
 
-            if line.lstrip(' ').startswith('<?'):
+            if re.match(r'^ {0,3}<\?', line):
                 # CommonMark type 3: a processing instruction runs to `?>`,
                 # and nothing inside it is Markdown.
                 html_block = '#pi'
@@ -515,7 +524,21 @@ def index():
                     html_block = None
                 continue
 
-            if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}[\s/>]', line, re.I):
+            if re.match(r'^ {0,3}<!\[CDATA\[', line):
+                html_block = '#cdata'          # type 5, ends at `]]>`
+                para = []
+                if ']]>' in line:
+                    html_block = None
+                continue
+
+            if re.match(r'^ {0,3}<![A-Za-z]', line):
+                html_block = '#decl'           # type 4 (`<!DOCTYPE …`), ends at `>`
+                para = []
+                if '>' in line:
+                    html_block = None
+                continue
+
+            if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', line, re.I):
                 html_block = '#blank'
                 para = []
                 continue
@@ -581,7 +604,16 @@ def index():
                 # blank line ends the paragraph, so the next `---` is a
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
-                if is_paragraph(line) and not is_heading:
+                if pending_defn and line.strip():
+                    # A reference definition may put its destination on the
+                    # following line: `[label]:` then ` /url`. That line is
+                    # still invisible, so it is not paragraph text either.
+                    pending_defn = False
+                    para = []
+                    continue
+                pending_defn = re.match(r'^ {0,3}\[[^\]]*\]:\s*$',
+                                        line) is not None
+                if is_paragraph(line) and not is_heading and not pending_defn:
                     para.append(line)
                 else:
                     para = []       # a blank line or a block ends the paragraph
@@ -1323,7 +1355,58 @@ self_test() {
     > "$c72/scripts/docs-retrieval-questions.tsv"
   check "a real script block still hides its contents" fail "$c72"
 
-  # 73. A comment line and a blank line in the fixture are skipped.
+  # 73. FOUR spaces before `\u003c?` is indented code, not a processing
+  #     instruction, so the scanner must not enter one and eat the page.
+  local c73="$tmp/c73"; make_corpus "$c73"
+  printf '# Page\n\n    \u003c?php\n\n## Secret runtime logger\n' \
+    > "$c73/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c73/scripts/docs-retrieval-questions.tsv"
+  check "four spaces before a PI is indented code" pass "$c73"
+
+  # 74. A CDATA section hides its contents.
+  local c74="$tmp/c74"; make_corpus "$c74"
+  printf '# Page\n\n\u003c![CDATA[\n# Secret runtime logger\n]]\u003e\n' \
+    > "$c74/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c74/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside CDATA is not indexed" fail "$c74"
+
+  # 75. A declaration block does too, and ends at its `\u003e`.
+  local c75="$tmp/c75"; make_corpus "$c75"
+  printf '# Page\n\n\u003c!DOCTYPE html\n# Secret runtime logger\n\u003e\n' \
+    > "$c75/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c75/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a declaration is not indexed" fail "$c75"
+
+  # 76. A container tag at END OF LINE still opens a type-6 block.
+  local c76="$tmp/c76"; make_corpus "$c76"
+  printf '# Page\n\n\u003cdiv\n# Secret runtime logger\n\n' \
+    > "$c76/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c76/scripts/docs-retrieval-questions.tsv"
+  check "a bare container tag at end of line opens a block" fail "$c76"
+
+  # 77. A reference definition may put its destination on the NEXT line; that
+  #     line is invisible too, so it is not setext text.
+  local c77="$tmp/c77"; make_corpus "$c77"
+  printf '# Page\n\n[Overview]:\n  /secret-runtime-logger.md\n---\n' \
+    > "$c77/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c77/scripts/docs-retrieval-questions.tsv"
+  check "a definition destination on the next line is not setext text" fail "$c77"
+
+  # 78. Ordinary paragraph text is STILL setext text — none of the above may
+  #     start swallowing prose.
+  local c78="$tmp/c78"; make_corpus "$c78"
+  printf '# Page\n\nSecret runtime logger\n---\n' \
+    > "$c78/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c78/scripts/docs-retrieval-questions.tsv"
+  check "paragraph text is still setext text" pass "$c78"
+
+  # 79. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

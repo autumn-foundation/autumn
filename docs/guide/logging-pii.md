@@ -175,11 +175,18 @@ understanding before an incident rather than during one:
   target is stuck at `trace` until the process restarts, and the advice below
   hardens accordingly: **restart now, not when convenient.**
 
-So the honest summary is: **lower it now, restart when convenient.** Lowering
-is what stops a trace-level firehose — potentially high-volume, and on a
-busy target potentially full of request detail — from running on after the
-investigation is closed. The restart is the tidy-up that stops a later `root`
-change from silently failing to reach that one target.
+So the honest summary depends on which case you are in:
+
+- **`previous` had a value** — the usual case. **Lower it now, restart when
+  convenient.** Lowering stops a trace-level firehose, potentially
+  high-volume and on a busy target full of request detail, from running on
+  after the investigation is closed. The restart is only the tidy-up that
+  stops a later `root` change from silently missing that target.
+- **`previous` was empty or `null`, with no global directive configured** —
+  **restart now.** The guarded command above does not fire, because there is
+  no level it could send, so nothing has lowered the target and it is still
+  at `trace`. Here the restart is not tidy-up; it is the only thing that
+  stops the volume.
 
 `GET /actuator/loggers` lists everything currently overridden, and is the
 check worth running before you call the incident closed — not least because it
