@@ -38,14 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would otherwise be found at 3am — that the `prod` profile turns CSRF on, so
   the bare `curl` is a `403` there and the page shows both ways through
   (`[security.csrf] exempt_paths`, or the double-submit cookie/header pair).
-  `[log] level` also accepts `off`, which the runtime endpoint does not. The
+  `[log] level` also accepts `off`, which the runtime endpoint does not, and
+  the page now states the *profile-specific* defaults rather than a flat
+  `info`/`Auto`: `dev` is `debug`/`Pretty`, `prod` is `info`/`Json`, both set
+  outright by smart defaults, and any other profile falls back to
+  `info`/`Auto`. "Why is dev so noisy" has a table to land on. The
   `Auto` /
   `Pretty` / `Json` table moves here from `getting-started.md`, which keeps a
   one-paragraph summary and a link, so the answer has one home rather than
   two that drift.
 
   Found by measuring the direction no existing gate measures.
-  `scripts/check-docs-retrieval.sh` (new, wired into CI with a 16/16
+  `scripts/check-docs-retrieval.sh` (new, wired into CI with an 18/18
   self-test) pairs a reader question with the page that answers it and checks
   the page says so in its slug, its H1 or a heading — body text deliberately
   excluded, because "the answer is in there somewhere" is the defect, not the

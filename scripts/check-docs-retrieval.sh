@@ -185,8 +185,14 @@ def index():
 
             # Outside a fence: drop complete `<!-- … -->` spans, and if an
             # unterminated one is left, the comment runs on past this line.
+            # The STRIPPED line is what gets indexed, not the original: a
+            # renderer shows `# Page <!-- Secret runtime logger -->` as
+            # "Page", so indexing the comment's words would let a row pass
+            # on text no reader sees — the multi-line case with the whole
+            # comment on one line.
             if '<!--' in line:
-                if '<!--' in re.sub(r'<!--.*?-->', '', line):
+                line = re.sub(r'<!--.*?-->', '', line)
+                if '<!--' in line:
                     comment = True
                     continue
 
@@ -440,7 +446,24 @@ self_test() {
     > "$c15/scripts/docs-retrieval-questions.tsv"
   check "an HTML comment opener inside a fence is sample text" pass "$c15"
 
-  # 16. A comment line and a blank line in the fixture are skipped.
+  # 16. An inline comment on a heading line is stripped before indexing: a
+  #     renderer shows only the text outside it.
+  local c16="$tmp/c16"; make_corpus "$c16"
+  printf '# Page \u003c!-- Secret runtime logger --\u003e\n' \
+    > "$c16/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c16/scripts/docs-retrieval-questions.tsv"
+  check "an inline comment on a heading is not indexed" fail "$c16"
+
+  # 17. Stripping the comment must leave the visible heading text indexed.
+  local c17="$tmp/c17"; make_corpus "$c17"
+  printf '# Page \u003c!-- an editorial note --\u003e\n' \
+    > "$c17/docs/guide/md.md"
+  printf 'page\tdocs/guide/md.md\n' \
+    > "$c17/scripts/docs-retrieval-questions.tsv"
+  check "the visible part of the heading is still indexed" pass "$c17"
+
+  # 18. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

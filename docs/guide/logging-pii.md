@@ -16,12 +16,26 @@ by default and is configured here too.
 
 ## Set the log level
 
-The global level lives in `[log] level`, and defaults to `info`:
+The global level lives in `[log] level`:
 
 ```toml
 [log]
 level = "info"
 ```
+
+**The effective default depends on the profile**, which is the usual answer to
+"why is dev so noisy and prod so quiet":
+
+| Profile | Default `level` |
+|---------|-----------------|
+| `dev`   | `debug`         |
+| `prod`  | `info`          |
+| any other profile (`staging`, `test`, a custom name) | `info` |
+
+`dev` and `prod` are the only profiles with smart defaults; anything else falls
+back to the struct default, `info`. Whatever you write in `autumn.toml` — or
+pass in the environment — overrides the profile's default, so the fence above
+pins `info` in dev too.
 
 The levels are `trace`, `debug`, `info`, `warn`, `error` and `off` — `off`
 silences the subscriber entirely. It is valid here, at startup, and only
@@ -67,15 +81,17 @@ format = "Auto"
 
 | Format   | Behavior                                                   |
 |----------|------------------------------------------------------------|
-| `Auto`   | Pretty in development, JSON when the profile is production |
+| `Auto`   | Pretty unless the profile is `prod`/`production` (or the environment says production), then JSON |
 | `Pretty` | Always human-readable, colorized                           |
 | `Json`   | Always structured JSON                                     |
 
-`Auto` is the default, and is why the same binary prints readable lines on a
-laptop and JSON in production without the config changing. Set `Json`
-explicitly when something parses the output in development too — a local log
-shipper, a test that asserts on fields. The environment spelling is
-`AUTUMN_LOG__FORMAT=Json`.
+As with the level, the profile picks the default: `dev` defaults to `Pretty`
+and `prod` to `Json`, both set outright, so the same binary reads well on a
+laptop and parses in production without the config changing. `Auto` is the
+struct default and is what any other profile gets — it reaches the same
+outcome by looking at the profile at startup. Set `Json` explicitly when
+something parses the output in development too: a local log shipper, a test
+that asserts on fields. The environment spelling is `AUTUMN_LOG__FORMAT=Json`.
 
 The format applies to every line the standard subscriber renders, the [access
 log](#access-log) included.
