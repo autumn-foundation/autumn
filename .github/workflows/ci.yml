@@ -1429,6 +1429,23 @@ jobs:
           cargo test -p autumn-billing --test dunning_close_scan_profile -- --ignored
           # autumn-billing: rearm_pending startup job-insert-loop findings profile (Ledger).
           cargo test -p autumn-billing --test dunning_rearm_pending_profile -- --ignored
+          # examples/bookmarks-distributed: link-checker mark_dead batch profile (Ledger).
+          # `bookmarks-distributed` ships no library target, so this lives in
+          # `src/tasks.rs`'s own `#[cfg(test)]` tree (a `--bin` unit test, not a
+          # `tests/*.rs` binary) and needs this explicit line the same way every
+          # other Docker-gated test in a crate with no consolidated sweep does.
+          # A substring filter matches nothing (and exits 0) after a silent
+          # rename, so this guards for a positive pass count the same way the
+          # redis job-admin and pg relative-delay filters above do.
+          (
+            set -o pipefail
+            cargo test -p bookmarks-distributed --bin bookmarks-distributed -- \
+              --ignored link_checker_batches_mark_dead --test-threads=1 \
+              | tee "${RUNNER_TEMP}/bookmarks-distributed-link-checker.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            "${RUNNER_TEMP}/bookmarks-distributed-link-checker.log" \
+            || { echo "::error::no link-checker mark_dead batch test ran — the ci.yml filter no longer matches"; exit 1; }
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
