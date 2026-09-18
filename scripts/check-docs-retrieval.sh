@@ -142,9 +142,19 @@ def index():
             # page and the gate passes while the reader still finds nothing.
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
             if marker:
+                run = marker.group(1)
                 if fence is None:
-                    fence = marker.group(1)[0] * 3
-                elif marker.group(1).startswith(fence):
+                    # Keep the opener VERBATIM, character and length. A page
+                    # documenting markdown opens with ```` so it can show a
+                    # ``` block inside; recording that opener as three would
+                    # let the inner line close it, and every heading after it
+                    # would be indexed while still inside the outer fence —
+                    # the same false positive this block exists to stop.
+                    fence = run
+                elif run[0] == fence[0] and len(run) >= len(fence):
+                    # CommonMark: the closing fence is the same character and
+                    # at least as long as the opener. A `~~~` never closes a
+                    # ``` block, and a shorter run is content.
                     fence = None
                 continue
             if fence is not None:
@@ -336,7 +346,25 @@ self_test() {
     > "$c8b/scripts/docs-retrieval-questions.tsv"
   check "a comment inside a fence is not a heading" fail "$c8b"
 
-  # 9. A comment line and a blank line in the fixture are skipped.
+  # 9. A four-backtick fence is not closed by a three-backtick line inside it.
+  #     The heading after the inner block is still fenced, so it must not be
+  #     indexed; recording the opener as three characters would index it.
+  local c9="$tmp/c9"; make_corpus "$c9"
+  printf '# Markdown\n\n````markdown\n```bash\n# Raise the global level\n```\n````\n\n## Something else\n' \
+    > "$c9/docs/guide/md.md"
+  printf 'raise the global level\tdocs/guide/md.md\n' \
+    > "$c9/scripts/docs-retrieval-questions.tsv"
+  check "an inner fence does not close a longer outer one" fail "$c9"
+
+  # 10. A `~~~` line does not close a ``` fence.
+  local c10="$tmp/c10"; make_corpus "$c10"
+  printf '# Page\n\n```text\n~~~\n# Raise the global level\n```\n' \
+    > "$c10/docs/guide/md.md"
+  printf 'raise the global level\tdocs/guide/md.md\n' \
+    > "$c10/scripts/docs-retrieval-questions.tsv"
+  check "a tilde run does not close a backtick fence" fail "$c10"
+
+  # 11. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
