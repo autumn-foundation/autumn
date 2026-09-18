@@ -190,6 +190,13 @@ pub struct FleetHalt {
     /// debris (an unwritten `shared/proxy-options` marker in particular) outlives
     /// the rollback and fails the NEXT deploy closed.
     pub degraded: Vec<(String, &'static str)>,
+    /// Hosts whose first deploy was torn down, but whose proxy route removal
+    /// failed (issue #2270), with the step label. Also present in `torn_down`
+    /// (the app really is gone), but named here TOO so an API caller or an
+    /// alert built from this struct — not just the console table — can tell a
+    /// clean compensation apart from one whose public port may still answer
+    /// 502 until it is redeployed or the route is removed by hand.
+    pub route_removal_failed: Vec<(String, &'static str)>,
     /// Hosts the fleet deliberately did NOT roll back, with the reason.
     pub manual: Vec<(String, &'static str)>,
 }
@@ -4945,6 +4952,10 @@ fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> 
     .detail("torn_down", join_hosts(&halt.torn_down))
     .detail("still_on_new", join_hosts(&halt.still_on_new))
     .detail("degraded", join_host_reasons(&halt.degraded))
+    .detail(
+        "route_removal_failed",
+        join_host_reasons(&halt.route_removal_failed),
+    )
     .detail("manual", join_host_reasons(&halt.manual))
     .build()
 }
@@ -5074,6 +5085,17 @@ fn fleet_halted(
         // table can never disagree about which hosts are still forward.
         still_on_new: named(fleet::HostOutcome::on_new_release),
         degraded: degraded.to_vec(),
+        route_removal_failed: plan
+            .hosts
+            .iter()
+            .zip(outcomes)
+            .filter_map(|(host, outcome)| match outcome {
+                fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step } => {
+                    Some((host.host.clone(), *failed_step))
+                }
+                _ => None,
+            })
+            .collect(),
         manual: plan
             .hosts
             .iter()
@@ -9906,6 +9928,7 @@ mod tests {
             torn_down: vec![],
             still_on_new: vec![],
             degraded: vec![("web-a".to_owned(), "prune")],
+            route_removal_failed: vec![],
             manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
         }
     }
@@ -10790,6 +10813,15 @@ mod tests {
             !halt.manual.iter().any(|(host, _)| host == "web-a"),
             "this is not a declined-automatically case: {:?}",
             halt.manual
+        );
+        // Codex review: this must be named in its OWN field too, not just the
+        // console table, so an alert built from `FleetHalt` can tell a clean
+        // compensation apart from one whose route may still 502.
+        assert_eq!(
+            halt.route_removal_failed,
+            vec![("web-a".to_owned(), "proxy-deregister")],
+            "the route-removal failure must be preserved in a dedicated field: {:?}",
+            halt.route_removal_failed
         );
 
         // The marker write is part of the (separate, already-run) app-teardown
