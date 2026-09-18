@@ -7381,7 +7381,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]

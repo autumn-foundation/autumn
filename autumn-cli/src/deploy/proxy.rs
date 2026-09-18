@@ -57,6 +57,16 @@ const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
 /// duplicating the string — a renamed label must fail to compile there too.
 pub const PROXY_DEREGISTER_LABEL: &str = "proxy-deregister";
 
+/// Delimiter the compat probe prints between its `deploy --help` and
+/// `remove --help` captures (issue #2270), so the Rust side can split the ONE
+/// combined round-trip back into its two halves and verify each on its OWN
+/// text. `remove` has no flag to check (unlike `deploy`), so this is what makes
+/// a fabricated/blank/differently-worded failure in the deploy half unable to
+/// leak a false positive or negative into the remove verdict, and vice versa —
+/// each half is judged on nothing but its own bytes. Deliberately distinctive so
+/// it can never collide with real `--help` output.
+const PROBE_REMOVE_HELP_DELIM: &str = "---autumn-kamal-proxy-remove-help---";
+
 /// Systemd unit path supervising the proxy process. `pub` (crate-internal in this
 /// binary crate) so the deploy-start probe ([`super::exec::probe_deploy_state`]) can
 /// read the installed unit's `--http-port` in the same round-trip (#2073).
@@ -533,19 +543,23 @@ an SSH user that can install packages. Install kamal-proxy {pin} at {bin} yourse
     ///
     /// `deploy` is the subcommand both the initial route and the health-gated flip
     /// use; `remove` is the subcommand [`Self::deregister_op`] uses to remove a
-    /// compensated first deploy's route. Both help outputs are captured together
-    /// so a drifted or renamed `remove` fails closed exactly like a drifted
-    /// `deploy` — never assumed present. `--help` is
-    /// a built-in that survives across kamal-proxy releases (v0.9.2, which dropped
-    /// the `version` subcommand, still has it). `2>&1` folds cobra's error/usage
-    /// output (e.g. an `unknown command` when a subcommand was renamed) into the
-    /// captured stream, and `|| true` keeps the ssh step itself from failing — the
-    /// Rust-side verdict, not the exit status, decides compatibility.
+    /// compensated first deploy's route. Both help outputs are captured together,
+    /// separated by [`PROBE_REMOVE_HELP_DELIM`] so the verdict can judge each on
+    /// its own text, so a drifted or renamed `remove` fails closed exactly like a
+    /// drifted `deploy` — never assumed present. `--help` is a built-in that
+    /// survives across kamal-proxy releases (v0.9.2, which dropped the `version`
+    /// subcommand, still has it). `2>&1` folds cobra's error/usage output (e.g. an
+    /// `unknown command` when a subcommand was renamed) into the captured stream,
+    /// and `|| true` keeps the ssh step itself from failing — the Rust-side
+    /// verdict, not the exit status, decides compatibility.
     #[must_use]
     pub fn compat_probe_command() -> RemoteCommand {
         RemoteCommand::new(
             "proxy-compat-probe",
-            "kamal-proxy deploy --help 2>&1 || true; kamal-proxy remove --help 2>&1 || true",
+            format!(
+                "kamal-proxy deploy --help 2>&1 || true; printf '%s' '{PROBE_REMOVE_HELP_DELIM}'; \
+                 kamal-proxy remove --help 2>&1 || true"
+            ),
         )
     }
 
@@ -970,33 +984,39 @@ fn output_lists_flag(output: &str, flag: &str) -> bool {
 ///    is [`KamalProxyCompatIssue::BinaryUnusable`]. Either way the deploy fails
 ///    closed.
 ///
-/// A fourth check rides the SAME capture (issue #2270): `deploy --help` has no
-/// flag to prove `remove` exists, so this looks instead for cobra's own
-/// `unknown command "remove"` — the exact text a renamed/removed `remove`
-/// prints. Checked only once the deploy help is confirmed valid (step 1), so a
-/// capture that never reaches this function (a test exercising ONLY the deploy
-/// half) can never trip it.
+/// A fourth check judges the `remove --help` half on ITS OWN text, split off
+/// [`PROBE_REMOVE_HELP_DELIM`] (issue #2270): `remove` has no flag to check
+/// (unlike `deploy`), so instead of one weak signal this REQUIRES POSITIVE
+/// evidence that `remove`'s own help actually rendered — [`remove_help_renders`]
+/// — and fails closed on anything else: a cobra `unknown command "remove"`, a
+/// blank capture, or an unrecognised error are all equally incompatible. This
+/// runs only once the deploy help is confirmed valid (step 1), so a capture that
+/// never reaches this function (a test exercising ONLY the deploy half) can
+/// never trip it — an absent delimiter degrades to an empty (so failing) remove
+/// half, never to skipping the check.
 fn assess_kamal_proxy_deploy_help(
     output: &str,
     required_flags: &[&'static str],
 ) -> Result<(), KamalProxyCompatIssue> {
+    let (deploy_part, remove_part) = output
+        .find(PROBE_REMOVE_HELP_DELIM)
+        .map_or((output, ""), |at| {
+            (&output[..at], &output[at + PROBE_REMOVE_HELP_DELIM.len()..])
+        });
     let missing: Vec<&'static str> = required_flags
         .iter()
         .copied()
-        .filter(|flag| !output_lists_flag(output, flag))
+        .filter(|flag| !output_lists_flag(deploy_part, flag))
         .collect();
 
     // (1) All required flags present → valid deploy help → compatible, unless the
-    // SAME capture's `remove --help` half shows a renamed/removed subcommand —
-    // even benign shell/login noise elsewhere is still fine. Same two-substring
-    // tolerance as case (3) below (not the exact cobra phrase), so a minor
-    // wording difference in the real error text still fails closed.
+    // remove half fails to prove itself (see this function's doc comment) — even
+    // benign shell/login noise in the DEPLOY half is still fine.
     if missing.is_empty() {
-        let lower = output.to_ascii_lowercase();
-        return if lower.contains("unknown command") && lower.contains("remove") {
-            Err(KamalProxyCompatIssue::RemoveSubcommandMissing)
-        } else {
+        return if remove_help_renders(remove_part) {
             Ok(())
+        } else {
+            Err(KamalProxyCompatIssue::RemoveSubcommandMissing)
         };
     }
 
@@ -1008,11 +1028,26 @@ fn assess_kamal_proxy_deploy_help(
 
     // (3) No required flag rendered → the deploy help did not print. Distinguish a
     // renamed/removed `deploy` subcommand from an unusable binary; both fail closed.
-    let lower = output.to_ascii_lowercase();
+    let lower = deploy_part.to_ascii_lowercase();
     if lower.contains("unknown command") && lower.contains("deploy") {
         return Err(KamalProxyCompatIssue::DeploySubcommandMissing);
     }
     Err(KamalProxyCompatIssue::BinaryUnusable)
+}
+
+/// Whether `remove_part` — the `remove --help` half split off
+/// [`PROBE_REMOVE_HELP_DELIM`] — is POSITIVE evidence that the `remove`
+/// subcommand still renders its own help (issue #2270): its `Usage:` line names
+/// `remove` itself, e.g. `kamal-proxy remove SERVICE [flags]`. Checking for a
+/// rendered Usage line, rather than only the ABSENCE of a cobra error, is
+/// deliberate: `remove` has no flag [`output_lists_flag`] can check, so a blank
+/// capture, a truncated one, or an error this function does not recognise must
+/// all fail closed exactly like a recognised `unknown command "remove"` does —
+/// proof of compatibility, not merely an absence of one specific complaint.
+fn remove_help_renders(remove_part: &str) -> bool {
+    remove_part
+        .to_ascii_lowercase()
+        .contains("kamal-proxy remove")
 }
 
 #[cfg(test)]
@@ -1122,9 +1157,10 @@ mod tests {
 
     #[test]
     fn deregister_op_removes_the_service_route() {
-        // Issue #2270: compensating a completed first deploy must clear the proxy
-        // route, or the public port keeps answering 502 with nothing live behind
-        // it. `remove` is socket-pinned like every other kamal-proxy invocation.
+        // Issue #2270: compensating a completed first deploy must remove the
+        // proxy route, or the public port keeps answering 502 with nothing live
+        // behind it. `remove` is socket-pinned like every other kamal-proxy
+        // invocation.
         let proxy = KamalProxyController::new(60);
         let DeployOp::Run(cmd) = proxy.deregister_op("myapp") else {
             panic!("deregister_op must be a Run op");
@@ -1610,7 +1646,11 @@ mod tests {
          \x20     --tls                         Configure TLS for this service\n\
          \x20     --deploy-timeout duration     How long to wait for the target\n\
          \x20     --drain-timeout duration      How long to drain the old target\n\
-         \x20     --force                       Skip health checks and force deployment\n"
+         \x20     --force                       Skip health checks and force deployment\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Remove a target from the proxy\n\
+         \n\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]
@@ -1622,7 +1662,9 @@ mod tests {
         // the ssh step (the Rust verdict decides compatibility).
         assert_eq!(
             cmd.shell,
-            "kamal-proxy deploy --help 2>&1 || true; kamal-proxy remove --help 2>&1 || true"
+            "kamal-proxy deploy --help 2>&1 || true; \
+             printf '%s' '---autumn-kamal-proxy-remove-help---'; \
+             kamal-proxy remove --help 2>&1 || true"
         );
     }
 
@@ -1679,7 +1721,9 @@ mod tests {
         // Non-TLS controller does not require --host/--tls, so a help capture that
         // lacks them is still compatible for it.
         let no_tls_help = "Flags:\n  --target x\n  --health-check-path p\n  \
-                           --deploy-timeout d\n  --drain-timeout d\n  --force\n";
+                           --deploy-timeout d\n  --drain-timeout d\n  --force\n\
+                           ---autumn-kamal-proxy-remove-help---\
+                           Usage:\n  kamal-proxy remove SERVICE [flags]\n";
         assert_eq!(
             KamalProxyController::new(60).assess_deploy_help(no_tls_help),
             Ok(()),
@@ -1769,15 +1813,26 @@ mod tests {
         assert!(issue.message().contains("no `deploy` subcommand"));
     }
 
+    /// [`sample_deploy_help`]'s deploy half ONLY, without its own embedded
+    /// valid remove-help — so a test can append its OWN (broken) remove half
+    /// after the delimiter without a leftover valid `Usage:` line masking it.
+    fn sample_deploy_help_only() -> &'static str {
+        sample_deploy_help()
+            .split_once("---autumn-kamal-proxy-remove-help---")
+            .expect("sample_deploy_help embeds the remove-help delimiter")
+            .0
+    }
+
     #[test]
     fn a_removed_remove_subcommand_is_caught() {
         // Issue #2270: cobra's error when `remove` is renamed/removed, folded
         // after a VALID `deploy --help` in the same combined capture — exactly
         // the shape `compat_probe_command` produces.
         let output = format!(
-            "{}Error: unknown command \"remove\" for \"kamal-proxy\"\n\
+            "{}---autumn-kamal-proxy-remove-help---\
+             Error: unknown command \"remove\" for \"kamal-proxy\"\n\
              Run 'kamal-proxy --help' for usage.\n",
-            sample_deploy_help(),
+            sample_deploy_help_only(),
         );
         let issue = KamalProxyController::new(60)
             .assess_deploy_help(&output)
@@ -1793,6 +1848,31 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_remove_help_is_caught_even_without_a_recognised_error() {
+        // Issue #2270 (Codex review): a wrapper or drifted proxy that fails
+        // `remove --help` with NO output at all, or with an error this module
+        // does not recognise, must still fail closed — the check requires
+        // POSITIVE proof `remove` rendered, not merely the absence of one
+        // specific cobra phrase.
+        let output = format!(
+            "{}---autumn-kamal-proxy-remove-help---",
+            sample_deploy_help_only(),
+        );
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&output),
+            Err(KamalProxyCompatIssue::RemoveSubcommandMissing),
+        );
+        let unrecognised = format!(
+            "{}---autumn-kamal-proxy-remove-help---unsupported subcommand\n",
+            sample_deploy_help_only(),
+        );
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&unrecognised),
+            Err(KamalProxyCompatIssue::RemoveSubcommandMissing),
+        );
+    }
+
+    #[test]
     fn a_removed_remove_subcommand_is_not_a_missing_binary() {
         // Never a host-prep case: a RESPONDING binary (deploy help rendered fine)
         // is somebody's working install, never ours to replace.
@@ -1800,8 +1880,9 @@ mod tests {
             .compat_probe()
             .expect("kamal-proxy declares a compat probe");
         let output = format!(
-            "{}Error: unknown command \"remove\" for \"kamal-proxy\"\n",
-            sample_deploy_help(),
+            "{}---autumn-kamal-proxy-remove-help---\
+             Error: unknown command \"remove\" for \"kamal-proxy\"\n",
+            sample_deploy_help_only(),
         );
         let err = probe
             .assess(&output)
@@ -1870,7 +1951,9 @@ mod tests {
             .expect("kamal-proxy declares a compat probe");
         assert_eq!(
             probe.command.shell,
-            "kamal-proxy deploy --help 2>&1 || true; kamal-proxy remove --help 2>&1 || true"
+            "kamal-proxy deploy --help 2>&1 || true; \
+             printf '%s' '---autumn-kamal-proxy-remove-help---'; \
+             kamal-proxy remove --help 2>&1 || true"
         );
         assert_eq!(probe.assess(sample_deploy_help()), Ok(()));
         let drifted = sample_deploy_help().replace("--target", "--upstream");
