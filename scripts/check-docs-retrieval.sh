@@ -582,14 +582,29 @@ def index():
         text = (ROOT / rel).read_text(encoding='utf-8')
         slug = pathlib.PurePath(rel).stem
         h1, headings = '', []
-        fence = None
+        fence = None            # (delimiter run, owning quote depth)
         comment = False
-        html_block = None
+        comment_depth = 0
+        html_block = None       # (kind, owning quote depth)
         pending_defn = False
         defn_head = None
         para = []
         para_depth = 0
         for line in text.splitlines():
+            # Every block below — a fence, a raw HTML block, a comment — ends
+            # when the BLOCK QUOTE holding it ends, because none of the three
+            # can be lazily continued. So each records the quote depth it
+            # opened at, and a line shallower than that closes it wherever it
+            # had got to. Without this, `> <script>` inside a quote waited for
+            # a `</script>` that the quote's end had already made
+            # unnecessary, and suppressed every heading to EOF.
+            #
+            # Quote depth, not `uncontain`'s marker count: a list item is
+            # continued by INDENTATION, so its lines carry no marker and would
+            # read as depth 0, closing every block it holds on its second
+            # line. Read from the RAW line, before any comment is stripped,
+            # because that is the line the container structure is made of.
+            container = unquote(line)[0]
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
             # the same false positive as indexing a fenced `#` line. This
@@ -603,6 +618,8 @@ def index():
             # match the page that fence sits on, which is exactly the page a
             # fixture row names — so the false positive lands on the EXPECTED
             # page and the gate passes while the reader still finds nothing.
+            if comment and comment_depth and container < comment_depth:
+                comment = False         # the quote that held it ended
             if comment:
                 # A line that BEGINS inside a comment can start no heading:
                 # a `#` after a mid-line `-->` is not at the start of the
@@ -611,6 +628,8 @@ def index():
                 # reopens, and treating that as "closed" would index the
                 # next line's hidden heading.
                 _, comment = uncomment(line, True)
+                if not comment:
+                    comment_depth = 0
                 para = []
                 continue
 
@@ -633,17 +652,25 @@ def index():
             # tracked: recognising it means deciding what counts as a tag name
             # at all, and its blank-line rule would then apply to lines like
             # `<Foo>` in prose. No guide page has one.
+            if (html_block is not None and html_block[1]
+                    and container < html_block[1]):
+                # The quote that held it ended, so the block did. This line is
+                # ordinary Markdown again and has to be READ, not skipped: the
+                # heading right after a quoted `<script>` is exactly the one
+                # that went missing.
+                html_block = None
             if html_block is not None:
-                if html_block == '#pi':
+                kind = html_block[0]
+                if kind == '#pi':
                     if '?>' in line:
                         html_block = None
-                elif html_block == '#cdata':
+                elif kind == '#cdata':
                     if ']]>' in line:
                         html_block = None
-                elif html_block == '#decl':
+                elif kind == '#decl':
                     if '>' in line:
                         html_block = None
-                elif html_block == '#blank':
+                elif kind == '#blank':
                     # `>` alone is a blank line INSIDE the quote, and that is
                     # what ends the block. Testing the raw line kept `#blank`
                     # open past it and swallowed the heading after — the
@@ -657,7 +684,7 @@ def index():
                     # list item that ends nothing.
                     if not unquote(line)[1].strip():
                         html_block = None
-                elif re.search(rf'</{html_block}\s*>', line, re.I):
+                elif re.search(rf'</{kind}\s*>', line, re.I):
                     html_block = None
                 para = []
                 continue
@@ -667,6 +694,8 @@ def index():
             # tabbed line close a fence that is still open, exposing hidden
             # content to the index.
             bare = uncontain(line)
+            if fence is not None and fence[1] and container < fence[1]:
+                fence = None        # the quote that held the fence ended
             marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', bare)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
@@ -686,9 +715,14 @@ def index():
                     # would be indexed while still inside the outer fence —
                     # the same false positive this block exists to stop.
                     # `rest` here is the info string (```bash), which an
-                    # OPENING fence may carry.
-                    fence = run
-                elif (run[0] == fence[0] and len(run) >= len(fence)
+                    # OPENING fence may carry. The quote depth goes with it:
+                    # a delimiter in ANOTHER container is content, not a
+                    # closer, so a top-level fence containing `> ``` ` used to
+                    # close on it and index everything after as visible text —
+                    # a false positive `uncontain` introduced.
+                    fence = (run, container)
+                elif (container == fence[1] and run[0] == fence[0][0]
+                      and len(run) >= len(fence[0])
                       and rest.strip(' \t') == ''):
                     # CommonMark: a closing fence is the same character, at
                     # least as long as the opener, and carries NO info string.
@@ -711,9 +745,10 @@ def index():
             opener = re.match(r'^ {0,3}<(script|pre|style|textarea)(?=[\s>]|$)',
                               bare, re.I)
             if opener:
-                html_block = opener.group(1).lower()
+                tag = opener.group(1).lower()
+                html_block = (tag, container)
                 para = []
-                if not re.search(rf'</{html_block}\s*>', line, re.I):
+                if not re.search(rf'</{tag}\s*>', line, re.I):
                     continue
                 html_block = None
                 para = []
@@ -722,28 +757,29 @@ def index():
             if re.match(r'^ {0,3}<\?', bare):
                 # CommonMark type 3: a processing instruction runs to `?>`,
                 # and nothing inside it is Markdown.
-                html_block = '#pi'
+                html_block = ('#pi', container)
                 para = []
                 if '?>' in line:
                     html_block = None
                 continue
 
             if re.match(r'^ {0,3}<!\[CDATA\[', bare):
-                html_block = '#cdata'          # type 5, ends at `]]>`
+                html_block = ('#cdata', container)   # type 5, ends at `]]>`
                 para = []
                 if ']]>' in line:
                     html_block = None
                 continue
 
             if re.match(r'^ {0,3}<![A-Za-z]', bare):
-                html_block = '#decl'           # type 4 (`<!DOCTYPE …`), ends at `>`
+                # type 4 (`<!DOCTYPE …`), ends at `>`
+                html_block = ('#decl', container)
                 para = []
                 if '>' in line:
                     html_block = None
                 continue
 
             if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', bare, re.I):
-                html_block = '#blank'
+                html_block = ('#blank', container)
                 para = []
                 continue
 
@@ -773,7 +809,10 @@ def index():
             # what gets indexed, so `# Page <!-- Secret runtime logger -->`
             # contributes "Page" and nothing else — and `# Page <!-- note`
             # still contributes "Page" even though the comment runs on.
+            was_comment = comment
             line, comment = uncomment(line, False)
+            if comment and not was_comment:
+                comment_depth = container
 
             # A SETEXT heading is its text on one line and `===` (h1) or
             # `---` (h2) on the next. Missing them is a false NEGATIVE of the
@@ -1811,7 +1850,69 @@ self_test() {
     > "$c97/scripts/docs-retrieval-questions.tsv"
   check "a legal link target is still dropped" fail "$c97"
 
-  # 98. A comment line and a blank line in the fixture are skipped.
+  # 98. A raw HTML block opened in a quote ends when the QUOTE does: nothing
+  #     can lazily continue it, so it does not wait for its closing tag.
+  local c98="$tmp/c98"; make_corpus "$c98"
+  printf '# Page\n\n\u003e \u003cscript\u003e\n\u003e var x\n\n## Secret runtime logger\n' \
+    > "$c98/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c98/scripts/docs-retrieval-questions.tsv"
+  check "a quoted html block ends with its quote" pass "$c98"
+
+  # 99. …and while the quote continues it still hides what is inside.
+  local c99="$tmp/c99"; make_corpus "$c99"
+  printf '# Page\n\n\u003e \u003cscript\u003e\n\u003e # Secret runtime logger\n\u003e var x\n' \
+    > "$c99/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c99/scripts/docs-retrieval-questions.tsv"
+  check "a quoted html block still hides its contents" fail "$c99"
+
+  # 100. A fence delimiter in ANOTHER container is content, not a closer. A
+  #      top-level fence holding `\u003e \u0060\u0060\u0060` used to close on it and index the
+  #      hidden heading after — a false positive, the worse direction.
+  local c100="$tmp/c100"; make_corpus "$c100"
+  printf '# Page\n\n\u0060\u0060\u0060\n\u003e \u0060\u0060\u0060\n# Secret runtime logger\n\u0060\u0060\u0060\n' \
+    > "$c100/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c100/scripts/docs-retrieval-questions.tsv"
+  check "a quoted delimiter does not close a top-level fence" fail "$c100"
+
+  # 101. …and a delimiter at the SAME depth still closes it. The control on
+  #      100, which "never close on a marker" would fail.
+  local c101="$tmp/c101"; make_corpus "$c101"
+  printf '# Page\n\n\u0060\u0060\u0060\n# hidden\n\u0060\u0060\u0060\n\n## Secret runtime logger\n' \
+    > "$c101/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c101/scripts/docs-retrieval-questions.tsv"
+  check "a same-depth delimiter still closes a fence" pass "$c101"
+
+  # 102. A fence opened INSIDE a quote is closed by the quote ending, or it
+  #      would swallow the rest of the page.
+  local c102="$tmp/c102"; make_corpus "$c102"
+  printf '# Page\n\n\u003e \u0060\u0060\u0060\n\u003e code\n\n## Secret runtime logger\n' \
+    > "$c102/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c102/scripts/docs-retrieval-questions.tsv"
+  check "a quoted fence ends with its quote" pass "$c102"
+
+  # 103. A comment opened in a quote ends with it too — same rule, third
+  #      block type.
+  local c103="$tmp/c103"; make_corpus "$c103"
+  printf '# Page\n\n\u003e \u003c!-- note\n\n## Secret runtime logger\n' \
+    > "$c103/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c103/scripts/docs-retrieval-questions.tsv"
+  check "a quoted comment ends with its quote" pass "$c103"
+
+  # 104. …and hides a heading while the quote lasts.
+  local c104="$tmp/c104"; make_corpus "$c104"
+  printf '# Page\n\n\u003e \u003c!-- note\n\u003e # Secret runtime logger\n\u003e --\u003e\n' \
+    > "$c104/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c104/scripts/docs-retrieval-questions.tsv"
+  check "a quoted comment still hides its contents" fail "$c104"
+
+  # 105. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
