@@ -227,6 +227,24 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 
 ---
 
+### `examples/collab-notes` — Collaborative Editing
+
+<!-- catalog:example name=collab-notes tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who needs multiplayer editing and does not want to rent a real-time backend |
+| **Journey** | Mark a field `#[collaborative]` → open one note in two browsers → type in both → watch the text merge character by character with a live participant list |
+| **Key capabilities** | `#[collaborative]` field marker, `CollabText` (an in-tree RGA text CRDT), `CollabHub` + `serve_socket` over the existing `#[ws]`/channel/presence seams, a 150-line browser replica, cursor reporting |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p collab-notes` |
+| **Success proof** | `curl -s http://localhost:3000/notes/1 \| grep -o 'data-socket="[^"]*"'` prints `data-socket="/notes/1/collab"`; opening that page in two browser windows and typing in both leaves both windows showing the same merged text |
+
+Boots with no database or external real-time service; the companion narrative
+is `docs/guide/collaboration.md`.
+
+---
+
 ### `examples/invoice` — PDF Downloads
 
 <!-- catalog:example name=invoice tier=supported -->
@@ -388,6 +406,7 @@ can pick the closest starting point without overlap.
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
+| Collaborative editing | `collab-notes` | A `#[collaborative]` text field merged by an in-tree CRDT, streamed with live presence over `#[ws]` + channels, with no external real-time service |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf`; also carries the worked `#[lifecycle]` invoice state machine |
 | SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
 

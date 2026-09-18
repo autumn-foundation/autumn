@@ -56,6 +56,12 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(all(feature = "db", feature = "collab"))]
+mod collab_model;
+#[cfg(all(feature = "collab", feature = "offline-sync"))]
+mod collab_offline_merge;
+#[cfg(all(feature = "collab", feature = "presence"))]
+mod collab_session;
 #[cfg(feature = "db")]
 mod commentable;
 mod commit_hook_drain;
@@ -215,6 +221,8 @@ mod model_derivation;
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
+#[cfg(feature = "db")]
+mod money_ledger_postgres;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -289,6 +297,10 @@ mod read_your_writes_routing;
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
 mod redis_job_admin_ci_coverage;
+// ci.yml names the `--lib` Postgres relative-delay Docker tests by full test
+// path; this fails if either is renamed (#2111 follow-up). No feature gate:
+// it only reads job.rs and ci.yml as text.
+mod pg_relative_delay_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
@@ -365,6 +377,8 @@ mod signed_webhooks;
 mod sim_advance_to;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
+#[cfg(feature = "collab")]
+mod sim_collab_convergence;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;
