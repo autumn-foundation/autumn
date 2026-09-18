@@ -579,6 +579,17 @@ name = "repository_crud"
 harness = false
 required-features = ["db"]
 
+# Multi-page invoice workload for profilers, driving `Pdf::from_html`/
+# `Pdf::render` through the real HTML parser (`pdf::html`) and layout
+# walker/word-wrapper/PDF writer (`pdf::layout`) — the framework's HTML-to-PDF
+# export path (`examples/invoice`'s `invoice_pdf` handler drives the same
+# `render` call via `from_markup`). `required-features` since `pdf` is an
+# opt-in feature, unlike the other benches in this crate.
+[[bench]]
+name = "pdf_render"
+harness = false
+required-features = ["pdf"]
+
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
@@ -868,6 +879,14 @@ path = "tests/sqlite_upsert_isolation.rs"
 [[test]]
 name = "sqlite_votable"
 path = "tests/sqlite_votable.rs"
+
+# SQLite golden suite for the double-entry money ledger (issue #1837). Runs
+# Docker-free on every push; the Postgres fork is
+# `tests/integration/money_ledger_postgres.rs`, which the CI Docker sweep picks
+# up. Needs `--features sqlite`. See the file's module doc for what it pins.
+[[test]]
+name = "sqlite_money_ledger"
+path = "tests/sqlite_money_ledger.rs"
 
 # SQLite proof for maintained derived read models (issue #1769). The Postgres
 # suite is server-gated, so this is the only place the `sqlite` arms a

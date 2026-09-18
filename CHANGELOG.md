@@ -9,6 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **💵 Money as a framework primitive: typed `Money<C>` and an enforced
+  double-entry ledger (issue #1837):** currency lived only in the view layer
+  (`format::number_to_currency` formats a bare `Decimal`), idempotency stopped
+  at the HTTP door (`idempotency.rs` is an `Idempotency-Key` middleware), and
+  there was no ledger at all — so every app that moved money hand-rolled one.
+  `autumn_web::money` adds the primitive, with **zero new dependencies**.
+  - `Money<C>` is an amount in one currency, held as an `i64` count of minor
+    units. The currency is a type parameter, so adding `Money<Usd>` to
+    `Money<Eur>` does not compile. There is **no `f64`** in the value or in any
+    operation on it, and a unit test reads the module source to keep it that
+    way. There are no `+`/`-` operators, because an operator cannot report an
+    overflow: `checked_add`, `checked_sub`, `checked_neg`, `checked_abs`,
+    `checked_mul` and `try_sum` each return `Result<_, MoneyError>`.
+  - `AnyMoney` is the same value with the currency carried as data, for a
+    ledger row whose currency is a `TEXT` column. It rejects what `Money<C>`
+    refuses to compile, with `MoneyError::CurrencyMismatch`.
+  - Rounding is never implicit. `Money::from_decimal` names one of `HalfUp`,
+    `HalfEven`, `HalfDown`, `TowardZero`, `AwayFromZero`, `Floor` or `Ceiling`;
+    `from_decimal_exact` refuses to round at all. `allocate` splits by weights
+    with the largest-remainder method, so the parts always sum back to the
+    whole — a dollar in three is 34/33/33, not 33/33/33 and a lost cent.
+  - 34 ISO 4217 currencies, covering 0, 2 and 3 minor digits.
+  - `autumn_web::money::ledger` is an append-only, double-entry store over
+    three `_autumn_money_*` tables. `post` refuses a transaction whose debits
+    do not equal its credits **before its first `INSERT`**, and also refuses
+    mixed currencies, a one-sided transaction, a zero line, a posting whose
+    currency the account does not hold, and a negative amount (the sign belongs
+    to the side, which keeps `i64::MIN` out of the ledger). It also refuses a
+    posting that would put an account's balance outside `i64`: the tables are
+    append-only, so such a balance could never be read back or repaired.
+  - **`post` must run inside a transaction.** A call on a bare connection is
+    refused with `LedgerError::NotInTransaction` rather than run weakly: the
+    account locks and the balance check only mean something inside one, and a
+    transaction row written without its postings could never be repaired.
+  - Posting twice posts once. Each transaction carries an idempotency key with
+    a `UNIQUE` index behind it; the second call returns
+    `PostOutcome::Replayed` carrying the first call's transaction. The key can
+    be one you already have (`IdempotencyKey::new`) or **derived from the
+    postings themselves** (`IdempotencyKey::derive`), which is what makes a
+    retry collapse with nothing for the caller to remember. The same key for
+    *different* money is a `KeyReuse` conflict, not a silent wrong replay —
+    a stored request hash over the normalized postings is what tells them
+    apart.
+  - `post` takes the connection, so it runs inside `Db::tx` with the
+    application rows the money justifies: they commit or roll back together,
+    and a rolled-back post frees its idempotency key again.
+  - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
+    `DELETE` of a transaction or a posting, and a statement-level pair on
+    Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
+    `INSERT OR REPLACE` is refused by `BEFORE INSERT` guards on the row keys.
+    They are guards rather than the `DELETE` triggers because SQLite skips
+    `DELETE` triggers for the row a `REPLACE` removes unless
+    `PRAGMA recursive_triggers` is on, and turning that on globally would
+    change the recursion semantics of every application trigger. One shape is
+    therefore **not** covered: a `REPLACE` that collides on the idempotency key
+    with a fresh row id, in a transaction that re-inserts the deleted id before
+    `COMMIT`. Like `DROP TABLE`, it needs deliberate multi-statement SQL against
+    framework-private tables; the triggers are a guard-rail against operational
+    accidents, not a boundary against arbitrary SQL.
+    `ledger::balance` sums an account's postings; `ledger::trial_balance`
+    makes the global zero-sum invariant queryable from a job or a health
+    check.
+  - A cancelled `post` never half-writes. The postings go in **before** the
+    transaction row they belong to, behind a `DEFERRABLE INITIALLY DEFERRED`
+    foreign key, so a future dropped between the two leaves the enclosing
+    transaction holding postings with no parent — and the database refuses that
+    commit. The other order could commit a transaction row with no postings,
+    which append-only tables could never repair. The ledger therefore ends up
+    with either nothing or one complete balanced transaction; which of the two
+    is not knowable from the cancellation alone, so a caller that races `post`
+    against a timeout settles it by posting the same idempotency key again.
+  - An account never changes currency. It is what `post` checks a posting
+    against, so a change would relabel every stored minor unit and let the next
+    posting in the new currency pass that check. A trigger on both backends
+    refuses it; `set_allow_negative` is unaffected.
+  - One configurable policy per account: `Account::disallow_negative()`. The
+    check reads the balance the posting *would* leave, before anything is
+    written. On Postgres the account rows are held with `SELECT ... FOR
+    UPDATE`, so two concurrent postings cannot both pass it; SQLite has no row
+    lock, so a SQLite app that posts concurrently must retry the transaction.
+  - `MoneyError` and `LedgerError` map to real statuses through `AutumnError` —
+    422 for a refused value or posting, 409 for a reused key, a refused
+    negative balance, or a key another transaction is posting right now.
+  - `Currency` is sealed. An outside implementation could declare an exponent
+    the minor-unit table has no row for and make every conversion wrong by
+    orders of magnitude.
+  - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
+    runs Docker-free on every push; it includes the issue's fault-injection
+    metric — 64 logical charges, each submitted two to four times with a share
+    of the attempts aborted after the ledger wrote but before the enclosing
+    `Db::tx` commits, ending with exactly one balanced transaction per charge
+    and `sum(debits) == sum(credits)` globally. That exercises the rollback
+    path; the windows a *dropped* future opens are covered separately by the
+    two deferred-foreign-key tests, which put the database in exactly those
+    states and check what `COMMIT` does.
+    `tests/integration/money_ledger_postgres.rs` proves the Postgres fork and
+    the races only it can show: eight connections posting the same charge at
+    once collapse to one transaction, and two concurrent payouts from a float
+    that covers one leave exactly one. See `docs/guide/money.md`.
+
 - **📖 Folio: make Autumn's log settings findable, and gate retrieval
   (questions 12/18 → 18/18, 0 pages added):** `docs/guide/logging-pii.md`
   carried `[log] level`, `log.format` and the access-log switches under the
@@ -129,6 +229,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
+  CI failure [no-plugin]:** nothing here is agent-facing — it's a
+  CI-workflow-only change plus a test split, not new framework surface
+  (`.github/workflows/quickstart-gate.yml`, `autumn-cli/tests/e2e.rs`). The
+  `local-dev-quickstart` job checks a source-built CLI's `autumn new`
+  against the *published* `autumn-web` — and has been red on every run
+  since it was added by #2459, because this repo's own policy (CLAUDE.md:
+  never bump the workspace version outside a deliberate release) guarantees
+  trunk-dev stays ahead of the last release indefinitely. Issue #2620
+  treated that as an incident ("broken for 26 straight CI runs, needs a
+  release") and recommended cutting one; the maintainer's call was that
+  trunk-dev being ahead of the crate release is permanent, not a
+  release-cadence gap to close. A permanent, by-design condition reported
+  as a build failure is exactly the kind of CI red that trains reviewers to
+  stop looking.
+  The job's single step used to run one test that both scaffolds (`autumn
+  new`) and builds the result — an initial fix wrapped the whole job in
+  `continue-on-error: true`, but a review caught that this would silently
+  tolerate a real regression in `autumn new` itself, not just the known
+  build-time drift (neither of the other two quickstart jobs pairs a
+  source-built CLI with the published crate, so nothing else would catch
+  that). Split instead: `autumn_new_succeeds_against_published_autumn_web`
+  is a new, fast test covering only the scaffold step, run in its own
+  hard-gated CI step with no tolerance — `autumn new` has no version pin to
+  drift against, so any failure there is always a real bug. The existing
+  `generated_project_compiles_against_published_autumn_web` (unchanged
+  assertions, now built on a shared `run_autumn_new_against_published`
+  helper) keeps the `cargo build` half, in its own step, and only *that*
+  step carries `continue-on-error: true`. The job still surfaces the exact
+  drifted call site in its log (and still goes fully green the moment a
+  release does catch up), but a run where the known drift fires no longer
+  fails the workflow, while an `autumn new` regression still would. No doc
+  change — the `[patch.crates-io]` workaround `docs/guide/getting-started.md`'s
+  "Local development" section already describes is unchanged and still
+  correct.
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —
@@ -1962,6 +2097,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `pdf_render` profiling harness; negative result, no fix:** added
+  `autumn/benches/pdf_render.rs`, driving `Pdf::from_html`/`Pdf::render`
+  over a realistic 60-row multi-page invoice (the same shape
+  `examples/invoice`'s `invoice_pdf` handler renders) through the real HTML
+  parser (`pdf::html`) and layout walker/word-wrapper/PDF writer
+  (`pdf::layout`) — the framework's HTML-to-PDF export path had no
+  committed benchmark before this. `valgrind --tool=callgrind`/`dhat`
+  profiling found the top costs are inherent to PDF generation, not
+  autumn's own code: `miniz_oxide`'s DEFLATE compressor (14.1% of
+  instructions, via `printpdf`/`lopdf`'s stream compression), glibc
+  allocator internals (~30.5%), and PDF content-stream float formatting
+  (~10.6%, `printpdf`/`lopdf` serializing text positions/widths) dominate;
+  `printpdf::PdfSaveOptions::optimize` is the only compression toggle
+  exposed, and it also prunes unreferenced objects, so flipping it changes
+  every deployed app's output size/shape — a maintainer call, not an
+  unreviewed autonomous change. Autumn's own `pdf` module code (HTML
+  parsing, glyph-width lookup, word-wrap, the layout walker) is 5.1% of
+  instructions combined, with no single function above 1.35% — under the
+  5%-of-profile bar for chasing a specific target. One hypothesis was
+  measured directly: `layout::Writer::ops` (the per-page PDF-operation
+  buffer) resets to an empty, zero-capacity `Vec` on every page via
+  `mem::take`, so `draw_word`'s per-word pushes re-climb the same
+  doubling-growth curve from scratch on every page of a multi-page
+  document; seeding each new page's buffer with the just-flushed page's
+  length as a capacity hint (consecutive pages flow at similar
+  op-per-line density) measured instructions -1.39%, DHAT allocation
+  bytes -0.80%, blocks -0.07% on this harness — real, but under both the
+  5%-of-instructions and 10%-of-allocations impact floor, so the change
+  was reverted rather than shipped. The harness itself is the lasting
+  artifact, giving `Pdf::render` its first profiling coverage.
 - **🗃️ Ledger: batch `autumn-billing`'s dunning restart re-arm into one
   round trip (insert calls N→1 per restart):** every process restart,
   `dunning::rearm_pending` re-queues every open dunning retry row. It used
