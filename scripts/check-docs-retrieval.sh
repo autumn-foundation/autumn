@@ -225,27 +225,69 @@ def _after_title_open(text):
     """State after `text`, which may OPEN a definition title at its first char.
 
     `None` when it cannot be a title at all — the caller then knows the
-    definition is over and the line is ordinary text.
+    definition is over and the line is ordinary text. A title has to be the
+    WHOLE of what is left: CommonMark reads `[foo]: /url` then `"title" ok`
+    as a definition without a title followed by a paragraph, so a closer with
+    anything after it is not a title either.
     """
     closer = TITLE_CLOSER.get(text[:1])
     if closer is None:
         return None
-    return ('title', closer) if _closes_at(text, 1, closer) < 0 else False
+    end = _closes_at(text, 1, closer)
+    if end < 0:
+        return ('title', closer)          # runs on to the next line
+    return False if not text[end:].strip() else None
+
+
+def _dest_end(text):
+    """Index just past a legal link destination at the start of `text`, -1 if
+    there is none.
+
+    This is what decides whether a `[label]:` line began a definition at all.
+    A destination is `<…>` or an unbroken run of non-space characters with
+    balanced parens — so `Secret runtime logger` is not one, `[Overview]:`
+    over it is no definition, and the two lines are the paragraph a `---`
+    then turns into a real heading.
+    """
+    if text.startswith('<'):
+        end = _closes_at(text, 1, '>')
+        if end < 0:
+            return -1              # `<` with no `>` is not a destination
+        return end
+    i, depth = 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c.isspace():
+            break
+        if ord(c) < 0x20 or c == '\x7f':
+            return -1              # control characters are not allowed
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth < 0:
+                return -1
+        i += 1
+    return i if i and depth == 0 else -1
 
 
 def _after_dest(text):
-    """State after a definition's destination line, title and all."""
-    if text.startswith('<'):
-        end = _closes_at(text, 1, '>')
-        rest = text[end:] if end >= 0 else ''
-    else:
-        sep = re.search(r'[ \t]', text)
-        rest = text[sep.end():] if sep else ''
-    rest = rest.strip()
+    """State after a definition's destination line, or `None` if it is not one.
+
+    Everything on this line has to belong to the definition: a destination,
+    then at most a title. Anything else and there is no definition here, the
+    same way `[foo]: /url "title" ok` is a paragraph rather than a link.
+    """
+    end = _dest_end(text)
+    if end < 0:
+        return None
+    rest = text[end:].strip()
     if not rest:
         return 'title?'          # a title may still begin on the next line
-    opened = _after_title_open(rest)
-    return False if opened is None else opened
+    return _after_title_open(rest)
 
 
 def defn_step(state, text):
@@ -255,17 +297,50 @@ def defn_step(state, text):
     CONSUMED line contributes nothing to the index. A line the definition
     cannot contain is not consumed, and the caller processes it as ordinary
     text — which is the whole point of returning a flag rather than swallowing
-    whatever follows. The title is OPTIONAL, so `[a]:`, then ` /x`, then
-    `Secret runtime logger` over `---` is a real setext heading that an
-    unconditional discard reported as a MISS.
+    whatever follows. Both parts after the label are conditional: the title is
+    OPTIONAL, and the destination has to BE one. `[a]:`, ` /x`, then `Secret
+    runtime logger` over `---` is a real setext heading, and so is `[a]:` over
+    `Secret runtime logger` — where the label line is ordinary text too, since
+    without a destination there is no definition for it to be part of.
     """
     if state == 'dest':
-        # The destination itself always belongs to the definition.
-        return True, _after_dest(text)
+        nxt = _after_dest(text)
+        return (False, False) if nxt is None else (True, nxt)
     if state == 'title?':
         opened = _after_title_open(text)
         return (False, False) if opened is None else (True, opened)
+    # Inside a title that ran on: the closer ends it, whatever follows. Junk
+    # after it invalidates the title in CommonMark, but its earlier lines are
+    # already consumed by then, so there is nothing to hand back.
     return True, (False if _closes_at(text, 0, state[1]) >= 0 else state)
+
+
+CONTAINER_MARKER = re.compile(r'^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)')
+
+
+def uncontain(line):
+    """A line with its block-container markers taken off the front.
+
+    `> ## Heading` and `- ## Heading` are REAL headings: CommonMark renders
+    and anchors them inside the quote or the list item, so a reader can land
+    on one and the gate has to see it. Inside a container the rest of the
+    block syntax applies too, which is why the FENCE and raw-HTML checks read
+    this form as well — recognising `> # comment` as a heading while `> ```
+    opened no fence would turn a false negative into the worse kind, a
+    shell comment indexed as a page's heading.
+
+    Only markers on the line itself come off. A heading that sits in a
+    container by INDENTATION alone — a deeply nested list where four spaces
+    are content rather than code — needs a parser tracking container widths,
+    and is not claimed here. Nor does the setext path use this: `- item` over
+    `---` is a list and a thematic break, not a heading, so `is_paragraph`
+    goes on reading the raw line.
+    """
+    while True:
+        m = CONTAINER_MARKER.match(line)
+        if not m:
+            return line
+        line = line[m.end():]
 
 
 def is_paragraph(line):
@@ -462,6 +537,7 @@ def index():
         comment = False
         html_block = None
         pending_defn = False
+        defn_head = None
         para = []
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
@@ -529,7 +605,8 @@ def index():
             # columns, so it cannot precede a fence at all. `\s{0,3}` let a
             # tabbed line close a fence that is still open, exposing hidden
             # content to the index.
-            marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
+            bare = uncontain(line)
+            marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', bare)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
                 if fence is None and run[0] == '`' and '`' in rest:
@@ -571,7 +648,7 @@ def index():
             # `</script>` that never comes — suppressing every heading to EOF.
             # A type-1 tag name ends at whitespace, `>` or end of line.
             opener = re.match(r'^ {0,3}<(script|pre|style|textarea)(?=[\s>]|$)',
-                              line, re.I)
+                              bare, re.I)
             if opener:
                 html_block = opener.group(1).lower()
                 para = []
@@ -581,7 +658,7 @@ def index():
                 para = []
                 continue
 
-            if re.match(r'^ {0,3}<\?', line):
+            if re.match(r'^ {0,3}<\?', bare):
                 # CommonMark type 3: a processing instruction runs to `?>`,
                 # and nothing inside it is Markdown.
                 html_block = '#pi'
@@ -590,21 +667,21 @@ def index():
                     html_block = None
                 continue
 
-            if re.match(r'^ {0,3}<!\[CDATA\[', line):
+            if re.match(r'^ {0,3}<!\[CDATA\[', bare):
                 html_block = '#cdata'          # type 5, ends at `]]>`
                 para = []
                 if ']]>' in line:
                     html_block = None
                 continue
 
-            if re.match(r'^ {0,3}<![A-Za-z]', line):
+            if re.match(r'^ {0,3}<![A-Za-z]', bare):
                 html_block = '#decl'           # type 4 (`<!DOCTYPE …`), ends at `>`
                 para = []
                 if '>' in line:
                     html_block = None
                 continue
 
-            if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', line, re.I):
+            if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', bare, re.I):
                 html_block = '#blank'
                 para = []
                 continue
@@ -628,7 +705,7 @@ def index():
             # harmless indentation change fail the gate on a page that
             # renders perfectly — a false NEGATIVE, and the only defect here
             # that could stop a contributor rather than let one through.
-            is_heading = re.match(r'^ {0,3}#{1,6}\s', line) is not None
+            is_heading = re.match(r'^ {0,3}#{1,6}\s', bare) is not None
 
             # Outside a fence: what a renderer would show of this line, and
             # whether a comment is left open past it. The VISIBLE text is
@@ -670,8 +747,8 @@ def index():
             # heading once the comment is stripped. It must NOT gate the
             # setext path above it, which is how that check was dead on
             # arrival the first time it was written.
-            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', line) if is_heading \
-                else None
+            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', uncontain(line)) \
+                if is_heading else None
             if not m:
                 # Only a plain, non-blank text line can be setext text. A
                 # blank line ends the paragraph, so the next `---` is a
@@ -687,6 +764,9 @@ def index():
                     consumed, pending_defn = defn_step(pending_defn,
                                                        line.strip())
                     if consumed:
+                        # The first consumed line is the destination, so the
+                        # definition is real and its label line invisible.
+                        defn_head = None
                         para = []
                         continue
                     # Not part of the definition after all: fall through and
@@ -694,9 +774,17 @@ def index():
                     # entering definition state cleared it — so the setext
                     # check above had nothing to do on this line anyway, and
                     # the underline that follows still finds its text.
-                pending_defn = ('dest'
-                                if re.match(r'^ {0,3}\[[^\]]*\]:\s*$', line)
-                                else False)
+                    if defn_head is not None:
+                        # No destination, so there was never a definition and
+                        # the LABEL line is ordinary text as well. Dropping it
+                        # would index a heading the reader does not see: what
+                        # `[Overview]:` over `Secret runtime logger` renders
+                        # is one paragraph carrying both.
+                        para = [defn_head]
+                        defn_head = None
+                head = re.match(r'^ {0,3}\[[^\]]*\]:\s*$', line)
+                pending_defn = 'dest' if head else False
+                defn_head = line if head else None
                 if is_paragraph(line) and not is_heading and not pending_defn:
                     para.append(line)
                 else:
@@ -1552,7 +1640,61 @@ self_test() {
     > "$c85/scripts/docs-retrieval-questions.tsv"
   check "text after a closed multi-line title is indexed" pass "$c85"
 
-  # 86. A comment line and a blank line in the fixture are skipped.
+  # 86. A bare label over a line that is NOT a legal destination is no
+  #     definition at all, so BOTH lines are the paragraph a `---` promotes.
+  local c86="$tmp/c86"; make_corpus "$c86"
+  printf '# Page\n\n[Overview]:\nSecret runtime logger\n---\n' \
+    > "$c86/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c86/scripts/docs-retrieval-questions.tsv"
+  check "a label over a non-destination is ordinary text" pass "$c86"
+
+  # 87. …while a legal `\u003c…\u003e` destination on that line still is one, and
+  #     stays invisible. The positive control on 86.
+  local c87="$tmp/c87"; make_corpus "$c87"
+  printf '# Page\n\n[Overview]:\n  \u003c/secret-runtime-logger.md\u003e\n---\n' \
+    > "$c87/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c87/scripts/docs-retrieval-questions.tsv"
+  check "an angle-bracket destination is still invisible" fail "$c87"
+
+  # 88. A title has to be ALL that is left on its line: CommonMark reads
+  #     `[foo]: /url` then `"title" ok` as a definition and a paragraph.
+  local c88="$tmp/c88"; make_corpus "$c88"
+  printf '# Page\n\n[Overview]:\n  /x\n  "a" secret runtime logger\n---\n' \
+    > "$c88/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c88/scripts/docs-retrieval-questions.tsv"
+  check "a closer with text after it is not a title" pass "$c88"
+
+  # 89. A heading inside a BLOCK QUOTE is a heading: it renders, it anchors,
+  #     a reader lands on it.
+  local c89="$tmp/c89"; make_corpus "$c89"
+  printf '# Page\n\n\u003e ## Secret runtime logger\n' \
+    > "$c89/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c89/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a block quote is indexed" pass "$c89"
+
+  # 90. So is one inside a LIST ITEM.
+  local c90="$tmp/c90"; make_corpus "$c90"
+  printf '# Page\n\n- ## Secret runtime logger\n' \
+    > "$c90/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c90/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a list item is indexed" pass "$c90"
+
+  # 91. And a FENCE inside a block quote still hides what is in it — the
+  #     control that stops 89 from indexing every `# comment` in the quoted
+  #     code blocks this corpus already has.
+  local c91="$tmp/c91"; make_corpus "$c91"
+  printf '# Page\n\n\u003e \u0060\u0060\u0060\n\u003e # Secret runtime logger\n\u003e \u0060\u0060\u0060\n' \
+    > "$c91/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c91/scripts/docs-retrieval-questions.tsv"
+  check "a fence inside a block quote still hides its contents" fail "$c91"
+
+  # 92. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
