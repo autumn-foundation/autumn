@@ -140,9 +140,9 @@ def index():
             # match the page that fence sits on, which is exactly the page a
             # fixture row names — so the false positive lands on the EXPECTED
             # page and the gate passes while the reader still finds nothing.
-            marker = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+            marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
             if marker:
-                run = marker.group(1)
+                run, rest = marker.group(1), marker.group(2)
                 if fence is None:
                     # Keep the opener VERBATIM, character and length. A page
                     # documenting markdown opens with ```` so it can show a
@@ -150,11 +150,18 @@ def index():
                     # let the inner line close it, and every heading after it
                     # would be indexed while still inside the outer fence —
                     # the same false positive this block exists to stop.
+                    # `rest` here is the info string (```bash), which an
+                    # OPENING fence may carry.
                     fence = run
-                elif run[0] == fence[0] and len(run) >= len(fence):
-                    # CommonMark: the closing fence is the same character and
-                    # at least as long as the opener. A `~~~` never closes a
-                    # ``` block, and a shorter run is content.
+                elif (run[0] == fence[0] and len(run) >= len(fence)
+                      and rest.strip(' \t') == ''):
+                    # CommonMark: a closing fence is the same character, at
+                    # least as long as the opener, and carries NO info string.
+                    # So a `~~~` never closes a ``` block, a shorter run is
+                    # content, and `~~~bash` inside a `~~~` fence is content
+                    # too — closing on it would reopen the whole hole, since
+                    # every heading-shaped line after it would be indexed
+                    # while still fenced.
                     fence = None
                 continue
             if fence is not None:
@@ -364,7 +371,25 @@ self_test() {
     > "$c10/scripts/docs-retrieval-questions.tsv"
   check "a tilde run does not close a backtick fence" fail "$c10"
 
-  # 11. A comment line and a blank line in the fixture are skipped.
+  # 11. A same-character run carrying an info string is content, not a close:
+  #     `~~~bash` inside a `~~~` fence leaves the fence open.
+  local c11="$tmp/c11"; make_corpus "$c11"
+  printf '# Page\n\n~~~\n~~~bash\n# Raise the global level\n~~~\n' \
+    > "$c11/docs/guide/md.md"
+  printf 'raise the global level\tdocs/guide/md.md\n' \
+    > "$c11/scripts/docs-retrieval-questions.tsv"
+  check "a run with an info string does not close a fence" fail "$c11"
+
+  # 12. Trailing spaces on a closing fence are allowed, so a real close still
+  #     closes and the heading after it IS indexed.
+  local c12="$tmp/c12"; make_corpus "$c12"
+  printf '# Page\n\n```bash\necho hi\n```   \n\n## Raise the global level\n' \
+    > "$c12/docs/guide/md.md"
+  printf 'raise the global level\tdocs/guide/md.md\n' \
+    > "$c12/scripts/docs-retrieval-questions.tsv"
+  check "trailing whitespace still closes a fence" pass "$c12"
+
+  # 13. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
