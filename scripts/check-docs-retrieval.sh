@@ -197,12 +197,43 @@ def _unlink(text):
                 if j < n and text[j] == '(':         # inline: [label](dest)
                     k, pdepth = j + 1, 1
                     while k < n and pdepth:
-                        if text[k] == '\\':
+                        c = text[k]
+                        if c == '\\':
                             k += 2
                             continue
-                        if text[k] == '(':
+                        # An optional TITLE follows the destination after
+                        # whitespace, quoted with `"` or `'`, and may contain
+                        # an unmatched parenthesis: `(foo "a ( b")`. Counting
+                        # its parens as nesting means the link never closes
+                        # and the whole raw source stays in the title. A
+                        # PARENTHESISED title needs no case — its parens are
+                        # balanced, so depth counting already handles it.
+                        if c in '"\'' and text[k - 1] in ' \t':
+                            k += 1
+                            while k < n:
+                                if text[k] == '\\':
+                                    k += 2
+                                    continue
+                                if text[k] == c:
+                                    k += 1
+                                    break
+                                k += 1
+                            continue
+                        # `<…>` destination: parens inside are literal.
+                        if c == '<' and (k == j + 1 or text[k - 1] in ' \t'):
+                            k += 1
+                            while k < n:
+                                if text[k] == '\\':
+                                    k += 2
+                                    continue
+                                if text[k] == '>':
+                                    k += 1
+                                    break
+                                k += 1
+                            continue
+                        if c == '(':
                             pdepth += 1
-                        elif text[k] == ')':
+                        elif c == ')':
                             pdepth -= 1
                         k += 1
                     if pdepth == 0:
@@ -664,7 +695,40 @@ self_test() {
     > "$c27/scripts/docs-retrieval-questions.tsv"
   check "text before an unterminated comment is indexed" pass "$c27"
 
-  # 28. A comment line and a blank line in the fixture are skipped.
+  # 28. An unmatched `(` inside a quoted link TITLE is not destination nesting.
+  local c28="$tmp/c28"; make_corpus "$c28"
+  printf '# Page\n\n## [Overview](foo "secret runtime logger (")\n' \
+    > "$c28/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c28/scripts/docs-retrieval-questions.tsv"
+  check "a paren inside a quoted title does not break the scan" fail "$c28"
+
+  # 29. Same for a `<…>` destination, where parens are literal.
+  local c29="$tmp/c29"; make_corpus "$c29"
+  printf '# Page\n\n## [Overview](\u003csecret-runtime-logger (x).md\u003e)\n' \
+    > "$c29/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c29/scripts/docs-retrieval-questions.tsv"
+  check "parens inside an angle destination are literal" fail "$c29"
+
+  # 30. A quote OUTSIDE any link is ordinary visible text and must survive —
+  #     the title rule must not start swallowing prose.
+  local c30="$tmp/c30"; make_corpus "$c30"
+  printf '# Page\n\n## Secret runtime logger "quoted (" tail\n' \
+    > "$c30/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c30/scripts/docs-retrieval-questions.tsv"
+  check "a quote outside a link is ordinary text" pass "$c30"
+
+  # 31. And the label of a titled link is still indexed.
+  local c31="$tmp/c31"; make_corpus "$c31"
+  printf '# Page\n\n## [Secret runtime logger](foo "a ( b")\n' \
+    > "$c31/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c31/scripts/docs-retrieval-questions.tsv"
+  check "the label of a titled link is indexed" pass "$c31"
+
+  # 32. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
