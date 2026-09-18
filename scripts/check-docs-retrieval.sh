@@ -123,10 +123,69 @@ def rendered(title):
     tag in a heading (none in the corpus) would need code-span-aware handling
     before anything is removed.
     """
-    title = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', title)   # ![alt](src)
-    title = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', title)    # [text](dest)
-    title = re.sub(r'\[([^\]]*)\]\[[^\]]*\]', r'\1', title)   # [text][ref]
-    return title.strip()
+    return _unlink(title).strip()
+
+
+def _unlink(text):
+    """Replace every `[label](dest)`, `![alt](src)` and `[label][ref]` with
+    its label, leaving everything else untouched.
+
+    Scanned rather than pattern-matched, on purpose. Three review rounds found
+    three different markup shapes that a regex per shape did not cover, and a
+    destination regex is the clearest case of why: `[^)]*` stops at the first
+    `)`, so `[Overview](foo(bar)-secret.md)` leaves `-secret.md)` in the title
+    and the invisible half is indexed again. CommonMark allows balanced
+    parentheses in a destination, and a backslash escapes either. Counting
+    depth handles every valid destination at once instead of adding an
+    epicycle per counter-example.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\\' and i + 1 < n:          # an escape covers the next char
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        # A label opens at `[`, or at `![` for an image.
+        bang = ch == '!' and i + 1 < n and text[i + 1] == '['
+        if ch == '[' or bang:
+            label_start = i + (2 if bang else 1)
+            j, depth = label_start, 1
+            while j < n and depth:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '[':
+                    depth += 1
+                elif text[j] == ']':
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                label = text[label_start:j - 1]
+                if j < n and text[j] == '(':         # inline: [label](dest)
+                    k, pdepth = j + 1, 1
+                    while k < n and pdepth:
+                        if text[k] == '\\':
+                            k += 2
+                            continue
+                        if text[k] == '(':
+                            pdepth += 1
+                        elif text[k] == ')':
+                            pdepth -= 1
+                        k += 1
+                    if pdepth == 0:
+                        out.append(_unlink(label))
+                        i = k
+                        continue
+                elif j < n and text[j] == '[':       # reference: [label][ref]
+                    k = text.find(']', j + 1)
+                    if k != -1:
+                        out.append(_unlink(label))
+                        i = k + 1
+                        continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 def words(text):
@@ -508,7 +567,49 @@ self_test() {
     > "$c19/scripts/docs-retrieval-questions.tsv"
   check "the link text in a heading is indexed" pass "$c19"
 
-  # 20. A comment line and a blank line in the fixture are skipped.
+  # 20. A destination with BALANCED parentheses is still all destination.
+  #     `[^)]*` stopped at the inner `)` and left the rest in the title.
+  local c20="$tmp/c20"; make_corpus "$c20"
+  printf '# Page\n\n## [Overview](foo(bar)-secret-runtime-logger.md)\n' \
+    > "$c20/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c20/scripts/docs-retrieval-questions.tsv"
+  check "balanced parens in a destination are not indexed" fail "$c20"
+
+  # 21. Same for an ESCAPED paren, which CommonMark also allows.
+  local c21="$tmp/c21"; make_corpus "$c21"
+  printf '# Page\n\n## [Overview](foo\\)-secret-runtime-logger.md)\n' \
+    > "$c21/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c21/scripts/docs-retrieval-questions.tsv"
+  check "an escaped paren in a destination is not indexed" fail "$c21"
+
+  # 22. The label after such a destination is still indexed, and so is text
+  #     following the link — the scanner must resume, not swallow the rest.
+  local c22="$tmp/c22"; make_corpus "$c22"
+  printf '# Page\n\n## [Secret runtime logger](foo(bar).md) and more\n' \
+    > "$c22/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c22/scripts/docs-retrieval-questions.tsv"
+  check "the label of a nested-paren link is indexed" pass "$c22"
+
+  # 23. Text AFTER the link survives too.
+  local c23="$tmp/c23"; make_corpus "$c23"
+  printf '# Page\n\n## [Overview](foo(bar).md) and the runtime logger\n' \
+    > "$c23/docs/guide/md.md"
+  printf 'runtime logger\tdocs/guide/md.md\n' \
+    > "$c23/scripts/docs-retrieval-questions.tsv"
+  check "text after a nested-paren link is indexed" pass "$c23"
+
+  # 24. A bare `[` that opens no link must not eat the heading.
+  local c24="$tmp/c24"; make_corpus "$c24"
+  printf '# Page\n\n## Secret runtime logger [unclosed\n' \
+    > "$c24/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c24/scripts/docs-retrieval-questions.tsv"
+  check "an unclosed bracket does not swallow the heading" pass "$c24"
+
+  # 25. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
