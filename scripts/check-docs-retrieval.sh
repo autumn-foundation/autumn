@@ -92,9 +92,6 @@ ROOT = pathlib.Path(sys.argv[2])
 GUIDE = 'docs/guide/'
 FIXTURE = 'scripts/docs-retrieval-questions.tsv'
 
-# Words a reader types that carry no retrieval signal. Kept short on purpose:
-# every entry here is a word the matcher stops requiring, so a long list turns
-# a failing question into a passing one without changing a page.
 # CommonMark type-6 block tags: a line opening with one of these starts a raw
 # HTML block that runs to the next blank line, so nothing inside is Markdown.
 CONTAINER_TAGS = (
@@ -105,6 +102,9 @@ CONTAINER_TAGS = (
     r'|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)'
 )
 
+# Words a reader types that carry no retrieval signal. Kept short on purpose:
+# every entry here is a word the matcher stops requiring, so a long list turns
+# a failing question into a passing one without changing a page.
 STOPWORDS = {
     'a', 'an', 'and', 'are', 'at', 'be', 'by', 'can', 'do', 'does', 'for',
     'from', 'how', 'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on', 'or', 'the',
@@ -319,7 +319,7 @@ def index():
         fence = None
         comment = False
         html_block = None
-        prev_para = None
+        para = []
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
@@ -342,6 +342,7 @@ def index():
                 # reopens, and treating that as "closed" would index the
                 # next line's hidden heading.
                 _, comment = uncomment(line, True)
+                para = []
                 continue
 
             # A CommonMark type-1 raw HTML block — `<script>`, `<pre>`,
@@ -369,6 +370,7 @@ def index():
                         html_block = None
                 elif re.search(rf'</{html_block}\s*>', line, re.I):
                     html_block = None
+                para = []
                 continue
 
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
@@ -394,21 +396,26 @@ def index():
                     # every heading-shaped line after it would be indexed
                     # while still fenced.
                     fence = None
+                para = []
                 continue
             if fence is not None:
+                para = []
                 continue
 
             opener = re.match(r'^ {0,3}<(script|pre|style|textarea)\b', line,
                               re.I)
             if opener:
                 html_block = opener.group(1).lower()
+                para = []
                 if not re.search(rf'</{html_block}\s*>', line, re.I):
                     continue
                 html_block = None
+                para = []
                 continue
 
             if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}[\s/>]', line, re.I):
                 html_block = '#blank'
+                para = []
                 continue
 
             # Whether this is a heading is decided on the RAW line, before
@@ -443,11 +450,16 @@ def index():
             # reached `prev_para`, so `- Secret runtime logger` over `---`
             # indexed a LIST ITEM as a heading. A comment asserting a
             # property is not the same as enforcing it.
-            if prev_para is not None:
+            if para:
                 under = re.match(r'^ {0,3}(=+|-+)\s*$', line)
                 if under:
-                    title = rendered(prev_para.strip())
-                    prev_para = None
+                    # CommonMark promotes the WHOLE preceding paragraph, which
+                    # may be wrapped over several lines. Keeping only the last
+                    # one indexed "logger" for a heading that reads "Secret
+                    # runtime logger" — a false negative that would fail CI on
+                    # nothing worse than a rewrap.
+                    title = rendered(' '.join(l.strip() for l in para))
+                    para = []
                     if title:
                         if under.group(1)[0] == '=' and not h1:
                             h1 = title
@@ -467,10 +479,12 @@ def index():
                 # blank line ends the paragraph, so the next `---` is a
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
-                prev_para = line if is_paragraph(line) and not is_heading \
-                    else None
+                if is_paragraph(line) and not is_heading:
+                    para.append(line)
+                else:
+                    para = []       # a blank line or a block ends the paragraph
                 continue
-            prev_para = None
+            para = []
             level, title = len(m.group(1)), rendered(m.group(2))
             if not title:
                 continue
@@ -1007,7 +1021,33 @@ self_test() {
     > "$c49/scripts/docs-retrieval-questions.tsv"
   check "paragraph text is still setext text" pass "$c49"
 
-  # 50. A comment line and a blank line in the fixture are skipped.
+  # 50. A setext heading's text may be WRAPPED: the whole paragraph is the
+  #     heading, not just its last line.
+  local c50="$tmp/c50"; make_corpus "$c50"
+  printf '# Page\n\nSecret runtime\nlogger\n---\n' \
+    > "$c50/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c50/scripts/docs-retrieval-questions.tsv"
+  check "a wrapped setext heading keeps all its words" pass "$c50"
+
+  # 51. A BLANK line ends the paragraph, so only what follows it is the
+  #     heading — the accumulator must not span the gap.
+  local c51="$tmp/c51"; make_corpus "$c51"
+  printf '# Page\n\nSecret runtime\n\nlogger\n---\n' \
+    > "$c51/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c51/scripts/docs-retrieval-questions.tsv"
+  check "a blank line ends the setext paragraph" fail "$c51"
+
+  # 52. A fence between the lines ends it too.
+  local c52="$tmp/c52"; make_corpus "$c52"
+  printf '# Page\n\nSecret runtime\n```\nx\n```\nlogger\n---\n' \
+    > "$c52/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c52/scripts/docs-retrieval-questions.tsv"
+  check "a fence ends the setext paragraph" fail "$c52"
+
+  # 53. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
