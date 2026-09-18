@@ -539,15 +539,10 @@ pub(crate) enum RollbackAction {
     /// to roll back TO: the honest compensation is to return the host to
     /// nothing-installed, which is also the state that makes the next `deploy up`
     /// correctly take the First path again. A half-installed host an external load
-    /// balancer may already be probing is worse than a clean absence.
-    ///
-    /// **Known gap (documented, not fixed here):** [`ProxyController`] exposes no
-    /// deregister op, so the host's kamal-proxy still holds a route for the service
-    /// pointing at the (now stopped) slot port — that host's public port answers
-    /// 502 instead of connection-refused until it is deployed again. Removing the
-    /// route needs a new `ProxyController` method and its own exact-vector tests;
-    /// it is tracked as follow-up work, and the state table names the host so the
-    /// operator is never surprised by it.
+    /// balancer may already be probing is worse than a clean absence. This also
+    /// removes the proxy's route to the (now stopped) slot (issue #2270), so the
+    /// host's public port refuses connections instead of answering 502 until it is
+    /// deployed again.
     Teardown(usize),
     /// Do NOT touch this host automatically; report it and the reason.
     Manual(usize, &'static str),
@@ -960,8 +955,8 @@ pub(crate) fn fleet_summary_lines(
                 "previous release restored (rolled back by the fleet)".to_owned()
             }
             HostOutcome::CompensatedTeardown => {
-                "NOTHING serving (the fleet removed this host's new first deploy; its proxy \
-                 still holds the route until the next deploy)"
+                "NOTHING serving (the fleet removed this host's new first deploy, proxy route \
+                 included)"
                     .to_owned()
             }
             HostOutcome::CompensationFailed { failed_step } => format!(
@@ -3101,8 +3096,8 @@ mod tests {
             "a degraded host must name the housekeeping step that failed:\n{rendered}"
         );
         assert!(
-            rendered.contains("NOTHING serving") && rendered.contains("still holds the route"),
-            "a torn-down first deploy must state the proxy-route residue:\n{rendered}"
+            rendered.contains("NOTHING serving") && rendered.contains("proxy route included"),
+            "a torn-down first deploy must state its proxy route was removed too:\n{rendered}"
         );
         assert!(
             rendered.contains("mid-transaction") && rendered.contains("NOT rolled back"),

@@ -4245,8 +4245,11 @@ where
         // leaves them behind and the next `deploy up` wrongly takes the redeploy
         // path with nothing serving.
         let teardown = match host_plan.mode {
+            // `None`: this is the pre-go-live path — its failure boundary IS the
+            // health-gated `proxy-route` op, so a failure here means the route was
+            // never established and there is nothing to deregister (issue #2270).
             fleet::HostMode::First => {
-                exec::first_deploy_teardown_ops(cfg, input.release_id, &state.slots)
+                exec::first_deploy_teardown_ops(cfg, input.release_id, &state.slots, None)
             }
             fleet::HostMode::Redeploy => {
                 exec::candidate_teardown_ops(cfg, input.release_id, &state.slots)
@@ -4608,18 +4611,14 @@ where
 ///
 /// A first deploy has no `shared/previous-release` marker, so there is nothing to
 /// roll back to: the honest compensation is the first-deploy teardown, which stops
-/// the slot unit, removes this run's release dir, and clears the `current` symlink
-/// and slot markers — leaving the host in the nothing-installed state that makes
-/// the next `deploy up` correctly take the First path again.
+/// the slot unit, removes this run's release dir, clears the `current` symlink
+/// and slot markers, and removes the proxy's route (issue #2270) — leaving the
+/// host in the nothing-installed state that makes the next `deploy up` correctly
+/// take the First path again, with its public port refusing connections rather
+/// than answering 502.
 ///
 /// Driven through [`exec::run_ops`], not `run_teardown`: at fleet scale a silently
 /// swallowed cleanup failure is how a host ends up half-removed with nobody told.
-///
-/// **Known residue:** [`ProxyController`] has no deregister op, so this host's
-/// kamal-proxy still holds a route for the service pointing at the stopped slot —
-/// its public port answers 502 rather than refusing the connection until it is
-/// deployed again. Removing the route needs a new controller method (and its own
-/// exact-vector tests); the state table names the host so this is never a surprise.
 fn compensate_teardown<E, P>(
     cfg: &ResolvedDeployConfig,
     input: &FleetUpInput<'_, P>,
@@ -4630,7 +4629,8 @@ where
     E: exec::DeployExecutor,
     P: ProxyController,
 {
-    let ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
+    let deregister = input.proxy.deregister_op(&cfg.service_name);
+    let ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots, Some(deregister));
     match exec::run_ops(&ops, executor) {
         Ok(()) => fleet::HostOutcome::CompensatedTeardown,
         Err(err) => {
@@ -10642,6 +10642,9 @@ mod tests {
             "teardown-candidate-dir",
             "teardown-current-symlink",
             "teardown-slot-markers",
+            // Issue #2270: the proxy route must go too, or the public port keeps
+            // answering 502 with nothing live behind it.
+            "proxy-deregister",
         ] {
             assert!(
                 web_a.contains(&teardown),
@@ -10669,6 +10672,57 @@ mod tests {
             halt.still_on_new.is_empty(),
             "nothing may be left on the new release"
         );
+    }
+
+    #[test]
+    fn a_completed_first_deploy_compensation_removes_the_proxy_route() {
+        // Issue #2270: a completed first deploy that the fleet compensates has a
+        // LIVE proxy route (unlike the pre-go-live path, which never reaches
+        // `proxy-route`). The compensating teardown must clear it, socket-pinned
+        // like every other kamal-proxy invocation, and it must run before the
+        // advisory `teardown-last-deploy` write.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let calls = recorder.calls_for("web-a");
+        let labels: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, .. } => Some(*label),
+                exec::test_support::RecordedCall::Upload { .. } => None,
+            })
+            .collect();
+        let deregister_at = labels
+            .iter()
+            .position(|l| *l == "proxy-deregister")
+            .expect("the compensated first deploy must deregister the proxy route");
+        let last_deploy_at = labels
+            .iter()
+            .position(|l| *l == "teardown-last-deploy")
+            .expect("the teardown must still record its result");
+        assert!(
+            deregister_at < last_deploy_at,
+            "the deregister must run before the advisory marker write: {labels:?}"
+        );
+
+        let shell = calls
+            .iter()
+            .find_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "proxy-deregister" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .expect("proxy-deregister ran");
+        assert_eq!(shell, "env -u XDG_RUNTIME_DIR kamal-proxy remove 'myapp'");
     }
 
     #[test]

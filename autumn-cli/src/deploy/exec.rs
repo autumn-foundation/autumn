@@ -1214,11 +1214,21 @@ pub fn candidate_teardown_ops(
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
+///
+/// `deregister` is `Some(op)` ONLY when the proxy route this first deploy
+/// installed is actually live — the fleet compensation case (issue #2270),
+/// where the driver passes [`super::proxy::ProxyController::deregister_op`]. It
+/// runs BEFORE the advisory last-deploy marker write, so a failed deregister is
+/// reported (not masked) and still leaves the marker at its last TRUE value.
+/// `None` for the pre-go-live path in [`execute_first_deploy`]: that boundary is
+/// the health-gated `proxy-route` op itself, so a failure there means the route
+/// was never established and there is nothing to remove.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
     release_id: &str,
     plan: &SlotPlan,
+    deregister: Option<DeployOp>,
 ) -> Vec<DeployOp> {
     let mut ops = candidate_teardown_ops(cfg, release_id, plan);
     ops.push(DeployOp::Run(RemoteCommand::new(
@@ -1233,6 +1243,9 @@ pub fn first_deploy_teardown_ops(
             shell_quote(&previous_release_marker(cfg)),
         ),
     )));
+    if let Some(op) = deregister {
+        ops.push(op);
+    }
     // AC-6: correct the last-deploy marker the first deploy already wrote, so a
     // host with nothing installed can never report a successful deploy. LAST, and
     // advisory — see this function's doc comment for why both matter and why the
@@ -5832,7 +5845,7 @@ mod tests {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
         let exec = RecordingExecutor::failing_on("readiness-gate");
         let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
         let err = execute_first_deploy(&checks, &ops, &teardown, &exec)
@@ -5868,7 +5881,7 @@ mod tests {
         // takes the redeploy path with nothing serving.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
         let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
         // It is a superset of the candidate teardown, PLUS the marker cleanup, PLUS
         // the `torn down` last-deploy record (#1621 audit gap G3) — see
@@ -5907,6 +5920,49 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_deregisters_the_proxy_route_before_the_marker() {
+        // Issue #2270: the fleet compensation path passes the deregister op so a
+        // compensated host stops answering rather than answering 502. It must run
+        // BEFORE the advisory `teardown-last-deploy` write — a failed deregister
+        // is a real op failure, and `run_ops` stopping there must leave the
+        // marker at its last TRUE value (see the function's own doc comment).
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let deregister = DeployOp::Run(RemoteCommand::new(
+            "proxy-deregister",
+            "kamal-proxy remove 'myapp'".to_owned(),
+        ));
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, Some(deregister));
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "teardown-candidate-unit",
+                "teardown-candidate-dir",
+                "teardown-current-symlink",
+                "teardown-slot-markers",
+                "proxy-deregister",
+                "teardown-last-deploy",
+            ],
+            "the deregister op must sit right before the advisory marker write: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn first_deploy_teardown_without_a_deregister_op_is_unchanged() {
+        // `None` (the pre-go-live path) must not add anything or change the shape
+        // that predates issue #2270.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert!(
+            !labels.contains(&"proxy-deregister"),
+            "no deregister op without one passed in: {labels:?}"
+        );
+    }
+
+    #[test]
     fn first_deploy_teardown_records_the_torn_down_result() {
         // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to nothing
         // installed — that is what `CompensatedTeardown` means. Leaving
@@ -5919,7 +5975,7 @@ mod tests {
         // down, on purpose, at this time.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
         let exec = RecordingExecutor::new();
         run_teardown(&teardown, &exec);
 
@@ -7329,6 +7385,9 @@ mod tests {
             fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
+            fn deregister_op(&self, _service: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
             // compat_probe() and binary_install_ops() use the trait defaults → None.
         }
         let exec = RecordingExecutor::new();
@@ -7491,6 +7550,9 @@ mod tests {
             }
             fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
                 self.0.flip_op(service, new_upstream)
+            }
+            fn deregister_op(&self, service: &str) -> DeployOp {
+                self.0.deregister_op(service)
             }
             fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
                 self.0.compat_probe()
