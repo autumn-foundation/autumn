@@ -283,6 +283,7 @@ def index():
         h1, headings = '', []
         fence = None
         comment = False
+        html_block = None
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
@@ -305,6 +306,24 @@ def index():
                 # reopens, and treating that as "closed" would index the
                 # next line's hidden heading.
                 _, comment = uncomment(line, True)
+                continue
+
+            # A CommonMark type-1 raw HTML block — `<script>`, `<pre>`,
+            # `<style>`, `<textarea>` — runs to its closing tag, and nothing
+            # inside it is Markdown. A heading-shaped line in there renders
+            # as script text, so indexing it is the fenced case again with
+            # angle brackets.
+            #
+            # LIMIT, stated rather than left to be discovered: only type 1 is
+            # tracked. Types 6 and 7 (`<div>`, `<table>`, a bare custom tag)
+            # end at a BLANK LINE rather than a closing tag, so tracking them
+            # means implementing most of the HTML-block rules for a shape no
+            # guide page uses — and getting those wrong would swallow real
+            # headings, which is the worse failure. If one ever appears, this
+            # is the place, and `--list` will show what it ate.
+            if html_block is not None:
+                if re.search(rf'</{html_block}\s*>', line, re.I):
+                    html_block = None
                 continue
 
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
@@ -334,6 +353,15 @@ def index():
             if fence is not None:
                 continue
 
+            opener = re.match(r'^ {0,3}<(script|pre|style|textarea)\b', line,
+                              re.I)
+            if opener:
+                html_block = opener.group(1).lower()
+                if not re.search(rf'</{html_block}\s*>', line, re.I):
+                    continue
+                html_block = None
+                continue
+
             # Whether this is a heading is decided on the RAW line, before
             # any comment is removed. `<!-- editorial -->## Heading` is an
             # HTML block in CommonMark, not a heading — the `##` is block
@@ -341,7 +369,12 @@ def index():
             # heading that no renderer shows and let a row match it. The
             # strip still runs, because the comment state has to be carried
             # across this line either way.
-            is_heading = re.match(r'^#{1,6}\s', line) is not None
+            # Up to THREE leading spaces still makes an ATX heading; four is
+            # an indented code block. Requiring column one made an ordinary,
+            # harmless indentation change fail the gate on a page that
+            # renders perfectly — a false NEGATIVE, and the only defect here
+            # that could stop a contributor rather than let one through.
+            is_heading = re.match(r'^ {0,3}#{1,6}\s', line) is not None
 
             # Outside a fence: what a renderer would show of this line, and
             # whether a comment is left open past it. The VISIBLE text is
@@ -352,7 +385,7 @@ def index():
             if not is_heading:
                 continue
 
-            m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
+            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
                 continue
             level, title = len(m.group(1)), rendered(m.group(2))
@@ -766,7 +799,49 @@ self_test() {
     > "$c34/scripts/docs-retrieval-questions.tsv"
   check "a heading after an HTML-block line is indexed" pass "$c34"
 
-  # 35. A comment line and a blank line in the fixture are skipped.
+  # 35. Up to three leading spaces is still a heading — the false NEGATIVE
+  #     that would fail the gate on a page that renders fine.
+  local c35="$tmp/c35"; make_corpus "$c35"
+  printf '# Page\n\n   ## Secret runtime logger\n' \
+    > "$c35/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c35/scripts/docs-retrieval-questions.tsv"
+  check "an indented ATX heading is indexed" pass "$c35"
+
+  # 36. FOUR spaces is an indented code block, not a heading.
+  local c36="$tmp/c36"; make_corpus "$c36"
+  printf '# Page\n\n    ## Secret runtime logger\n' \
+    > "$c36/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c36/scripts/docs-retrieval-questions.tsv"
+  check "four spaces is code, not a heading" fail "$c36"
+
+  # 37. A heading-shaped line inside a raw HTML block is script text.
+  local c37="$tmp/c37"; make_corpus "$c37"
+  printf '# Page\n\n\u003cscript\u003e\n# Secret runtime logger\n\u003c/script\u003e\n' \
+    > "$c37/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c37/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a script block is not indexed" fail "$c37"
+
+  # 38. The block ends at its closing tag: a real heading after it is indexed.
+  local c38="$tmp/c38"; make_corpus "$c38"
+  printf '# Page\n\n\u003cscript\u003e\nvar x = 1;\n\u003c/script\u003e\n\n## Secret runtime logger\n' \
+    > "$c38/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c38/scripts/docs-retrieval-questions.tsv"
+  check "a heading after a script block is indexed" pass "$c38"
+
+  # 39. `<script>` inside a FENCE is sample code, not a block opener, so it
+  #     must not swallow the headings that follow the fence.
+  local c39="$tmp/c39"; make_corpus "$c39"
+  printf '# Page\n\n```html\n\u003cscript\u003e\n```\n\n## Secret runtime logger\n' \
+    > "$c39/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c39/scripts/docs-retrieval-questions.tsv"
+  check "a script tag inside a fence is sample code" pass "$c39"
+
+  # 40. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
