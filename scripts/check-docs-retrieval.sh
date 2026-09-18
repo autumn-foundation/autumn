@@ -334,12 +334,23 @@ def index():
             if fence is not None:
                 continue
 
+            # Whether this is a heading is decided on the RAW line, before
+            # any comment is removed. `<!-- editorial -->## Heading` is an
+            # HTML block in CommonMark, not a heading — the `##` is block
+            # content — so stripping the comment first would manufacture a
+            # heading that no renderer shows and let a row match it. The
+            # strip still runs, because the comment state has to be carried
+            # across this line either way.
+            is_heading = re.match(r'^#{1,6}\s', line) is not None
+
             # Outside a fence: what a renderer would show of this line, and
             # whether a comment is left open past it. The VISIBLE text is
             # what gets indexed, so `# Page <!-- Secret runtime logger -->`
             # contributes "Page" and nothing else — and `# Page <!-- note`
             # still contributes "Page" even though the comment runs on.
             line, comment = uncomment(line, False)
+            if not is_heading:
+                continue
 
             m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
@@ -728,7 +739,34 @@ self_test() {
     > "$c31/scripts/docs-retrieval-questions.tsv"
   check "the label of a titled link is indexed" pass "$c31"
 
-  # 32. A comment line and a blank line in the fixture are skipped.
+  # 32. A complete comment BEFORE heading-shaped text makes the line an HTML
+  #     block, not a heading — stripping it must not manufacture one.
+  local c32="$tmp/c32"; make_corpus "$c32"
+  printf '# Page\n\n\u003c!-- editorial --\u003e## Secret runtime logger\n' \
+    > "$c32/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c32/scripts/docs-retrieval-questions.tsv"
+  check "a comment before the hashes does not make a heading" fail "$c32"
+
+  # 33. A comment WITHIN a real heading is still removed, and the heading
+  #     itself still indexed — the raw-line check must not undo that.
+  local c33="$tmp/c33"; make_corpus "$c33"
+  printf '# Page\n\n## Secret runtime logger \u003c!-- editorial --\u003e\n' \
+    > "$c33/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c33/scripts/docs-retrieval-questions.tsv"
+  check "a comment inside a real heading is still stripped" pass "$c33"
+
+  # 34. The HTML-block line must not break state: a real heading after it is
+  #     still indexed.
+  local c34="$tmp/c34"; make_corpus "$c34"
+  printf '# Page\n\n\u003c!-- editorial --\u003e## Not a heading\n\n## Secret runtime logger\n' \
+    > "$c34/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c34/scripts/docs-retrieval-questions.tsv"
+  check "a heading after an HTML-block line is indexed" pass "$c34"
+
+  # 35. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
