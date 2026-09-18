@@ -1,0 +1,44 @@
+# Reader questions, and the guide page that answers each.
+#
+# Read by `scripts/check-docs-retrieval.sh`. Format: question<TAB>page.
+#
+# A question belongs here when a reader failure has been observed — a retrieval
+# test that dead-ended, a repeated support/issue question, a search term that
+# returned nothing. It is not an aspiration about what a page "should" cover,
+# and it is not added because a page looks like it deserves one. The page named
+# is the page that ANSWERS the question, not merely a page that mentions it: a
+# retitle that re-aims a page at a different question fails here rather than
+# passing quietly.
+#
+# Lines beginning with `#` and blank lines are ignored.
+
+# --- Regression set -------------------------------------------------------
+# These passed at the gate's baseline. They are here so a retitle, a heading
+# rewrite or a page move cannot take them away without failing.
+rate limiting	docs/guide/rate-limiting.md
+pagination	docs/guide/pagination.md
+compression	docs/guide/compression.md
+gzip	docs/guide/compression.md
+websockets	docs/guide/websockets.md
+soft delete	docs/guide/soft-delete.md
+full text search	docs/guide/full-text-search.md
+time zones	docs/guide/time-zones.md
+feature flags	docs/guide/feature-flags.md
+distributed locks	docs/guide/distributed-locks.md
+middleware ordering	docs/guide/middleware.md
+migrations	docs/guide/migrations.md
+access log	docs/guide/logging-pii.md
+
+# --- Log configuration ----------------------------------------------------
+# All six failed at the gate's baseline. `docs/guide/logging-pii.md` carried
+# `[log] level`, `log.format` and the access-log switches under the title
+# "Logging & PII", and the README listed it under that name, so a reader
+# asking about log levels read it as a privacy page and never opened it. The
+# runtime half — `PUT /actuator/loggers/{name}` — was on no reader-facing page
+# at all.
+log level	docs/guide/logging-pii.md
+change the log level	docs/guide/logging-pii.md
+debug logging	docs/guide/logging-pii.md
+log format	docs/guide/logging-pii.md
+json logs	docs/guide/logging-pii.md
+change log level at runtime	docs/guide/logging-pii.md
