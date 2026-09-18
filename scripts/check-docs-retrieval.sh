@@ -217,9 +217,13 @@ ASCII_PUNCT = frozenset('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
 # HTML block whose contents no reader sees.
 _ATTR = (r'[a-zA-Z_:][a-zA-Z0-9_.:-]*'
          r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
-TYPE7_TAG = re.compile(
-    rf'^ {{0,3}}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+{_ATTR})*\s*/?>'
-    rf'|</[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$')
+_TAG = (rf'<[a-zA-Z][a-zA-Z0-9-]*(?:\s+{_ATTR})*\s*/?>'
+        rf'|</[a-zA-Z][a-zA-Z0-9-]*\s*>')
+TYPE7_TAG = re.compile(rf'^ {{0,3}}(?:{_TAG})[ \t]*$')
+# The same grammar inline. A tag name cannot be followed by `:` or `@`, so
+# `<https://example.com>` and `<a@b.com>` are autolinks and stay put — there
+# the URL IS the rendered text.
+INLINE_TAG = re.compile(_TAG)
 
 
 def _escaped(text, i):
@@ -454,15 +458,17 @@ def rendered(title, defined=None):
     Autolinks (`<https://example.com>`) are deliberately left alone: there the
     URL *is* the rendered text.
 
-    NOT stripped, deliberately, and measured rather than assumed: HTML tags.
-    Every `<…>` in a guide heading today — 21 of them — is inside an inline
-    code span (`Auth<T>`, `Query<T>`, `autumn credentials edit [--env <env>]`),
-    where it is literal text a reader sees. A naive `<[^>]*>` strip would take
-    the visible half of all 21 and index `Query` for `Query<T>`, which is the
-    failure this whole function guards against, pointed the other way: losing
-    words a reader CAN see is as bad as gaining words they cannot. A real HTML
-    tag in a heading (none in the corpus) would need code-span-aware handling
-    before anything is removed.
+    Real inline HTML tags ARE stripped, but only where they are markup. An
+    earlier round left them alone, reasoning that every `<…>` in a guide
+    heading today — 21 of them — sits inside a code span (`Auth<T>`,
+    `Query<T>`, `autumn credentials edit [--env <env>]`) where it is literal
+    text a reader sees, and that a naive `<[^>]*>` strip would take the
+    visible half of all 21. The first half of that is right and the
+    conclusion was wrong: "no page does this yet" is not a rule, and leaving
+    tags in indexed `<span title="secret runtime logger">Overview</span>` as
+    four searchable words a reader never sees. The strip happens inside the
+    scanner, which already knows where code spans are, so both directions
+    hold: markup goes, `Query<T>` stays.
     """
     return _unlink(title, defined).strip()
 
@@ -509,6 +515,18 @@ def _unlink(text, defined=None):
         if span is not None:
             out.append(text[i:span])
             i = span
+            continue
+
+        # A real inline tag renders as markup, not words: a reader of
+        # `<span title="secret runtime logger">Overview</span>` sees
+        # "Overview" and nothing else, so indexing the attribute is the
+        # invisible-text failure again — and it was reproduced as a false
+        # POSITIVE, the gate reporting a hit on words that are not on the
+        # page. Reached only outside code spans, which is what keeps
+        # `Auth<T>` and `Query<T>` intact.
+        tag = INLINE_TAG.match(text, i)
+        if tag:
+            i = tag.end()
             continue
         # A label opens at `[`, or at `![` for an image.
         bang = ch == '!' and i + 1 < n and text[i + 1] == '['
@@ -742,6 +760,19 @@ def index():
             # tabbed line close a fence that is still open, exposing hidden
             # content to the index.
             bare = uncontain(line)
+            # Whether a LIST marker was stripped to get there. A marker means
+            # a new list item begins on this line, so its delimiter is that
+            # item's first content and cannot close a fence that belongs to
+            # anything else — which is how a `- ``` ` INSIDE a top-level
+            # fence was closing it and exposing the rest as visible text.
+            # Openers are unaffected: `- ``` ` does open a fence.
+            #
+            # Not a depth, the way quotes are: a list item is continued by
+            # INDENTATION, so its later lines carry no marker at all. Which
+            # also marks the limit here — a fence opened inside an item and
+            # left unclosed there runs on past the list, rather than ending
+            # with it, and that needs container widths to fix.
+            listed = bare != unquote(line)[1]
             if fence is not None and fence[1] and container < fence[1]:
                 fence = None        # the quote that held the fence ended
             marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', bare)
@@ -769,7 +800,8 @@ def index():
                     # close on it and index everything after as visible text —
                     # a false positive `uncontain` introduced.
                     fence = (run, container)
-                elif (container == fence[1] and run[0] == fence[0][0]
+                elif (container == fence[1] and not listed
+                      and run[0] == fence[0][0]
                       and len(run) >= len(fence[0])
                       and rest.strip(' \t') == ''):
                     # CommonMark: a closing fence is the same character, at
@@ -2067,7 +2099,51 @@ self_test() {
     > "$c113/scripts/docs-retrieval-questions.tsv"
   check "a type-7 tag does not interrupt a paragraph" pass "$c113"
 
-  # 114. A comment line and a blank line in the fixture are skipped.
+  # 114. A real inline TAG is markup: its attributes are not words on the
+  #      page, so indexing them is a hit on text no reader can see.
+  local c114="$tmp/c114"; make_corpus "$c114"
+  printf '# Page\n\n## \u003cspan title="secret runtime logger"\u003eOverview\u003c/span\u003e\n' \
+    > "$c114/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c114/scripts/docs-retrieval-questions.tsv"
+  check "an inline tag attribute is not indexed" fail "$c114"
+
+  # 115. …while `\u003c…\u003e` inside a CODE SPAN is literal text a reader sees. The
+  #      control that keeps the strip from eating `Query\u003cT\u003e`.
+  local c115="$tmp/c115"; make_corpus "$c115"
+  printf '# Page\n\n## \u0060Secret\u003cruntime\u003elogger\u0060\n' \
+    > "$c115/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c115/scripts/docs-retrieval-questions.tsv"
+  check "angle brackets in a code span survive" pass "$c115"
+
+  # 116. An AUTOLINK is not a tag: there the URL is the rendered text.
+  local c116="$tmp/c116"; make_corpus "$c116"
+  printf '# Page\n\n## \u003chttps://example.com/secret-runtime-logger\u003e\n' \
+    > "$c116/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c116/scripts/docs-retrieval-questions.tsv"
+  check "an autolink is still visible text" pass "$c116"
+
+  # 117. A delimiter carrying a LIST MARKER starts an item; it cannot close a
+  #      fence that belongs to something else, so what follows stays fenced.
+  local c117="$tmp/c117"; make_corpus "$c117"
+  printf '# Page\n\n\u0060\u0060\u0060\n- \u0060\u0060\u0060\n# Secret runtime logger\n\u0060\u0060\u0060\n' \
+    > "$c117/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c117/scripts/docs-retrieval-questions.tsv"
+  check "a list-marker delimiter does not close a fence" fail "$c117"
+
+  # 118. …and a fence a list item OPENS is still closed by its own indented
+  #      delimiter, which carries no marker. The control on 117.
+  local c118="$tmp/c118"; make_corpus "$c118"
+  printf '# Page\n\n- \u0060\u0060\u0060\n  hidden\n  \u0060\u0060\u0060\n\n## Secret runtime logger\n' \
+    > "$c118/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c118/scripts/docs-retrieval-questions.tsv"
+  check "an indented delimiter closes a list item's fence" pass "$c118"
+
+  # 119. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
