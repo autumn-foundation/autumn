@@ -412,7 +412,34 @@ def unquote(line):
         depth += 1
 
 
-def is_paragraph(line):
+def _defn_at(text):
+    """The label of a link reference definition at the start of `text`, and
+    the index just past its `]:` — or `(None, -1)` if there is none.
+
+    A label takes backslash escapes, so `[Foo*bar\]]: /url` is a definition
+    whose label is `Foo*bar]` (CommonMark example 194). A `[^\]]*` pattern
+    stopped at that escaped bracket, called the line paragraph text, and a
+    `---` under it then indexed a destination no reader sees.
+    """
+    m = re.match(r'^ {0,3}\[', text)
+    if not m:
+        return None, -1
+    i = m.end()
+    while i < len(text):
+        if _escaped(text, i):
+            i += 2
+            continue
+        if text[i] == '[':
+            return None, -1      # an unescaped `[` cannot appear in a label
+        if text[i] == ']':
+            if text[i + 1:i + 2] != ':':
+                return None, -1
+            return text[m.end():i], i + 2
+        i += 1
+    return None, -1
+
+
+def is_paragraph(line, open_para=False):
     """Whether a line is paragraph text, and so can carry a setext underline.
 
     CommonMark only makes an underline a heading when what precedes it is a
@@ -434,7 +461,7 @@ def is_paragraph(line):
         return False            # ordered list item
     if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
         return False            # thematic break
-    if re.match(r'^\[[^\]]*\]:', stripped):
+    if _defn_at(stripped)[0] is not None:
         # (A bare `[label]:` with the destination on the NEXT line is handled
         # by the caller, which has to carry state across lines.)
         # A link-reference definition renders as NOTHING — it only defines a
@@ -443,7 +470,11 @@ def is_paragraph(line):
         # a heading, which is the invisible-text failure with yet another
         # syntax. `rendered()` cannot help here: this is not an inline link,
         # so there is no label to reduce it to.
-        return False
+        #
+        # Unless a paragraph is already open: a definition cannot INTERRUPT
+        # one, so there it is continuation text, and the `---` under it makes
+        # a heading of both lines.
+        return open_para
     return True
 
 
@@ -978,17 +1009,22 @@ def index():
                         # is one paragraph carrying both.
                         para = [defn_head]
                         defn_head = None
-                head = re.match(r'^ {0,3}\[([^\]]*)\]:\s*$', body)
+                # With a paragraph already open this is not a definition at
+                # all, whatever it looks like: one cannot interrupt a
+                # paragraph, so the line is continuation text.
+                label, after = (None, -1) if para else _defn_at(body)
+                rest = body[after:].strip() if label is not None else ''
+                head = label is not None and not rest
                 pending_defn = 'dest' if head else False
                 defn_head = body if head else None
-                pending_label = ref_label(head.group(1)) if head else None
+                pending_label = ref_label(label) if head else None
                 # The one-line form defines a label too, and its destination
                 # has to be legal for the same reason: `[a]: not a url` is a
                 # paragraph, and a `[x][a]` elsewhere stays literal text.
-                one_line = re.match(r'^ {0,3}\[([^\]]*)\]:\s*(\S.*)$', body)
-                if one_line and _after_dest(one_line.group(2).strip()) is not None:
-                    defined.add(ref_label(one_line.group(1)))
-                if is_paragraph(body) and not is_heading and not pending_defn:
+                if rest and _after_dest(rest) is not None:
+                    defined.add(ref_label(label))
+                if is_paragraph(body, bool(para)) and not is_heading \
+                        and not pending_defn:
                     para.append(body)
                     para_depth = depth
                 else:
@@ -2143,7 +2179,53 @@ self_test() {
     > "$c118/scripts/docs-retrieval-questions.tsv"
   check "an indented delimiter closes a list item's fence" pass "$c118"
 
-  # 119. A comment line and a blank line in the fixture are skipped.
+  # 119. A definition cannot INTERRUPT a paragraph, so after prose it is
+  #      continuation text and the `---` under it makes a heading of both.
+  local c119="$tmp/c119"; make_corpus "$c119"
+  printf '# Page\n\nIntro\n[foo]: /secret-runtime-logger\n---\n' \
+    > "$c119/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c119/scripts/docs-retrieval-questions.tsv"
+  check "a definition cannot interrupt a paragraph" pass "$c119"
+
+  # 120. …and with NO paragraph open it is a definition, invisible as ever.
+  #      The control on 119.
+  local c120="$tmp/c120"; make_corpus "$c120"
+  printf '# Page\n\n[foo]: /secret-runtime-logger\n---\n' \
+    > "$c120/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c120/scripts/docs-retrieval-questions.tsv"
+  check "a definition with no paragraph open is invisible" fail "$c120"
+
+  # 121. A label takes backslash escapes, so `[foo\]]:` is a definition whose
+  #      label is `foo]` — CommonMark example 194 — and renders as nothing.
+  local c121="$tmp/c121"; make_corpus "$c121"
+  printf '# Page\n\n[foo\\]]: /secret-runtime-logger\n---\n' \
+    > "$c121/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c121/scripts/docs-retrieval-questions.tsv"
+  check "an escaped bracket does not end a label" fail "$c121"
+
+  # 122. …while an UNescaped one does, so `[foo]]:` is not a definition and
+  #      the line is the visible text it looks like. The control on 121.
+  local c122="$tmp/c122"; make_corpus "$c122"
+  printf '# Page\n\n[foo]]: secret runtime logger\n---\n' \
+    > "$c122/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c122/scripts/docs-retrieval-questions.tsv"
+  check "an unescaped bracket still ends a label" pass "$c122"
+
+  # 123. The BARE-label form cannot interrupt one either. This is what the
+  #      caller's own guard covers: without it the line opens definition
+  #      state, which discards the paragraph the `---` was going to promote.
+  local c123="$tmp/c123"; make_corpus "$c123"
+  printf '# Page\n\nIntro\n[foo]:\n/secret-runtime-logger\n---\n' \
+    > "$c123/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c123/scripts/docs-retrieval-questions.tsv"
+  check "a bare label cannot interrupt a paragraph" pass "$c123"
+
+  # 124. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

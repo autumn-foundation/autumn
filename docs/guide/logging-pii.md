@@ -107,18 +107,32 @@ takes effect on the next event:
 ```bash
 LOGGERS=http://localhost:3000/actuator/loggers
 
-# Raise the global level, KEEPING what it was. Do not assume `info`: the level
-# in force is whatever the profile or config set, and once you have replaced
-# it the response is the only place it still exists.
-ROOT_PREV=$(curl -sX PUT "$LOGGERS/root" \
-  -H 'content-type: application/json' -d '{"level":"debug"}' | jq -r .previous)
+# Do not assume the global level is `info`: it is whatever the profile or
+# config set, and once you have replaced it the response is the only place it
+# still exists.
+raise() {                         # raise <logger> <level>; prints `previous`
+  local out
+  out=$(curl -sX PUT "$LOGGERS/$1" \
+    -H 'content-type: application/json' -d "{\"level\":\"$2\"}")
+  # `applied` is what says the change reached the live subscriber. With no
+  # reload-capable one the endpoint still answers 200 — `"status":
+  # "recorded"`, `"applied": false` — having remembered the level and
+  # changed nothing. Read the logs after that and you are reading the old
+  # level while believing you raised it.
+  if [ "$(printf '%s' "$out" | jq -r .applied)" != true ]; then
+    printf 'NOT APPLIED: %s\n' "$(printf '%s' "$out" | jq -r .message)" >&2
+  fi
+  printf '%s' "$out" | jq -r .previous
+}
+
+# Raise the global level, KEEPING what it was, and check it took.
+ROOT_PREV=$(raise root debug)
 
 # Raise one target, leaving everything else where it is. Keep this response
 # too, in a variable of its own: it holds that TARGET's previous override,
 # which is a different thing from the global level and is not put back by
 # restoring `root`.
-ORDERS_PREV=$(curl -sX PUT "$LOGGERS/my_app::orders" \
-  -H 'content-type: application/json' -d '{"level":"trace"}' | jq -r .previous)
+ORDERS_PREV=$(raise my_app::orders trace)
 
 # … investigate …
 
@@ -141,8 +155,14 @@ restore root "$ROOT_PREV"
 restore my_app::orders "$ORDERS_PREV"
 ```
 
-(`jq` only to pull one field out; any JSON reader will do, and `GET
-$LOGGERS` shows `current_level` if you would rather read it by eye first.)
+(`jq` only to pull fields out; any JSON reader will do, and `GET $LOGGERS`
+shows `current_level` if you would rather read it by eye first.)
+
+**If `raise` prints `NOT APPLIED`, stop.** The level was recorded and the log
+stream did not change, so nothing you read next reflects the level you asked
+for — see [`applied` is the field to check](#change-log-levels-at-runtime-without-a-restart)
+below for when that happens. `previous` is still worth keeping: the override
+is in the process state either way, so it still wants restoring.
 
 Restoring the two separately is the part that is easy to drop, and dropping
 it is silent: put `root` back, walk away, and `my_app::orders` is still at
