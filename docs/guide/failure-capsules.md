@@ -945,7 +945,7 @@ is not.
 
 - [Error Reporting](./error-reporting.md) — the pipeline that decides a request
   failed, and the `ErrorEvent` a capsule attaches to.
-- [Logging & PII](./logging-pii.md) — `[log] filter_parameters`, the one list
+- [Logging: levels, format & PII](./logging-pii.md) — `[log] filter_parameters`, the one list
   that governs redaction here too.
 - [Cloud-Native Guide](./cloud-native.md) — running Autumn where the disk a
   capsule lands on may not outlive the pod.

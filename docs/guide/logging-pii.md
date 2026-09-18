@@ -1,46 +1,144 @@
-# Logging & PII
+# Logging: log levels, format, and PII scrubbing
 
-Autumn includes a parameter scrubber for structured payloads. Today, it is wired
-into dev HTML error-badge request context rendering (headers/query) and helper APIs.
-It is **not yet globally applied to every tracing/log event payload**.
+This page is the one place Autumn's logging is configured. It answers four
+questions, in the order people usually arrive with them:
 
-## Built-in defaults
+- [how loud the logs are](#set-the-log-level) — `[log] level`
+- [what shape they come out in](#choose-the-log-format-pretty-or-json) —
+  `[log] format`, pretty or JSON
+- [how to turn up a log level in production without a
+  redeploy](#change-log-levels-at-runtime-without-a-restart) —
+  `PUT /actuator/loggers/{name}`
+- [what is kept out of them](#scrub-pii-from-logs) — the parameter scrubber
 
-By default, the scrubber filters keys such as:
+The [access log](#access-log) — one structured line per served request — is on
+by default and is configured here too.
 
-- `password`, `password_confirmation`
-- `token`, `access_token`, `refresh_token`
-- `secret`, `authorization`
-- `api_key`
-- `cookie`, `set-cookie`
-- `ssn`, `credit_card`, `card_number`, `cvv`
+## Set the log level
 
-Matched values are replaced with:
-
-```text
-[FILTERED]
-```
-
-## Configure in `autumn.toml`
+The global level lives in `[log] level`, and defaults to `info`:
 
 ```toml
 [log]
 level = "info"
-format = "Json"
-
-# Add app-specific sensitive keys
-filter_parameters = ["pin", "private_note"]
-
-# Opt out of built-in defaults (use sparingly)
-unfilter_parameters = ["password"]
 ```
 
-### Important behavior
+The five levels are `trace`, `debug`, `info`, `warn` and `error`.
 
-- Matching is case-insensitive.
-- Matching is normalization-aware for separators/casing (`api_key`, `apiKey`,
-  `API-KEY`, `apikey` are treated equivalently).
-- Empty custom keys are ignored to avoid accidental “scrub everything”.
+For a deployment with no `autumn.toml` — a container, a platform that only
+hands you environment variables — the same field is `AUTUMN_LOG__LEVEL`:
+
+```bash
+AUTUMN_LOG__LEVEL=debug cargo run
+```
+
+Either spelling is read once, at startup. To change a level on a process that
+is already running, see [Change log levels at
+runtime](#change-log-levels-at-runtime-without-a-restart) below.
+
+### Turn on debug logging for one target
+
+The field takes the full [`tracing` filter
+syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html),
+not just a bare level, so one target can be turned up without raising the floor
+for everything else — which is usually what "turn on debug logging" should
+mean, since a global `debug` on a busy service buries the lines you came for:
+
+```toml
+[log]
+level = "info,autumn_web=debug,tower_http=trace"
+```
+
+The same syntax works in the environment variable:
+`AUTUMN_LOG__LEVEL="info,my_app::orders=debug"`.
+
+## Choose the log format (pretty or JSON)
+
+`[log] format` decides whether log lines are rendered for a human reading a
+terminal or for a collector parsing JSON:
+
+```toml
+[log]
+format = "Auto"
+```
+
+| Format   | Behavior                                                   |
+|----------|------------------------------------------------------------|
+| `Auto`   | Pretty in development, JSON when the profile is production |
+| `Pretty` | Always human-readable, colorized                           |
+| `Json`   | Always structured JSON                                     |
+
+`Auto` is the default, and is why the same binary prints readable lines on a
+laptop and JSON in production without the config changing. Set `Json`
+explicitly when something parses the output in development too — a local log
+shipper, a test that asserts on fields. The environment spelling is
+`AUTUMN_LOG__FORMAT=Json`.
+
+The format applies to every line the standard subscriber renders, the [access
+log](#access-log) included.
+
+## Change log levels at runtime, without a restart
+
+`[log] level` is read at startup, so raising verbosity to investigate
+something in production would normally mean a redeploy — by which time the
+thing you wanted to see has usually stopped happening. `PUT
+/actuator/loggers/{name}` changes the live `tracing` subscriber instead, and
+takes effect on the next event:
+
+```bash
+# Raise the global level
+curl -X PUT http://localhost:3000/actuator/loggers/root \
+  -H 'content-type: application/json' -d '{"level":"debug"}'
+
+# Raise one target, leaving everything else at its configured level
+curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
+  -H 'content-type: application/json' -d '{"level":"trace"}'
+
+# Put it back
+curl -X PUT http://localhost:3000/actuator/loggers/root \
+  -H 'content-type: application/json' -d '{"level":"info"}'
+```
+
+`{name}` is either `root` (the global level) or a `tracing` target — a module
+path such as `my_app::orders`. `GET /actuator/loggers` reports what is in
+force:
+
+```json
+{
+  "current_level": "info",
+  "available_levels": ["trace", "debug", "info", "warn", "error"],
+  "loggers": { "my_app::orders": "trace" }
+}
+```
+
+Four things are worth knowing before you rely on this in an incident:
+
+- **Overrides are ephemeral.** They live in the running process. A restart,
+  a redeploy or a replacement replica is back at the configured `[log] level`.
+  Nothing here edits `autumn.toml`.
+- **`applied` is the field to check, not the status code.** A successful
+  change answers `"status": "ok"` with `"applied": true`. If the app was built
+  with a subscriber that cannot be reloaded, the change is remembered but
+  never reaches the log stream, and the response says so —
+  `"status": "recorded"`, `"applied": false` — rather than reporting a
+  false-positive `ok`. Both are `200`; only `applied` distinguishes them.
+- **A bad level or a bad target is a `400`.** Levels outside the five above
+  are rejected, and so are target names carrying `EnvFilter` metacharacters
+  (`=`, `,`, `[`, `]`, `{`, `}`, whitespace), so a malformed directive can
+  never reach the subscriber.
+- **The endpoint is mounted only in sensitive actuator mode.** It can change
+  what a production process logs, so it lives behind the same switch as
+  `/actuator/env` and `/actuator/configprops`:
+
+  ```toml
+  [actuator]
+  sensitive = true
+  ```
+
+  A `404` on `/actuator/loggers` means the profile has not enabled it, not
+  that the path is wrong. See
+  [Deployment](deployment.md) for what sensitive mode exposes and how to keep
+  it reachable only from inside your network.
 
 ## Access log
 
@@ -53,7 +151,7 @@ subscriber, so `log.format` controls its shape, and it requires no telemetry
 feature or collector.
 
 The line never includes query strings, headers, or bodies, so it cannot leak
-the sensitive values this scrubber protects.
+the sensitive values the [parameter scrubber](#scrub-pii-from-logs) protects.
 
 Probe and asset noise is excluded by default; both knobs live in `[log]`:
 
@@ -71,12 +169,55 @@ Both knobs also honor environment overrides for TOML-less deployments:
 `AUTUMN_LOG__ACCESS_LOG=false` and
 `AUTUMN_LOG__ACCESS_LOG_EXCLUDE=/health,/internal` (comma-separated).
 
-## Startup warnings
+## Scrub PII from logs
+
+Autumn includes a parameter scrubber for structured payloads. Today, it is wired
+into dev HTML error-badge request context rendering (headers/query) and helper APIs.
+It is **not yet globally applied to every tracing/log event payload**.
+
+### Built-in defaults
+
+By default, the scrubber filters keys such as:
+
+- `password`, `password_confirmation`
+- `token`, `access_token`, `refresh_token`
+- `secret`, `authorization`
+- `api_key`
+- `cookie`, `set-cookie`
+- `ssn`, `credit_card`, `card_number`, `cvv`
+
+Matched values are replaced with:
+
+```text
+[FILTERED]
+```
+
+### Add or remove scrubbed keys
+
+Both lists live in `[log]`, beside the level and format above:
+
+```toml
+[log]
+# Add app-specific sensitive keys
+filter_parameters = ["pin", "private_note"]
+
+# Opt out of built-in defaults (use sparingly)
+unfilter_parameters = ["password"]
+```
+
+### Important behavior
+
+- Matching is case-insensitive.
+- Matching is normalization-aware for separators/casing (`api_key`, `apiKey`,
+  `API-KEY`, `apikey` are treated equivalently).
+- Empty custom keys are ignored to avoid accidental “scrub everything”.
+
+### Startup warnings
 
 If you opt out of built-in sensitive defaults via `unfilter_parameters`, Autumn
 emits a startup warning listing the opted-out keys.
 
-## Programmatic use
+### Programmatic use
 
 ```rust
 use autumn_web::log::filter::scrub;

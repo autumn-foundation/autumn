@@ -823,6 +823,6 @@ apply-time error.
   two automatic classification sources.
 - [Confidential fields](confidential-fields.md) — `#[confidential]`, whose
   column names the log filter also folds in.
-- [Logging & PII](logging-pii.md) — the log-side scrubber, which is a different
+- [Logging: levels, format & PII](logging-pii.md) — the log-side scrubber, which is a different
   thing entirely.
 - [Seeding](seeding.md) — synthetic data when you do not need production shapes.
