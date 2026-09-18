@@ -172,6 +172,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🪞 Echo: `autumn generate auth --oauth`/`--webauthn` no longer mutate an
+  unrelated `autumn_web` dependency (#2753):** `ensure_autumn_web_oauth2_feature`
+  and `ensure_autumn_web_webauthn_feature` matched a `[dependencies.autumn_web]`
+  subtable as "this is `autumn-web`" purely by name, but Cargo does not
+  normalize `-`/`_` in a dependency table key — `[dependencies.autumn_web]`
+  names an unrelated package literally called `autumn_web` unless its body
+  renames it back with `package = "autumn-web"`. A project with such a
+  dependency (and `autumn-web` declared some other way) got the `oauth2`/
+  `webauthn` cargo feature silently added to the wrong dependency's features
+  list. `ensure_autumn_web_mail_feature` already carried the correct
+  `package`-rename check (#2752); the other two now call the same guard
+  before matching the underscore form, matching the fix Echo's findings
+  issue #2753 tracked as still outstanding. Two new regression tests
+  (`cargo_toml_oauth2_feature_ignores_unrenamed_underscore_subtable`,
+  `cargo_toml_webauthn_feature_ignores_unrenamed_underscore_subtable`) pin
+  the negative case; the existing underscore-subtable-form tests for both
+  functions still pass unchanged. The remaining clone-class work tracked by
+  #2753 (unifying all five `ensure_*_feature` helpers into one
+  `ensure_crate_features` and closing the multi-line `features = [...]`
+  array gap) is intentionally out of scope here — it is a ~700-line
+  refactor that needs its own characterization-tests-first PR, not folded
+  into a narrow security fix.
 - **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
   CI failure [no-plugin]:** nothing here is agent-facing — it's a
   CI-workflow-only change plus a test split, not new framework surface

@@ -3992,6 +3992,10 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// silently misses forms like `package= "..."` or `package ="..."`. Also
 /// tolerant of TOML's single-quoted literal-string form (`package =
 /// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
+/// Also tolerant of a quoted key (`"package" = "autumn-web"` or `'package' =
+/// "autumn-web"`) -- TOML permits quoting any bare key, Cargo treats it
+/// identically to the unquoted form, and a caller who writes `cargo add
+/// --rename` output by hand has no reason to know the quoting is optional.
 ///
 /// `pub(super)`: also called from `super::auth`'s `ensure_autumn_web_*_feature`
 /// helpers, which must not treat a `[dependencies.autumn_web]` subtable as the
@@ -4006,7 +4010,8 @@ pub(super) fn declares_package(text: &str, target: &str) -> bool {
     };
     split_top_level_commas(body).into_iter().any(|part| {
         part.split_once('=').is_some_and(|(k, v)| {
-            k.trim() == "package" && v.trim().trim_matches(['"', '\'']) == target
+            k.trim().trim_matches(['"', '\'']) == "package"
+                && v.trim().trim_matches(['"', '\'']) == target
         })
     })
 }
@@ -8513,6 +8518,36 @@ fn main() {
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn declares_package_recognizes_a_quoted_key() {
+        // TOML permits quoting any bare key; Cargo treats `"package" = "..."`
+        // identically to `package = "..."`. A caller who writes `cargo add
+        // --rename` output by hand has no reason to know the quoting is
+        // optional, so `declares_package` must accept both forms.
+        assert!(declares_package(
+            "\"package\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(declares_package("'package' = \"autumn-web\"", "autumn-web"));
+        assert!(declares_package(
+            "aw = { \"package\" = \"autumn-web\", version = \"0.6\" }",
+            "autumn-web"
+        ));
+    }
+
+    #[test]
+    fn ensure_feature_package_alias_dep_autumn_web_alias_quoted_key() {
+        // Same fixture as `ensure_feature_package_alias_dep_autumn_web_alias`,
+        // but with the `package` key itself quoted -- a form Cargo accepts
+        // identically to the unquoted one.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { \"package\" = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "autumn_web alias with quoted package key must have feature added: {updated}"
+        );
     }
 
     #[test]
