@@ -543,6 +543,13 @@ def index():
                 para = []
                 continue
 
+            # A four-space-indented line with no paragraph open is an
+            # indented CODE block, so a `<!--` in it is literal and must not
+            # put the scanner into comment state — which would suppress every
+            # heading until some later `-->`.
+            if not para and re.match(r'^(    |\t)', line):
+                continue
+
             # Whether this is a heading is decided on the RAW line, before
             # any comment is removed. `<!-- editorial -->## Heading` is an
             # HTML block in CommonMark, not a heading — the `##` is block
@@ -605,14 +612,27 @@ def index():
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
                 if pending_defn and line.strip():
-                    # A reference definition may put its destination on the
-                    # following line: `[label]:` then ` /url`. That line is
-                    # still invisible, so it is not paragraph text either.
-                    pending_defn = False
+                    # A reference definition may spill onto following lines:
+                    # `[label]:`, then ` /url`, then an optional ` "title"`.
+                    # All of it is invisible, so none of it is paragraph text.
+                    # State clears at the first line that cannot be part of
+                    # the definition — in practice a blank line, handled
+                    # below — or after a line that closes a quoted title.
+                    stripped_defn = line.strip()
+                    if pending_defn == 'dest':
+                        # The destination line may carry the title with it.
+                        pending_defn = ('title'
+                                        if not re.search(r'["\')]\s*$', stripped_defn)
+                                        else False)
+                    elif not re.search(r'["\')]\s*$', stripped_defn):
+                        pending_defn = False
+                    else:
+                        pending_defn = False
                     para = []
                     continue
-                pending_defn = re.match(r'^ {0,3}\[[^\]]*\]:\s*$',
-                                        line) is not None
+                pending_defn = ('dest'
+                                if re.match(r'^ {0,3}\[[^\]]*\]:\s*$', line)
+                                else False)
                 if is_paragraph(line) and not is_heading and not pending_defn:
                     para.append(line)
                 else:
@@ -1406,7 +1426,42 @@ self_test() {
     > "$c78/scripts/docs-retrieval-questions.tsv"
   check "paragraph text is still setext text" pass "$c78"
 
-  # 79. A comment line and a blank line in the fixture are skipped.
+  # 79. A definition's optional TITLE may be on a further line; it is
+  #     invisible too, so it is not setext text.
+  local c79="$tmp/c79"; make_corpus "$c79"
+  printf '# Page\n\n[Overview]:\n  /x\n  "secret runtime logger"\n---\n' \
+    > "$c79/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c79/scripts/docs-retrieval-questions.tsv"
+  check "a definition title on a later line is not setext text" fail "$c79"
+
+  # 80. A `\u003c!--` inside an INDENTED CODE block is literal, so it must not
+  #     swallow the heading that follows and ends the block.
+  local c80="$tmp/c80"; make_corpus "$c80"
+  printf '# Page\n\n    \u003c!-- literal\n\n## Secret runtime logger\n' \
+    > "$c80/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c80/scripts/docs-retrieval-questions.tsv"
+  check "a comment marker in indented code is literal" pass "$c80"
+
+  # 81. A real comment at the MARGIN still opens one, so the indent rule did
+  #     not disable comment tracking.
+  local c81="$tmp/c81"; make_corpus "$c81"
+  printf '# Page\n\n\u003c!-- literal\n# Secret runtime logger\n--\u003e\n' \
+    > "$c81/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c81/scripts/docs-retrieval-questions.tsv"
+  check "a comment at the margin still opens" fail "$c81"
+
+  # 82. Paragraph text is STILL setext text after all of this.
+  local c82="$tmp/c82"; make_corpus "$c82"
+  printf '# Page\n\nSecret runtime logger\n---\n' \
+    > "$c82/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c82/scripts/docs-retrieval-questions.tsv"
+  check "paragraph text is still setext text" pass "$c82"
+
+  # 83. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
