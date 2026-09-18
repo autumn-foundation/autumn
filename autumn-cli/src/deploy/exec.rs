@@ -1219,10 +1219,15 @@ pub fn candidate_teardown_ops(
 /// installed is actually live — the fleet compensation case (issue #2270),
 /// where the driver passes [`super::proxy::ProxyController::deregister_op`]. It
 /// runs BEFORE the advisory last-deploy marker write, so a failed deregister is
-/// reported (not masked) and still leaves the marker at its last TRUE value.
-/// `None` for the pre-go-live path in [`execute_first_deploy`]: that boundary is
-/// the health-gated `proxy-route` op itself, so a failure there means the route
-/// was never established and there is nothing to remove.
+/// reported, not masked. Every op before it in this list has already run when
+/// it fails, so the caller knows the app itself is gone and only the route is
+/// stuck — the fleet driver reports that exact case as its own outcome
+/// (`HostOutcome::CompensatedTeardownRouteFailed` in `fleet.rs`), and still
+/// records the marker itself with [`first_deploy_torn_down_marker_op`], since
+/// the write here never ran. `None` for the pre-go-live path in
+/// [`execute_first_deploy`]: that boundary is the health-gated `proxy-route` op
+/// itself, so a failure there means the route was never established and there
+/// is nothing to remove.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -1250,11 +1255,21 @@ pub fn first_deploy_teardown_ops(
     // host with nothing installed can never report a successful deploy. LAST, and
     // advisory — see this function's doc comment for why both matter and why the
     // marker is rewritten rather than removed.
-    ops.push(DeployOp::Run(RemoteCommand::new(
+    ops.push(first_deploy_torn_down_marker_op(cfg));
+    ops
+}
+
+/// The advisory `shared/last-deploy` write [`first_deploy_teardown_ops`] runs
+/// LAST, exposed so the fleet driver can also run it on its own (issue #2270):
+/// when `deregister` is the step that failed, every op before it already ran —
+/// the app is gone — so the record must still say `torn down` even though
+/// [`run_ops`] stopped before reaching this op in the main sequence.
+#[must_use]
+pub fn first_deploy_torn_down_marker_op(cfg: &ResolvedDeployConfig) -> DeployOp {
+    DeployOp::Run(RemoteCommand::new(
         "teardown-last-deploy",
         record_last_deploy_fragment(cfg, LAST_DEPLOY_TORN_DOWN),
-    )));
-    ops
+    ))
 }
 
 /// The previous release an on-demand rollback repoints to, resolved from the

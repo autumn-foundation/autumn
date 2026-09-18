@@ -52,6 +52,11 @@ use super::exec::{DeployOp, FileContents, ProxyServiceOptions, RemoteCommand, sh
 /// Absolute path the proxy binary is expected at on the target.
 const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
 
+/// Op label [`KamalProxyController::deregister_op`] runs under (issue #2270).
+/// `pub` so the fleet driver (`deploy.rs`) can name this exact step without
+/// duplicating the string — a renamed label must fail to compile there too.
+pub const PROXY_DEREGISTER_LABEL: &str = "proxy-deregister";
+
 /// Systemd unit path supervising the proxy process. `pub` (crate-internal in this
 /// binary crate) so the deploy-start probe ([`super::exec::probe_deploy_state`]) can
 /// read the installed unit's `--http-port` in the same round-trip (#2073).
@@ -527,10 +532,10 @@ an SSH user that can install packages. Install kamal-proxy {pin} at {bin} yourse
     /// #2270), folded into ONE round-trip.
     ///
     /// `deploy` is the subcommand both the initial route and the health-gated flip
-    /// use; `remove` is the subcommand [`Self::deregister_op`] (via the trait's
-    /// `deregister_op`) uses to clear a compensated first deploy's route. Both
-    /// help outputs are captured together so a drifted or renamed `remove` fails
-    /// closed exactly like a drifted `deploy` — never assumed present. `--help` is
+    /// use; `remove` is the subcommand [`Self::deregister_op`] uses to remove a
+    /// compensated first deploy's route. Both help outputs are captured together
+    /// so a drifted or renamed `remove` fails closed exactly like a drifted
+    /// `deploy` — never assumed present. `--help` is
     /// a built-in that survives across kamal-proxy releases (v0.9.2, which dropped
     /// the `version` subcommand, still has it). `2>&1` folds cobra's error/usage
     /// output (e.g. an `unknown command` when a subcommand was renamed) into the
@@ -674,12 +679,12 @@ impl ProxyController for KamalProxyController {
     }
 
     fn deregister_op(&self, service: &str) -> DeployOp {
-        // `remove` drops the route (and the drained old target) entirely, so the
-        // public port stops answering instead of answering 502 for a route with
-        // nothing live behind it (issue #2270). Socket-pinned like every other
-        // kamal-proxy invocation (see `deploy_shell_with_tls`).
+        // `remove` removes the route (and the drained old target) entirely, so
+        // the public port stops answering instead of answering 502 for a route
+        // with nothing live behind it (issue #2270). Socket-pinned like every
+        // other kamal-proxy invocation (see `deploy_shell_with_tls`).
         DeployOp::Run(RemoteCommand::new(
-            "proxy-deregister",
+            PROXY_DEREGISTER_LABEL,
             format!(
                 "env -u XDG_RUNTIME_DIR kamal-proxy remove {}",
                 shell_quote(service)
@@ -855,7 +860,7 @@ pub enum KamalProxyCompatIssue {
     /// CLI surface has drifted from what this release was built against.
     MissingFlags(Vec<&'static str>),
     /// The binary responded to `deploy --help` but has no `remove` subcommand
-    /// (renamed/removed) — the op a compensated first deploy uses to clear its
+    /// (renamed/removed) — the op a compensated first deploy uses to remove its
     /// route (issue #2270) is gone.
     RemoveSubcommandMissing,
 }
@@ -896,7 +901,7 @@ impl KamalProxyCompatIssue {
             ),
             Self::RemoveSubcommandMissing => format!(
                 "the installed kamal-proxy has no `remove` subcommand — a compensated \
-                 first deploy needs it to clear its route. Pin kamal-proxy to a \
+                 first deploy needs it to remove its route. Pin kamal-proxy to a \
                  compatible version ({pin}) in the target's host bootstrap and \
                  redeploy. Aborting before any cutover, so live traffic was not \
                  touched."
@@ -983,12 +988,12 @@ fn assess_kamal_proxy_deploy_help(
 
     // (1) All required flags present → valid deploy help → compatible, unless the
     // SAME capture's `remove --help` half shows a renamed/removed subcommand —
-    // even benign shell/login noise elsewhere is still fine.
+    // even benign shell/login noise elsewhere is still fine. Same two-substring
+    // tolerance as case (3) below (not the exact cobra phrase), so a minor
+    // wording difference in the real error text still fails closed.
     if missing.is_empty() {
-        return if output
-            .to_ascii_lowercase()
-            .contains("unknown command \"remove\"")
-        {
+        let lower = output.to_ascii_lowercase();
+        return if lower.contains("unknown command") && lower.contains("remove") {
             Err(KamalProxyCompatIssue::RemoveSubcommandMissing)
         } else {
             Ok(())

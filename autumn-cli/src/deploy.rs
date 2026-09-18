@@ -4610,15 +4610,25 @@ where
 /// Remove ONE host's just-completed FIRST deploy (issue #1621, §4.7).
 ///
 /// A first deploy has no `shared/previous-release` marker, so there is nothing to
-/// roll back to: the honest compensation is the first-deploy teardown, which stops
-/// the slot unit, removes this run's release dir, clears the `current` symlink
-/// and slot markers, and removes the proxy's route (issue #2270) — leaving the
+/// roll back to. The honest compensation is the first-deploy teardown: stop the
+/// slot unit, remove this run's release dir, clear the `current` symlink and
+/// slot markers, and remove the proxy's route (issue #2270). This leaves the
 /// host in the nothing-installed state that makes the next `deploy up` correctly
-/// take the First path again, with its public port refusing connections rather
-/// than answering 502.
+/// take the First path again. Its public port then refuses connections instead
+/// of answering 502.
 ///
 /// Driven through [`exec::run_ops`], not `run_teardown`: at fleet scale a silently
 /// swallowed cleanup failure is how a host ends up half-removed with nobody told.
+///
+/// A failure at the LAST real step — removing the proxy route — is reported as
+/// its own outcome, [`fleet::HostOutcome::CompensatedTeardownRouteFailed`], not
+/// the generic [`fleet::HostOutcome::CompensationFailed`]: every op before it
+/// already ran, so the app is genuinely gone and only the route is stuck. The
+/// generic outcome means "still on the new release, roll it back", which is
+/// both untrue here and impossible — a first deploy has no previous release to
+/// roll back to. This also re-records the `torn down` last-deploy marker
+/// ([`exec::first_deploy_torn_down_marker_op`]) best-effort, since `run_ops`
+/// stopped before [`exec::first_deploy_teardown_ops`] reached its own write.
 fn compensate_teardown<E, P>(
     cfg: &ResolvedDeployConfig,
     input: &FleetUpInput<'_, P>,
@@ -4635,6 +4645,21 @@ where
         Ok(()) => fleet::HostOutcome::CompensatedTeardown,
         Err(err) => {
             let failed_step = fleet::failed_step_label(&err);
+            if failed_step == proxy::PROXY_DEREGISTER_LABEL {
+                // The app is gone — only the route removal failed. Record the
+                // true result the same way a clean teardown would have
+                // (best-effort: this must never itself turn into a second,
+                // reported failure), then tell the operator the actual state
+                // and the actual fix, not "roll it back".
+                let _ = exec::run_ops(&[exec::first_deploy_torn_down_marker_op(cfg)], executor);
+                eprintln!(
+                    "\u{26A0}\u{FE0F}  [{}] removed the first deploy, but `{failed_step}` FAILED \
+                     \u{2014} its public port may still answer 502 until it is redeployed or the \
+                     route is removed by hand.",
+                    cfg.host.as_deref().unwrap_or_default(),
+                );
+                return fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step };
+            }
             eprintln!(
                 "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
                  host is still on {}. The remaining hosts are still compensated.",
@@ -5040,7 +5065,9 @@ fn fleet_halted(
         torn_down: named(|o| {
             matches!(
                 o,
-                fleet::HostOutcome::TornDown { .. } | fleet::HostOutcome::CompensatedTeardown
+                fleet::HostOutcome::TornDown { .. }
+                    | fleet::HostOutcome::CompensatedTeardown
+                    | fleet::HostOutcome::CompensatedTeardownRouteFailed { .. }
             )
         }),
         // Shared with the summary table's own list, so the halt error and the state
@@ -10678,7 +10705,7 @@ mod tests {
     fn a_completed_first_deploy_compensation_removes_the_proxy_route() {
         // Issue #2270: a completed first deploy that the fleet compensates has a
         // LIVE proxy route (unlike the pre-go-live path, which never reaches
-        // `proxy-route`). The compensating teardown must clear it, socket-pinned
+        // `proxy-route`). The compensating teardown must remove it, socket-pinned
         // like every other kamal-proxy invocation, and it must run before the
         // advisory `teardown-last-deploy` write.
         let fleet = fleet_of(&["web-a", "web-b"]);
@@ -10723,6 +10750,65 @@ mod tests {
             })
             .expect("proxy-deregister ran");
         assert_eq!(shell, "env -u XDG_RUNTIME_DIR kamal-proxy remove 'myapp'");
+    }
+
+    #[test]
+    fn a_failed_deregister_reports_its_own_outcome_not_a_generic_compensation_failure() {
+        // Issue #2270: when the proxy-deregister op itself fails, every op before
+        // it in `first_deploy_teardown_ops` already ran — the app is genuinely
+        // gone, only the route is stuck. This must NOT read as
+        // `CompensationFailed` ("still serving, roll it back"): that is both
+        // untrue (nothing is serving) and impossible (a first deploy has no
+        // previous release `autumn deploy rollback` could target).
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a").fail("web-a", "proxy-deregister");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "the app is gone, so this host is torn down, not still forward"
+        );
+        assert!(
+            !halt.still_on_new.contains(&"web-a".to_owned()),
+            "a failed deregister must never be told to `rollback` a host with \
+             nothing installed: {:?}",
+            halt.still_on_new
+        );
+        assert!(
+            !halt.manual.iter().any(|(host, _)| host == "web-a"),
+            "this is not a declined-automatically case: {:?}",
+            halt.manual
+        );
+
+        // The marker write that `run_ops` never reached (it stopped at
+        // `proxy-deregister`) must still land, best-effort, so `deploy status`
+        // reports the true result instead of the stale `deployed`.
+        let calls = recorder.calls_for("web-a");
+        let last_deploy_writes: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "teardown-last-deploy" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let last = *last_deploy_writes
+            .last()
+            .expect("the marker must still be recorded despite the deregister failure");
+        assert!(
+            last.contains("'torn down'") && !last.contains("'deployed'"),
+            "a fully torn-down host must not report a successful deploy: {last}"
+        );
     }
 
     #[test]
