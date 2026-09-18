@@ -274,6 +274,39 @@ pub fn decimal() -> Decimal {
     Decimal::new(cents, 2)
 }
 
+/// A random non-negative [`Decimal`] shaped for a `decimal{p,s}` column
+/// (issue #2597): at most `p - s` integer digits and at most `s` fractional
+/// digits, so every draw fits the declared precision and scale by
+/// construction.
+///
+/// Unlike [`decimal`], which always draws scale 2 over `0.00..=9999.99`, this
+/// respects narrow columns: a `decimal{5,2}` column gets only values below
+/// `1000.00`, and a `decimal{5,0}` column only whole numbers. `#[model]`
+/// selects this automatically when the field carries the
+/// `#[decimal_shape(precision = p, scale = s)]` attribute the generator
+/// emits; the untyped [`decimal`] remains for ad-hoc use.
+///
+/// The write paths normalize before storage (`SqliteDecimal` writes
+/// `value.normalize().to_string()`), so trailing-zero fractional draws (e.g.
+/// `19.90` at `s = 2`) become canonical (`19.9`) and still satisfy the
+/// SQLite decimal `CHECK`.
+///
+/// Out-of-range shapes are clamped defensively (`precision` to `1..=28` —
+/// rust_decimal's range — and `scale` to `0..=precision`): a malformed shape
+/// must not panic the factory, it just narrows the draw.
+#[must_use]
+pub fn decimal_with(precision: u32, scale: u32) -> Decimal {
+    /// rust_decimal's hard precision ceiling.
+    const MAX_PRECISION: u32 = 28;
+    let scale = scale.min(MAX_PRECISION);
+    let precision = precision.clamp(scale.max(1), MAX_PRECISION);
+    let int_digits = precision - scale;
+    let scale_pow = 10_i128.pow(scale);
+    let int_part = with_rng(|r| r.random_range(0..10_i128.pow(int_digits)));
+    let frac_part = with_rng(|r| r.random_range(0..scale_pow));
+    Decimal::from_i128_with_scale(int_part * scale_pow + frac_part, scale)
+}
+
 /// A random `f64` in `[0, 10000)`, for `f32`/`f64` fields.
 #[must_use]
 pub fn decimal_f64() -> f64 {
@@ -734,3 +767,92 @@ static DOMAINS: &[&str] = &[
     "stark.io",
     "wayne.net",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Integer digits of a [`Decimal`] — digits left of the decimal point.
+    fn int_digits(value: Decimal) -> u32 {
+        let mantissa_digits = value.mantissa().abs().to_string().len() as u32;
+        mantissa_digits.saturating_sub(value.scale())
+    }
+
+    /// Every draw of `decimal_with(p, s)` must fit the declared `decimal{p,s}`
+    /// shape: non-negative, at most `p - s` integer digits, at most `s`
+    /// fractional digits (issue #2597). Seeded, so the exact sequence is
+    /// pinned — this cannot pass by luck.
+    #[test]
+    fn decimal_with_respects_declared_shape() {
+        let _guard = test_serial_guard();
+        reseed(0x5EED_2597);
+        for (precision, scale) in [
+            (5, 2),
+            (5, 0),
+            (12, 2),
+            (2, 2),
+            (28, 10),
+            (1, 0),
+            (10, 9),
+            (28, 28),
+        ] {
+            for _ in 0..300 {
+                let v = decimal_with(precision, scale);
+                assert!(v >= Decimal::ZERO, "must be non-negative: {v}");
+                assert!(
+                    v.scale() <= scale,
+                    "scale {} exceeds declared {scale} (p={precision}): {v}",
+                    v.scale()
+                );
+                assert!(
+                    int_digits(v) <= precision - scale,
+                    "integer digits exceed p - s = {} (p={precision}, s={scale}): {v}",
+                    precision - scale
+                );
+            }
+        }
+    }
+
+    /// Golden sequence: the exact draws for a fixed seed, pinning the RNG
+    /// consumption (two draws per value — integer part, then fractional
+    /// part). A change in draw order or distribution breaks this loudly.
+    /// Values captured from the scratch verification run (issue #2597).
+    #[test]
+    fn decimal_with_golden_sequence() {
+        let _guard = test_serial_guard();
+        reseed(7);
+        let first: Vec<String> = (0..5).map(|_| decimal_with(5, 2).to_string()).collect();
+        assert_eq!(first, ["167.72", "359.84", "989.38", "257.52", "75.21"]);
+        reseed(7);
+        let whole: Vec<String> = (0..5).map(|_| decimal_with(5, 0).to_string()).collect();
+        assert_eq!(whole, ["16798", "35936", "98997", "25730", "7576"]);
+    }
+
+    /// Degenerate shapes must narrow the draw, never panic the factory.
+    #[test]
+    fn decimal_with_degenerate_shapes_do_not_panic() {
+        let _guard = test_serial_guard();
+        reseed(11);
+        for (precision, scale) in [(0, 0), (0, 5), (30, 2), (5, 9), (28, 30)] {
+            let v = decimal_with(precision, scale);
+            assert!(v >= Decimal::ZERO, "must be non-negative: {v}");
+            assert!(
+                v.scale() <= 28,
+                "scale must stay within rust_decimal's range: {v}"
+            );
+        }
+    }
+
+    /// `decimal()` is unchanged by the shaped entry point: still the
+    /// untyped 0.00–9999.99 draw for ad-hoc use.
+    #[test]
+    fn decimal_stays_untyped() {
+        let _guard = test_serial_guard();
+        reseed(13);
+        for _ in 0..100 {
+            let v = decimal();
+            assert_eq!(v.scale(), 2, "{v}");
+            assert!(v < Decimal::new(10_000, 0), "{v}");
+        }
+    }
+}
