@@ -34,7 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime, without a restart` — the last documenting the request and
   response shapes, that `applied` and not the status code is what says a
   change reached the subscriber, that overrides die with the process, and
-  that the endpoint needs `[actuator] sensitive = true`. The `Auto` /
+  that the endpoint needs `[actuator] sensitive = true`, and — the part that
+  would otherwise be found at 3am — that the `prod` profile turns CSRF on, so
+  the bare `curl` is a `403` there and the page shows both ways through
+  (`[security.csrf] exempt_paths`, or the double-submit cookie/header pair).
+  `[log] level` also accepts `off`, which the runtime endpoint does not. The
+  `Auto` /
   `Pretty` / `Json` table moves here from `getting-started.md`, which keeps a
   one-paragraph summary and a link, so the answer has one home rather than
   two that drift.

@@ -18,7 +18,16 @@
 rate limiting	docs/guide/rate-limiting.md
 pagination	docs/guide/pagination.md
 compression	docs/guide/compression.md
-gzip	docs/guide/compression.md
+# "gzip" is NOT here, and the omission is the point. It was admitted to this
+# set on a false pass: before the matcher learned to skip fenced content, the
+# `# Enable gzip/brotli response compression…` comment inside
+# `compression.md`'s config fence was indexed as a heading, so the row went
+# green on a code comment. With fences excluded it fails — `compression.md` is
+# titled "Response Compression" and names gzip only in body text and a table.
+# That is a real but much milder findability defect than the one this PR
+# closes (the page's own title is the reader's word, so the question is
+# reachable as "compression"), and it is a different question class: it gets
+# its own change, on its own evidence, not a ride here.
 websockets	docs/guide/websockets.md
 soft delete	docs/guide/soft-delete.md
 full text search	docs/guide/full-text-search.md

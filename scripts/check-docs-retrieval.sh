@@ -132,15 +132,26 @@ def index():
         text = (ROOT / rel).read_text(encoding='utf-8')
         slug = pathlib.PurePath(rel).stem
         h1, headings = '', []
+        fence = None
         for line in text.splitlines():
+            # A `#` inside a fence is a shell comment, a TOML comment or a Rust
+            # attribute, not a heading, and it must not be indexed: a `# Raise
+            # the global level` comment in a curl fence would let a question
+            # match the page that fence sits on, which is exactly the page a
+            # fixture row names — so the false positive lands on the EXPECTED
+            # page and the gate passes while the reader still finds nothing.
+            marker = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+            if marker:
+                if fence is None:
+                    fence = marker.group(1)[0] * 3
+                elif marker.group(1).startswith(fence):
+                    fence = None
+                continue
+            if fence is not None:
+                continue
             m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
                 continue
-            # A `#` inside a fence is a shell comment or a Rust attribute, not
-            # a heading. Tracking fences exactly costs more than it buys here:
-            # a heading line that is really a comment can only ADD a place to
-            # match, and the fixture pins the answering page, so a spurious
-            # match on the wrong page still fails.
             level, title = len(m.group(1)), m.group(2)
             if level == 1 and not h1:
                 h1 = title
@@ -315,7 +326,17 @@ self_test() {
     > "$c7/scripts/docs-retrieval-questions.tsv"
   check "an all-stopword question lands nowhere" fail "$c7"
 
-  # 8. A comment line and a blank line in the fixture are skipped.
+  # 8. A `#` comment inside a fence is not a heading. Without this, the curl
+  #    fence in `logging-pii.md` would index "Raise the global level" onto the
+  #    very page a fixture row names.
+  local c8b="$tmp/c8b"; make_corpus "$c8b"
+  printf '# Logging\n\n```bash\n# Raise the global level\ncurl ...\n```\n' \
+    > "$c8b/docs/guide/logging-pii.md"
+  printf 'raise the global level\tdocs/guide/logging-pii.md\n' \
+    > "$c8b/scripts/docs-retrieval-questions.tsv"
+  check "a comment inside a fence is not a heading" fail "$c8b"
+
+  # 9. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

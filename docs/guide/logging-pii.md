@@ -23,7 +23,10 @@ The global level lives in `[log] level`, and defaults to `info`:
 level = "info"
 ```
 
-The five levels are `trace`, `debug`, `info`, `warn` and `error`.
+The levels are `trace`, `debug`, `info`, `warn`, `error` and `off` — `off`
+silences the subscriber entirely. It is valid here, at startup, and only
+here: the [runtime endpoint](#change-log-levels-at-runtime-without-a-restart)
+takes the five named levels and rejects `off` with a `400`.
 
 For a deployment with no `autumn.toml` — a container, a platform that only
 hands you environment variables — the same field is `AUTUMN_LOG__LEVEL`:
@@ -99,6 +102,10 @@ curl -X PUT http://localhost:3000/actuator/loggers/root \
   -H 'content-type: application/json' -d '{"level":"info"}'
 ```
 
+Those run as shown in development. **In production they need a CSRF token**,
+and the failure is a `403` that never reaches the handler — see [Getting a
+`PUT` past CSRF](#getting-a-put-past-csrf) below before you need this at 3am.
+
 `{name}` is either `root` (the global level) or a `tracing` target — a module
 path such as `my_app::orders`. `GET /actuator/loggers` reports what is in
 force:
@@ -139,6 +146,52 @@ Four things are worth knowing before you rely on this in an incident:
   that the path is wrong. See
   [Deployment](deployment.md) for what sensitive mode exposes and how to keep
   it reachable only from inside your network.
+
+### Getting a `PUT` past CSRF
+
+The `prod` profile turns CSRF on (`[security.csrf] enabled = true`, a smart
+default), `PUT` is not one of the safe methods, and the actuator carries no
+built-in exemption. So the bare `curl` above is a `403` in production: the
+CSRF layer wraps the whole router, the actuator endpoints included, so the
+request is rejected before `loggers_put` ever runs. In development, where CSRF is off by default, it works as
+written, which is exactly how this is discovered at the worst moment.
+
+Two ways through, and which one you want is a standing decision to make before
+an incident, not during one.
+
+**Exempt the actuator prefix.** `[security.csrf] exempt_paths` exists for
+management and API paths that authenticate with something other than a cookie:
+
+```toml
+[security.csrf]
+exempt_paths = ["/actuator/"]
+```
+
+CSRF defends against a browser being made to send a request with the user's
+ambient cookies. An actuator reached over an internal network, with no
+cookie-based session in play, is not that threat — which is why exempting it
+is a reasonable posture and not a hole. It is only reasonable if the actuator
+is *actually* unreachable from the public internet, so make this change
+together with the network restriction in
+[Deployment](deployment.md), never instead of it.
+
+**Or send the token.** CSRF here is double-submit: the cookie value and the
+`X-CSRF-Token` header must match. Any `GET` through the same origin mints the
+cookie, so pick one up and send it back:
+
+```bash
+# Mint the cookie (any GET will do) and keep it in a jar
+curl -c /tmp/jar -s -o /dev/null http://localhost:3000/actuator/health
+
+# Resend it as both cookie and header
+TOKEN=$(awk '/autumn-csrf/ {print $7}' /tmp/jar)
+curl -X PUT http://localhost:3000/actuator/loggers/root \
+  -b /tmp/jar -H "X-CSRF-Token: $TOKEN" \
+  -H 'content-type: application/json' -d '{"level":"debug"}'
+```
+
+`autumn-csrf` and `X-CSRF-Token` are the default cookie and header names
+(`[security.csrf] cookie_name` and `token_header` if you have changed them).
 
 ## Access log
 
