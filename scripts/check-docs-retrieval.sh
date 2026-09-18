@@ -204,6 +204,29 @@ def uncomment(line, in_comment):
 
 TITLE_CLOSER = {'"': '"', "'": "'", '(': ')'}
 
+# CommonMark escapes ASCII PUNCTUATION and nothing else. A backslash before
+# anything else — a space, a letter — is a literal backslash, which is why
+# `(secret\ runtime\ logger)` is not a destination and not a link: the spaces
+# are real, so a reader sees all three words.
+ASCII_PUNCT = frozenset('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
+
+
+# CommonMark type 7: a line holding ONE complete tag and nothing else but
+# whitespace. The "nothing else" is what keeps prose out — `<Foo> is the type`
+# has text after the tag, so it is a paragraph, while `<Foo>` alone is a raw
+# HTML block whose contents no reader sees.
+_ATTR = (r'[a-zA-Z_:][a-zA-Z0-9_.:-]*'
+         r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
+TYPE7_TAG = re.compile(
+    rf'^ {{0,3}}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+{_ATTR})*\s*/?>'
+    rf'|</[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$')
+
+
+def _escaped(text, i):
+    """Whether `text[i]` is a backslash that escapes the character after it."""
+    return (text[i] == '\\' and i + 1 < len(text)
+            and text[i + 1] in ASCII_PUNCT)
+
 
 def _closes_at(text, i, closer):
     """Index just past `closer` in `text[i:]`, or -1 if it never closes.
@@ -212,7 +235,7 @@ def _closes_at(text, i, closer):
     end it.
     """
     while i < len(text):
-        if text[i] == '\\':
+        if _escaped(text, i):
             i += 2
             continue
         if text[i] == closer:
@@ -257,7 +280,7 @@ def _dest_end(text):
     i, depth = 0, 0
     while i < len(text):
         c = text[i]
-        if c == '\\':
+        if _escaped(text, i):
             i += 2
             continue
         if c.isspace():
@@ -674,10 +697,9 @@ def index():
             # not a reason to leave a hole. Both directions are pinned by the
             # self-test.
             #
-            # Type 7 (a bare custom tag on a line of its own) is still not
-            # tracked: recognising it means deciding what counts as a tag name
-            # at all, and its blank-line rule would then apply to lines like
-            # `<Foo>` in prose. No guide page has one.
+            # Type 7 — one complete tag alone on its line, any name — is
+            # tracked too, below the type-6 check so the named tags keep
+            # their own rule. It also ends at a blank line.
             if (html_block is not None and html_block[1]
                     and container < html_block[1]):
                 # The quote that held it ended, so the block did. This line is
@@ -807,6 +829,21 @@ def index():
             if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', bare, re.I):
                 html_block = ('#blank', container)
                 para = []
+                continue
+
+            # Type 7, reached only once types 1-6 have declined: one COMPLETE
+            # tag alone on its line, any name, ending at a blank line. An
+            # earlier round declined to track it on the grounds that the rule
+            # would catch `<Foo>` in prose. It does not — a tag with text
+            # after it fails the "nothing else on the line" test — and
+            # declining indexed a `# heading` inside `<custom>…</custom>` as
+            # if a reader could see it, which is a false POSITIVE: the gate
+            # passes and the reader still finds nothing.
+            #
+            # `not para` because type 7, alone among the seven, cannot
+            # interrupt a paragraph.
+            if not para and TYPE7_TAG.match(bare):
+                html_block = ('#blank', container)
                 continue
 
             # A four-space-indented line with no paragraph open is an
@@ -1975,7 +2012,62 @@ self_test() {
     > "$c107/scripts/docs-retrieval-questions.tsv"
   check "a bad definition does not resolve a reference" pass "$c107"
 
-  # 108. A comment line and a blank line in the fixture are skipped.
+  # 108. A backslash escapes ASCII PUNCTUATION and nothing else, so `\ ` is a
+  #      literal backslash and a real space: the target has spaces, is not a
+  #      destination, and the whole construct is words on the page.
+  local c108="$tmp/c108"; make_corpus "$c108"
+  printf '# Page\n\n## [Overview](secret\\ runtime\\ logger)\n' \
+    > "$c108/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c108/scripts/docs-retrieval-questions.tsv"
+  check "a backslash before a space escapes nothing" pass "$c108"
+
+  # 109. …while a backslash before PUNCTUATION does escape it, so this really
+  #      is a link and its destination really is invisible.
+  local c109="$tmp/c109"; make_corpus "$c109"
+  printf '# Page\n\n## [Overview](secret\\(runtime\\)logger.md)\n' \
+    > "$c109/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c109/scripts/docs-retrieval-questions.tsv"
+  check "an escaped paren keeps the target a link" fail "$c109"
+
+  # 110. A complete type-7 tag opens a raw HTML block: what is inside renders
+  #      as HTML, not as a heading, so indexing it is a false POSITIVE.
+  local c110="$tmp/c110"; make_corpus "$c110"
+  printf '# Page\n\n<custom>\n# Secret runtime logger\n\n' \
+    > "$c110/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c110/scripts/docs-retrieval-questions.tsv"
+  check "a type-7 tag hides the heading after it" fail "$c110"
+
+  # 111. …and it ends at its blank line, so the next heading is visible again.
+  local c111="$tmp/c111"; make_corpus "$c111"
+  printf '# Page\n\n<custom>\nhidden\n\n## Secret runtime logger\n' \
+    > "$c111/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c111/scripts/docs-retrieval-questions.tsv"
+  check "a type-7 block ends at its blank line" pass "$c111"
+
+  # 112. A tag with TEXT after it is prose, not a block — the control that
+  #      keeps `<Foo> is the type` from swallowing the page.
+  local c112="$tmp/c112"; make_corpus "$c112"
+  printf '# Page\n\n<Foo> is the type\n# Secret runtime logger\n' \
+    > "$c112/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c112/scripts/docs-retrieval-questions.tsv"
+  check "a tag with text after it opens no block" pass "$c112"
+
+  # 113. Type 7 cannot INTERRUPT a paragraph — alone among the seven. After
+  #      prose, `\u003ccustom\u003e` is more prose, and the ATX heading below it (which
+  #      can interrupt one) is a heading a reader sees.
+  local c113="$tmp/c113"; make_corpus "$c113"
+  printf '# Page\n\nSome prose\n\u003ccustom\u003e\n# Secret runtime logger\n' \
+    > "$c113/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c113/scripts/docs-retrieval-questions.tsv"
+  check "a type-7 tag does not interrupt a paragraph" pass "$c113"
+
+  # 114. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
