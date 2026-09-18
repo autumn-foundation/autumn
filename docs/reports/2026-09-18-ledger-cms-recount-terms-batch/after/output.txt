@@ -1,0 +1,195 @@
+   Compiling cms v0.7.0 (/home/user/autumn/examples/cms)
+warning: cms@0.7.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 19s
+     Running tests/recount_terms_batch_profile.rs (target/debug/deps/recount_terms_batch_profile-152e41e0159ba48a)
+
+running 1 test
+test recount_terms_batch_profile ... 
+=== pg_stat_statements: tier small (previous=3, wanted=5, overlap=1, affected=7) ===
+calls=8      buffers=0        SELECT $1
+calls=7      buffers=28       SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=6      buffers=0        SET statement_timeout = 0
+calls=6      buffers=24       SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=5      buffers=20       SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=3      buffers=9        SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=11       SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=42       UPDATE terms SET post_count = data.count FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data WHERE terms.id = data.id
+calls=1      buffers=30       SELECT "post_terms"."term_id", COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = ANY($1)) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) GROUP BY "post_terms"."term_id"
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=22       SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = ANY($1)) ORDER BY "terms"."id" ASC FOR UPDATE
+calls=1      buffers=31       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=0        COMMIT
+calls=1      buffers=5        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=0        BEGIN
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=110      INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=16       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=6        DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+-- total: calls=61 buffers=388 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 7 -- batched ANY() terms lock (this fix): 1 -- single-row count (recount_term pre-fix): 0 -- grouped batched count (this fix): 1 -- single-row update (recount_term pre-fix): 0 -- bulk UNNEST update (this fix): 1 --
+
+=== pg_stat_statements: tier medium (previous=10, wanted=20, overlap=3, affected=27) ===
+calls=27     buffers=108      SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=21     buffers=84       SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=20     buffers=80       SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=15     buffers=0        SELECT $1
+calls=13     buffers=0        SET statement_timeout = 0
+calls=10     buffers=30       SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=41       SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=298      UPDATE terms SET post_count = data.count FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data WHERE terms.id = data.id
+calls=1      buffers=98       SELECT "post_terms"."term_id", COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = ANY($1)) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) GROUP BY "post_terms"."term_id"
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=82       SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = ANY($1)) ORDER BY "terms"."id" ASC FOR UPDATE
+calls=1      buffers=25       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=0        COMMIT
+calls=1      buffers=2        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=0        BEGIN
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=428      INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14), ($15, $16), ($17, $18), ($19, $20), ($21, $22), ($23, $24), ($25, $26), ($27, $28), ($29, $30), ($31, $32), ($33, $34), ($35, $36), ($37, $38), ($39, $40) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=14       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=13       DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+-- total: calls=132 buffers=1337 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 27 -- batched ANY() terms lock (this fix): 1 -- single-row count (recount_term pre-fix): 0 -- grouped batched count (this fix): 1 -- single-row update (recount_term pre-fix): 0 -- bulk UNNEST update (this fix): 1 --
+
+=== pg_stat_statements: tier large (previous=25, wanted=50, overlap=10, affected=65) ===
+calls=65     buffers=260      SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=51     buffers=204      SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=50     buffers=200      SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=30     buffers=0        SELECT $1
+calls=28     buffers=0        SET statement_timeout = 0
+calls=25     buffers=100      SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=103      SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=268      UPDATE terms SET post_count = data.count FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data WHERE terms.id = data.id
+calls=1      buffers=98       SELECT "post_terms"."term_id", COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = ANY($1)) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) GROUP BY "post_terms"."term_id"
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=198      SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = ANY($1)) ORDER BY "terms"."id" ASC FOR UPDATE
+calls=1      buffers=25       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=0        COMMIT
+calls=1      buffers=2        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=0        BEGIN
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=1070     INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14), ($15, $16), ($17, $18), ($19, $20), ($21, $22), ($23, $24), ($25, $26), ($27, $28), ($29, $30), ($31, $32), ($33, $34), ($35, $36), ($37, $38), ($39, $40), ($41, $42), ($43, $44), ($45, $46), ($47, $48), ($49, $50), ($51, $52), ($53, $54), ($55, $56), ($57, $58), ($59, $60), ($61, $62), ($63, $64), ($65, $66), ($67, $68), ($69, $70), ($71, $72), ($73, $74), ($75, $76), ($77, $78), ($79, $80), ($81, $82), ($83, $84), ($85, $86), ($87, $88), ($89, $90), ($91, $92), ($93, $94), ($95, $96), ($97, $98), ($99, $100) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=14       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=28       DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+-- total: calls=275 buffers=2604 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 65 -- batched ANY() terms lock (this fix): 1 -- single-row count (recount_term pre-fix): 0 -- grouped batched count (this fix): 1 -- single-row update (recount_term pre-fix): 0 -- bulk UNNEST update (this fix): 1 --
+
+=== statement-count scaling across tiers ===
+tier       affected  total calls  total buffers   single-lock   any-lock   single-count   grouped-count   single-update   bulk-update
+small             7           61            388             7          1              0               1               0             1
+medium           27          132           1337            27          1              0               1               0             1
+large            65          275           2604            65          1              0               1               0             1
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row lock shape (recount_term pre-fix, one call per id, unbatched) ===
+SELECT "terms"."id" FROM "terms" WHERE "terms"."id" = 1 FOR UPDATE
+LockRows  (cost=0.28..8.31 rows=1 width=14) (actual time=0.054..0.056 rows=1 loops=1)
+  Output: id, ctid
+  Buffers: shared hit=7
+  ->  Index Scan using terms_pkey on public.terms  (cost=0.28..8.30 rows=1 width=14) (actual time=0.047..0.048 rows=1 loops=1)
+        Output: id, ctid
+        Index Cond: (terms.id = 1)
+        Buffers: shared hit=6
+Query Identifier: 5244836203064578844
+Planning Time: 0.049 ms
+Execution Time: 0.075 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched ANY() lock shape (the fix: sort ascending, then lock — one call for the whole 65-id affected set, given to the planner pre-sorted DESCENDING to stress the ordering guarantee) ===
+SELECT "terms"."id" FROM "terms" WHERE "terms"."id" = ANY(ARRAY[5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035]) ORDER BY "terms"."id" ASC FOR UPDATE
+LockRows  (cost=0.28..215.67 rows=65 width=14) (actual time=0.053..0.119 rows=65 loops=1)
+  Output: id, ctid
+  Buffers: shared hit=201
+  ->  Index Scan using terms_pkey on public.terms  (cost=0.28..215.02 rows=65 width=14) (actual time=0.047..0.091 rows=65 loops=1)
+        Output: id, ctid
+        Index Cond: (terms.id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+        Buffers: shared hit=136
+Query Identifier: -7076713045939142718
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.110 ms
+Execution Time: 0.138 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-term scalar count shape (recount_term pre-fix, one call per id) ===
+SELECT COUNT(*) FROM post_terms pt JOIN posts p ON p.id = pt.post_id WHERE pt.term_id = 5035 AND p.status = 'publish' AND p.post_type IN ('post', 'page')
+Aggregate  (cost=16.61..16.62 rows=1 width=8) (actual time=0.011..0.011 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=2
+  ->  Nested Loop  (cost=0.56..16.61 rows=1 width=0) (actual time=0.009..0.009 rows=0 loops=1)
+        Inner Unique: true
+        Buffers: shared hit=2
+        ->  Index Scan using idx_post_terms_term on public.post_terms pt  (cost=0.28..8.30 rows=1 width=8) (actual time=0.009..0.009 rows=0 loops=1)
+              Output: pt.id, pt.post_id, pt.term_id
+              Index Cond: (pt.term_id = 5035)
+              Buffers: shared hit=2
+        ->  Index Scan using posts_pkey on public.posts p  (cost=0.28..8.30 rows=1 width=8) (never executed)
+              Output: p.id, p.post_type, p.title, p.slug, p.excerpt, p.body, p.status, p.author_id, p.parent_id, p.featured_media_id, p.menu_order, p.comment_status, p.password, p.sticky, p.comment_count, p.published_at, p.lock_version, p.created_at, p.updated_at, p.search_vector
+              Index Cond: (p.id = pt.post_id)
+              Filter: ((p.post_type = ANY ('{post,page}'::text[])) AND (p.status = 'publish'::text))
+Query Identifier: -4414865338407683125
+Planning:
+  Buffers: shared hit=13
+Planning Time: 0.307 ms
+Execution Time: 0.051 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): grouped batched count shape (the fix: term_post_counts, one call for the whole set) ===
+SELECT pt.term_id, COUNT(*) FROM post_terms pt JOIN posts p ON p.id = pt.post_id WHERE pt.term_id = ANY(ARRAY[5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035]) AND p.status = 'publish' AND p.post_type IN ('post', 'page') GROUP BY pt.term_id
+HashAggregate  (cost=223.16..224.04 rows=88 width=16) (actual time=0.659..0.665 rows=50 loops=1)
+  Output: pt.term_id, count(*)
+  Group Key: pt.term_id
+  Batches: 1  Memory Usage: 24kB
+  Buffers: shared hit=209
+  ->  Hash Join  (cost=103.84..222.72 rows=88 width=8) (actual time=0.644..0.648 rows=50 loops=1)
+        Output: pt.term_id
+        Hash Cond: (p.id = pt.post_id)
+        Buffers: shared hit=209
+        ->  Seq Scan on public.posts p  (cost=0.00..108.00 rows=2000 width=8) (actual time=0.005..0.467 rows=2003 loops=1)
+              Output: p.id, p.post_type, p.title, p.slug, p.excerpt, p.body, p.status, p.author_id, p.parent_id, p.featured_media_id, p.menu_order, p.comment_status, p.password, p.sticky, p.comment_count, p.published_at, p.lock_version, p.created_at, p.updated_at, p.search_vector
+              Filter: ((p.post_type = ANY ('{post,page}'::text[])) AND (p.status = 'publish'::text))
+              Buffers: shared hit=78
+        ->  Hash  (cost=102.74..102.74 rows=88 width=16) (actual time=0.052..0.053 rows=50 loops=1)
+              Output: pt.term_id, pt.post_id
+              Buckets: 1024  Batches: 1  Memory Usage: 11kB
+              Buffers: shared hit=131
+              ->  Bitmap Heap Scan on public.post_terms pt  (cost=74.71..102.74 rows=88 width=16) (actual time=0.036..0.039 rows=50 loops=1)
+                    Output: pt.term_id, pt.post_id
+                    Recheck Cond: (pt.term_id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+                    Heap Blocks: exact=1
+                    Buffers: shared hit=131
+                    ->  Bitmap Index Scan on idx_post_terms_term  (cost=0.00..74.69 rows=88 width=0) (actual time=0.032..0.032 rows=50 loops=1)
+                          Index Cond: (pt.term_id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+                          Buffers: shared hit=130
+Query Identifier: -6704154189606623960
+Planning:
+  Buffers: shared hit=13
+Planning Time: 0.353 ms
+Execution Time: 0.753 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.04s
+
