@@ -224,6 +224,16 @@ TYPE7_TAG = re.compile(rf'^ {{0,3}}(?:{_TAG})[ \t]*$')
 # `<https://example.com>` and `<a@b.com>` are autolinks and stay put — there
 # the URL IS the rendered text.
 INLINE_TAG = re.compile(_TAG)
+# CommonMark's inline raw HTML is a tag, a comment, a processing instruction,
+# a declaration or a CDATA section. The last three render as markup too —
+# `<?secret runtime logger?>` shows a reader nothing — so they are stripped
+# beside tags. Comments are already gone by here: `uncomment` runs first,
+# because its state has to be carried across lines and this does not.
+INLINE_RAW = re.compile(
+    r'<\?.*?\?>'                       # processing instruction
+    r'|<!\[CDATA\[.*?\]\]>'            # CDATA section (before the next one)
+    r'|<![A-Za-z][^>]*>',              # declaration
+    re.S)
 
 
 def _escaped(text, i):
@@ -453,6 +463,31 @@ def unquote(line):
         depth += 1
 
 
+def _label_end(text, i):
+    """Index just past the `]` closing a link LABEL that opens at `text[i]`,
+    or -1 if there is none.
+
+    CommonMark: a label ends at the first `]` that is NOT backslash-escaped,
+    holds no unescaped `[`, must contain at least one character that is not
+    whitespace, and is at most 999 characters between the brackets. `[]:` is
+    therefore no definition at all, and renders as the text it looks like.
+    """
+    j = i + 1
+    while j < len(text):
+        if _escaped(text, j):
+            j += 2
+            continue
+        if text[j] == '[':
+            return -1
+        if text[j] == ']':
+            inner = text[i + 1:j]
+            if not inner.strip() or len(inner) > 999:
+                return -1
+            return j + 1
+        j += 1
+    return -1
+
+
 def _defn_at(text):
     """The label of a link reference definition at the start of `text`, and
     the index just past its `]:` — or `(None, -1)` if there is none.
@@ -465,19 +500,10 @@ def _defn_at(text):
     m = re.match(r'^ {0,3}\[', text)
     if not m:
         return None, -1
-    i = m.end()
-    while i < len(text):
-        if _escaped(text, i):
-            i += 2
-            continue
-        if text[i] == '[':
-            return None, -1      # an unescaped `[` cannot appear in a label
-        if text[i] == ']':
-            if text[i + 1:i + 2] != ':':
-                return None, -1
-            return text[m.end():i], i + 2
-        i += 1
-    return None, -1
+    end = _label_end(text, m.end() - 1)
+    if end < 0 or text[end:end + 1] != ':':
+        return None, -1
+    return text[m.end():end - 1], end + 1
 
 
 def is_paragraph(line):
@@ -586,7 +612,7 @@ def _unlink(text, defined=None):
         # POSITIVE, the gate reporting a hit on words that are not on the
         # page. Reached only outside code spans, which is what keeps
         # `Auth<T>` and `Query<T>` intact.
-        tag = INLINE_TAG.match(text, i)
+        tag = INLINE_TAG.match(text, i) or INLINE_RAW.match(text, i)
         if tag:
             i = tag.end()
             continue
@@ -660,16 +686,25 @@ def _unlink(text, defined=None):
                         i = k
                         continue
                 elif j < n and text[j] == '[':       # reference: [label][ref]
-                    k = text.find(']', j + 1)
-                    if k != -1:
-                        # `[label][]` is the collapsed form: the label is its
-                        # own reference. An UNDEFINED reference is not a link
-                        # at all, so it falls through and renders verbatim.
-                        ref = text[j + 1:k] or label
-                        if defined is None or ref_label(ref) in defined:
-                            out.append(_unlink(label, defined))
-                            i = k + 1
-                            continue
+                    # `[label][]` is the collapsed form: the label is its own
+                    # reference, and the empty `[]` is the one place a label
+                    # may be empty. Everything else goes through the same
+                    # escape-aware scan as a definition's label, or an
+                    # escaped `]` inside the reference ends it early and the
+                    # link goes unrecognised — leaving its invisible label
+                    # in the index.
+                    if text[j:j + 2] == '[]':
+                        k, ref = j + 2, label
+                    else:
+                        k = _label_end(text, j)
+                        ref = text[j + 1:k - 1] if k != -1 else None
+                    # An UNDEFINED reference is not a link at all, so it
+                    # falls through and renders verbatim.
+                    if ref is not None and (defined is None
+                                            or ref_label(ref) in defined):
+                        out.append(_unlink(label, defined))
+                        i = k
+                        continue
         out.append(ch)
         i += 1
     return ''.join(out)
@@ -763,10 +798,20 @@ def index():
                 # across it, because `--> <!-- another` both closes and
                 # reopens, and treating that as "closed" would index the
                 # next line's hidden heading.
-                _, comment = uncomment(line, True)
+                visible, comment = uncomment(line, True)
                 if not comment:
                     comment_depth = 0
-                para = []
+                # What the comment left behind is ordinary text, and
+                # throwing it away lost a heading a reader sees: `Secret
+                # <!--`, `--> runtime logger`, `---` renders one setext
+                # heading carrying both halves. It can start no BLOCK, as
+                # above, but it can continue — or begin — a paragraph.
+                if is_paragraph(visible):
+                    if not para:
+                        para_depth = container
+                    para.append(visible)
+                else:
+                    para = []
                 continue
 
             # A CommonMark type-1 raw HTML block — `<script>`, `<pre>`,
@@ -2265,7 +2310,75 @@ self_test() {
     > "$c127/scripts/docs-retrieval-questions.tsv"
   check "an unclosed title below a definition is text" pass "$c127"
 
-  # 128. A comment line and a blank line in the fixture are skipped.
+  # 128. An inline PROCESSING INSTRUCTION renders as markup, not words.
+  local c128="$tmp/c128"; make_corpus "$c128"
+  printf '# Page\n\n## <?secret runtime logger?> Overview\n' \
+    > "$c128/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c128/scripts/docs-retrieval-questions.tsv"
+  check "an inline processing instruction is not indexed" fail "$c128"
+
+  # 129. So does an inline DECLARATION, and a CDATA section.
+  local c129="$tmp/c129"; make_corpus "$c129"
+  printf '# Page\n\n## <!A secret runtime logger> Overview\n## <![CDATA[secret runtime logger]]> Two\n' \
+    > "$c129/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c129/scripts/docs-retrieval-questions.tsv"
+  check "an inline declaration and CDATA are not indexed" fail "$c129"
+
+  # 130. …and inside a CODE SPAN all three are literal text. The control.
+  local c130="$tmp/c130"; make_corpus "$c130"
+  printf '# Page\n\n## `<?secret runtime logger?>`\n' \
+    > "$c130/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c130/scripts/docs-retrieval-questions.tsv"
+  check "raw inline markup in a code span survives" pass "$c130"
+
+  # 131. A reference USE takes the same escape rules as a definition label,
+  #      or the link goes unrecognised and its invisible label is indexed.
+  local c131="$tmp/c131"; make_corpus "$c131"
+  printf '# Page\n\n## [Overview][secret\\] runtime logger]\n\n[secret\\] runtime logger]: /x\n' \
+    > "$c131/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c131/scripts/docs-retrieval-questions.tsv"
+  check "an escaped bracket does not end a reference" fail "$c131"
+
+  # 132. …and with no such definition it is not a link, so every word of it
+  #      is on the page. The control on 131.
+  local c132="$tmp/c132"; make_corpus "$c132"
+  printf '# Page\n\n## [Overview][secret\\] runtime logger]\n' \
+    > "$c132/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c132/scripts/docs-retrieval-questions.tsv"
+  check "an unresolved escaped reference is visible" pass "$c132"
+
+  # 133. A label must hold a non-whitespace character, so `[]:` is no
+  #      definition and the line renders as the text it looks like.
+  local c133="$tmp/c133"; make_corpus "$c133"
+  printf '# Page\n\n[]: /secret-runtime-logger\n---\n' \
+    > "$c133/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c133/scripts/docs-retrieval-questions.tsv"
+  check "an empty label is not a definition" pass "$c133"
+
+  # 134. Text a comment leaves BEHIND is ordinary text: `Secret <!--`,
+  #      `--> runtime logger`, `---` is one setext heading.
+  local c134="$tmp/c134"; make_corpus "$c134"
+  printf '# Page\n\nSecret <!--\n--> runtime logger\n---\n' \
+    > "$c134/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c134/scripts/docs-retrieval-questions.tsv"
+  check "text after a comment closes is indexed" pass "$c134"
+
+  # 135. …while a comment that stays open still hides everything in it.
+  local c135="$tmp/c135"; make_corpus "$c135"
+  printf '# Page\n\nSecret <!--\nruntime logger\n---\n' \
+    > "$c135/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c135/scripts/docs-retrieval-questions.tsv"
+  check "an open comment still hides its contents" fail "$c135"
+
+  # 136. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
