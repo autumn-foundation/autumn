@@ -120,12 +120,21 @@ curl -sX PUT "$LOGGERS/my_app::orders" \
 # … investigate …
 
 # Put the global level back to exactly what it was
-curl -sX PUT "$LOGGERS/root" \
+[ -n "$PREV" ] && curl -sX PUT "$LOGGERS/root" \
   -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}"
 ```
 
 (`jq` only to pull one field out; any JSON reader will do, and `GET
 $LOGGERS` shows `current_level` if you would rather read it by eye first.)
+
+The `[ -n "$PREV" ]` guard is not defensive padding. If `[log] level` names
+only targets — `level = "my_app=debug"`, valid under the full filter syntax —
+then there is no global directive, `current_level` is empty, and `previous`
+comes back as `""`. Sending that empty string is a `400`, and there is no way
+to put the global filter *back* to "unset" over HTTP. **That state needs a
+restart**, same as an override on a target that never had one. The guard stops
+the runbook from turning a missing restore into a confusing error on top of
+it.
 
 **`previous` is the whole point of that first response.** Every `PUT` returns
 the level that target had before the change, and it is the only record of what

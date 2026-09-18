@@ -133,14 +133,40 @@ def uncomment(line, in_comment):
                 break                      # comment runs past this line
             in_comment = False
             i = k + 3
-        else:
-            k = line.find('<!--', i)
-            if k == -1:
-                out.append(line[i:])
-                break
-            out.append(line[i:k])
+            continue
+
+        # An inline CODE SPAN is literal text, so a `<!--` inside one opens
+        # nothing: a heading like ``## The `<!--` marker`` is visible, and
+        # treating its literal as an opener loses that heading AND leaves the
+        # scanner "in a comment" for every line after it, until some later
+        # `-->`. That is the losing-visible-text direction with a whole page
+        # of blast radius, so code spans are recognised before comments.
+        #
+        # Backticks inside a comment are NOT a code span — they are comment
+        # text — which is why this sits in the else branch.
+        if line[i] == '`':
+            j = i
+            while j < n and line[j] == '`':
+                j += 1
+            ticks = line[i:j]
+            close = line.find(ticks, j)
+            # CommonMark closes a span with a run of EXACTLY the same length.
+            while close != -1 and line[close + len(ticks):close + len(ticks) + 1] == '`':
+                close = line.find(ticks, close + 1)
+            if close != -1:
+                end = close + len(ticks)
+                out.append(line[i:end])    # the span renders verbatim
+                i = end
+                continue
+            # An unclosed run is just literal backticks; fall through.
+
+        if line.startswith('<!--', i):
             in_comment = True
-            i = k + 4
+            i += 4
+            continue
+
+        out.append(line[i])
+        i += 1
     return ''.join(out), in_comment
 
 
@@ -1073,7 +1099,34 @@ self_test() {
     > "$c54/scripts/docs-retrieval-questions.tsv"
   check "prose with brackets is still setext text" pass "$c54"
 
-  # 55. A comment line and a blank line in the fixture are skipped.
+  # 55. A `\u003c!--` inside an inline CODE SPAN is literal text, not a comment
+  #     opener: the heading is visible and must be indexed.
+  local c55="$tmp/c55"; make_corpus "$c55"
+  printf '# Page\n\n## The `\u003c!--` secret runtime logger marker\n' \
+    > "$c55/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c55/scripts/docs-retrieval-questions.tsv"
+  check "a comment opener inside a code span is literal" pass "$c55"
+
+  # 56. And it must not leave the scanner inside a comment: a LATER heading
+  #     is still indexed. This is the blast radius, not just the one line.
+  local c56="$tmp/c56"; make_corpus "$c56"
+  printf '# Page\n\n## The `\u003c!--` marker\n\n## Secret runtime logger\n' \
+    > "$c56/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c56/scripts/docs-retrieval-questions.tsv"
+  check "a code-span opener does not swallow later headings" pass "$c56"
+
+  # 57. A REAL comment on the same line still opens one, so the rule did not
+  #     simply stop recognising comments.
+  local c57="$tmp/c57"; make_corpus "$c57"
+  printf '# Page\n\n## A `\u003c!--` marker \u003c!-- and a real one\n## Secret runtime logger\n--\u003e\n' \
+    > "$c57/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c57/scripts/docs-retrieval-questions.tsv"
+  check "a real comment after a code span still opens" fail "$c57"
+
+  # 58. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
