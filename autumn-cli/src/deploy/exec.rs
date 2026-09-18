@@ -1214,6 +1214,14 @@ pub fn candidate_teardown_ops(
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
+///
+/// Builds ONLY the app-teardown chain — never the proxy route. The fleet
+/// compensation case (issue #2270) removes the route as its OWN, separate step
+/// after this succeeds; see
+/// [`compensate_teardown`](crate::deploy::compensate_teardown) for why: folding
+/// it in here would let a transport failure on the route step (which carries no
+/// op label at all) masquerade as an ordinary op failure earlier in this chain,
+/// when in truth every op here would already have succeeded.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -5907,6 +5915,21 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_never_touches_the_proxy_route() {
+        // Issue #2270: the proxy route is removed as its OWN separate step by
+        // the fleet driver (`compensate_teardown`), never folded into this app-
+        // only chain — see the function's own doc comment for why.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("proxy")),
+            "this chain must never run a proxy op: {labels:?}"
+        );
+    }
+
+    #[test]
     fn first_deploy_teardown_records_the_torn_down_result() {
         // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to nothing
         // installed — that is what `CompensatedTeardown` means. Leaving
@@ -7310,7 +7333,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]
@@ -7327,6 +7352,9 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn deregister_op(&self, _service: &str) -> DeployOp {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             // compat_probe() and binary_install_ops() use the trait defaults → None.
@@ -7491,6 +7519,9 @@ mod tests {
             }
             fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
                 self.0.flip_op(service, new_upstream)
+            }
+            fn deregister_op(&self, service: &str) -> DeployOp {
+                self.0.deregister_op(service)
             }
             fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
                 self.0.compat_probe()
