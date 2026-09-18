@@ -158,10 +158,22 @@ Four things are worth knowing before you rely on this in an incident:
   sensitive = true
   ```
 
-  A `404` on `/actuator/loggers` means the profile has not enabled it, not
-  that the path is wrong. See
+  A `404` on `/actuator/loggers` usually means the profile has not enabled it
+  — but check the prefix before you go changing `sensitive`, since a wrong
+  path 404s identically. See
   [Deployment](deployment.md) for what sensitive mode exposes and how to keep
   it reachable only from inside your network.
+
+  ```toml
+  [actuator]
+  prefix = "/actuator"
+  ```
+
+  Every path on this page assumes that default. If your app sets
+  `[actuator] prefix = "/ops"`, the endpoint is `/ops/loggers` and
+  `/ops/loggers/{name}`, and the CSRF exemption below has to name `/ops/`
+  too — an `exempt_paths` entry still pointing at `/actuator/` matches
+  nothing and leaves the `PUT` returning `403`.
 
 ### Getting a `PUT` past CSRF
 
@@ -182,6 +194,8 @@ management and API paths that authenticate with something other than a cookie:
 [security.csrf]
 exempt_paths = ["/actuator/"]
 ```
+
+(Or whatever `[actuator] prefix` is set to — the two have to agree.)
 
 CSRF defends against a browser being made to send a request with the user's
 ambient cookies. An actuator reached over an internal network, with no

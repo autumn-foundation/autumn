@@ -102,6 +102,23 @@ STOPWORDS = {
 }
 
 
+def rendered(title):
+    """A heading's visible text: what a renderer shows, not its source.
+
+    A link's DESTINATION is markup, not words on the page — a reader sees
+    "Overview", not `secret-runtime-logger.md` — so indexing the raw source
+    lets a row match a path no reader can read. Same reasoning as the fenced
+    and commented cases: if it is not shown, it is not findable.
+
+    Autolinks (`<https://example.com>`) are deliberately left alone: there the
+    URL *is* the rendered text.
+    """
+    title = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', title)   # ![alt](src)
+    title = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', title)    # [text](dest)
+    title = re.sub(r'\[([^\]]*)\]\[[^\]]*\]', r'\1', title)   # [text][ref]
+    return title.strip()
+
+
 def words(text):
     """Casefold, split on non-alphanumerics, drop stopwords, fold plurals."""
     out = []
@@ -199,7 +216,9 @@ def index():
             m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
                 continue
-            level, title = len(m.group(1)), m.group(2)
+            level, title = len(m.group(1)), rendered(m.group(2))
+            if not title:
+                continue
             if level == 1 and not h1:
                 h1 = title
             else:
@@ -463,7 +482,23 @@ self_test() {
     > "$c17/scripts/docs-retrieval-questions.tsv"
   check "the visible part of the heading is still indexed" pass "$c17"
 
-  # 18. A comment line and a blank line in the fixture are skipped.
+  # 18. A link destination in a heading is markup, not words on the page.
+  local c18="$tmp/c18"; make_corpus "$c18"
+  printf '# Page\n\n## [Overview](secret-runtime-logger.md)\n' \
+    > "$c18/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c18/scripts/docs-retrieval-questions.tsv"
+  check "a link destination in a heading is not indexed" fail "$c18"
+
+  # 19. The link TEXT is what a reader sees, so it must still be indexed.
+  local c19="$tmp/c19"; make_corpus "$c19"
+  printf '# Page\n\n## [Secret runtime logger](overview.md)\n' \
+    > "$c19/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c19/scripts/docs-retrieval-questions.tsv"
+  check "the link text in a heading is indexed" pass "$c19"
+
+  # 20. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
