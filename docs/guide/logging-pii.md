@@ -202,21 +202,33 @@ understanding before an incident rather than during one:
   restarts, and the advice below hardens accordingly: **restart now, not when
   convenient.**
 
-So the honest summary depends on which case you are in:
+So the honest summary is two questions, and they are **independent**: the
+target and the global level come back separately, and one of them coming back
+says nothing about the other.
 
-- **`$ORDERS_PREV` was a level** — the usual case for a target `[log] level`
-  already named. `restore` put it back exactly as it was; there is nothing
-  left to do.
-- **`$ORDERS_PREV` was `null`, and `$ROOT_PREV` is a level** — **lower it
-  now, restart when convenient.** The fallback call above stops a
-  trace-level firehose, potentially high-volume and on a busy target full of
-  request detail, from running on after the investigation is closed. The
-  restart is only the tidy-up that stops a later `root` change from silently
-  missing that target.
+**Did the target come back?**
+
+- **`$ORDERS_PREV` was a level** — yes. `restore` put it back exactly as it
+  was, and there is nothing further to do *to the target*.
+- **`$ORDERS_PREV` was `null` and `$ROOT_PREV` is a level** — **lower it now,
+  restart when convenient.** The fallback call stops a trace-level firehose,
+  potentially high-volume and on a busy target full of request detail, from
+  running on after the investigation is closed. The restart is only the
+  tidy-up that stops a later `root` change from silently missing that target.
 - **Neither was a level** — **restart now.** No `restore` fires, because
   there is no level either call could send, so nothing has lowered the target
   and it is still at `trace`. Here the restart is not tidy-up; it is the only
   thing that stops the volume.
+
+**Did the global level come back?**
+
+- **`$ROOT_PREV` was a level** — yes, and you are done.
+- **`$ROOT_PREV` was `""` or `off`** — no, and no `PUT` can fix it: `root` is
+  sitting at the `debug` you raised it to, and this endpoint can set neither
+  "unset" nor `off`. **Restart to clear it**, whatever happened to the target.
+  `level = "my_app::orders=warn"` is exactly this shape — a directive naming
+  only targets leaves the global `previous` empty — so it is quite possible to
+  restore the target perfectly and still be leaking `debug` globally.
 
 `GET /actuator/loggers` lists everything currently overridden, and is the
 check worth running before you call the incident closed — not least because it

@@ -290,6 +290,25 @@ def _after_dest(text):
     return _after_title_open(rest)
 
 
+def _is_link_target(inner):
+    """Whether what a link's `(…)` holds is a legal destination and title.
+
+    The same question `_after_dest` asks of a reference definition, asked of
+    an inline link — one rule, two syntaxes. `(secret runtime logger)` fails
+    it because an unbracketed destination may not contain spaces, which is
+    why CommonMark renders that construct as the literal text it looks like.
+    """
+    s = inner.strip()
+    if not s:
+        return True            # `[a]()` is a link with an empty destination
+    end = _dest_end(s)
+    if end < 0:
+        return False
+    rest = s[end:].strip()
+    # A complete, closed title and nothing after it, or no title at all.
+    return not rest or _after_title_open(rest) is False
+
+
 def defn_step(state, text):
     """One line of a multi-line link reference definition.
 
@@ -341,6 +360,29 @@ def uncontain(line):
         if not m:
             return line
         line = line[m.end():]
+
+
+QUOTE_MARKER = re.compile(r'^ {0,3}>[ \t]?')
+
+
+def unquote(line):
+    """`(depth, rest)`: how many block-quote markers a line carries, and what
+    is left after them.
+
+    The setext path needs the DEPTH, not just the text. `> Secret runtime
+    logger` over `> ---` is a real heading; the same text over an unquoted
+    `---` is a paragraph in a quote followed by a thematic break. Only a
+    matching prefix on both lines makes the underline an underline, which is
+    also why this stops at quote markers: a list item's setext heading is
+    decided by content INDENTATION, the case `uncontain` already declines.
+    """
+    depth = 0
+    while True:
+        m = QUOTE_MARKER.match(line)
+        if not m:
+            return depth, line
+        line = line[m.end():]
+        depth += 1
 
 
 def is_paragraph(line):
@@ -488,7 +530,14 @@ def _unlink(text):
                         elif c == ')':
                             pdepth -= 1
                         k += 1
-                    if pdepth == 0:
+                    if pdepth == 0 and _is_link_target(text[j + 1:k - 1]):
+                        # Only a LEGAL target may be dropped. Balanced parens
+                        # are not enough: `[Overview](secret runtime logger)`
+                        # has spaces in an unbracketed destination, so it is
+                        # no link and a reader sees every word of it.
+                        # Reducing it to `Overview` deleted visible text from
+                        # the index — the mirror image of indexing invisible
+                        # text, and a MISS on a heading that matches by eye.
                         out.append(_unlink(label))
                         i = k
                         continue
@@ -539,6 +588,7 @@ def index():
         pending_defn = False
         defn_head = None
         para = []
+        para_depth = 0
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
@@ -594,7 +644,18 @@ def index():
                     if '>' in line:
                         html_block = None
                 elif html_block == '#blank':
-                    if not line.strip():
+                    # `>` alone is a blank line INSIDE the quote, and that is
+                    # what ends the block. Testing the raw line kept `#blank`
+                    # open past it and swallowed the heading after — the
+                    # opener became container-aware in this round, so the
+                    # terminator has to be, or the pair is inconsistent in
+                    # the direction that hides real headings.
+                    #
+                    # Quote markers only, not `uncontain`: a list item's
+                    # blank line is absolutely blank in CommonMark, so
+                    # stripping `- ` here would end the block on an empty
+                    # list item that ends nothing.
+                    if not unquote(line)[1].strip():
                         html_block = None
                 elif re.search(rf'</{html_block}\s*>', line, re.I):
                     html_block = None
@@ -725,8 +786,9 @@ def index():
             # reached `prev_para`, so `- Secret runtime logger` over `---`
             # indexed a LIST ITEM as a heading. A comment asserting a
             # property is not the same as enforcing it.
-            if para:
-                under = re.match(r'^ {0,3}(=+|-+)\s*$', line)
+            depth, body = unquote(line)
+            if para and depth == para_depth:
+                under = re.match(r'^ {0,3}(=+|-+)\s*$', body)
                 if under:
                     # CommonMark promotes the WHOLE preceding paragraph, which
                     # may be wrapped over several lines. Keeping only the last
@@ -754,7 +816,7 @@ def index():
                 # blank line ends the paragraph, so the next `---` is a
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
-                if pending_defn and line.strip():
+                if pending_defn and body.strip():
                     # A reference definition may spill onto following lines:
                     # `[label]:`, then ` /url`, then an optional ` "title"`.
                     # All of it is invisible, so none of it is paragraph text.
@@ -762,7 +824,7 @@ def index():
                     # the definition — a blank line, handled below; a closed
                     # title; or a line where the OPTIONAL title simply is not.
                     consumed, pending_defn = defn_step(pending_defn,
-                                                       line.strip())
+                                                       body.strip())
                     if consumed:
                         # The first consumed line is the destination, so the
                         # definition is real and its label line invisible.
@@ -782,11 +844,12 @@ def index():
                         # is one paragraph carrying both.
                         para = [defn_head]
                         defn_head = None
-                head = re.match(r'^ {0,3}\[[^\]]*\]:\s*$', line)
+                head = re.match(r'^ {0,3}\[[^\]]*\]:\s*$', body)
                 pending_defn = 'dest' if head else False
-                defn_head = line if head else None
-                if is_paragraph(line) and not is_heading and not pending_defn:
-                    para.append(line)
+                defn_head = body if head else None
+                if is_paragraph(body) and not is_heading and not pending_defn:
+                    para.append(body)
+                    para_depth = depth
                 else:
                     para = []       # a blank line or a block ends the paragraph
                 continue
@@ -1694,7 +1757,61 @@ self_test() {
     > "$c91/scripts/docs-retrieval-questions.tsv"
   check "a fence inside a block quote still hides its contents" fail "$c91"
 
-  # 92. A comment line and a blank line in the fixture are skipped.
+  # 92. A SETEXT heading inside a block quote is a heading: both lines carry
+  #     the same quote prefix, so the underline is an underline.
+  local c92="$tmp/c92"; make_corpus "$c92"
+  printf '# Page\n\n\u003e Secret runtime logger\n\u003e ---\n' \
+    > "$c92/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c92/scripts/docs-retrieval-questions.tsv"
+  check "a setext heading inside a block quote is indexed" pass "$c92"
+
+  # 93. A MISMATCHED prefix is not. Test 47 has the unquoted underline; this
+  #     is the other direction, and the pair is what makes 92 depth-matching
+  #     rather than prefix-blind.
+  local c93="$tmp/c93"; make_corpus "$c93"
+  printf '# Page\n\nSecret runtime logger\n\u003e ---\n' \
+    > "$c93/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c93/scripts/docs-retrieval-questions.tsv"
+  check "a quoted underline does not promote unquoted text" fail "$c93"
+
+  # 94. A raw HTML block nested in a quote ends at a line that is blank
+  #     INSIDE the quote, so the heading after it is visible again.
+  local c94="$tmp/c94"; make_corpus "$c94"
+  printf '# Page\n\n\u003e \u003cdiv\u003e\n\u003e # Hidden\n\u003e\n\u003e ## Secret runtime logger\n' \
+    > "$c94/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c94/scripts/docs-retrieval-questions.tsv"
+  check "a nested html block ends at a quoted blank line" pass "$c94"
+
+  # 95. …and without that blank line it still hides what follows.
+  local c95="$tmp/c95"; make_corpus "$c95"
+  printf '# Page\n\n\u003e \u003cdiv\u003e\n\u003e ## Secret runtime logger\n' \
+    > "$c95/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c95/scripts/docs-retrieval-questions.tsv"
+  check "a nested html block still hides its contents" fail "$c95"
+
+  # 96. An inline link whose target is NOT a legal destination is not a link:
+  #     a reader sees every word of it, so every word is indexed.
+  local c96="$tmp/c96"; make_corpus "$c96"
+  printf '# Page\n\n## [Overview](secret runtime logger)\n' \
+    > "$c96/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c96/scripts/docs-retrieval-questions.tsv"
+  check "an invalid link target is visible text" pass "$c96"
+
+  # 97. …and a legal one is still reduced to its label. The control on 96,
+  #     which "never reduce anything" would pass.
+  local c97="$tmp/c97"; make_corpus "$c97"
+  printf '# Page\n\n## [Overview](secret-runtime-logger.md "a title")\n' \
+    > "$c97/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c97/scripts/docs-retrieval-questions.tsv"
+  check "a legal link target is still dropped" fail "$c97"
+
+  # 98. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
