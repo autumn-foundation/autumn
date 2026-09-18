@@ -112,6 +112,31 @@ STOPWORDS = {
 }
 
 
+def code_span_end(text, i):
+    """End index of the inline code span starting at `i`, or None.
+
+    ONE implementation, used by both `uncomment` and `_unlink`. They each need
+    to leave code spans alone — a `<!--` in one opens nothing, a `[x](y)` in
+    one links nowhere — and two copies of this rule would be two things to
+    keep in step by hand. That is exactly how the in-comment and
+    out-of-comment paths drifted earlier in this gate's life.
+    """
+    if text[i:i + 1] != '`':
+        return None
+    j = i
+    while j < len(text) and text[j] == '`':
+        j += 1
+    ticks = text[i:j]
+    close = text.find(ticks, j)
+    # CommonMark closes a span with a run of EXACTLY the same length, so a
+    # longer run is not the close.
+    while close != -1 and text[close + len(ticks):close + len(ticks) + 1] == '`':
+        close = text.find(ticks, close + 1)
+    if close == -1:
+        return None                        # unclosed: literal backticks
+    return close + len(ticks)
+
+
 def uncomment(line, in_comment):
     """Split one line into what a renderer shows, and the comment state after.
 
@@ -144,21 +169,11 @@ def uncomment(line, in_comment):
         #
         # Backticks inside a comment are NOT a code span — they are comment
         # text — which is why this sits in the else branch.
-        if line[i] == '`':
-            j = i
-            while j < n and line[j] == '`':
-                j += 1
-            ticks = line[i:j]
-            close = line.find(ticks, j)
-            # CommonMark closes a span with a run of EXACTLY the same length.
-            while close != -1 and line[close + len(ticks):close + len(ticks) + 1] == '`':
-                close = line.find(ticks, close + 1)
-            if close != -1:
-                end = close + len(ticks)
-                out.append(line[i:end])    # the span renders verbatim
-                i = end
-                continue
-            # An unclosed run is just literal backticks; fall through.
+        end = code_span_end(line, i)
+        if end is not None:
+            out.append(line[i:end])        # the span renders verbatim
+            i = end
+            continue
 
         if line.startswith('<!--', i):
             in_comment = True
@@ -246,6 +261,14 @@ def _unlink(text):
         if ch == '\\' and i + 1 < n:          # an escape covers the next char
             out.append(text[i:i + 2])
             i += 2
+            continue
+        # A link written INSIDE a code span is literal text a reader sees, so
+        # reducing it to its label would drop words that are on the page —
+        # ``## `[Overview](secret.md)` `` renders the whole thing.
+        span = code_span_end(text, i)
+        if span is not None:
+            out.append(text[i:span])
+            i = span
             continue
         # A label opens at `[`, or at `![` for an image.
         bang = ch == '!' and i + 1 < n and text[i + 1] == '['
@@ -1126,7 +1149,25 @@ self_test() {
     > "$c57/scripts/docs-retrieval-questions.tsv"
   check "a real comment after a code span still opens" fail "$c57"
 
-  # 58. A comment line and a blank line in the fixture are skipped.
+  # 58. A link written inside a CODE SPAN is literal text a reader sees, so
+  #     its destination must stay indexed rather than be reduced to a label.
+  local c58="$tmp/c58"; make_corpus "$c58"
+  printf '# Page\n\n## The `[Overview](secret-runtime-logger.md)` form\n' \
+    > "$c58/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c58/scripts/docs-retrieval-questions.tsv"
+  check "a link inside a code span keeps its text" pass "$c58"
+
+  # 59. A REAL link outside a span is still reduced, so the fix did not just
+  #     stop unlinking.
+  local c59="$tmp/c59"; make_corpus "$c59"
+  printf '# Page\n\n## [Overview](secret-runtime-logger.md)\n' \
+    > "$c59/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c59/scripts/docs-retrieval-questions.tsv"
+  check "a real link is still reduced to its label" fail "$c59"
+
+  # 60. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

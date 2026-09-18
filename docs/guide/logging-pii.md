@@ -152,18 +152,30 @@ understanding before an incident rather than during one:
 - **A target that had an override** (one named in `[log] level` at startup,
   like the `tower_http` in `level = "info,tower_http=warn"`) goes back by
   setting it to that `previous` value — `warn` here, not the global level.
-- **A target that had none** — `"previous": null` — cannot be put back. There
-  is no "remove this override" call, and setting it to today's global level is
-  not the same thing: it leaves a pinned override that will *not* follow later
-  changes to `root`. The only way back to no-override is a restart, which
-  clears them all, since they live only in the process.
+- **A target that had none** — `"previous": null` — takes two steps, and the
+  first one is not optional. You raised it from the global level to `trace`,
+  so **it is still emitting at `trace` until you lower it**. Set it back to
+  the level you want it at, normally the global one:
 
-So raising one untouched target for an investigation leaves a trace behind
-until the next deploy. That is usually fine — an override at the level it
-already had emits the same lines — but it is worth knowing rather than
-discovering when a later `root` change does not take effect where you
-expected. `GET /actuator/loggers` lists everything currently overridden, and
-is the check worth running before you call the incident closed.
+  ```bash
+  curl -sX PUT "$LOGGERS/my_app::orders" \
+    -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}"
+  ```
+
+  That stops the volume immediately. What it cannot do is remove the override:
+  there is no "remove" call, so the target stays *pinned* at that level and
+  will not follow later changes to `root`. Only a restart clears the pin,
+  since overrides live in the process.
+
+So the honest summary is: **lower it now, restart when convenient.** Lowering
+is what stops a trace-level firehose — potentially high-volume, and on a
+busy target potentially full of request detail — from running on after the
+investigation is closed. The restart is the tidy-up that stops a later `root`
+change from silently failing to reach that one target.
+
+`GET /actuator/loggers` lists everything currently overridden, and is the
+check worth running before you call the incident closed — not least because it
+is the only way to notice a target someone else raised.
 
 Those run as shown in development. **In production they need a CSRF token**,
 and the failure is a `403` that never reaches the handler — see [Getting a
