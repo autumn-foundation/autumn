@@ -95,6 +95,16 @@ FIXTURE = 'scripts/docs-retrieval-questions.tsv'
 # Words a reader types that carry no retrieval signal. Kept short on purpose:
 # every entry here is a word the matcher stops requiring, so a long list turns
 # a failing question into a passing one without changing a page.
+# CommonMark type-6 block tags: a line opening with one of these starts a raw
+# HTML block that runs to the next blank line, so nothing inside is Markdown.
+CONTAINER_TAGS = (
+    r'(address|article|aside|base|blockquote|body|caption|center|col|colgroup'
+    r'|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form'
+    r'|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li'
+    r'|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search'
+    r'|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)'
+)
+
 STOPWORDS = {
     'a', 'an', 'and', 'are', 'at', 'be', 'by', 'can', 'do', 'does', 'for',
     'from', 'how', 'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on', 'or', 'the',
@@ -284,6 +294,7 @@ def index():
         fence = None
         comment = False
         html_block = None
+        prev_para = None
         for line in text.splitlines():
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
@@ -314,15 +325,24 @@ def index():
             # as script text, so indexing it is the fenced case again with
             # angle brackets.
             #
-            # LIMIT, stated rather than left to be discovered: only type 1 is
-            # tracked. Types 6 and 7 (`<div>`, `<table>`, a bare custom tag)
-            # end at a BLANK LINE rather than a closing tag, so tracking them
-            # means implementing most of the HTML-block rules for a shape no
-            # guide page uses — and getting those wrong would swallow real
-            # headings, which is the worse failure. If one ever appears, this
-            # is the place, and `--list` will show what it ate.
+            # Type 6 — a container tag such as `<div>` or `<table>` — is a
+            # raw HTML block too, and ends at a BLANK LINE rather than a
+            # closing tag. An earlier round of this gate declined to track it,
+            # on the grounds that a wrong blank-line rule would swallow real
+            # headings. That was the right worry and the wrong conclusion: the
+            # rule is one line, and "would get it wrong" is a thing to test,
+            # not a reason to leave a hole. Both directions are pinned by the
+            # self-test.
+            #
+            # Type 7 (a bare custom tag on a line of its own) is still not
+            # tracked: recognising it means deciding what counts as a tag name
+            # at all, and its blank-line rule would then apply to lines like
+            # `<Foo>` in prose. No guide page has one.
             if html_block is not None:
-                if re.search(rf'</{html_block}\s*>', line, re.I):
+                if html_block == '#blank':
+                    if not line.strip():
+                        html_block = None
+                elif re.search(rf'</{html_block}\s*>', line, re.I):
                     html_block = None
                 continue
 
@@ -362,6 +382,10 @@ def index():
                 html_block = None
                 continue
 
+            if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}[\s/>]', line, re.I):
+                html_block = '#blank'
+                continue
+
             # Whether this is a heading is decided on the RAW line, before
             # any comment is removed. `<!-- editorial -->## Heading` is an
             # HTML block in CommonMark, not a heading — the `##` is block
@@ -382,12 +406,43 @@ def index():
             # contributes "Page" and nothing else — and `# Page <!-- note`
             # still contributes "Page" even though the comment runs on.
             line, comment = uncomment(line, False)
-            if not is_heading:
-                continue
 
-            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', line)
+            # A SETEXT heading is its text on one line and `===` (h1) or
+            # `---` (h2) on the next. Missing them is a false NEGATIVE of the
+            # same kind as requiring column one: the page renders a heading,
+            # the gate does not see it, and an ordinary reformat fails CI.
+            #
+            # An underline only counts after PARAGRAPH text. After a blank
+            # line `---` is a thematic break, after a list item it is part of
+            # the list, and `|---|` is a table rule — none of which reach
+            # `prev_para`, because only a plain text line sets it.
+            if prev_para is not None:
+                under = re.match(r'^ {0,3}(=+|-+)\s*$', line)
+                if under:
+                    title = rendered(prev_para.strip())
+                    prev_para = None
+                    if title:
+                        if under.group(1)[0] == '=' and not h1:
+                            h1 = title
+                        else:
+                            headings.append(title)
+                    continue
+
+            # `is_heading` gates only the ATX path: it is what stops
+            # `<!-- x -->## H` — an HTML block — from being read as a
+            # heading once the comment is stripped. It must NOT gate the
+            # setext path above it, which is how that check was dead on
+            # arrival the first time it was written.
+            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', line) if is_heading \
+                else None
             if not m:
+                # Only a plain, non-blank text line can be setext text. A
+                # blank line ends the paragraph, so the next `---` is a
+                # thematic break rather than an underline; and a line that
+                # LOOKED like a heading is never setext text either.
+                prev_para = None if is_heading or not line.strip() else line
                 continue
+            prev_para = None
             level, title = len(m.group(1)), rendered(m.group(2))
             if not title:
                 continue
@@ -841,7 +896,58 @@ self_test() {
     > "$c39/scripts/docs-retrieval-questions.tsv"
   check "a script tag inside a fence is sample code" pass "$c39"
 
-  # 40. A comment line and a blank line in the fixture are skipped.
+  # 40. A heading inside a `<div>` block is raw HTML, not a heading.
+  local c40="$tmp/c40"; make_corpus "$c40"
+  printf '# Page\n\n\u003cdiv\u003e\n# Secret runtime logger\n\u003c/div\u003e\n' \
+    > "$c40/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c40/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a div block is not indexed" fail "$c40"
+
+  # 41. That block ends at a BLANK LINE, not a closing tag — a heading after
+  #     the blank must still be indexed, or the rule eats the rest of the page.
+  local c41="$tmp/c41"; make_corpus "$c41"
+  printf '# Page\n\n\u003cdiv\u003e\nraw\n\n## Secret runtime logger\n' \
+    > "$c41/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c41/scripts/docs-retrieval-questions.tsv"
+  check "a heading after the blank line ending a div is indexed" pass "$c41"
+
+  # 42. A SETEXT h1 is a heading — the false negative an ordinary reformat
+  #     would otherwise turn into a CI failure.
+  local c42="$tmp/c42"; make_corpus "$c42"
+  printf '# Page\n\nSecret runtime logger\n=====\n' \
+    > "$c42/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c42/scripts/docs-retrieval-questions.tsv"
+  check "a setext h1 is indexed" pass "$c42"
+
+  # 43. And a setext h2.
+  local c43="$tmp/c43"; make_corpus "$c43"
+  printf '# Page\n\nSecret runtime logger\n-----\n' \
+    > "$c43/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c43/scripts/docs-retrieval-questions.tsv"
+  check "a setext h2 is indexed" pass "$c43"
+
+  # 44. A `---` after a BLANK line is a thematic break, not an underline, so
+  #     the paragraph above it is not a heading.
+  local c44="$tmp/c44"; make_corpus "$c44"
+  printf '# Page\n\nSecret runtime logger\n\n---\n' \
+    > "$c44/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c44/scripts/docs-retrieval-questions.tsv"
+  check "a thematic break is not a setext underline" fail "$c44"
+
+  # 45. A table rule is not a setext underline either.
+  local c45="$tmp/c45"; make_corpus "$c45"
+  printf '# Page\n\n| Secret runtime logger |\n|---|\n' \
+    > "$c45/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c45/scripts/docs-retrieval-questions.tsv"
+  check "a table rule is not a setext underline" fail "$c45"
+
+  # 46. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

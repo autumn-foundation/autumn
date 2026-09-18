@@ -113,10 +113,21 @@ curl -X PUT http://localhost:3000/actuator/loggers/root \
 curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
   -H 'content-type: application/json' -d '{"level":"trace"}'
 
-# Put it back
+# Put it back — BOTH of them. The global level and each target you raised
+# are separate overrides, and reverting one leaves the other emitting.
 curl -X PUT http://localhost:3000/actuator/loggers/root \
   -H 'content-type: application/json' -d '{"level":"info"}'
+curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
+  -H 'content-type: application/json' -d '{"level":"info"}'
 ```
+
+There is no "remove this override" call: you put a target back by setting it
+to the level it should have, and `GET /actuator/loggers` lists every override
+still in force, which is the check worth running before you call the incident
+closed. Note that a target named in `[log] level` at startup — the
+`tower_http` in `level = "info,tower_http=warn"` — is *already* an override,
+so putting that one back means `warn`, not the global level. A restart clears
+the lot, since overrides live only in the process.
 
 Those run as shown in development. **In production they need a CSRF token**,
 and the failure is a `403` that never reaches the handler — see [Getting a
