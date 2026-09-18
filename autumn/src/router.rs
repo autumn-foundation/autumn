@@ -897,7 +897,7 @@ fn build_router_pre_state(
                 cors: config.cors.clone(),
                 // The same-origin shortcut is gated on the app's trusted-Host
                 // policy so it can't be abused for DNS rebinding.
-                trusted_hosts: TrustedHostPolicy::from_config(config),
+                trusted_hosts: TrustedHostPolicy::from_config_with_state(config, state),
                 tenant_header,
                 // Forward the configured CSRF header (default `x-csrf-token`) so
                 // customized CsrfConfig::token_header deployments work via MCP.
@@ -5013,7 +5013,7 @@ fn apply_middleware(
     // Redis-backed rate limiter — that must not run on the way to a fail-fast `Err`.
     let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
-    let trusted_host_policy = TrustedHostPolicy::from_config(config);
+    let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
@@ -14855,6 +14855,18 @@ pub struct TrustedHostPolicy {
     allow_any: bool,
     allow_missing_host: bool,
     probe_bypass_paths: Arc<std::collections::HashSet<String>>,
+    /// Where a hostname that no static rule matches is looked up (#2657).
+    ///
+    /// A tenant's connected hostname is never in `[security.trusted_hosts]
+    /// hosts` — that is the point of the feature — so without this the
+    /// trusted-host layer answers `400 Invalid Host header` before tenancy
+    /// resolution runs, and custom domains work only with `hosts = ["*"]`.
+    ///
+    /// Read late, not captured, because the registry is published at bind
+    /// time, after the router is built. `None` for a policy built without a
+    /// state (the MCP unit tests); an app that does not enable custom domains
+    /// publishes no registry, so the lookup finds nothing.
+    custom_domains: Option<crate::state::LateExtensions>,
 }
 
 impl TrustedHostPolicy {
@@ -14883,6 +14895,20 @@ impl TrustedHostPolicy {
             allow_any,
             allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
+            custom_domains: None,
+        }
+    }
+
+    /// [`from_config`](Self::from_config), plus the app state that publishes
+    /// the custom-domain registry (#2657).
+    ///
+    /// Every ingress policy is built this way. The state is read per request,
+    /// so a domain connected — or offboarded — while the app runs takes effect
+    /// without a restart.
+    pub(crate) fn from_config_with_state(config: &AutumnConfig, state: &AppState) -> Self {
+        Self {
+            custom_domains: Some(state.late_extensions()),
+            ..Self::from_config(config)
         }
     }
 
@@ -14901,7 +14927,7 @@ impl TrustedHostPolicy {
         if self.allow_any {
             return true;
         }
-        self.rules.iter().any(|rule| {
+        let matches_rule = self.rules.iter().any(|rule| {
             rule.strip_prefix('.').map_or_else(
                 || host == rule,
                 |suffix| {
@@ -14911,6 +14937,21 @@ impl TrustedHostPolicy {
                             .is_some_and(|prefix| prefix.ends_with('.'))
                 },
             )
+        });
+        matches_rule || self.is_connected_domain(host)
+    }
+
+    /// Is `host` a tenant custom domain this deployment serves right now?
+    ///
+    /// Only after the static rules miss, so the common path stays a slice
+    /// comparison. Only a *servable* (`active`) domain passes, which is the
+    /// rule SNI already applies at the handshake: a registration stuck at
+    /// `pending_dns` must not become a way past host validation.
+    fn is_connected_domain(&self, host: &str) -> bool {
+        self.custom_domains.as_ref().is_some_and(|extensions| {
+            extensions
+                .get::<Arc<crate::custom_domain::CustomDomainRegistry>>()
+                .is_some_and(|registry| registry.is_servable(host))
         })
     }
 }

@@ -1268,3 +1268,107 @@ async fn a_registry_that_did_not_hydrate_refuses_to_connect_anything() {
             .is_ok()
     );
 }
+
+// ── #2657: the mounted router, not the extractor alone ───────────────────
+
+/// Echo the tenant the framework resolved, so a test can assert the request
+/// reached a handler AND resolved to the right tenant.
+#[autumn_web::get("/whoami")]
+async fn whoami(tenant: autumn_web::tenancy::Tenant) -> String {
+    tenant.0
+}
+
+/// A production deployment that serves `myapp.com` and its tenant subdomains.
+///
+/// `hosts` is mandatory under `profile = "prod"`, and a tenant's connected
+/// hostname is never in it: that is the design (#1635).
+fn prod_config() -> AutumnConfig {
+    let mut config = AutumnConfig {
+        profile: Some("prod".to_owned()),
+        ..AutumnConfig::default()
+    };
+    // The deployment's own zone: its apex and its tenant subdomains. A
+    // tenant's connected hostname is not here, and cannot be.
+    config.security.trusted_hosts.hosts = vec!["myapp.com".to_owned(), ".myapp.com".to_owned()];
+    config.tenancy.enabled = true;
+    "subdomain".clone_into(&mut config.tenancy.source);
+    config.tenancy.base_domain = Some("myapp.com".to_owned());
+    config
+}
+
+#[tokio::test]
+async fn a_mounted_router_serves_an_active_custom_domain() {
+    let registry = registry();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .register("pending.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_active("app.clientco.com", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+
+    let client = autumn_web::test::TestApp::new()
+        .config(prod_config())
+        .routes(autumn_web::routes![whoami])
+        .build();
+    // Production publishes the registry at bind time, AFTER the router is
+    // built, so the test publishes it in that order too. A policy that
+    // snapshots the registry while the router is built sees nothing here.
+    client.state().insert_extension(Arc::clone(&registry));
+
+    let response = client
+        .get("/whoami")
+        .header("host", "app.clientco.com")
+        .send()
+        .await;
+    response.assert_status(200);
+    assert_eq!(
+        response.text(),
+        "tenant-a",
+        "an active custom domain must reach the handler and resolve to its tenant"
+    );
+
+    // A registration that has not reached `Active` is not servable, so it stays
+    // a 400: SNI enforces the same rule at the handshake.
+    client
+        .get("/whoami")
+        .header("host", "pending.clientco.com")
+        .send()
+        .await
+        .assert_status(400);
+
+    // An outside hostname nobody registered is still rejected.
+    client
+        .get("/whoami")
+        .header("host", "evil.example.net")
+        .send()
+        .await
+        .assert_status(400);
+
+    // The deployment's own names and its tenant subdomains are untouched.
+    let response = client
+        .get("/whoami")
+        .header("host", "acme.myapp.com")
+        .send()
+        .await;
+    response.assert_status(200);
+    assert_eq!(
+        response.text(),
+        "acme",
+        "subdomain tenancy must be unchanged"
+    );
+
+    // Offboarding makes the hostname untrusted again with no restart.
+    assert!(registry.remove("app.clientco.com").await.unwrap());
+    client
+        .get("/whoami")
+        .header("host", "app.clientco.com")
+        .send()
+        .await
+        .assert_status(400);
+}
