@@ -166,6 +166,14 @@ def is_paragraph(line):
         return False            # ordered list item
     if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
         return False            # thematic break
+    if re.match(r'^\[[^\]]*\]:\s', stripped):
+        # A link-reference definition renders as NOTHING — it only defines a
+        # target for `[text][ref]` elsewhere. Treating it as setext text put
+        # its raw destination (`/secret-runtime-logger.md`) into the index as
+        # a heading, which is the invisible-text failure with yet another
+        # syntax. `rendered()` cannot help here: this is not an inline link,
+        # so there is no label to reduce it to.
+        return False
     return True
 
 
@@ -1047,7 +1055,25 @@ self_test() {
     > "$c52/scripts/docs-retrieval-questions.tsv"
   check "a fence ends the setext paragraph" fail "$c52"
 
-  # 53. A comment line and a blank line in the fixture are skipped.
+  # 53. A link-reference DEFINITION renders as nothing, so it is not setext
+  #     text and its destination is not a heading.
+  local c53="$tmp/c53"; make_corpus "$c53"
+  printf '# Page\n\n[Overview]: /secret-runtime-logger.md\n---\n' \
+    > "$c53/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c53/scripts/docs-retrieval-questions.tsv"
+  check "a link-reference definition is not setext text" fail "$c53"
+
+  # 54. Text that merely CONTAINS a colon after brackets is still paragraph
+  #     text — the rule must not reject ordinary prose.
+  local c54="$tmp/c54"; make_corpus "$c54"
+  printf '# Page\n\nSecret runtime logger [see also] : notes\n---\n' \
+    > "$c54/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c54/scripts/docs-retrieval-questions.tsv"
+  check "prose with brackets is still setext text" pass "$c54"
+
+  # 55. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

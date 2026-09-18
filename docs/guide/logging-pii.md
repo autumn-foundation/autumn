@@ -105,23 +105,31 @@ thing you wanted to see has usually stopped happening. `PUT
 takes effect on the next event:
 
 ```bash
-# Raise the global level
-curl -X PUT http://localhost:3000/actuator/loggers/root \
-  -H 'content-type: application/json' -d '{"level":"debug"}'
+LOGGERS=http://localhost:3000/actuator/loggers
 
-# Raise one target, leaving everything else at its configured level
-curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
+# Raise the global level, KEEPING what it was. Do not assume `info`: the level
+# in force is whatever the profile or config set, and once you have replaced
+# it the response is the only place it still exists.
+PREV=$(curl -sX PUT "$LOGGERS/root" \
+  -H 'content-type: application/json' -d '{"level":"debug"}' | jq -r .previous)
+
+# Raise one target, leaving everything else where it is
+curl -sX PUT "$LOGGERS/my_app::orders" \
   -H 'content-type: application/json' -d '{"level":"trace"}'
 
-# Put the GLOBAL level back — to whatever it was, which is not necessarily
-# `info`: in the dev profile it starts at `debug`.
-curl -X PUT http://localhost:3000/actuator/loggers/root \
-  -H 'content-type: application/json' -d '{"level":"debug"}'
+# … investigate …
+
+# Put the global level back to exactly what it was
+curl -sX PUT "$LOGGERS/root" \
+  -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}"
 ```
 
-**Read `previous` off each response and write it down before you need it.**
-Every `PUT` returns the level that target had before the change, which is the
-only record of what to restore:
+(`jq` only to pull one field out; any JSON reader will do, and `GET
+$LOGGERS` shows `current_level` if you would rather read it by eye first.)
+
+**`previous` is the whole point of that first response.** Every `PUT` returns
+the level that target had before the change, and it is the only record of what
+to restore:
 
 ```json
 { "status": "ok", "message": "Logger 'root' set to 'debug'",
