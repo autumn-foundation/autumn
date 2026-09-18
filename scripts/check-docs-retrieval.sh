@@ -133,13 +133,29 @@ def index():
         slug = pathlib.PurePath(rel).stem
         h1, headings = '', []
         fence = None
+        comment = False
         for line in text.splitlines():
+            # A heading inside an HTML comment is not a heading: no renderer
+            # shows it and no reader can navigate to it, so indexing one is
+            # the same false positive as indexing a fenced `#` line. This
+            # corpus writes its gate waivers as multi-line `<!-- … -->`
+            # blocks, which is exactly where a quoted heading would appear.
+            # Checked INSIDE the fence check below only when not fenced: a
+            # `<!--` inside a code fence is sample text, not a comment.
             # A `#` inside a fence is a shell comment, a TOML comment or a Rust
             # attribute, not a heading, and it must not be indexed: a `# Raise
             # the global level` comment in a curl fence would let a question
             # match the page that fence sits on, which is exactly the page a
             # fixture row names — so the false positive lands on the EXPECTED
             # page and the gate passes while the reader still finds nothing.
+            if comment:
+                # Only the close matters; a line that begins inside a comment
+                # cannot start a heading, and a `#` after a mid-line `-->` is
+                # not at the start of the line, so it is not one either.
+                if '-->' in line:
+                    comment = False
+                continue
+
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
@@ -166,6 +182,14 @@ def index():
                 continue
             if fence is not None:
                 continue
+
+            # Outside a fence: drop complete `<!-- … -->` spans, and if an
+            # unterminated one is left, the comment runs on past this line.
+            if '<!--' in line:
+                if '<!--' in re.sub(r'<!--.*?-->', '', line):
+                    comment = True
+                    continue
+
             m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
                 continue
@@ -389,7 +413,34 @@ self_test() {
     > "$c12/scripts/docs-retrieval-questions.tsv"
   check "trailing whitespace still closes a fence" pass "$c12"
 
-  # 13. A comment line and a blank line in the fixture are skipped.
+  # 13. A heading inside a multi-line HTML comment is not indexed: no renderer
+  #     shows it, so a reader can neither see nor navigate to it.
+  local c13="$tmp/c13"; make_corpus "$c13"
+  printf '# Page\n\n\u003c!--\n# Secret runtime logger\n--\u003e\n' \
+    > "$c13/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c13/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside an HTML comment is not indexed" fail "$c13"
+
+  # 14. The comment ends where it says it does: a real heading after `-->`
+  #     is still indexed, so the fix cannot pass by swallowing the rest.
+  local c14="$tmp/c14"; make_corpus "$c14"
+  printf '# Page\n\n\u003c!--\nnote\n--\u003e\n\n## Secret runtime logger\n' \
+    > "$c14/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c14/scripts/docs-retrieval-questions.tsv"
+  check "a heading after the comment closes is indexed" pass "$c14"
+
+  # 15. `<!--` inside a fence is sample text, not a comment, so it must not
+  #     swallow the headings that follow the fence.
+  local c15="$tmp/c15"; make_corpus "$c15"
+  printf '# Page\n\n```html\n\u003c!-- unterminated in sample code\n```\n\n## Secret runtime logger\n' \
+    > "$c15/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c15/scripts/docs-retrieval-questions.tsv"
+  check "an HTML comment opener inside a fence is sample text" pass "$c15"
+
+  # 16. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

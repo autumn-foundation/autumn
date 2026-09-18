@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two that drift.
 
   Found by measuring the direction no existing gate measures.
-  `scripts/check-docs-retrieval.sh` (new, wired into CI with a 13/13
+  `scripts/check-docs-retrieval.sh` (new, wired into CI with a 16/16
   self-test) pairs a reader question with the page that answers it and checks
   the page says so in its slug, its H1 or a heading — body text deliberately
   excluded, because "the answer is in there somewhere" is the defect, not the
