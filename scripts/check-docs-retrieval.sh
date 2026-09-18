@@ -112,6 +112,16 @@ def rendered(title):
 
     Autolinks (`<https://example.com>`) are deliberately left alone: there the
     URL *is* the rendered text.
+
+    NOT stripped, deliberately, and measured rather than assumed: HTML tags.
+    Every `<…>` in a guide heading today — 21 of them — is inside an inline
+    code span (`Auth<T>`, `Query<T>`, `autumn credentials edit [--env <env>]`),
+    where it is literal text a reader sees. A naive `<[^>]*>` strip would take
+    the visible half of all 21 and index `Query` for `Query<T>`, which is the
+    failure this whole function guards against, pointed the other way: losing
+    words a reader CAN see is as bad as gaining words they cannot. A real HTML
+    tag in a heading (none in the corpus) would need code-span-aware handling
+    before anything is removed.
     """
     title = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', title)   # ![alt](src)
     title = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', title)    # [text](dest)
