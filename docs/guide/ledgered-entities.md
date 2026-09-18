@@ -5,6 +5,9 @@ when, and to what?"_ — but a column-level diff log cannot be queried **as
 state**. You cannot ask what a record looked like last Tuesday, diff it across
 two instants, or prove the stored history was not rewritten.
 
+> This page is about the history of a record. For money, see
+> [Money and the double-entry ledger](money.md).
+
 A **ledgered** entity closes that gap. One marker makes an entity bitemporal by
 construction: every write appends an immutable, hash-chained revision carrying a
 full row snapshot in your own Postgres or SQLite, so you can query any record

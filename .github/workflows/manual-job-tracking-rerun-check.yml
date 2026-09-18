@@ -1,0 +1,105 @@
+name: Manual job_tracking rerun check (Semaphore rerun harness)
+
+# Manual dispatch only. Same-commit rerun-rate harness for
+# job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it
+# (docs/ci-health/quarantine-ledger.md, "under active investigation" section):
+# n=2 organic hits (2026-09-11, 2026-09-15), panic "record should be past its
+# configured TTL" at autumn/tests/integration/job_tracking_stores_integration.rs:264.
+# Unlike the macOS contention cluster, this test needs no new runner class or
+# CI spend to rerun — it's an ordinary ubuntu-latest + Docker (testcontainers
+# Postgres) job, the same shape `test-docker` already runs on every PR — so
+# this harness doesn't need the same human sign-off that workflow does. Still
+# gated on workflow_dispatch rather than folded into ci.yml: it exists to
+# generate a same-commit rerun-rate baseline on demand, not to run on every
+# push.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to test. Must build the autumn-web integration_tests binary."
+        required: true
+      iterations:
+        description: "Number of same-process reruns of the target test"
+        required: false
+        default: "50"
+        type: choice
+        options: ["20", "50"]
+
+env:
+  # Same values as ci.yml.
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  # #2594 taught this repo that a dispatch-only workflow can still be
+  # evaluated on other events (observed on manual-macos-contention-check.yml)
+  # -- guard on the event so anything but a manual dispatch skips cleanly
+  # rather than running the Docker-heavy steps below unasked.
+  rerun:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Build the integration_tests binary once
+        # Same package/feature set ci.yml's test-docker job uses for this
+        # test (see its "Run Docker-dependent tests" step) so the binary
+        # under test is byte-for-byte what CI actually exercises. --no-run
+        # so the loop below only pays compile cost once, not once per
+        # iteration.
+        run: |
+          cargo test -p autumn-web \
+            --features "test-support,offline-sync,ws,mail,redis,i18n,collab" \
+            --test integration_tests --no-run
+      - name: Rerun the target test against a fresh Postgres container each time
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        # workflow_dispatch's `type: choice` only constrains the manual UI
+        # dropdown - the API/CLI (`gh workflow run -f iterations=...`) can
+        # pass any string, so it's re-validated here rather than trusted.
+        run: |
+          case "$ITERATIONS" in
+            20|50) ;;
+            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+          esac
+          fail=0
+          pass=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "=== iteration $i/$ITERATIONS ==="
+            cargo test -p autumn-web \
+              --features "test-support,offline-sync,ws,mail,redis,i18n,collab" \
+              --test integration_tests -- \
+              --ignored --test-threads=1 \
+              integration::job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it \
+              2>&1 | tee "iteration-$i.log"
+            rc="${PIPESTATUS[0]}"
+            if ! grep -qE 'test result: ok\. 1 passed' "iteration-$i.log"; then
+              echo "iteration $i: NO MATCHING PASS LINE (rc=$rc) - treating as a failure/miss, not silently skipping"
+              fail=$((fail + 1))
+            elif [ "$rc" -eq 0 ]; then
+              echo "iteration $i: PASS"
+              pass=$((pass + 1))
+            else
+              echo "iteration $i: FAIL (rc=$rc)"
+              fail=$((fail + 1))
+            fi
+          done
+          {
+            echo "## job_tracking rerun result"
+            echo ""
+            echo "\`$fail\`/\`$ITERATIONS\` failed, \`$pass\`/\`$ITERATIONS\` passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT: $fail/$ITERATIONS failed, $pass/$ITERATIONS passed"
+      - name: Upload every iteration's full log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: job-tracking-rerun-logs
+          path: iteration-*.log
+          retention-days: 14
