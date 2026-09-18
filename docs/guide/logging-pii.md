@@ -110,42 +110,56 @@ LOGGERS=http://localhost:3000/actuator/loggers
 # Raise the global level, KEEPING what it was. Do not assume `info`: the level
 # in force is whatever the profile or config set, and once you have replaced
 # it the response is the only place it still exists.
-PREV=$(curl -sX PUT "$LOGGERS/root" \
+ROOT_PREV=$(curl -sX PUT "$LOGGERS/root" \
   -H 'content-type: application/json' -d '{"level":"debug"}' | jq -r .previous)
 
-# Raise one target, leaving everything else where it is
-curl -sX PUT "$LOGGERS/my_app::orders" \
-  -H 'content-type: application/json' -d '{"level":"trace"}'
+# Raise one target, leaving everything else where it is. Keep this response
+# too, in a variable of its own: it holds that TARGET's previous override,
+# which is a different thing from the global level and is not put back by
+# restoring `root`.
+ORDERS_PREV=$(curl -sX PUT "$LOGGERS/my_app::orders" \
+  -H 'content-type: application/json' -d '{"level":"trace"}' | jq -r .previous)
 
 # … investigate …
 
-# Put the global level back to exactly what it was — but only if it is a
-# level this endpoint accepts. See below for when it is not.
-case "$PREV" in
-  trace|debug|info|warn|error)
-    curl -sX PUT "$LOGGERS/root" \
-      -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}" ;;
-  *) echo "cannot restore '$PREV' over HTTP — restart to clear it" ;;
-esac
+# Put each back to exactly what it was — but only to a level this endpoint
+# accepts. See below for when it is not one.
+restore() {                       # restore <logger> <level>
+  case "$2" in
+    trace|debug|info|warn|error)
+      curl -sX PUT "$LOGGERS/$1" \
+        -H 'content-type: application/json' -d "{\"level\":\"$2\"}" ;;
+    *) echo "cannot restore $1 to '$2' over HTTP — see below" ;;
+  esac
+}
+restore root "$ROOT_PREV"
+restore my_app::orders "$ORDERS_PREV"
 ```
 
 (`jq` only to pull one field out; any JSON reader will do, and `GET
 $LOGGERS` shows `current_level` if you would rather read it by eye first.)
 
-That `case` is not defensive padding. **The endpoint accepts only the five
-named levels, and `previous` can hold something outside them** — so there are
-configurations this API cannot put back at all:
+Restoring the two separately is the part that is easy to drop, and dropping
+it is silent: put `root` back, walk away, and `my_app::orders` is still at
+`trace` with the level it used to have recorded nowhere but a response you
+no longer have.
+
+The `case` inside `restore` is not defensive padding either. **The endpoint
+accepts only the five named levels, and `previous` can hold something outside
+them** — so there are configurations this API cannot put back at all:
 
 | What `previous` holds | When | Restorable over HTTP? |
 |---|---|---|
 | `trace`/`debug`/`info`/`warn`/`error` | the usual case | yes |
 | `""` | `[log] level` names only targets (`"my_app=debug"`), so there is no global directive | **no** — and there is no way to set it back to "unset" either |
 | `off` | `[log] level = "off"` | **no** — `off` is valid at startup and rejected by this endpoint |
+| `null` | a target with no override of its own | **no** — there was no level to go back to; see below for what to send instead |
 
-The last two both mean the same thing in practice: **restart to clear it.**
-Guarding on the accepted set rather than on "is it empty" is deliberate —
-`off` was the second case to turn up this way, and a membership test covers
-whatever the third would have been.
+`""` and `off` mean the same thing in practice: **restart to clear it.**
+`null` is the one row with a way forward, and it is below.
+Guarding on the accepted set rather than on "is it empty" is deliberate:
+`off` was the second value to turn up this way and `null` the third, and a
+membership test absorbed both without growing a branch for either.
 
 **`previous` is the whole point of that first response.** Every `PUT` returns
 the level that target had before the change, and it is the only record of what
@@ -161,20 +175,19 @@ it is that target's previous override — or `null`, which is the case worth
 understanding before an incident rather than during one:
 
 - **A target that had an override** (one named in `[log] level` at startup,
-  like the `tower_http` in `level = "info,tower_http=warn"`) goes back by
-  setting it to that `previous` value — `warn` here, not the global level.
-- **A target that had none** — `"previous": null` — takes two steps, and the
-  first one is not optional. You raised it from the global level to `trace`,
-  so **it is still emitting at `trace` until you lower it**. Set it back to
-  the level you want it at, normally the global one:
+  like the `tower_http` in `level = "info,tower_http=warn"`) is what
+  `$ORDERS_PREV` holds — `warn` here, not the global level — and the
+  `restore my_app::orders "$ORDERS_PREV"` above is the call that puts it
+  back. Restoring only `root` leaves this target at `trace` *and* throws
+  away the one record of the level it is supposed to be at.
+- **A target that had none** — `"previous": null` — is the case `restore`
+  cannot close by itself, and the step it leaves you is not optional. You
+  raised the target from the global level to `trace`, so **it is still
+  emitting at `trace` until you lower it**. Send it the level you want it
+  at, normally whatever `root` is back to:
 
   ```bash
-  case "$PREV" in
-    trace|debug|info|warn|error)
-      curl -sX PUT "$LOGGERS/my_app::orders" \
-        -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}" ;;
-    *) echo "cannot lower this target over HTTP — restart now" ;;
-  esac
+  restore my_app::orders "$ROOT_PREV"
   ```
 
   That stops the volume immediately. What it cannot do is remove the override:
@@ -182,23 +195,28 @@ understanding before an incident rather than during one:
   will not follow later changes to `root`. Only a restart clears the pin,
   since overrides live in the process.
 
-  The same membership guard, and for a sharper reason than on the global
-  restore. Whenever `$PREV` is outside the five — empty, or `off` — there is
-  **no level you can send that restores this target**, so it stays at `trace`
-  until the process restarts, and the advice below hardens accordingly:
-  **restart now, not when convenient.**
+  `restore` guards this call too, and here for a sharper reason than on the
+  global one. Whenever the level you have to fall back on is itself outside
+  the five — `$ROOT_PREV` empty, or `off` — there is **no level you can send
+  that lowers this target**, so it stays at `trace` until the process
+  restarts, and the advice below hardens accordingly: **restart now, not when
+  convenient.**
 
 So the honest summary depends on which case you are in:
 
-- **`previous` had a value** — the usual case. **Lower it now, restart when
-  convenient.** Lowering stops a trace-level firehose, potentially
-  high-volume and on a busy target full of request detail, from running on
-  after the investigation is closed. The restart is only the tidy-up that
-  stops a later `root` change from silently missing that target.
-- **`previous` was `null`, empty, or `off`** — **restart now.** The guarded
-  command above does not fire, because there is no level it could send, so
-  nothing has lowered the target and it is still at `trace`. Here the restart
-  is not tidy-up; it is the only thing that stops the volume.
+- **`$ORDERS_PREV` was a level** — the usual case for a target `[log] level`
+  already named. `restore` put it back exactly as it was; there is nothing
+  left to do.
+- **`$ORDERS_PREV` was `null`, and `$ROOT_PREV` is a level** — **lower it
+  now, restart when convenient.** The fallback call above stops a
+  trace-level firehose, potentially high-volume and on a busy target full of
+  request detail, from running on after the investigation is closed. The
+  restart is only the tidy-up that stops a later `root` change from silently
+  missing that target.
+- **Neither was a level** — **restart now.** No `restore` fires, because
+  there is no level either call could send, so nothing has lowered the target
+  and it is still at `trace`. Here the restart is not tidy-up; it is the only
+  thing that stops the volume.
 
 `GET /actuator/loggers` lists everything currently overridden, and is the
 check worth running before you call the incident closed — not least because it

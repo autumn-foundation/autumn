@@ -202,6 +202,72 @@ def uncomment(line, in_comment):
     return ''.join(out), in_comment
 
 
+TITLE_CLOSER = {'"': '"', "'": "'", '(': ')'}
+
+
+def _closes_at(text, i, closer):
+    """Index just past `closer` in `text[i:]`, or -1 if it never closes.
+
+    Backslash escapes are honoured, so a `\\"` inside a quoted title does not
+    end it.
+    """
+    while i < len(text):
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text[i] == closer:
+            return i + 1
+        i += 1
+    return -1
+
+
+def _after_title_open(text):
+    """State after `text`, which may OPEN a definition title at its first char.
+
+    `None` when it cannot be a title at all — the caller then knows the
+    definition is over and the line is ordinary text.
+    """
+    closer = TITLE_CLOSER.get(text[:1])
+    if closer is None:
+        return None
+    return ('title', closer) if _closes_at(text, 1, closer) < 0 else False
+
+
+def _after_dest(text):
+    """State after a definition's destination line, title and all."""
+    if text.startswith('<'):
+        end = _closes_at(text, 1, '>')
+        rest = text[end:] if end >= 0 else ''
+    else:
+        sep = re.search(r'[ \t]', text)
+        rest = text[sep.end():] if sep else ''
+    rest = rest.strip()
+    if not rest:
+        return 'title?'          # a title may still begin on the next line
+    opened = _after_title_open(rest)
+    return False if opened is None else opened
+
+
+def defn_step(state, text):
+    """One line of a multi-line link reference definition.
+
+    Returns `(consumed, next_state)`. A definition renders as NOTHING, so a
+    CONSUMED line contributes nothing to the index. A line the definition
+    cannot contain is not consumed, and the caller processes it as ordinary
+    text — which is the whole point of returning a flag rather than swallowing
+    whatever follows. The title is OPTIONAL, so `[a]:`, then ` /x`, then
+    `Secret runtime logger` over `---` is a real setext heading that an
+    unconditional discard reported as a MISS.
+    """
+    if state == 'dest':
+        # The destination itself always belongs to the definition.
+        return True, _after_dest(text)
+    if state == 'title?':
+        opened = _after_title_open(text)
+        return (False, False) if opened is None else (True, opened)
+    return True, (False if _closes_at(text, 0, state[1]) >= 0 else state)
+
+
 def is_paragraph(line):
     """Whether a line is paragraph text, and so can carry a setext underline.
 
@@ -616,20 +682,18 @@ def index():
                     # `[label]:`, then ` /url`, then an optional ` "title"`.
                     # All of it is invisible, so none of it is paragraph text.
                     # State clears at the first line that cannot be part of
-                    # the definition — in practice a blank line, handled
-                    # below — or after a line that closes a quoted title.
-                    stripped_defn = line.strip()
-                    if pending_defn == 'dest':
-                        # The destination line may carry the title with it.
-                        pending_defn = ('title'
-                                        if not re.search(r'["\')]\s*$', stripped_defn)
-                                        else False)
-                    elif not re.search(r'["\')]\s*$', stripped_defn):
-                        pending_defn = False
-                    else:
-                        pending_defn = False
-                    para = []
-                    continue
+                    # the definition — a blank line, handled below; a closed
+                    # title; or a line where the OPTIONAL title simply is not.
+                    consumed, pending_defn = defn_step(pending_defn,
+                                                       line.strip())
+                    if consumed:
+                        para = []
+                        continue
+                    # Not part of the definition after all: fall through and
+                    # read this line as what it is. `para` is empty here —
+                    # entering definition state cleared it — so the setext
+                    # check above had nothing to do on this line anyway, and
+                    # the underline that follows still finds its text.
                 pending_defn = ('dest'
                                 if re.match(r'^ {0,3}\[[^\]]*\]:\s*$', line)
                                 else False)
@@ -1461,7 +1525,34 @@ self_test() {
     > "$c82/scripts/docs-retrieval-questions.tsv"
   check "paragraph text is still setext text" pass "$c82"
 
-  # 83. A comment line and a blank line in the fixture are skipped.
+  # 83. The definition's title is OPTIONAL. A line that cannot open one is
+  #     not part of the definition, so it is read as what it is — ordinary
+  #     paragraph text, and here the text of a real setext heading.
+  local c83="$tmp/c83"; make_corpus "$c83"
+  printf '# Page\n\n[Overview]:\n  /x\nSecret runtime logger\n---\n' \
+    > "$c83/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c83/scripts/docs-retrieval-questions.tsv"
+  check "a line that cannot be a definition title is text again" pass "$c83"
+
+  # 84. A title that RUNS ON to a further line is invisible for all of it.
+  local c84="$tmp/c84"; make_corpus "$c84"
+  printf '# Page\n\n[Overview]:\n  /x\n  "a\n  secret runtime logger"\n---\n' \
+    > "$c84/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c84/scripts/docs-retrieval-questions.tsv"
+  check "a title running onto a further line stays invisible" fail "$c84"
+
+  # 85. …and once that title closes, the next line is text again — the
+  #     positive control on 84, which "never leave title state" would fail.
+  local c85="$tmp/c85"; make_corpus "$c85"
+  printf '# Page\n\n[Overview]:\n  /x\n  "a\n  b"\nSecret runtime logger\n---\n' \
+    > "$c85/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c85/scripts/docs-retrieval-questions.tsv"
+  check "text after a closed multi-line title is indexed" pass "$c85"
+
+  # 86. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
