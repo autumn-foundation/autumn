@@ -72,8 +72,10 @@ root-causing the one finding, ~30m).
 `examples/collab-notes`'s client (`static/collab.js`) silently drops a
 keystroke typed while the editor is mid-round-trip on a previous character.
 `updateWritability()` sets `editor.readOnly = !settled()` for the entire
-gap between sending a character and receiving its echo; a browser gives no
-event at all for a keystroke typed into a read-only `<textarea>`, so the
+gap between sending a character and receiving its echo; a read-only
+`<textarea>` still fires `keydown`/`keyup` for a keystroke typed into it,
+but the browser suppresses the value mutation and the `input` event that
+would follow it, so the app is never told a character arrived. The
 character vanishes with no error, no console warning, and no change to the
 `status` line — and since it was never sent, neither editor's copy of the
 note ever has it. Isolated with a `keydown`/`readOnly` correlation check
@@ -93,7 +95,8 @@ This directly falsifies `examples/collab-notes/README.md`'s own claim
 ("Every character both people type survives"), and is confined to the
 example's own client, not the `CollabHub`/`CollabText` framework primitives
 — the WebSocket protocol and CRDT never see the dropped keystroke because
-the browser blocks it before any JS runs. Filed as a report, not a fix PR:
+the browser suppresses the value change and `input` event before any of
+`collab.js`'s edit-sending logic runs. Filed as a report, not a fix PR:
 the code comment above `updateWritability()` already explains that the
 lock exists to avoid a different hazard (a redraw overwriting un-tracked
 keystrokes), so removing it isn't a safe small patch — a real fix needs
