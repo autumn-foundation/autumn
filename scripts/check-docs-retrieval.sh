@@ -439,7 +439,10 @@ def index():
             # at all, and its blank-line rule would then apply to lines like
             # `<Foo>` in prose. No guide page has one.
             if html_block is not None:
-                if html_block == '#blank':
+                if html_block == '#pi':
+                    if '?>' in line:
+                        html_block = None
+                elif html_block == '#blank':
                     if not line.strip():
                         html_block = None
                 elif re.search(rf'</{html_block}\s*>', line, re.I):
@@ -447,7 +450,11 @@ def index():
                 para = []
                 continue
 
-            marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
+            # Literal SPACES only: a tab in column one expands to four
+            # columns, so it cannot precede a fence at all. `\s{0,3}` let a
+            # tabbed line close a fence that is still open, exposing hidden
+            # content to the index.
+            marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
                 if fence is None and run[0] == '`' and '`' in rest:
@@ -484,8 +491,12 @@ def index():
                 para = []
                 continue
 
-            opener = re.match(r'^ {0,3}<(script|pre|style|textarea)\b', line,
-                              re.I)
+            # `\b` also matches before a hyphen, so `<script-widget>` was read
+            # as a `<script>` block and the scanner then waited for a
+            # `</script>` that never comes — suppressing every heading to EOF.
+            # A type-1 tag name ends at whitespace, `>` or end of line.
+            opener = re.match(r'^ {0,3}<(script|pre|style|textarea)(?=[\s>]|$)',
+                              line, re.I)
             if opener:
                 html_block = opener.group(1).lower()
                 para = []
@@ -493,6 +504,15 @@ def index():
                     continue
                 html_block = None
                 para = []
+                continue
+
+            if line.lstrip(' ').startswith('<?'):
+                # CommonMark type 3: a processing instruction runs to `?>`,
+                # and nothing inside it is Markdown.
+                html_block = '#pi'
+                para = []
+                if '?>' in line:
+                    html_block = None
                 continue
 
             if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}[\s/>]', line, re.I):
@@ -1252,7 +1272,58 @@ self_test() {
     > "$c66/scripts/docs-retrieval-questions.tsv"
   check "a tilde fence may carry a backtick" fail "$c66"
 
-  # 67. A comment line and a blank line in the fixture are skipped.
+  # 67. A processing instruction runs to `?\u003e`; a heading inside is raw HTML.
+  local c67="$tmp/c67"; make_corpus "$c67"
+  printf '# Page\n\n\u003c?php\n# Secret runtime logger\n?\u003e\n' \
+    > "$c67/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c67/scripts/docs-retrieval-questions.tsv"
+  check "a heading inside a processing instruction is not indexed" fail "$c67"
+
+  # 68. And it ends there: a heading after `?\u003e` is still indexed.
+  local c68="$tmp/c68"; make_corpus "$c68"
+  printf '# Page\n\n\u003c?php\nx\n?\u003e\n\n## Secret runtime logger\n' \
+    > "$c68/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c68/scripts/docs-retrieval-questions.tsv"
+  check "a heading after a processing instruction is indexed" pass "$c68"
+
+  # 69. A TAB cannot precede a fence, so a tabbed run does not close one and
+  #     the content after it stays hidden.
+  local c69="$tmp/c69"; make_corpus "$c69"
+  printf '# Page\n\n```\n\t```\n# Secret runtime logger\n```\n' \
+    > "$c69/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c69/scripts/docs-retrieval-questions.tsv"
+  check "a tab does not close a fence" fail "$c69"
+
+  # 70. Up to three SPACES still closes one, so the rule did not break
+  #     ordinary indented fences.
+  local c70="$tmp/c70"; make_corpus "$c70"
+  printf '# Page\n\n```\nx\n   ```\n\n## Secret runtime logger\n' \
+    > "$c70/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c70/scripts/docs-retrieval-questions.tsv"
+  check "three spaces still closes a fence" pass "$c70"
+
+  # 71. `\u003cscript-widget\u003e` is NOT a `\u003cscript\u003e` block: it ends at a blank line,
+  #     so a heading after it is visible and must be indexed.
+  local c71="$tmp/c71"; make_corpus "$c71"
+  printf '# Page\n\n\u003cscript-widget\u003e\n\n## Secret runtime logger\n' \
+    > "$c71/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c71/scripts/docs-retrieval-questions.tsv"
+  check "a hyphenated custom element is not a script block" pass "$c71"
+
+  # 72. A real `\u003cscript\u003e` still is one.
+  local c72="$tmp/c72"; make_corpus "$c72"
+  printf '# Page\n\n\u003cscript\u003e\n# Secret runtime logger\n\u003c/script\u003e\n' \
+    > "$c72/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c72/scripts/docs-retrieval-questions.tsv"
+  check "a real script block still hides its contents" fail "$c72"
+
+  # 73. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
