@@ -3915,9 +3915,16 @@ tests live in consolidated binaries (`autumn` → `integration_tests`,
 a `mod` line in `tests/integration/mod.rs`, not new `[[test]]` targets.
 
 CI also runs a feature-combination compile gate (35 `autumn-web` feature
-combos via `cargo hack`), a generator-conformance gate, and a plugin
+combos via `cargo hack`), a generator-conformance gate, a plugin
 freshness gate (`scripts/check-plugin-freshness.sh` — user-facing changelog
-entries must ship matching Claude-plugin updates).
+entries must ship matching Claude-plugin updates), and a changelog fragment
+gate (`scripts/check-changelog-fragments.sh`).
+
+Do not edit `CHANGELOG.md` in a PR. A release note goes in its own file,
+`changelog.d/<slug>.md`, holding the markdown the `## [Unreleased]` section
+holds: a `### <Kind>` heading and its bullets. Every PR used to write to the
+top of that section, so every PR conflicted with every other PR. See
+`changelog.d/README.md`.
 
 For docs or generated-app changes, also run the docs smoke procedure in
 `docs/guide/docs-smoke.md`. For public API changes, run doctests for the
@@ -3941,6 +3948,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
 - `STABILITY.md`
+- `changelog.d/README.md` (where an unreleased note is written)
 - `docs/migrations/README.md` (per-release upgrade guides; `next.md` is the
   rolling draft for unreleased breaking changes)
 - `docs/release-checklist.md`
