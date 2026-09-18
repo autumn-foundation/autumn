@@ -619,8 +619,8 @@ fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
 fn changelog_notes_are_written_as_fragments() {
     let root = workspace_root();
 
-    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
-        .expect("read ci.yml");
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     assert!(
         workflow.contains("./scripts/check-changelog-fragments.sh"),
         "ci.yml must run the changelog fragment gate; without it, CHANGELOG.md \
