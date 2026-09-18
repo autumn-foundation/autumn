@@ -1096,6 +1096,38 @@ without also filling in the intake form above.
   ~210.9 hours idle, close to 9 days). The recommendation to dispatch it
   stands, more overdue with each pass this signature keeps recurring
   uncampaigned.
+- **2026-09-18 update — 10th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-17 report's own cutoff
+  (2026-09-17T09:59:29Z, exclusive) to 2026-09-18T07:33:38Z (~21.6h, a single
+  `perPage=100`/`page=1` query whose own span, 2026-09-17T09:28:44Z–
+  2026-09-18T07:33:38Z, fully covers the window with margin on both ends, so
+  no second page was needed this pass) — 96 runs in-window: 80 cancelled, 14
+  success, 2 failure. Both failures triaged by job/log inspection, neither
+  matching any tracked signature: `claude/elegant-ptolemy-scqmqh` (run
+  35254153432) failed its own `Determinism seam gate` repo-hygiene self-check
+  inside the `Lint` job — a branch-owned WIP failure, not a CI health issue;
+  `dependabot/cargo/validator-0.21.0` (run 35232563734) failed both `Supply
+  chain (cargo-deny)` (the same pre-existing `fuzz/Cargo.lock --locked`
+  staleness this ledger has already attributed to this branch on prior
+  passes) and `Test (Docker)` — the latter is a **new** failure shape on this
+  branch, not previously logged: the validator 0.21.0 bump itself breaks
+  `examples/ledger-admin-bulk-app`'s own `PostForm`/`update` handler
+  (`E0277`/`E0599` on `Validate`/`IntoChangeset` trait bounds), i.e. the
+  dependency bump this PR exists to land is what's actually broken — squarely
+  this PR's own subject matter, not a CI health issue. Same caveat as prior
+  passes: only the 2 run-level failures were inspected at job level; the 80
+  `cancelled`-overall runs were not, so this "no repeat" finding is scoped to
+  the runs actually inspected, not proven-exhaustive across the full 96-run
+  window. `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-18T~10:1xZ — unchanged for a
+  **10th** straight pass since it became dispatchable 2026-09-08T15:07:44Z
+  (now ~235 hours idle, closing in on 10 days).
+
+  **This pass also builds (but cannot yet dispatch) a second rerun harness**,
+  `.github/workflows/manual-job-tracking-rerun-check.yml` — see the dated
+  update on the `job_tracking_stores_integration` entry below for why now,
+  what it does, and why it isn't dispatchable yet.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1169,6 +1201,9 @@ without also filling in the intake form above.
 - **2026-09-17 update**: no repeat in the ~24.3h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-17 dated update above for the
   window and method).
+- **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-18 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -1192,6 +1227,9 @@ without also filling in the intake form above.
   absence, for that one run. Still n=1, still not campaigned.
 - **2026-09-17 update**: no repeat in the ~24.3h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-17 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-18 dated update above for the
   window and method). Still n=1, still not campaigned.
 
 ### `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
@@ -1381,3 +1419,38 @@ without also filling in the intake form above.
 - **2026-09-17 update**: no repeat in the ~24.3h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-17 dated update above for the
   window and method). Still n=2, still not campaigned.
+- **2026-09-18 update — the recommended rerun harness is built, not yet
+  dispatchable.** No repeat in the ~21.6h window sampled this pass (see the
+  `live_upgrade` entry's 2026-09-18 dated update above for the window and
+  method). Still n=2 organic, still no rerun-rate baseline. This pass adds
+  `.github/workflows/manual-job-tracking-rerun-check.yml`: a `workflow_dispatch`
+  harness that builds the `autumn-web` `integration_tests` binary once
+  (`--features "test-support,offline-sync,ws,mail,redis,i18n,collab"`,
+  matching `ci.yml`'s `test-docker` job exactly) and then reruns just
+  `integration::job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+  20 or 50 times in a loop against a fresh testcontainers Postgres container
+  each iteration, logging each iteration's pass/fail to its own uploaded
+  artifact. Unlike `manual-macos-contention-check.yml`, this needs no new
+  runner class or CI spend to justify a human sign-off — it's the same
+  ordinary `ubuntu-latest` + Docker shape `test-docker` already runs on every
+  PR, just isolated to one test and looped — so the intent is to dispatch it
+  as a matter of routine CI-health work, not as a spend decision.
+
+  **Built this pass, but not dispatchable this pass**: `workflow_dispatch`
+  only accepts a workflow that already exists on the repository's *default*
+  branch (`trunk-dev`), even when the dispatch targets a different `ref` —
+  confirmed directly by attempting the dispatch against this harness's own
+  authoring branch and getting `404 Not Found` from the
+  `actions/workflows/{id}/dispatches` endpoint. This is the identical gotcha
+  `manual-macos-contention-check.yml` hit: that harness "only became
+  dispatchable... when #2627 fixed its parse error" landed on `trunk-dev`,
+  per this ledger's own `live_upgrade` entry. **Next step, for whichever pass
+  finds this PR merged**: dispatch
+  `manual-job-tracking-rerun-check.yml` with `iterations: "50"` (the low-rate
+  side of this role's own ≥20/≥50 split — n=2 organic in roughly two weeks of
+  ambient PR traffic is well under 10%) against `trunk-dev`'s tip, then fold
+  the resulting `k/50` into this entry and, if `k` is nonzero, pull the failing
+  iterations' logs to check which of the two candidate mechanisms (demoted
+  clock-step vs. the better-supported worker-refresh race) actually fired —
+  each iteration's log is uploaded individually so a failing one doesn't get
+  lost in a combined tail.
