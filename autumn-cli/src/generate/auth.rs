@@ -14584,6 +14584,30 @@ mod tests {
         );
     }
 
+    /// `declares_package` regression: a `package` key quoted as `"package"`
+    /// (valid TOML, and identical to the unquoted form to Cargo) must still be
+    /// recognized as the rename declaration, for both `autumn-web` siblings
+    /// that gained the `declares_package` guard in this PR.
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_subtable_underscore_form_quoted_package_key() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n\"package\" = \"autumn-web\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for quoted package key: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_subtable_underscore_form_quoted_package_key() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n\"package\" = \"autumn-web\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for quoted package key: {out}"
+        );
+    }
+
     /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize a
     /// properly `package`-renamed `[dependencies.autumn_web]` the same way its
     /// `oauth2`/`webauthn` siblings do (see
