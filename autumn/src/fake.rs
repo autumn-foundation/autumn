@@ -274,8 +274,9 @@ pub fn decimal() -> Decimal {
     Decimal::new(cents, 2)
 }
 
-/// A random non-negative [`Decimal`] shaped for a `decimal{p,s}` column
-/// (issue #2597): at most `p - s` integer digits and at most `s` fractional
+/// A random non-negative [`Decimal`] shaped for a `decimal{p,s}` column.
+///
+/// Issue #2597: at most `p - s` integer digits and at most `s` fractional
 /// digits, so every draw fits the declared precision and scale by
 /// construction.
 ///
@@ -289,14 +290,14 @@ pub fn decimal() -> Decimal {
 /// The write paths normalize before storage (`SqliteDecimal` writes
 /// `value.normalize().to_string()`), so trailing-zero fractional draws (e.g.
 /// `19.90` at `s = 2`) become canonical (`19.9`) and still satisfy the
-/// SQLite decimal `CHECK`.
+/// `SQLite` decimal `CHECK`.
 ///
 /// Out-of-range shapes are clamped defensively (`precision` to `1..=28` —
-/// rust_decimal's range — and `scale` to `0..=precision`): a malformed shape
+/// `rust_decimal`'s range — and `scale` to `0..=precision`): a malformed shape
 /// must not panic the factory, it just narrows the draw.
 #[must_use]
 pub fn decimal_with(precision: u32, scale: u32) -> Decimal {
-    /// rust_decimal's hard precision ceiling.
+    /// `rust_decimal`'s hard precision ceiling.
     const MAX_PRECISION: u32 = 28;
     let scale = scale.min(MAX_PRECISION);
     let precision = precision.clamp(scale.max(1), MAX_PRECISION);
@@ -774,7 +775,9 @@ mod tests {
 
     /// Integer digits of a [`Decimal`] — digits left of the decimal point.
     fn int_digits(value: Decimal) -> u32 {
-        let mantissa_digits = value.mantissa().abs().to_string().len() as u32;
+        // An `i128` mantissa is at most 39 digits, so this always fits.
+        let mantissa_digits = u32::try_from(value.mantissa().abs().to_string().len())
+            .expect("a Decimal mantissa has at most 39 digits");
         mantissa_digits.saturating_sub(value.scale())
     }
 

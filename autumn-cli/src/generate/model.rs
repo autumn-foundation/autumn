@@ -2936,6 +2936,23 @@ fn render_enum_decl(
     out
 }
 
+/// Emit the `#[decimal_shape]` marker for a `decimal{p,s}` field (issue #2597).
+///
+/// The declared shape rides into `#[model]` on a field attribute the macro
+/// parses, so the factory `.fake()` draws values that fit the column by
+/// construction (`fake::decimal_with(p, s)`). A no-op for every other kind,
+/// which keeps their output byte-identical.
+fn push_decimal_shape_attr(out: &mut String, kind: FieldKind) {
+    use std::fmt::Write as _;
+
+    if let FieldKind::Decimal { precision, scale } = kind {
+        let _ = writeln!(
+            out,
+            "    #[decimal_shape(precision = {precision}, scale = {scale})]"
+        );
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one parameter per axis of the emitted model file; a struct here would \
@@ -3086,17 +3103,7 @@ fn render_model_file(
         if f.is_translatable() {
             out.push_str("    #[translatable]\n");
         }
-        // Issue #2597: the declared `decimal{p,s}` shape rides into `#[model]`
-        // on a field attribute the macro parses (`field_decimal_shape`), so
-        // the factory `.fake()` draws values that fit the column by
-        // construction (`fake::decimal_with(p, s)`). Absent for non-decimal
-        // fields — that no-op path keeps their output byte-identical.
-        if let FieldKind::Decimal { precision, scale } = f.kind {
-            let _ = writeln!(
-                out,
-                "    #[decimal_shape(precision = {precision}, scale = {scale})]"
-            );
-        }
+        push_decimal_shape_attr(&mut out, f.kind);
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
         // distinguish it. Emit a marker doc comment that (a) tells a human
