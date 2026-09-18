@@ -248,7 +248,7 @@ metrics::counter("checkout_completed_total")
 > unbounded. Every distinct combination of label values is a separate time
 > series that lives for the life of the process — and a label value is written
 > in plaintext to whatever scrapes you. The same rule (and the same reasoning)
-> as structured log fields: see [Logging and PII](logging-pii.md).
+> as structured log fields: see [Logging: levels, format & PII](logging-pii.md).
 
 The facade enforces hard caps so a mistake degrades the metric instead of the
 process. The three that bound **cardinality** are configurable; the rest are

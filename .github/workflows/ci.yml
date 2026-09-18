@@ -610,6 +610,30 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: Docs retrieval gate
+        # Every gate above checks a page a reader HAS REACHED, and
+        # `check-docs-orphans.sh` checks that a path of links to it exists at
+        # all. Neither asks what a reader mid-task actually arrives with: not
+        # "which link do I click" but "what do I type". A page whose title and
+        # headings are spelled in project vocabulary instead of the reader's is
+        # invisible to that search while staying perfectly reachable,
+        # accurate and linked — every other gate green over it.
+        #
+        # The baseline found the log-configuration question class failing
+        # exactly that way. `docs/guide/logging-pii.md` carried `[log] level`,
+        # `log.format` and the access-log switches under the title
+        # "Logging & PII" — the name the README listed it by — so "log level",
+        # "debug logging" and "json logs" returned nothing, while `[log]`
+        # itself appeared in 9 fences across 7 pages. The runtime half,
+        # `PUT /actuator/loggers/{name}`, was on no reader-facing page at all.
+        #
+        # The fixture pins the ANSWERING page, not merely "some hit", so a
+        # retitle that re-aims a page at a different question fails here
+        # rather than passing quietly.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-retrieval.sh --self-test && ./scripts/check-docs-retrieval.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
