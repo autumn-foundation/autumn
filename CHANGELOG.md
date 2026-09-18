@@ -2296,6 +2296,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes unchanged. See
   `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
 
+- **🗃️ Ledger: batch `examples/cms`'s `recount_terms` per-term loop
+  (statements 3N→3):** `content::recount_terms` — called from
+  `set_post_terms`'s editor save path, the scheduled-publish sweep, and the
+  delete-user cascade whenever more than one term needs its published-post
+  count rebuilt — looped its ids one at a time and called `recount_term`
+  per id, which itself issued three round trips (a single-row `FOR UPDATE`
+  lock, a single-term scalar `COUNT(*)`, a single-row `UPDATE`). N affected
+  terms cost 3N round trips through this function alone. Now it locks every
+  row up front in one batched, ascending-id-order `FOR UPDATE` (the same
+  guarantee `lock_terms` uses, needed here too since `recount_terms_for_post`
+  reaches this function without a prior `lock_terms` call), computes every
+  count in one call to the already-batched `term_post_counts` helper
+  (previously used only by read-path screens), and writes every count back
+  in one bulk `UPDATE ... FROM UNNEST(...)` instead of N single-row updates.
+  Profiled through the real editor "Update" route against a 5,000-term/
+  2,000-post fixture at three tiers of affected-term count: statements
+  79→61 (N=7), 210→132 (N=27), 467→275 (N=65) — this function's own
+  contribution drops from 3N to 3 at every tier. `cargo test -p cms` (99
+  tests) and the full Docker-gated integration suite (211 tests) pass
+  unchanged. See `docs/reports/2026-09-18-ledger-cms-recount-terms-batch/`.
+
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
   30-entry Atom feed, the same `Feed::atom(...).entries(...)` shape
