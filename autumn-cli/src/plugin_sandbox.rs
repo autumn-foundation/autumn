@@ -485,6 +485,10 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             bin: None,
             plugin_name: &manifest.name,
             expected_prefix: Some(&manifest.prefix),
+            // Sandboxed plugins declare routes only through their manifest,
+            // which has no intentional-root spelling yet (follow-up, issue
+            // #2828): the exemption list stays empty on this lane.
+            intentional_root_routes: &[],
             sensitive_routes: &sensitive,
             format: ReportFormat::Text,
             // `Absent`, and deliberately so. A `ContractDump` reports what a

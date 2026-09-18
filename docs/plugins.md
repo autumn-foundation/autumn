@@ -674,7 +674,7 @@ This checks:
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
 | `route-attribution` | Every plugin route carries `plugin:<your-name>` source |
-| `route-prefix` | Every plugin route lives under the declared prefix |
+| `route-prefix` | Every plugin route lives under the declared prefix, or is declared as an intentional root route via `--intentional-root PATH` (repeatable; exact path match) |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
 | `duplicate-registration` | No plugin route appears more than once, which would indicate the plugin was installed twice |
