@@ -388,8 +388,11 @@ pub(crate) enum HostOutcome {
     /// "still on the new release, roll it back", which is both untrue here (the app
     /// is gone) and impossible (a first deploy has no previous release).
     CompensatedTeardownRouteFailed {
-        /// Label of the step that failed — always `"proxy-deregister"` today, kept
-        /// as the step label for the same reason every other outcome carries one.
+        /// Label of the step that failed — `"proxy-deregister"` for an ordinary
+        /// remote failure, or `"ssh-transport"` when the local `ssh` launch
+        /// itself died. Either way this outcome only happens when the route
+        /// removal (this driver's own, separate call) is the ONE thing that
+        /// failed, so the label always names that attempt, never an earlier one.
         failed_step: &'static str,
     },
     /// Fleet compensation was attempted on this host and FAILED — it is still on

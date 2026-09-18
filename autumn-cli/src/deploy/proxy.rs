@@ -1037,16 +1037,33 @@ fn assess_kamal_proxy_deploy_help(
 
 /// Whether `remove_part` — the `remove --help` half split off
 /// [`PROBE_REMOVE_HELP_DELIM`] — is POSITIVE evidence that the `remove`
-/// subcommand still renders its own help (issue #2270): its `Usage:` line names
+/// subcommand still renders its own help (issue #2270): a `Usage:` line naming
 /// `remove` itself, e.g. `kamal-proxy remove SERVICE [flags]`. Checking for a
 /// rendered Usage line, rather than only the ABSENCE of a cobra error, is
 /// deliberate: `remove` has no flag [`output_lists_flag`] can check, so a blank
 /// capture, a truncated one, or an error this function does not recognise must
 /// all fail closed exactly like a recognised `unknown command "remove"` does —
 /// proof of compatibility, not merely an absence of one specific complaint.
+///
+/// A bare `contains("kamal-proxy remove")` is NOT enough: an error like `kamal-
+/// proxy remove is unsupported` contains that same text without proving
+/// anything rendered. So this requires the STRUCTURE too — `kamal-proxy remove`
+/// appearing shortly AFTER a `Usage:` label, the shape cobra's own help always
+/// takes and a bare error string does not.
 fn remove_help_renders(remove_part: &str) -> bool {
-    remove_part
-        .to_ascii_lowercase()
+    let lower = remove_part.to_ascii_lowercase();
+    let Some(usage_at) = lower.find("usage:") else {
+        return false;
+    };
+    // The command line naming `remove` follows immediately (same or next
+    // line); a short fixed window keeps a LATER, unrelated mention of "remove"
+    // (e.g. in a flag's description) from ever satisfying this by accident.
+    // Bounded by CHARS, not bytes, so this can never panic on a multi-byte
+    // boundary in whatever text a real (or adversarial) binary prints.
+    lower[usage_at..]
+        .chars()
+        .take(80)
+        .collect::<String>()
         .contains("kamal-proxy remove")
 }
 
@@ -1868,6 +1885,23 @@ mod tests {
         );
         assert_eq!(
             KamalProxyController::new(60).assess_deploy_help(&unrecognised),
+            Err(KamalProxyCompatIssue::RemoveSubcommandMissing),
+        );
+    }
+
+    #[test]
+    fn a_bare_mention_of_remove_without_a_usage_line_is_not_proof() {
+        // Issue #2270 (Codex review): `kamal-proxy remove` can appear in an ERROR
+        // message too (e.g. a wrapper reporting the subcommand is unsupported),
+        // so a bare substring match would wrongly pass this. Real help always
+        // renders a `Usage:` line; an error alone never does.
+        let output = format!(
+            "{}---autumn-kamal-proxy-remove-help---\
+             Error: kamal-proxy remove is unsupported\n",
+            sample_deploy_help_only(),
+        );
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&output),
             Err(KamalProxyCompatIssue::RemoveSubcommandMissing),
         );
     }

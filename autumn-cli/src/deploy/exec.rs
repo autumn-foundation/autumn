@@ -1215,25 +1215,18 @@ pub fn candidate_teardown_ops(
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
 ///
-/// `deregister` is `Some(op)` ONLY when the proxy route this first deploy
-/// installed is actually live — the fleet compensation case (issue #2270),
-/// where the driver passes [`super::proxy::ProxyController::deregister_op`]. It
-/// runs BEFORE the advisory last-deploy marker write, so a failed deregister is
-/// reported, not masked. Every op before it in this list has already run when
-/// it fails, so the caller knows the app itself is gone and only the route is
-/// stuck — the fleet driver reports that exact case as its own outcome
-/// (`HostOutcome::CompensatedTeardownRouteFailed` in `fleet.rs`), and still
-/// records the marker itself with [`first_deploy_torn_down_marker_op`], since
-/// the write here never ran. `None` for the pre-go-live path in
-/// [`execute_first_deploy`]: that boundary is the health-gated `proxy-route` op
-/// itself, so a failure there means the route was never established and there
-/// is nothing to remove.
+/// Builds ONLY the app-teardown chain — never the proxy route. The fleet
+/// compensation case (issue #2270) removes the route as its OWN, separate step
+/// after this succeeds; see
+/// [`compensate_teardown`](crate::deploy::compensate_teardown) for why: folding
+/// it in here would let a transport failure on the route step (which carries no
+/// op label at all) masquerade as an ordinary op failure earlier in this chain,
+/// when in truth every op here would already have succeeded.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
     release_id: &str,
     plan: &SlotPlan,
-    deregister: Option<DeployOp>,
 ) -> Vec<DeployOp> {
     let mut ops = candidate_teardown_ops(cfg, release_id, plan);
     ops.push(DeployOp::Run(RemoteCommand::new(
@@ -1248,28 +1241,15 @@ pub fn first_deploy_teardown_ops(
             shell_quote(&previous_release_marker(cfg)),
         ),
     )));
-    if let Some(op) = deregister {
-        ops.push(op);
-    }
     // AC-6: correct the last-deploy marker the first deploy already wrote, so a
     // host with nothing installed can never report a successful deploy. LAST, and
     // advisory — see this function's doc comment for why both matter and why the
     // marker is rewritten rather than removed.
-    ops.push(first_deploy_torn_down_marker_op(cfg));
-    ops
-}
-
-/// The advisory `shared/last-deploy` write [`first_deploy_teardown_ops`] runs
-/// LAST, exposed so the fleet driver can also run it on its own (issue #2270):
-/// when `deregister` is the step that failed, every op before it already ran —
-/// the app is gone — so the record must still say `torn down` even though
-/// [`run_ops`] stopped before reaching this op in the main sequence.
-#[must_use]
-pub fn first_deploy_torn_down_marker_op(cfg: &ResolvedDeployConfig) -> DeployOp {
-    DeployOp::Run(RemoteCommand::new(
+    ops.push(DeployOp::Run(RemoteCommand::new(
         "teardown-last-deploy",
         record_last_deploy_fragment(cfg, LAST_DEPLOY_TORN_DOWN),
-    ))
+    )));
+    ops
 }
 
 /// The previous release an on-demand rollback repoints to, resolved from the
@@ -5860,7 +5840,7 @@ mod tests {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let exec = RecordingExecutor::failing_on("readiness-gate");
         let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
         let err = execute_first_deploy(&checks, &ops, &teardown, &exec)
@@ -5896,7 +5876,7 @@ mod tests {
         // takes the redeploy path with nothing serving.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
         // It is a superset of the candidate teardown, PLUS the marker cleanup, PLUS
         // the `torn down` last-deploy record (#1621 audit gap G3) — see
@@ -5935,45 +5915,17 @@ mod tests {
     }
 
     #[test]
-    fn first_deploy_teardown_deregisters_the_proxy_route_before_the_marker() {
-        // Issue #2270: the fleet compensation path passes the deregister op so a
-        // compensated host stops answering rather than answering 502. It must run
-        // BEFORE the advisory `teardown-last-deploy` write — a failed deregister
-        // is a real op failure, and `run_ops` stopping there must leave the
-        // marker at its last TRUE value (see the function's own doc comment).
+    fn first_deploy_teardown_never_touches_the_proxy_route() {
+        // Issue #2270: the proxy route is removed as its OWN separate step by
+        // the fleet driver (`compensate_teardown`), never folded into this app-
+        // only chain — see the function's own doc comment for why.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let deregister = DeployOp::Run(RemoteCommand::new(
-            "proxy-deregister",
-            "kamal-proxy remove 'myapp'".to_owned(),
-        ));
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, Some(deregister));
-        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "teardown-candidate-unit",
-                "teardown-candidate-dir",
-                "teardown-current-symlink",
-                "teardown-slot-markers",
-                "proxy-deregister",
-                "teardown-last-deploy",
-            ],
-            "the deregister op must sit right before the advisory marker write: {labels:?}"
-        );
-    }
-
-    #[test]
-    fn first_deploy_teardown_without_a_deregister_op_is_unchanged() {
-        // `None` (the pre-go-live path) must not add anything or change the shape
-        // that predates issue #2270.
-        let cfg = resolved();
-        let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
         assert!(
-            !labels.contains(&"proxy-deregister"),
-            "no deregister op without one passed in: {labels:?}"
+            !labels.iter().any(|l| l.contains("proxy")),
+            "this chain must never run a proxy op: {labels:?}"
         );
     }
 
@@ -5990,7 +5942,7 @@ mod tests {
         // down, on purpose, at this time.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan, None);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let exec = RecordingExecutor::new();
         run_teardown(&teardown, &exec);
 
