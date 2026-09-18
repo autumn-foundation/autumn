@@ -420,7 +420,7 @@ def is_paragraph(line):
     return True
 
 
-def rendered(title):
+def rendered(title, defined=None):
     """A heading's visible text: what a renderer shows, not its source.
 
     A link's DESTINATION is markup, not words on the page — a reader sees
@@ -441,10 +441,19 @@ def rendered(title):
     tag in a heading (none in the corpus) would need code-span-aware handling
     before anything is removed.
     """
-    return _unlink(title).strip()
+    return _unlink(title, defined).strip()
 
 
-def _unlink(text):
+def ref_label(text):
+    """A reference label in the form CommonMark compares them by.
+
+    Case-folded, with internal whitespace collapsed, so `[Secret  Logger]`
+    and `[secret logger]` name the same definition.
+    """
+    return ' '.join(text.split()).casefold()
+
+
+def _unlink(text, defined=None):
     """Replace every `[label](dest)`, `![alt](src)` and `[label][ref]` with
     its label, leaving everything else untouched.
 
@@ -456,6 +465,12 @@ def _unlink(text):
     parentheses in a destination, and a backslash escapes either. Counting
     depth handles every valid destination at once instead of adding an
     epicycle per counter-example.
+
+    `defined` is the set of reference labels the page actually defines. A
+    `[label][ref]` with no definition is NOT a link — CommonMark renders the
+    whole construct literally — so reducing it to `label` deletes words a
+    reader can see. `None` means "no page context", and then a reference is
+    assumed to resolve.
     """
     out, i, n = [], 0, len(text)
     while i < n:
@@ -538,15 +553,20 @@ def _unlink(text):
                         # Reducing it to `Overview` deleted visible text from
                         # the index — the mirror image of indexing invisible
                         # text, and a MISS on a heading that matches by eye.
-                        out.append(_unlink(label))
+                        out.append(_unlink(label, defined))
                         i = k
                         continue
                 elif j < n and text[j] == '[':       # reference: [label][ref]
                     k = text.find(']', j + 1)
                     if k != -1:
-                        out.append(_unlink(label))
-                        i = k + 1
-                        continue
+                        # `[label][]` is the collapsed form: the label is its
+                        # own reference. An UNDEFINED reference is not a link
+                        # at all, so it falls through and renders verbatim.
+                        ref = text[j + 1:k] or label
+                        if defined is None or ref_label(ref) in defined:
+                            out.append(_unlink(label, defined))
+                            i = k + 1
+                            continue
         out.append(ch)
         i += 1
     return ''.join(out)
@@ -581,7 +601,13 @@ def index():
             continue
         text = (ROOT / rel).read_text(encoding='utf-8')
         slug = pathlib.PurePath(rel).stem
-        h1, headings = '', []
+        # Headings are collected RAW and rendered after the page, because
+        # whether `[Overview][ref]` is a link depends on a definition that may
+        # sit below the heading that uses it. Rendering as we go would have to
+        # guess, and guessing "it resolves" deletes visible words.
+        raw_headings = []        # (level, source text)
+        defined = set()          # reference labels this page defines
+        pending_label = None
         fence = None            # (delimiter run, owning quote depth)
         comment = False
         comment_depth = 0
@@ -834,13 +860,10 @@ def index():
                     # one indexed "logger" for a heading that reads "Secret
                     # runtime logger" — a false negative that would fail CI on
                     # nothing worse than a rewrap.
-                    title = rendered(' '.join(l.strip() for l in para))
+                    raw = ' '.join(l.strip() for l in para)
                     para = []
-                    if title:
-                        if under.group(1)[0] == '=' and not h1:
-                            h1 = title
-                        else:
-                            headings.append(title)
+                    raw_headings.append((1 if under.group(1)[0] == '=' else 2,
+                                         raw))
                     continue
 
             # `is_heading` gates only the ATX path: it is what stops
@@ -866,7 +889,10 @@ def index():
                                                        body.strip())
                     if consumed:
                         # The first consumed line is the destination, so the
-                        # definition is real and its label line invisible.
+                        # definition is real and its label line invisible —
+                        # and the label is now defined for the whole page.
+                        if defn_head is not None and pending_label is not None:
+                            defined.add(pending_label)
                         defn_head = None
                         para = []
                         continue
@@ -883,9 +909,16 @@ def index():
                         # is one paragraph carrying both.
                         para = [defn_head]
                         defn_head = None
-                head = re.match(r'^ {0,3}\[[^\]]*\]:\s*$', body)
+                head = re.match(r'^ {0,3}\[([^\]]*)\]:\s*$', body)
                 pending_defn = 'dest' if head else False
                 defn_head = body if head else None
+                pending_label = ref_label(head.group(1)) if head else None
+                # The one-line form defines a label too, and its destination
+                # has to be legal for the same reason: `[a]: not a url` is a
+                # paragraph, and a `[x][a]` elsewhere stays literal text.
+                one_line = re.match(r'^ {0,3}\[([^\]]*)\]:\s*(\S.*)$', body)
+                if one_line and _after_dest(one_line.group(2).strip()) is not None:
+                    defined.add(ref_label(one_line.group(1)))
                 if is_paragraph(body) and not is_heading and not pending_defn:
                     para.append(body)
                     para_depth = depth
@@ -893,7 +926,10 @@ def index():
                     para = []       # a blank line or a block ends the paragraph
                 continue
             para = []
-            level, title = len(m.group(1)), rendered(m.group(2))
+            raw_headings.append((len(m.group(1)), m.group(2)))
+        h1, headings = '', []
+        for level, raw in raw_headings:
+            title = rendered(raw, defined)
             if not title:
                 continue
             if level == 1 and not h1:
@@ -1912,7 +1948,34 @@ self_test() {
     > "$c104/scripts/docs-retrieval-questions.tsv"
   check "a quoted comment still hides its contents" fail "$c104"
 
-  # 105. A comment line and a blank line in the fixture are skipped.
+  # 105. An UNRESOLVED reference is not a link: CommonMark renders the whole
+  #      construct, so every word of it is on the page and in the index.
+  local c105="$tmp/c105"; make_corpus "$c105"
+  printf '# Page\n\n## [Overview][secret-runtime-logger]\n' \
+    > "$c105/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c105/scripts/docs-retrieval-questions.tsv"
+  check "an unresolved reference is visible text" pass "$c105"
+
+  # 106. …and a RESOLVED one is still reduced to its label, wherever on the
+  #      page the definition sits. The control on 105.
+  local c106="$tmp/c106"; make_corpus "$c106"
+  printf '# Page\n\n## [Overview][secret-runtime-logger]\n\n[secret-runtime-logger]: /x.md\n' \
+    > "$c106/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c106/scripts/docs-retrieval-questions.tsv"
+  check "a resolved reference is still dropped" fail "$c106"
+
+  # 107. A definition whose destination is not one defines nothing, so the
+  #      reference using it stays visible text.
+  local c107="$tmp/c107"; make_corpus "$c107"
+  printf '# Page\n\n## [Overview][secret-runtime-logger]\n\n[secret-runtime-logger]: not a url\n' \
+    > "$c107/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c107/scripts/docs-retrieval-questions.tsv"
+  check "a bad definition does not resolve a reference" pass "$c107"
+
+  # 108. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

@@ -125,10 +125,15 @@ ORDERS_PREV=$(curl -sX PUT "$LOGGERS/my_app::orders" \
 # Put each back to exactly what it was — but only to a level this endpoint
 # accepts. See below for when it is not one.
 restore() {                       # restore <logger> <level>
-  case "$2" in
+  # `previous` comes back in the casing `[log] level` was written in, and
+  # `INFO` is as valid there as `info`. Fold it before matching — and send
+  # the folded form, which is what the endpoint does with it anyway.
+  local lvl
+  lvl=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  case "$lvl" in
     trace|debug|info|warn|error)
       curl -sX PUT "$LOGGERS/$1" \
-        -H 'content-type: application/json' -d "{\"level\":\"$2\"}" ;;
+        -H 'content-type: application/json' -d "{\"level\":\"$lvl\"}" ;;
     *) echo "cannot restore $1 to '$2' over HTTP — see below" ;;
   esac
 }
@@ -150,13 +155,19 @@ them** — so there are configurations this API cannot put back at all:
 
 | What `previous` holds | When | Restorable over HTTP? |
 |---|---|---|
-| `trace`/`debug`/`info`/`warn`/`error` | the usual case | yes |
+| `trace`/`debug`/`info`/`warn`/`error` | the usual case — in **whatever casing `[log] level` used** | yes, once folded to lower case |
 | `""` | `[log] level` names only targets (`"my_app=debug"`), so there is no global directive | **no** — and there is no way to set it back to "unset" either |
 | `off` | `[log] level = "off"` | **no** — `off` is valid at startup and rejected by this endpoint |
 | `null` | a target with no override of its own | **no** — there was no level to go back to; see below for what to send instead |
 
 `""` and `off` mean the same thing in practice: **restart to clear it.**
 `null` is the one row with a way forward, and it is below.
+Casing is why `restore` folds before it matches. `[log] level` accepts a
+level in any casing and stores it as written, so `level = "INFO"` makes
+`previous` come back as `INFO` — a perfectly restorable level that a
+case-sensitive test would send to the "cannot restore" branch, leaving the
+logger raised while the summary below says it was put back.
+
 Guarding on the accepted set rather than on "is it empty" is deliberate:
 `off` was the second value to turn up this way and `null` the third, and a
 membership test absorbed both without growing a branch for either.
