@@ -102,6 +102,38 @@ STOPWORDS = {
 }
 
 
+def uncomment(line, in_comment):
+    """Split one line into what a renderer shows, and the comment state after.
+
+    Scanned, not substring-tested, for the reason `_unlink` is: `'-->' in line`
+    answers "did a comment close somewhere" when the question is "what is the
+    state at the END of this line". `--> <!-- another` does both, and reporting
+    only the close hides the next line's heading from the index while the gate
+    still calls it visible.
+
+    One function for both directions, so the in-comment and out-of-comment
+    paths cannot disagree again — they had to be kept in step by hand before,
+    and were not.
+    """
+    out, i, n = [], 0, len(line)
+    while i < n:
+        if in_comment:
+            k = line.find('-->', i)
+            if k == -1:
+                break                      # comment runs past this line
+            in_comment = False
+            i = k + 3
+        else:
+            k = line.find('<!--', i)
+            if k == -1:
+                out.append(line[i:])
+                break
+            out.append(line[i:k])
+            in_comment = True
+            i = k + 4
+    return ''.join(out), in_comment
+
+
 def rendered(title):
     """A heading's visible text: what a renderer shows, not its source.
 
@@ -235,11 +267,13 @@ def index():
             # fixture row names — so the false positive lands on the EXPECTED
             # page and the gate passes while the reader still finds nothing.
             if comment:
-                # Only the close matters; a line that begins inside a comment
-                # cannot start a heading, and a `#` after a mid-line `-->` is
-                # not at the start of the line, so it is not one either.
-                if '-->' in line:
-                    comment = False
+                # A line that BEGINS inside a comment can start no heading:
+                # a `#` after a mid-line `-->` is not at the start of the
+                # line. But the state still has to be carried correctly
+                # across it, because `--> <!-- another` both closes and
+                # reopens, and treating that as "closed" would index the
+                # next line's hidden heading.
+                _, comment = uncomment(line, True)
                 continue
 
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
@@ -269,18 +303,12 @@ def index():
             if fence is not None:
                 continue
 
-            # Outside a fence: drop complete `<!-- … -->` spans, and if an
-            # unterminated one is left, the comment runs on past this line.
-            # The STRIPPED line is what gets indexed, not the original: a
-            # renderer shows `# Page <!-- Secret runtime logger -->` as
-            # "Page", so indexing the comment's words would let a row pass
-            # on text no reader sees — the multi-line case with the whole
-            # comment on one line.
-            if '<!--' in line:
-                line = re.sub(r'<!--.*?-->', '', line)
-                if '<!--' in line:
-                    comment = True
-                    continue
+            # Outside a fence: what a renderer would show of this line, and
+            # whether a comment is left open past it. The VISIBLE text is
+            # what gets indexed, so `# Page <!-- Secret runtime logger -->`
+            # contributes "Page" and nothing else — and `# Page <!-- note`
+            # still contributes "Page" even though the comment runs on.
+            line, comment = uncomment(line, False)
 
             m = re.match(r'^(#{1,6})\s+(.*\S)\s*$', line)
             if not m:
@@ -609,7 +637,34 @@ self_test() {
     > "$c24/scripts/docs-retrieval-questions.tsv"
   check "an unclosed bracket does not swallow the heading" pass "$c24"
 
-  # 25. A comment line and a blank line in the fixture are skipped.
+  # 25. A comment that closes and REOPENS on the same line is still open:
+  #     `--> <!-- second` must hide the heading on the next line.
+  local c25="$tmp/c25"; make_corpus "$c25"
+  printf '# Page\n\n\u003c!--\nfirst\n--\u003e \u003c!-- second\n# Secret runtime logger\n--\u003e\n' \
+    > "$c25/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c25/scripts/docs-retrieval-questions.tsv"
+  check "a comment reopened on a closing line stays open" fail "$c25"
+
+  # 26. Two complete comments on one line leave it CLOSED — the scanner must
+  #     not treat the second opener as unterminated.
+  local c26="$tmp/c26"; make_corpus "$c26"
+  printf '# Page\n\n\u003c!-- a --\u003e \u003c!-- b --\u003e\n\n## Secret runtime logger\n' \
+    > "$c26/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c26/scripts/docs-retrieval-questions.tsv"
+  check "two complete comments on a line leave it closed" pass "$c26"
+
+  # 27. A heading BEFORE an unterminated comment on the same line is visible,
+  #     so its words are indexed even though the comment runs on.
+  local c27="$tmp/c27"; make_corpus "$c27"
+  printf '# Page\n\n## Secret runtime logger \u003c!-- note\n--\u003e\n' \
+    > "$c27/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c27/scripts/docs-retrieval-questions.tsv"
+  check "text before an unterminated comment is indexed" pass "$c27"
+
+  # 28. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
