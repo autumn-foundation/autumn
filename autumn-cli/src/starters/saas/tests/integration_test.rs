@@ -450,6 +450,93 @@ async fn tenants_are_isolated() {
     );
 }
 
+/// An out-of-range project name (empty, or over 200 characters, checked after
+/// trimming) used to bounce `POST /dashboard/projects` to the framework's
+/// generic error page, dropping the user off the project list and discarding
+/// what they had typed. It now redisplays the dashboard inline (HTTP 200)
+/// with exactly what the user submitted still in the field — not the trimmed
+/// value the length check itself uses, which would silently blank out a
+/// whitespace-only submission (Codex review finding on this PR) — the error
+/// adjacent to the form, and the existing project list intact (Wayfinder:
+/// error-path inventory — 0/1 failure modes cleared the bar before this fix,
+/// 1/1 after).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_project_failure_redisplays_the_dashboard_with_name_preserved() {
+    let client = db_client().await;
+    let cookie = signup(&client, "founder@acme.test").await;
+
+    // A prior project, so the redisplay-on-failure assertion below also
+    // proves the list survived the rejected submission rather than being
+    // dropped along with the form.
+    client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form("name=Existing")
+        .send()
+        .await
+        .assert_status(303);
+
+    // Empty name (after trimming whitespace).
+    let resp = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form("name=%20%20%20")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(
+        resp.text()
+            .contains("Project name must be between 1 and 200 characters"),
+        "expected the length-validation error in the re-rendered dashboard, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("Existing"),
+        "expected the existing project list to survive the rejected submission, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains(r#"value="   ""#),
+        "expected the raw (untrimmed) whitespace-only submission to be preserved verbatim \
+         in the re-rendered field rather than silently blanked by the length check's own \
+         trimming, got: {}",
+        resp.text()
+    );
+
+    // Over-long name.
+    let long_name = "x".repeat(201);
+    let resp = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&format!("name={long_name}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(
+        resp.text()
+            .contains("Project name must be between 1 and 200 characters")
+    );
+    assert!(
+        resp.text().contains(&format!(r#"value="{long_name}""#)),
+        "expected the rejected name to be preserved in the re-rendered field, got: {}",
+        resp.text()
+    );
+
+    // No project was created by either rejected submission.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    assert!(
+        dashboard.text().contains("1 total"),
+        "a rejected submission must not create a project, got: {}",
+        dashboard.text()
+    );
+}
+
 /// AC8 (issue #1397): the whole persistent remember-me lifecycle, under the
 /// grace-window rotation model —
 ///   1. `POST /login` with `remember=on` sets BOTH a session cookie and a
