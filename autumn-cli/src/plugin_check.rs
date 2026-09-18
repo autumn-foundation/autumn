@@ -162,6 +162,14 @@ pub struct PluginCheckOptions<'a> {
     pub plugin_name: &'a str,
     /// Expected URL prefix for plugin routes (e.g. `"/admin"`).
     pub expected_prefix: Option<&'a str>,
+    /// Paths intentionally served at the root level, exempt from the
+    /// route-prefix check (exact path match). The CLI-side spelling of the
+    /// library API's `ConformanceConfig::intentional_root_routes`
+    /// (issue #2828): a route the library harness can declare via
+    /// `.intentional_root_route(...)` must be declarable to
+    /// `autumn plugin-check` as well, or the CLI reports a false
+    /// `route-prefix` FAIL for the same route the crate's own test passes.
+    pub intentional_root_routes: &'a [String],
     /// Declared sensitive routes with their auth mechanisms.
     pub sensitive_routes: &'a [SensitiveRouteDecl],
     /// Output format.
@@ -227,6 +235,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
             bin: opts.bin,
             plugin_name: opts.plugin_name,
             expected_prefix: opts.expected_prefix,
+            intentional_root_routes: opts.intentional_root_routes,
             sensitive_routes: opts.sensitive_routes,
             format: opts.format.clone(),
             contracts: &contracts,
@@ -272,7 +281,12 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     checks.push(check_route_attribution(opts.plugin_name, routes));
 
     if let Some(prefix) = opts.expected_prefix {
-        checks.push(check_route_prefix(opts.plugin_name, prefix, routes));
+        checks.push(check_route_prefix(
+            opts.plugin_name,
+            prefix,
+            opts.intentional_root_routes,
+            routes,
+        ));
     }
 
     checks.push(check_collisions(routes));
@@ -618,7 +632,18 @@ fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResu
     }
 }
 
-fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> CheckResult {
+/// Check that all plugin routes live under `prefix`.
+///
+/// Routes listed in `intentional_root` (exact path match) are exempt — the
+/// same exemption the library API's `check_route_prefix` grants via
+/// `ConformanceConfig::intentional_root_routes` (issue #2828).
+/// Returns `Skip` when no routes are attributed to the plugin.
+fn check_route_prefix(
+    plugin_name: &str,
+    prefix: &str,
+    intentional_root: &[String],
+    routes: &[RouteInfo],
+) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
@@ -635,7 +660,7 @@ fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> 
         .iter()
         .filter(|r| {
             let p = &r.path;
-            p != prefix && !p.starts_with(&format!("{prefix}/"))
+            p != prefix && !p.starts_with(&format!("{prefix}/")) && !intentional_root.contains(p)
         })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
@@ -651,7 +676,10 @@ fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> 
         CheckResult {
             name: "route-prefix".to_owned(),
             status: CheckStatus::Fail,
-            message: format!("{} route(s) not under prefix {prefix}", off_prefix.len()),
+            message: format!(
+                "{} route(s) not under prefix {prefix} and not declared as intentional root routes",
+                off_prefix.len()
+            ),
             diagnostics: off_prefix,
         }
     }
@@ -1290,6 +1318,7 @@ mod tests {
             bin: None,
             plugin_name: "test",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
@@ -1307,6 +1336,7 @@ mod tests {
             bin: None,
             plugin_name: "test",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
@@ -1323,6 +1353,7 @@ mod tests {
             bin: None,
             plugin_name: "admin",
             expected_prefix: Some("/admin"),
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
@@ -1333,6 +1364,99 @@ mod tests {
         assert!(report.checks.iter().any(|c| c.name == "route-prefix"));
     }
 
+    /// A root-level route the operator declared via `--intentional-root` is
+    /// exempt from the prefix check (issue #2828): the CLI must not fail
+    /// what the library API's `.intentional_root_route(...)` lets pass.
+    #[test]
+    fn build_report_exempts_declared_intentional_root_routes() {
+        let declared = vec!["/webhook".to_owned()];
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &declared,
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+        };
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("POST", "/webhook", "plugin:admin"),
+        ];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.diagnostics.is_empty());
+    }
+
+    /// The exemption is an exact-path match, like the library's: declaring
+    /// `/webhook2` does not cover `/webhook`.
+    #[test]
+    fn build_report_intentional_root_exemption_is_exact() {
+        let declared = vec!["/webhook2".to_owned()];
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &declared,
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+        };
+        let routes = vec![make_route("POST", "/webhook", "plugin:admin")];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.diagnostics.iter().any(|d| d.contains("/webhook")));
+        assert!(
+            check
+                .message
+                .contains("not declared as intentional root routes"),
+            "fail message names the exemption: {check:?}"
+        );
+    }
+
+    /// Without any declaration, an off-prefix route still fails — the new
+    /// exemption must not silently widen the check.
+    #[test]
+    fn build_report_off_prefix_route_still_fails_without_declaration() {
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &[],
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+        };
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("POST", "/webhook", "plugin:admin"),
+        ];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.diagnostics.iter().any(|d| d.contains("/webhook")));
+    }
+
     #[test]
     fn build_report_plugin_name_in_report() {
         let opts = PluginCheckOptions {
@@ -1340,6 +1464,7 @@ mod tests {
             bin: None,
             plugin_name: "autumn-admin-plugin",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
@@ -1365,6 +1490,7 @@ mod contract_tests {
             bin: None,
             plugin_name: "autumn-plugin-demo",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
             contracts,
