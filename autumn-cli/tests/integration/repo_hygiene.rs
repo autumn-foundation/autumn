@@ -653,6 +653,27 @@ fn changelog_notes_are_written_as_fragments() {
         root.join("scripts/update-changelog.sh").is_file(),
         "scripts/update-changelog.sh folds the fragments in at release time",
     );
+
+    // The splice in scripts/lib/changelog.sh carries whole markdown files
+    // between stages. `awk -v` carries a value in ONE line: the BSD awk on
+    // macOS rejects a newline in a `-v` assignment ("awk: newline in string"),
+    // which failed the macOS test leg while every Linux leg passed.
+    // Comments are skipped: the rule is written down beside the code it
+    // governs, and a test that reads its own explanation as a violation
+    // teaches the next author to delete the explanation.
+    let lib = std::fs::read_to_string(root.join("scripts/lib/changelog.sh"))
+        .expect("read scripts/lib/changelog.sh");
+    let offenders: Vec<&str> = lib
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("awk -v"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "scripts/lib/changelog.sh must not pass changelog text through an awk \
+         `-v` assignment — a newline in one kills the one-true-awk on macOS:\n{}",
+        offenders.join("\n"),
+    );
 }
 
 #[test]

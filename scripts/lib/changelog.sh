@@ -95,7 +95,7 @@ changelog_fragment_body() {
 #
 # Usage: changelog_view [ref]
 changelog_view() {
-  local ref="${1-}" changelog="" fragments="" path body
+  local ref="${1-}" changelog="" fragments="" path body heading_line
 
   if [[ -z "$ref" ]]; then
     [[ -f "$CHANGELOG_FILE" ]] && changelog="$(cat "$CHANGELOG_FILE")"
@@ -115,20 +115,28 @@ changelog_view() {
     return 0
   fi
 
-  if ! grep -qE '^##[[:space:]]+\[Unreleased\]' <<<"$changelog"; then
+  # The splice is line arithmetic, not awk. A fragment is many lines, and
+  # `awk -v` carries data in ONE line: the BSD awk on macOS rejects a newline
+  # in a `-v` assignment outright ("awk: newline in string"), which failed the
+  # macOS leg of the test job while every Linux leg passed.
+  #
+  # Every stage below reads its whole input. `grep -m1`, `head` and `tail -n1`
+  # each close the pipe early, and under `set -o pipefail` — which every caller
+  # sets — the SIGPIPE that kills the upstream `printf` fails the pipeline that
+  # just succeeded.
+  heading_line="$(
+    printf '%s\n' "$changelog" |
+      grep -n -E '^##[[:space:]]+\[Unreleased\]' |
+      cut -d: -f1 |
+      sed -n 1p
+  )" || heading_line=""
+
+  if [[ -z "$heading_line" ]]; then
     printf '## [Unreleased]\n\n%s%s\n' "$fragments" "$changelog"
     return 0
   fi
 
-  awk -v fragments="$fragments" '
-    { sub(/\r$/, "") }
-    /^##[[:space:]]+\[Unreleased\]/ && !spliced {
-      print
-      print ""
-      printf "%s", fragments
-      spliced = 1
-      next
-    }
-    { print }
-  ' <<<"$changelog"
+  printf '%s\n' "$changelog" | sed -n "1,${heading_line}p"
+  printf '\n%s' "$fragments"
+  printf '%s\n' "$changelog" | sed -n "$((heading_line + 1)),\$p"
 }
