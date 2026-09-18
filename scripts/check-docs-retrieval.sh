@@ -520,8 +520,14 @@ def is_paragraph(line):
     if line.startswith('    ') or line.startswith('\t'):
         return False            # indented code
     stripped = line.lstrip(' ')
-    if stripped.startswith(('>', '|', '<')):
-        return False            # block quote, table row, raw HTML
+    if stripped.startswith(('>', '|')):
+        return False            # block quote, table row
+    # A leading `<` is NOT rejected. Every raw-HTML block start condition —
+    # all seven — is tested before this is reached, and each one claims its
+    # line there. What arrives here beginning with `<` is therefore a line
+    # that matched none of them, which in CommonMark is ordinary text:
+    # `<Secret runtime logger` is an incomplete tag, so it renders as those
+    # three words and a `---` under it makes them a heading.
     if re.match(r'^([-*+_])\s', stripped):
         return False            # bullet list item
     if re.match(r'^\d+[.)]\s', stripped):
@@ -2378,7 +2384,25 @@ self_test() {
     > "$c135/scripts/docs-retrieval-questions.tsv"
   check "an open comment still hides its contents" fail "$c135"
 
-  # 136. A comment line and a blank line in the fixture are skipped.
+  # 136. A line beginning with `<` that opens no HTML block is ordinary
+  #      text: an INCOMPLETE tag renders as the words it is made of.
+  local c136="$tmp/c136"; make_corpus "$c136"
+  printf '# Page\n\n<Secret runtime logger\n---\n' \
+    > "$c136/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c136/scripts/docs-retrieval-questions.tsv"
+  check "an incomplete tag is setext text" pass "$c136"
+
+  # 137. …while a COMPLETE one opens a type-7 block, and what follows is
+  #      inside it. The control on 136.
+  local c137="$tmp/c137"; make_corpus "$c137"
+  printf '# Page\n\n<secret-runtime-logger>\n---\n' \
+    > "$c137/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c137/scripts/docs-retrieval-questions.tsv"
+  check "a complete tag still opens a block" fail "$c137"
+
+  # 138. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
