@@ -158,7 +158,7 @@ understanding before an incident rather than during one:
   the level you want it at, normally the global one:
 
   ```bash
-  curl -sX PUT "$LOGGERS/my_app::orders" \
+  [ -n "$PREV" ] && curl -sX PUT "$LOGGERS/my_app::orders" \
     -H 'content-type: application/json' -d "{\"level\":\"$PREV\"}"
   ```
 
@@ -166,6 +166,14 @@ understanding before an incident rather than during one:
   there is no "remove" call, so the target stays *pinned* at that level and
   will not follow later changes to `root`. Only a restart clears the pin,
   since overrides live in the process.
+
+  The same `[ -n "$PREV" ]` guard, and for a sharper reason than on the
+  global restore. If there is no global directive, `$PREV` is empty — and
+  there is **no level you can send that restores this target**. The empty
+  string is a `400`, and `off`, which is what "matching nothing" amounted to,
+  is startup-only and rejected by this endpoint. So in that configuration the
+  target is stuck at `trace` until the process restarts, and the advice below
+  hardens accordingly: **restart now, not when convenient.**
 
 So the honest summary is: **lower it now, restart when convenient.** Lowering
 is what stops a trace-level firehose — potentially high-volume, and on a

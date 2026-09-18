@@ -127,10 +127,16 @@ def code_span_end(text, i):
     while j < len(text) and text[j] == '`':
         j += 1
     ticks = text[i:j]
-    close = text.find(ticks, j)
     # CommonMark closes a span with a run of EXACTLY the same length, so a
-    # longer run is not the close.
-    while close != -1 and text[close + len(ticks):close + len(ticks) + 1] == '`':
+    # candidate must be a WHOLE run: no backtick on either side of it.
+    # Checking only the character after was not enough — for a one-backtick
+    # opener and a later two-backtick run, the first candidate is rejected and
+    # `find` then returns the run's SECOND backtick, which has no backtick
+    # after it and was accepted as a closer that CommonMark does not have.
+    close = text.find(ticks, j)
+    while close != -1 and not (
+            text[close - 1:close] != '`'
+            and text[close + len(ticks):close + len(ticks) + 1] != '`'):
         close = text.find(ticks, close + 1)
     if close == -1:
         return None                        # unclosed: literal backticks
@@ -1167,7 +1173,25 @@ self_test() {
     > "$c59/scripts/docs-retrieval-questions.tsv"
   check "a real link is still reduced to its label" fail "$c59"
 
-  # 60. A comment line and a blank line in the fixture are skipped.
+  # 60. A LONGER backtick run does not close a shorter opener, so the comment
+  #     after it is a real comment and its text is not indexed.
+  local c60="$tmp/c60"; make_corpus "$c60"
+  printf '# Page\n\n## ` \u003c!-- secret runtime logger --\u003e `` tail\n' \
+    > "$c60/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c60/scripts/docs-retrieval-questions.tsv"
+  check "a longer run does not close a shorter opener" fail "$c60"
+
+  # 61. An equal-length run still closes, and the span is still literal — the
+  #     rule must not stop recognising code spans altogether.
+  local c61="$tmp/c61"; make_corpus "$c61"
+  printf '# Page\n\n## The `\u003c!--` secret runtime logger marker\n' \
+    > "$c61/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c61/scripts/docs-retrieval-questions.tsv"
+  check "an equal-length run still closes a span" pass "$c61"
+
+  # 62. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
