@@ -301,22 +301,6 @@ def _dest_end(text):
     return i if i and depth == 0 else -1
 
 
-def _after_dest(text):
-    """State after a definition's destination line, or `None` if it is not one.
-
-    Everything on this line has to belong to the definition: a destination,
-    then at most a title. Anything else and there is no definition here, the
-    same way `[foo]: /url "title" ok` is a paragraph rather than a link.
-    """
-    end = _dest_end(text)
-    if end < 0:
-        return None
-    rest = text[end:].strip()
-    if not rest:
-        return 'title?'          # a title may still begin on the next line
-    return _after_title_open(rest)
-
-
 def _is_link_target(inner):
     """Whether what a link's `(…)` holds is a legal destination and title.
 
@@ -336,29 +320,86 @@ def _is_link_target(inner):
     return not rest or _after_title_open(rest) is False
 
 
-def defn_step(state, text):
-    """One line of a multi-line link reference definition.
+def _title_runs(text, n, body_at):
+    """Follow a definition title that opens at `text[0]` from line `n` on.
 
-    Returns `(consumed, next_state)`. A definition renders as NOTHING, so a
-    CONSUMED line contributes nothing to the index. A line the definition
-    cannot contain is not consumed, and the caller processes it as ordinary
-    text — which is the whole point of returning a flag rather than swallowing
-    whatever follows. Both parts after the label are conditional: the title is
-    OPTIONAL, and the destination has to BE one. `[a]:`, ` /x`, then `Secret
-    runtime logger` over `---` is a real setext heading, and so is `[a]:` over
-    `Secret runtime logger` — where the label line is ordinary text too, since
-    without a destination there is no definition for it to be part of.
+    Returns `(closed, next_line)`. A title may span lines, so this reads
+    ahead until its closer — and a closer with anything after it does not
+    count, the way `[foo]: /url "title" ok` is a paragraph.
     """
-    if state == 'dest':
-        nxt = _after_dest(text)
-        return (False, False) if nxt is None else (True, nxt)
-    if state == 'title?':
-        opened = _after_title_open(text)
-        return (False, False) if opened is None else (True, opened)
-    # Inside a title that ran on: the closer ends it, whatever follows. Junk
-    # after it invalidates the title in CommonMark, but its earlier lines are
-    # already consumed by then, so there is nothing to hand back.
-    return True, (False if _closes_at(text, 0, state[1]) >= 0 else state)
+    closer = TITLE_CLOSER.get(text[:1])
+    if closer is None:
+        return False, n
+    end = _closes_at(text, 1, closer)
+    if end >= 0:
+        return not text[end:].strip(), n
+    while True:
+        nxt = body_at(n)
+        if nxt is None:
+            return False, n              # ran out of lines: never a title
+        n += 1
+        end = _closes_at(nxt, 0, closer)
+        if end >= 0:
+            return not nxt[end:].strip(), n
+
+
+def defn_extent(lines, i):
+    """`(label, line count)` for a link reference definition starting at
+    `lines[i]`, or `(None, 0)` if there is none.
+
+    LOOKAHEAD, deliberately, where this used to consume a line at a time and
+    hope. A definition whose destination is not a destination, or whose title
+    opens and never closes, is not a definition at all — and every line it
+    looked like it covered is paragraph text that a `---` may then turn into
+    a real heading. The incremental version had to hand those lines back, and
+    its own comment admitted the case it could not: "its earlier lines are
+    already consumed by then, so there is nothing to hand back." Deciding the
+    whole extent first means never owing anything.
+    """
+    depth, body = unquote(lines[i])
+    label, after = _defn_at(body)
+    if label is None:
+        return None, 0
+
+    def body_at(k):
+        """Line `k`'s text inside the same quote, or `None` at the end of it.
+
+        A blank line ends a definition, and so does leaving the quote that
+        holds it — neither can appear in the middle of one.
+        """
+        if k >= len(lines):
+            return None
+        d, b = unquote(lines[k])
+        return b.strip() if d == depth and b.strip() else None
+
+    n = i + 1
+    rest = body[after:].strip()
+    if not rest:                         # `[label]:` with the rest below it
+        rest = body_at(n)
+        if rest is None:
+            return None, 0
+        n += 1
+
+    end = _dest_end(rest)
+    if end < 0:
+        return None, 0
+    rest = rest[end:].strip()
+
+    if rest:
+        # A title opening on the DESTINATION's line has to close, or nothing
+        # on that line is a definition.
+        closed, n = _title_runs(rest, n, body_at)
+        return (label, n - i) if closed else (None, 0)
+
+    # A title MAY open on the next line. If it does not, or it never closes,
+    # the definition is already complete without one and those lines are not
+    # ours — CommonMark reads `[foo]: /url` over `"title" ok` as exactly that.
+    done = n - i
+    nxt = body_at(n)
+    if nxt is None:
+        return label, done
+    closed, n = _title_runs(nxt, n + 1, body_at)
+    return (label, n - i) if closed else (label, done)
 
 
 CONTAINER_MARKER = re.compile(r'^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)')
@@ -439,7 +480,7 @@ def _defn_at(text):
     return None, -1
 
 
-def is_paragraph(line, open_para=False):
+def is_paragraph(line):
     """Whether a line is paragraph text, and so can carry a setext underline.
 
     CommonMark only makes an underline a heading when what precedes it is a
@@ -461,20 +502,10 @@ def is_paragraph(line, open_para=False):
         return False            # ordered list item
     if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
         return False            # thematic break
-    if _defn_at(stripped)[0] is not None:
-        # (A bare `[label]:` with the destination on the NEXT line is handled
-        # by the caller, which has to carry state across lines.)
-        # A link-reference definition renders as NOTHING — it only defines a
-        # target for `[text][ref]` elsewhere. Treating it as setext text put
-        # its raw destination (`/secret-runtime-logger.md`) into the index as
-        # a heading, which is the invisible-text failure with yet another
-        # syntax. `rendered()` cannot help here: this is not an inline link,
-        # so there is no label to reduce it to.
-        #
-        # Unless a paragraph is already open: a definition cannot INTERRUPT
-        # one, so there it is continuation text, and the `---` under it makes
-        # a heading of both lines.
-        return open_para
+    # A line that LOOKS like a link reference definition is not rejected
+    # here. `defn_extent` has already claimed the real ones — and only the
+    # real ones, so `[a]: not a url` reaches this point as the paragraph text
+    # it renders as.
     return True
 
 
@@ -679,16 +710,15 @@ def index():
         # guess, and guessing "it resolves" deletes visible words.
         raw_headings = []        # (level, source text)
         defined = set()          # reference labels this page defines
-        pending_label = None
         fence = None            # (delimiter run, owning quote depth)
         comment = False
         comment_depth = 0
         html_block = None       # (kind, owning quote depth)
-        pending_defn = False
-        defn_head = None
+        skip = 0                # lines a definition has already claimed
         para = []
         para_depth = 0
-        for line in text.splitlines():
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
             # Every block below — a fence, a raw HTML block, a comment — ends
             # when the BLOCK QUOTE holding it ends, because none of the three
             # can be lazily continued. So each records the quote depth it
@@ -703,6 +733,14 @@ def index():
             # line. Read from the RAW line, before any comment is stripped,
             # because that is the line the container structure is made of.
             container = unquote(line)[0]
+
+            # Lines a definition already claimed. Nothing in one is visible,
+            # and nothing in one can open a block: the lookahead that claimed
+            # them checked that.
+            if skip:
+                skip -= 1
+                para = []
+                continue
             # A heading inside an HTML comment is not a heading: no renderer
             # shows it and no reader can navigate to it, so indexing one is
             # the same false positive as indexing a fenced `#` line. This
@@ -978,53 +1016,18 @@ def index():
                 # blank line ends the paragraph, so the next `---` is a
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
-                if pending_defn and body.strip():
-                    # A reference definition may spill onto following lines:
-                    # `[label]:`, then ` /url`, then an optional ` "title"`.
-                    # All of it is invisible, so none of it is paragraph text.
-                    # State clears at the first line that cannot be part of
-                    # the definition — a blank line, handled below; a closed
-                    # title; or a line where the OPTIONAL title simply is not.
-                    consumed, pending_defn = defn_step(pending_defn,
-                                                       body.strip())
-                    if consumed:
-                        # The first consumed line is the destination, so the
-                        # definition is real and its label line invisible —
-                        # and the label is now defined for the whole page.
-                        if defn_head is not None and pending_label is not None:
-                            defined.add(pending_label)
-                        defn_head = None
-                        para = []
+                # A definition renders as NOTHING, and its extent is decided
+                # in one go rather than a line at a time — see `defn_extent`.
+                # Only where no paragraph is open: a definition cannot
+                # INTERRUPT one, so after prose the same line is continuation
+                # text and the `---` under it makes a heading of both.
+                if not para:
+                    label, span = defn_extent(lines, idx)
+                    if label is not None:
+                        defined.add(ref_label(label))
+                        skip = span - 1
                         continue
-                    # Not part of the definition after all: fall through and
-                    # read this line as what it is. `para` is empty here —
-                    # entering definition state cleared it — so the setext
-                    # check above had nothing to do on this line anyway, and
-                    # the underline that follows still finds its text.
-                    if defn_head is not None:
-                        # No destination, so there was never a definition and
-                        # the LABEL line is ordinary text as well. Dropping it
-                        # would index a heading the reader does not see: what
-                        # `[Overview]:` over `Secret runtime logger` renders
-                        # is one paragraph carrying both.
-                        para = [defn_head]
-                        defn_head = None
-                # With a paragraph already open this is not a definition at
-                # all, whatever it looks like: one cannot interrupt a
-                # paragraph, so the line is continuation text.
-                label, after = (None, -1) if para else _defn_at(body)
-                rest = body[after:].strip() if label is not None else ''
-                head = label is not None and not rest
-                pending_defn = 'dest' if head else False
-                defn_head = body if head else None
-                pending_label = ref_label(label) if head else None
-                # The one-line form defines a label too, and its destination
-                # has to be legal for the same reason: `[a]: not a url` is a
-                # paragraph, and a `[x][a]` elsewhere stays literal text.
-                if rest and _after_dest(rest) is not None:
-                    defined.add(ref_label(label))
-                if is_paragraph(body, bool(para)) and not is_heading \
-                        and not pending_defn:
+                if is_paragraph(body) and not is_heading:
                     para.append(body)
                     para_depth = depth
                 else:
@@ -2225,7 +2228,44 @@ self_test() {
     > "$c123/scripts/docs-retrieval-questions.tsv"
   check "a bare label cannot interrupt a paragraph" pass "$c123"
 
-  # 124. A comment line and a blank line in the fixture are skipped.
+  # 124. A title that opens on the DESTINATION's line and never closes makes
+  #      the whole thing not a definition, so the line is visible text.
+  local c124="$tmp/c124"; make_corpus "$c124"
+  printf '# Page\n\n[foo]: /x "Secret runtime logger\n---\n' \
+    > "$c124/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c124/scripts/docs-retrieval-questions.tsv"
+  check "an unclosed title is not a definition" pass "$c124"
+
+  # 125. …and when it does close, the definition is real and invisible. The
+  #      control on 124.
+  local c125="$tmp/c125"; make_corpus "$c125"
+  printf '# Page\n\n[foo]: /x "Secret runtime logger"\n---\n' \
+    > "$c125/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c125/scripts/docs-retrieval-questions.tsv"
+  check "a closed title is still a definition" fail "$c125"
+
+  # 126. A title may SPAN lines, and every line of it is invisible. The
+  #      line-at-a-time version indexed the tail of one as prose.
+  local c126="$tmp/c126"; make_corpus "$c126"
+  printf '# Page\n\n[foo]: /x "a\nsecret runtime logger"\n---\n' \
+    > "$c126/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c126/scripts/docs-retrieval-questions.tsv"
+  check "a title spanning lines stays invisible" fail "$c126"
+
+  # 127. A title on a LATER line that never closes is not a title, but the
+  #      definition above it is still one — CommonMark reads `[foo]: /url`
+  #      over `"title" ok` as a definition and then a paragraph.
+  local c127="$tmp/c127"; make_corpus "$c127"
+  printf '# Page\n\n[foo]: /x\n"secret runtime logger\n---\n' \
+    > "$c127/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c127/scripts/docs-retrieval-questions.tsv"
+  check "an unclosed title below a definition is text" pass "$c127"
+
+  # 128. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
