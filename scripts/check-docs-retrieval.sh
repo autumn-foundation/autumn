@@ -175,6 +175,17 @@ def uncomment(line, in_comment):
         #
         # Backticks inside a comment are NOT a code span — they are comment
         # text — which is why this sits in the else branch.
+        # A BACKSLASH-escaped character is literal, and that includes a
+        # backtick: `\\`` opens no code span. `_unlink` already honoured
+        # escapes; `uncomment` did not, so the two disagreed even after they
+        # started sharing `code_span_end`. Sharing the span scanner was not
+        # enough — the decision of WHERE a span can start has to be shared
+        # too, and this is that decision.
+        if line[i] == '\\' and i + 1 < n:
+            out.append(line[i:i + 2])
+            i += 2
+            continue
+
         end = code_span_end(line, i)
         if end is not None:
             out.append(line[i:end])        # the span renders verbatim
@@ -213,7 +224,7 @@ def is_paragraph(line):
         return False            # ordered list item
     if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
         return False            # thematic break
-    if re.match(r'^\[[^\]]*\]:\s', stripped):
+    if re.match(r'^\[[^\]]*\]:', stripped):
         # A link-reference definition renders as NOTHING — it only defines a
         # target for `[text][ref]` elsewhere. Treating it as setext text put
         # its raw destination (`/secret-runtime-logger.md`) into the index as
@@ -439,6 +450,14 @@ def index():
             marker = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
+                if fence is None and run[0] == '`' and '`' in rest:
+                    # CommonMark: a BACKTICK fence's info string may not
+                    # contain a backtick, so ```` ```a`b ```` opens nothing.
+                    # Treating it as an opener suppressed every real heading
+                    # after it — a false negative with the rest of the page as
+                    # its blast radius.
+                    para = []
+                    continue
                 if fence is None:
                     # Keep the opener VERBATIM, character and length. A page
                     # documenting markdown opens with ```` so it can show a
@@ -1191,7 +1210,49 @@ self_test() {
     > "$c61/scripts/docs-retrieval-questions.tsv"
   check "an equal-length run still closes a span" pass "$c61"
 
-  # 62. A comment line and a blank line in the fixture are skipped.
+  # 62. ESCAPED backticks are literal, so they open no code span and the
+  #     comment between them is a real, invisible comment.
+  local c62="$tmp/c62"; make_corpus "$c62"
+  printf '# Page\n\n## \\`\u003c!-- secret runtime logger --\u003e\\`\n' \
+    > "$c62/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c62/scripts/docs-retrieval-questions.tsv"
+  check "escaped backticks open no code span" fail "$c62"
+
+  # 63. A link definition needs no space after the colon.
+  local c63="$tmp/c63"; make_corpus "$c63"
+  printf '# Page\n\n[Overview]:/secret-runtime-logger.md\n---\n' \
+    > "$c63/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c63/scripts/docs-retrieval-questions.tsv"
+  check "a definition with no space after the colon is not setext text" fail "$c63"
+
+  # 64. A backtick fence opener may not carry a backtick in its info string,
+  #     so it opens nothing and a LATER heading is still indexed.
+  local c64="$tmp/c64"; make_corpus "$c64"
+  printf '# Page\n\n```bad`info\n\n## Secret runtime logger\n' \
+    > "$c64/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c64/scripts/docs-retrieval-questions.tsv"
+  check "a backtick in the info string opens no fence" pass "$c64"
+
+  # 65. A VALID fence still opens and still hides what is inside it.
+  local c65="$tmp/c65"; make_corpus "$c65"
+  printf '# Page\n\n```bash\n# Secret runtime logger\n```\n' \
+    > "$c65/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c65/scripts/docs-retrieval-questions.tsv"
+  check "a valid fence still hides its contents" fail "$c65"
+
+  # 66. A tilde fence MAY carry a backtick in its info string.
+  local c66="$tmp/c66"; make_corpus "$c66"
+  printf '# Page\n\n~~~a`b\n# Secret runtime logger\n~~~\n' \
+    > "$c66/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c66/scripts/docs-retrieval-questions.tsv"
+  check "a tilde fence may carry a backtick" fail "$c66"
+
+  # 67. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
