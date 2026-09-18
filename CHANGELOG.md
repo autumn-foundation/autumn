@@ -2040,6 +2040,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `pdf_render` profiling harness; negative result, no fix:** added
+  `autumn/benches/pdf_render.rs`, driving `Pdf::from_html`/`Pdf::render`
+  over a realistic 60-row multi-page invoice (the same shape
+  `examples/invoice`'s `invoice_pdf` handler renders) through the real HTML
+  parser (`pdf::html`) and layout walker/word-wrapper/PDF writer
+  (`pdf::layout`) — the framework's HTML-to-PDF export path had no
+  committed benchmark before this. `valgrind --tool=callgrind`/`dhat`
+  profiling found the top costs are inherent to PDF generation, not
+  autumn's own code: `miniz_oxide`'s DEFLATE compressor (14.1% of
+  instructions, via `printpdf`/`lopdf`'s stream compression), glibc
+  allocator internals (~30.5%), and PDF content-stream float formatting
+  (~10.6%, `printpdf`/`lopdf` serializing text positions/widths) dominate;
+  `printpdf::PdfSaveOptions::optimize` is the only compression toggle
+  exposed, and it also prunes unreferenced objects, so flipping it changes
+  every deployed app's output size/shape — a maintainer call, not an
+  unreviewed autonomous change. Autumn's own `pdf` module code (HTML
+  parsing, glyph-width lookup, word-wrap, the layout walker) is 5.1% of
+  instructions combined, with no single function above 1.35% — under the
+  5%-of-profile bar for chasing a specific target. One hypothesis was
+  measured directly: `layout::Writer::ops` (the per-page PDF-operation
+  buffer) resets to an empty, zero-capacity `Vec` on every page via
+  `mem::take`, so `draw_word`'s per-word pushes re-climb the same
+  doubling-growth curve from scratch on every page of a multi-page
+  document; seeding each new page's buffer with the just-flushed page's
+  length as a capacity hint (consecutive pages flow at similar
+  op-per-line density) measured instructions -1.39%, DHAT allocation
+  bytes -0.80%, blocks -0.07% on this harness — real, but under both the
+  5%-of-instructions and 10%-of-allocations impact floor, so the change
+  was reverted rather than shipped. The harness itself is the lasting
+  artifact, giving `Pdf::render` its first profiling coverage.
 - **🗃️ Ledger: batch `autumn-billing`'s dunning restart re-arm into one
   round trip (insert calls N→1 per restart):** every process restart,
   `dunning::rearm_pending` re-queues every open dunning retry row. It used

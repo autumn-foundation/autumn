@@ -579,6 +579,17 @@ name = "repository_crud"
 harness = false
 required-features = ["db"]
 
+# Multi-page invoice workload for profilers, driving `Pdf::from_html`/
+# `Pdf::render` through the real HTML parser (`pdf::html`) and layout
+# walker/word-wrapper/PDF writer (`pdf::layout`) — the framework's HTML-to-PDF
+# export path (`examples/invoice`'s `invoice_pdf` handler drives the same
+# `render` call via `from_markup`). `required-features` since `pdf` is an
+# opt-in feature, unlike the other benches in this crate.
+[[bench]]
+name = "pdf_render"
+harness = false
+required-features = ["pdf"]
+
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
