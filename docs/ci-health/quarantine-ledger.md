@@ -1381,12 +1381,12 @@ without also filling in the intake form above.
   isolating experiment (e.g. asserting on `updated_at` to see which write,
   if either, actually fired), so treat the verdict as provisional per this
   role's own bar.
-- **Status**: n=2 as of 2026-09-15 (see that dated update below) — escalated
-  out of "n=1, not campaigned" per this entry's own stated trigger, a repeat
-  signature. Not yet campaigned: a same-commit rerun-rate harness is
-  recommended (see the 2026-09-15 update) but not yet built. Not
-  quarantined — the Docker sweep is unmodified and this test keeps running
-  on every sweep.
+- **Status** *(superseded — see the 2026-09-18 dated updates below for the
+  current status; kept here as the historical record of this entry's
+  escalation trigger)*: n=2 as of 2026-09-15 (see that dated update below) —
+  escalated out of "n=1, not campaigned" per this entry's own stated trigger,
+  a repeat signature. Not yet campaigned: a same-commit rerun-rate harness is
+  recommended (see the 2026-09-15 update) but not yet built.
 - **2026-09-13 update**: no repeat in the ~19h window sampled this pass
   (see the `live_upgrade` entry's dated update above for the window and
   method). Still n=1, still not campaigned.
@@ -1454,3 +1454,65 @@ without also filling in the intake form above.
   clock-step vs. the better-supported worker-refresh race) actually fired —
   each iteration's log is uploaded individually so a failing one doesn't get
   lost in a combined tail.
+
+- **2026-09-18, same day, second update — dispatched, and it has a rerun-rate
+  baseline: 1/50 (2%), same exact signature, mechanism still not
+  distinguishable from this data alone.** Once PR #2845 (the harness's own
+  merge) landed on `trunk-dev`, the harness became dispatchable per the note
+  above. First dispatch attempt (run 35364903427) failed at `actions/checkout`
+  with `git fetch` exit code 1 — a self-inflicted input error, not a harness
+  or product defect: the `sha` input was passed as a short 8-character hash
+  (`dd664e8e`), and `actions/checkout` only takes the "fetch this exact
+  commit" path for a full 40-character SHA; a short one is instead treated as
+  a ref-pattern glob (`+refs/heads/dd664e8e*:...`) that matches no branch or
+  tag and fails outright. Re-dispatched (run 35365077413) with the full SHA
+  (`dd664e8e21be34beddd5f9b27280fde1d86ab6d2`) at `iterations: "50"` and it
+  ran clean: build finished at 16:01:15Z, the 50-iteration loop finished at
+  16:03:46Z (~2.6s/iteration once the binary is built — each iteration is a
+  fresh `testcontainers` Postgres container start + the single test +
+  teardown), for a **same-commit rerun-rate baseline of 1/50 (2%)**.
+
+  **Iteration 26 failed with the identical panic text this entry's two
+  organic hits already carry**: `thread
+  'integration::job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it'
+  panicked at autumn/tests/integration/job_tracking_stores_integration.rs:264:5:
+  record should be past its configured TTL`. This is now the third confirmed
+  occurrence of this exact signature (2026-09-11, 2026-09-15, and this
+  harness run), and the first one obtained from a controlled, reproducible
+  same-commit protocol rather than organic PR traffic — exactly the Tier 1
+  evidence this role's hard gate asks for before a fix. All other 49
+  iterations passed cleanly (`test result: ok. 1 passed`), so this is not a
+  100%-reproducible defect; it is a genuine low-rate flake, confirming the
+  ledger's own prior "well under 10%" assumption that justified the ≥50
+  sample size.
+
+  **The mechanism question is still open — this run's log does not resolve
+  it.** The test's own assertion (`autumn/tests/integration/job_tracking_stores_integration.rs:264`)
+  carries no interpolated diagnostic value (`assert!(expired, "record should
+  be past its configured TTL")`), and the test prints nothing about the row's
+  `status`/`updated_at` on failure, so this occurrence cannot be attributed to
+  either the demoted clock-step hypothesis or the better-supported
+  worker-refresh race (a `mark_running`/`settle_success` write landing inside
+  the 1.2s window and pushing `expires_at` back) without more instrumentation
+  than the test currently has. **Per this role's own hard gate ("a diagnosis
+  with a mechanism" is required before any fix), this data point alone does
+  not clear the bar for a determinism PR** — it upgrades the entry from
+  "n=2 organic, uncampaigned" to "1/50 measured, mechanism still
+  undetermined," not further. The artifact
+  (`job-tracking-rerun-logs`, run 35365077413, id 10556686252, retained 14
+  days) holds all 50 individual iteration logs.
+
+  **Recommended next step, not done this pass**: add temporary diagnostic
+  output only (not a tolerance change) — e.g. select and print
+  `status`/`updated_at` alongside `expires_at`/`NOW()` in the same query,
+  right before the `assert!` — so the next campaign's failing iteration
+  says which write (if any) touched the row between the initial read and the
+  1.2s check, distinguishing the two candidate mechanisms directly instead of
+  by inference from source reading alone. Re-running the harness at a larger
+  `n` (e.g. 200-300, several dispatches) after that instrumentation lands
+  would then have a real chance of catching another hit with the mechanism
+  visible in the log.
+- **Status**: n=2 organic + 1/50 same-commit measured (3 confirmed
+  occurrences of the identical signature total). Rerun-rate baseline now
+  exists; mechanism does not yet. Not quarantined — the Docker sweep is
+  unmodified and this test keeps running on every sweep.
