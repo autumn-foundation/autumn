@@ -144,6 +144,31 @@ def uncomment(line, in_comment):
     return ''.join(out), in_comment
 
 
+def is_paragraph(line):
+    """Whether a line is paragraph text, and so can carry a setext underline.
+
+    CommonMark only makes an underline a heading when what precedes it is a
+    paragraph. A list item, a block quote, a table row and indented code are
+    all something else, and a `---` after them is a thematic break or part of
+    the block — so treating them as setext text indexes words that render as
+    anything but a heading.
+    """
+    if not line.strip():
+        return False
+    if line.startswith('    ') or line.startswith('\t'):
+        return False            # indented code
+    stripped = line.lstrip(' ')
+    if stripped.startswith(('>', '|', '<')):
+        return False            # block quote, table row, raw HTML
+    if re.match(r'^([-*+_])\s', stripped):
+        return False            # bullet list item
+    if re.match(r'^\d+[.)]\s', stripped):
+        return False            # ordered list item
+    if re.match(r'^([-*_])(\s*\1){2,}\s*$', stripped):
+        return False            # thematic break
+    return True
+
+
 def rendered(title):
     """A heading's visible text: what a renderer shows, not its source.
 
@@ -412,10 +437,12 @@ def index():
             # same kind as requiring column one: the page renders a heading,
             # the gate does not see it, and an ordinary reformat fails CI.
             #
-            # An underline only counts after PARAGRAPH text. After a blank
-            # line `---` is a thematic break, after a list item it is part of
-            # the list, and `|---|` is a table rule — none of which reach
-            # `prev_para`, because only a plain text line sets it.
+            # An underline only counts after PARAGRAPH text, which is what
+            # `is_paragraph` decides. The first version of this comment
+            # claimed that and the code did not do it: every non-blank line
+            # reached `prev_para`, so `- Secret runtime logger` over `---`
+            # indexed a LIST ITEM as a heading. A comment asserting a
+            # property is not the same as enforcing it.
             if prev_para is not None:
                 under = re.match(r'^ {0,3}(=+|-+)\s*$', line)
                 if under:
@@ -440,7 +467,8 @@ def index():
                 # blank line ends the paragraph, so the next `---` is a
                 # thematic break rather than an underline; and a line that
                 # LOOKED like a heading is never setext text either.
-                prev_para = None if is_heading or not line.strip() else line
+                prev_para = line if is_paragraph(line) and not is_heading \
+                    else None
                 continue
             prev_para = None
             level, title = len(m.group(1)), rendered(m.group(2))
@@ -947,7 +975,39 @@ self_test() {
     > "$c45/scripts/docs-retrieval-questions.tsv"
   check "a table rule is not a setext underline" fail "$c45"
 
-  # 46. A comment line and a blank line in the fixture are skipped.
+  # 46. A LIST ITEM over `---` is a list plus a thematic break, not a heading.
+  local c46="$tmp/c46"; make_corpus "$c46"
+  printf '# Page\n\n- Secret runtime logger\n---\n' \
+    > "$c46/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c46/scripts/docs-retrieval-questions.tsv"
+  check "a list item is not setext text" fail "$c46"
+
+  # 47. Nor is a block quote.
+  local c47="$tmp/c47"; make_corpus "$c47"
+  printf '# Page\n\n\u003e Secret runtime logger\n---\n' \
+    > "$c47/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c47/scripts/docs-retrieval-questions.tsv"
+  check "a block quote is not setext text" fail "$c47"
+
+  # 48. Nor indented code.
+  local c48="$tmp/c48"; make_corpus "$c48"
+  printf '# Page\n\n    Secret runtime logger\n---\n' \
+    > "$c48/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c48/scripts/docs-retrieval-questions.tsv"
+  check "indented code is not setext text" fail "$c48"
+
+  # 49. Ordinary paragraph text still is — the rule must not reject everything.
+  local c49="$tmp/c49"; make_corpus "$c49"
+  printf '# Page\n\nSecret runtime logger\n---\n' \
+    > "$c49/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c49/scripts/docs-retrieval-questions.tsv"
+  check "paragraph text is still setext text" pass "$c49"
+
+  # 50. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \

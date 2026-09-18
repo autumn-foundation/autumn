@@ -113,21 +113,40 @@ curl -X PUT http://localhost:3000/actuator/loggers/root \
 curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
   -H 'content-type: application/json' -d '{"level":"trace"}'
 
-# Put it back — BOTH of them. The global level and each target you raised
-# are separate overrides, and reverting one leaves the other emitting.
+# Put the GLOBAL level back — to whatever it was, which is not necessarily
+# `info`: in the dev profile it starts at `debug`.
 curl -X PUT http://localhost:3000/actuator/loggers/root \
-  -H 'content-type: application/json' -d '{"level":"info"}'
-curl -X PUT http://localhost:3000/actuator/loggers/my_app::orders \
-  -H 'content-type: application/json' -d '{"level":"info"}'
+  -H 'content-type: application/json' -d '{"level":"debug"}'
 ```
 
-There is no "remove this override" call: you put a target back by setting it
-to the level it should have, and `GET /actuator/loggers` lists every override
-still in force, which is the check worth running before you call the incident
-closed. Note that a target named in `[log] level` at startup — the
-`tower_http` in `level = "info,tower_http=warn"` — is *already* an override,
-so putting that one back means `warn`, not the global level. A restart clears
-the lot, since overrides live only in the process.
+**Read `previous` off each response and write it down before you need it.**
+Every `PUT` returns the level that target had before the change, which is the
+only record of what to restore:
+
+```json
+{ "status": "ok", "message": "Logger 'root' set to 'debug'",
+  "previous": "info", "applied": true }
+```
+
+For `root`, `previous` is the global level you just replaced. For a target,
+it is that target's previous override — or `null`, which is the case worth
+understanding before an incident rather than during one:
+
+- **A target that had an override** (one named in `[log] level` at startup,
+  like the `tower_http` in `level = "info,tower_http=warn"`) goes back by
+  setting it to that `previous` value — `warn` here, not the global level.
+- **A target that had none** — `"previous": null` — cannot be put back. There
+  is no "remove this override" call, and setting it to today's global level is
+  not the same thing: it leaves a pinned override that will *not* follow later
+  changes to `root`. The only way back to no-override is a restart, which
+  clears them all, since they live only in the process.
+
+So raising one untouched target for an investigation leaves a trace behind
+until the next deploy. That is usually fine — an override at the level it
+already had emits the same lines — but it is worth knowing rather than
+discovering when a later `root` change does not take effect where you
+expected. `GET /actuator/loggers` lists everything currently overridden, and
+is the check worth running before you call the incident closed.
 
 Those run as shown in development. **In production they need a CSRF token**,
 and the failure is a `403` that never reaches the handler — see [Getting a
