@@ -450,13 +450,16 @@ async fn tenants_are_isolated() {
     );
 }
 
-/// An out-of-range project name (empty, or over 200 characters) used to bounce
-/// `POST /dashboard/projects` to the framework's generic error page, dropping
-/// the user off the project list and discarding what they had typed. It now
-/// redisplays the dashboard inline (HTTP 200) with the rejected name still in
-/// the field, the error adjacent to the form, and the existing project list
-/// intact (Wayfinder: error-path inventory — 0/1 failure modes cleared the
-/// bar before this fix, 1/1 after).
+/// An out-of-range project name (empty, or over 200 characters, checked after
+/// trimming) used to bounce `POST /dashboard/projects` to the framework's
+/// generic error page, dropping the user off the project list and discarding
+/// what they had typed. It now redisplays the dashboard inline (HTTP 200)
+/// with exactly what the user submitted still in the field — not the trimmed
+/// value the length check itself uses, which would silently blank out a
+/// whitespace-only submission (Codex review finding on this PR) — the error
+/// adjacent to the form, and the existing project list intact (Wayfinder:
+/// error-path inventory — 0/1 failure modes cleared the bar before this fix,
+/// 1/1 after).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn create_project_failure_redisplays_the_dashboard_with_name_preserved() {
@@ -491,6 +494,13 @@ async fn create_project_failure_redisplays_the_dashboard_with_name_preserved() {
     assert!(
         resp.text().contains("Existing"),
         "expected the existing project list to survive the rejected submission, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains(r#"value="   ""#),
+        "expected the raw (untrimmed) whitespace-only submission to be preserved verbatim \
+         in the re-rendered field rather than silently blanked by the length check's own \
+         trimming, got: {}",
         resp.text()
     );
 

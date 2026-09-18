@@ -95,21 +95,22 @@ pub async fn create_project(
     repo: PgProjectRepository,
     Form(form): Form<NewProjectForm>,
 ) -> AutumnResult<Response> {
-    let name = form.name.trim().to_owned();
+    let trimmed = form.name.trim();
     // Mirror the `#[validate(length(min = 1, max = 200))]` constraint on the
     // Project model so the route rejects out-of-range names before saving.
-    if name.is_empty() || name.chars().count() > 200 {
-        // Redisplay the dashboard inline (HTTP 200) with the rejected name still
-        // in the field and the project list intact, instead of navigating the
-        // user away to the framework's generic error page (Wayfinder:
-        // error-path inventory).
+    if trimmed.is_empty() || trimmed.chars().count() > 200 {
+        // Redisplay the dashboard inline (HTTP 200) with exactly what the user
+        // submitted (not the trimmed value, which would silently blank out a
+        // whitespace-only submission) still in the field, and the project list
+        // intact, instead of navigating the user away to the framework's
+        // generic error page (Wayfinder: error-path inventory).
         let projects = repo.find_all().await?;
         let total = cached_project_count(tenant_id.clone(), &repo).await?;
         let page = dashboard_page(
             &tenant_id,
             total,
             &projects,
-            &name,
+            &form.name,
             Some("Project name must be between 1 and 200 characters"),
         );
         return Ok(page.into_response());
@@ -117,7 +118,10 @@ pub async fn create_project(
 
     // The tenant_id is stamped by the tenant_scoped repository from the context
     // established by the tenancy middleware, so it is not part of `NewProject`.
-    repo.save(&NewProject { name }).await?;
+    repo.save(&NewProject {
+        name: trimmed.to_owned(),
+    })
+    .await?;
     // Discharge the invalidation the repository declares. The build proves the
     // edge exists and names a real cached read; calling it is what makes the
     // next dashboard render show the new count instead of the 30s-old one.
