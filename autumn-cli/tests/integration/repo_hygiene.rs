@@ -611,6 +611,50 @@ fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
     }
 }
 
+/// A release note belongs in its own file under `changelog.d/`, never at the
+/// top of the `## [Unreleased]` section — the lines every other open PR also
+/// edits. The rule only holds while the gate runs and the instruction files
+/// say so, and both have been quietly dropped from this repository before.
+#[test]
+fn changelog_notes_are_written_as_fragments() {
+    let root = workspace_root();
+
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    assert!(
+        workflow.contains("./scripts/check-changelog-fragments.sh"),
+        "ci.yml must run the changelog fragment gate; without it, CHANGELOG.md \
+         edits come back and every PR conflicts with every other PR",
+    );
+
+    for path in ["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            doc.contains("changelog.d/"),
+            "{path} must send a release note to changelog.d/",
+        );
+    }
+
+    for path in ["CLAUDE.md", "AGENTS.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            !doc.contains("under the existing `## [Unreleased]` section"),
+            "{path} must not tell an agent to write into the Unreleased section",
+        );
+    }
+
+    assert!(
+        root.join("changelog.d/README.md").is_file(),
+        "changelog.d/README.md documents the fragment shape the gate enforces",
+    );
+    assert!(
+        root.join("scripts/update-changelog.sh").is_file(),
+        "scripts/update-changelog.sh folds the fragments in at release time",
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();

@@ -196,6 +196,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Changelog fragment gate
+        # A release note used to go straight into CHANGELOG.md, at the top of
+        # the `## [Unreleased]` section — the same few lines every other open
+        # PR wrote to, so every PR conflicted with every other PR over text
+        # that was never the point of either. A note is now its own file under
+        # `changelog.d/`, and this step keeps it that way: it fails a PR that
+        # edits CHANGELOG.md, and fails a fragment the release tooling and the
+        # migration-guide gate above could not read.
+        #
+        # A release commit is exempt through the `release` label or a
+        # [changelog] token in the PR body. CI does not re-run on `labeled`,
+        # so the token is the reliable one: put it in the release PR body when
+        # you open it.
+        #
+        # Shares this docs-only job for the same reason as the gates around
+        # it: no toolchain, no cache, reports in seconds.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: ./scripts/check-changelog-fragments.sh --self-test && ./scripts/check-changelog-fragments.sh
       - name: Migration version gate
         # Framework, plugin and app migrations share one version space: diesel
         # keys `__diesel_schema_migrations` on the 14-digit version and
