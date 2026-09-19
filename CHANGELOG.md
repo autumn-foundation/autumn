@@ -187,6 +187,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🌐 Custom domains reach the app in production (issue #2657):** a tenant
+  hostname is never in `[security.trusted_hosts] hosts` — that is the point of
+  the feature — and `TrustedHostPolicy::from_config` read only that list. So a
+  request for `app.clientco.com`, registered, verified, `active` and holding
+  its own certificate, got `400 Invalid Host header` before tenancy resolution
+  ran. Every part below the trusted-host layer was correct; nothing reached it.
+  The only workaround was `hosts = ["*"]`, which turns host validation off for
+  the whole deployment — "custom domains **or** Host-header protection, pick
+  one". The policy now asks the custom-domain registry about a host its static
+  rules do not match, and admits it only while the domain is servable
+  (`active`), which is the rule SNI already applies at the handshake: a
+  `pending_dns` registration is not a way past host validation. The registry is
+  read per request, not captured, because the app publishes it at bind time —
+  after the router is built — so a domain connected or offboarded while the app
+  runs takes effect with no restart. A deployment with no registry pays one
+  extension lookup on the path that was about to answer `400` anyway.
+  The acceptance test for this behaviour called the tenancy extractor
+  directly, so the middleware that rejected the request was never in the path;
+  the new test drives a **mounted router** through the whole stack, and
+  publishes the registry after the build, as production does.
+  `AppState::late_extensions` is the small seam that makes the late read
+  possible. `docs/guide/tls.md` and `docs/guide/deployment.md` now state the
+  interaction.
+
 - **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
   CI failure [no-plugin]:** nothing here is agent-facing — it's a
   CI-workflow-only change plus a test split, not new framework surface
