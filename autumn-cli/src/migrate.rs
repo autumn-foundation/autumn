@@ -70,6 +70,36 @@ fn is_sqlite_target(database_url: &str) -> bool {
     )
 }
 
+/// Reject a `database_url` this CLI build's embedded `FRAMEWORK_MIGRATIONS`
+/// would apply wrong DDL to.
+///
+/// `FRAMEWORK_MIGRATIONS` (`autumn/src/migrate.rs`) is chosen once, at
+/// COMPILE time, by the `sqlite` cargo feature — never per target at
+/// runtime. A `sqlite`-feature build therefore embeds the `SQLite` fork for
+/// the WHOLE binary: several of its migrations are no-op shims (tables a
+/// `SQLite` app already owns elsewhere), others use `SQLite`-only DDL. Run
+/// against a non-`SQLite` target, Diesel would record a shim or
+/// incompatible version as "applied" over the real `PostgreSQL` schema
+/// instead of running it — silently, since the version names match.
+/// `autumn-cli/Cargo.toml` already documents `sqlite` as mutually exclusive
+/// with the default `PostgreSQL` build; this rejects the mismatch at runtime
+/// too, instead of trusting the operator to never point one build at the
+/// other backend's database.
+fn framework_migrations_backend_mismatch(database_url: &str) -> Result<(), String> {
+    if cfg!(feature = "sqlite") && !is_sqlite_target(database_url) {
+        return Err(
+            "this CLI build was compiled with `--features sqlite`, so its embedded framework \
+             migrations are the SQLite fork for the whole binary (chosen once, at compile time) \
+             \u{2014} not selected per target. This target's URL is not `sqlite://`, so applying \
+             them would run SQLite-shaped DDL, including no-op shims, against a different \
+             database instead of the real schema. Rebuild the default (PostgreSQL) CLI for this \
+             target; the `sqlite` feature must never be pointed at a non-SQLite database."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Whether every resolved target is a `SQLite` URL, used to skip the Postgres-only
 /// `diesel` CLI preflight (`check_diesel_cli`) — the `SQLite` apply path uses the
 /// in-process harness, never the `diesel` subprocess.
@@ -79,8 +109,13 @@ fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
 
 /// Apply pending user migrations against a `SQLite` database through the unlocked
 /// diesel harness (no advisory lock, no `diesel` subprocess — issue #1999/#2036
-/// precedent). Real only under the `sqlite` feature; the default build returns
-/// the [`SQLITE_FEATURE_MSG`] seam.
+/// precedent), then the `SQLite` variants of the framework tables every
+/// database needs — the control-plane schema (`FRAMEWORK_MIGRATIONS`, issue
+/// #2699) and the shard-required sets — with the two enumerated together
+/// first so an app migration sharing a framework version cannot mask it (see
+/// [`autumn_web::migrate::run_pending_sqlite_with_framework_migrations`]).
+/// Real only under the `sqlite` feature; the default build returns the
+/// [`SQLITE_FEATURE_MSG`] seam.
 #[cfg(feature = "sqlite")]
 fn apply_pending_sqlite_cli(
     database_url: &str,
@@ -93,7 +128,7 @@ fn apply_pending_sqlite_cli(
                 migrations_dir.display()
             ))
         })?;
-    autumn_web::migrate::run_pending_sqlite(database_url, migrations)
+    autumn_web::migrate::run_pending_sqlite_with_framework_migrations(database_url, &migrations)
 }
 
 /// `SQLite` apply seam in the default (Postgres-only) build — references no
@@ -178,7 +213,7 @@ pub enum MigrateAction {
     Baseline(BaselineArgs),
 }
 
-/// Per-migration safety report returned by [`check_migrations_in_dir`].
+/// Per-migration safety report returned by [`check_migrations_in_dir_for`].
 pub struct MigrationSafetyReport {
     /// Migration directory name (e.g. `"20260101000000_create_posts"`).
     pub name: String,
@@ -222,7 +257,7 @@ pub fn run(
             // offline / CI safety checks), so the `.env` overlay is built lazily
             // only in the database-backed paths below.
             let migrations_dir = resolve_migrations_dir();
-            run_safety_check(&migrations_dir);
+            run_safety_check(&migrations_dir, profile);
             return;
         }
         MigrateAction::Down(args) => {
@@ -279,6 +314,7 @@ pub fn run(
             // reaching the `diesel` subprocess and dying with a raw OS error (the
             // `diesel` CLI preflight was deliberately skipped for all-SQLite runs).
             let mut sqlite_unsupported = false;
+            let mut collision_seen = false;
             for (label, url) in &targets {
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
                 if is_sqlite_target(url) {
@@ -292,14 +328,36 @@ pub fn run(
                     sqlite_unsupported = true;
                     continue;
                 }
+                if let Err(message) = framework_migrations_backend_mismatch(url) {
+                    eprintln!("  \u{2717} {message}");
+                    eprintln!();
+                    sqlite_unsupported = true;
+                    continue;
+                }
+                // Diesel tracks a migration by version alone, so with an app
+                // migration on a framework version both sides can read as
+                // applied here while one never ran. Say so first, and exit
+                // non-zero at the end, rather than present a clean report.
+                let is_shard = label.starts_with("shard:");
+                if let Some(message) = framework_version_collision_error(
+                    std::path::Path::new(&migrations_dir),
+                    is_shard,
+                ) {
+                    eprintln!(
+                        "  \u{2717} Migration version collision, so the status below cannot \
+                         tell the two apart: {message}"
+                    );
+                    eprintln!();
+                    collision_seen = true;
+                }
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
                 // Shard targets only require the shard framework migrations, so
                 // report against that set instead of the full control-plane one.
-                show_framework_status(url, label.starts_with("shard:"));
+                show_framework_status(url, is_shard);
                 eprintln!();
             }
-            if sqlite_unsupported {
+            if sqlite_unsupported || collision_seen {
                 std::process::exit(1);
             }
         }
@@ -588,6 +646,11 @@ fn run_single_target(
         return run_single_target_sqlite(database_url, migrations_dir);
     }
 
+    if let Err(message) = framework_migrations_backend_mismatch(database_url) {
+        eprintln!("\u{274C} {message}");
+        return false;
+    }
+
     // Startup wait — only when enabled (startup_wait_secs > 0 or --wait N).
     // When wait == Duration::ZERO we skip entirely so the existing fail-fast
     // path is preserved byte-for-byte (AC #6).
@@ -609,6 +672,18 @@ fn run_single_target(
                 return false;
             }
         }
+    }
+
+    // A version an app migration shares with a framework migration lets
+    // whichever side runs first mask the other, and the `diesel` CLI below
+    // tracks a migration under its directory's version only, so unlike the
+    // SQLite path this one cannot carry the app migration under a substitute.
+    // Stop before anything runs, with the rename to make.
+    if let Some(message) =
+        framework_version_collision_error(std::path::Path::new(migrations_dir), is_shard)
+    {
+        eprintln!("\u{274C} Migration version collision: {message}");
+        return false;
     }
 
     // Acquire this target database's Postgres advisory lock before reading
@@ -699,16 +774,24 @@ fn run_single_target(
 }
 
 /// Apply pending user migrations to a single `SQLite` target through the unlocked
-/// harness (issue #2058). Returns whether it succeeded.
+/// harness (issue #2058), then the `SQLite` variants of the framework tables
+/// every database needs. Returns whether it succeeded.
 ///
 /// Deliberately mirrors `autumn schema migrate`'s `SQLite` path: no advisory lock
-/// (`SQLite` is single-writer, #1999), no `diesel` subprocess, no Postgres
-/// content-checksum bookkeeping, and no control-plane / shard framework
-/// migrations (their DDL is Postgres-specific and is never applied to a `SQLite`
-/// database). Only the project's `migrations/` user set is applied.
+/// (`SQLite` is single-writer, #1999), no `diesel` subprocess, and no Postgres
+/// content-checksum bookkeeping. The Postgres control-plane schema
+/// (`FRAMEWORK_MIGRATIONS`) now has a `SQLite` variant too (issue #2699), so it
+/// applies here alongside the three shard-required sets (version history,
+/// commit-hook queue, derivation state) — a deployment with startup
+/// auto-migration off still gets all of them (#1769). The app set and the
+/// framework sets are version-disambiguated together before any is applied,
+/// as at boot, so an app migration that shares a version with a framework one
+/// masks nothing.
 fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
     let dir = std::path::Path::new(migrations_dir);
-    eprintln!("  Running pending migrations (SQLite, unlocked harness)...\n");
+    eprintln!(
+        "  Running pending migrations (SQLite, unlocked harness; app set, then framework sets)...\n"
+    );
     match apply_pending_sqlite_cli(database_url, dir) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\u{2713} Migrations are already up to date.");
@@ -840,8 +923,13 @@ fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
 ///
 /// Prints a human-readable report to stderr and exits with code 1 if any
 /// unsafe or potentially-blocking operations are detected in either direction.
-fn run_safety_check(migrations_dir: &str) {
-    let reports = match check_migrations_in_dir(Path::new(migrations_dir)) {
+fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
+    // The app's own backend decides the dialect (issue #1906): a SQLite app must
+    // not be told to use `CREATE INDEX CONCURRENTLY`. `detect_backend_offline`
+    // honors `--profile`, reads no `.env`, and never exits, so `check` stays the
+    // offline, URL-free preflight documented above.
+    let backend = crate::generate::detect_backend_offline(Path::new("."), profile);
+    let reports = match check_migrations_in_dir_for(backend, Path::new(migrations_dir)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("\u{2717} Migration safety check failed: {e}");
@@ -900,7 +988,24 @@ fn rolling_deploy_blocked(reports: &[MigrationSafetyReport]) -> bool {
 ///
 /// Migration directories that have no `up.sql` are silently skipped.
 /// `down.sql` is optional — its findings are empty when the file is absent.
+#[cfg(test)]
 pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>, String> {
+    check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Postgres, dir)
+}
+
+/// Read every migration directory in `dir` and classify both `up.sql` and
+/// `down.sql` against a specific database `backend` (issue #1906).
+///
+/// The Postgres path is unchanged. On `SQLite` the SQL is classified against
+/// `SQLite`'s dialect ([`safety::classify_sql_for`]) and the
+/// `CREATE INDEX CONCURRENTLY` transaction opt-out check is skipped — `SQLite`
+/// has no `CONCURRENTLY`, so the classifier already reports the keyword itself
+/// as unsupported.
+pub fn check_migrations_in_dir_for(
+    backend: autumn_web::config::DatabaseBackend,
+    dir: &Path,
+) -> Result<Vec<MigrationSafetyReport>, String> {
+    let postgres = backend == autumn_web::config::DatabaseBackend::Postgres;
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(std::result::Result::ok)
@@ -919,19 +1024,23 @@ pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>,
         }
         let up_sql = std::fs::read_to_string(&up_sql_path)
             .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
-        let mut up_findings = safety::classify_sql(&up_sql);
-        check_concurrent_index_transaction_opt_out(&up_sql, &entry.path(), &mut up_findings);
+        let mut up_findings = safety::classify_sql_for(backend, &up_sql);
+        if postgres {
+            check_concurrent_index_transaction_opt_out(&up_sql, &entry.path(), &mut up_findings);
+        }
 
         let down_sql_path = entry.path().join("down.sql");
         let down_findings = if down_sql_path.exists() {
             let down_sql = std::fs::read_to_string(&down_sql_path)
                 .map_err(|e| format!("cannot read {}: {e}", down_sql_path.display()))?;
-            let mut down_findings = safety::classify_sql(&down_sql);
-            check_concurrent_index_transaction_opt_out(
-                &down_sql,
-                &entry.path(),
-                &mut down_findings,
-            );
+            let mut down_findings = safety::classify_sql_for(backend, &down_sql);
+            if postgres {
+                check_concurrent_index_transaction_opt_out(
+                    &down_sql,
+                    &entry.path(),
+                    &mut down_findings,
+                );
+            }
             down_findings
         } else {
             Vec::new()
@@ -1181,7 +1290,7 @@ pub fn read_autumn_toml_table_with_profile_in(
     // EXISTS yet can't be read or parsed is a hard error — silently ignoring it
     // would resolve different URLs than the running app (which the runtime
     // loader rejects), risking migrations/row-moves against the wrong database.
-    let read_table = |path: &Path| -> Option<toml::Table> {
+    read_autumn_toml_table_with_profile_in_using(dir, profile, |path| {
         if !path.exists() {
             return None;
         }
@@ -1196,8 +1305,29 @@ pub fn read_autumn_toml_table_with_profile_in(
                 std::process::exit(1);
             }
         }
-    };
+    })
+}
 
+/// Reads an existing `autumn.toml`, tolerating a missing, unreadable or
+/// malformed file by returning `None` for it.
+///
+/// For the OFFLINE preflights only (issue #1906 review): they analyze SQL and
+/// must never abort on local config the running app is not being pointed at.
+/// Every path that resolves a real database URL uses the hard-error reader in
+/// [`read_autumn_toml_table_with_profile_in`] instead.
+pub fn read_optional_toml_table(path: &Path) -> Option<toml::Table> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+}
+
+/// [`read_autumn_toml_table_with_profile_in`] with a caller-supplied file
+/// reader, so the offline preflights can substitute a tolerant one.
+pub fn read_autumn_toml_table_with_profile_in_using(
+    dir: &Path,
+    profile: Option<&str>,
+    read_table: impl Fn(&Path) -> Option<toml::Table>,
+) -> Option<toml::Table> {
     let base = read_table(&dir.join("autumn.toml"));
     let Some(profile) = profile.filter(|p| !p.is_empty()) else {
         return base;
@@ -1731,6 +1861,7 @@ fn run_down(
             args,
             url,
             dir,
+            label.starts_with("shard:"),
             with_maintenance,
             &mut maintenance_enabled,
             preflighted_plan,
@@ -1896,6 +2027,7 @@ fn run_down_target(
     args: &DownArgs,
     database_url: &str,
     dir: &Path,
+    is_shard: bool,
     with_maintenance: bool,
     maintenance_enabled: &mut bool,
     preflighted_plan: &[String],
@@ -1956,6 +2088,14 @@ fn run_down_target(
     if is_sqlite_target(database_url) {
         revert_user_migrations_sqlite_cli(database_url, dir, plan, on_reverted)
     } else {
+        // Rollback plans by version too and excludes framework versions from
+        // the plan, so a colliding app migration would be skipped as
+        // framework-owned: the same refusal as the apply path.
+        if let Some(message) = framework_version_collision_error(dir, is_shard) {
+            return Err(MigrationError::Migration(format!(
+                "migration version collision: {message}"
+            )));
+        }
         autumn_web::migrate::revert_user_migrations_locked(
             database_url,
             dir,
@@ -1963,6 +2103,34 @@ fn run_down_target(
             plan,
             on_reverted,
         )
+    }
+}
+
+/// The refusal for an app `migrations_dir` that shares a version with a
+/// framework migration the target receives (see
+/// [`autumn_web::migrate::app_framework_version_collisions`]; a shard gets
+/// only the shard-required sets), one remedy per collision, or `None` when
+/// there is nothing to refuse. A directory that cannot be enumerated is
+/// refused too, since the check could not run.
+fn framework_version_collision_error(migrations_dir: &Path, is_shard: bool) -> Option<String> {
+    let target = if is_shard {
+        autumn_web::migrate::FrameworkTarget::Shard
+    } else {
+        autumn_web::migrate::FrameworkTarget::Control
+    };
+    match autumn_web::migrate::app_framework_version_collisions(migrations_dir, target) {
+        Ok(collisions) if collisions.is_empty() => None,
+        Ok(collisions) => Some(
+            collisions
+                .iter()
+                .map(autumn_web::migrate::FrameworkVersionCollision::remedy)
+                .collect::<Vec<_>>()
+                .join("\n  "),
+        ),
+        Err(e) => Some(format!(
+            "could not check {} for version collisions: {e}",
+            migrations_dir.display()
+        )),
     }
 }
 
@@ -2273,6 +2441,112 @@ mod tests {
             }
             _ => panic!("expected Baseline"),
         }
+    }
+
+    // ── check_migrations_in_dir_for: SQLite dialect (#1906) ────────────────
+
+    /// A migration dir with the given `up.sql`.
+    fn migrations_dir_with_up(up: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("up.sql"), up).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn sqlite_dir_scan_does_not_flag_the_drop_index_before_drop_column() {
+        // The generated SQLite remove-column migration must pass the gate: its
+        // DROP INDEX is a precondition of the DROP COLUMN, not a risk.
+        let tmp = migrations_dir_with_up(
+            "DROP INDEX IF EXISTS idx_posts_title;\nALTER TABLE posts DROP COLUMN title;\n",
+        );
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let ops: Vec<&str> = reports[0].up.iter().map(|f| f.operation.as_str()).collect();
+        assert_eq!(ops, vec!["DROP COLUMN"], "got {ops:?}");
+    }
+
+    #[test]
+    fn sqlite_dir_scan_skips_the_concurrently_transaction_opt_out_check() {
+        // On SQLite the CONCURRENTLY keyword is itself unsupported; the
+        // Postgres-only `metadata.toml` opt-out finding must not also fire.
+        let tmp = migrations_dir_with_up("CREATE INDEX CONCURRENTLY i ON posts (title);\n");
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let ops: Vec<&str> = reports[0].up.iter().map(|f| f.operation.as_str()).collect();
+        assert_eq!(
+            ops,
+            vec!["CREATE INDEX CONCURRENTLY (unsupported on SQLite)"],
+            "got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_dir_scan_classifies_down_sql_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("up.sql"), "CREATE INDEX i ON posts (title);\n").unwrap();
+        std::fs::write(
+            dir.join("down.sql"),
+            "DROP INDEX i;\nALTER TABLE posts ALTER COLUMN title TYPE TEXT;\n",
+        )
+        .unwrap();
+        let reports =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Sqlite, tmp.path())
+                .unwrap();
+        let down: Vec<&str> = reports[0]
+            .down
+            .iter()
+            .map(|f| f.operation.as_str())
+            .collect();
+        assert_eq!(
+            down,
+            vec!["ALTER COLUMN (unsupported on SQLite)"],
+            "the DROP INDEX must not be flagged, the ALTER COLUMN must be: {down:?}"
+        );
+    }
+
+    #[test]
+    fn grade_migrate_check_for_grades_against_the_given_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_m");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The generated SQLite remove-column shape: safe on SQLite, blocking on
+        // Postgres (which wants DROP INDEX CONCURRENTLY).
+        std::fs::write(
+            dir.join("up.sql"),
+            "DROP INDEX IF EXISTS idx_posts_title;\n",
+        )
+        .unwrap();
+        assert!(
+            crate::deploy::grade_migrate_check_for(
+                autumn_web::config::DatabaseBackend::Sqlite,
+                tmp.path()
+            )
+            .passed
+        );
+        assert!(
+            !crate::deploy::grade_migrate_check_for(
+                autumn_web::config::DatabaseBackend::Postgres,
+                tmp.path()
+            )
+            .passed
+        );
+    }
+
+    #[test]
+    fn check_migrations_in_dir_still_classifies_as_postgres() {
+        let tmp = migrations_dir_with_up("DROP INDEX idx_posts_title;\n");
+        let bare = check_migrations_in_dir(tmp.path()).unwrap();
+        let explicit =
+            check_migrations_in_dir_for(autumn_web::config::DatabaseBackend::Postgres, tmp.path())
+                .unwrap();
+        assert_eq!(bare[0].up.len(), explicit[0].up.len());
+        assert_eq!(bare[0].up[0].operation, "DROP INDEX (non-concurrent)");
     }
 
     // ── check_migrations_in_dir ────────────────────────────────────────────
@@ -2710,6 +2984,47 @@ mod tests {
         }
     }
 
+    /// The Postgres apply and rollback paths refuse an app migration that
+    /// shares a version with a framework migration, naming both and the
+    /// rename; an app set with its own versions is not refused.
+    #[test]
+    fn framework_version_collision_error_names_both_sides_and_the_remedy() {
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-cli-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let colliding = dir.join("20260907101530_zzz_app");
+        std::fs::create_dir_all(&colliding).expect("migration dir");
+        std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        let message =
+            framework_version_collision_error(&dir, false).expect("a collision is refused");
+        assert!(
+            framework_version_collision_error(&dir, true).is_some(),
+            "the derivation migration reaches shards too"
+        );
+        assert!(message.contains("20260907101530_zzz_app"), "{message}");
+        assert!(
+            message.contains("20260907101530_create_derivations"),
+            "{message}"
+        );
+        assert!(
+            message.contains("UPDATE __diesel_schema_migrations"),
+            "{message}"
+        );
+
+        let own = dir.join("20260101000000_create_widgets");
+        std::fs::remove_dir_all(&colliding).expect("drop the colliding migration");
+        std::fs::create_dir_all(&own).expect("migration dir");
+        std::fs::write(own.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(own.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        assert!(framework_version_collision_error(&dir, false).is_none());
+        assert!(framework_version_collision_error(&dir, true).is_none());
+    }
+
     #[test]
     fn rollback_plans_diverge_detects_mismatched_targets() {
         let plan = |label: &str, versions: &[&str]| {
@@ -3016,6 +3331,15 @@ mod tests {
                 .any(|name| name == "20260515000000_create_repository_commit_hook_queue"),
             "framework migrations must include the durable repository commit hook queue: {names:?}"
         );
+        // `autumn migrate` applies only this set to the control target, so the
+        // derivation state table has to be in it or a release migration job
+        // reports the control database current without it (#1769).
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "20260907101530_create_derivations"),
+            "framework migrations must include the derivation state table: {names:?}"
+        );
     }
 
     #[test]
@@ -3221,6 +3545,33 @@ replica_url = "postgres://replica:5432/app"
     fn reject_sqlite_sharding_allows_no_control_no_shards() {
         // No primary role and no shards: nothing to reject.
         assert_eq!(reject_sqlite_sharding_topology(None, &[]), Ok(()));
+    }
+
+    #[test]
+    fn framework_migrations_backend_mismatch_rejects_non_sqlite_targets_under_a_sqlite_build() {
+        // `FRAMEWORK_MIGRATIONS` is chosen once, at compile time, by the `sqlite`
+        // cargo feature (autumn/src/migrate.rs) — never per target at runtime.
+        // Compiled with `sqlite`, this build's embedded set is the SQLite fork
+        // for the WHOLE binary, so a non-SQLite target must be rejected here
+        // rather than silently applying the wrong DDL. The default build has no
+        // such mismatch to reject. `cfg!` makes this assertion track whichever
+        // build actually compiled it, so the test is meaningful either way.
+        let is_mismatch = framework_migrations_backend_mismatch("postgres://control/app").is_err();
+        assert_eq!(
+            is_mismatch,
+            cfg!(feature = "sqlite"),
+            "a `sqlite`-feature build must reject a non-SQLite target; the default build must not"
+        );
+    }
+
+    #[test]
+    fn framework_migrations_backend_mismatch_allows_sqlite_targets_in_any_build() {
+        // A genuine `sqlite://` target is never a backend mismatch, regardless
+        // of which backend this CLI was compiled for.
+        assert_eq!(
+            framework_migrations_backend_mismatch("sqlite:///tmp/app.db"),
+            Ok(())
+        );
     }
 
     #[test]

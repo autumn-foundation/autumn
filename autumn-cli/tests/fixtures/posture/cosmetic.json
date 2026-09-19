@@ -1,0 +1,102 @@
+{
+  "schema_version": 3,
+  "dimensions": {
+    "routes": {
+      "provenance": "provable",
+      "source": "macro:#[secured]/#[authorize]/#[public]",
+      "entries": [
+        {
+          "path": "/",
+          "method": "GET",
+          "name": "index",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "src/routes/home.rs:8",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/health",
+          "method": "GET",
+          "name": "health",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/admin/users",
+          "method": "GET",
+          "name": "index",
+          "classification": "gated",
+          "roles": [
+            "admin"
+          ],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "src/routes/admin/users.rs:9",
+          "provenance": "provable"
+        },
+        {
+          "path": "/posts/{id}",
+          "method": "PUT",
+          "name": "update_post",
+          "classification": "gated",
+          "roles": [
+            "user"
+          ],
+          "scopes": [],
+          "policy": true,
+          "source": "user",
+          "location": "src/routes/posts.rs:140",
+          "provenance": "provable"
+        }
+      ]
+    },
+    "csrf": {
+      "provenance": "declared",
+      "source": "config:security.csrf",
+      "exempt_paths": [],
+      "entries": [
+        {
+          "path": "/posts/{id}",
+          "method": "PUT",
+          "csrf_enforced": true,
+          "exempt": false
+        }
+      ]
+    },
+    "security_headers": {
+      "provenance": "declared",
+      "source": "config:security.headers",
+      "entries": [
+        {
+          "header": "x_frame_options",
+          "value": "DENY",
+          "emitted": true
+        }
+      ]
+    },
+    "authorization_policies": {
+      "provenance": "provable",
+      "source": "macro:#[authorize]",
+      "runtime_caveat": "which impl Policy<Resource> answers the check is a boot fact",
+      "entries": [
+        {
+          "path": "/posts/{id}",
+          "method": "PUT",
+          "name": "update",
+          "action": "update",
+          "resource": "Post",
+          "provenance": "provable"
+        }
+      ]
+    }
+  },
+  "excluded": []
+}

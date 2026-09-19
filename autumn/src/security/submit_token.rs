@@ -197,63 +197,6 @@ fn storage_key(token: &str) -> String {
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
-/// Return the byte position of the first occurrence of `needle` in `haystack`.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Scan a buffered `multipart/form-data` body for a named text field.
-fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -> Option<&'a str> {
-    let delimiter = format!("--{boundary}");
-    let delim = delimiter.as_bytes();
-    let end_marker = format!("\r\n{delimiter}");
-    let end_bytes = end_marker.as_bytes();
-    let mut pos = 0;
-
-    loop {
-        let rel = find_bytes(&bytes[pos..], delim)?;
-        pos += rel + delim.len();
-
-        match bytes.get(pos..pos + 2) {
-            Some(b"\r\n") => pos += 2,
-            _ => break,
-        }
-
-        let header_end = find_bytes(&bytes[pos..], b"\r\n\r\n")?;
-        let headers = std::str::from_utf8(&bytes[pos..pos + header_end]).ok()?;
-        let value_start = pos + header_end + 4;
-
-        let is_match = headers.lines().any(|line| {
-            if !line
-                .to_ascii_lowercase()
-                .starts_with("content-disposition:")
-            {
-                return false;
-            }
-            line.split(';').skip(1).any(|attr| {
-                attr.trim()
-                    .strip_prefix("name=")
-                    .map(|v| v.trim_matches('"'))
-                    == Some(field_name)
-            })
-        });
-
-        if is_match {
-            let end = find_bytes(&bytes[value_start..], end_bytes)
-                .map_or(bytes.len(), |i| value_start + i);
-            return std::str::from_utf8(&bytes[value_start..end]).ok();
-        }
-
-        let next = find_bytes(&bytes[value_start..], end_bytes)?;
-        pos = value_start + next + 2;
-    }
-
-    None
-}
-
 fn scan_for_token(
     bytes: &[u8],
     is_urlencoded: bool,
@@ -265,7 +208,7 @@ fn scan_for_token(
             .find(|(key, _)| key == field)
             .map(|(_, value)| value.into_owned())
     } else if let Some(boundary) = boundary {
-        scan_multipart_field(bytes, boundary, field).map(str::to_owned)
+        super::multipart_scan::scan_multipart_field(bytes, boundary, field).map(str::to_owned)
     } else {
         None
     }
@@ -601,15 +544,22 @@ where
         });
         let is_guarded = !is_exempt && is_mutating_method(req.method());
 
+        // Every GET (and every exempt/non-mutating request) takes this branch:
+        // nothing below needs `self.inner` cloned into an owned value, so
+        // `self.inner.call(req)` can be boxed directly rather than cloning
+        // `self.inner` (a `BoxCloneSyncService` at this point in the stack,
+        // whose `Clone` impl allocates a fresh box) just to move the clone
+        // into an `async move` block that would immediately `.await` it and
+        // do nothing else.
+        if !is_guarded {
+            return Box::pin(self.inner.call(req));
+        }
+
         let settings = Arc::clone(&self.settings);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            if !is_guarded {
-                return inner.call(req).await;
-            }
-
             let (submitted, req) =
                 match extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes)
                     .await

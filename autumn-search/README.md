@@ -8,6 +8,30 @@ one engine-agnostic API.
 The autumn-shaped answer to Laravel Scout, with vectors first-class rather than
 bolted on.
 
+## Installation
+
+```bash
+autumn plugin add autumn-search
+```
+
+One command adds the dependency at a version compatible with your app's
+`autumn-web`, mounts `SearchPlugin` in your `autumn_web::app()` builder chain,
+and prints the follow-up steps (mark a model `#[searchable]`, register the
+index, backfill). It is safe to re-run, and it refuses — before touching any
+file — to install into an app on an incompatible `autumn-web` version. See
+[docs/plugins.md](https://github.com/autumn-foundation/autumn/blob/main/docs/plugins.md#installing-a-plugin).
+
+### Manual install
+
+If you would rather wire it yourself (or `autumn plugin add` could not find your
+builder chain and printed these lines for you):
+
+```toml
+[dependencies]
+autumn-web = "0.7"
+autumn-search = "0.7"
+```
+
 ## What you write
 
 ```rust

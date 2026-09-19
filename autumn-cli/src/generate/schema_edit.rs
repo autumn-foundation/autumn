@@ -16,6 +16,7 @@ use autumn_web::config::DatabaseBackend;
 
 use super::GenerateError;
 use super::dsl::{EncryptedMode, Field, FieldConstraints, FieldKind, IdType};
+use super::prior_index::PriorIndex;
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -324,7 +325,7 @@ pub fn create_table_sql_with_metadata_and_id_for(
         {
             let _ = write!(sql, " DEFAULT {default}");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(sql, " {check}");
         }
     }
@@ -493,20 +494,17 @@ pub fn position_triggers_up_sql_for(
                 } else {
                     scope_cond_new.clone()
                 };
-                // A transaction-scoped advisory lock, keyed by table+scope
-                // (a constant second key when unscoped, so every insert into
-                // the table serializes against every other). Without it,
-                // two concurrent `BEFORE INSERT`s under READ COMMITTED can
-                // both read the same `MAX(position)` before either commits
-                // and be assigned the same value — there is no UNIQUE
-                // constraint on `(scope, position)` to catch it (positions
-                // are only ever *maintained* uniquely, by these triggers and
-                // `move_to`'s own locking; nothing at the schema level
-                // enforces it, matching how `move_to` itself achieves
-                // exclusivity through locking rather than a constraint).
-                // `pg_advisory_xact_lock` auto-releases at commit/rollback,
-                // so it composes with the rest of the inserting transaction
-                // with no separate unlock statement.
+                // A transaction-scoped advisory lock keyed by table and scope, with
+                // a constant second key when unscoped so every insert into the table
+                // serializes against every other. Without it, two concurrent `BEFORE
+                // INSERT`s under READ COMMITTED can both read the same
+                // `MAX(position)` before either commits and be assigned the same
+                // value. There is no UNIQUE constraint on `(scope, position)` to
+                // catch it: positions are only ever maintained uniquely, by these
+                // triggers and `move_to`'s own locking, and nothing at the schema
+                // level enforces it. `pg_advisory_xact_lock` auto-releases at commit
+                // or rollback, so it composes with the rest of the inserting
+                // transaction with no separate unlock statement.
                 let lock_key2 = scope.map_or_else(
                     || "0".to_owned(),
                     |s| format!("hashtext(NEW.\"{s}\"::text)"),
@@ -526,30 +524,28 @@ pub fn position_triggers_up_sql_for(
                     "CREATE TRIGGER {table}_{position}_assign_trg BEFORE INSERT ON \"{table}\" \
                      FOR EACH ROW EXECUTE FUNCTION {table}_{position}_assign();"
                 );
-                // Same advisory lock key as the assign trigger, keyed by
-                // `OLD`'s scope value (unchanged from `NEW`'s for a row that
-                // isn't itself being re-scoped): without it, a concurrent
-                // insert's `SELECT MAX(position)` (a plain read, not
-                // row-locked) can run against a snapshot taken before this
-                // compaction's shift commits, computing a next-position that
-                // leaves a gap where the compacted range used to end. Taking
-                // the same lock here makes insert and delete-compaction on
-                // the same scope fully serialize, closing that window.
+                // The same advisory lock key as the assign trigger, keyed by
+                // `OLD`'s scope value, unchanged from `NEW`'s for a row that is
+                // not itself being re-scoped. Without it, a concurrent insert's
+                // `SELECT MAX(position)` — a plain read, not row-locked — can run
+                // against a snapshot taken before this compaction's shift commits,
+                // computing a next-position that leaves a gap where the compacted
+                // range used to end. The shared lock makes insert and
+                // delete-compaction on one scope serialize fully.
                 let lock_key2_old = scope.map_or_else(
                     || "0".to_owned(),
                     |s| format!("hashtext(OLD.\"{s}\"::text)"),
                 );
-                // On a `--soft-delete` model this trigger only ever fires
-                // from `purge` — every row it hard-deletes was *already*
-                // soft-deleted (the scaffold's purge handler only reaches
-                // rows filtered to `deleted_at IS NOT NULL`), whose position
-                // was already excluded from the live sequence by
-                // `compact_soft` at the time it was soft-deleted. Running
-                // this compaction unconditionally would shift the live rows
-                // a SECOND time for the same removal, producing a duplicate
-                // live position. Skip entirely when `OLD.deleted_at` is set;
-                // on a non-soft-delete model there is no such column and
-                // this trigger is the only compaction path, so it always runs.
+                // On a `--soft-delete` model this trigger fires only from `purge`,
+                // and every row it hard-deletes was already soft-deleted — the
+                // scaffold's purge handler reaches only rows filtered to
+                // `deleted_at IS NOT NULL`, whose position `compact_soft` already
+                // excluded from the live sequence at soft-delete time. Running this
+                // compaction unconditionally would shift the live rows a second time
+                // for the same removal, producing a duplicate live position. Skip
+                // entirely when `OLD.deleted_at` is set. On a non-soft-delete model
+                // there is no such column and this is the only compaction path, so
+                // it always runs.
                 let (compact_guard_open, compact_guard_close) = if has_soft_delete {
                     ("IF OLD.deleted_at IS NULL THEN\n    ", "\n  END IF;")
                 } else {
@@ -588,21 +584,18 @@ pub fn position_triggers_up_sql_for(
                         "CREATE TRIGGER {table}_{position}_compact_soft_trg AFTER UPDATE OF deleted_at ON \"{table}\" \
                          FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact_soft();"
                     );
-                    // Codex review: `compact_soft` only ever handles the
-                    // soft-delete transition (`deleted_at` NULL -> non-NULL).
-                    // The generated repository's `restore()` — reachable from
-                    // the scaffold's Trash page — performs the OPPOSITE
-                    // transition, and without a trigger of its own the
-                    // restored row re-enters the live set still carrying
-                    // whatever stale position it had when it was soft-deleted
-                    // — a position some other, still-live row may since have
-                    // taken, producing a duplicate. Mirrors the insert-assign
-                    // trigger exactly (same advisory lock key, same
-                    // append-at-the-end `MAX(position) + 1` read, now keyed
-                    // off `NEW`'s scope since a restore never itself changes
-                    // scope) rather than trying to recreate the row's old
-                    // position, which this slice does not attempt to
-                    // preserve across a soft-delete/restore round trip.
+                    // `compact_soft` handles only the soft-delete transition,
+                    // `deleted_at` NULL to non-NULL. The generated repository's
+                    // `restore()`, reachable from the scaffold's Trash page, performs
+                    // the opposite transition, and without a trigger of its own the
+                    // restored row re-enters the live set still carrying whatever
+                    // stale position it had when soft-deleted — a position some other
+                    // still-live row may since have taken, producing a duplicate.
+                    // This mirrors the insert-assign trigger exactly: same advisory
+                    // lock key, same append-at-the-end `MAX(position) + 1` read, now
+                    // keyed off `NEW`'s scope since a restore never changes scope. It
+                    // does not try to recreate the row's old position, which this
+                    // slice does not preserve across a soft-delete and restore.
                     let _ = writeln!(
                         out,
                         "CREATE FUNCTION {table}_{position}_restore() RETURNS TRIGGER AS $$\n\
@@ -620,27 +613,25 @@ pub fn position_triggers_up_sql_for(
                          EXECUTE FUNCTION {table}_{position}_restore();"
                     );
                 }
-                // Issue #1358 review: an ordinary `UPDATE` can reassign a
-                // scoped row's scope FK (e.g. dragging a Kanban card to a
-                // different board via `board_id`) — nothing about `position`
-                // makes that column immutable. Without this trigger the row
-                // keeps its old position, leaving a gap in the old scope and
-                // usually a duplicate in the new one. `BEFORE UPDATE` (not
-                // `AFTER`) because only a `BEFORE` trigger can set `NEW`'s
-                // position; the compaction UPDATE and the append-to-new-scope
-                // assignment both run inside the same function/statement, so
-                // a hard crash mid-trigger can't leave one done without the
-                // other. Locks BOTH the old and new scope's advisory key —
-                // always in ascending-hash order, mirroring `move_to`'s
-                // fixed id-ascending row-lock order — so two rows swapping
-                // scopes concurrently can't deadlock each other; a rescope
-                // racing a plain insert/delete/move_to on either scope is
-                // still safe (same lock key, Postgres's deadlock detector
-                // aborts one side of any residual cycle rather than
-                // corrupting data). Skipped for soft-deleted rows on either
-                // side of the change (`compact_soft`/restore already own
-                // that transition) and for unscoped position fields (no
-                // scope column exists to reassign).
+                // #1358 review: an ordinary `UPDATE` can reassign a scoped row's
+                // scope FK — dragging a Kanban card to a different board via
+                // `board_id` — since nothing about `position` makes that column
+                // immutable. Without this trigger the row keeps its old position,
+                // leaving a gap in the old scope and usually a duplicate in the new
+                // one. `BEFORE UPDATE`, not `AFTER`, because only a `BEFORE` trigger
+                // can set `NEW`'s position; the compaction UPDATE and the
+                // append-to-new-scope assignment both run inside the same function
+                // and statement, so a hard crash mid-trigger cannot leave one done
+                // without the other. It locks both the old and new scope's advisory
+                // key, always in ascending-hash order, mirroring `move_to`'s fixed
+                // id-ascending row-lock order, so two rows swapping scopes
+                // concurrently cannot deadlock. A rescope racing a plain insert,
+                // delete, or move_to on either scope is still safe: same lock key,
+                // and Postgres's deadlock detector aborts one side of any residual
+                // cycle rather than corrupting data. Skipped for soft-deleted rows on
+                // either side of the change, where `compact_soft` and restore own the
+                // transition, and for unscoped position fields, which have no scope
+                // column to reassign.
                 if let Some(scope_col) = scope {
                     let rescope_when = if has_soft_delete {
                         format!(
@@ -733,19 +724,17 @@ pub fn position_triggers_up_sql_for(
                          END;"
                     );
                 }
-                // Same reasoning as the Postgres `rescope` trigger above: an
-                // ordinary `UPDATE` reassigning a scoped row's scope FK must
-                // compact the old scope's gap and append the row to the end
-                // of the new scope, or the contiguous invariant breaks on a
-                // common "move card to another board" operation. `SQLite`
-                // can't mutate `NEW` in a `BEFORE` trigger, so this runs
-                // `AFTER UPDATE` and corrects the already-written row with a
-                // follow-up `UPDATE ... WHERE id = new.id`, mirroring the
-                // `_assign` trigger's own after-the-fact correction. No
-                // locking needed — `SQLite` has none, and write-write
-                // correctness rests on `scoped_immediate_transaction`'s
-                // `BEGIN IMMEDIATE` the same way every other position
-                // trigger here does.
+                // Same reasoning as the Postgres `rescope` trigger above: an ordinary
+                // `UPDATE` reassigning a scoped row's scope FK must compact the old
+                // scope's gap and append the row to the end of the new scope, or the
+                // contiguous invariant breaks on a common "move card to another
+                // board" operation. SQLite cannot mutate `NEW` in a `BEFORE` trigger,
+                // so this runs `AFTER UPDATE` and corrects the already-written row
+                // with a follow-up `UPDATE ... WHERE id = new.id`, mirroring the
+                // `_assign` trigger's own after-the-fact correction. No locking is
+                // needed: SQLite has none, and write-write correctness rests on
+                // `scoped_immediate_transaction`'s `BEGIN IMMEDIATE`, as it does for
+                // every other position trigger here.
                 if let Some(scope_col) = scope {
                     let rescope_when = if has_soft_delete {
                         format!(
@@ -956,23 +945,127 @@ pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
     format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
-/// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
-/// clause that enforces the closed set at the database layer. `None` for
-/// every other field kind.
+/// The trailing `CHECK (…)` clause a column needs to enforce at the database
+/// layer what its declared type promises, or `None` when the column type
+/// already enforces it.
 ///
-/// Variants are validated `snake_case` identifiers (see
-/// [`super::dsl::parse_field`]), so no SQL-escaping is needed here.
-fn enum_check_suffix(field: &Field) -> Option<String> {
-    if !field.kind.is_enum() {
-        return None;
+/// Two kinds need one:
+///
+/// - `enum{…}` on both backends — the closed variant set, since the column is
+///   `TEXT` either way.
+/// - `decimal{p,s}` on `SQLite` only (issue #1924) — Postgres gets a real
+///   `NUMERIC(p, s)`, but the `SQLite` column is `TEXT`, so without this the
+///   declared precision and scale bind nothing and a repository write can
+///   persist `123456.789` into a `decimal{5,2}`.
+fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String> {
+    if field.kind.is_enum() {
+        // Variants are validated `snake_case` identifiers (see
+        // `super::dsl::parse_field`), so no SQL-escaping is needed here.
+        let quoted = field
+            .variants
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("CHECK ({} IN ({quoted}))", field.name));
     }
-    let quoted = field
-        .variants
-        .iter()
-        .map(|v| format!("'{v}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("CHECK ({} IN ({quoted}))", field.name))
+    if backend == DatabaseBackend::Sqlite
+        && let FieldKind::Decimal { precision, scale } = field.kind
+    {
+        return Some(sqlite_decimal_check(&field.name, precision, scale));
+    }
+    None
+}
+
+/// The `SQLite` `CHECK` that enforces `NUMERIC(precision, scale)` over a `TEXT`
+/// column (issue #1924).
+///
+/// `SQLite` has no fixed-precision numeric type and no regular expressions, so
+/// the constraint is spelled with string builtins over the stored text, which
+/// `db::sqlite_types::SqliteDecimal` always writes as a plain, normalized
+/// decimal literal. Six conditions, in order:
+///
+/// 1. only digits remain once the sign and the point are removed;
+/// 2. at most one decimal point;
+/// 3. a `-`, if present, is leading;
+/// 4. the fractional part is at most `scale` digits, and the integer part at
+///    most `precision - scale` digits once leading zeros are stripped;
+/// 5. the spelling is canonical — what `Decimal::normalize` would produce
+///    (issue #2636): the integer part is a lone `0` or starts `1`-`9` (no
+///    `007.5`, no `0019`, no missing integer part as in `.5`), a fractional
+///    part never ends in `0` (`19.90`, `0.10` rejected) and a bare trailing
+///    `.` is rejected (`19.00` normalizes to `19`, not `19.0`);
+/// 6. no negative zero (`-0`): `Decimal::normalize` converts -0 to 0, so the
+///    wrapper never writes it (`-0.0` is already caught by (5)).
+///
+/// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
+/// unlike Postgres, which rounds a value to `scale` — a loud failure beats
+/// silently storing what the schema says is out of range. (5)-(6) exist
+/// because SQLite compares `TEXT` byte for byte: without them, text written
+/// outside the wrapper (raw SQL, an import, a hand-written migration) passes
+/// the constraint while being a spelling the wrapper would never produce —
+/// and is then invisible to the equality lookups the generated `find_by_*`
+/// queries issue (`'19.90'` vs `'19.9'`), or admitted twice by a `:unique`
+/// index while Rust equality says they are the same value.
+/// `NULL` passes; the column's own `NOT NULL` decides that.
+fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+    // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
+    let abs = format!("replace({column},'-','')");
+    let frac_len =
+        format!("CASE WHEN instr({abs},'.') = 0 THEN 0 ELSE length({abs}) - instr({abs},'.') END");
+    let int_part = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
+    );
+    let frac = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN '' ELSE substr({abs}, instr({abs},'.') + 1) END"
+    );
+    // The digits alone — sign and point removed. Condition 1 proves it is all
+    // digits, so its length is the digit count.
+    let digits = format!("replace(replace({column},'-',''),'.','')");
+    let conditions = [
+        // 0: actually stored as TEXT. `TEXT` affinity does NOT convert a BLOB,
+        // so `x'31392e3939'` keeps storage class blob while every string
+        // function below reads it as `19.99` and waves it through — and diesel's
+        // `FromSql<Text, Sqlite>` for `String` then refuses the blob before
+        // `Decimal` ever sees it. Same unloadable-row failure as conditions 1-5,
+        // one storage class further out.
+        format!("typeof({column}) = 'text'"),
+        // 1-5: a plain decimal literal. Without the digit count and the sign
+        // count, `''`, `'-'`, `'.'`, `'--1'` and `'-1-'` all pass — values a
+        // raw INSERT, an import or a hand-written migration can produce, which
+        // would satisfy the constraint and then fail `SqliteDecimal::from_sql`,
+        // leaving a row that cannot be loaded.
+        format!("ltrim({digits}, '0123456789') = ''"),
+        format!("length({digits}) >= 1"),
+        format!("length({column}) - length(replace({column},'.','')) <= 1"),
+        format!("length({column}) - length(replace({column},'-','')) <= 1"),
+        format!("(instr({column},'-') = 0 OR instr({column},'-') = 1)"),
+        // 6: scale.
+        format!("{frac_len} <= {scale}"),
+        // 7: precision, as the integer-digit budget NUMERIC(p, s) allows.
+        format!(
+            "length(ltrim({int_part}, '0')) <= {}",
+            precision.saturating_sub(scale)
+        ),
+        // 8: canonical integer part — the wrapper writes what
+        // `Decimal::normalize` produces: a lone `0`, or digits starting
+        // `1`-`9`. Rejects leading zeros (`007.5`, `0019`) and a missing
+        // integer part (`.5`); `Decimal` never prints either spelling.
+        format!(
+            "length({int_part}) >= 1 AND ({int_part} = '0' OR substr({int_part}, 1, 1) BETWEEN '1' AND '9')"
+        ),
+        // 9: canonical fractional part — `Decimal::normalize` strips trailing
+        // zeros and drops the point entirely when nothing remains (`19.00`
+        // becomes `19`, not `19.0`). Rejects `19.90`, `0.10` and a bare
+        // trailing `.`.
+        format!(
+            "(instr({abs},'.') = 0 OR (length({frac}) >= 1 AND substr({frac}, length({frac}), 1) != '0'))"
+        ),
+        // 10: no negative zero — `Decimal::normalize` converts -0 to 0, so
+        // the wrapper never writes `-0` (`-0.0` is already caught by 9).
+        format!("(instr({column},'-') = 0 OR ltrim({digits},'0') != '')"),
+    ];
+    format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
 }
 
 /// Result of inferring a migration shape from its name.
@@ -1172,27 +1265,26 @@ pub fn add_columns_up_sql_for(
                 f.name
             )));
         }
-        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
-        // DEFAULT (issue #1614 AC #4). This path carries no per-field default,
-        // so any NOT NULL added column is rejected at generate time rather than
-        // emitting DDL that breaks on SQLite. Postgres is unaffected (its
-        // output stays byte-for-byte identical), and a NOT NULL column inside
-        // CREATE TABLE (the `generate model` path) is likewise fine on SQLite.
-        // Issue #1318: `lock_version` is the one column this path can default
-        // on its own. `#[lock_version]` makes it DB-managed — the generated
-        // `New{Model}` never names it — so a bare `NOT NULL` add would leave
-        // every subsequent INSERT failing, and the retrofit ("add optimistic
-        // locking to a resource I already shipped") is the *normal* way this
-        // column arrives. `DEFAULT 0` also backfills existing rows in one
-        // statement, which is why this add needs neither the blocking-safety
-        // banner nor the SQLite refusal below.
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT (#1614
+        // AC #4). This path carries no per-field default, so any NOT NULL added column is
+        // rejected at generate time rather than emitting DDL that breaks on SQLite.
+        // Postgres is unaffected — its output stays byte for byte identical — and a NOT
+        // NULL column inside CREATE TABLE, the `generate model` path, is likewise fine on
+        // SQLite.
         //
-        // Issue #1384: a `{translatable}` column is the same shape of retrofit
-        // — the container column is `NOT NULL` and defaults to the empty JSON
-        // object `'{}'`, a constant that backfills every existing row in one
-        // statement. So, like `lock_version`, it needs neither the blocking
-        // banner nor the SQLite refusal, and `autumn migrate check` classifies
-        // the result as plain `ADD COLUMN NOT NULL DEFAULT <constant>` — safe.
+        // #1318: `lock_version` is the one column this path can default on its own.
+        // `#[lock_version]` makes it DB-managed, so the generated `New{Model}` never names
+        // it and a bare `NOT NULL` add would leave every subsequent INSERT failing — and
+        // the retrofit, "add optimistic locking to a resource I already shipped", is the
+        // normal way this column arrives. `DEFAULT 0` also backfills existing rows in one
+        // statement, which is why this add needs neither the blocking-safety banner nor
+        // the SQLite refusal below.
+        //
+        // #1384: a `{translatable}` column is the same shape of retrofit — the container
+        // column is `NOT NULL` and defaults to the empty JSON object `'{}'`, a constant
+        // that backfills every existing row in one statement. Like `lock_version` it needs
+        // neither the banner nor the refusal, and `autumn migrate check` classifies the
+        // result as a plain, safe `ADD COLUMN NOT NULL DEFAULT <constant>`.
         let lock_version_default = super::model::is_lock_version_column(f);
         let inherent_default = f.sql_default();
         let has_default = lock_version_default || inherent_default.is_some();
@@ -1223,7 +1315,7 @@ pub fn add_columns_up_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
@@ -1468,7 +1560,7 @@ pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
 #[cfg(test)]
 #[must_use]
 pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
-    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "")
+    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "", &[])
 }
 
 /// `remove_columns_up_sql` for a specific database `backend` (issue #1614).
@@ -1494,21 +1586,30 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// Postgres cascades index drops with the column, so its output stays
 /// byte-for-byte identical (no explicit `DROP INDEX`).
 ///
-/// Scope boundary: a column indexed for reasons the generator cannot see (a
-/// composite index spanning several columns) remains the documented limitation
-/// of issue #1906.
-///
 /// `existing_schema` mirrors [`add_columns_down_sql_for`] so a `unique` field's
 /// index name matches the one the up path generated.
+///
+/// `prior_indexes` (issue #1906) are the table's already-existing indexes, from
+/// [`crate::generate::prior_index::scan_prior_indexes`]. `SQLite` refuses
+/// `DROP COLUMN` while ANY index names the column, and the conventional
+/// `idx_<table>_<col>` guess above cannot reach a composite, partial,
+/// expression or hand-named index an earlier migration created. Each prior
+/// index that names a removed column gets its own `DROP INDEX IF EXISTS`.
+/// Postgres cascades index drops with the column, so it ignores `prior_indexes`
+/// and its output stays byte-for-byte identical.
 #[must_use]
 pub fn remove_columns_up_sql_for(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
     existing_schema: &str,
+    prior_indexes: &[PriorIndex],
 ) -> String {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
+    // Every index name already dropped, normalized. Two removed columns can
+    // share one composite index; drop it once.
+    let mut dropped: Vec<String> = Vec::new();
     for f in fields {
         let _ = writeln!(
             out,
@@ -1516,26 +1617,45 @@ pub fn remove_columns_up_sql_for(
              -- old replicas that reference this column will fail until restarted; \
              use expand/contract"
         );
-        // SQLite: drop the generator's index for this field first (see doc
-        // comment). SQLite refuses `DROP COLUMN` while any index references the
-        // column. The generator names a plain `--index` field's index and a
-        // `references` field's auto-index identically (`idx_<table>_<col>`), and
-        // the DSL/schema can't tell after the fact whether a column carried a
-        // plain index — so emit `DROP INDEX IF EXISTS idx_<table>_<col>;`
-        // unconditionally (a safe no-op via `IF EXISTS` for a non-indexed
-        // column), plus the `unique` field's uniquely-named index. Names are
-        // derived with the same helpers the ADD/CREATE paths use so the DROP
-        // matches the existing CREATE INDEX.
+        // SQLite: drop the generator's index for this field first (see doc comment).
+        // SQLite refuses `DROP COLUMN` while any index references the column. The
+        // generator names a plain `--index` field's index and a `references` field's
+        // auto-index identically (`idx_<table>_<col>`), and the DSL and schema cannot
+        // tell after the fact whether a column carried a plain index, so emit `DROP
+        // INDEX IF EXISTS idx_<table>_<col>;` unconditionally — a safe no-op for a
+        // non-indexed column — plus the `unique` field's uniquely-named index. Names
+        // come from the same helpers the ADD and CREATE paths use, so the DROP matches
+        // the existing CREATE INDEX.
         if backend == DatabaseBackend::Sqlite {
-            let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_{};", f.name);
+            let mut names = vec![format!("idx_{table}_{}", f.name)];
             if f.unique {
-                let name = unique_index_name(table, &f.name, &collision_fields);
+                names.push(unique_index_name(table, &f.name, &collision_fields));
+            }
+            // Indexes an earlier migration created that name this column.
+            names.extend(
+                prior_indexes
+                    .iter()
+                    .filter(|i| i.covers(&f.name))
+                    .map(|i| i.name.clone()),
+            );
+            for name in names {
+                let key = index_name_key(&name);
+                if dropped.contains(&key) {
+                    continue;
+                }
+                dropped.push(key);
                 let _ = writeln!(out, "DROP INDEX IF EXISTS {name};");
             }
         }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
+}
+
+/// Comparison key for an index name: unquoted and lowercased, so a scanned
+/// `"idx_posts_title"` matches the generator's own `idx_posts_title`.
+fn index_name_key(name: &str) -> String {
+    name.trim().trim_matches('"').to_lowercase()
 }
 
 /// `down.sql` companion to [`remove_columns_up_sql`]. Restores a `references`
@@ -1556,8 +1676,14 @@ pub fn remove_columns_up_sql_for(
 #[cfg(test)]
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
-    remove_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
-        .expect("Postgres ADD COLUMN generation never rejects")
+    remove_columns_down_sql_for(
+        DatabaseBackend::Postgres,
+        table,
+        fields,
+        existing_schema,
+        &[],
+    )
+    .expect("Postgres ADD COLUMN generation never rejects")
 }
 
 /// `remove_columns_down_sql` for a specific database `backend` (issue #1614).
@@ -1576,25 +1702,34 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
 /// so every `NOT NULL` re-added column is rejected on `SQLite`; nullable
 /// re-added columns are unaffected. The Postgres path never rejects and stays
 /// byte-for-byte identical.
+///
+/// `prior_indexes` (issue #1906) are the indexes the up path dropped. This
+/// re-creates each one that named a removed column, after the columns are back:
+/// an index cannot reference a column that does not exist yet. Without it a
+/// `migrate down` would leave the table missing indexes it had before. Ignored
+/// on Postgres, whose output stays byte-for-byte identical.
 pub fn remove_columns_down_sql_for(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
     existing_schema: &str,
+    prior_indexes: &[PriorIndex],
 ) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
+    // Index names this function re-creates itself, below. A prior index that
+    // repeats one must not be re-created twice: SQLite fails the whole rollback
+    // with "index <name> already exists".
+    let mut own_indexes: Vec<String> = Vec::new();
     for f in fields.iter().rev() {
-        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
-        // DEFAULT (issue #1614 AC #4). The rollback re-adds the dropped column
-        // with the same `ADD COLUMN` DDL and carries no per-field default, so a
-        // NOT NULL re-added column is rejected at generate time — mirroring the
-        // forward path (`add_columns_up_sql_for`) for a consistent generate
-        // contract. Postgres is unaffected (its output stays byte-for-byte
-        // identical), and a NOT NULL column inside CREATE TABLE is likewise
-        // fine on SQLite.
-        // Issue #1384: a `{translatable}` column carries its own constant
-        // default (`'{}'`), so the rollback's re-add is valid on SQLite too.
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
+        // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
+        // COLUMN` DDL and carries no per-field default, so a NOT NULL re-added column
+        // is rejected at generate time, mirroring the forward path
+        // (`add_columns_up_sql_for`) for a consistent generate contract. Postgres is
+        // unaffected, and a NOT NULL column inside CREATE TABLE is likewise fine on
+        // SQLite. A `{translatable}` column (#1384) carries its own constant default
+        // (`'{}'`), so its rollback re-add is valid on SQLite too.
         let inherent_default = f.sql_default();
         if backend == DatabaseBackend::Sqlite && !f.nullable && inherent_default.is_none() {
             return Err(super::sqlite_add_not_null_without_default_error(
@@ -1614,7 +1749,7 @@ pub fn remove_columns_down_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
@@ -1628,9 +1763,31 @@ pub fn remove_columns_down_sql_for(
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+            own_indexes.push(index_name_key(&format!("idx_{table}_{}", f.name)));
         }
         if f.unique {
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+            own_indexes.push(index_name_key(&unique_index_name(
+                table,
+                &f.name,
+                &collision_fields,
+            )));
+        }
+    }
+    // Re-create the prior indexes the up path dropped, after every column is
+    // back. Skips a name this function already emitted, and dedupes the scan
+    // itself: two removed columns can share one composite index.
+    if backend == DatabaseBackend::Sqlite {
+        for index in prior_indexes
+            .iter()
+            .filter(|i| fields.iter().any(|f| i.covers(&f.name)))
+        {
+            let key = index_name_key(&index.name);
+            if own_indexes.contains(&key) {
+                continue;
+            }
+            own_indexes.push(key);
+            let _ = writeln!(out, "{}", index.create_sql);
         }
     }
     Ok(out)
@@ -1762,37 +1919,28 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
     out
 }
 
-/// Inject the `#[path]`-qualified `mod schema;` / `mod models;` declarations
-/// that link a scaffolded app's `src/schema.rs` and `src/models/` into the
-/// standalone `src/bin/seed.rs` binary (issue #1718).
+/// Link `src/schema.rs` and `src/models/` into the standalone `src/bin/seed.rs`
+/// binary with `#[path]`-qualified `mod` declarations (issues #1718, #2669).
 ///
 /// `autumn seed --count/--model` resolves a model by name through an
-/// `inventory` registry that each `#[autumn_web::model]` submits into. That
-/// registry is only populated with models actually **compiled into the seed
-/// binary** — but `autumn new` emits `src/bin/seed.rs` as a separate `[[bin]]`
-/// target that links neither `src/main.rs` nor `src/models/`, so a scaffolded
-/// model was never visible to it and `--model M` returned
-/// `unknown model M; available: (none)`. Declaring the models (and the
-/// `schema` module they `use crate::schema::…` from) directly in `seed.rs`
-/// pulls their `inventory::submit!`s into the seed binary.
+/// `inventory` registry. Each `#[autumn_web::model]` submits into that
+/// registry. The registry only contains models compiled into the seed binary.
+/// `autumn new` emits `src/bin/seed.rs` as a separate `[[bin]]` target. That
+/// target links neither `src/main.rs` nor `src/models/`. Without this link,
+/// `--model M` returns `unknown model M; available: (none)`.
 ///
-/// The `#[path]` form is required because `src/bin/seed.rs`'s own module tree
-/// has no `models`/`schema` child relative to `src/bin/`; the attribute points
+/// The `#[path]` form is required. A bare `mod schema;` inside `src/bin/`
+/// resolves to `src/bin/schema.rs`, which does not exist. The attribute points
 /// each declaration at the real file under `src/`. Child modules of
-/// `models/mod.rs` (`mod post;` → `src/models/post.rs`) resolve relative to
-/// that file's directory, so no per-model edit is needed here — regenerating
-/// or adding a model just extends `src/models/mod.rs`, which this single
-/// declaration already re-exports into the seed binary.
+/// `models/mod.rs` resolve relative to that file's directory, so no per-model
+/// edit is needed.
 ///
-/// Idempotent: a declaration already present (in any `mod x;` / `pub mod x;`
-/// form, with or without a preceding `#[path]` attribute) is left untouched,
-/// so repeated `generate` runs converge. The inverse
-/// [`unlink_models_from_seed_bin`] removes these injected declarations at
-/// destroy time — necessary because `autumn destroy` **deletes**
-/// `src/models/mod.rs` / `src/schema.rs` once its `ModDecl`/`SchemaTable`
-/// reverts empty them (destroying the last model), which would otherwise leave
-/// `seed.rs`'s `#[path]` links dangling at missing files and break
-/// `cargo check --bins` / `autumn seed`.
+/// A hand-written plain `mod schema;` / `mod models;` (issue #2669) gets the
+/// same treatment: the declaration is kept, and the `#[path]` attribute is
+/// added above it. A declaration that already carries an attribute (a
+/// hand-written `#[path]`, a `#[cfg]`, …) is left untouched.
+///
+/// Idempotent. [`unlink_models_from_seed_bin`] is the destroy-time inverse.
 #[must_use]
 pub fn link_models_into_seed_bin(existing: &str) -> String {
     // (module name, full declaration incl. its `#[path]` attribute)
@@ -1800,32 +1948,40 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
         ("schema", "#[path = \"../schema.rs\"]\nmod schema;"),
         ("models", "#[path = \"../models/mod.rs\"]\nmod models;"),
     ];
+    // A hand-written plain `mod schema;` / `mod models;` points at
+    // `src/bin/…`, which does not exist — qualify it with the `#[path]`
+    // attribute instead of leaving the seed binary broken (issue #2669).
+    let mut qualified = existing.to_owned();
+    for (name, decl) in &entries {
+        let attr = decl.split('\n').next().unwrap_or("");
+        qualified = qualify_plain_mod(&qualified, name, attr);
+    }
     let needed: Vec<&str> = entries
         .iter()
-        .filter(|(name, _)| !has_mod_declaration(existing, name))
+        .filter(|(name, _)| !has_mod_declaration(&qualified, name))
         .map(|(_, decl)| *decl)
         .collect();
     if needed.is_empty() {
-        return existing.to_owned();
+        return qualified;
     }
     let block = needed.join("\n");
 
     // `mod` declarations are *items* and must follow any crate-level inner
     // attributes (`#![…]`) and `//!` doc comments — mirror `ensure_mods`.
-    let split = existing
+    let split = qualified
         .lines()
         .position(|l| {
             let t = l.trim_start();
             !t.is_empty() && !t.starts_with("//!") && !t.starts_with("#![")
         })
-        .unwrap_or_else(|| existing.lines().count());
+        .unwrap_or_else(|| qualified.lines().count());
 
     if split == 0 {
-        return format!("{block}\n\n{existing}");
+        return format!("{block}\n\n{qualified}");
     }
 
-    let mut out = String::with_capacity(existing.len() + block.len() + 4);
-    let lines: Vec<&str> = existing.lines().collect();
+    let mut out = String::with_capacity(qualified.len() + block.len() + 4);
+    let lines: Vec<&str> = qualified.lines().collect();
     for line in &lines[..split] {
         out.push_str(line);
         out.push('\n');
@@ -1839,36 +1995,124 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
             out.push('\n');
         }
     }
+    if !qualified.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Add the `#[path]` attribute above a hand-written plain `mod <name>;`
+/// declaration in `src/bin/seed.rs` (issue #2669).
+///
+/// A plain `mod schema;` / `mod models;` inside `src/bin/seed.rs` resolves to
+/// `src/bin/schema.rs` / `src/bin/models/`, which do not exist — the seed
+/// binary fails to compile, and the models stay invisible to `autumn seed`.
+/// Inserting the `#[path]` attribute above the existing declaration points it
+/// at the real file under `src/` without duplicating the declaration.
+///
+/// Rules, applied per line:
+/// - Only a bare `mod <name>;` or `pub mod <name>;` — the two forms
+///   [`has_mod_declaration`] recognises — is qualified.
+/// - A declaration that already carries an attribute (a hand-written
+///   `#[path]`, a `#[cfg]`, …), even one separated from the declaration by
+///   blank lines or comments, is left untouched.
+/// - The attribute goes on its own line directly above the declaration,
+///   reusing the declaration's indentation. Visibility is preserved.
+/// - Idempotent: a qualified declaration carries the canonical attribute, so
+///   a second pass finds it and changes nothing.
+#[must_use]
+fn qualify_plain_mod(existing: &str, name: &str, path_attr: &str) -> String {
+    let decls = [format!("mod {name};"), format!("pub mod {name};")];
+    let lines: Vec<&str> = existing.lines().collect();
+    let is_plain = |line: &str| decls.iter().any(|d| line.trim() == *d);
+    if !lines
+        .iter()
+        .enumerate()
+        .any(|(i, line)| is_plain(line) && !carries_attribute(&lines, i))
+    {
+        return existing.to_owned();
+    }
+    let mut out = String::with_capacity(existing.len() + path_attr.len() + 8);
+    for (i, line) in lines.iter().enumerate() {
+        if is_plain(line) && !carries_attribute(&lines, i) {
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            out.push_str(&indent);
+            out.push_str(path_attr);
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Preserve the original trailing-newline status.
     if !existing.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
     out
 }
 
+/// Whether the `mod` declaration on `lines[i]` already carries an attribute
+/// (`#[path = …]`, `#[cfg(…)]`, …). Such a declaration is not "plain" and is
+/// never qualified by [`qualify_plain_mod`].
+///
+/// Rust attaches an attribute to its item even across intervening blank lines
+/// and comments, so the scan skips blank lines and `//` comment lines looking
+/// upward: the declaration counts as attribute-carrying only when the first
+/// line above that is neither blank nor a comment starts with `#[`. Without
+/// the skip, a custom `#[path]` separated from its `mod` by a comment would be
+/// treated as plain and get a second, conflicting `#[path]` — and at destroy
+/// time the unlinker would remove that canonical block together with the
+/// declaration, leaving the original attribute dangling and disconnecting the
+/// custom module.
+fn carries_attribute(lines: &[&str], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        let t = lines[j].trim_start();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        return t.starts_with("#[");
+    }
+    false
+}
+
 /// Remove the `#[path]`-qualified `mod schema;` / `mod models;` declarations
-/// that [`link_models_into_seed_bin`] injected into `src/bin/seed.rs`, the
-/// destroy-time inverse of that link (issue #1718 follow-up).
+/// (private and `pub` forms) that [`link_models_into_seed_bin`] injected into
+/// `src/bin/seed.rs`, the destroy-time inverse of that link (issue #1718
+/// follow-up).
 ///
 /// `autumn destroy` deletes `src/schema.rs` and `src/models/mod.rs` once the
 /// last model's `SchemaTable`/`ModDecl` reverts empty them, so the seed
 /// binary's `#[path = "../schema.rs"] mod schema;` /
 /// `#[path = "../models/mod.rs"] mod models;` links would then point at missing
-/// files and fail `cargo check --bins`. This strips exactly those two injected
+/// files and fail `cargo check --bins`. This strips exactly the injected
 /// two-line blocks (attribute + `mod` declaration), matched on trimmed content
 /// so only this generator's own `#[path]`-qualified form is touched — a
 /// hand-written plain `mod schema;` without the injected attribute is left
 /// alone. Idempotent: a block already absent is a no-op. Blank lines left at
 /// the removal seam are collapsed so the reverted file stays tidy.
 ///
+/// A hand-written plain declaration that linking qualified (issue #2669) is
+/// removed as one block too, in both the `mod` and `pub mod` forms: the bare
+/// `mod schema;` points at `src/bin/schema.rs`, which does not exist, so
+/// keeping it would break `cargo check --bins` exactly like a dangling
+/// `#[path]` would. Without the `pub mod` entries, a hand-written
+/// `pub mod schema;` qualified at link time would keep its canonical `#[path]`
+/// block after the last model is destroyed and fail `cargo check --bins`.
+///
 /// This is gated by [`Revert::SeedBinLinks`](crate::generate::emit::Revert::SeedBinLinks)'s `owner_dir` (`src/models`) so it
 /// only runs when the *last* model is destroyed — destroying one of several
 /// models leaves the links in place, matching the surviving `models/mod.rs`.
 #[must_use]
 pub fn unlink_models_from_seed_bin(existing: &str) -> String {
-    // (attribute line, declaration line) for each injected block.
-    let blocks: [[&str; 2]; 2] = [
+    // (attribute line, declaration line) for each injected block, in both the
+    // private and `pub` declaration forms (issue #2669 qualifies `pub mod`
+    // too).
+    let blocks: [[&str; 2]; 4] = [
         ["#[path = \"../schema.rs\"]", "mod schema;"],
+        ["#[path = \"../schema.rs\"]", "pub mod schema;"],
         ["#[path = \"../models/mod.rs\"]", "mod models;"],
+        ["#[path = \"../models/mod.rs\"]", "pub mod models;"],
     ];
     let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
     for [attr, decl] in blocks {
@@ -3835,14 +4079,26 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// silently misses forms like `package= "..."` or `package ="..."`. Also
 /// tolerant of TOML's single-quoted literal-string form (`package =
 /// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
-fn declares_package(text: &str, target: &str) -> bool {
+/// The *key* may likewise be quoted (`"package" = "autumn-web"` is valid
+/// TOML that Cargo treats as the same key), so quote characters are stripped
+/// from the key exactly as they already are from the value — otherwise a
+/// properly-renamed dependency would be missed by the rename gate.
+///
+/// `pub(super)`: also called from `super::auth`'s `ensure_autumn_web_*_feature`
+/// helpers, which must not treat a `[dependencies.autumn_web]` subtable as the
+/// framework dependency unless it actually renames the package this way — Cargo
+/// does not normalize `-`/`_` in a dependency table key itself (confirmed via
+/// `cargo metadata`: `[dependencies.async_trait]` with no `package` key fails
+/// to resolve, suggesting the hyphenated name instead of aliasing to it).
+pub(super) fn declares_package(text: &str, target: &str) -> bool {
     let body = match (text.find('{'), text.rfind('}')) {
         (Some(open), Some(close)) if close > open => &text[open + 1..close],
         _ => text,
     };
     split_top_level_commas(body).into_iter().any(|part| {
         part.split_once('=').is_some_and(|(k, v)| {
-            k.trim() == "package" && v.trim().trim_matches(['"', '\'']) == target
+            k.trim().trim_matches(['"', '\'']) == "package"
+                && v.trim().trim_matches(['"', '\'']) == target
         })
     })
 }
@@ -5515,6 +5771,7 @@ mod tests {
             "posts",
             &fields(&["title:String{translatable}"]),
             "",
+            &[],
         )
         .expect("SQLite rollback accepted for a defaulted column");
         assert!(sql.contains("title TEXT NOT NULL DEFAULT '{}'"), "{sql}");
@@ -6172,6 +6429,196 @@ mod tests {
         );
     }
 
+    // ── prior-index-aware Remove…From… on SQLite (#1906) ───────────────────
+
+    fn prior(create: &str, table: &str) -> Vec<crate::generate::prior_index::PriorIndex> {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("2026_01_01_000000_a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("up.sql"), create).unwrap();
+        crate::generate::prior_index::scan_prior_indexes(tmp.path(), table)
+    }
+
+    #[test]
+    fn sqlite_remove_column_drops_a_prior_composite_index_first() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
+            "posts",
+        );
+        let up = remove_columns_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String"]),
+            "",
+            &indexes,
+        );
+        let drop_index = up
+            .find("DROP INDEX IF EXISTS idx_posts_author_title;")
+            .unwrap_or_else(|| panic!("composite index must be dropped:\n{up}"));
+        let drop_column = up
+            .find("ALTER TABLE posts DROP COLUMN title;")
+            .unwrap_or_else(|| panic!("column must be dropped:\n{up}"));
+        assert!(
+            drop_index < drop_column,
+            "index drop must come first:\n{up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_column_restores_a_prior_index_on_rollback() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:Option<String>"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        let add = down
+            .find("ALTER TABLE posts ADD COLUMN title")
+            .unwrap_or_else(|| panic!("column must be re-added:\n{down}"));
+        let recreate = down
+            .find("CREATE INDEX idx_posts_author_title ON posts (author_id, title);")
+            .unwrap_or_else(|| panic!("index must be re-created:\n{down}"));
+        assert!(
+            add < recreate,
+            "column must exist before the index:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_column_ignores_a_prior_index_on_other_columns() {
+        let indexes = prior("CREATE INDEX idx_posts_body ON posts (body);", "posts");
+        let up = remove_columns_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String"]),
+            "",
+            &indexes,
+        );
+        assert!(!up.contains("idx_posts_body"), "got:\n{up}");
+    }
+
+    #[test]
+    fn sqlite_remove_column_does_not_repeat_the_conventional_index_name() {
+        // The generator already emits `idx_<table>_<col>` unconditionally; a
+        // scanned index of the same name must not produce a duplicate DROP.
+        let indexes = prior("CREATE INDEX idx_posts_title ON posts (title);", "posts");
+        let up = remove_columns_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["title:String"]),
+            "",
+            &indexes,
+        );
+        assert_eq!(
+            up.matches("DROP INDEX IF EXISTS idx_posts_title;").count(),
+            1,
+            "got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn postgres_remove_column_ignores_prior_indexes() {
+        // Postgres cascades index drops with the column; its output must stay
+        // byte-for-byte identical to the prior-index-unaware path.
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
+            "posts",
+        );
+        let with = remove_columns_up_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            &fields(&["title:String"]),
+            "",
+            &indexes,
+        );
+        let without = remove_columns_up_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            &fields(&["title:String"]),
+            "",
+            &[],
+        );
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn sqlite_remove_column_never_recreates_one_index_twice() {
+        // The per-field loop already re-creates a `unique` field's index by the
+        // same name the scan recovers. Emitting both fails the whole rollback
+        // with "index idx_posts_slug_unique already exists".
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["slug:Option<String>:unique"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_slug_unique ON posts (slug);")
+                .count(),
+            1,
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_reference_column_never_recreates_its_auto_index_twice() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_author_id ON posts (author_id);")
+                .count(),
+            1,
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_two_columns_sharing_one_composite_index_recreates_it_once() {
+        let indexes = prior(
+            "CREATE INDEX idx_posts_author_title ON posts (author_id, title);",
+            "posts",
+        );
+        let f = fields(&["title:Option<String>", "author_id:Option<i64>"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &indexes);
+        let down = remove_columns_down_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &indexes)
+            .unwrap();
+        // The up path drops it once, ahead of the first DROP COLUMN.
+        assert_eq!(
+            up.matches("DROP INDEX IF EXISTS idx_posts_author_title;")
+                .count(),
+            1,
+            "got:\n{up}"
+        );
+        // And the rollback creates it exactly once.
+        assert_eq!(
+            down.matches("CREATE INDEX idx_posts_author_title").count(),
+            1,
+            "got:\n{down}"
+        );
+    }
+
     #[test]
     fn position_triggers_sqlite_unscoped_assign_and_compact() {
         let up = position_triggers_up_sql_for(
@@ -6546,15 +6993,13 @@ mod tests {
 
     #[test]
     fn unique_index_name_disambiguates_coincidental_collision_with_plain_index() {
-        // Regression guard (issue #1032 review follow-up): a plain index
-        // always names itself after its own column (`idx_<table>_<name>`),
-        // with no `_unique` suffix. If some *other* field in the same table
-        // happens to be literally named `<field>_unique`, that field's own
-        // plain index collides with `field`'s unique index name even though
-        // the two fields are otherwise unrelated (`email:unique` +
-        // `email_unique:String --index email_unique` both want
-        // `idx_users_email_unique`) -- the generated migration would fail
-        // with "relation already exists" before the table was ever usable.
+        // Regression guard (#1032 review follow-up): a plain index always names itself
+        // after its own column (`idx_<table>_<name>`), with no `_unique` suffix. If some
+        // other field in the same table happens to be named literally `<field>_unique`,
+        // that field's plain index collides with `field`'s unique index name even though
+        // the two are unrelated: `email:unique` and `email_unique:String --index
+        // email_unique` both want `idx_users_email_unique`, and the generated migration
+        // would fail with "relation already exists" before the table was ever usable.
         let colliding_field = fields(&["email_unique:String"]);
         let name = unique_index_name("users", "email", &colliding_field);
         assert_ne!(
@@ -6632,15 +7077,13 @@ mod tests {
 
     #[test]
     fn add_columns_up_sql_avoids_name_collision_with_earlier_migrations_columns() {
-        // Regression guard (issue #1032 review follow-up): `add_columns_up_sql`
-        // only ever sees the columns being added in *this* `AddXToY`
-        // migration -- not a table's other, already-existing columns from an
-        // earlier, separately-run migration. A field named `email_unique`
-        // added back when the table was first created would otherwise still
-        // collide with a `unique` field named `email` added later, with no
-        // way for this call alone to know `email_unique` already exists.
-        // `src/schema.rs` (kept in sync by every model/scaffold generator) is
-        // what lets this call see across that gap.
+        // Regression guard (#1032 review follow-up): `add_columns_up_sql` sees only the
+        // columns being added in this `AddXToY` migration, not a table's other,
+        // already-existing columns from an earlier, separately-run one. A field named
+        // `email_unique` added when the table was first created would otherwise still
+        // collide with a `unique` field named `email` added later, with no way for this
+        // call alone to know `email_unique` exists. `src/schema.rs`, kept in sync by
+        // every model and scaffold generator, is what lets this call see across that gap.
         let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
         let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), &existing_schema);
         assert!(
@@ -6952,7 +7395,7 @@ mod tests {
     #[test]
     fn sqlite_remove_columns_up_drops_reference_index_before_column() {
         let f = fields(&["author:references?"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_posts_author_id;")
             .expect("drop index");
@@ -6971,7 +7414,7 @@ mod tests {
     #[test]
     fn sqlite_remove_columns_up_drops_unique_index_before_column() {
         let f = fields(&["email:Option<String>:unique"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_users_email_unique;")
             .expect("drop index");
@@ -6994,7 +7437,7 @@ mod tests {
     fn sqlite_remove_columns_up_drops_plain_index_before_column() {
         // `RemoveTitleFromPosts`: `title` was created via scaffold `--index`.
         let f = fields(&["title:String"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "", &[]);
         let drop_idx = up
             .find("DROP INDEX IF EXISTS idx_posts_title;")
             .expect("drop index");
@@ -7013,7 +7456,7 @@ mod tests {
     #[test]
     fn postgres_remove_columns_up_has_no_explicit_drop_index() {
         let f = fields(&["author:references?"]);
-        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "", &[]);
         assert!(!up.contains("DROP INDEX"), "up:\n{up}");
         assert!(up.contains("ALTER TABLE posts DROP COLUMN author_id;"));
         // And the Postgres-default test wrapper matches.
@@ -7306,6 +7749,175 @@ mod models;
 use autumn_web::seed::SeedContext;
 ";
         assert_eq!(link_models_into_seed_bin(existing), existing);
+    }
+
+    #[test]
+    fn link_seed_bin_qualifies_a_hand_written_plain_mod() {
+        // A hand-written plain `mod schema;` inside `src/bin/seed.rs` resolves
+        // to `src/bin/schema.rs`, which does not exist — the seed binary would
+        // not compile and `autumn seed` could not see the models. Link it by
+        // qualifying the existing declaration with the `#[path]` attribute
+        // instead of leaving it broken or duplicating it (issue #2669).
+        let existing = "\
+//! seed
+mod schema;
+mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(
+            linked.contains("#[path = \"../schema.rs\"]\nmod schema;"),
+            "plain `mod schema;` must be #[path]-qualified:\n{linked}"
+        );
+        assert!(
+            linked.contains("#[path = \"../models/mod.rs\"]\nmod models;"),
+            "plain `mod models;` must be #[path]-qualified:\n{linked}"
+        );
+        assert_eq!(
+            linked.matches("mod schema;").count(),
+            1,
+            "must not duplicate the qualified `mod schema;`:\n{linked}"
+        );
+        assert_eq!(
+            linked.matches("mod models;").count(),
+            1,
+            "must not duplicate the qualified `mod models;`:\n{linked}"
+        );
+        // Qualifying is idempotent: a second link pass changes nothing.
+        assert_eq!(
+            link_models_into_seed_bin(&linked),
+            linked,
+            "re-linking a qualified seed bin is a no-op"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_qualify_preserves_visibility_indentation_and_custom_path() {
+        // Qualification must not rewrite the author's own choices: `pub`
+        // visibility and indentation survive, and a declaration carrying a
+        // hand-written `#[path]` (or any other attribute) is left untouched
+        // (issue #2669).
+        let existing = "\
+//! seed
+    pub mod schema;
+#[path = \"custom/schema.rs\"]
+mod models;
+#[cfg(feature = \"extra\")]
+mod schemata;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(
+            linked.contains("    #[path = \"../schema.rs\"]\n    pub mod schema;"),
+            "the attribute must reuse the declaration's indentation and keep `pub`:\n{linked}"
+        );
+        assert!(
+            linked.contains("#[path = \"custom/schema.rs\"]\nmod models;"),
+            "a hand-written `#[path]` must be preserved:\n{linked}"
+        );
+        assert!(
+            !linked.contains("../models/mod.rs"),
+            "must not add a second `models` link:\n{linked}"
+        );
+        assert!(
+            linked.contains("#[cfg(feature = \"extra\")]\nmod schemata;"),
+            "an attribute-carrying non-seed declaration must be untouched:\n{linked}"
+        );
+        assert_eq!(
+            link_models_into_seed_bin(&linked),
+            linked,
+            "re-linking is a no-op"
+        );
+    }
+
+    #[test]
+    fn unlink_seed_bin_removes_a_qualified_hand_written_mod() {
+        // Destroy-time inverse of qualification: a hand-written plain
+        // `mod schema;` that linking qualified goes away as one block. The
+        // bare declaration points at `src/bin/schema.rs`, which does not
+        // exist, so keeping it would break `cargo check --bins` exactly like
+        // a dangling `#[path]` would (issue #2669).
+        let existing = "\
+//! seed
+mod schema;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        let unlinked = unlink_models_from_seed_bin(&linked);
+        assert!(
+            !unlinked.contains("mod schema;") && !unlinked.contains("../schema.rs"),
+            "the qualified block must be fully removed:\n{unlinked}"
+        );
+        assert!(
+            unlinked.contains("use autumn_web::seed::SeedContext;"),
+            "the original seed-binary items must be preserved:\n{unlinked}"
+        );
+    }
+
+    #[test]
+    fn unlink_seed_bin_removes_qualified_pub_mods() {
+        // Destroy-time inverse of qualifying a hand-written `pub mod`:
+        // linking qualifies `pub mod schema;` / `pub mod models;` too, so the
+        // unlinker must strip those canonical blocks — otherwise the
+        // `#[path]` attribute dangles at the deleted `src/schema.rs` /
+        // `src/models/mod.rs` and `cargo check --bins` fails (issue #2669,
+        // Codex review on #2824).
+        let existing = "\
+//! seed
+pub mod schema;
+    pub mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(
+            linked.contains("#[path = \"../schema.rs\"]\npub mod schema;"),
+            "link must qualify `pub mod schema;`:\n{linked}"
+        );
+        let unlinked = unlink_models_from_seed_bin(&linked);
+        assert!(
+            !unlinked.contains("mod schema;")
+                && !unlinked.contains("mod models;")
+                && !unlinked.contains("../schema.rs")
+                && !unlinked.contains("../models/mod.rs"),
+            "both qualified `pub mod` blocks must be fully removed:\n{unlinked}"
+        );
+        assert!(
+            unlinked.contains("use autumn_web::seed::SeedContext;"),
+            "the original seed-binary items must be preserved:\n{unlinked}"
+        );
+        assert_eq!(
+            unlink_models_from_seed_bin(&unlinked),
+            unlinked,
+            "unlinking is idempotent"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_qualify_skips_comment_separated_attribute() {
+        // Rust attaches an attribute to its item even across blank lines and
+        // comments, so a hand-written `#[path]` separated from its `mod` by a
+        // comment or blank line is not "plain" and must be left untouched.
+        // Qualifying it would add a second, conflicting `#[path]` — and at
+        // destroy time the unlinker would remove the canonical block together
+        // with the declaration, leaving the original attribute dangling and
+        // disconnecting the custom module (issue #2669, Codex review on
+        // #2824).
+        let existing = "\
+//! seed
+#[path = \"custom/schema.rs\"]
+// points at the hand-maintained schema
+mod schema;
+
+#[path = \"custom/models/mod.rs\"]
+
+mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert_eq!(
+            linked, existing,
+            "attribute-carrying declarations separated by comments/blank lines must be untouched:\n{linked}"
+        );
     }
 
     #[test]
@@ -7802,6 +8414,107 @@ fn main() {
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
 
+    /// The `SQLite` decimal `CHECK` is SQL, so it is tested by running it —
+    /// against a real in-memory `SQLite`, not by matching the string (issue
+    /// #1924). Covers the digit budgets it exists for, and the malformed text
+    /// that an earlier version admitted: a value that satisfies the constraint
+    /// but fails `SqliteDecimal::from_sql` is a row nothing can load.
+    #[test]
+    fn sqlite_decimal_check_enforces_precision_scale_and_shape() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // `decimal{10,2}`: at most 8 integer digits and 2 fractional.
+        let check = sqlite_decimal_check("price", 10, 2);
+        conn.batch_execute(&format!("CREATE TABLE t (price TEXT NULL {check})"))
+            .expect("the generated CHECK must be valid SQLite SQL");
+
+        let accepts = |conn: &mut diesel::SqliteConnection, value: &str| {
+            diesel::sql_query(format!("INSERT INTO t (price) VALUES ('{value}')"))
+                .execute(conn)
+                .is_ok()
+        };
+
+        for value in ["0", "0.1", "19.99", "-19.99", "12345678.99", "-0.01"] {
+            assert!(accepts(&mut conn, value), "`{value}` is in range");
+        }
+        for value in [
+            // Over budget.
+            "123456789.99",
+            "19.999",
+            "123456.789",
+            // Malformed: no digit, or a stray/duplicated sign.
+            "",
+            "-",
+            ".",
+            "-.",
+            "--1",
+            "-1-",
+            "1.2.3",
+            "abc",
+        ] {
+            assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
+        }
+
+        // Canonicality (issue #2636): SQLite compares TEXT byte for byte, so
+        // a non-canonical spelling passes every shape check above yet is
+        // invisible to the equality lookups the generated `find_by_*` queries
+        // issue — and a `:unique` index would admit both spellings as
+        // distinct rows while Rust equality says they are one value. Only
+        // what `Decimal::normalize` would write may pass.
+        for value in [
+            // Trailing zero in the fractional part, or a bare trailing point.
+            "19.90", "0.10", "19.0", "0.0", "19.", "-19.90",
+            // Leading zeros in the integer part, or none at all.
+            "007.5", "0019", "00.5", ".5", "-.5",
+            // Negative zero: `Decimal::normalize` converts -0 to 0, so the
+            // wrapper never writes it.
+            "-0", "-0.0",
+        ] {
+            assert!(
+                !accepts(&mut conn, value),
+                "`{value}` is not what `Decimal::normalize` writes and must be rejected"
+            );
+        }
+        // The canonical spellings of those same values stay accepted.
+        for value in ["19.9", "0.1", "19", "7.5", "0", "0.5", "-0.5", "10", "100"] {
+            assert!(
+                accepts(&mut conn, value),
+                "`{value}` is canonical and must be accepted"
+            );
+        }
+
+        // Storage class, not just text shape. A BLOB whose BYTES spell a valid
+        // decimal is the one case `TEXT` affinity will NOT convert, so it keeps
+        // storage class blob and `FromSql<Text, Sqlite>` refuses it — an
+        // unloadable row unless the CHECK rejects it up front.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (x'31392e3939')")
+                .execute(&mut conn)
+                .is_err(),
+            "a blob spelling `19.99` must be rejected: TEXT affinity does not convert it"
+        );
+        // Unquoted numeric literals ARE converted by TEXT affinity, so they are
+        // stored as text and load fine — the CHECK must not reject them.
+        for literal in ["19.99", "19", "-0.01"] {
+            assert!(
+                diesel::sql_query(format!("INSERT INTO t (price) VALUES ({literal})"))
+                    .execute(&mut conn)
+                    .is_ok(),
+                "`{literal}` is converted to TEXT by affinity and must be accepted"
+            );
+        }
+
+        // NULL is the column's own business, not the CHECK's.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (NULL)")
+                .execute(&mut conn)
+                .is_ok(),
+            "NULL must pass; NOT NULL decides that"
+        );
+    }
+
     #[test]
     fn ensure_feature_status_reports_not_found_when_dep_absent() {
         // No `autumn-web` dependency at all → status `false` so callers can warn.
@@ -8061,6 +8774,45 @@ fn main() {
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    /// `declares_package` must accept TOML-quoted `package` keys (Codex review
+    /// on #2771): `"package" = "autumn-web"` is valid TOML that Cargo treats
+    /// as the same key, so the rename gate in `ensure_autumn_web_*_feature`
+    /// must not miss it.
+    #[test]
+    fn declares_package_accepts_quoted_keys() {
+        assert!(declares_package("package = \"autumn-web\"", "autumn-web"));
+        assert!(declares_package(
+            "\"package\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(declares_package("'package' = 'autumn-web'", "autumn-web"));
+        assert!(declares_package(
+            "version = \"0.3\", \"package\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(declares_package(
+            "{ version = \"0.3\", 'package' = \"autumn-web\" }",
+            "autumn-web"
+        ));
+    }
+
+    #[test]
+    fn declares_package_still_rejects_non_package_keys() {
+        assert!(!declares_package("version = \"0.3\"", "autumn-web"));
+        assert!(!declares_package(
+            "packaging = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(!declares_package(
+            "\"packaging\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(!declares_package(
+            "package = \"some-other-crate\"",
+            "autumn-web"
+        ));
     }
 
     #[test]
@@ -9206,16 +9958,14 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_aliased_path_source() {
-        // Regression test (Codex review, issue #1023): a renamed dep, e.g.
-        // `autumn_web = { package = "autumn-web", path = "../autumn" }`,
-        // wasn't recognized at all -- the detector only matched the literal
-        // `autumn-web` key, so it fell back to a mismatched crates.io
-        // version. Confirmed via `cargo metadata --offline` that Cargo
-        // unifies dependency sources by *package name* (here "autumn-web"),
-        // not by the local alias key, so an unaliased `autumn-web = { path
-        // = "../autumn", ... }` dev-dependency (mirroring just the source,
-        // not the alias) resolves to the identical node as the aliased
-        // `[dependencies]` entry.
+        // Regression test (Codex review, #1023): a renamed dep such as `autumn_web = {
+        // package = "autumn-web", path = "../autumn" }` was not recognized at all — the
+        // detector matched only the literal `autumn-web` key, so it fell back to a
+        // mismatched crates.io version. `cargo metadata --offline` confirms Cargo unifies
+        // dependency sources by package name, here "autumn-web", not by the local alias
+        // key, so an unaliased `autumn-web = { path = "../autumn", ... }` dev-dependency,
+        // mirroring the source rather than the alias, resolves to the identical node as
+        // the aliased `[dependencies]` entry.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", path = \"../autumn\" }\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9282,15 +10032,13 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_existing_pinned_version_not_cli_version() {
-        // Regression test (Codex review, issue #1023): the fallback used to
-        // insert `version = "<CLI's own CARGO_PKG_VERSION>"` unconditionally,
-        // ignoring whatever `[dependencies]` actually pins. When the two
-        // differ (e.g. a project pinned to an older `autumn-web = "0.5"`
-        // while the CLI itself is `0.6`), Cargo's resolver can reject the
-        // manifest outright if the two version requirements don't overlap
-        // (confirmed via `cargo metadata`: "failed to select a version").
-        // The dev-dependency entry must mirror the *existing* requirement,
-        // not the CLI's.
+        // Regression test (Codex review, #1023): the fallback used to insert `version =
+        // "<CLI's own CARGO_PKG_VERSION>"` unconditionally, ignoring whatever
+        // `[dependencies]` actually pins. When the two differ — a project pinned to an
+        // older `autumn-web = "0.5"` while the CLI is `0.6` — Cargo's resolver can reject
+        // the manifest outright if the requirements do not overlap; `cargo metadata`
+        // reports "failed to select a version". The dev-dependency entry must mirror the
+        // existing requirement, not the CLI's.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9332,17 +10080,15 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_dotted_aliased_path_source() {
-        // Regression test (Codex review, issue #1023): the renamed-dep fixes
-        // covered the inline-table (`autumn_web = { package = "autumn-web",
-        // ... }`) and subtable (`[dependencies.autumn_web]`) alias shapes,
-        // but not Cargo's dotted renamed-dependency form
-        // (`autumn_web.package = "autumn-web"` plus `autumn_web.path =
-        // "../autumn"` on separate lines). The alias-detection branch split
-        // on the key's dot and compared the whole `autumn_web.package`
-        // string against `autumn_web`, so it never matched and fell through
-        // to a mismatched crates.io version. Confirmed via `cargo metadata
-        // --offline` that two different paths for the same package name
-        // conflict, same as the other alias forms.
+        // Regression test (Codex review, #1023): the renamed-dep fixes covered the
+        // inline-table (`autumn_web = { package = "autumn-web", ... }`) and subtable
+        // (`[dependencies.autumn_web]`) alias shapes, but not Cargo's dotted
+        // renamed-dependency form — `autumn_web.package = "autumn-web"` plus
+        // `autumn_web.path = "../autumn"` on separate lines. The alias-detection branch
+        // split on the key's dot and compared the whole `autumn_web.package` string
+        // against `autumn_web`, so it never matched and fell through to a mismatched
+        // crates.io version. `cargo metadata --offline` confirms two different paths for
+        // the same package name conflict, as with the other alias forms.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = \"autumn-web\"\nautumn_web.path = \"../autumn\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9543,14 +10289,12 @@ pub struct Comment {
 
     #[test]
     fn tokio_test_features_mirrors_path_source() {
-        // Regression test (Codex review, issue #1023): the same
-        // source-mismatch bug that motivated the whole autumn-web
-        // source-mirroring saga also applies to tokio -- if [dependencies]
-        // sources tokio from a path/workspace/git override (e.g. an
-        // internal fork), inserting a crates.io `version = "1"` dev entry
-        // makes Cargo reject the manifest ("Dependency 'tokio' has
-        // different source paths depending on the build target"; confirmed
-        // via a hand-built `cargo metadata --offline` reproduction). The
+        // Regression test (Codex review, #1023): the source-mismatch bug behind the whole
+        // autumn-web source-mirroring saga also applies to tokio. If `[dependencies]`
+        // sources tokio from a path, workspace, or git override — an internal fork —
+        // inserting a crates.io `version = "1"` dev entry makes Cargo reject the manifest
+        // with "Dependency 'tokio' has different source paths depending on the build
+        // target", confirmed via a hand-built `cargo metadata --offline` reproduction. The
         // new entry must mirror the existing path source instead.
         let cargo =
             "[package]\nname=\"x\"\n\n[dependencies]\ntokio = { path = \"../fake-tokio\" }\n";

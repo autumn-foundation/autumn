@@ -16,6 +16,13 @@ autotests = false
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
+# Conflict-free collaborative editing (issue #1806). Adds
+# `autumn_web::collab`: an in-tree RGA text CRDT (`CollabText`), the
+# `#[collaborative]` model field marker, and the session hub that streams ops
+# and cursors over the existing channel/presence seams. Zero new dependencies.
+# The hub half additionally needs `presence`; the CRDT, the marker and the
+# offline-sync resolver compile without it.
+collab = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -38,7 +45,31 @@ mcp = ["openapi"]
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
+# Parse, validate and server-render Constela documents — the constrained JSON
+# UI language (https://github.com/yuuichieguchi/constela) — so an app can serve
+# an interface a language model generated without ever handing it a code path.
+# See `constela::policy` for the safety guarantee and `docs/guide/constela.md`
+# for the htmx wiring.
+#
+# Implies `maud`: the module's whole output is a `maud::Markup`, so there is no
+# build where parsing a document is useful and rendering it is not. Adds NO new
+# dependencies — `serde`, `serde_json` and `maud` are already in the graph. The
+# `markdown` node kind additionally requires the `markdown` feature; without it
+# a document containing one fails validation with `constela.feature_required`
+# rather than rendering nothing.
+constela = ["maud"]
+# `reqwest?/blocking` powers the replication S3 destination (#1628), which needs
+# BOTH `db` and `http-client`. The `?` means it is enabled only when something
+# else already pulled reqwest in, so an app on `http-client` alone (no database,
+# and therefore no replication) does not compile the blocking client. The
+# replication loop runs on its own OS thread — file, SQLite and network I/O all
+# off the reactor — and `autumn db replica restore` is a synchronous CLI with no
+# runtime at all, so a blocking client is the one shape both can share. It is
+# constructed, used and dropped only on those threads, never inside the async
+# runtime.
 db = [
+    "autumn-macros/db",
+    "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
@@ -85,11 +116,13 @@ offline-sync = ["db", "http-client"]
 # must use an explicit `--features` list that EXCLUDES `sqlite` (see
 # `.github/workflows/ci.yml`).
 #
-# PR1 is a no-op refactor: enabling it switches the connection *type alias* but
-# the SQLite pool CONSTRUCTION stays refused at runtime
-# (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
-# — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
-# already in the graph.
+# The runtime is wired (#1905): enabling this feature switches the connection
+# type alias AND builds a deadpool pool over
+# `SyncConnectionWrapper<SqliteConnection>`, so an app boots, migrates and
+# serves against a `sqlite://` target. Needs no extra deps — diesel's sqlite
+# backend and diesel-async's sync-connection-wrapper are already in the graph.
+# What this build REFUSES is a Postgres target (`PoolError::UnsupportedBackend`),
+# the mirror of the default build's refusal of a SQLite one.
 # `sqlite` pulls in `db` so it is genuinely self-sufficient: `db` owns the
 # shared, backend-neutral migration/pool plumbing this feature builds on — the
 # `crate::migrate` module (itself `#[cfg(feature = "db")]`), `deadpool`, and
@@ -121,7 +154,12 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
-redis = ["dep:redis"]
+# `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
+# feature makes `rediss://` URLs reachable, and those panic inside
+# `rustls::ClientConfig::builder()` unless a process-level
+# `CryptoProvider` is installed first. `redis_tls` installs one — see
+# that module and issue #2172.
+redis = ["dep:redis", "dep:rustls"]
 i18n = []
 # Embed the app's `static/` tree (incl. the fingerprint manifest) and i18n
 # `locales`/`i18n` bundles into the release binary at compile time, so a single
@@ -205,7 +243,15 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
-acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
+acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
+# Real-ACME end-to-end coverage against a Pebble container (issue #1863).
+# Turns on `testcontainers`' `host-port-exposure` tunnel — the SSH sidecar
+# that lets a container reach a `127.0.0.1`-bound listener on this host —
+# and implies `acme` + `test-support`. Kept out of both of THOSE features so
+# an ordinary `cargo test -p autumn-web --features test-support` (or a plain
+# `--workspace` run) does not pull in `host-port-exposure`'s `russh`/crypto
+# dependency subtree; only the dedicated Pebble CI step enables it.
+acme-pebble = ["acme", "test-support", "testcontainers/host-port-exposure"]
 # Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
 # re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
 # the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
@@ -218,12 +264,44 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 # `edge_routes!` macros are re-exported unconditionally — a route can be *marked*
 # without this feature; the feature is what wires the seam at the origin.
 edge = ["dep:autumn-edge"]
+# Capability-sandboxed WASM plugins (issue #1609). Loads a third-party plugin as
+# a portable `.autumn-plugin` artifact — a manifest plus a `wasm32-wasip1`
+# module — and serves HTTP requests from it under the manifest's declared
+# prefix, in-process, with deny-by-default ambient authority, hard CPU/memory
+# ceilings and fault isolation.
+#
+# Purely additive and host-only: the native `Plugin` trait is untouched and no
+# existing app changes shape. `wasmi` is a pure-Rust interpreter (no codegen
+# backend, no C toolchain), so enabling this keeps the single-binary deploy
+# story intact.
+#
+# Not a default feature of `autumn-web`: an application opts in explicitly.
+# Note that `autumn-cli` enables it unconditionally (its `plugin package` /
+# `plugin inspect` commands read and write the container and load the module
+# into the same sandbox the runtime uses), so a `--workspace` build of this
+# repo does compile it via feature unification. That is deliberate — it means
+# the always-on workspace clippy and test lanes cover the module — but it is
+# why "off by default" is a statement about `autumn-web`'s feature set, not
+# about every build in the tree.
+plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
 autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
-autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
+# Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
+# resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
+# new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
+# floor); licensed MIT OR Apache-2.0.
+wasmi = { version = "0.40", optional = true }
+# `default-features = false` drops the `#[model]` / `#[repository]` codegen from
+# the macro crate; the `db` feature above forwards it back on. A no-database app
+# could never reach either macro anyway (both re-exports are `#[cfg(feature =
+# "db")]` in `src/lib.rs`), and skipping them cuts the macro crate's own compile
+# time by ~90% on the no-DB onboarding path (issue #2309).
+autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
 axum.workspace = true
-bytes = "1"
+# 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
+# sandbox concurrency permit and release it exactly when the last handle drops.
+bytes = "1.9"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
 # "cafe"). Already resolved transitively (via `stringprep`, the Postgres
 # SCRAM-auth crate), so this adds no new entry to the dependency graph.
@@ -293,6 +371,9 @@ multer = { workspace = true }
 pin-project-lite = "0.2"
 serde.workspace = true
 serde_json = "1"
+# Version-requirement matching for the plugin API stability contract
+# (issue #1601). `semver` has no transitive dependencies.
+semver.workspace = true
 thiserror.workspace = true
 # `test-util` is required at runtime by the `#[sim_test]` macro (S-1797): its
 # generated code builds a `start_paused(true)` current-thread runtime so
@@ -320,12 +401,16 @@ opentelemetry-otlp = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
-uuid = { version = "1", features = ["v4"] }
+# `serde` is library-side, not test-only: `db::sqlite_types::SqliteUuid` is
+# `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under
+# `--features sqlite` without it.
+uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 rand_chacha = "0.9"
 chrono = { workspace = true }
 chrono-tz.workspace = true
-rust_decimal.workspace = true
+# `serde` is a default feature, named here because `SqliteDecimal` depends on it.
+rust_decimal = { workspace = true, features = ["serde"] }
 croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
@@ -336,7 +421,7 @@ serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
 subtle = "2.6.1"
-base64 = "0.22"
+base64 = "0.23"
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -349,7 +434,20 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+# `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
+# drops. It matters on the client side of `#[confidential]` (#1771), where a
+# crash dump would otherwise expose material the field key is derived from.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Deterministic wipe of the client root key used by `#[confidential]` (#1771).
+# Adds NO new crate to the graph: `aes-gcm` and `secrecy` already resolve it.
+zeroize = "1"
+# NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
+# (RFC 8292) and the ECDH half of RFC 8291 payload encryption. Adds NO new
+# crate to the graph — `jsonwebtoken` (a non-optional dependency above) already
+# resolves p256 0.13 for its `rust_crypto` ES256 backend; this only adds the
+# direct edge plus the `ecdh` feature, which is a feature flag on the
+# already-compiled `elliptic-curve`, not a new dependency.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
 getrandom = "0.2"
 hex = "0.4"
 include_dir = { version = "0.7", optional = true }
@@ -384,14 +482,30 @@ nix = { version = "0.31.2", features = ["fs"] }
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
 diesel = { version = "2", features = ["chrono", "postgres"] }
+# `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
+# the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
+# (issue #2597): generated apps get `db-diesel2-postgres` from the model
+# generator's `MODEL_DEPS`, but the `autumn-web` lib itself only enables
+# `serde`, so the in-repo test target needs the feature here. Test-only — the
+# sqlite `cargo build` / `clippy --lib` lanes never build dev-dependencies.
+rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
+# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
+# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
+# without `http2` — see the workspace dependency comment.
+hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["timeout", "util"] }
 trybuild = "1"
+# Compiles the hand-written WAT guest modules the plugin-sandbox suite uses as
+# fixtures (a hello guest and the adversarial escape corpus) into wasm bytes at
+# test time. Pure Rust, so the escape suite runs on any CI runner with no
+# `wasm32-wasip1` toolchain installed. Test-only.
+wat = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 redis.workspace = true
@@ -417,6 +531,18 @@ features = [
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
+  "plugin-sandbox",
+  # Generated UI. Pure Rust over dependencies already in the graph, so it
+  # builds in the docs.rs sandbox — and without it the whole `constela` module
+  # (Document, the policy allowlists, dispatch) is missing from the published
+  # docs. Listed alongside `markdown`, which is what makes its `markdown` node
+  # kind reachable.
+  "constela",
+  # Direct HTTPS termination (#1603). Pure Rust (rustls/ring), no system
+  # libraries, so it builds in the docs.rs sandbox — and without it the whole
+  # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
+  # from the published docs.
+  "tls",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -442,6 +568,66 @@ harness = false
 
 [[bench]]
 name = "form_render"
+harness = false
+
+# Atom feed rendering workload for profilers: drives `Feed::render` over a
+# realistic 30-entry blog feed (the same `Feed::atom(...).entries(...)` shape
+# `examples/blog`'s `feed_xml` handler builds) so the private `escape`
+# XML-escaping helper's per-field cost is attributable in a profiler. Asserts
+# nothing — see the file header for the exact commands.
+[[bench]]
+name = "feed_render"
+harness = false
+
+# Real DB-backed CRUD workload for profilers, driving the `#[repository]`
+# macro's generated save/find_by_id/page methods against a live Postgres
+# connection — the query-building/row-mapping layer `request_pipeline`
+# deliberately excludes (its handlers are trivial and non-DB by design).
+# `required-features` since it needs a real database connection, unlike the
+# other benches in this crate.
+[[bench]]
+name = "repository_crud"
+harness = false
+required-features = ["db"]
+
+# Multi-page invoice workload for profilers, driving `Pdf::from_html`/
+# `Pdf::render` through the real HTML parser (`pdf::html`) and layout
+# walker/word-wrapper/PDF writer (`pdf::layout`) — the framework's HTML-to-PDF
+# export path (`examples/invoice`'s `invoice_pdf` handler drives the same
+# `render` call via `from_markup`). `required-features` since `pdf` is an
+# opt-in feature, unlike the other benches in this crate.
+[[bench]]
+name = "pdf_render"
+harness = false
+required-features = ["pdf"]
+
+# Signed-CSRF-cookie workload for profilers: drives real POST traffic through
+# `security::CsrfLayer` with HMAC signing active so the verification cost is
+# attributable in a profiler. Asserts nothing — see the file header for the
+# exact commands.
+[[bench]]
+name = "csrf_verify"
+harness = false
+
+# Bot-protection / CAPTCHA workload for profilers: drives real GET traffic
+# through `security::BotProtectionService`'s safe-method exempt branch — the
+# branch every GET takes when bot protection is enabled — so its per-request
+# cost is attributable in a profiler. Does not exercise the token-verification
+# path (no `AutumnConfig`-driven way to inject a non-network-calling provider
+# there; see the file header for detail). Asserts nothing — see the file
+# header for the exact commands.
+[[bench]]
+name = "captcha_check"
+harness = false
+
+# Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
+# drives real GET traffic through a `#[throttle]`-guarded handler and an
+# identical unthrottled handler, interleaved, so a profiler can attribute the
+# limiter's own per-request cost against the same ingress stack
+# `request_pipeline.rs` already measures. Asserts nothing beyond "not denied"
+# — see the file header for the exact commands.
+[[bench]]
+name = "throttle_check"
 harness = false
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
@@ -475,6 +661,60 @@ path = "tests/config_alloc_gate.rs"
 [[test]]
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
+
+# Allocation gate for the sandbox's request-header canonicalisation: a header
+# the allowlist drops must not be cloned on its way to being discarded. The
+# function's output is identical either way, so this has to be judged on
+# allocations. Own binary for the same `allocation-counter` global-allocator
+# reason as `config_alloc_gate` above.
+[[test]]
+name = "sandbox_header_alloc_gate"
+path = "tests/sandbox_header_alloc_gate.rs"
+
+# Allocation gate for the guest-stderr excerpt: a 64 KiB stderr of invalid
+# bytes must not be expanded into a 192 KiB replacement string to keep 512
+# characters of it. Its own binary for the same reason as the header gate —
+# `allocation-counter` installs a process-wide `#[global_allocator]`.
+[[test]]
+name = "sandbox_render_alloc_gate"
+path = "tests/sandbox_render_alloc_gate.rs"
+
+[[test]]
+name = "sandbox_stderr_alloc_gate"
+path = "tests/sandbox_stderr_alloc_gate.rs"
+
+# Allocation gate for the response-side wire checks: a `Location` segment and a
+# declared content type are both guest-chosen strings the wire asks a yes/no
+# question about, and both were lower-cased whole to answer it. Its own binary
+# for the same reason as the gates above — `allocation-counter` installs a
+# process-wide global allocator.
+[[test]]
+name = "sandbox_response_alloc_gate"
+path = "tests/sandbox_response_alloc_gate.rs"
+
+# Allocation gate for `SandboxArtifact::seal`: a hand-built manifest refusable
+# from its own fields must not be rendered to TOML on the way to being rejected.
+# The verdict is identical either way, so allocation is the observable.
+[[test]]
+name = "sandbox_manifest_seal_alloc_gate"
+path = "tests/sandbox_manifest_seal_alloc_gate.rs"
+
+# Allocation gate for the scaffolded form-render helpers on the same 12-field
+# workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
+# at the per-field `error_id` allocation). Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "form_render_alloc_gate"
+path = "tests/form_render_alloc_gate.rs"
+
+# Allocation gate for the version-history diff entry points on the same
+# 7-column record as `benches/version_history.rs` (#2429, proving the owned
+# entry points the versioned-repository codegen calls move column names and
+# values instead of cloning them). Own binary for the same `allocation-counter`
+# global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "version_history_alloc_gate"
+path = "tests/version_history_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
@@ -564,6 +804,21 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# `unique_violation_field` against a real SQLite unique-violation (issue
+# #2698): diesel boxes SQLite's DatabaseErrorInformation as a bare String,
+# whose constraint_name() is always None, so the Postgres-only
+# constraint-name match left every generated app's friendly-conflict
+# handling for a `--unique` column dead on SQLite. Boots an in-memory pool,
+# triggers a genuine duplicate-insert UniqueViolation, and proves the fix
+# resolves it to the mapped field/message the same way Postgres already does.
+# Only meaningful under `--features sqlite`; the file is `#![cfg(feature =
+# "sqlite")]` so a default `cargo test` compiles it to an empty (passing)
+# binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_unique_violation_field`.
+[[test]]
+name = "sqlite_unique_violation_field"
+path = "tests/sqlite_unique_violation_field.rs"
+
 # SQLite model-field type conversions (issue #1924): proves a `#[model]` carrying
 # a `DateTime<Utc>` (-> TimestamptzSqlite), a `NaiveDateTime` (-> Timestamp), and
 # an `Option<Blob>` attachment (-> Text/JSON) compiles AND round-trips on an
@@ -577,6 +832,21 @@ path = "tests/sqlite_crud_basic.rs"
 [[test]]
 name = "sqlite_field_conversions"
 path = "tests/sqlite_field_conversions.rs"
+
+# `Uuid` / `Decimal` / generated-enum model fields on SQLite (issue #1924).
+# `uuid::Uuid` and `rust_decimal::Decimal` are foreign types with no possible
+# diesel SQLite conversion, so they ride the local newtypes
+# `db::sqlite_types::{SqliteUuid, SqliteDecimal}`. Proves a `#[model]` carrying
+# required and nullable `Uuid`/`Decimal` fields plus a generated `enum{…}` field
+# compiles, round-trips (incl. NULLs and canonical decimal text), and binds in a
+# WHERE clause on an in-memory SQLite pool with no Docker.
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_uuid_decimal_conversions`.
+[[test]]
+name = "sqlite_uuid_decimal_conversions"
+path = "tests/sqlite_uuid_decimal_conversions.rs"
 
 # `serde_json::Value` model-field round-trip on SQLite (issue #1341): proves a
 # `#[model]` carrying a required `serde_json::Value` and an
@@ -621,6 +891,22 @@ path = "tests/sqlite_upsert_isolation.rs"
 name = "sqlite_votable"
 path = "tests/sqlite_votable.rs"
 
+# SQLite golden suite for the double-entry money ledger (issue #1837). Runs
+# Docker-free on every push; the Postgres fork is
+# `tests/integration/money_ledger_postgres.rs`, which the CI Docker sweep picks
+# up. Needs `--features sqlite`. See the file's module doc for what it pins.
+[[test]]
+name = "sqlite_money_ledger"
+path = "tests/sqlite_money_ledger.rs"
+
+# SQLite proof for maintained derived read models (issue #1769). The Postgres
+# suite is server-gated, so this is the only place the `sqlite` arms a
+# derivation adds are type-checked and run. Needs `--features sqlite`.
+# See the file's module doc for what it pins and how to run it.
+[[test]]
+name = "sqlite_derivation"
+path = "tests/sqlite_derivation.rs"
+
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +
 # update + delete each append a `_autumn_version_history` row, `version_history()`
@@ -635,6 +921,18 @@ path = "tests/sqlite_votable.rs"
 [[test]]
 name = "sqlite_version_history"
 path = "tests/sqlite_version_history.rs"
+
+# Bitemporal, tamper-evident record ledger end-to-end proof (issue #1699). The
+# issue's golden test — create/update/update, as-of reconstruction against a live
+# oracle at every intermediate instant, then tamper and assert `ledger_verify`
+# names the broken link — plus the mutation/insertion/deletion tampering classes,
+# the zero-false-positive check, and fail-closed tenant isolation. In-memory
+# SQLite, no Docker, so it runs on every CI push rather than only in the Docker
+# sweep. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_ledger`.
+[[test]]
+name = "sqlite_ledger"
+path = "tests/sqlite_ledger.rs"
 
 # SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
 # the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
@@ -666,6 +964,35 @@ path = "tests/sqlite_commit_hook_worker.rs"
 [[test]]
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
+
+# Snag QA probe (#1771): runs the `#[repository]`-generated
+# `find_by_body_bidx` finder against real data (many owners, some sharing
+# plaintext) on a tempfile SQLite pool, which nothing in the existing
+# confidential-fields suite does (`confidential_model.rs` queries the
+# blind-index column with a raw Diesel `.filter(...)`, and
+# `tests/compile-pass/confidential_blind_index_finder.rs` only proves the
+# generated finder compiles). Isolated for the same feature-unification
+# reason as `sqlite_jobs_scheduler_e2e` above: `sqlite` flips
+# `db::RuntimeConnection` for the whole build graph, so it cannot share the
+# consolidated `integration_tests` binary with the Postgres-assuming `db`
+# suite. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test confidential_repository_bidx`.
+[[test]]
+name = "confidential_repository_bidx"
+path = "tests/confidential_repository_bidx.rs"
+
+# FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
+# (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,
+# commit-hook queue, version history, runtime config, feature flags,
+# experiments, migration checksums and the ledger tables are created; tables
+# another module self-manages (jobs, job tracking, shard directory/map) are
+# not. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
+# empty (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_framework_migrations`.
+[[test]]
+name = "sqlite_framework_migrations"
+path = "tests/sqlite_framework_migrations.rs"
 
 # SQLite searchable-repository fallback proof (issue #1996). Drives
 # `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
@@ -742,6 +1069,19 @@ path = "tests/sqlite_dependent_destroy.rs"
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
 
+# DB-backed sessions store on SQLite (issue #1908): the `generate auth` tracked-
+# sessions store binds `::autumn_web::RuntimeBackend` instead of `diesel::pg::Pg`,
+# so it accepts the SQLite `RuntimeConnection`. Mirrors the generated DDL, schema
+# block and store functions and runs them against a real SQLite database — login
+# tracking, the revocation gate, `last_seen_at` refresh, rotation rebinding, and
+# the three revoke paths. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_tracked_sessions`.
+[[test]]
+name = "sqlite_tracked_sessions"
+path = "tests/sqlite_tracked_sessions.rs"
+
 # Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
 # `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
 # transactional) SQLite pool from the recorded URL instead of dropping it and
@@ -779,6 +1119,19 @@ path = "tests/sim_sqlite_substrate.rs"
 [[test]]
 name = "sim_chaos"
 path = "tests/sim_chaos.rs"
+
+# Authored fault-scenario DoD (issue #1680): the `FaultPlan` database lane —
+# ordinal-targeted DB checkout faults over the in-memory SQLite sim substrate,
+# plus the 100x byte-identical replay metric. Same isolated-binary rationale as
+# `sim_chaos` above — the Postgres-typed consolidated binary does not compile
+# under `sqlite`, and it needs `test-support` for the public `TestApp` harness,
+# so the file is `#![cfg(all(feature = "sqlite", feature = "test-support"))]`
+# and a default `cargo test` compiles it to an empty (passing) binary. Runs
+# without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fault_plan_db`.
+[[test]]
+name = "sim_fault_plan_db"
+path = "tests/sim_fault_plan_db.rs"
 
 # W5.c crash-recovery DoD (issue #1797, item 7): kill-between-awaits + durable
 # repository commit-hook recovery over the in-memory SQLite sim substrate. Same
@@ -928,6 +1281,12 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: installs a process-global cache backend and depends on it surviving
+# across two requests, which any concurrent `TestApp::build` would clear.
+[[test]]
+name = "capsule_cache_effect"
+path = "tests/capsule_cache_effect.rs"
+
 # Isolated: loom model-checking binary. Empty under a normal build
 # (`#![cfg(loom_models)]`); only compiles/runs under
 # `RUSTFLAGS="--cfg loom_models"`, and is exercised in its own dedicated CI job
@@ -941,3 +1300,11 @@ path = "tests/loom_models.rs"
 
 [lints]
 workspace = true
+
+# mTLS rejection counters (#1640). Its own binary because the metric registry is
+# a process-global singleton with a bounded instrument count: sharing the
+# consolidated `integration_tests` process would evict the instruments this
+# suite asserts on before it ever read them.
+[[test]]
+name = "tls_client_auth_metrics"
+path = "tests/tls_client_auth_metrics.rs"

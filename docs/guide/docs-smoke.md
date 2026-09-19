@@ -40,6 +40,47 @@ Do not add `[patch.crates-io]`, path dependencies, or `cargo install --path`
 when certifying the published-user path. Those are contributor-mode shortcuts,
 not first-run documentation proof.
 
+## Scaffold Reconciliation
+
+The [upgrading guide](upgrading.md) documents `autumn upgrade` end to end.
+Certify its scaffold half in the same smoke directory, on the app just
+generated:
+
+```bash
+autumn upgrade --check
+```
+
+Passing output: exit status `0`, and a report ending
+
+```text
+  Your framework-owned files are up to date with this release.
+```
+
+A freshly generated app is, by construction, current. Then prove the drift path
+by aging the app: delete a framework-owned file and remove its line from
+`.autumn/scaffold.toml`, so the project looks like one scaffolded before that
+file existed.
+
+```bash
+rm rust-toolchain.toml
+grep -v '^"rust-toolchain.toml"' .autumn/scaffold.toml > /tmp/m && mv /tmp/m .autumn/scaffold.toml
+
+autumn upgrade --check ; echo "exit=$?"
+autumn upgrade
+autumn upgrade --apply
+autumn upgrade --check ; echo "exit=$?"
+```
+
+Passing output:
+
+- the first `--check` prints `add  rust-toolchain.toml` and `exit=3`;
+- the bare `autumn upgrade` prints the same file under `Scaffold files`, prints
+  `Nothing was written`, and leaves `rust-toolchain.toml` absent;
+- `--apply` recreates `rust-toolchain.toml`;
+- the second `--check` prints `up to date` and `exit=0`.
+
+The trailing `Upgrade guide:` line of every report must be a URL that resolves.
+
 ## Pre-Publish Rehearsal
 
 Before the `autumn-cli` or `autumn-web` release has reached crates.io, the same

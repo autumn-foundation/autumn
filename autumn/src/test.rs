@@ -716,6 +716,12 @@ pub struct TestApp {
     scoped_groups: Vec<crate::app::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    /// Routes declared for opaque `nest` mounts, mirroring
+    /// [`AppBuilder::declare_plugin_routes`]. Carried so a `TestApp` runs the
+    /// same duplicate-route preflight production does — without this, a plugin
+    /// whose manifest collides with a host route would mount cleanly in tests
+    /// and panic at boot in production.
+    declared_routes: Vec<crate::route_listing::RouteInfo>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
@@ -746,6 +752,10 @@ pub struct TestApp {
     /// Always-on job recorder capturing every enqueue. Composed ahead of any
     /// user-supplied [`with_job_interceptor`](Self::with_job_interceptor).
     job_recorder: JobRecorder,
+    /// Authored fault schedule attached via
+    /// [`with_fault_plan`](Self::with_fault_plan) (issue #1680); `None` means no
+    /// fault interceptors are installed at all.
+    fault_plan: Option<crate::sim::fault::FaultPlan>,
     #[cfg(feature = "db")]
     db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
     #[cfg(feature = "ws")]
@@ -808,6 +818,7 @@ impl TestApp {
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             config,
@@ -831,6 +842,7 @@ impl TestApp {
             mail_recorder: MailRecorder::new(),
             job_interceptor: None,
             job_recorder: JobRecorder::new(),
+            fault_plan: None,
             #[cfg(feature = "db")]
             db_interceptor: None,
             #[cfg(feature = "ws")]
@@ -1149,6 +1161,8 @@ impl TestApp {
             session_cookie_name,
             auth_session_key,
             session_signing_keys: None,
+            fault_ledger: None,
+            observed_server_errors: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1166,6 +1180,32 @@ impl TestApp {
         F: FnOnce(&AppState) + Send + 'static,
     {
         self.state_initializers.push(Box::new(f));
+        self
+    }
+
+    /// Install a designated live-state block, so handlers that read it through
+    /// [`AppState::live_state`](crate::AppState::live_state) can be tested.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::with_live_state`]. A test app never
+    /// adopts a snapshot from a predecessor — there is no upgrade in flight —
+    /// so `initial` is always the value handlers see.
+    #[must_use]
+    pub fn with_live_state<T>(mut self, initial: T) -> Self
+    where
+        T: crate::upgrade::LiveState,
+    {
+        self.state_initializers.push(Box::new(move |state| {
+            assert!(
+                state
+                    .extension::<crate::upgrade::LiveStateRegistry>()
+                    .is_none(),
+                "an app may designate only one block of live state; the real builder \
+                 refuses a second one at startup, so a test app does too"
+            );
+            let handle = crate::upgrade::LiveStateHandle::new(initial);
+            state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
+            state.insert_extension(handle);
+        }));
         self
     }
 
@@ -1199,6 +1239,33 @@ impl TestApp {
         self
     }
 
+    /// Mirrors
+    /// [`crate::app::AppBuilder::with_push_subscription_store`].
+    #[must_use]
+    pub fn with_push_subscription_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::push::PushSubscriptionStore,
+    {
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(crate::push::WebPush::from_state_with_store(state, store));
+        }));
+        self
+    }
+
+    /// Register an explicit [`WebPush`](crate::push::WebPush) service,
+    /// overriding key, store and transport at once.
+    ///
+    /// The usual reason is a
+    /// [`RecordingPushTransport`](crate::push::RecordingPushTransport), so a
+    /// test can assert exactly what would have gone to the push service.
+    #[must_use]
+    pub fn with_web_push(mut self, push: crate::push::WebPush) -> Self {
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(push);
+        }));
+        self
+    }
+
     /// Apply a plugin directly to the test app.
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {
@@ -1226,6 +1293,7 @@ impl TestApp {
         self.scoped_groups.extend(app_builder.scoped_groups);
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
+        self.declared_routes.extend(app_builder.declared_routes);
         self.custom_layers.extend(app_builder.custom_layers);
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
@@ -1371,6 +1439,61 @@ impl TestApp {
         interceptor: impl crate::interceptor::JobInterceptor,
     ) -> Self {
         self.job_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Attach an authored, seed-deterministic fault schedule
+    /// ([`FaultPlan`](crate::sim::FaultPlan), issue #1680).
+    ///
+    /// The plan's faults are injected through the existing
+    /// [`interceptor`](crate::interceptor) seams, so no application code
+    /// changes: the ordinal-th database checkout or job execution fails, exactly
+    /// as a real transient failure would, and everything the run did is recorded
+    /// into a serializable [`FaultOutcome`](crate::sim::FaultOutcome) reachable
+    /// through [`TestClient::fault_outcome`] (or
+    /// [`TestClient::fault_ledger`]).
+    ///
+    /// It **composes with**, and never replaces, the interceptors already in
+    /// play: the always-on enqueue recorder still records, a
+    /// [`with_job_interceptor`](Self::with_job_interceptor) still runs (and
+    /// observes the injected error like a real handler failure), transactional
+    /// database isolation is preserved, and [`Sim::chaos`](crate::sim::Sim::chaos)
+    /// keeps working alongside. The fault decision is innermost of each chain.
+    ///
+    /// Attaching a plan registers an error reporter of its own, which — exactly
+    /// like `with_error_reporter` — means the built-in `LogReporter` fallback is
+    /// no longer installed for that app.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::sim::FaultPlan;
+    ///
+    /// let client = TestApp::new()
+    ///     .plugin(ChargeCardJobs) // the plugin registering `charge_card`
+    ///     .with_fault_plan(FaultPlan::from_seed(0x5EED).fail_job("charge_card", 1))
+    ///     .build();
+    /// ```
+    ///
+    /// # Determinism
+    ///
+    /// Attaching a plan also defaults the app's entropy source to
+    /// `SeededEntropy::shared(plan.seed())` when the test supplied none, so
+    /// request ids and job-retry jitter replay from the same seed. Run the
+    /// scenario under [`#[sim_test]`](crate::sim_test) (a paused,
+    /// single-threaded runtime with a virtual clock) for the ordinals to be
+    /// reproducible; see the [`fault`](crate::sim::fault) module docs.
+    ///
+    /// # Panics
+    ///
+    /// [`build`](Self::build) panics if the config would make the fault schedule
+    /// non-reproducible: more than one job worker (`jobs.workers`), error
+    /// reporting disabled / sampled below `1.0` (the sampler draws OS
+    /// randomness, so a sampled-out 5xx would be missing from the outcome at
+    /// random), or failure capture enabled (reporting awaits the capsule's
+    /// blocking persistence before any reporter runs, so an observed 5xx could
+    /// still be in flight when the outcome is read).
+    #[must_use]
+    pub fn with_fault_plan(mut self, plan: crate::sim::fault::FaultPlan) -> Self {
+        self.fault_plan = Some(plan);
         self
     }
 
@@ -1654,6 +1777,46 @@ impl TestApp {
         // leak into this one (it is re-installed below).
         crate::events::clear_global_event_bus();
 
+        // An attached fault plan (issue #1680) only replays byte-for-byte when
+        // the surrounding config cannot reorder, drop, or delay what it records,
+        // so the knobs that would are checked up front rather than silently
+        // producing a flaky scenario.
+        if let Some(plan) = self.fault_plan.as_ref() {
+            assert_eq!(
+                self.config.jobs.workers, 1,
+                "a fault plan needs `jobs.workers = 1`: concurrent workers can swap \
+                 which execution is the Nth, so the ordinals would not replay"
+            );
+            #[cfg(feature = "reporting")]
+            assert!(
+                self.config.reporting.enabled && self.config.reporting.sample_rate >= 1.0,
+                "a fault plan needs `reporting.enabled = true` and \
+                 `reporting.sample_rate = 1.0`: the sampler draws OS randomness, so a \
+                 sampled-out 5xx would drop out of `FaultOutcome::server_errors` at random"
+            );
+            // Codex review (round 2): with capture on, `ReporterChain::dispatch`
+            // awaits the capsule's blocking persistence (a directory scan, a
+            // write and a `sync_all` on the blocking pool) BEFORE any reporter
+            // runs, so `fault_outcome()`'s cooperative settle could snapshot
+            // while that write is still in flight on slow storage and miss a
+            // 5xx the client already observed. Capsules are production
+            // evidence with no place in a fault scenario, so refuse the
+            // combination rather than make the settle depend on disk speed.
+            #[cfg(feature = "reporting")]
+            assert!(
+                !self.config.failure_capture.enabled,
+                "a fault plan needs `failure_capture.enabled = false`: reporting awaits \
+                 the capsule's blocking persistence before any reporter runs, so a 5xx \
+                 could be missing from `FaultOutcome::server_errors` when the outcome is \
+                 read"
+            );
+            // Replay the app's identifier stream (request ids, job-retry jitter)
+            // from the plan's seed unless the test injected its own source.
+            if self.entropy.is_none() {
+                self.entropy = Some(crate::entropy::SeededEntropy::shared(plan.seed()));
+            }
+        }
+
         // Postgres transactional test isolation (`begin_test_transaction` +
         // SAVEPOINT rollback on a `max_size(1)` control pool) is Postgres-only;
         // SQLite has no equivalent, so under the `sqlite` feature the harness
@@ -1781,6 +1944,9 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
+        // Shared with the collaboration hub, for the reason `app.rs` gives.
+        #[cfg(feature = "presence")]
+        let test_presence = crate::presence::Presence::new(test_channels.clone());
         // Resolve the injected clock BEFORE the state literal so `started_at`
         // is stamped on the same timeline the app will read time from. A sim
         // installs a virtual clock here, and uptime has to start at that
@@ -1789,6 +1955,13 @@ impl TestApp {
             .clock
             .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
         let started_at = clock.monotonic();
+
+        // The fault ledger is created here, per build, from the RESOLVED clock:
+        // a sim installs its virtual clock immediately before `build`, and a
+        // `Sim::kill`/`restart` rebuilds, so counting restarts with the app.
+        let fault_ledger = self.fault_plan.as_ref().map(|plan| {
+            crate::sim::fault::FaultLedger::new(plan, std::sync::Arc::clone(&clock), started_at)
+        });
 
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
@@ -1848,8 +2021,10 @@ impl TestApp {
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: crate::collab::CollabHub::new(test_channels.clone(), test_presence.clone()),
             #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(test_channels.clone()),
+            presence: test_presence,
             #[cfg(feature = "ws")]
             channels: test_channels,
 
@@ -1877,6 +2052,17 @@ impl TestApp {
                 std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
+        }
+        // Same for the entropy source (#1634): a handler that mints a session
+        // id, a token or a job id must mint the *recorded* one on replay, or
+        // the identifier in the capsule's SQL binds will not be the one the
+        // replayed code produced.
+        #[cfg(feature = "reporting")]
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingEntropy::new(state.entropy_arc()))
+                    as std::sync::Arc<dyn crate::entropy::Entropy>;
+            state = state.with_entropy(recording);
         }
 
         for register in self.policy_registrations {
@@ -1915,11 +2101,26 @@ impl TestApp {
             let recorder_for_client = self.job_recorder.clone();
             let recorder: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
                 std::sync::Arc::new(self.job_recorder);
+            // Chain order is recorder → user → fault plan, so an attached
+            // `FaultPlan` sits INNERMOST: a user interceptor observes the
+            // injected error exactly as it would a real handler failure, and
+            // the recorder still sees every enqueue.
+            let mut inner = self.job_interceptor;
+            if let Some(ledger) = fault_ledger.as_ref() {
+                let fault = ledger.job_interceptor();
+                inner = Some(match inner {
+                    Some(user) => std::sync::Arc::new(ChainedJobInterceptor {
+                        first: user,
+                        second: fault,
+                    }),
+                    None => fault,
+                });
+            }
             let effective: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
-                if let Some(user) = self.job_interceptor {
+                if let Some(inner) = inner {
                     std::sync::Arc::new(ChainedJobInterceptor {
                         first: recorder,
-                        second: user,
+                        second: inner,
                     })
                 } else {
                     recorder
@@ -1928,8 +2129,21 @@ impl TestApp {
             recorder_for_client
         };
         #[cfg(feature = "db")]
-        if let Some(interceptor) = db_interceptor {
-            state.insert_extension(interceptor);
+        {
+            // The single `Arc<dyn DbConnectionInterceptor>` extension the
+            // checkout path reads. An attached `FaultPlan` WRAPS whatever was
+            // already composed (the user's interceptor, transactional test
+            // isolation, or both) and runs its decision innermost, forwarding
+            // `is_transactional_test` so rollback isolation survives. Written
+            // without `ComposedDbInterceptor`, which does not exist under the
+            // `sqlite` feature.
+            let db_interceptor = match fault_ledger.as_ref() {
+                Some(ledger) => Some(ledger.db_interceptor(db_interceptor)),
+                None => db_interceptor,
+            };
+            if let Some(interceptor) = db_interceptor {
+                state.insert_extension(interceptor);
+            }
         }
         #[cfg(feature = "ws")]
         let broadcast_recorder_for_client = {
@@ -1961,6 +2175,14 @@ impl TestApp {
                 #[cfg(feature = "presence")]
                 {
                     state.presence = crate::presence::Presence::new(state.channels.clone());
+                    // Same reason as `app.rs`: the hub captured the old pair.
+                    #[cfg(feature = "collab")]
+                    {
+                        state.collab = crate::collab::CollabHub::new(
+                            state.channels.clone(),
+                            state.presence.clone(),
+                        );
+                    }
                 }
             }
             recorder_for_client
@@ -2033,6 +2255,26 @@ impl TestApp {
 
         for initializer in self.state_initializers {
             initializer(&state);
+        }
+
+        // Register the fault plan's 5xx projector alongside the app's own
+        // reporters (which keep receiving every event). It goes FIRST in the
+        // chain: `ReporterChain::report_all` awaits the reporters one after
+        // another, so a user reporter whose future stays pending (one waiting
+        // on a timer under a paused sim, say) would otherwise starve the
+        // projector and the observed 5xx would never reach
+        // `FaultOutcome::server_errors`. The projector records as its future is
+        // built and resolves immediately, so leading the chain delays nobody.
+        // Must land before the router is built, which is where
+        // `ReportingLayer` reads the chain.
+        #[cfg(feature = "reporting")]
+        if let Some(ledger) = fault_ledger.as_ref() {
+            let mut reporters = state
+                .extension::<crate::reporting::RegisteredReporters>()
+                .map(|registered| registered.0.clone())
+                .unwrap_or_default();
+            reporters.insert(0, ledger.reporter());
+            state.insert_extension(crate::reporting::RegisteredReporters(reporters));
         }
 
         // Wire the event bus: always install a recorder so tests can assert on
@@ -2160,6 +2402,7 @@ impl TestApp {
                 scoped_groups: self.scoped_groups,
                 merge_routers,
                 nest_routers: self.nest_routers,
+                declared_routes: self.declared_routes,
                 custom_layers: self.custom_layers,
                 static_gate_layers: self.static_gate_layers,
                 #[cfg(feature = "maud")]
@@ -2222,6 +2465,8 @@ impl TestApp {
             session_cookie_name,
             auth_session_key,
             session_signing_keys,
+            fault_ledger,
+            observed_server_errors: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -2309,6 +2554,16 @@ pub struct TestClient {
     /// present, `acting_as` signs the seeded cookie so the `SessionLayer`
     /// accepts it.
     session_signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
+    /// The runtime ledger for an attached [`crate::sim::FaultPlan`] (issue
+    /// #1680); `None` when no plan was attached (and for
+    /// [`TestApp::from_router`] clients).
+    fault_ledger: Option<crate::sim::fault::FaultLedger>,
+    /// How many 5xx responses this client has seen on its own
+    /// [`RequestBuilder::send`] calls. [`TestClient::fault_outcome`] settles the
+    /// detached reporter tasks against this count, so an outcome is read only
+    /// once the 5xx the test actually observed have reached the ledger. Only
+    /// incremented while a ledger exists.
+    observed_server_errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A cookie stored in the jar: its value plus an optional absolute expiry.
@@ -2788,6 +3043,95 @@ impl TestClient {
         self.state.config_arc().dev.inspector_n_plus_one_threshold
     }
 
+    /// The shared 5xx counter handed to each [`RequestBuilder`], or `None` when
+    /// no [`crate::sim::FaultPlan`] is attached (so an ordinary test app never
+    /// touches an atomic per request).
+    ///
+    /// Also `None` without the `reporting` feature: nothing can ever populate
+    /// `FaultOutcome::server_errors` then, so counting observed 5xx would only
+    /// make [`fault_outcome`](Self::fault_outcome) spin out its whole settle
+    /// budget against a list that stays empty by contract.
+    #[cfg_attr(
+        not(feature = "reporting"),
+        allow(
+            clippy::unused_self,
+            clippy::missing_const_for_fn,
+            reason = "without `reporting` the answer is a constant `None`, but the \
+                      signature has to stay one method so every request builder \
+                      keeps a single call site"
+        )
+    )]
+    fn fault_error_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        #[cfg(feature = "reporting")]
+        {
+            self.fault_ledger
+                .as_ref()
+                .map(|_| std::sync::Arc::clone(&self.observed_server_errors))
+        }
+        #[cfg(not(feature = "reporting"))]
+        {
+            None
+        }
+    }
+
+    /// The runtime ledger for the [`crate::sim::FaultPlan`] attached with
+    /// [`TestApp::with_fault_plan`], or `None` when none was attached.
+    ///
+    /// The handle is cheap to clone and shares the underlying ledger, so it can
+    /// be read mid-run. For a scenario that drove HTTP requests, prefer
+    /// [`fault_outcome`](Self::fault_outcome), which settles the detached
+    /// reporter tasks first.
+    #[must_use]
+    pub fn fault_ledger(&self) -> Option<crate::sim::fault::FaultLedger> {
+        self.fault_ledger.clone()
+    }
+
+    /// Settle the reporting lane, then snapshot the
+    /// [`FaultOutcome`](crate::sim::FaultOutcome) for this run.
+    ///
+    /// Autumn's error-reporting layer dispatches on a **detached** task, so a
+    /// 5xx this client already saw on the wire may not have reached the ledger
+    /// yet. This yields cooperatively (never sleeping and never advancing the
+    /// virtual clock, which would corrupt a sim's timeline) until the ledger has
+    /// recorded at least as many server errors as this client observed, up to a
+    /// bounded number of yields — then snapshots regardless, so a 5xx the
+    /// reporting layer never sees (one raised outside `ReportingLayer`, e.g. by
+    /// the session layer) can only cost a bounded spin, not a hang.
+    ///
+    /// The bound is sufficient because [`TestApp::build`] refuses the two
+    /// configurations under which the dispatch could still be pending after
+    /// it: a sampled reporter (`reporting.sample_rate < 1.0`) and failure
+    /// capture (`failure_capture.enabled`), whose blocking capsule persistence
+    /// reporting awaits before any reporter runs. With both refused the
+    /// dispatch task reaches the ledger's projector on its first poll.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no [`crate::sim::FaultPlan`] was attached with
+    /// [`TestApp::with_fault_plan`].
+    pub async fn fault_outcome(&self) -> crate::sim::fault::FaultOutcome {
+        /// Cooperative yields spent waiting for the detached reporter tasks.
+        const MAX_SETTLE_YIELDS: usize = 10_000;
+
+        let ledger = self.fault_ledger.as_ref().expect(
+            "no fault plan attached to this TestApp; call `TestApp::with_fault_plan(..)` before `build()`",
+        );
+        // Fully-qualified: a `diesel_async::RunQueryDsl` glob import in this
+        // module also offers a `.load(..)` method by that name.
+        let observed = usize::try_from(std::sync::atomic::AtomicU64::load(
+            &self.observed_server_errors,
+            std::sync::atomic::Ordering::SeqCst,
+        ))
+        .unwrap_or(usize::MAX);
+        for _ in 0..MAX_SETTLE_YIELDS {
+            if ledger.server_errors_len() >= observed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        ledger.outcome()
+    }
+
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {
@@ -2798,6 +3142,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -2811,6 +3156,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -2824,6 +3170,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -2837,6 +3184,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -2850,6 +3198,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -2863,6 +3212,7 @@ impl TestClient {
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
             self.n_plus_one_threshold(),
+            self.fault_error_counter(),
         )
     }
 
@@ -3081,6 +3431,12 @@ pub struct RequestBuilder {
     /// propagated to the resulting [`TestResponse`] so
     /// [`TestResponse::assert_no_n_plus_one`] can honour the app's config.
     n_plus_one_threshold: usize,
+    /// Shared with the originating [`TestClient`] when a
+    /// [`crate::sim::FaultPlan`] is attached: every 5xx this request produces is
+    /// counted here, and [`TestClient::fault_outcome`] settles the detached
+    /// reporter tasks against that count. `None` when no plan is attached, so a
+    /// plain test app pays nothing.
+    observed_server_errors: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl RequestBuilder {
@@ -3091,6 +3447,7 @@ impl RequestBuilder {
         cookie_jar: CookieJar,
         clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
         n_plus_one_threshold: usize,
+        observed_server_errors: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> Self {
         Self {
             router,
@@ -3101,6 +3458,7 @@ impl RequestBuilder {
             cookie_jar: Some(cookie_jar),
             clock,
             n_plus_one_threshold,
+            observed_server_errors,
         }
     }
 
@@ -3156,6 +3514,9 @@ impl RequestBuilder {
         let request_method = self.method.to_string();
         let request_path = self.uri.clone();
         let n_plus_one_threshold = self.n_plus_one_threshold;
+        // Cloned up front: `self` is partially moved below (the router and body
+        // are consumed building the request).
+        let observed_server_errors = self.observed_server_errors.clone();
 
         let mut builder = Request::builder().method(self.method).uri(&self.uri);
 
@@ -3274,6 +3635,14 @@ impl RequestBuilder {
                     apply_set_cookie(&mut jar, value, now);
                 }
             }
+        }
+
+        // Count the 5xx an attached fault plan will want to see reflected in
+        // `FaultOutcome::server_errors`; `fault_outcome()` settles against it.
+        if status.is_server_error()
+            && let Some(counter) = observed_server_errors.as_ref()
+        {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         TestResponse {
@@ -4808,6 +5177,7 @@ mod tests {
             cookie_jar: None,
             clock: None,
             n_plus_one_threshold: 5,
+            observed_server_errors: None,
         }
         .send()
         .await;

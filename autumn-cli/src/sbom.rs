@@ -1,0 +1,2495 @@
+//! `autumn sbom` — `CycloneDX` Software Bill of Materials generation and
+//! verification (issue #1615).
+//!
+//! One implementation serves four surfaces:
+//!
+//! * `autumn sbom` — read `cargo metadata` for the project in the current
+//!   directory and emit a `CycloneDX` 1.5 document. Used by the framework's
+//!   publish gate and by the scaffolded production image's builder stage.
+//! * `autumn sbom --verify <FILE>` — regenerate from the source tree and
+//!   compare against `<FILE>`, reporting a component-level diff. This is what
+//!   makes "the SBOM matches the tagged source" a real gate rather than a
+//!   tautology.
+//! * `autumn sbom --binary <FILE>` — decode the dependency list
+//!   [`cargo-auditable`](https://github.com/rust-secure-code/cargo-auditable)
+//!   embeds in a compiled binary, with no access to the source tree or
+//!   lockfile. This is how a deployed single-binary autumn app answers
+//!   "exactly which crate versions are compiled into you?".
+//! * `--output <FILE>` — write anywhere instead of stdout.
+//!
+//! ## Determinism
+//!
+//! The document deliberately carries **no** `serialNumber` (a random UUID) and
+//! **no** `metadata.timestamp` (a wall clock read). Both are optional in
+//! `CycloneDX` and both would make `--verify` impossible. Components are sorted
+//! by `(name, version, purl)` and de-duplicated by `bom-ref`, so the output is
+//! byte-identical for a given source tree and CLI version regardless of the
+//! order `cargo metadata` happens to emit packages in.
+
+use std::collections::BTreeMap;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// The `CycloneDX` specification version emitted. 1.5 is the first version whose
+/// `metadata.tools` is an object with a `components` array (rather than the
+/// deprecated flat `tools` array).
+const SPEC_VERSION: &str = "1.5";
+
+/// Section names `cargo-auditable` uses for its embedded dependency list.
+///
+/// Upstream uses `.dep-v0` on every format — verified against
+/// `auditable-extract`, which looks up `.dep-v0` for ELF/PE/WASM and
+/// `("__DATA", ".dep-v0")` for Mach-O. The underscore-prefixed spellings are
+/// accepted defensively (Mach-O section names are conventionally
+/// underscore-prefixed, and a future or third-party writer may follow that
+/// convention) so a binary that IS auditable is never reported as one that
+/// is not.
+const DEP_SECTION_NAMES: &[&str] = &[".dep-v0", "dep-v0", "__dep-v0", "__dep_v0"];
+
+/// Ceiling on the DECOMPRESSED size of an embedded dependency list.
+///
+/// `--binary` inflates a section out of a file the caller did not necessarily
+/// build. zlib reaches ~1000:1 on repetitive input, so a ~100 MB section would
+/// otherwise ask for ~100 GB of `String`. 16 MiB is two orders of magnitude
+/// above any real dependency list (autumn's own ~900-crate graph is well under
+/// 1 MiB uncompressed) and matches the spirit of upstream `auditable-info`'s
+/// own default limit.
+pub const MAX_AUDIT_DATA_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SbomError {
+    #[error("cargo metadata failed: {0}")]
+    CargoMetadata(String),
+    #[error("malformed cargo metadata: {0}")]
+    Metadata(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported object file format")]
+    UnsupportedObjectFormat,
+    #[error("truncated or malformed object file")]
+    MalformedObject,
+    #[error(
+        "embedded dependency list expands to more than {limit} bytes — refusing to \
+         decompress further (a compressed section can amplify ~1000x, so an untrusted \
+         binary could otherwise exhaust memory)"
+    )]
+    AuditDataTooLarge { limit: usize },
+    #[error(
+        "no embedded dependency list found: the binary was not built with cargo-auditable \
+         (rebuild it with `cargo auditable build --release`, or `autumn build --auditable`)"
+    )]
+    NoAuditData,
+    #[error(
+        "this universal binary carries an embedded dependency list in {slices} architecture \
+         slices, which can legitimately differ (a `cfg(target_arch)` dependency is in one and \
+         not another). Refusing to describe the whole binary by one of them — extract the \
+         architecture you mean first, e.g. `lipo -thin arm64 <binary> -output <binary>.arm64`"
+    )]
+    AmbiguousUniversalBinary { slices: usize },
+    #[error("SBOM does not match the source tree:\n{0}")]
+    VerifyMismatch(String),
+    #[error("SBOM describes version {found}, but {expected} is being released")]
+    VersionMismatch { expected: String, found: String },
+}
+
+// ---------------------------------------------------------------------------
+// CycloneDX document model
+// ---------------------------------------------------------------------------
+
+// `deny_unknown_fields` throughout is load bearing, not pedantry. `--verify`
+// compares the DESERIALIZED document, so any field this tool does not model
+// would be dropped on read and the comparison would report a match — letting a
+// transported SBOM gain a fabricated `vulnerabilities` array, an injected
+// `metadata.timestamp`, or an extra `dependencies` graph without the gate
+// noticing. Rejecting them is also the honest contract: `--verify` asks "is
+// this the document this tool would generate?", not "is this valid CycloneDX?".
+/// A `CycloneDX` 1.5 bill of materials.
+///
+/// Field order here IS the serialized key order, which is part of the
+/// determinism contract — do not reorder without regenerating any checked-in
+/// SBOM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+// `bom_format` deliberately repeats the type name: it mirrors CycloneDX's own
+// `bomFormat` key, and renaming the Rust field would only obscure that.
+#[allow(clippy::struct_field_names)]
+pub struct Bom {
+    #[serde(rename = "bomFormat")]
+    pub bom_format: String,
+    #[serde(rename = "specVersion")]
+    pub spec_version: String,
+    #[serde(
+        rename = "serialNumber",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub serial_number: Option<String>,
+    pub version: u32,
+    pub metadata: BomMetadata,
+    pub components: Vec<Component>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BomMetadata {
+    pub tools: Tools,
+    pub component: Component,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tools {
+    pub components: Vec<Component>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "bom-ref", skip_serializing_if = "Option::is_none", default)]
+    pub bom_ref: Option<String>,
+    pub name: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub purl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub licenses: Option<Vec<License>>,
+    #[serde(
+        rename = "externalReferences",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub external_references: Option<Vec<ExternalReference>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub properties: Option<Vec<Property>>,
+    /// The cargo package id this component came from. Never serialized — it is
+    /// an ordering/identity tiebreaker only, so a document round-tripped
+    /// through disk still compares equal to a freshly generated one.
+    #[serde(skip)]
+    pub source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct License {
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalReference {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Property {
+    pub name: String,
+    pub value: String,
+}
+
+impl Component {
+    fn label(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+
+    /// A copy stripped of fields that are never serialized.
+    ///
+    /// `source_id` is an in-memory ordering tiebreaker, so a document read back
+    /// from disk always has `None` there. Comparing it would make every
+    /// `--verify` of a freshly generated document against its own written form
+    /// report that every component "differs".
+    fn comparable(&self) -> Self {
+        Self {
+            source_id: None,
+            ..self.clone()
+        }
+    }
+
+    /// Sort key. `purl` and then the cargo package id participate, so two
+    /// packages sharing a name and version — a vendored copy beside a registry
+    /// one — still order deterministically rather than by whatever order
+    /// `cargo metadata` happened to emit them in.
+    fn sort_key(&self) -> (&str, &str, &str, &str) {
+        (
+            self.name.as_str(),
+            self.version.as_str(),
+            self.purl.as_deref().unwrap_or(""),
+            self.source_id.as_deref().unwrap_or(""),
+        )
+    }
+}
+
+/// Canonical crates.io registry source, as `cargo metadata` spells it.
+const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// A package URL, plus the `bom-ref` to use when there is no meaningful one.
+///
+/// `pkg:cargo/<name>@<version>` asserts a **crates.io** identity. Emitting it
+/// for a path dependency points a scanner at a package that either does not
+/// exist or belongs to somebody else — this workspace alone has 27 path
+/// packages, several of which (`blog`, `bookmarks`, …) are not published
+/// anywhere. A git or alternate-registry dependency is not crates.io either,
+/// so it carries a qualifier naming where it actually came from.
+///
+/// Returns `(purl, bom_ref)`; `purl` is `None` when the component has no
+/// registry identity to claim, and `bom_ref` then uses a scheme that says so.
+fn package_url(name: &str, version: &str, source: Option<&str>) -> (Option<String>, String) {
+    let bare = format!("pkg:cargo/{name}@{version}");
+    match source {
+        // Unpublished: a workspace member or path dependency.
+        None => (None, format!("path:{name}@{version}")),
+        Some(CRATES_IO_SOURCE) => (Some(bare.clone()), bare),
+        Some(src) if src.starts_with("git+") => {
+            let qualified = format!(
+                "{bare}?vcs_url={}",
+                percent_encoding::utf8_percent_encode(
+                    src.trim_start_matches("git+"),
+                    percent_encoding::NON_ALPHANUMERIC
+                )
+            );
+            (Some(qualified.clone()), qualified)
+        }
+        Some(src) if src.starts_with("registry+") || src.starts_with("sparse+") => {
+            let qualified = format!(
+                "{bare}?repository_url={}",
+                percent_encoding::utf8_percent_encode(
+                    src.split_once('+').map_or(src, |(_, url)| url),
+                    percent_encoding::NON_ALPHANUMERIC
+                )
+            );
+            (Some(qualified.clone()), qualified)
+        }
+        // Something cargo grew since this was written: record it without
+        // claiming it is crates.io.
+        Some(_) => (None, format!("other:{name}@{version}")),
+    }
+}
+
+fn tool_component(tool_version: &str) -> Component {
+    Component {
+        kind: "application".into(),
+        bom_ref: None,
+        name: "autumn-cli".into(),
+        version: tool_version.to_owned(),
+        purl: None,
+        licenses: None,
+        external_references: None,
+        properties: None,
+        source_id: None,
+    }
+}
+
+/// Assemble the envelope, sorting and de-duplicating `components` so callers
+/// never have to remember to.
+/// A CONTENT-DERIVED serial number.
+///
+/// `CycloneDX` wants a `serialNumber`, and consumers require one: GitHub's
+/// `actions/attest-sbom` sniffs the document format by looking for
+/// `bomFormat` + `serialNumber` + `specVersion` together, and rejects the
+/// document outright without it. The obvious implementation — a fresh random
+/// UUID per run — would destroy the determinism `--verify` depends on, so
+/// derive it from the document's own content instead.
+///
+/// Hashes the document's ENTIRE serialized form with the serial itself unset,
+/// rather than a hand-picked subset of fields. Consumers identify a BOM
+/// revision by `(serialNumber, version)`, so anything that changes the emitted
+/// bytes — a dependency's licence or repository, the root's purl, the
+/// generator's version — has to change the serial, or two different documents
+/// claim to be the same revision.
+///
+/// Formatted as a syntactically valid RFC 4122 v4 UUID (version and variant
+/// bits forced) so tools that parse it are satisfied.
+fn content_serial_number(bom: &Bom) -> String {
+    debug_assert!(
+        bom.serial_number.is_none(),
+        "the serial must be hashed over a document that does not yet carry one"
+    );
+    let mut hasher = Sha256::new();
+    // Serialization of our own types cannot realistically fail; an empty digest
+    // input would still be deterministic, which is what matters here.
+    hasher.update(serde_json::to_vec(bom).unwrap_or_default());
+    let d = hasher.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let mut hex = String::with_capacity(32);
+    for byte in b {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Give every component a unique `bom-ref`, disambiguating any that collide.
+///
+/// A purl is `pkg:cargo/<name>@<version>` and carries no source qualifier, so
+/// a `[patch]`ed or vendored copy alongside a registry copy of the same
+/// version collides. Collapsing those would DROP a real dependency from the
+/// inventory, so keep both and suffix the later ones — `CycloneDX` requires
+/// `bom-ref` to be unique within a document. Components are already sorted, so
+/// which one keeps the bare ref is deterministic.
+fn disambiguate_bom_refs(components: &mut [Component]) {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for c in components.iter_mut() {
+        let Some(base) = c.bom_ref.clone() else {
+            continue;
+        };
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            c.bom_ref = Some(format!("{base}#{count}"));
+        }
+    }
+}
+
+fn assemble(root: Component, mut components: Vec<Component>, tool_version: &str) -> Bom {
+    components.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    // Collapse only entries that are identical in every respect — two packages
+    // that merely share a name and version are distinct dependencies.
+    components.dedup_by(|a, b| a == b);
+    disambiguate_bom_refs(&mut components);
+    let mut bom = Bom {
+        bom_format: "CycloneDX".into(),
+        spec_version: SPEC_VERSION.into(),
+        serial_number: None,
+        version: 1,
+        metadata: BomMetadata {
+            tools: Tools {
+                components: vec![tool_component(tool_version)],
+            },
+            component: root,
+        },
+        components,
+    };
+    // Seal it last, over the finished document.
+    bom.serial_number = Some(content_serial_number(&bom));
+    bom
+}
+
+/// Identity to fall back on when `cargo metadata` reports no resolve root —
+/// which is what a virtual workspace manifest (like autumn's own) produces.
+#[derive(Debug, Clone)]
+pub struct RootFallback {
+    pub name: String,
+    pub version: String,
+}
+
+// ---------------------------------------------------------------------------
+// cargo metadata -> CycloneDX
+// ---------------------------------------------------------------------------
+
+fn str_field<'a>(pkg: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    pkg.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn component_from_package(pkg: &serde_json::Value) -> Result<Component, SbomError> {
+    let name = str_field(pkg, "name")
+        .ok_or_else(|| SbomError::Metadata("a package has no `name`".into()))?;
+    let version = str_field(pkg, "version")
+        .ok_or_else(|| SbomError::Metadata(format!("package `{name}` has no `version`")))?;
+    let (purl, bom_ref) = package_url(name, version, str_field(pkg, "source"));
+    Ok(Component {
+        kind: "library".into(),
+        bom_ref: Some(bom_ref),
+        name: name.to_owned(),
+        version: version.to_owned(),
+        purl,
+        licenses: str_field(pkg, "license").map(|l| {
+            vec![License {
+                expression: l.to_owned(),
+            }]
+        }),
+        external_references: str_field(pkg, "repository").map(|url| {
+            vec![ExternalReference {
+                kind: "vcs".into(),
+                url: url.to_owned(),
+            }]
+        }),
+        properties: None,
+        source_id: str_field(pkg, "id").map(str::to_owned),
+    })
+}
+
+/// Build a `CycloneDX` document from `cargo metadata --format-version 1` output.
+///
+/// The top-level component is `resolve.root` when cargo resolved one (the
+/// common case for a scaffolded app, where the command runs inside the single
+/// member crate). A virtual workspace manifest has no root, so `fallback`
+/// supplies the identity — for autumn itself that is the repository name plus
+/// `[workspace.package].version`, which is exactly what the release tag
+/// encodes.
+///
+/// # Errors
+///
+/// Returns [`SbomError::Metadata`] if `packages` is absent or any package is
+/// missing `name`/`version`.
+pub fn bom_from_cargo_metadata(
+    metadata: &serde_json::Value,
+    fallback: &RootFallback,
+    tool_version: &str,
+) -> Result<Bom, SbomError> {
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| SbomError::Metadata("no `packages` array".into()))?;
+
+    let root_id = metadata
+        .get("resolve")
+        .and_then(|r| r.get("root"))
+        .and_then(serde_json::Value::as_str);
+
+    let root_pkg = root_id.and_then(|id| {
+        packages
+            .iter()
+            .find(|p| p.get("id").and_then(serde_json::Value::as_str) == Some(id))
+    });
+
+    let root = match root_pkg {
+        Some(pkg) => Component {
+            kind: "application".into(),
+            ..component_from_package(pkg)?
+        },
+        // A virtual workspace has no package of its own, so there is no
+        // crates.io identity to claim. Emitting `pkg:cargo/<name>@<version>`
+        // here would point a scanner at whatever unrelated crate happens to
+        // share the repository's name (autumn's own workspace publishes
+        // `autumn-web`, while `autumn` is somebody else's crate), and would
+        // collide with a member's `bom-ref` in workspaces named after one of
+        // their own crates. Use a scheme that asserts nothing instead.
+        None => Component {
+            kind: "application".into(),
+            bom_ref: Some(format!("workspace:{}@{}", fallback.name, fallback.version)),
+            name: fallback.name.clone(),
+            version: fallback.version.clone(),
+            purl: None,
+            licenses: None,
+            external_references: None,
+            properties: None,
+            source_id: None,
+        },
+    };
+
+    let components = packages
+        .iter()
+        .filter(|p| root_id.is_none() || p.get("id").and_then(serde_json::Value::as_str) != root_id)
+        .map(component_from_package)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(assemble(root, components, tool_version))
+}
+
+/// Serialize `bom` deterministically: pretty-printed JSON with a trailing
+/// newline, so the file is diffable and POSIX-clean.
+///
+/// # Errors
+///
+/// Returns [`SbomError::Json`] if serialization fails.
+pub fn render(bom: &Bom) -> Result<String, SbomError> {
+    let mut s = serde_json::to_string_pretty(bom)?;
+    s.push('\n');
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
+// verification
+// ---------------------------------------------------------------------------
+
+/// Compare a freshly generated `expected` BOM against the `actual` one read
+/// from disk, returning one human-readable line per difference (empty when
+/// they agree).
+///
+/// Deliberately component-level rather than a byte diff: a gate failure has to
+/// tell a release engineer *which* dependency drifted, not that line 4,812
+/// differs.
+#[must_use]
+pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
+    let mut report = Vec::new();
+
+    if expected.bom_format != actual.bom_format {
+        report.push(format!(
+            "  bom format: expected {}, found {}",
+            expected.bom_format, actual.bom_format
+        ));
+    }
+    if expected.spec_version != actual.spec_version {
+        report.push(format!(
+            "  spec version: expected CycloneDX {}, found {}",
+            expected.spec_version, actual.spec_version
+        ));
+    }
+    if expected.version != actual.version {
+        report.push(format!(
+            "  document version: expected {}, found {}",
+            expected.version, actual.version
+        ));
+    }
+    if expected.serial_number != actual.serial_number {
+        // Content-derived, so a mismatch means the inventory it was computed
+        // from is not the one in the file.
+        report.push("  serial number: does not match this document's contents".to_owned());
+    }
+    // Compare the WHOLE root component, not just name+version: an edited
+    // `purl`, a forged licence, or a swapped `bom-ref` on the top-level
+    // component is exactly the kind of drift this gate exists to catch.
+    let (e, a) = (&expected.metadata.component, &actual.metadata.component);
+    if e.comparable() != a.comparable() {
+        report.push(if e.name == a.name && e.version == a.version {
+            format!("  root component metadata differs for {}", e.label())
+        } else {
+            format!(
+                "  root component: expected {}, found {}",
+                e.label(),
+                a.label()
+            )
+        });
+    }
+    if expected.metadata.tools != actual.metadata.tools {
+        report.push(
+            "  generator: the SBOM names a different tool than the one verifying it".to_owned(),
+        );
+    }
+
+    let index = |bom: &Bom| -> BTreeMap<String, Component> {
+        bom.components
+            .iter()
+            .map(|c| {
+                (
+                    c.bom_ref.clone().unwrap_or_else(|| c.label()),
+                    c.comparable(),
+                )
+            })
+            .collect()
+    };
+    let (ei, ai) = (index(expected), index(actual));
+
+    for (key, comp) in &ei {
+        match ai.get(key) {
+            None => report.push(format!("  missing component: {}", comp.label())),
+            Some(found) if found != comp => report.push(format!(
+                "  component differs: {} (licenses/metadata changed)",
+                comp.label()
+            )),
+            Some(_) => {}
+        }
+    }
+    for (key, comp) in &ai {
+        if !ei.contains_key(key) {
+            report.push(format!("  unexpected component: {}", comp.label()));
+        }
+    }
+
+    // Indexing by `bom-ref` collapses duplicates, so an SBOM listing the same
+    // component twice would otherwise compare equal to a clean one. Report the
+    // raw length disagreement unconditionally — a doubled entry alongside
+    // other drift is still a doubled entry.
+    if expected.components.len() != actual.components.len() {
+        report.push(format!(
+            "  component count: expected {}, found {} (duplicate entries?)",
+            expected.components.len(),
+            actual.components.len()
+        ));
+    }
+    report
+}
+
+/// Assert that `bom`'s root component describes `expected`.
+///
+/// The release gate needs this: an SBOM that verifies perfectly against *a*
+/// source tree still fails the AC if that tree is not the tagged one. Kept
+/// here, beside the document model, rather than as shell that re-parses the
+/// JSON — the gate script has no business owning a second `CycloneDX` parser.
+///
+/// # Errors
+///
+/// Returns [`SbomError::VersionMismatch`] when the versions differ.
+pub fn check_expected_version(bom: &Bom, expected: &str) -> Result<(), SbomError> {
+    if bom.metadata.component.version == expected {
+        Ok(())
+    } else {
+        Err(SbomError::VersionMismatch {
+            expected: expected.to_owned(),
+            found: bom.metadata.component.version.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cargo-auditable payload -> CycloneDX
+// ---------------------------------------------------------------------------
+
+/// One entry of `cargo-auditable`'s embedded `VersionInfo` payload.
+#[derive(Debug, Deserialize)]
+struct AuditPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    /// `runtime` when absent — that is the format's own default.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    root: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditData {
+    packages: Vec<AuditPackage>,
+}
+
+fn component_from_audit(pkg: &AuditPackage) -> Component {
+    // cargo-auditable records a vocabulary of its own ("crates.io", "registry",
+    // "git", "local", …) rather than a cargo source URL, so translate it to the
+    // same "only claim a crates.io identity when it IS one" rule.
+    let (purl, bom_ref) = package_url(
+        &pkg.name,
+        &pkg.version,
+        match pkg.source.as_deref() {
+            Some("crates.io" | "registry") => Some(CRATES_IO_SOURCE),
+            // No URL is recorded, so there is nothing to qualify with; say it
+            // is not a registry package rather than claiming it is.
+            Some("git") => Some("git+"),
+            _ => None,
+        },
+    );
+    let kind = pkg.kind.as_deref().unwrap_or("runtime");
+    let mut properties = Vec::new();
+    // Only annotate the non-default kind, so a runtime-only BOM stays clean.
+    if kind != "runtime" {
+        properties.push(Property {
+            name: "cargo:dependency-kind".into(),
+            value: kind.to_owned(),
+        });
+    }
+    if let Some(source) = pkg.source.as_deref().filter(|s| !s.is_empty()) {
+        properties.push(Property {
+            name: "cargo:source".into(),
+            value: source.to_owned(),
+        });
+    }
+    Component {
+        kind: "library".into(),
+        bom_ref: Some(bom_ref),
+        name: pkg.name.clone(),
+        version: pkg.version.clone(),
+        purl,
+        licenses: None,
+        external_references: None,
+        properties: (!properties.is_empty()).then_some(properties),
+        source_id: None,
+    }
+}
+
+/// Build a `CycloneDX` document from the JSON `cargo-auditable` embeds.
+///
+/// # Errors
+///
+/// Returns [`SbomError::Json`] when `json` is not a valid audit payload.
+pub fn bom_from_audit_data(json: &str, tool_version: &str) -> Result<Bom, SbomError> {
+    let data: AuditData = serde_json::from_str(json)?;
+    let root_pkg = data.packages.iter().find(|p| p.root);
+    let root = root_pkg.map_or_else(
+        || Component {
+            kind: "application".into(),
+            bom_ref: None,
+            name: "unknown".into(),
+            version: "0.0.0".into(),
+            purl: None,
+            licenses: None,
+            external_references: None,
+            properties: None,
+            source_id: None,
+        },
+        |p| Component {
+            kind: "application".into(),
+            properties: None,
+            ..component_from_audit(p)
+        },
+    );
+    let components = data
+        .packages
+        .iter()
+        .filter(|p| !p.root)
+        .map(component_from_audit)
+        .collect();
+    Ok(assemble(root, components, tool_version))
+}
+
+/// Decode a compiled binary's embedded dependency list into a `CycloneDX`
+/// document — the "no source tree, no lockfile" path.
+///
+/// # Errors
+///
+/// Propagates [`SbomError::UnsupportedObjectFormat`], [`SbomError::NoAuditData`]
+/// and JSON/decompression failures.
+pub fn bom_from_binary(bytes: &[u8], tool_version: &str) -> Result<Bom, SbomError> {
+    let section = extract_dep_section(bytes)?;
+    let json = inflate_audit_data(section)?;
+    bom_from_audit_data(&json, tool_version)
+}
+
+// ---------------------------------------------------------------------------
+// object-file section extraction
+// ---------------------------------------------------------------------------
+
+/// Endian-aware little/big integer reads over a byte slice, bounds-checked so
+/// a truncated or hostile file yields [`SbomError::MalformedObject`] rather
+/// than a panic.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    big_endian: bool,
+}
+
+impl<'a> Reader<'a> {
+    const fn new(bytes: &'a [u8], big_endian: bool) -> Self {
+        Self { bytes, big_endian }
+    }
+
+    fn slice(&self, off: usize, len: usize) -> Result<&'a [u8], SbomError> {
+        self.bytes
+            .get(off..off.checked_add(len).ok_or(SbomError::MalformedObject)?)
+            .ok_or(SbomError::MalformedObject)
+    }
+
+    fn u16(&self, off: usize) -> Result<u16, SbomError> {
+        let b: [u8; 2] = self
+            .slice(off, 2)?
+            .try_into()
+            .map_err(|_| SbomError::MalformedObject)?;
+        Ok(if self.big_endian {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        })
+    }
+
+    fn u32(&self, off: usize) -> Result<u32, SbomError> {
+        let b: [u8; 4] = self
+            .slice(off, 4)?
+            .try_into()
+            .map_err(|_| SbomError::MalformedObject)?;
+        Ok(if self.big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    }
+
+    fn u64(&self, off: usize) -> Result<u64, SbomError> {
+        let b: [u8; 8] = self
+            .slice(off, 8)?
+            .try_into()
+            .map_err(|_| SbomError::MalformedObject)?;
+        Ok(if self.big_endian {
+            u64::from_be_bytes(b)
+        } else {
+            u64::from_le_bytes(b)
+        })
+    }
+
+    /// A pointer-width integer: 8 bytes for a 64-bit object, 4 for a 32-bit one.
+    fn usize_at(&self, off: usize, class64: bool) -> Result<u64, SbomError> {
+        if class64 {
+            self.u64(off)
+        } else {
+            Ok(u64::from(self.u32(off)?))
+        }
+    }
+}
+
+fn is_dep_section(name: &str) -> bool {
+    DEP_SECTION_NAMES.contains(&name)
+}
+
+/// Read a NUL-terminated name out of a string table.
+fn cstr_at(table: &[u8], off: usize) -> Result<&str, SbomError> {
+    let rest = table.get(off..).ok_or(SbomError::MalformedObject)?;
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    std::str::from_utf8(&rest[..end]).map_err(|_| SbomError::MalformedObject)
+}
+
+/// A fixed-size, NUL-padded name field (Mach-O sections, PE sections).
+fn fixed_name(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn extract_from_elf(bytes: &[u8]) -> Result<&[u8], SbomError> {
+    let class64 = match bytes.get(4) {
+        Some(1) => false,
+        Some(2) => true,
+        _ => return Err(SbomError::MalformedObject),
+    };
+    let big_endian = match bytes.get(5) {
+        Some(1) => false,
+        Some(2) => true,
+        _ => return Err(SbomError::MalformedObject),
+    };
+    let r = Reader::new(bytes, big_endian);
+
+    // e_shoff / e_shentsize / e_shnum / e_shstrndx live at different offsets
+    // in the 32- and 64-bit headers.
+    let (shoff_at, shentsize_at, shnum_at, shstrndx_at) = if class64 {
+        (0x28, 0x3a, 0x3c, 0x3e)
+    } else {
+        (0x20, 0x2e, 0x30, 0x32)
+    };
+
+    let shoff =
+        usize::try_from(r.usize_at(shoff_at, class64)?).map_err(|_| SbomError::MalformedObject)?;
+    if shoff == 0 {
+        return Err(SbomError::NoAuditData);
+    }
+    let shentsize = r.u16(shentsize_at)? as usize;
+    if shentsize == 0 {
+        return Err(SbomError::MalformedObject);
+    }
+    let mut shnum = r.u16(shnum_at)? as usize;
+    let mut shstrndx = r.u16(shstrndx_at)? as usize;
+
+    // Extended numbering: with more than 0xff00 sections (or shstrndx past
+    // SHN_LORESERVE) the real values live in the otherwise-unused section
+    // header 0. Rare, but a large release binary can hit it.
+    let sh = |i: usize| -> Result<usize, SbomError> {
+        shoff
+            .checked_add(i.checked_mul(shentsize).ok_or(SbomError::MalformedObject)?)
+            .ok_or(SbomError::MalformedObject)
+    };
+    if shnum == 0 || shstrndx == 0xffff {
+        let zero = sh(0)?;
+        // `e_shoff` is attacker-controlled and unbounded, so `zero` can be
+        // usize::MAX here; these adds must be checked like every other read.
+        let at = |delta: usize| zero.checked_add(delta).ok_or(SbomError::MalformedObject);
+        let (size_at, link_at) = if class64 {
+            (at(32)?, at(40)?)
+        } else {
+            (at(20)?, at(24)?)
+        };
+        if shnum == 0 {
+            shnum = usize::try_from(r.usize_at(size_at, class64)?)
+                .map_err(|_| SbomError::MalformedObject)?;
+        }
+        if shstrndx == 0xffff {
+            shstrndx = r.u32(link_at)? as usize;
+        }
+    }
+    if shstrndx >= shnum {
+        return Err(SbomError::MalformedObject);
+    }
+
+    // Section header layout: sh_name u32, sh_type u32, then pointer-width
+    // sh_flags / sh_addr / sh_offset / sh_size.
+    let (offset_at, size_at) = if class64 { (24, 32) } else { (16, 20) };
+    let read_hdr = |i: usize| -> Result<(u32, usize, usize), SbomError> {
+        let base = sh(i)?;
+        // Reject a header that runs past EOF before trusting any of its fields.
+        r.slice(base, shentsize)?;
+        let name = r.u32(base)?;
+        let off = usize::try_from(r.usize_at(base + offset_at, class64)?)
+            .map_err(|_| SbomError::MalformedObject)?;
+        let size = usize::try_from(r.usize_at(base + size_at, class64)?)
+            .map_err(|_| SbomError::MalformedObject)?;
+        Ok((name, off, size))
+    };
+
+    let (_, strtab_off, strtab_size) = read_hdr(shstrndx)?;
+    // A stripped binary can point at a zero-length (or absent) string table;
+    // that is a "no audit data" case, not a malformed file.
+    let strtab = r.slice(strtab_off, strtab_size).unwrap_or(&[]);
+
+    for i in 0..shnum {
+        let (name_off, off, size) = read_hdr(i)?;
+        // A single garbage `sh_name` (or a stripped binary whose `e_shstrndx`
+        // is SHN_UNDEF, leaving an empty string table) must not mask a
+        // `.dep-v0` section later in the table, nor turn an honest "not built
+        // with cargo-auditable" into "malformed object file".
+        if cstr_at(strtab, name_off as usize).is_ok_and(is_dep_section) {
+            return r.slice(off, size);
+        }
+    }
+    Err(SbomError::NoAuditData)
+}
+
+fn extract_from_macho_thin(bytes: &[u8], base: usize) -> Result<&[u8], SbomError> {
+    // MH_MAGIC(_64) is 0xfeedface / 0xfeedfacf as a NUMBER, so a little-endian
+    // image starts with those bytes reversed. Derive both the word size and the
+    // byte order from the raw bytes rather than assuming little-endian and
+    // rejecting the swapped form as "unsupported".
+    let (class64, big_endian) = match Reader::new(bytes, false).slice(base, 4)? {
+        [0xcf, 0xfa, 0xed, 0xfe] => (true, false),
+        [0xce, 0xfa, 0xed, 0xfe] => (false, false),
+        [0xfe, 0xed, 0xfa, 0xcf] => (true, true),
+        [0xfe, 0xed, 0xfa, 0xce] => (false, true),
+        _ => return Err(SbomError::UnsupportedObjectFormat),
+    };
+    let r = Reader::new(bytes, big_endian);
+    let header_len = if class64 { 32 } else { 28 };
+    let ncmds = r.u32(base + 16)? as usize;
+
+    let mut cmd_off = base + header_len;
+    for _ in 0..ncmds {
+        let cmd = r.u32(cmd_off)?;
+        let cmdsize = r.u32(cmd_off + 4)? as usize;
+        if cmdsize < 8 {
+            return Err(SbomError::MalformedObject);
+        }
+        // LC_SEGMENT (0x1) / LC_SEGMENT_64 (0x19)
+        let seg64 = cmd == 0x19;
+        if seg64 || cmd == 0x1 {
+            let (seg_len, sect_len, nsects_at) = if seg64 {
+                (72usize, 80usize, 64usize)
+            } else {
+                (56, 68, 48)
+            };
+            let nsects = r.u32(cmd_off + nsects_at)? as usize;
+            for s in 0..nsects {
+                let sect = s
+                    .checked_mul(sect_len)
+                    .and_then(|o| o.checked_add(seg_len))
+                    .and_then(|o| cmd_off.checked_add(o))
+                    .ok_or(SbomError::MalformedObject)?;
+                let name = fixed_name(r.slice(sect, 16)?);
+                if is_dep_section(name) {
+                    // sectname[16] segname[16] addr size offset ...
+                    let (off_at, size_at) = if seg64 {
+                        (48usize, 40usize)
+                    } else {
+                        (40usize, 36usize)
+                    };
+                    let size = usize::try_from(r.usize_at(sect + size_at, seg64)?)
+                        .map_err(|_| SbomError::MalformedObject)?;
+                    let off = r.u32(sect + off_at)? as usize;
+                    let at = base.checked_add(off).ok_or(SbomError::MalformedObject)?;
+                    return r.slice(at, size);
+                }
+            }
+        }
+        cmd_off = cmd_off
+            .checked_add(cmdsize)
+            .ok_or(SbomError::MalformedObject)?;
+    }
+    Err(SbomError::NoAuditData)
+}
+
+fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError> {
+    // Fat headers are always big-endian regardless of the slices inside.
+    let r = Reader::new(bytes, true);
+    let narch = r.u32(4)? as usize;
+    let entry = if fat64 { 32usize } else { 20 };
+
+    // Collect EVERY slice that carries audit data rather than returning the
+    // first. Architecture slices can legitimately disagree — a
+    // `cfg(target_arch)` dependency is in one and not another — so describing
+    // the whole binary by whichever came first would silently omit crates that
+    // are really in it. A slice that fails to parse is skipped: an unreadable
+    // one must not mask a readable one, and if none are readable the caller
+    // still gets `NoAuditData`.
+    let mut found: Vec<&[u8]> = Vec::new();
+    for i in 0..narch {
+        let base = i
+            .checked_mul(entry)
+            .and_then(|o| o.checked_add(8))
+            .ok_or(SbomError::MalformedObject)?;
+        let off = if fat64 {
+            usize::try_from(r.u64(base + 8)?).map_err(|_| SbomError::MalformedObject)?
+        } else {
+            r.u32(base + 8)? as usize
+        };
+        if let Ok(section) = extract_from_macho_thin(bytes, off) {
+            found.push(section);
+        }
+    }
+
+    match found.len() {
+        0 => Err(SbomError::NoAuditData),
+        1 => Ok(found[0]),
+        // Identical payloads across slices are not a disagreement — that is
+        // just the same dependency list compiled twice.
+        _ if found.iter().all(|s| *s == found[0]) => Ok(found[0]),
+        slices => Err(SbomError::AmbiguousUniversalBinary { slices }),
+    }
+}
+
+fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
+    let r = Reader::new(bytes, false);
+    let pe_off = r.u32(0x3c)? as usize;
+    if r.slice(pe_off, 4)? != b"PE\0\0" {
+        return Err(SbomError::UnsupportedObjectFormat);
+    }
+    let coff = pe_off.checked_add(4).ok_or(SbomError::MalformedObject)?;
+    let nsections = r.u16(coff + 2)? as usize;
+    let opt_len = r.u16(coff + 16)? as usize;
+    let table = coff
+        .checked_add(20)
+        .and_then(|o| o.checked_add(opt_len))
+        .ok_or(SbomError::MalformedObject)?;
+    for i in 0..nsections {
+        let sect = table
+            .checked_add(i.checked_mul(40).ok_or(SbomError::MalformedObject)?)
+            .ok_or(SbomError::MalformedObject)?;
+        let name = fixed_name(r.slice(sect, 8)?);
+        if is_dep_section(name) {
+            let size = r.u32(sect + 16)? as usize;
+            let off = r.u32(sect + 20)? as usize;
+            return r.slice(off, size);
+        }
+    }
+    Err(SbomError::NoAuditData)
+}
+
+/// Locate `cargo-auditable`'s embedded dependency section in an object file.
+///
+/// Handles ELF (32/64-bit, either endianness), Mach-O (thin and fat/universal)
+/// and PE — i.e. every target the CLI itself ships binaries for.
+///
+/// # Errors
+///
+/// * [`SbomError::UnsupportedObjectFormat`] — not a recognized object file.
+/// * [`SbomError::NoAuditData`] — a valid object file with no embedded list.
+/// * [`SbomError::MalformedObject`] — truncated or self-inconsistent headers.
+pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
+    match bytes.get(..4) {
+        Some(b"\x7fELF") => extract_from_elf(bytes),
+        Some([0xfe, 0xed, 0xfa, 0xcf | 0xce] | [0xcf | 0xce, 0xfa, 0xed, 0xfe]) => {
+            extract_from_macho_thin(bytes, 0)
+        }
+        Some([0xca, 0xfe, 0xba, 0xbe]) => extract_from_macho_fat(bytes, false),
+        Some([0xca, 0xfe, 0xba, 0xbf]) => extract_from_macho_fat(bytes, true),
+        Some([b'M', b'Z', ..]) => extract_from_pe(bytes),
+        _ => Err(SbomError::UnsupportedObjectFormat),
+    }
+}
+
+/// Inflate the zlib-compressed JSON `cargo-auditable` stores in the section.
+///
+/// # Errors
+///
+/// Returns [`SbomError::Io`] when the payload is not valid zlib or not UTF-8.
+pub fn inflate_audit_data(compressed: &[u8]) -> Result<String, SbomError> {
+    let mut out = String::new();
+    // `.take(LIMIT + 1)` caps the work AND lets an over-limit payload be told
+    // apart from one that exactly fills the budget.
+    flate2::read::ZlibDecoder::new(compressed)
+        .take(MAX_AUDIT_DATA_BYTES as u64 + 1)
+        .read_to_string(&mut out)?;
+    if out.len() > MAX_AUDIT_DATA_BYTES {
+        return Err(SbomError::AuditDataTooLarge {
+            limit: MAX_AUDIT_DATA_BYTES,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct SbomOptions {
+    /// Path to a `Cargo.toml` to describe (defaults to the current directory).
+    pub manifest_path: Option<PathBuf>,
+    /// Write the document here instead of stdout.
+    pub output: Option<PathBuf>,
+    /// Regenerate and compare against this file instead of emitting one.
+    pub verify: Option<PathBuf>,
+    /// Read the embedded dependency list out of this compiled binary.
+    pub binary: Option<PathBuf>,
+    /// Pass `--locked` to `cargo metadata` (the release gate does; the
+    /// scaffold's image build deliberately does not, so an app with a stale
+    /// lockfile still builds).
+    pub locked: bool,
+    /// Resolve with every optional feature enabled rather than the default set.
+    ///
+    /// Off by default on purpose. `--all-features` on this workspace resolves
+    /// 907 packages against 841 for a default build — 66 crates no shipped
+    /// artifact links — and co-enables mutually exclusive backends (both
+    /// `ring` and `aws-lc-rs`), so the document would assert a combination
+    /// that cannot exist. It also guarantees the `cargo metadata` view can
+    /// never agree with what `--binary` reads out of a real build.
+    pub all_features: bool,
+    /// Extra cargo features to enable when resolving, comma-separated.
+    ///
+    /// The image build passes the same features its final compile used, so the
+    /// sidecar SBOM describes the crates that are actually linked. Without
+    /// this, an `embed-assets` build's SBOM would omit the crates that feature
+    /// pulls in, and the documented sidecar-vs-binary cross-check would show
+    /// spurious binary-only entries.
+    pub features: Option<String>,
+    /// Restrict resolution to one target triple.
+    ///
+    /// An SBOM generated inside the Linux production image otherwise lists
+    /// every target-specific dependency of every platform — the whole
+    /// `windows-*` family, 89 packages in this workspace — none of which can
+    /// be in that image. The generated Dockerfile passes the builder's own
+    /// host triple. Deliberately off by default: autumn's own release is a
+    /// SOURCE release consumed on every platform, so narrowing its SBOM to
+    /// whichever runner built it would understate what was published.
+    pub filter_platform: Option<String>,
+    /// Require the SBOM's root component to describe exactly this version.
+    pub expect_version: Option<String>,
+}
+
+/// The `cargo metadata` argument list `opts` implies.
+///
+/// Split out from the spawn so the resolution switches are unit-testable —
+/// getting one wrong silently changes what the SBOM claims, which is exactly
+/// the class of bug that is invisible until an auditor reads the document.
+fn metadata_args(opts: &SbomOptions) -> Vec<String> {
+    let mut args = vec!["metadata".into(), "--format-version".into(), "1".into()];
+    if opts.all_features {
+        args.push("--all-features".into());
+    }
+    if let Some(features) = opts
+        .features
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        args.push("--features".into());
+        args.push(features.to_owned());
+    }
+    if let Some(triple) = opts
+        .filter_platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        args.push("--filter-platform".into());
+        args.push(triple.to_owned());
+    }
+    if opts.locked {
+        args.push("--locked".into());
+    }
+    args
+}
+
+fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError> {
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.args(metadata_args(opts));
+    if let Some(path) = &opts.manifest_path {
+        cmd.arg("--manifest-path").arg(path);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| SbomError::CargoMetadata(format!("could not run cargo: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(SbomError::CargoMetadata(if stderr.is_empty() {
+            format!("cargo exited with {}", out.status)
+        } else {
+            stderr
+        }));
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// Derive the fallback root identity for a virtual workspace: the workspace
+/// directory's name plus `[workspace.package].version` (falling back to
+/// `[package].version`) from its root manifest.
+fn workspace_fallback(metadata: &serde_json::Value) -> RootFallback {
+    let root_dir = metadata
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let manifest = root_dir
+        .as_ref()
+        .and_then(|d| std::fs::read_to_string(d.join("Cargo.toml")).ok())
+        // `toml::from_str`, not `str::parse`: since toml 1.0 the `FromStr`
+        // impl parses a bare TOML *value*, not a document, and silently fails
+        // on the very first table header.
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok());
+
+    // Prefer the repository URL's last path segment over the checkout
+    // directory's name: cloning into `autumn-fork/` must not silently change
+    // the identity the release SBOM claims.
+    let name = manifest
+        .as_ref()
+        .and_then(|t| {
+            t.get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("repository"))
+                .or_else(|| t.get("package").and_then(|p| p.get("repository")))
+                .and_then(toml::Value::as_str)
+        })
+        .and_then(|url| {
+            url.trim_end_matches('/')
+                .trim_end_matches(".git")
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            root_dir
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "workspace".to_owned());
+
+    let version = manifest
+        .as_ref()
+        .and_then(|t| {
+            t.get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("version"))
+                .or_else(|| t.get("package").and_then(|p| p.get("version")))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "0.0.0".to_owned());
+    RootFallback { name, version }
+}
+
+fn generate(opts: &SbomOptions) -> Result<Bom, SbomError> {
+    let tool_version = env!("CARGO_PKG_VERSION");
+    if let Some(path) = &opts.binary {
+        let bytes = std::fs::read(path)?;
+        return bom_from_binary(&bytes, tool_version);
+    }
+    let metadata = run_cargo_metadata(opts)?;
+    let fallback = workspace_fallback(&metadata);
+    bom_from_cargo_metadata(&metadata, &fallback, tool_version)
+}
+
+fn execute(opts: &SbomOptions) -> Result<(), SbomError> {
+    let bom = generate(opts)?;
+
+    // Checked against the FRESHLY GENERATED document, before any comparison:
+    // if the source tree is not the version being released, the SBOM under
+    // test cannot be right even if it matches that tree byte for byte.
+    if let Some(expected) = &opts.expect_version {
+        check_expected_version(&bom, expected)?;
+    }
+
+    if let Some(path) = &opts.verify {
+        let existing = std::fs::read_to_string(path)?;
+        let actual: Bom = serde_json::from_str(&existing).map_err(|e| {
+            SbomError::VerifyMismatch(format!(
+                "  {} is not a document this CLI would generate: {e}\n\
+                 \x20 (verification compares against this tool's own output, so any \
+                 field it does not emit — an added timestamp, a vulnerabilities \
+                 array — is a mismatch, not something to ignore)",
+                path.display()
+            ))
+        })?;
+        let report = diff(&bom, &actual);
+        if !report.is_empty() {
+            return Err(SbomError::VerifyMismatch(report.join("\n")));
+        }
+        eprintln!(
+            "SBOM {} matches the source tree ({} components).",
+            path.display(),
+            bom.components.len()
+        );
+        return Ok(());
+    }
+
+    let rendered = render(&bom)?;
+    match &opts.output {
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &rendered)?;
+            eprintln!(
+                "Wrote CycloneDX SBOM ({} components) to {}",
+                bom.components.len(),
+                path.display()
+            );
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// Run `autumn sbom`, exiting non-zero on any failure.
+pub fn run(opts: &SbomOptions) {
+    if let Err(e) = execute(opts) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fallback() -> RootFallback {
+        RootFallback {
+            name: "autumn".into(),
+            version: "0.7.0".into(),
+        }
+    }
+
+    fn metadata_with(packages: &serde_json::Value, root: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "packages": packages,
+            "workspace_root": "/tmp/ws",
+            "resolve": { "root": root },
+        })
+    }
+
+    /// A registry package as `cargo metadata` really reports one — `source`
+    /// included, since that is what decides whether a crates.io identity may
+    /// be claimed.
+    fn pkg(name: &str, version: &str) -> serde_json::Value {
+        json!({
+            "id": format!("registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"),
+            "name": name,
+            "version": version,
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "license": "MIT OR Apache-2.0",
+            "repository": format!("https://example.invalid/{name}"),
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // cargo metadata -> CycloneDX
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn emits_a_cyclonedx_envelope() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+
+        assert_eq!(v["bomFormat"], "CycloneDX");
+        assert_eq!(v["specVersion"], "1.5");
+        assert_eq!(v["version"], 1);
+        assert_eq!(
+            v["metadata"]["tools"]["components"][0]["name"],
+            "autumn-cli"
+        );
+        assert_eq!(v["metadata"]["tools"]["components"][0]["version"], "0.7.0");
+    }
+
+    #[test]
+    fn omits_nondeterministic_fields() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let rendered =
+            render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap()).unwrap();
+        // A UUID serial number or a wall-clock timestamp would make the
+        // publish gate's `--verify` comparison impossible.
+        assert!(
+            !rendered.contains("timestamp"),
+            "SBOM must not carry a wall-clock timestamp: {rendered}"
+        );
+
+        // A `serialNumber` IS present — consumers require one, and GitHub's
+        // `actions/attest-sbom` refuses a CycloneDX document without it — but
+        // it is derived from the document's content, not randomly generated,
+        // so it survives `--verify`.
+        let serial = serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["serialNumber"]
+            .as_str()
+            .expect("a CycloneDX serialNumber must be present")
+            .to_owned();
+        assert!(serial.starts_with("urn:uuid:"), "{serial}");
+        let again = render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap()).unwrap();
+        assert_eq!(rendered, again, "the serial number must be reproducible");
+
+        // …and it tracks the inventory: one crate different, different serial.
+        let other = metadata_with(&json!([pkg("serde", "1.0.1")]), &json!(null));
+        let other_serial = serde_json::from_str::<serde_json::Value>(
+            &render(&bom_from_cargo_metadata(&other, &fallback(), "0.7.0").unwrap()).unwrap(),
+        )
+        .unwrap()["serialNumber"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(serial, other_serial);
+    }
+
+    #[test]
+    fn the_serial_number_covers_everything_the_document_emits() {
+        // The serial is advertised as content-derived, and consumers use
+        // (serialNumber, version) to identify a BOM revision — so any change
+        // that alters the rendered bytes must alter it, not just the component
+        // list. Hashing a hand-picked subset let a licence or purl edit produce
+        // two different documents claiming the same revision.
+        let serial_of = |bom: &Bom| bom.serial_number.clone().expect("serialNumber");
+        let base = bom_of(&[("serde", "1.0.0")]);
+
+        let mut licence_changed = base.clone();
+        licence_changed.components[0].licenses = Some(vec![License {
+            expression: "Proprietary".into(),
+        }]);
+        assert_ne!(
+            serial_of(&base),
+            serial_of(&reseal(licence_changed)),
+            "a changed licence must change the serial"
+        );
+
+        let mut vcs_changed = base.clone();
+        vcs_changed.components[0].external_references = Some(vec![ExternalReference {
+            kind: "vcs".into(),
+            url: "https://evil.invalid/serde".into(),
+        }]);
+        assert_ne!(serial_of(&base), serial_of(&reseal(vcs_changed)));
+
+        let mut root_changed = base.clone();
+        root_changed.metadata.component.purl = Some("pkg:cargo/other@0.7.0".into());
+        assert_ne!(serial_of(&base), serial_of(&reseal(root_changed)));
+
+        let mut tool_changed = base.clone();
+        tool_changed.metadata.tools.components[0].version = "9.9.9".into();
+        assert_ne!(serial_of(&base), serial_of(&reseal(tool_changed)));
+
+        // …and an identical document still hashes identically.
+        assert_eq!(serial_of(&base), serial_of(&reseal(base.clone())));
+    }
+
+    /// Recompute a `Bom`'s serial after mutating it, the way `assemble` does.
+    fn reseal(mut bom: Bom) -> Bom {
+        bom.serial_number = None;
+        bom.serial_number = Some(content_serial_number(&bom));
+        bom
+    }
+
+    #[test]
+    fn a_platform_filter_reaches_cargo_metadata() {
+        // Without it, an SBOM generated inside a Linux image lists the whole
+        // `windows-*` family — 89 packages in this workspace that cannot be in
+        // that image.
+        let args = metadata_args(&SbomOptions {
+            filter_platform: Some("x86_64-unknown-linux-gnu".into()),
+            ..SbomOptions::default()
+        });
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--filter-platform", "x86_64-unknown-linux-gnu"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn no_platform_filter_is_applied_by_default() {
+        // Autumn's own release is a SOURCE release consumed on every platform,
+        // so its SBOM must not be narrowed to whichever runner built it.
+        let args = metadata_args(&SbomOptions::default());
+        assert!(!args.iter().any(|a| a == "--filter-platform"), "{args:?}");
+    }
+
+    #[test]
+    fn metadata_args_carry_the_other_resolution_switches() {
+        let args = metadata_args(&SbomOptions {
+            locked: true,
+            all_features: true,
+            features: Some("embed-assets".into()),
+            ..SbomOptions::default()
+        });
+        assert!(args.iter().any(|a| a == "--locked"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--all-features"), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--features", "embed-assets"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_workspace_identity_when_there_is_no_root_package() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+
+        assert_eq!(v["metadata"]["component"]["name"], "autumn");
+        assert_eq!(v["metadata"]["component"]["version"], "0.7.0");
+        assert_eq!(v["metadata"]["component"]["type"], "application");
+    }
+
+    #[test]
+    fn uses_the_resolved_root_package_as_the_top_level_component() {
+        let root_id = "path+file:///tmp/ws#my-app@1.2.3";
+        let md = metadata_with(
+            &json!([
+                {
+                    "id": root_id,
+                    "name": "my-app",
+                    "version": "1.2.3",
+                    "license": "MIT",
+                    "repository": serde_json::Value::Null,
+                },
+                pkg("serde", "1.0.0"),
+            ]),
+            &json!(root_id),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+
+        assert_eq!(v["metadata"]["component"]["name"], "my-app");
+        assert_eq!(v["metadata"]["component"]["version"], "1.2.3");
+        // The root must not be duplicated into the flat component list.
+        let names: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["serde"]);
+    }
+
+    #[test]
+    fn records_purl_license_and_vcs_for_each_component() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let c = &v["components"][0];
+
+        assert_eq!(c["type"], "library");
+        assert_eq!(c["name"], "serde");
+        assert_eq!(c["version"], "1.0.0");
+        assert_eq!(c["purl"], "pkg:cargo/serde@1.0.0");
+        assert_eq!(c["bom-ref"], "pkg:cargo/serde@1.0.0");
+        assert_eq!(c["licenses"][0]["expression"], "MIT OR Apache-2.0");
+        assert_eq!(c["externalReferences"][0]["type"], "vcs");
+        assert_eq!(
+            c["externalReferences"][0]["url"],
+            "https://example.invalid/serde"
+        );
+    }
+
+    #[test]
+    fn a_path_package_claims_no_crates_io_identity() {
+        // `pkg:cargo/blog@0.1.0` tells a scanner to look up a crates.io crate
+        // that either does not exist or belongs to somebody else. A path
+        // dependency has no registry identity to assert.
+        let md = metadata_with(
+            &json!([{
+                "id": "path+file:///ws/blog#blog@0.1.0",
+                "name": "blog", "version": "0.1.0", "source": serde_json::Value::Null,
+            }]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let c = &v["components"][0];
+        assert!(c.get("purl").is_none(), "{c}");
+        assert_eq!(c["bom-ref"], "path:blog@0.1.0");
+    }
+
+    #[test]
+    fn a_git_package_qualifies_its_purl_with_the_repository() {
+        let md = metadata_with(
+            &json!([{
+                "id": "git+https://example.invalid/x#patched@1.0.0",
+                "name": "patched", "version": "1.0.0",
+                "source": "git+https://example.invalid/x?rev=abc123",
+            }]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let purl = v["components"][0]["purl"].as_str().unwrap();
+        assert!(
+            purl.starts_with("pkg:cargo/patched@1.0.0?vcs_url="),
+            "a git dependency must not read as a crates.io package: {purl}"
+        );
+    }
+
+    #[test]
+    fn a_crates_io_package_keeps_the_canonical_purl() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["components"][0]["purl"], "pkg:cargo/serde@1.0.0");
+    }
+
+    #[test]
+    fn audit_data_marks_a_locally_built_package_as_unpublished() {
+        let bom = bom_from_audit_data(
+            r#"{"packages":[{"name":"my-app","version":"1.0.0","source":"local","root":true},
+                            {"name":"vendored","version":"2.0.0","source":"local"}]}"#,
+            "0.7.0",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert!(v["components"][0].get("purl").is_none());
+        assert_eq!(v["components"][0]["bom-ref"], "path:vendored@2.0.0");
+    }
+
+    #[test]
+    fn the_no_audit_data_error_does_not_recommend_a_broken_remedy() {
+        // A bare RUSTC_WORKSPACE_WRAPPER=cargo-auditable fails the very next
+        // build — this crate's own `build.rs` documents why. Telling a user to
+        // try it is worse than saying nothing.
+        let msg = SbomError::NoAuditData.to_string();
+        assert!(msg.contains("cargo auditable build"), "{msg}");
+        assert!(
+            !msg.contains("RUSTC_WORKSPACE_WRAPPER"),
+            "the error must not suggest a remedy that breaks the build: {msg}"
+        );
+    }
+
+    #[test]
+    fn omits_license_and_vcs_when_the_package_declares_none() {
+        let md = metadata_with(
+            &json!([{ "id": "x#anon@0.1.0", "name": "anon", "version": "0.1.0" }]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+
+        assert!(v["components"][0].get("licenses").is_none());
+        assert!(v["components"][0].get("externalReferences").is_none());
+    }
+
+    #[test]
+    fn output_is_byte_identical_regardless_of_cargo_metadata_ordering() {
+        let a = metadata_with(
+            &json!([
+                pkg("serde", "1.0.0"),
+                pkg("anyhow", "1.0.5"),
+                pkg("serde", "0.9.0")
+            ]),
+            &json!(null),
+        );
+        let b = metadata_with(
+            &json!([
+                pkg("serde", "0.9.0"),
+                pkg("serde", "1.0.0"),
+                pkg("anyhow", "1.0.5")
+            ]),
+            &json!(null),
+        );
+        let ra = render(&bom_from_cargo_metadata(&a, &fallback(), "0.7.0").unwrap()).unwrap();
+        let rb = render(&bom_from_cargo_metadata(&b, &fallback(), "0.7.0").unwrap()).unwrap();
+        assert_eq!(ra, rb);
+
+        let v: serde_json::Value = serde_json::from_str(&ra).unwrap();
+        let ordered: Vec<String> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}@{}",
+                    c["name"].as_str().unwrap(),
+                    c["version"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(ordered, vec!["anyhow@1.0.5", "serde@0.9.0", "serde@1.0.0"]);
+    }
+
+    #[test]
+    fn deduplicates_components_that_share_a_bom_ref() {
+        let md = metadata_with(
+            &json!([pkg("serde", "1.0.0"), pkg("serde", "1.0.0")]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_metadata_without_a_packages_array() {
+        let md = json!({ "workspace_root": "/tmp/ws" });
+        assert!(matches!(
+            bom_from_cargo_metadata(&md, &fallback(), "0.7.0"),
+            Err(SbomError::Metadata(_))
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // verification diff
+    // ---------------------------------------------------------------------
+
+    fn bom_of(pkgs: &[(&str, &str)]) -> Bom {
+        let packages: Vec<serde_json::Value> = pkgs.iter().map(|(n, v)| pkg(n, v)).collect();
+        bom_from_cargo_metadata(
+            &metadata_with(&serde_json::Value::Array(packages), &json!(null)),
+            &fallback(),
+            "0.7.0",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn identical_boms_diff_to_nothing() {
+        let a = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
+        let b = bom_of(&[("anyhow", "1.0.5"), ("serde", "1.0.0")]);
+        assert!(diff(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn verification_rejects_a_document_carrying_fields_this_tool_never_emits() {
+        // Modelling only the fields we write means anything else — an injected
+        // `metadata.timestamp`, a fabricated `vulnerabilities` array, an extra
+        // `dependencies` graph — is silently dropped on read and the comparison
+        // sees a document that matches. Verification has to notice.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["vulnerabilities"] = json!([{ "id": "CVE-0000-0000" }]);
+
+        let err = serde_json::from_str::<Bom>(&doc.to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("vulnerabilities"),
+            "the error must name the unexpected field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verification_rejects_an_injected_timestamp() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["metadata"]["timestamp"] = json!("2026-01-01T00:00:00Z");
+        assert!(serde_json::from_str::<Bom>(&doc.to_string()).is_err());
+    }
+
+    #[test]
+    fn verification_rejects_an_extra_component_field() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["components"][0]["description"] = json!("smuggled");
+        assert!(serde_json::from_str::<Bom>(&doc.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_bom_round_tripped_through_json_still_verifies() {
+        // Regression: `source_id` is `#[serde(skip)]`, so a document read back
+        // from disk has `None` where a freshly generated one has the cargo
+        // package id. Comparing it made every component "differ" and the
+        // release gate failed on its own output.
+        let fresh = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
+        let from_disk: Bom = serde_json::from_str(&render(&fresh).unwrap()).unwrap();
+        assert!(
+            diff(&fresh, &from_disk).is_empty(),
+            "{:?}",
+            diff(&fresh, &from_disk)
+        );
+    }
+
+    #[test]
+    fn diff_names_the_missing_component() {
+        let expected = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
+        let actual = bom_of(&[("serde", "1.0.0")]);
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("anyhow@1.0.5"), "{report}");
+        assert!(report.contains("missing"), "{report}");
+    }
+
+    #[test]
+    fn diff_names_the_unexpected_component() {
+        let expected = bom_of(&[("serde", "1.0.0")]);
+        let actual = bom_of(&[("serde", "1.0.0"), ("evil", "6.6.6")]);
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("evil@6.6.6"), "{report}");
+        assert!(report.contains("unexpected"), "{report}");
+    }
+
+    #[test]
+    fn diff_reports_a_changed_root_component() {
+        let expected = bom_of(&[("serde", "1.0.0")]);
+        let mut actual = bom_of(&[("serde", "1.0.0")]);
+        actual.metadata.component.version = "9.9.9".into();
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("root component"), "{report}");
+        assert!(report.contains("9.9.9"), "{report}");
+    }
+
+    #[test]
+    fn workspace_fallback_reads_the_virtual_manifest_version() {
+        // Regression: `str::parse::<toml::Value>()` parses a bare TOML value,
+        // not a document, so it fails on the first table header and every
+        // virtual-workspace SBOM silently claimed version 0.0.0.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        let md = json!({ "workspace_root": dir.path().to_str().unwrap() });
+        let fb = workspace_fallback(&md);
+        assert_eq!(fb.version, "1.2.3");
+        assert_eq!(fb.name, dir.path().file_name().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn workspace_fallback_reads_a_plain_package_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"4.5.6\"\n",
+        )
+        .unwrap();
+        let md = json!({ "workspace_root": dir.path().to_str().unwrap() });
+        assert_eq!(workspace_fallback(&md).version, "4.5.6");
+    }
+
+    #[test]
+    fn workspace_fallback_prefers_the_repository_name_over_the_checkout_directory() {
+        // A release SBOM's identity must not depend on what the CI runner
+        // happened to name the clone directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.2.3\"\n\
+             repository = \"https://github.com/autumn-foundation/autumn\"\n",
+        )
+        .unwrap();
+        let md = json!({ "workspace_root": dir.path().to_str().unwrap() });
+        let fb = workspace_fallback(&md);
+        assert_eq!(fb.name, "autumn");
+        assert_ne!(fb.name, dir.path().file_name().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn workspace_fallback_tolerates_a_trailing_slash_or_dot_git() {
+        for url in [
+            "https://github.com/autumn-foundation/autumn/",
+            "https://github.com/autumn-foundation/autumn.git",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("Cargo.toml"),
+                format!("[workspace.package]\nversion = \"1.2.3\"\nrepository = \"{url}\"\n"),
+            )
+            .unwrap();
+            let md = json!({ "workspace_root": dir.path().to_str().unwrap() });
+            assert_eq!(workspace_fallback(&md).name, "autumn", "for {url}");
+        }
+    }
+
+    #[test]
+    fn diff_catches_a_duplicated_component() {
+        // Indexing by `bom-ref` collapses duplicates; without an explicit
+        // length check a doubled entry would verify clean.
+        let expected = bom_of(&[("serde", "1.0.0")]);
+        let mut actual = expected.clone();
+        let dup = actual.components[0].clone();
+        actual.components.push(dup);
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("component count"), "{report}");
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_a_big_endian_mach_o() {
+        // A fully byte-swapped image, not just a swapped magic: this is the
+        // only test that actually walks the big-endian load-command path.
+        let macho = synth_macho_endian("dep-v0", b"payload-bytes", true);
+        assert_eq!(&macho[..4], &0xfeed_facfu32.to_be_bytes());
+        assert_eq!(extract_dep_section(&macho).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn refuses_a_decompression_bomb() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        // ~1000:1 amplification is trivially achievable, so an attacker-supplied
+        // binary with a modest `.dep-v0` section can otherwise drive this to an
+        // out-of-memory kill.
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![b'A'; MAX_AUDIT_DATA_BYTES * 2])
+            .unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(
+            bomb.len() < MAX_AUDIT_DATA_BYTES,
+            "the fixture must be small enough that only the LIMIT stops it"
+        );
+
+        let err = inflate_audit_data(&bomb).unwrap_err();
+        assert!(
+            matches!(err, SbomError::AuditDataTooLarge { .. }),
+            "expected a size refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn does_not_panic_on_an_elf_with_an_absurd_section_table_offset() {
+        // `e_shoff` near usize::MAX previously reached an unchecked `+ 32`
+        // while reading the extended-numbering fields off section header 0.
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1];
+        elf.extend_from_slice(&[0u8; 9]);
+        elf.resize(64, 0);
+        elf[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes()); // e_shoff
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[0x3c..0x3e].copy_from_slice(&0u16.to_le_bytes()); // e_shnum = extended
+        assert!(extract_dep_section(&elf).is_err());
+    }
+
+    #[test]
+    fn a_section_name_pointing_past_the_string_table_does_not_abort_the_scan() {
+        // A stripped or hand-edited binary can carry a garbage `sh_name`. That
+        // must not mask a `.dep-v0` section later in the table, nor turn a
+        // plain "not built with cargo-auditable" into "malformed object".
+        let mut elf = synth_elf(true, false, ".dep-v0", b"payload-bytes");
+        let shoff =
+            usize::try_from(u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap())).unwrap();
+        // Section header 1 is `.shstrtab`; point its own name past the table.
+        elf[shoff + 64..shoff + 68].copy_from_slice(&0xffff_u32.to_le_bytes());
+        assert_eq!(extract_dep_section(&elf).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn diff_reports_root_component_metadata_drift() {
+        // Comparing only name+version let an edited root purl or licence
+        // through — the release gate must reject the whole component.
+        let expected = bom_of(&[("serde", "1.0.0")]);
+        let mut actual = expected.clone();
+        actual.metadata.component.purl = Some("pkg:cargo/backdoor@0.7.0".into());
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("root component"), "{report}");
+    }
+
+    #[test]
+    fn a_synthesised_workspace_root_claims_no_crates_io_identity() {
+        // `pkg:cargo/autumn@0.7.0` would point a scanner at an unrelated
+        // crates.io crate: this workspace publishes `autumn-web`, and `autumn`
+        // is somebody else's package.
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["metadata"]["component"]["name"], "autumn");
+        assert!(
+            v["metadata"]["component"].get("purl").is_none(),
+            "a synthesised workspace identity has no package URL: {}",
+            v["metadata"]["component"]
+        );
+        assert_eq!(
+            v["metadata"]["component"]["bom-ref"],
+            "workspace:autumn@0.7.0"
+        );
+    }
+
+    #[test]
+    fn two_distinct_packages_sharing_a_name_and_version_both_survive() {
+        // A `[patch]`ed or path copy alongside a registry copy resolves to the
+        // same `name@version`. Collapsing them would drop a real dependency
+        // from the inventory.
+        let md = metadata_with(
+            &json!([
+                {
+                    "id": "registry+https://crates.io#dup@1.0.0",
+                    "name": "dup", "version": "1.0.0", "license": "MIT",
+                },
+                {
+                    "id": "path+file:///vendor/dup#dup@1.0.0",
+                    "name": "dup", "version": "1.0.0", "license": "Apache-2.0",
+                },
+            ]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let refs: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["bom-ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(refs.len(), 2, "both copies must appear: {refs:?}");
+        assert_ne!(refs[0], refs[1], "CycloneDX bom-refs must be unique");
+    }
+
+    #[test]
+    fn identical_packages_listed_twice_still_collapse() {
+        let md = metadata_with(
+            &json!([pkg("serde", "1.0.0"), pkg("serde", "1.0.0")]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        assert_eq!(bom.components.len(), 1);
+    }
+
+    #[test]
+    fn expected_version_accepts_a_matching_root() {
+        let bom = bom_of(&[("serde", "1.0.0")]);
+        assert!(check_expected_version(&bom, "0.7.0").is_ok());
+    }
+
+    #[test]
+    fn expected_version_rejects_a_mismatched_root() {
+        let bom = bom_of(&[("serde", "1.0.0")]);
+        let err = check_expected_version(&bom, "9.9.9").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("9.9.9"), "{msg}");
+        assert!(msg.contains("0.7.0"), "{msg}");
+    }
+
+    // ---------------------------------------------------------------------
+    // cargo-auditable payload -> CycloneDX
+    // ---------------------------------------------------------------------
+
+    const AUDIT_JSON: &str = r#"{
+        "packages": [
+            {"name":"my-app","version":"1.2.3","source":"local","kind":"runtime","root":true,
+             "dependencies":[1,2]},
+            {"name":"serde","version":"1.0.0","source":"crates.io","dependencies":[]},
+            {"name":"cc","version":"1.0.83","source":"crates.io","kind":"build","dependencies":[]}
+        ]
+    }"#;
+
+    #[test]
+    fn audit_data_root_becomes_the_top_level_component() {
+        let bom = bom_from_audit_data(AUDIT_JSON, "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+
+        assert_eq!(v["metadata"]["component"]["name"], "my-app");
+        assert_eq!(v["metadata"]["component"]["version"], "1.2.3");
+        let names: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["cc", "serde"]);
+    }
+
+    #[test]
+    fn audit_data_marks_build_only_dependencies() {
+        let bom = bom_from_audit_data(AUDIT_JSON, "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let cc = &v["components"][0];
+        assert_eq!(cc["name"], "cc");
+        assert_eq!(cc["properties"][0]["name"], "cargo:dependency-kind");
+        assert_eq!(cc["properties"][0]["value"], "build");
+        assert_eq!(cc["properties"][1]["name"], "cargo:source");
+        assert_eq!(cc["properties"][1]["value"], "crates.io");
+
+        // `runtime` is the format's default kind, so a runtime dependency is
+        // annotated with its provenance only — never a redundant kind property.
+        let serde = &v["components"][1];
+        assert_eq!(serde["name"], "serde");
+        let props: Vec<&str> = serde["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(props, vec!["cargo:source"]);
+    }
+
+    #[test]
+    fn audit_data_without_a_root_still_produces_a_bom() {
+        let bom = bom_from_audit_data(
+            r#"{"packages":[{"name":"serde","version":"1.0.0","source":"crates.io"}]}"#,
+            "0.7.0",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_audit_data_that_is_not_json() {
+        assert!(bom_from_audit_data("not json", "0.7.0").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // object-file section extraction
+    // ---------------------------------------------------------------------
+
+    /// Build a synthetic ELF carrying `payload` in a section named `sec_name`.
+    ///
+    /// Writing fixed-width object-file headers is all narrowing casts by
+    /// nature, and every value here is a handful of bytes.
+    #[allow(clippy::cast_possible_truncation)]
+    fn synth_elf(class64: bool, big_endian: bool, sec_name: &str, payload: &[u8]) -> Vec<u8> {
+        let w16 = |v: u16| -> Vec<u8> {
+            if big_endian {
+                v.to_be_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            }
+        };
+        let w32 = |v: u32| -> Vec<u8> {
+            if big_endian {
+                v.to_be_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            }
+        };
+        let w64 = |v: u64| -> Vec<u8> {
+            if big_endian {
+                v.to_be_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            }
+        };
+        let wn = |v: u64| -> Vec<u8> { if class64 { w64(v) } else { w32(v as u32) } };
+
+        let ehdr_size: usize = if class64 { 64 } else { 52 };
+        let shent: usize = if class64 { 64 } else { 40 };
+
+        // .shstrtab: "\0.shstrtab\0<sec_name>\0"
+        let mut strtab = vec![0u8];
+        let shstrtab_off = strtab.len() as u32;
+        strtab.extend_from_slice(b".shstrtab\0");
+        let sec_name_off = strtab.len() as u32;
+        strtab.extend_from_slice(sec_name.as_bytes());
+        strtab.push(0);
+
+        let strtab_file_off = ehdr_size;
+        let payload_file_off = strtab_file_off + strtab.len();
+        let shoff = payload_file_off + payload.len();
+
+        let mut out = Vec::new();
+        // ELF header
+        out.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
+        out.push(if class64 { 2 } else { 1 });
+        out.push(if big_endian { 2 } else { 1 });
+        out.push(1); // EI_VERSION
+        out.extend_from_slice(&[0u8; 9]); // padding to 16
+        out.extend_from_slice(&w16(2)); // e_type = ET_EXEC
+        out.extend_from_slice(&w16(62)); // e_machine
+        out.extend_from_slice(&w32(1)); // e_version
+        out.extend_from_slice(&wn(0)); // e_entry
+        out.extend_from_slice(&wn(0)); // e_phoff
+        out.extend_from_slice(&wn(shoff as u64)); // e_shoff
+        out.extend_from_slice(&w32(0)); // e_flags
+        out.extend_from_slice(&w16(ehdr_size as u16)); // e_ehsize
+        out.extend_from_slice(&w16(0)); // e_phentsize
+        out.extend_from_slice(&w16(0)); // e_phnum
+        out.extend_from_slice(&w16(shent as u16)); // e_shentsize
+        out.extend_from_slice(&w16(3)); // e_shnum
+        out.extend_from_slice(&w16(1)); // e_shstrndx
+        assert_eq!(out.len(), ehdr_size);
+
+        out.extend_from_slice(&strtab);
+        out.extend_from_slice(payload);
+        assert_eq!(out.len(), shoff);
+
+        let mut shdr = |name: u32, off: u64, size: u64| {
+            out.extend_from_slice(&w32(name)); // sh_name
+            out.extend_from_slice(&w32(1)); // sh_type = SHT_PROGBITS
+            out.extend_from_slice(&wn(0)); // sh_flags
+            out.extend_from_slice(&wn(0)); // sh_addr
+            out.extend_from_slice(&wn(off)); // sh_offset
+            out.extend_from_slice(&wn(size)); // sh_size
+            out.extend_from_slice(&w32(0)); // sh_link
+            out.extend_from_slice(&w32(0)); // sh_info
+            out.extend_from_slice(&wn(0)); // sh_addralign
+            out.extend_from_slice(&wn(0)); // sh_entsize
+        };
+        shdr(0, 0, 0); // SHN_UNDEF
+        shdr(shstrtab_off, strtab_file_off as u64, strtab.len() as u64);
+        shdr(sec_name_off, payload_file_off as u64, payload.len() as u64);
+        out
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_elf64_little_endian() {
+        let elf = synth_elf(true, false, ".dep-v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&elf).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_elf32() {
+        let elf = synth_elf(false, false, ".dep-v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&elf).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_big_endian_elf() {
+        let elf = synth_elf(true, true, ".dep-v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&elf).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn reports_a_binary_built_without_cargo_auditable() {
+        let elf = synth_elf(true, false, ".text", b"nothing-here");
+        assert!(matches!(
+            extract_dep_section(&elf),
+            Err(SbomError::NoAuditData)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_file_that_is_not_an_object_file() {
+        assert!(matches!(
+            extract_dep_section(b"#!/bin/sh\necho hi\n"),
+            Err(SbomError::UnsupportedObjectFormat)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_truncated_elf() {
+        let elf = synth_elf(true, false, ".dep-v0", b"payload-bytes");
+        assert!(matches!(
+            extract_dep_section(&elf[..40]),
+            Err(SbomError::MalformedObject)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_elf_whose_section_runs_past_the_end_of_the_file() {
+        let mut elf = synth_elf(true, false, ".dep-v0", b"payload-bytes");
+        elf.truncate(elf.len() - 8); // chop the tail of the last section header
+        assert!(extract_dep_section(&elf).is_err());
+    }
+
+    /// Build a synthetic 64-bit Mach-O carrying `payload` in `__DATA,<sec_name>`.
+    /// Endian-aware fixed-width writer for the synthetic object-file builders.
+    trait ToEndian {
+        fn to_e(self, big_endian: bool) -> Vec<u8>;
+    }
+    macro_rules! to_endian {
+        ($($t:ty),*) => {$(
+            impl ToEndian for $t {
+                fn to_e(self, big_endian: bool) -> Vec<u8> {
+                    if big_endian { self.to_be_bytes().to_vec() } else { self.to_le_bytes().to_vec() }
+                }
+            }
+        )*};
+    }
+    to_endian!(u16, u32, u64, i32);
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn synth_macho(sec_name: &str, payload: &[u8]) -> Vec<u8> {
+        synth_macho_endian(sec_name, payload, false)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn synth_macho_endian(sec_name: &str, payload: &[u8], big_endian: bool) -> Vec<u8> {
+        fn name16(s: &str) -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[..s.len()].copy_from_slice(s.as_bytes());
+            b
+        }
+        let header_len = 32usize;
+        let seg_len = 72usize;
+        let sect_len = 80usize;
+        let payload_off = header_len + seg_len + sect_len;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xfeed_facfu32.to_e(big_endian)); // MH_MAGIC_64
+        out.extend_from_slice(&0x0100_0007i32.to_e(big_endian)); // cputype x86_64
+        out.extend_from_slice(&3i32.to_e(big_endian)); // cpusubtype
+        out.extend_from_slice(&2u32.to_e(big_endian)); // filetype MH_EXECUTE
+        out.extend_from_slice(&1u32.to_e(big_endian)); // ncmds
+        out.extend_from_slice(&((seg_len + sect_len) as u32).to_e(big_endian)); // sizeofcmds
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved
+
+        out.extend_from_slice(&0x19u32.to_e(big_endian)); // LC_SEGMENT_64
+        out.extend_from_slice(&((seg_len + sect_len) as u32).to_e(big_endian)); // cmdsize
+        out.extend_from_slice(&name16("__DATA"));
+        out.extend_from_slice(&0u64.to_e(big_endian)); // vmaddr
+        out.extend_from_slice(&0u64.to_e(big_endian)); // vmsize
+        out.extend_from_slice(&0u64.to_e(big_endian)); // fileoff
+        out.extend_from_slice(&0u64.to_e(big_endian)); // filesize
+        out.extend_from_slice(&0i32.to_e(big_endian)); // maxprot
+        out.extend_from_slice(&0i32.to_e(big_endian)); // initprot
+        out.extend_from_slice(&1u32.to_e(big_endian)); // nsects
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
+        assert_eq!(out.len(), header_len + seg_len);
+
+        out.extend_from_slice(&name16(sec_name));
+        out.extend_from_slice(&name16("__DATA"));
+        out.extend_from_slice(&0u64.to_e(big_endian)); // addr
+        out.extend_from_slice(&(payload.len() as u64).to_e(big_endian)); // size
+        out.extend_from_slice(&(payload_off as u32).to_e(big_endian)); // offset
+        out.extend_from_slice(&0u32.to_e(big_endian)); // align
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reloff
+        out.extend_from_slice(&0u32.to_e(big_endian)); // nreloc
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved1
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved2
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved3
+        assert_eq!(out.len(), payload_off);
+
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_mach_o() {
+        // cargo-auditable's Mach-O section name has no leading dot.
+        let macho = synth_macho("dep-v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&macho).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_mach_o_with_an_underscore_prefixed_name() {
+        let macho = synth_macho("__dep_v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&macho).unwrap(), b"payload-bytes");
+    }
+
+    /// Wrap `slices` into a fat/universal Mach-O container.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn synth_fat_macho(slices: &[Vec<u8>]) -> Vec<u8> {
+        let header = 8 + slices.len() * 20;
+        let mut offsets = Vec::new();
+        let mut off = header;
+        for s in slices {
+            // Each slice is page-aligned in a real fat binary; alignment is
+            // irrelevant here, only that the offsets are correct.
+            offsets.push(off);
+            off += s.len();
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xcafe_babeu32.to_be_bytes());
+        out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        for (i, s) in slices.iter().enumerate() {
+            out.extend_from_slice(&(0x0100_0007i32).to_be_bytes()); // cputype
+            out.extend_from_slice(&(i as i32).to_be_bytes()); // cpusubtype
+            out.extend_from_slice(&(offsets[i] as u32).to_be_bytes());
+            out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        assert_eq!(out.len(), header);
+        for s in slices {
+            out.extend_from_slice(s);
+        }
+        out
+    }
+
+    #[test]
+    fn a_universal_binary_with_one_auditable_slice_is_read() {
+        let fat = synth_fat_macho(&[
+            synth_macho("__text", b"no-audit-data-here"),
+            synth_macho("dep-v0", b"payload-bytes"),
+        ]);
+        assert_eq!(extract_dep_section(&fat).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn a_universal_binary_with_several_auditable_slices_is_refused() {
+        // Slices can carry different `cfg(target_arch)` dependencies, so
+        // silently describing the binary by whichever one comes first would
+        // omit crates that are genuinely in it.
+        let fat = synth_fat_macho(&[
+            synth_macho("dep-v0", b"x86-payload"),
+            synth_macho("dep-v0", b"arm-payload"),
+        ]);
+        let err = extract_dep_section(&fat).unwrap_err();
+        assert!(
+            matches!(err, SbomError::AmbiguousUniversalBinary { slices: 2 }),
+            "expected an ambiguity refusal, got: {err}"
+        );
+        assert!(err.to_string().contains("lipo"), "{err}");
+    }
+
+    #[test]
+    fn a_universal_binary_with_no_audit_data_reports_that() {
+        let fat = synth_fat_macho(&[synth_macho("__text", b"a"), synth_macho("__text", b"b")]);
+        assert!(matches!(
+            extract_dep_section(&fat),
+            Err(SbomError::NoAuditData)
+        ));
+    }
+
+    #[test]
+    fn reports_a_mach_o_built_without_cargo_auditable() {
+        let macho = synth_macho("__text", b"nothing-here");
+        assert!(matches!(
+            extract_dep_section(&macho),
+            Err(SbomError::NoAuditData)
+        ));
+    }
+
+    /// Build a synthetic PE/COFF image carrying `payload` in `<sec_name>`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn synth_pe(sec_name: &str, payload: &[u8]) -> Vec<u8> {
+        let pe_off = 0x80usize;
+        let opt_hdr_len = 0xf0usize;
+        let sect_tbl_off = pe_off + 4 + 20 + opt_hdr_len;
+        let payload_off = sect_tbl_off + 40;
+
+        let mut out = vec![0u8; pe_off];
+        out[0] = b'M';
+        out[1] = b'Z';
+        out[0x3c..0x40].copy_from_slice(&(pe_off as u32).to_le_bytes());
+
+        out.extend_from_slice(b"PE\0\0");
+        out.extend_from_slice(&0x8664u16.to_le_bytes()); // machine
+        out.extend_from_slice(&1u16.to_le_bytes()); // numberOfSections
+        out.extend_from_slice(&0u32.to_le_bytes()); // timeDateStamp
+        out.extend_from_slice(&0u32.to_le_bytes()); // pointerToSymbolTable
+        out.extend_from_slice(&0u32.to_le_bytes()); // numberOfSymbols
+        out.extend_from_slice(&(opt_hdr_len as u16).to_le_bytes()); // sizeOfOptionalHeader
+        out.extend_from_slice(&0u16.to_le_bytes()); // characteristics
+        out.extend_from_slice(&vec![0u8; opt_hdr_len]);
+        assert_eq!(out.len(), sect_tbl_off);
+
+        let mut name = [0u8; 8];
+        name[..sec_name.len()].copy_from_slice(sec_name.as_bytes());
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // virtualSize
+        out.extend_from_slice(&0u32.to_le_bytes()); // virtualAddress
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // sizeOfRawData
+        out.extend_from_slice(&(payload_off as u32).to_le_bytes()); // pointerToRawData
+        out.extend_from_slice(&0u32.to_le_bytes()); // pointerToRelocations
+        out.extend_from_slice(&0u32.to_le_bytes()); // pointerToLinenumbers
+        out.extend_from_slice(&0u16.to_le_bytes()); // numberOfRelocations
+        out.extend_from_slice(&0u16.to_le_bytes()); // numberOfLinenumbers
+        out.extend_from_slice(&0u32.to_le_bytes()); // characteristics
+        assert_eq!(out.len(), payload_off);
+
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn extracts_dep_v0_from_pe() {
+        let pe = synth_pe(".dep-v0", b"payload-bytes");
+        assert_eq!(extract_dep_section(&pe).unwrap(), b"payload-bytes");
+    }
+
+    // ---------------------------------------------------------------------
+    // zlib payload decoding
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn inflates_the_zlib_compressed_audit_payload() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(AUDIT_JSON.as_bytes()).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        assert_eq!(inflate_audit_data(&compressed).unwrap(), AUDIT_JSON);
+    }
+
+    #[test]
+    fn rejects_a_corrupt_audit_payload() {
+        assert!(inflate_audit_data(b"not-zlib-data").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // end-to-end: object file -> CycloneDX
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn reads_a_bom_straight_out_of_an_auditable_binary() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(AUDIT_JSON.as_bytes()).unwrap();
+        let elf = synth_elf(true, false, ".dep-v0", &enc.finish().unwrap());
+
+        let bom = bom_from_binary(&elf, "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["metadata"]["component"]["name"], "my-app");
+        assert_eq!(v["components"].as_array().unwrap().len(), 2);
+    }
+}

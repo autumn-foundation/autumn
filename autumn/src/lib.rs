@@ -87,6 +87,16 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+// The build-time agent authority envelope (issue #1691): what an MCP-exposed,
+// agent-operable handler is allowed to do -- which models it writes, whether it
+// leaves the tenant, which hosts it calls, which jobs it enqueues, how
+// reversible the whole thing is -- declared as a `Grant` and checked by the
+// compiler at each proved effect.
+//
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope.
+pub mod agent_authority;
 pub mod batches;
 /// Locating a usable Chromium/Chrome binary on the host.
 ///
@@ -105,6 +115,15 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+// Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
+// sustains, and the admission limit it licenses. Ungated on purpose —
+// `route_listing` and `router` consult it on every boot.
+//
+// A plain comment, not a doc comment: an outer `///` block here merges with the
+// module's own `//!` docs, and the intra-doc links in those then resolve in the
+// crate root's scope instead of the module's (`-D rustdoc::broken_intra_doc_links`
+// catches it). The module documents itself.
+pub mod capacity;
 /// Deterministic replay capsules: record a failing request (redacted request,
 /// clock reads, database traffic, outcome) and replay it offline.
 ///
@@ -113,15 +132,50 @@ pub mod canary;
 #[cfg(feature = "reporting")]
 pub mod capsule;
 pub mod circuit_breaker;
+// Shared owner-only atomic-write helper (issue #1864): stage-then-rename,
+// used by both `acme::store` and `capsule::persist` (secrets and
+// must-never-be-torn data respectively). Crate-private — an internal helper,
+// not part of the public API.
+mod fs_atomic;
+// Compile-time data classification (issue #1654): carries a "personal data"
+// classification on the *type* of a `#[model]` column and gates the `Json`
+// response sink on it, so a leak is a build failure rather than a production
+// incident.
+//
+// A plain comment, not a doc comment: an outer `///` here would be merged with
+// the module's own `//!` docs and the whole merged block would then resolve its
+// intra-doc links in *this* scope, where `Classified` and `Declassification` are
+// not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
+// The module documents itself.
+pub mod classify;
+// A plain comment, not a doc comment: the module carries its own `//!` docs
+// and an outer `///` here would be merged with them.
 pub mod cluster;
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod config;
 pub mod consent;
+// Parse, validate and server-render Constela documents: the constrained JSON UI
+// language (https://github.com/yuuichieguchi/constela), for serving interfaces
+// a language model generated. Enable with the Cargo feature `constela`.
+//
+// A plain comment, not a doc comment, for the same reason `agent_authority` and
+// `classify` carry one: an outer `///` here is merged with the module's own
+// `//!` docs, and the whole block then resolves its intra-doc links in *this*
+// scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
+#[cfg(feature = "constela")]
+pub mod constela;
 pub mod credentials;
 pub mod current;
+pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
+pub(crate) mod db_url;
 pub mod dotenv;
 pub mod download;
+#[cfg(test)]
+pub(crate) mod test_urls;
 /// The edge capsule's read lane (issue #1790), re-exported from `autumn-edge`.
 ///
 /// [`EdgeRoute`](autumn_edge::EdgeRoute), [`EdgeCache`](autumn_edge::EdgeCache),
@@ -192,7 +246,18 @@ pub mod metrics;
 pub mod migrate;
 pub(crate) mod pg_conn_str;
 pub mod plugin;
+/// The refusal [`AppBuilder::plugin_route_infos`](app::AppBuilder::plugin_route_infos)
+/// and [`route_listing::collect_route_infos`] return.
+///
+/// Re-exported from the crate-private `router` module because both of those
+/// are public functions that hand it back: without this, a caller could not
+/// name the type, match its variants, or write the signature of a function
+/// that forwards it.
+pub use router::RouterBuildError;
 pub mod plugin_conformance;
+pub mod plugin_contract;
+#[cfg(feature = "plugin-sandbox")]
+pub mod plugin_sandbox;
 pub mod probe;
 pub mod query_string;
 
@@ -267,11 +332,21 @@ pub use plugin::{Plugin, Plugins};
 
 pub mod route_listing;
 
-/// Inbound (server-side) TLS support (issue #1603).
+/// In-place upgrades: swap a running app to a new binary without dropping
+/// connections or in-memory state (#1674).
+///
+/// Documented from inside the module: the `SIGUSR2` handoff protocol, the
+/// designated live-state block, and the compile-checked
+/// [`state_migration!`](crate::state_migration) between shapes.
+pub mod upgrade;
+
+/// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
 /// Load and validate a certificate + key, build a reloadable rustls
-/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
-/// off-by-default `tls` feature.
+/// `ServerConfig`, inspect leaf-certificate expiry, and — through
+/// [`tls::client_auth`] — verify client certificates and hand the verified
+/// machine identity to handlers and policies. Gated behind the off-by-default
+/// `tls` feature.
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -292,6 +367,10 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+/// Maintained derived read models: `#[derivation]` (#1769).
+#[cfg(feature = "db")]
+pub mod derivation;
+
 // Threaded, polymorphic comments — autumn's fifth association kind (#1367).
 // Documented from inside the module: an outer `///` here would make rustdoc
 // resolve the module's own intra-doc links in *this* scope instead of the
@@ -299,14 +378,32 @@ pub(crate) mod counter_cache;
 #[cfg(feature = "db")]
 pub mod commentable;
 
+/// Continuous SQLite replication with point-in-time restore (issue #1628).
+#[cfg(feature = "db")]
+pub mod replication;
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
 pub(crate) mod repository_commit_hooks;
+/// AWS Signature Version 4 request signing, shared by the replication and
+/// offsite-backup S3 clients (issues #1628 / #1619).
+pub mod sigv4;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 #[cfg(feature = "db")]
 pub mod retention;
+
+// Unified retention policy for framework-owned data (issue #1605).
+//
+// Deliberately NOT gated on `db`, unlike `retention` above: three of the
+// datasets (idempotency, webhook replay, sessions) and the audit archive
+// exist in database-free builds too, and the policy surface — the dataset
+// registry, the effective-window rules, the CLI report — must be answerable
+// either way. A `//` comment, not `///`: an outer doc attribute here would
+// merge into the module's own `//!` header and make its unqualified
+// intra-doc links resolve in `lib.rs`'s scope instead of the module's,
+// breaking `scripts/check-docs.sh`.
+pub mod data_retention;
 
 /// Read-your-own-writes routing support.
 ///
@@ -317,7 +414,7 @@ pub mod retention;
 #[cfg(feature = "db")]
 pub mod read_your_writes;
 
-/// Offline-first local SQLite store and background sync engine for
+/// Offline-first local `SQLite` store and background sync engine for
 /// occasionally-connected apps (e.g. Tauri mobile).
 ///
 /// See the [`sync`] module documentation for the architecture (change
@@ -325,13 +422,40 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+// Typed money and an append-only, double-entry money ledger (issue #1837).
+// Not to be confused with `ledger` below, which records the history of a
+// `#[repository]` row.
+//
+// A `//` comment, not `///`: an outer doc attribute here merges into the
+// module's own `//!` header and makes its unqualified intra-doc links resolve
+// in `lib.rs`'s scope instead of the module's. `Money`, `AnyMoney` and
+// `MoneyError` are deliberately not re-exported at the crate root — `Money` is
+// too plausible an application type name to take — so every one of those links
+// would break. Same reason as `data_retention` above.
+pub mod money;
+
+/// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
+///
+/// See [`ledger`] module documentation for the full API (issue #1699). This
+/// records the history of a row. For money, see [`money`].
+pub mod ledger;
+// The data types a caller handles. The two *evidence* enums the verification
+// entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
+// deliberately not re-exported: they are arguments to one `ledger::` function,
+// and a caller reaching for them is already inside that module.
+pub use ledger::{
+    LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
+    LedgerHighWater, LedgerPin, LedgerRevision, LedgerVerification, LedgeredRecord,
+};
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
 pub mod version_history;
 pub use version_history::{
     ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
-    compute_delete_changes, compute_diff, compute_insert_changes,
+    compute_delete_changes, compute_delete_changes_owned, compute_diff, compute_diff_owned,
+    compute_insert_changes, compute_insert_changes_owned,
 };
 
 /// Router construction and integration with Axum.
@@ -374,6 +498,26 @@ pub mod __fuzz {
     // Cookie / signed-session decode.
     pub use crate::session::__fuzz_decode_cookie as decode_cookie;
 
+    // DNS wire-format parsing for the ACME DNS-01 propagation probe (#1620).
+    // The bytes come off a UDP socket, so anyone on-path can shape them.
+    #[cfg(feature = "acme")]
+    pub use crate::acme::dns::resolver::parse_response as parse_dns_response;
+    // Sandboxed-plugin decoders (#1609). Both parse bytes produced by an
+    // artifact the operator has explicitly NOT audited: the `.autumn-plugin`
+    // container and the NDJSON frames a guest writes. `plugin-sandbox` is not a
+    // default feature, so the `fuzz/` crate enables it.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_guest_frame as parse_sandbox_guest_frame;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_manifest as parse_sandbox_manifest;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_read_artifact as read_sandbox_artifact;
+    // The render-hook fragment tree (#1632): the one guest-supplied structure
+    // that becomes markup a browser parses, so its failure mode is stored XSS
+    // rather than a refused request.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_render_fragment as render_sandbox_fragment;
+
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
     #[cfg(feature = "inbound-mail")]
@@ -396,6 +540,7 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
@@ -435,6 +580,22 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Build-checked typed contracts between two Autumn services (issue #1755).
+///
+/// See the [`wire`] module for the mechanism and `docs/guide/wire-contracts.md`
+/// for the guide.
+pub mod wire;
+// Declared bare, like `notifications`: the module carries its own `//!` docs,
+// and an outer doc comment here would make rustdoc resolve that whole
+// combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
+// friends are not in scope, breaking every intra-doc link in the module and
+// failing the `-D rustdoc::broken_intra_doc_links` docs gate.
+pub mod push;
+/// Compile-time per-route database query budgets (#1667).
+///
+/// See [`query_budget::StaticQueryBudget`] and the
+/// [`query_budget`](macro@crate::query_budget) attribute macro.
+pub mod query_budget;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
 pub mod presence;
@@ -459,6 +620,10 @@ pub use seo::SeoRouteDefaults;
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
+/// URLs — see [`redis_tls::open_client`] (issue #2172).
+#[cfg(feature = "redis")]
+pub mod redis_tls;
 /// Pluggable error reporting: catch handler panics and route panics + 5xx
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///
@@ -468,10 +633,19 @@ pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
-/// URL-safe slug generation (`slugify`), shared by the scaffold generator's
-/// `slug:slug{from:...}` DSL token and any hand-written app.
+/// Live-traffic shadow mirroring and response diffing.
+///
+/// Samples `GET`/`HEAD` traffic to a candidate build and compares the two
+/// responses before cutover (issue #1653) — see
+/// `docs/guide/staged-deploys.md`.
+pub mod shadow;
+/// URL-safe slug generation (`slugify`).
+///
+/// Shared by the scaffold generator's `slug:slug{from:...}` DSL token and any
+/// hand-written app. Also holds `contains_letter_or_number`, the input check
+/// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
-pub use slug::slugify;
+pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
@@ -491,6 +665,11 @@ pub mod experiments;
 pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
+// A plain comment, not a doc comment, for the same reason `classify` carries
+// one: an outer `///` here is merged with the module's `//!` docs and the whole
+// block then resolves its intra-doc links in *this* scope. The module
+// documents itself.
+pub mod graph;
 pub mod job;
 pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
@@ -594,6 +773,8 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::is_retryable_txn_error;
     #[cfg(feature = "db")]
+    pub use crate::db::maybe_immediate_transaction;
+    #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
@@ -668,6 +849,16 @@ pub use db::Db;
 /// helper for [`Db::tx_with`]. See [`db::TxOptions`].
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
+
+/// Lazy database connection extractor.
+///
+/// Use `LazyDb` instead of `Db` in a handler that also takes a body
+/// extractor (`Form`, `Json`, `Multipart`, ...). `Db` checks out a pooled
+/// connection before the body is read. `LazyDb` waits until the handler
+/// calls [`db::LazyDb::checkout`]. See [`db::LazyDb`] for the full contract
+/// and an example.
+#[cfg(feature = "db")]
+pub use db::LazyDb;
 
 /// The runtime database connection type (Postgres by default; `SQLite` under the
 /// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
@@ -856,6 +1047,42 @@ pub use autumn_macros::mailer_preview;
 ///         .await;
 /// }
 /// ```
+///
+/// # Tuning the runtime
+///
+/// The attribute owns the `tokio::runtime::Builder` call, so its optional
+/// arguments reach the builder knobs an app would otherwise have to drop the
+/// macro to set: `flavor` (`"multi_thread"`, the default, or
+/// `"current_thread"`), `worker_threads`, `max_blocking_threads`,
+/// `thread_name`, `thread_stack_size`, `thread_keep_alive` (a duration string
+/// such as `"30s"`), and `configure` — the path of a
+/// `fn(&mut tokio::runtime::Builder)` that runs last, after the others, for
+/// everything the list does not name.
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::reexports::tokio;
+///
+/// #[get("/")]
+/// async fn index() -> &'static str { "hi" }
+///
+/// fn tune_runtime(builder: &mut tokio::runtime::Builder) {
+///     builder.global_queue_interval(64);
+/// }
+///
+/// #[autumn_web::main(worker_threads = 4, thread_name = "autumn-worker", configure = tune_runtime)]
+/// async fn main() {
+///     autumn_web::app()
+///         .routes(routes![index])
+///         .run()
+///         .await;
+/// }
+/// ```
+///
+/// With no arguments the runtime is `Builder::new_multi_thread().enable_all()`
+/// — tokio's defaults, which is what most apps should keep. Autumn's own
+/// background work (jobs, scheduled tasks, the mailer) shares this runtime, so
+/// a worker count set below what the machine offers throttles that too.
 pub use autumn_macros::main;
 /// Annotate an async function as a deterministic simulation test (S-1797).
 ///
@@ -906,6 +1133,43 @@ pub use autumn_macros::story;
 ///     pub title: String,
 /// }
 /// ```
+///
+/// # Maintained derived columns
+///
+/// `#[belongs_to(Post, counter_cache)]` maintains `posts.comment_count` from
+/// this model's repository. `#[derivation]` is its filtered and weighted
+/// superset (#1769): it maintains a `count` or a `sum(<field>)` over the child
+/// rows a filter accepts, on a column of the parent.
+///
+/// ```rust,ignore
+/// use autumn_web::model;
+///
+/// #[model(table = "comments")]
+/// #[belongs_to(Post, fk = post_id)]
+/// #[derivation(Post, column = "published_comment_count", filter = published)]
+/// #[derivation(Post, column = "visible_score", transform = sum(score),
+///              filter = published && score > 0)]
+/// pub struct Comment {
+///     #[id]
+///     pub id: i64,
+///     pub post_id: i64,
+///     pub published: bool,
+///     pub score: i64,
+/// }
+/// ```
+///
+/// Write it **below** `#[model]`, which consumes it. Both columns are
+/// maintained by every generated repository mutation, inside the same
+/// transaction as the row mutation, with atomic set-based SQL. The filter is
+/// lowered to a Rust predicate and to a SQL predicate from one declaration, so
+/// the two cannot disagree; it accepts `bool`, integer and `String` fields and
+/// their `Option` forms.
+///
+/// The parent column is the application's migration (`BIGINT NOT NULL DEFAULT
+/// 0`). Each derivation is content-addressed, so a changed definition enqueues a
+/// resumable backfill at startup. See the [`derivation`] module for the
+/// registry, backfill and status API, `GET /actuator/derivations` for state and
+/// drift, and `docs/guide/derivations.md` for the guide.
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
 /// Annotate an OAuth2/OIDC callback handler.
@@ -945,6 +1209,34 @@ pub use autumn_macros::repository;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::service;
+
+/// Mark a typed handler as a service endpoint (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// See the [`wire`] module for the mechanism and
+/// `docs/guide/wire-contracts.md` for the guide.
+pub use autumn_macros::endpoint;
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::contract_checked;
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::WireShape;
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// The generated methods call through [`http_client::Client`], so this needs
+/// the `http-client` feature.
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
 
 /// Annotate an async function as a `PATCH` route handler.
 ///
@@ -1272,6 +1564,68 @@ pub use autumn_macros::step_up;
 /// ```
 pub use autumn_macros::throttle;
 
+/// Bound a handler's database query count at compile time.
+///
+/// `#[query_budget(N)]` fails the build when a statically reachable path
+/// through the handler can issue more than `N` queries — the classic N+1 (a
+/// repository call inside a loop over runtime-sized rows) is the canonical
+/// case. Unlike the runtime tools (the dev inspector and
+/// [`crate::test::TestResponse::assert_max_queries`]), the gate fires on every
+/// branch, tested or not.
+///
+/// ```ignore
+/// use autumn_web::{get, query_budget};
+///
+/// #[get("/posts")]
+/// #[query_budget(2)]
+/// async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+///     let posts = repo.find_all().await?;
+///     let posts = repo.preload(posts, Post::preload().author()).await?;
+///     Ok(render(&posts))
+/// }
+/// ```
+///
+/// Escape hatches: `#[query_budget(unbounded, reason = "…")]` on the handler,
+/// and `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement.
+/// See [`query_budget::StaticQueryBudget`] for the constant the expansion
+/// leaves behind, and `docs/guide/query-budgets.md` for the guide.
+pub use autumn_macros::query_budget;
+
+/// Declare what an agent-operable handler is allowed to do, and check it.
+///
+/// `#[agent_operable(grant = TheGrant)]` derives the handler's static effect
+/// set — bounded and unbounded writes, cross-tenant queries, outbound calls,
+/// webhook dispatches, job enqueues — and fails the build at the offending call
+/// when the declared [`agent_authority::Grant`] does not cover it. Effects it
+/// cannot prove are errors, not silence; `#[agent_effect(...)]` on the
+/// statement is the escape hatch, and it declares effects that are checked
+/// exactly like proved ones.
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// autumn_web::authority_grant! {
+///     pub RefundDrafter {
+///         writes: [Refund],
+///         reversibility: compensable,
+///     }
+/// }
+///
+/// #[post("/refunds")]
+/// #[api_doc(mcp, summary = "Draft a refund")]
+/// #[agent_operable(grant = RefundDrafter)]
+/// async fn draft_refund(
+///     repo: PgRefundRepository,
+///     Json(body): Json<NewRefund>,
+/// ) -> AutumnResult<Json<Refund>> {
+///     Ok(Json(repo.create(&body).await?)) // allowed: `writes: [Refund]`
+/// }
+/// ```
+///
+/// See [`agent_authority`] for the vocabulary and
+/// `docs/guide/agent-authority.md` for the guide.
+pub use autumn_macros::agent_operable;
+
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
 /// delegates to a custom fallback specified with `fallback = my_fn`.
@@ -1408,6 +1762,10 @@ pub use autumn_macros::edge_routes;
 /// enum, and a typestate transition module (named after the enum in
 /// `snake_case`) whose `Machine<S>` only exposes `to_<target>` methods for
 /// declared edges — firing an undeclared transition is a compile error.
+///
+/// The declared graph is proven structurally sound at compile time: a state
+/// unreachable from `initial`, or a reachable non-terminal state with no path
+/// to a terminal, is a compile error naming the variant.
 ///
 /// # Examples
 ///
@@ -1691,6 +2049,7 @@ pub use axum::extract::State;
 /// | `axum` | `autumn_web::reexports::axum` | Custom routers, middleware, extractors |
 /// | `diesel` | `autumn_web::reexports::diesel` | Raw Diesel queries, schema types |
 /// | `http` | `autumn_web::reexports::http` | HTTP types (`StatusCode`, `Method`, headers) |
+/// | `redis` | `autumn_web::reexports::redis` | Naming the `redis::Client` [`redis_tls::open_client`] returns (`redis` feature) |
 /// | `serde_json` | `autumn_web::reexports::serde_json` | JSON values and conversion helpers |
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
@@ -1700,10 +2059,24 @@ pub mod reexports {
     pub use diesel;
     #[cfg(feature = "db")]
     pub use diesel_async;
+    /// Re-exported because `embed_migrations!` — re-exported from
+    /// [`crate::migrate`] — expands to unqualified `diesel_migrations::…`
+    /// paths. A plugin shipping migrations through the stable
+    /// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)
+    /// seam (issue #1601) can bring this into scope instead of taking its own
+    /// `diesel-migrations` dependency at a matching major.
+    #[cfg(feature = "db")]
+    pub use diesel_migrations;
     pub use http;
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    /// Re-exported because [`crate::redis_tls::open_client`] returns a
+    /// `redis::Client`: without this, an app calling it cannot name the
+    /// returned type without adding its own `redis` dependency at a
+    /// compatible major.
+    #[cfg(feature = "redis")]
+    pub use redis;
     pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
@@ -1712,6 +2085,11 @@ pub mod reexports {
     pub use tokio;
     pub use tokio_util;
     pub use tracing;
+    /// Re-exported so `#[model]`'s generated schema can name the GENUINE
+    /// `uuid::Uuid` when checking a field's runtime type identity, instead of
+    /// matching a hand-written path prefix that any crate named `uuid` would
+    /// satisfy (issue #802).
+    pub use uuid;
     pub use validator;
 }
 

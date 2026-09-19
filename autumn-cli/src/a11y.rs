@@ -1,8 +1,7 @@
 //! `autumn a11y verify` — a build-time accessibility audit of raw `html!`
 //! markup.
 //!
-//! The typed primitives in [`autumn_web::a11y`] (`Img`,
-//! `Button`, `Link`, `MenuItem`, `TextField`) discharge every accessible-name
+//! The typed primitives in [`autumn_web::a11y`] discharge every accessible-name
 //! obligation **at compile time**: an alt-less image or an unlabeled field
 //! written through them does not compile. Code that uses those primitives is
 //! therefore already proven and is intentionally *not* re-scanned here.
@@ -44,6 +43,27 @@
 //!   `aria-label`/`aria-labelledby` (WCAG 4.1.2, Serious).
 //! - **`link-name`** — an `<a>` with an `href` but no text content and no
 //!   `aria-label`/`aria-labelledby` (WCAG 2.4.4 / 4.1.2, Serious).
+//!
+//! # Route attribution
+//!
+//! A file and a line say where a defect is; a route says which page it breaks.
+//! The scan reads the route attribute macros (`#[get("/settings")]`,
+//! `#[post(..)]`, …) out of the same token stream, indexes every function and
+//! the free functions it calls, then walks out from each handler to the markup
+//! it reaches — so a defect in a shared partial names the routes that reach it. The manifest carries the result three ways: a `routes` array of
+//! per-route `pass`/`fail`, a `routes` list on each finding, and a `wcag`
+//! rollup keyed by success criterion.
+//!
+//! The walk is as conservative as the scanner: a call is followed only when the
+//! called name is defined exactly once across the scan **as a free item**;
+//! method calls, type-qualified associated calls, functions passed by name and
+//! names a parameter or local shadows are not resolved; and the path is the one
+//! **declared** on the handler (mount-time
+//! prefixes are applied at runtime). So `status: "pass"` means no finding was
+//! attributed to that route, not that the page is proven clean — the summary's
+//! `unrouted` count qualifies it. An unattributed finding is still a finding:
+//! the exit code is computed from severities alone, so attribution reports and
+//! never gates.
 //!
 //! # Known heuristic limits
 //!
@@ -176,6 +196,14 @@ pub struct Finding {
     pub message: &'static str,
     /// The typed primitive that fixes it at compile time.
     pub hint: &'static str,
+    /// Routes that statically reach this markup, as `"METHOD /path"`. Empty
+    /// when no route handler reaches it (a partial nothing renders, or a call
+    /// chain the scan could not resolve). Always serialized, empty included:
+    /// an unattributed finding is the one a reader most needs to notice.
+    pub routes: Vec<String>,
+    /// 0-based column of the element, for attribution only.
+    #[serde(skip)]
+    column: usize,
 }
 
 fn serialize_severity<S>(severity: &Severity, serializer: S) -> Result<S::Ok, S::Error>
@@ -185,13 +213,51 @@ where
     serializer.serialize_str(&severity.to_string())
 }
 
-/// Aggregate counts by severity.
+/// Aggregate counts by severity, plus route coverage.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 pub struct Summary {
     pub critical: usize,
     pub serious: usize,
     pub moderate: usize,
     pub total: usize,
+    /// Routes declared in the scanned source. A handler carrying two route
+    /// attributes declares two.
+    pub routes: usize,
+    /// Routes carrying at least one finding.
+    pub routes_failing: usize,
+    /// Findings no route statically reaches.
+    pub unrouted: usize,
+}
+
+/// Per-route conformance, one entry per declared route handler.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteConformance {
+    /// HTTP method from the route attribute (`GET`, `POST`, …).
+    pub method: String,
+    /// Path **as declared** on the handler. Mount-time prefixes (a `scope`, a
+    /// nested router) are applied at runtime and are not resolved here.
+    pub path: String,
+    /// Handler function name.
+    pub handler: String,
+    /// Source file, relative to the project root.
+    pub file: String,
+    /// 1-based line of the handler.
+    pub line: usize,
+    /// Findings in markup this route statically reaches.
+    pub findings: usize,
+    /// `"pass"` when the route reaches no finding, else `"fail"`.
+    pub status: &'static str,
+}
+
+/// Findings rolled up by WCAG success criterion — the conformance view.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WcagCriterion {
+    /// WCAG 2.1 success criterion, e.g. `"1.1.1"`.
+    pub criterion: String,
+    /// Rule ids that breached it, sorted.
+    pub rules: Vec<&'static str>,
+    /// Findings breaching it.
+    pub findings: usize,
 }
 
 /// The full result of a verify run — the JSON conformance manifest.
@@ -201,8 +267,12 @@ pub struct Report {
     pub files_scanned: usize,
     /// Number of `html!` blocks discovered and analyzed.
     pub html_blocks: usize,
+    /// Declared routes with their conformance status, sorted by path.
+    pub routes: Vec<RouteConformance>,
     /// Findings, sorted by file then line.
     pub findings: Vec<Finding>,
+    /// Findings rolled up by WCAG success criterion, sorted by criterion.
+    pub wcag: Vec<WcagCriterion>,
     pub summary: Summary,
 }
 
@@ -211,6 +281,17 @@ impl Report {
     fn from_scan(mut scan: Scan) -> Self {
         scan.findings
             .sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+        let graph = RouteGraph::build(&scan.fns);
+        let reaching: Vec<Vec<usize>> = scan
+            .findings
+            .iter()
+            .map(|f| graph.routes_reaching(&f.file, (f.line, f.column)))
+            .collect();
+        for (finding, hit) in scan.findings.iter_mut().zip(&reaching) {
+            finding.routes = graph.display_keys(hit);
+        }
+        let routes = graph.conformance(&reaching);
+
         let mut summary = Summary::default();
         for finding in &scan.findings {
             match finding.severity {
@@ -218,11 +299,19 @@ impl Report {
                 Severity::Serious => summary.serious += 1,
                 Severity::Moderate => summary.moderate += 1,
             }
+            if finding.routes.is_empty() {
+                summary.unrouted += 1;
+            }
         }
         summary.total = scan.findings.len();
+        summary.routes = routes.len();
+        summary.routes_failing = routes.iter().filter(|r| r.findings > 0).count();
+
         Self {
             files_scanned: scan.files_scanned,
             html_blocks: scan.html_blocks,
+            routes,
+            wcag: roll_up_wcag(&scan.findings),
             findings: scan.findings,
             summary,
         }
@@ -249,10 +338,12 @@ struct Scan {
     findings: Vec<Finding>,
     files_scanned: usize,
     html_blocks: usize,
+    /// Every function declaration seen, for route attribution.
+    fns: Vec<FnDecl>,
 }
 
 impl Scan {
-    fn push(&mut self, rule: Rule, element: &str, line: usize, file: &str) {
+    fn push(&mut self, rule: Rule, element: &str, line: usize, column: usize, file: &str) {
         self.findings.push(Finding {
             file: file.to_owned(),
             line,
@@ -262,6 +353,8 @@ impl Scan {
             severity: Severity::Serious,
             message: rule.message(),
             hint: rule.hint(),
+            routes: Vec::new(),
+            column,
         });
     }
 }
@@ -337,6 +430,8 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
         return;
     };
     find_html_blocks(&stream, file, scan);
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    collect_fns(&trees, file, &mut scan.fns);
 }
 
 /// Recursively walk a token stream, analyzing each `html! { … }` macro body and
@@ -472,6 +567,553 @@ fn looks_like_jsx(trees: &[TokenTree]) -> bool {
     false
 }
 
+// ── Route attribution ──────────────────────────────────────────────────────
+//
+// A finding is only actionable if the developer knows which page it breaks.
+// Autumn declares routes with attribute macros on the handler
+// (`#[get("/settings")] async fn settings()`), so the routes a piece of markup
+// serves can be read from the same token stream the scanner already walks: index
+// every `fn`, record the free functions each one calls, then walk out from each
+// handler to the markup it reaches.
+//
+// The walk is deliberately conservative, like the scanner itself. It resolves a
+// call only when the called name is defined EXACTLY once across the whole scan;
+// two functions sharing a name cannot be told apart from tokens, and guessing
+// would key a defect to a route that never renders it. Method calls
+// (`page.sidebar()`) are not resolved at all. Attribution is therefore a
+// best-effort lower bound: an unattributed finding is still a finding.
+
+/// Route declared by an attribute macro on a handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteDecl {
+    method: &'static str,
+    /// Path as written in the attribute; mount-time prefixes are not resolved.
+    path: String,
+}
+
+/// A function declaration and the call edges leaving it.
+#[derive(Debug)]
+struct FnDecl {
+    name: String,
+    file: String,
+    /// `(line, column)` of the `fn` keyword and of the body's closing brace.
+    start: (usize, usize),
+    end: (usize, usize),
+    /// Names of free functions called in the body, unresolved.
+    calls: BTreeSet<String>,
+    /// Route attributes on this function, if any.
+    routes: Vec<RouteDecl>,
+    /// Whether a bare `name()` elsewhere can reach this function. A nested item
+    /// is visible only inside its enclosing block, and an associated function
+    /// is reached through a receiver or a type-qualified path — neither of
+    /// which this scan resolves — so neither is a target.
+    callable: bool,
+}
+
+/// Route attribute macros that serve markup. `#[static_get]` is one of them —
+/// it pre-renders a page, so an alt-less image in it is as broken as in any
+/// other. `#[ws]` is not: a WebSocket upgrade serves no document.
+const ROUTE_ATTRS: [(&str, &str); 6] = [
+    ("get", "GET"),
+    ("post", "POST"),
+    ("put", "PUT"),
+    ("patch", "PATCH"),
+    ("delete", "DELETE"),
+    ("static_get", "GET"),
+];
+
+/// Rust keywords that can precede a parenthesized group without being a call.
+const CALL_KEYWORDS: [&str; 6] = ["if", "while", "match", "return", "for", "in"];
+
+/// Item keywords whose following identifier is a declaration, not a call.
+const DECL_KEYWORDS: [&str; 6] = ["fn", "struct", "enum", "union", "trait", "mod"];
+
+/// Index every function in `trees`, recording its span, call edges, and any
+/// route attributes, appending to `out`.
+///
+/// `#[cfg(test)]` items are skipped wholesale, mirroring the scanner: test
+/// scaffolding is neither a route nor a rendering path, and indexing it would
+/// only create name collisions that suppress real attribution.
+fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
+    collect_fns_in(trees, file, true, out);
+}
+
+/// [`collect_fns`], carrying whether items at this level are reachable by a
+/// bare name. Free items in a module are; items inside a function body or an
+/// `impl`/`trait` block are not.
+fn collect_fns_in(trees: &[TokenTree], file: &str, callable: bool, out: &mut Vec<FnDecl>) {
+    let mut pending: Vec<RouteDecl> = Vec::new();
+    // Set when an `impl`/`trait` head is seen, so its block is descended as
+    // associated items.
+    let mut assoc_block = false;
+    let mut i = 0;
+    while i < trees.len() {
+        if is_cfg_test_attr(trees, i) {
+            i = skip_cfg_test_item(trees, i + 2);
+            pending.clear();
+            continue;
+        }
+        if let Some((route, next)) = read_attr(trees, i) {
+            pending.extend(route);
+            i = next;
+            continue;
+        }
+        // A `macro_rules!` body holds templates, not definitions. Indexing the
+        // `fn` inside one would make a real helper of the same name look
+        // defined twice, and every call edge to it would be dropped.
+        if let TokenTree::Ident(ident) = &trees[i]
+            && *ident == "macro_rules"
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+        {
+            pending.clear();
+            i = skip_cfg_test_item(trees, i + 2);
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i] {
+            if *ident == "fn"
+                && let Some(TokenTree::Ident(name)) = trees.get(i + 1)
+                && let Some(body_at) = find_fn_body(trees, i + 2)
+                && let TokenTree::Group(body) = &trees[body_at]
+            {
+                let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+                let mut calls = BTreeSet::new();
+                collect_calls(&inner, &mut calls);
+                // A name bound in this function — a parameter, a local, a
+                // closure argument — shadows any free function that shares it,
+                // so calling it does not reach that function.
+                let mut bound = BTreeSet::new();
+                // The parameter list is the first parenthesized group after the
+                // name; a return type or a `where` clause can sit between it
+                // and the body.
+                if let Some(params) = trees[i + 2..body_at].iter().find_map(|tree| match tree {
+                    TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
+                    _ => None,
+                }) {
+                    collect_idents(&params.stream().into_iter().collect::<Vec<_>>(), &mut bound);
+                }
+                collect_bindings(&inner, &mut bound);
+                calls.retain(|call| !bound.contains(call));
+                let start = trees[i].span().start();
+                let end = body.span().end();
+                out.push(FnDecl {
+                    name: name.to_string(),
+                    file: file.to_owned(),
+                    start: (start.line, start.column),
+                    end: (end.line, end.column),
+                    calls,
+                    routes: std::mem::take(&mut pending),
+                    callable,
+                });
+                collect_fns_in(&inner, file, false, out);
+                i = body_at + 1;
+                continue;
+            }
+            // An attribute binds to the next item. If that item is not a
+            // function, the route attributes seen so far are not ours.
+            if matches!(ident.to_string().as_str(), "impl" | "trait") {
+                assoc_block = true;
+            }
+            if !matches!(
+                ident.to_string().as_str(),
+                "pub" | "async" | "unsafe" | "extern"
+            ) {
+                pending.clear();
+            }
+        }
+        match &trees[i] {
+            // A brace group reached here closes an item that was not a
+            // function (an `extern "C" { … }` block, a `struct` body), so a
+            // route attribute seen before it was not ours.
+            TokenTree::Group(group) => {
+                let brace = group.delimiter() == Delimiter::Brace;
+                if brace {
+                    pending.clear();
+                }
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                collect_fns_in(&inner, file, callable && !(brace && assoc_block), out);
+                if brace {
+                    assoc_block = false;
+                }
+            }
+            // Likewise a literal: `extern "C"` leads with one.
+            TokenTree::Literal(_) => pending.clear(),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Read the attribute starting at `trees[i]` (a `#` followed by a bracket
+/// group), returning any route it declares and the index just past it.
+fn read_attr(trees: &[TokenTree], i: usize) -> Option<(Option<RouteDecl>, usize)> {
+    let TokenTree::Punct(p) = trees.get(i)? else {
+        return None;
+    };
+    if p.as_char() != '#' {
+        return None;
+    }
+    let TokenTree::Group(group) = trees.get(i + 1)? else {
+        return None;
+    };
+    if group.delimiter() != Delimiter::Bracket {
+        return None;
+    }
+    Some((route_from_attr(&group.stream()), i + 2))
+}
+
+/// Parse a route attribute body (`get("/settings", …)`, or a path-qualified
+/// `autumn_web::get("/settings")`) into a [`RouteDecl`].
+fn route_from_attr(stream: &TokenStream) -> Option<RouteDecl> {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    // The macro name is the last ident before the argument group.
+    let group_at = trees.iter().position(
+        |t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis),
+    )?;
+    let TokenTree::Ident(name) = trees.get(group_at.checked_sub(1)?)? else {
+        return None;
+    };
+    let name = name.to_string();
+    let method = ROUTE_ATTRS
+        .iter()
+        .find(|(attr, _)| *attr == name)
+        .map(|(_, method)| *method)?;
+    let TokenTree::Group(args) = &trees[group_at] else {
+        return None;
+    };
+    // The path is the first POSITIONAL string literal: `#[get(crate = "…",
+    // "/a")]` is accepted by the route macros, so a literal that follows `=` is
+    // a named argument's value, not the path.
+    let arg_trees: Vec<TokenTree> = args.stream().into_iter().collect();
+    let path = arg_trees.iter().enumerate().find_map(|(at, tree)| {
+        let TokenTree::Literal(lit) = tree else {
+            return None;
+        };
+        let named = matches!(
+            at.checked_sub(1).and_then(|prev| arg_trees.get(prev)),
+            Some(TokenTree::Punct(p)) if p.as_char() == '='
+        );
+        if named {
+            None
+        } else {
+            string_literal_value(lit)
+        }
+    })?;
+    Some(RouteDecl { method, path })
+}
+
+/// Index of the brace group holding a function body, searching from `start`
+/// (just past the function name). Returns `None` for a body-less declaration
+/// (a trait method signature), whose `;` is reached first.
+fn find_fn_body(trees: &[TokenTree], start: usize) -> Option<usize> {
+    for (offset, tree) in trees.iter().enumerate().skip(start) {
+        match tree {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return Some(offset),
+            TokenTree::Punct(p) if p.as_char() == ';' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Collect the names of free functions called anywhere in `trees`.
+///
+/// A call is an identifier immediately followed by a parenthesized group, which
+/// already excludes a macro (`html!(…)`, whose `!` sits between the two). Four
+/// shapes that match that pattern are still not calls this scan can resolve,
+/// and each is skipped rather than guessed at:
+///
+/// - `page.sidebar()` — a method on a receiver whose type is unknown.
+/// - `Widget::new()` — an associated function on a type. Rust names types in
+///   `UpperCamelCase` and modules in `snake_case`, so an upper-case qualifier
+///   marks the call as type-qualified; `views::sidebar()` stays resolvable.
+/// - `fn helper(…)` / `struct Row(…)` — a declaration, not a call.
+/// - a nested `fn` item — its body belongs to that function, which is indexed
+///   in its own right; folding its calls into the enclosing one would attribute
+///   markup to a function that never calls it.
+///
+/// Attribute bodies are skipped for the same reason: `#[cfg(test)]` would
+/// otherwise register a call to `cfg`.
+fn collect_calls(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i < trees.len() {
+        // Skip a nested `fn NAME … { … }` item whole, name included.
+        if let TokenTree::Ident(ident) = &trees[i]
+            && *ident == "fn"
+            && matches!(trees.get(i + 1), Some(TokenTree::Ident(_)))
+        {
+            i = find_fn_body(trees, i + 2).map_or(trees.len(), |body| body + 1);
+            continue;
+        }
+        // Skip an attribute (`#` + bracket group) without descending into it.
+        if let TokenTree::Punct(p) = &trees[i]
+            && p.as_char() == '#'
+            && matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+        {
+            i += 2;
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i]
+            && matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+            && is_resolvable_call(trees, i)
+        {
+            let name = ident.to_string();
+            if !CALL_KEYWORDS.contains(&name.as_str()) {
+                out.insert(name);
+            }
+        }
+        if let TokenTree::Group(group) = &trees[i] {
+            let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+            collect_calls(&inner, out);
+        }
+        i += 1;
+    }
+}
+
+/// Every identifier in `trees`, at any depth.
+///
+/// Used on a parameter list, where the binding names are mixed with type names.
+/// Collecting both over-approximates what is shadowed, which only ever drops a
+/// call edge — the safe direction — and type names are `UpperCamelCase` while
+/// function names are `snake_case`, so they rarely collide in practice.
+fn collect_idents(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    for tree in trees {
+        match tree {
+            TokenTree::Ident(ident) => {
+                out.insert(ident.to_string());
+            }
+            TokenTree::Group(group) => {
+                collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names bound by a `let` statement or a closure argument list anywhere in
+/// `trees`.
+///
+/// Both are read loosely — every identifier between `let` and the `=`/`;` that
+/// ends its pattern, and every identifier between a pair of `|` — because
+/// over-collecting only drops a call edge, while under-collecting would let a
+/// shadowed name resolve to an unrelated function.
+fn collect_bindings(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Ident(ident) if *ident == "let" => {
+                i += 1;
+                while let Some(tree) = trees.get(i) {
+                    match tree {
+                        TokenTree::Punct(p) if p.as_char() == '=' || p.as_char() == ';' => break,
+                        TokenTree::Ident(id) => {
+                            out.insert(id.to_string());
+                        }
+                        TokenTree::Group(group) => {
+                            collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+                        }
+                        TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                    }
+                    i += 1;
+                }
+            }
+            // A closure argument list. A lone `|` (a bitwise or, a match-arm
+            // alternative) has no closing pipe on this level and collects
+            // nothing.
+            TokenTree::Punct(p) if p.as_char() == '|' => {
+                let mut j = i + 1;
+                let mut names = BTreeSet::new();
+                let closed = loop {
+                    match trees.get(j) {
+                        Some(TokenTree::Punct(q)) if q.as_char() == '|' => break true,
+                        Some(TokenTree::Ident(id)) => {
+                            names.insert(id.to_string());
+                        }
+                        Some(TokenTree::Punct(_) | TokenTree::Literal(_)) => {}
+                        Some(TokenTree::Group(_)) | None => break false,
+                    }
+                    j += 1;
+                };
+                if closed {
+                    out.extend(names);
+                    i = j;
+                }
+            }
+            TokenTree::Group(group) => {
+                collect_bindings(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Whether the identifier at `trees[i]` names a free function this scan can
+/// resolve by name — see [`collect_calls`] for the shapes this rejects.
+fn is_resolvable_call(trees: &[TokenTree], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).and_then(|at| trees.get(at)) else {
+        return true;
+    };
+    match prev {
+        // `page.sidebar()`.
+        TokenTree::Punct(p) if p.as_char() == '.' => false,
+        // `fn helper(…)`, `struct Row(…)`.
+        TokenTree::Ident(id) if DECL_KEYWORDS.contains(&id.to_string().as_str()) => false,
+        // A path: resolvable only when the qualifier is a module.
+        TokenTree::Punct(p) if p.as_char() == ':' => qualifier_is_module(trees, i),
+        _ => true,
+    }
+}
+
+/// Whether the path segment before the `::` at `trees[i - 2]` is a module
+/// rather than a type. Rust names modules in `snake_case` and types in
+/// `UpperCamelCase`, so the leading character decides. Anything that is not a
+/// plain identifier (a turbofish, `<Foo as Bar>::baz`) is not resolvable.
+fn qualifier_is_module(trees: &[TokenTree], i: usize) -> bool {
+    let qualifier = i.checked_sub(3).and_then(|at| trees.get(at));
+    matches!(
+        qualifier,
+        Some(TokenTree::Ident(id))
+            if id.to_string().chars().next().is_some_and(char::is_lowercase)
+    ) && !matches!(qualifier, Some(TokenTree::Ident(id)) if *id == "Self")
+}
+
+/// The call graph rooted at each declared route.
+struct RouteGraph<'a> {
+    fns: &'a [FnDecl],
+    /// One entry per route: its declaration, its handler, and every function it
+    /// statically reaches.
+    routes: Vec<(RouteDecl, usize, BTreeSet<usize>)>,
+}
+
+impl<'a> RouteGraph<'a> {
+    fn build(fns: &'a [FnDecl]) -> Self {
+        // A name defined more than once is unresolvable, so it is not indexed.
+        let mut by_name: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
+        for (index, decl) in fns.iter().enumerate().filter(|(_, d)| d.callable) {
+            by_name
+                .entry(decl.name.as_str())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(index));
+        }
+
+        let mut routes = Vec::new();
+        for (index, decl) in fns.iter().enumerate() {
+            for route in &decl.routes {
+                let mut reached = BTreeSet::new();
+                let mut stack = vec![index];
+                while let Some(current) = stack.pop() {
+                    if !reached.insert(current) {
+                        continue;
+                    }
+                    for call in &fns[current].calls {
+                        if let Some(Some(target)) = by_name.get(call.as_str()) {
+                            stack.push(*target);
+                        }
+                    }
+                }
+                routes.push((route.clone(), index, reached));
+            }
+        }
+        Self { fns, routes }
+    }
+
+    /// The innermost function whose span contains `file:line:column`.
+    ///
+    /// Position is compared with the column, not the line alone: two functions
+    /// can share a line (`fn a() { … } fn b() { … }`), and a line-only
+    /// comparison would hand one of them the other's markup.
+    fn enclosing_fn(&self, file: &str, at: (usize, usize)) -> Option<usize> {
+        self.fns
+            .iter()
+            .enumerate()
+            .filter(|(_, decl)| decl.file == file && decl.start <= at && at <= decl.end)
+            .min_by_key(|(_, decl)| (decl.end.0 - decl.start.0, decl.end.1))
+            .map(|(index, _)| index)
+    }
+
+    /// Indices of the routes reaching the markup at `file:line:column`.
+    ///
+    /// Routes are identified by index, not by their `"METHOD /path"` key: paths
+    /// are declared rather than mounted, so two handlers can legitimately
+    /// declare the same one, and keying by the string would report a clean
+    /// handler as failing for its namesake's defect.
+    fn routes_reaching(&self, file: &str, at: (usize, usize)) -> Vec<usize> {
+        let Some(target) = self.enclosing_fn(file, at) else {
+            return Vec::new();
+        };
+        self.routes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, reached))| reached.contains(&target))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The display keys for a set of route indices, sorted and deduplicated.
+    fn display_keys(&self, indices: &[usize]) -> Vec<String> {
+        let mut keys: Vec<String> = indices
+            .iter()
+            .map(|index| route_key(&self.routes[*index].0))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Per-route conformance, sorted by path then method. `reaching` holds the
+    /// route indices of each finding, in finding order.
+    fn conformance(&self, reaching: &[Vec<usize>]) -> Vec<RouteConformance> {
+        let mut out: Vec<RouteConformance> = self
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(index, (route, handler, _))| {
+                let count = reaching.iter().filter(|hit| hit.contains(&index)).count();
+                RouteConformance {
+                    method: route.method.to_owned(),
+                    path: route.path.clone(),
+                    handler: self.fns[*handler].name.clone(),
+                    file: self.fns[*handler].file.clone(),
+                    line: self.fns[*handler].start.0,
+                    findings: count,
+                    status: if count == 0 { "pass" } else { "fail" },
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.path, &a.method, &a.handler).cmp(&(&b.path, &b.method, &b.handler)));
+        out
+    }
+}
+
+/// `"GET /settings"` — the display key a finding and a route agree on.
+fn route_key(route: &RouteDecl) -> String {
+    format!("{} {}", route.method, route.path)
+}
+
+/// Roll findings up by WCAG success criterion, splitting the multi-criterion
+/// rules (`label` covers 1.3.1, 3.3.2 and 4.1.2) so each criterion reports on
+/// its own — the view a conformance claim is written against.
+fn roll_up_wcag(findings: &[Finding]) -> Vec<WcagCriterion> {
+    let mut by_criterion: std::collections::BTreeMap<&str, (BTreeSet<&'static str>, usize)> =
+        std::collections::BTreeMap::new();
+    for finding in findings {
+        for criterion in finding.wcag.split('/').map(str::trim) {
+            let entry = by_criterion.entry(criterion).or_default();
+            entry.0.insert(finding.rule_id);
+            entry.1 += 1;
+        }
+    }
+    by_criterion
+        .into_iter()
+        .map(|(criterion, (rules, findings))| WcagCriterion {
+            criterion: criterion.to_owned(),
+            rules: rules.into_iter().collect(),
+            findings,
+        })
+        .collect()
+}
+
 // ── Maud markup model ──────────────────────────────────────────────────────
 
 /// A parsed attribute value.
@@ -498,6 +1140,9 @@ struct Attr {
 struct Element {
     name: String,
     line: usize,
+    /// 0-based column of the element, used only to pick the innermost enclosing
+    /// function when two of them share a line.
+    column: usize,
     attrs: Vec<Attr>,
     children: Vec<Node>,
 }
@@ -929,6 +1574,7 @@ fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> u
 /// index just past it.
 fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
     let line = trees[start].span().start().line;
+    let column = trees[start].span().start().column;
     // A leading `.`/`#` with no explicit tag name is an implicit `div`; the
     // shorthand class/id begins AT `start` and the tag is `div`. Otherwise the
     // tag name is a full maud `HtmlName` (`Punctuated<HtmlNameFragment, '-' | ':'>`),
@@ -987,6 +1633,7 @@ fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
         Element {
             name,
             line,
+            column,
             attrs,
             children,
         },
@@ -1336,16 +1983,16 @@ fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
                 && !el.has_title_name()
                 && !is_presentational(el) =>
         {
-            scan.push(Rule::ImageAlt, "img", el.line, file);
+            scan.push(Rule::ImageAlt, "img", el.line, el.column, file);
         }
         name @ ("input" | "select" | "textarea") => {
             check_field(el, name, file, ctx, scan);
         }
         "button" if !named_content(el) => {
-            scan.push(Rule::ButtonName, "button", el.line, file);
+            scan.push(Rule::ButtonName, "button", el.line, el.column, file);
         }
         "a" if el.has_attr("href") && !named_content(el) => {
-            scan.push(Rule::LinkName, "a", el.line, file);
+            scan.push(Rule::LinkName, "a", el.line, el.column, file);
         }
         _ => {}
     }
@@ -1387,7 +2034,7 @@ fn check_field(el: &Element, name: &str, file: &str, ctx: &LabelCtx, scan: &mut 
         Some(AttrValue::Dynamic) => return,
         _ => {}
     }
-    scan.push(Rule::Label, name, el.line, file);
+    scan.push(Rule::Label, name, el.line, el.column, file);
 }
 
 /// Whether an element has an accessible name from its own attributes or content:
@@ -1456,10 +2103,9 @@ fn label_provides_name(el: &Element) -> bool {
 
 // ── Output ─────────────────────────────────────────────────────────────────
 
-const PRIMITIVE_NOTE: &str = "Note: code using the typed autumn_web::a11y primitives (Img, Button, \
-Link, MenuItem, TextField) is proven accessible at compile time and is \
-intentionally not re-scanned. This pass targets raw html! markup that bypasses \
-those primitives.";
+const PRIMITIVE_NOTE: &str = "Note: code using the typed autumn_web::a11y primitives is proven \
+accessible at compile time and is intentionally not re-scanned. This pass \
+targets raw html! markup that bypasses those primitives.";
 
 /// Verify `root`, print a report, and return the process exit code (non-zero
 /// when findings meet the failure threshold). The `autumn a11y verify` command
@@ -1492,41 +2138,91 @@ fn print_json(report: &Report) {
 }
 
 fn print_text(report: &Report, strict: bool) {
-    println!("autumn a11y verify");
-    println!(
+    print!("{}", format_text(report, strict));
+}
+
+/// Render the human-readable report.
+fn format_text(report: &Report, strict: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "autumn a11y verify");
+    let _ = writeln!(
+        out,
         "  scanned {} html! block(s) across {} .rs file(s)",
         report.html_blocks, report.files_scanned
     );
-    println!("  {PRIMITIVE_NOTE}");
+    let _ = writeln!(
+        out,
+        "  {} route(s) discovered, {} carrying findings",
+        report.summary.routes, report.summary.routes_failing
+    );
+    let _ = writeln!(out, "  {PRIMITIVE_NOTE}");
 
     if report.findings.is_empty() {
-        println!("\nResult: PASS — no accessibility violations in raw html! markup.");
-        return;
+        let _ = writeln!(
+            out,
+            "\nResult: PASS — no accessibility violations in raw html! markup."
+        );
+        return out;
     }
 
-    println!("\n  findings:");
+    let _ = writeln!(out, "\n  findings:");
     for f in &report.findings {
-        println!(
+        let _ = writeln!(
+            out,
             "    {}:{}: <{}> [WCAG {}] {} — {}",
             f.file, f.line, f.element, f.wcag, f.severity, f.message
         );
-        println!("        hint: {}", f.hint);
+        if !f.routes.is_empty() {
+            let _ = writeln!(out, "        routes: {}", f.routes.join(", "));
+        }
+        let _ = writeln!(out, "        hint: {}", f.hint);
     }
 
-    println!(
-        "\n  summary: {} Critical, {} Serious, {} Moderate ({} total)",
+    let failing: Vec<&RouteConformance> = report.routes.iter().filter(|r| r.findings > 0).collect();
+    if !failing.is_empty() {
+        let _ = writeln!(out, "\n  failing routes:");
+        for route in failing {
+            let _ = writeln!(
+                out,
+                "    {} {} ({}) — {} finding(s)",
+                route.method, route.path, route.handler, route.findings
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\n  WCAG success criteria breached:");
+    for criterion in &report.wcag {
+        let _ = writeln!(
+            out,
+            "    WCAG {} — {} finding(s) [{}]",
+            criterion.criterion,
+            criterion.findings,
+            criterion.rules.join(", ")
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n  summary: {} Critical, {} Serious, {} Moderate ({} total, {} not reached by any route)",
         report.summary.critical,
         report.summary.serious,
         report.summary.moderate,
-        report.summary.total
+        report.summary.total,
+        report.summary.unrouted,
     );
     if report.exit_code(strict) == 0 {
-        println!("Result: PASS with findings — below the failure threshold.");
+        let _ = writeln!(
+            out,
+            "Result: PASS with findings — below the failure threshold."
+        );
     } else {
-        println!(
+        let _ = writeln!(
+            out,
             "Result: FAIL — fix the accessibility violations above (or use the typed primitives)."
         );
     }
+    out
 }
 
 #[cfg(test)]
@@ -3025,5 +3721,604 @@ mod tests {
             1,
             "the same defect at the scan root must be flagged",
         );
+    }
+
+    // ── Route attribution (issue #1706, AC3) ───────────────────────────────
+
+    /// Build a full report from one or more in-memory `(file, source)` pairs.
+    fn report_for(files: &[(&str, &str)]) -> Report {
+        let mut scan = Scan::default();
+        for (name, src) in files {
+            scan_source(src, name, &mut scan);
+            scan.files_scanned += 1;
+        }
+        Report::from_scan(scan)
+    }
+
+    /// The routes attributed to the single finding of a one-file report.
+    fn routes_of_only_finding(files: &[(&str, &str)]) -> Vec<String> {
+        let report = report_for(files);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        report.findings[0].routes.clone()
+    }
+
+    #[test]
+    fn finding_in_a_route_handler_is_keyed_to_that_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finding_in_a_called_helper_inherits_the_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attribution_crosses_files() {
+        let handler = r#"
+            #[post("/settings")]
+            async fn save() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+        "#;
+        let partial = r#"
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("routes.rs", handler), ("partials.rs", partial)]),
+            vec!["POST /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_helper_reached_from_two_routes_lists_both() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned(), "GET /b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_helper_name_is_not_traversed() {
+        // Two functions share a name, so a bare `sidebar()` call cannot be
+        // resolved to one of them. Guessing would key the finding to a route
+        // that never renders it, so the call edge is dropped instead.
+        let handler = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        let one = r#"
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let two = r#"
+            fn sidebar() -> Markup { html! { span { "hi" } } }
+        "#;
+        assert!(
+            routes_of_only_finding(&[("a.rs", handler), ("one.rs", one), ("two.rs", two)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_finding_outside_any_route_has_no_route() {
+        let src = r#"
+            fn orphan() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(
+            report.findings[0].routes.is_empty(),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(report.summary.unrouted, 1);
+    }
+
+    #[test]
+    fn mutually_recursive_helpers_terminate() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (left()) } }
+
+            fn left() -> Markup { html! { (right()) } }
+
+            fn right() -> Markup { html! { (left()) img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn method_calls_are_not_resolved_as_helpers() {
+        // `self.sidebar()` is a method call, not a call to the free function
+        // `sidebar`; treating it as one would attribute the finding to a route
+        // that cannot reach it.
+        let src = r#"
+            #[get("/a")]
+            async fn a(page: Page) -> Markup { html! { (page.sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn routes_section_reports_per_route_status() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+
+            #[get("/about")]
+            async fn about() -> Markup { html! { img src="/logo.png" alt="Logo"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let paths: Vec<_> = report
+            .routes
+            .iter()
+            .map(|r| (r.path.as_str(), r.findings, r.status))
+            .collect();
+        assert_eq!(paths, vec![("/about", 0, "pass"), ("/settings", 1, "fail")]);
+        assert_eq!(report.routes[1].method, "GET");
+        assert_eq!(report.routes[1].handler, "settings");
+        assert_eq!(report.routes[1].file, "views.rs");
+        assert_eq!(report.summary.routes, 2);
+        assert_eq!(report.summary.routes_failing, 1);
+    }
+
+    #[test]
+    fn a_route_without_markup_is_still_listed_as_passing() {
+        let src = r#"
+            #[get("/api/todos")]
+            async fn list() -> Json<Vec<Todo>> { Json(vec![]) }
+        "#;
+        let report = report_for(&[("api.rs", src)]);
+        assert_eq!(report.routes.len(), 1);
+        assert_eq!(report.routes[0].status, "pass");
+    }
+
+    #[test]
+    fn a_nested_fn_is_not_a_target_for_a_bare_call() {
+        // Rust makes a nested item visible only inside its enclosing block, so
+        // an unrelated route's bare `render()` cannot reach it.
+        let src = r#"
+            fn outer() -> Markup {
+                fn render() -> Markup { html! { img src="/x.png"; } }
+                html! { span { "hi" } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn an_associated_fn_is_not_a_target_for_a_bare_call() {
+        // A method is reached through a receiver or a type-qualified path,
+        // neither of which this scan resolves.
+        let src = r#"
+            impl Card {
+                fn render(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_module_level_fn_is_still_a_target_for_a_bare_call() {
+        // Items in a module are reachable by a bare name through a `use`, so
+        // scoping must not cost the ordinary case.
+        let src = r#"
+            mod views {
+                fn sidebar() -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_route_on_an_associated_fn_is_still_a_route() {
+        let src = r#"
+            impl Dashboard {
+                #[get("/a")]
+                async fn show(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_shadowing_parameter_is_not_resolved_as_a_helper() {
+        // The handler calls its own parameter, not the free function that
+        // happens to share the name.
+        let src = r#"
+            #[get("/a")]
+            async fn a(view: impl Fn() -> Markup) -> Markup { html! { (view()) } }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_local_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                let view = || html! { span { "local" } };
+                html! { (view()) }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_closure_parameter_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(rows: Vec<Row>) -> Markup {
+                html! { @for row in rows { (rows.iter().map(|view| view()).count()) } }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn shadowing_in_one_handler_does_not_hide_a_real_call_in_another() {
+        // Bindings are per function: `b` really does call the free `sidebar`.
+        let src = r#"
+            #[get("/a")]
+            async fn a(sidebar: impl Fn() -> Markup) -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn type_qualified_associated_calls_are_not_resolved_as_helpers() {
+        // `Metrics::render()` is an associated function on a type this scan
+        // cannot see. Resolving its bare name would blame the route for markup
+        // in an unrelated free `render`.
+        let src = r#"
+            #[get("/dash")]
+            async fn dash() -> Markup { html! { (Metrics::render()) } }
+
+            fn render() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn module_qualified_calls_are_resolved_as_helpers() {
+        // A module path is the ordinary way to reach a view helper, so it must
+        // still resolve — only type-qualified calls are dropped.
+        let src = r#"
+            #[get("/dash")]
+            async fn dash() -> Markup { html! { (crate::views::sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /dash".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_nested_fn_declaration_is_not_a_call_edge() {
+        // Declaring a function inside a handler is not calling it, and neither
+        // is it calling what that function calls.
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                fn never_called() -> Markup { sidebar() }
+                html! { span { "hi" } }
+            }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_macro_rules_template_is_not_an_ambiguous_definition() {
+        // A `fn` inside a `macro_rules!` body is a template, not a definition.
+        // Indexing it would make the real helper look defined twice and drop
+        // the call edge to it.
+        let src = r#"
+            macro_rules! decl {
+                () => { fn sidebar() -> Markup { html! { span { "gen" } } } };
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn two_handlers_sharing_a_path_do_not_share_findings() {
+        // Paths are declared, not mounted, so two handlers can legitimately
+        // declare the same one. Counting by the display key would report the
+        // clean handler as failing.
+        let src = r#"
+            #[get("/a")]
+            async fn one() -> Markup { html! { img src="/logo.png"; } }
+
+            #[get("/a")]
+            async fn two() -> Markup { html! { span { "ok" } } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let rows: Vec<_> = report
+            .routes
+            .iter()
+            .map(|r| (r.handler.as_str(), r.findings, r.status))
+            .collect();
+        assert_eq!(rows, vec![("one", 1, "fail"), ("two", 0, "pass")]);
+        assert_eq!(report.summary.routes_failing, 1);
+    }
+
+    #[test]
+    fn two_fns_on_one_line_do_not_steal_each_others_findings() {
+        // Line-range containment alone ties on single-line functions; the
+        // finding belongs to whichever function actually encloses its column.
+        let src = concat!(
+            "#[get(\"/a\")] fn a() -> Markup { html! { span {} } } ",
+            "fn b() -> Markup { html! { img src=\"/x.png\"; } }",
+        );
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_route_attribute_does_not_leak_past_a_non_fn_item() {
+        // An attribute binds to the item that follows it. When that item is not
+        // a function, the route must not attach to the next function instead.
+        let src = r#"
+            #[get("/a")]
+            extern "C" { }
+
+            pub async fn helper() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(
+            report.findings[0].routes.is_empty(),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_leading_crate_override_is_not_read_as_the_path() {
+        // `#[get(crate = "…", "/a")]` puts a string literal before the path.
+        let src = r#"
+            #[get(crate = "autumn_web", "/a")]
+            async fn a() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn every_http_route_macro_is_recognised() {
+        let src = r#"
+            #[get("/a")] async fn a() -> Markup { html! { span {} } }
+            #[post("/b")] async fn b() -> Markup { html! { span {} } }
+            #[put("/c")] async fn c() -> Markup { html! { span {} } }
+            #[patch("/d")] async fn d() -> Markup { html! { span {} } }
+            #[delete("/e")] async fn e() -> Markup { html! { span {} } }
+            #[static_get("/f")] async fn f() -> Markup { html! { span {} } }
+        "#;
+        let keys: Vec<String> = report_for(&[("views.rs", src)])
+            .routes
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "GET /a",
+                "POST /b",
+                "PUT /c",
+                "PATCH /d",
+                "DELETE /e",
+                "GET /f",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_handler_can_serve_several_routes() {
+        let src = r#"
+            #[get("/a")]
+            #[post("/a")]
+            async fn a() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned(), "POST /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn route_conformance_points_at_the_handler_line() {
+        let src = "\n\n#[get(\"/a\")]\nasync fn a() -> Markup { html! { span {} } }\n";
+        let report = report_for(&[("views.rs", src)]);
+        assert_eq!(report.routes[0].line, 4);
+    }
+
+    #[test]
+    fn an_unrouted_finding_still_fails_the_build() {
+        // Attribution reports; it never gates. A defect in a partial no route
+        // reaches must still fail CI.
+        let src = r#"fn orphan() -> Markup { html! { img src="/l.png"; } }"#;
+        let report = report_for(&[("partials.rs", src)]);
+        assert_eq!(report.summary.unrouted, 1);
+        assert_ne!(report.exit_code(false), 0, "{report:?}");
+    }
+
+    #[test]
+    fn unrouted_findings_serialize_an_empty_route_list() {
+        // The key must not vanish for exactly the findings a consumer most
+        // needs to notice.
+        let src = r#"fn orphan() -> Markup { html! { img src="/l.png"; } }"#;
+        let json = serde_json::to_string(&report_for(&[("partials.rs", src)])).unwrap();
+        assert!(json.contains(r#""routes":[]"#), "{json}");
+    }
+
+    #[test]
+    fn wcag_rollup_splits_multi_criterion_rules() {
+        let src = r#"
+            fn view() -> Markup {
+                html! { img src="/logo.png"; input type="text" name="email"; }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let rollup: Vec<_> = report
+            .wcag
+            .iter()
+            .map(|c| (c.criterion.as_str(), c.findings))
+            .collect();
+        // `label` maps to three criteria; each is reported on its own.
+        assert_eq!(
+            rollup,
+            vec![("1.1.1", 1), ("1.3.1", 1), ("3.3.2", 1), ("4.1.2", 1),]
+        );
+        assert_eq!(report.wcag[0].rules, vec!["image-alt"]);
+        for criterion in &report.wcag[1..] {
+            assert_eq!(criterion.rules, vec!["label"], "{criterion:?}");
+        }
+    }
+
+    #[test]
+    fn wcag_rollup_is_empty_when_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        assert!(report_for(&[("views.rs", src)]).wcag.is_empty());
+    }
+
+    #[test]
+    fn text_output_names_failing_routes_and_criteria() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(
+            text.contains("1 route(s) discovered, 1 carrying findings"),
+            "{text}"
+        );
+        assert!(text.contains("\n  failing routes:\n"), "{text}");
+        assert!(
+            text.contains("    GET /settings (settings) — 1 finding(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  WCAG success criteria breached:\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    WCAG 1.1.1 — 1 finding(s) [image-alt]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 total, 0 not reached by any route"),
+            "{text}"
+        );
+        assert!(text.contains("Result: FAIL"), "{text}");
+    }
+
+    #[test]
+    fn text_output_passes_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(
+            text.contains("0 route(s) discovered, 0 carrying findings"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Result: PASS — no accessibility violations in raw html! markup."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn route_attribution_ignores_cfg_test_handlers() {
+        // A `#[cfg(test)]` handler is test scaffolding: it must not appear in
+        // the route manifest, mirroring the scanner's cfg(test) skip.
+        let src = r#"
+            #[cfg(test)]
+            mod tests {
+                #[get("/fixture")]
+                async fn fixture() -> Markup { html! { img src="/logo.png"; } }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 }

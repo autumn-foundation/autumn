@@ -1,0 +1,7 @@
+error: `#[agent_operable(...)]` needs the authority it is checked against, e.g. `#[agent_operable(grant = RefundDrafter)]`. Declare the grant with `authority_grant! { ... }`. See docs/guide/agent-authority.md.
+ --> tests/compile-fail/agent_authority_bad_attr.rs:8:1
+  |
+8 | #[agent_operable]
+  | ^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `agent_operable` (in Nightly builds, run with -Z macro-backtrace for more info)

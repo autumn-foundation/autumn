@@ -1,0 +1,5 @@
+error: unknown `#[query_budget(...)]` argument `infinite`; expected a query count like `3`, or `unbounded`
+ --> tests/compile-fail/query_budget_bad_attr.rs:6:16
+  |
+6 | #[query_budget(infinite)]
+  |                ^^^^^^^^

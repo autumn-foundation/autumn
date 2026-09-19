@@ -383,6 +383,10 @@ autumn generate system-test Post
 
 ```bash
 autumn doctor
-# or the dedicated check:
-autumn system-test check   # planned; use `autumn doctor` today
 ```
+
+`autumn doctor` reports browser availability today. A dedicated
+`autumn system-test check` is planned but does not exist yet.
+
+<!-- cli-surface-allow: autumn system-test — planned, not shipped; named here only to say so -->
+

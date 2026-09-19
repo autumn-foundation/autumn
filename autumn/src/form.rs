@@ -1,5 +1,8 @@
 //! Changeset-style form helpers with validation and Maud rendering.
 //!
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/forms.md)
+//! for the narrative version of everything below.
+//!
 //! # Overview
 //!
 //! [`Changeset<T>`] captures submitted form values together with per-field
@@ -295,6 +298,24 @@ impl<T> Changeset<T> {
     pub const fn errors(&self) -> &HashMap<String, Vec<String>> {
         &self.errors
     }
+
+    /// Record one more error message against `field`, keeping any already
+    /// there.
+    ///
+    /// Appends rather than replaces, so a field that failed a
+    /// `#[validate(...)]` rule *and* carried unstorable input shows both
+    /// messages. Adding any error makes the changeset invalid.
+    ///
+    /// Used by [`ChangesetForm`] to attach the
+    /// [`NUL_CHARACTER_FIELD_ERROR`] a validator cannot see, and available to
+    /// handlers that need to fold a post-decode failure (a uniqueness check
+    /// that only the database can answer, say) back into the form round-trip.
+    pub fn add_error(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.errors
+            .entry(field.into())
+            .or_default()
+            .push(message.into());
+    }
 }
 
 impl<T: Serialize> Changeset<T> {
@@ -322,6 +343,83 @@ impl<T: Serialize> Changeset<T> {
     }
 }
 
+// ── #2423: NUL bytes in submitted text ─────────────────────────────
+
+/// The message recorded against a field whose submitted value carried an
+/// embedded NUL (`U+0000`) character (issue #2423).
+///
+/// A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, so such a value used
+/// to sail past every `#[validate(...)]` rule and fail only at the
+/// Diesel→Postgres boundary, surfacing as an unhandled `500`. [`ChangesetForm`]
+/// now records this message against the offending field instead, so the
+/// submission is rejected the same way any other invalid input is — inline, on
+/// the field, with the author's remaining text intact.
+///
+/// A real user can produce a NUL without meaning to (a paste from a binary
+/// source, an input-method glitch), so the wording names the character rather
+/// than accusing the author of anything.
+pub const NUL_CHARACTER_FIELD_ERROR: &str = "Cannot contain the NUL character (0x00)";
+
+/// Submitted names that carry framework plumbing rather than form data.
+///
+/// No template renders an error against one of these, so a
+/// [`NUL_CHARACTER_FIELD_ERROR`] keyed under one would leave the form invalid
+/// with nothing on screen to explain why — the failure the exemption exists to
+/// prevent. None is ever written to a column, so nothing is lost by cleaning
+/// one silently.
+///
+/// These are the *default* names. Both token fields are configurable, so the
+/// extractors additionally exempt whatever name request extensions carry; the
+/// defaults are listed here as well so a direct caller of the public
+/// [`crate::nested_form::decode_nested_urlencoded`], which never sees those
+/// extensions, is covered for the common case.
+const PLUMBING_FIELDS: &[&str] = &["_method", "_csrf", "_submit_token"];
+
+/// Whether `name` is one of the default [`PLUMBING_FIELDS`].
+pub(crate) fn is_plumbing_field(name: &str) -> bool {
+    PLUMBING_FIELDS.contains(&name)
+}
+
+/// Remove every NUL from each submitted value, returning the names of the
+/// fields that carried one (issue #2423).
+///
+/// Runs on the decoded key/value pairs, *before* deserialization, which is the
+/// only point where the offending field is still identifiable by name — after
+/// `serde` has built `T` the bytes are just some `String` field among others.
+///
+/// Values are cleaned rather than left as submitted for two reasons: the
+/// rejected form is re-rendered from this data, and neither the author's
+/// browser nor any downstream consumer should be handed back a raw `0x00`; and
+/// the cleaned text is what the author most likely meant, so the resubmission
+/// they make after reading the error succeeds.
+///
+/// Keys are deliberately left alone. Stripping a NUL out of a *key* would
+/// rename it — potentially onto a real field of `T` — inventing a submission
+/// the client never made. A mangled key simply fails to match any field and is
+/// ignored, exactly as any other unknown key is.
+///
+/// The returned names are deduplicated, so a repeated key (a multi-value
+/// field) contributes at most one message.
+///
+/// Deduplication goes through a `BTreeSet` rather than a linear scan of the
+/// names collected so far. That scan is O(n²) in the number of *distinct*
+/// offending keys, and the key count is bounded only by `DefaultBodyLimit` — a
+/// 32 MiB body of `k1=%00&k2=%00&…` is millions of distinct keys, which is
+/// minutes of CPU burned synchronously on a runtime worker thread. The set also
+/// gives the names a deterministic order.
+pub(crate) fn strip_nul_from_pairs(pairs: &mut [(String, String)]) -> Vec<String> {
+    let mut offenders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (key, value) in pairs {
+        if value.as_bytes().contains(&0) {
+            *value = crate::normalize::strip_nul(value);
+            if !offenders.contains(key.as_str()) {
+                offenders.insert(key.clone());
+            }
+        }
+    }
+    offenders.into_iter().collect()
+}
+
 // ── IntoChangeset ──────────────────────────────────────────────────
 
 /// Validate `self` and wrap in a [`Changeset`].
@@ -330,6 +428,21 @@ impl<T: Serialize> Changeset<T> {
 pub trait IntoChangeset: Sized {
     /// Run validation and produce a `Changeset<Self>`.
     fn into_changeset(self) -> Changeset<Self>;
+
+    /// Build a changeset. Use `resolve` to look up a message for a field and
+    /// error code.
+    /// Return `None` from `resolve` to keep autumn-web's default English
+    /// message.
+    ///
+    /// The default implementation ignores `resolve` and defers to
+    /// [`into_changeset`](Self::into_changeset). This keeps a hand-rolled
+    /// `IntoChangeset` impl written before this method compiling unchanged.
+    fn into_changeset_with(
+        self,
+        _resolve: impl Fn(&str, &str) -> Option<String>,
+    ) -> Changeset<Self> {
+        self.into_changeset()
+    }
 }
 
 impl<T: validator::Validate> IntoChangeset for T {
@@ -337,6 +450,18 @@ impl<T: validator::Validate> IntoChangeset for T {
         match validator::Validate::validate(&self) {
             Ok(()) => Changeset::new(self),
             Err(errors) => Changeset::from_errors(self, validation_errors_to_map(&errors)),
+        }
+    }
+
+    fn into_changeset_with(
+        self,
+        resolve: impl Fn(&str, &str) -> Option<String>,
+    ) -> Changeset<Self> {
+        match validator::Validate::validate(&self) {
+            Ok(()) => Changeset::new(self),
+            Err(errors) => {
+                Changeset::from_errors(self, validation_errors_to_map_with(&errors, &resolve))
+            }
         }
     }
 }
@@ -353,6 +478,18 @@ impl<T: validator::Validate> IntoChangeset for T {
 /// 422 — errors live in the [`Changeset`] and the handler decides how to
 /// respond.  Fails with 400 only when the body cannot be decoded into `T` at
 /// all.
+///
+/// # Unstorable bytes
+///
+/// Submitted text values are swept for NUL (`U+0000`) before deserialization
+/// (issue #2423). A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, and no
+/// `#[validate(...)]` rule can express that — the value is a perfectly good
+/// Rust `String` — so such a field used to fail only at the database, as an
+/// unhandled 500. A field that carried one now gets
+/// [`NUL_CHARACTER_FIELD_ERROR`] like any other field error, and the value kept
+/// for re-render is the author's text with the byte removed. The CSRF token is
+/// exempt (no template renders it); file parts of a multipart body are
+/// untouched.
 ///
 /// # CSRF — no extra developer action in POST handlers
 ///
@@ -546,11 +683,40 @@ impl<T: Serialize> ChangesetForm<T> {
         rich_text_area(&self.changeset, field, label)
     }
 
+    /// Render a labeled Markdown editor for a rich-text `field`, with
+    /// caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_with_labels`]; see [`rich_text_area`] for
+    /// the full contract.
+    pub fn rich_text_area_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_with_labels(&self.changeset, field, label, labels)
+    }
+
     /// Render a Markdown editor with an htmx-driven live preview pane.
     ///
     /// Delegates to [`rich_text_area_htmx`]; see that function for full docs.
     pub fn rich_text_area_htmx(&self, field: &str, label: &str, preview_url: &str) -> maud::Markup {
         rich_text_area_htmx(&self.changeset, field, label, preview_url)
+    }
+
+    /// Render a Markdown editor with an htmx-driven live preview pane, with
+    /// caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_htmx_with_labels`]; see
+    /// [`rich_text_area_htmx`] for full docs.
+    pub fn rich_text_area_htmx_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        preview_url: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_htmx_with_labels(&self.changeset, field, label, preview_url, labels)
     }
 
     /// Render a Markdown editor with an htmx live preview, excluding the
@@ -571,6 +737,31 @@ impl<T: Serialize> ChangesetForm<T> {
             label,
             preview_url,
             token_field,
+        )
+    }
+
+    /// Render a Markdown editor with an htmx live preview, excluding the
+    /// configured submit-token field `token_field` from the preview POST,
+    /// with caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_htmx_with_token_field_with_labels`]; use
+    /// this when the app both customizes `[security.submit_token].field_name`
+    /// (issue #1843) and needs translated chrome labels.
+    pub fn rich_text_area_htmx_with_token_field_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        preview_url: &str,
+        token_field: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_htmx_with_token_field_with_labels(
+            &self.changeset,
+            field,
+            label,
+            preview_url,
+            token_field,
+            labels,
         )
     }
 
@@ -597,11 +788,38 @@ where
             .extensions()
             .get::<crate::security::csrf::CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |f| f.0.clone());
+        // Read for the #2423 exemption only. `ChangesetForm` does not otherwise
+        // use the submit token — `SubmitTokenLayer` consumes it from the raw
+        // body upstream — but a scaffolded flat form does post the hidden
+        // field, so its name has to be exempt here exactly as the nested
+        // extractor exempts it.
+        let submit_field = req
+            .extensions()
+            .get::<crate::security::SubmitFormField>()
+            .map_or_else(|| "_submit_token".to_owned(), |f| f.0.clone());
 
-        let data: T = decode_form_body(req, state).await?;
+        let (data, nul_fields) = decode_form_body::<T, S>(req, state).await?;
+
+        let mut changeset = data.into_changeset();
+        for field in nul_fields {
+            // The two tokens and the method override are transport plumbing,
+            // not form fields: no template renders any of them, so an error
+            // keyed under one would make the form permanently invalid with
+            // nothing on screen to explain why, and none is ever written to a
+            // column. The configurable names come from request extensions; the
+            // defaults are in `PLUMBING_FIELDS` too, because `CsrfService`
+            // accepts the literal `_csrf` even when another name is configured.
+            if field == csrf_field
+                || field == submit_field
+                || PLUMBING_FIELDS.contains(&field.as_str())
+            {
+                continue;
+            }
+            changeset.add_error(field, NUL_CHARACTER_FIELD_ERROR);
+        }
 
         Ok(Self {
-            changeset: data.into_changeset(),
+            changeset,
             csrf_token,
             csrf_field,
         })
@@ -609,6 +827,10 @@ where
 }
 
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
+///
+/// Returns the decoded `T` alongside the names of the fields whose submitted
+/// value carried a NUL byte (#2423); those values are cleaned before `T` is
+/// built, so the caller only has to decide what to say about them.
 // `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
 // 128 bytes — that is `axum::response::Response`'s own size, not something this
 // crate chose. Returning a ready-made rejection response IS the idiom here, and
@@ -616,7 +838,10 @@ where
 // heuristic. Allowed at the site rather than workspace-wide so the lint stays
 // armed for error types we do control.
 #[allow(clippy::result_large_err)]
-async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+async fn decode_form_body<T, S>(
+    req: Request,
+    state: &S,
+) -> Result<(T, Vec<String>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
@@ -656,8 +881,11 @@ where
         .await
         .map_err(IntoResponse::into_response)?;
 
-    decode_urlencoded_dropping_blank_optional_fields::<T>(&bytes)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+    let mut pairs = parse_urlencoded_pairs(&bytes);
+    let nul_fields = strip_nul_from_pairs(&mut pairs);
+    let data = decode_pairs_dropping_blank_optional_fields::<T>(pairs)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    Ok((data, nul_fields))
 }
 
 /// Deserialize `T` from `application/x-www-form-urlencoded` bytes, tolerating
@@ -696,10 +924,26 @@ where
 pub(crate) fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
-    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(bytes)
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    decode_pairs_dropping_blank_optional_fields(parse_urlencoded_pairs(bytes))
+}
 
+/// Parse an `application/x-www-form-urlencoded` body into owned key/value
+/// pairs — the form in which the #2423 NUL sweep can still name the offending
+/// field.
+pub(crate) fn parse_urlencoded_pairs(bytes: &[u8]) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// The blank-optional-dropping retry loop itself, over already-parsed pairs.
+///
+/// See [`decode_urlencoded_dropping_blank_optional_fields`] for the contract;
+/// this is the same function with the parse step hoisted out so callers can
+/// inspect and clean the pairs first.
+pub(crate) fn decode_pairs_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
+    mut pairs: Vec<(String, String)>,
+) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
     loop {
         let encoded = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -743,7 +987,10 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
 // `axum::response::Response`, which IS the rejection, and boxing it would cost
 // an allocation on every rejection to satisfy a size heuristic.
 #[allow(clippy::result_large_err)]
-async fn decode_multipart<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+async fn decode_multipart<T, S>(
+    req: Request,
+    state: &S,
+) -> Result<(T, Vec<String>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
@@ -780,6 +1027,11 @@ where
         pairs.push((name, value));
     }
 
+    // #2423: the same NUL sweep the URL-encoded path runs, applied to the
+    // text fields only — file parts were skipped above and their bytes are
+    // never text to begin with.
+    let nul_fields = strip_nul_from_pairs(&mut pairs);
+
     // Re-encode as URL-encoded so serde_urlencoded handles type coercions
     // ("30" → u32, "true" → bool, etc.) consistently with the Form extractor.
     let encoded = url::form_urlencoded::Serializer::new(String::new())
@@ -787,7 +1039,7 @@ where
         .finish();
 
     match serde_urlencoded::from_str::<T>(&encoded) {
-        Ok(data) => Ok(data),
+        Ok(data) => Ok((data, nul_fields)),
         Err(first_err) => {
             // Same blank-optional-field accommodation as `decode_form_body`:
             // a number/date/uuid field left empty submits an empty text
@@ -804,9 +1056,11 @@ where
             let filtered = url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(non_blank.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .finish();
-            serde_urlencoded::from_str::<T>(&filtered).map_err(|_| {
-                (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
-            })
+            serde_urlencoded::from_str::<T>(&filtered)
+                .map(|data| (data, nul_fields))
+                .map_err(|_| {
+                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+                })
         }
     }
 }
@@ -817,7 +1071,21 @@ pub(crate) fn validation_errors_to_map(
     errors: &validator::ValidationErrors,
 ) -> HashMap<String, Vec<String>> {
     let mut map = HashMap::new();
-    collect_errors(errors, "", &mut map);
+    collect_errors(errors, "", &mut map, &|_, _| None);
+    map
+}
+
+/// Like [`validation_errors_to_map`], but `resolve` gets a chance to supply a
+/// message for a field and code before the hardcoded English fallback runs.
+///
+/// `resolve` is consulted only when a `validator::ValidationError` has no
+/// explicit `.message` — an explicit message always wins.
+pub(crate) fn validation_errors_to_map_with(
+    errors: &validator::ValidationErrors,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    collect_errors(errors, "", &mut map, resolve);
     map
 }
 
@@ -825,6 +1093,7 @@ fn collect_errors(
     errors: &validator::ValidationErrors,
     prefix: &str,
     map: &mut HashMap<String, Vec<String>>,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     for (field, kind) in errors.errors() {
         let key = if prefix.is_empty() {
@@ -838,7 +1107,10 @@ fn collect_errors(
                     .iter()
                     .map(|e| {
                         e.message.as_ref().map_or_else(
-                            || format!("validation failed: {}", e.code),
+                            || {
+                                resolve(&key, &e.code)
+                                    .unwrap_or_else(|| format!("validation failed: {}", e.code))
+                            },
                             ToString::to_string,
                         )
                     })
@@ -846,12 +1118,12 @@ fn collect_errors(
                 map.entry(key).or_default().extend(messages);
             }
             validator::ValidationErrorsKind::Struct(nested) => {
-                collect_errors(nested, &key, map);
+                collect_errors(nested, &key, map, resolve);
             }
             validator::ValidationErrorsKind::List(list) => {
                 for (idx, nested) in list {
                     let indexed_key = format!("{key}[{idx}]");
-                    collect_errors(nested, &indexed_key, map);
+                    collect_errors(nested, &indexed_key, map, resolve);
                 }
             }
         }
@@ -985,6 +1257,135 @@ pub fn method_input(method: &str) -> maud::Markup {
     }
 }
 
+/// HTML-escapes `input` (the same 4 characters `maud::escape::escape_to_string`
+/// does: `&`, `<`, `>`, `"`) by appending to `out`.
+///
+/// `maud::escape::escape_to_string` scans one byte at a time and calls
+/// `String::push`/`push_str` per byte even when nothing needs escaping —
+/// on a scaffolded form's field values (mostly clean prose/numbers, no
+/// `&<>"`) that per-byte dispatch dominated `benches/form_render.rs`'s
+/// profile. This does the identical escape (output verified byte-for-byte
+/// against a naive reference by the `fast_escape_matches_naive_reference`
+/// proptest) but copies each clean run in one `push_str` instead of one
+/// call per byte. Slicing at the positions found below is always on a
+/// UTF-8 char boundary: `&`, `<`, `>`, and `"` are single-byte ASCII code
+/// points, so they can never be a continuation byte of a multi-byte
+/// sequence, and no multi-byte sequence can contain one of those bytes
+/// either.
+#[cfg(feature = "maud")]
+#[allow(
+    clippy::string_slice,
+    reason = "every slice index below comes from a position() match on a single-byte ASCII \
+              value (&, <, >, \"), which can never land inside a multi-byte UTF-8 sequence — \
+              always a char boundary. Proven for arbitrary input by the \
+              fast_escape_matches_naive_reference proptest."
+)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`i + 1` where `i` is a byte index already `< input.len()` (from `bytes.iter().\
+              enumerate()`), and `input.len() <= isize::MAX` is a `str` invariant — cannot \
+              overflow `usize`."
+)]
+fn write_escaped(input: &str, out: &mut String) {
+    let bytes = input.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let replacement = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        out.push_str(&input[start..i]);
+        out.push_str(replacement);
+        start = i + 1;
+    }
+    out.push_str(&input[start..]);
+}
+
+/// A field value, label, or error message, escaped for direct
+/// interpolation into a `maud::html!` buffer.
+///
+/// Implements [`maud::Render`] itself — rather than pre-building an owned,
+/// escaped `String` and handing it to `maud::PreEscaped` — so the escaped
+/// bytes are written straight into `html!`'s own growing output buffer.
+/// Building a separate `String` first (an earlier version of this code
+/// did that, via a `Cow`-returning `fast_escape`) means a *second* copy
+/// for any value that actually needs escaping: once into the temporary
+/// `String`, then again when `PreEscaped` hands it off. This way there is
+/// only ever the one copy `maud::escape::escape_to_string` was already
+/// doing — a `Render` impl is documented as receiving "no further
+/// escaping" from `html!`, so this fully replaces it rather than skipping
+/// it.
+///
+/// Named `esc`, not `Escaped`/`escape`: `maud_macros` sizes a `html!`
+/// block's output buffer from the *source token length* of the macro
+/// invocation, not runtime content, so a longer call spelled out at every
+/// interpolation site measurably over-reserves that buffer's initial
+/// capacity even though it's never actually grown again. A short call
+/// keeps the estimate close to what the plain, unescaped `(value)` it
+/// replaces already cost.
+#[cfg(feature = "maud")]
+struct Esc<'a>(&'a str);
+
+#[cfg(feature = "maud")]
+impl maud::Render for Esc<'_> {
+    fn render_to(&self, w: &mut String) {
+        write_escaped(self.0, w);
+    }
+}
+
+#[cfg(feature = "maud")]
+const fn esc(s: &str) -> Esc<'_> {
+    Esc(s)
+}
+
+/// Pre-escape a field name the same way `maud::html!` would, for building
+/// an `id`/`name`-derived string (`format!("{field_html}-error")`) ahead
+/// of a `maud::html!` block rather than inside one.
+///
+/// Unlike [`esc`]/[`Esc`], this has to produce an owned-or-borrowed `str`
+/// rather than write into a buffer, since the result gets concatenated via
+/// `format!` before it's ever interpolated — so it keeps the `Cow`
+/// interface and, when there's nothing to escape (the overwhelmingly
+/// common case for a field name), returns the input completely
+/// unallocated. Escaping first and concatenating after is equivalent to
+/// concatenating first and escaping after here, since the literal
+/// `"-error"`/`"-field"` suffixes contain no characters that need
+/// escaping — see `fast_escape_matches_naive_reference` for the
+/// byte-for-byte equivalence check against a naive reference.
+#[cfg(feature = "maud")]
+fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+    {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    write_escaped(input, &mut out);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Build `"{base}{suffix}"` by direct, exactly-sized concatenation instead of
+/// `format!`. `format!("{base}{suffix}")` drives an unsized `String::new()`
+/// through the `Arguments`/`fmt::Write` machinery — arguments are boxed into
+/// a `[ArgumentV1]`, each piece is dispatched through `Display::fmt`, and the
+/// output `String` grows via reallocation as pieces land rather than being
+/// sized up front. For the fixed two-part `-field`/`-error` id suffixes every
+/// scaffolded input helper builds once per render, that dispatch is pure
+/// overhead: both parts are already `&str`, so one `String::with_capacity`
+/// plus two `push_str` calls produces the identical bytes.
+#[cfg(feature = "maud")]
+fn concat_suffix(base: &str, suffix: &str) -> String {
+    let mut s = String::with_capacity(base.len().saturating_add(suffix.len()));
+    s.push_str(base);
+    s.push_str(suffix);
+    s
+}
+
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
 /// - Sets `name` and `id` to `field`
@@ -1004,24 +1405,28 @@ pub fn text_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="text"
-                id=(field)
-                name=(field)
-                value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1141,7 +1546,7 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
     let hx_params = format!("not {token_field}");
@@ -1154,9 +1559,9 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
                 id=(field)
                 name=(field)
                 value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""))
                 hx-post=(validate_url)
                 hx-trigger="change"
                 hx-target=(target)
@@ -1164,7 +1569,7 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
                 hx-include="closest form"
                 hx-params=(hx_params);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1229,7 +1634,7 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
     let hx_params = format!("not {token_field}");
@@ -1244,9 +1649,9 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""))
                 hx-post=(validate_url)
                 hx-trigger="change"
                 hx-target=(target)
@@ -1254,7 +1659,7 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
                 hx-include="closest form"
                 hx-params=(hx_params);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1291,23 +1696,27 @@ pub fn password_input<T: Serialize>(
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="password"
-                id=(field)
-                name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                id=(field_pe)
+                name=(field_pe)
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1330,23 +1739,27 @@ pub fn textarea_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             textarea
-                id=(field)
-                name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
-                { (value) }
+                id=(field_pe)
+                name=(field_pe)
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe)
+                { (esc(&value)) }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1426,6 +1839,69 @@ const RICH_TEXT_TOOLBAR: &[(&str, &str)] = &[
     ("Quote", "> quote"),
 ];
 
+/// Labels for the rich text editor chrome. Set a label to change its text.
+///
+/// The default labels are English. Pass a customized `RichTextLabels` to a
+/// `_with_labels` function (e.g. [`rich_text_area_with_labels`]) to translate
+/// the toolbar, hint, and preview heading for a non-English locale.
+#[cfg(feature = "maud")]
+#[derive(Clone, Copy)]
+pub struct RichTextLabels<'a> {
+    toolbar_group: &'a str,
+    controls: &'a [(&'a str, &'a str)],
+    hint: &'a str,
+    preview_heading: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> RichTextLabels<'a> {
+    /// Make the default English labels.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            toolbar_group: "Markdown formatting",
+            controls: RICH_TEXT_TOOLBAR,
+            hint: RICH_TEXT_HINT,
+            preview_heading: "Preview",
+        }
+    }
+
+    /// Set the toolbar group label.
+    #[must_use]
+    pub const fn toolbar_group(mut self, label: &'a str) -> Self {
+        self.toolbar_group = label;
+        self
+    }
+
+    /// Set the toolbar control names and syntax hints.
+    #[must_use]
+    pub const fn controls(mut self, controls: &'a [(&'a str, &'a str)]) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    /// Set the hint text under the editor.
+    #[must_use]
+    pub const fn hint(mut self, hint: &'a str) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Set the preview pane heading.
+    #[must_use]
+    pub const fn preview_heading(mut self, heading: &'a str) -> Self {
+        self.preview_heading = heading;
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+impl Default for RichTextLabels<'static> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Render a labeled Markdown editor for a rich-text field (issue #1255).
 ///
 /// The control is a plain `<textarea>` carrying the Markdown **source** — the
@@ -1452,7 +1928,20 @@ pub fn rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, false)
+    rich_text_area_inner(changeset, field, label, None, false, &RichTextLabels::new())
+}
+
+/// Like [`rich_text_area`] but with caller-supplied chrome labels, for
+/// translating the toolbar, hint, and preview heading (issue #2227).
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, false, labels)
 }
 
 /// Render a [`rich_text_area`] with an htmx-driven live preview pane.
@@ -1510,6 +1999,27 @@ pub fn rich_text_area_htmx<T: Serialize>(
     )
 }
 
+/// Like [`rich_text_area_htmx`] but with caller-supplied chrome labels; see
+/// [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_htmx_with_token_field_with_labels(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+        labels,
+    )
+}
+
 /// Like [`rich_text_area_htmx`] but excludes the caller-supplied submit-token
 /// field name from the preview POST instead of the hardcoded default
 /// `_submit_token`.
@@ -1533,6 +2043,30 @@ pub fn rich_text_area_htmx_with_token_field<T: Serialize>(
         label,
         Some((preview_url, token_field)),
         false,
+        &RichTextLabels::new(),
+    )
+}
+
+/// Like [`rich_text_area_htmx_with_token_field`] but with caller-supplied
+/// chrome labels; see [`rich_text_area_with_labels`] for why the labels seam
+/// exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        false,
+        labels,
     )
 }
 
@@ -1556,7 +2090,20 @@ pub fn required_rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, true)
+    rich_text_area_inner(changeset, field, label, None, true, &RichTextLabels::new())
+}
+
+/// Like [`required_rich_text_area`] but with caller-supplied chrome labels;
+/// see [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, true, labels)
 }
 
 /// Render a **required** Markdown editor with an htmx-driven live preview.
@@ -1581,6 +2128,27 @@ pub fn required_rich_text_area_htmx<T: Serialize>(
     )
 }
 
+/// Like [`required_rich_text_area_htmx`] but with caller-supplied chrome
+/// labels; see [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    required_rich_text_area_htmx_with_token_field_with_labels(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+        labels,
+    )
+}
+
 /// Like [`required_rich_text_area_htmx`] but excludes the caller-supplied
 /// submit-token field name from the preview POST instead of the hardcoded
 /// default `_submit_token`.
@@ -1601,11 +2169,37 @@ pub fn required_rich_text_area_htmx_with_token_field<T: Serialize>(
         label,
         Some((preview_url, token_field)),
         true,
+        &RichTextLabels::new(),
+    )
+}
+
+/// Like [`required_rich_text_area_htmx_with_token_field`] but with
+/// caller-supplied chrome labels; see [`rich_text_area_with_labels`] for why
+/// the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        true,
+        labels,
     )
 }
 
 /// Shared body of [`rich_text_area`] and its htmx variant. `preview` is
-/// `Some((preview_url, token_field))` for the live-preview flavour.
+/// `Some((preview_url, token_field))` for the live-preview flavour. `labels`
+/// carries the chrome text (toolbar, hint, preview heading) — pass
+/// `&RichTextLabels::new()` for the default English labels.
 #[cfg(feature = "maud")]
 fn rich_text_area_inner<T: Serialize>(
     changeset: &Changeset<T>,
@@ -1613,18 +2207,19 @@ fn rich_text_area_inner<T: Serialize>(
     label: &str,
     preview: Option<(&str, &str)>,
     required: bool,
+    labels: &RichTextLabels<'_>,
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let hint_id = format!("{field}-hint");
     let wrapper_id = format!("{field}-field");
     let preview_id = format!("{field}-preview");
     // The hint is always present, so `aria-describedby` is never empty and
     // never names an element that isn't in the DOM.
     let described_by = if has_errors {
-        format!("{hint_id} {error_id}")
+        format!("{hint_id} {}", error_id.as_deref().unwrap_or_default())
     } else {
         hint_id.clone()
     };
@@ -1634,8 +2229,8 @@ fn rich_text_area_inner<T: Serialize>(
     maud::html! {
         div id=(wrapper_id) class="autumn-field autumn-rich-text" data-autumn-field-wrapper=(field) {
             label for=(field) class="autumn-field__label" { (label) }
-            div class="autumn-rich-text__toolbar" role="group" aria-label="Markdown formatting" {
-                @for (control, syntax) in RICH_TEXT_TOOLBAR {
+            div class="autumn-rich-text__toolbar" role="group" aria-label=(labels.toolbar_group) {
+                @for (control, syntax) in labels.controls {
                     span class="autumn-rich-text__toolbar-item" {
                         span class="autumn-rich-text__toolbar-label" { (control) }
                         code class="autumn-rich-text__toolbar-syntax" { (syntax) }
@@ -1646,8 +2241,8 @@ fn rich_text_area_inner<T: Serialize>(
                 id=(field)
                 name=(field)
                 rows="12"
-                class=(if has_errors { "autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" } else { "autumn-field__input autumn-rich-text__editor" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-rich-text__editor autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input autumn-rich-text__editor") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
                 aria-describedby=(described_by)
                 required[required]
                 aria-required=[required.then_some("true")]
@@ -1658,9 +2253,9 @@ fn rich_text_area_inner<T: Serialize>(
                 hx-include=[preview.map(|_| "closest form")]
                 hx-params=[hx_params.as_deref()]
                 { (value) }
-            p id=(hint_id) class="autumn-rich-text__hint" { (RICH_TEXT_HINT) }
+            p id=(hint_id) class="autumn-rich-text__hint" { (labels.hint) }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -1668,7 +2263,7 @@ fn rich_text_area_inner<T: Serialize>(
             }
             @if preview.is_some() {
                 div class="autumn-rich-text__preview-wrapper" {
-                    span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { "Preview" }
+                    span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { (labels.preview_heading) }
                     // Deliberately NOT an `aria-live` region: this element is
                     // the htmx swap target and re-renders on every pause in
                     // typing, so announcing it would read the entire post back
@@ -1722,7 +2317,7 @@ pub fn required_text_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1735,10 +2330,10 @@ pub fn required_text_input<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" {
                     @for error in errors {
                         p { (error) }
                     }
@@ -1791,25 +2386,29 @@ pub fn checkbox_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let checked = changeset.field_value(field).as_deref() == Some("true");
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="checkbox"
-                id=(field)
-                name=(field)
+                id=(field_pe)
+                name=(field_pe)
                 value="true"
                 checked[checked]
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1836,25 +2435,29 @@ pub fn number_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="number"
-                id=(field)
-                name=(field)
-                value=(value)
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
                 step=[step]
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1878,7 +2481,7 @@ pub fn required_number_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -1892,11 +2495,11 @@ pub fn required_number_input<T: Serialize>(
                 step=[step]
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2265,24 +2868,28 @@ pub fn date_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="date"
-                id=(field)
-                name=(field)
-                value=(value)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -2305,7 +2912,7 @@ pub fn required_date_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2318,11 +2925,11 @@ pub fn required_date_input<T: Serialize>(
                 value=(value)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2378,7 +2985,7 @@ pub fn datetime_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2390,11 +2997,11 @@ pub fn datetime_input<T: Serialize>(
                 name=(field)
                 value=(value)
                 step="any"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2419,7 +3026,7 @@ pub fn required_datetime_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2433,11 +3040,11 @@ pub fn required_datetime_input<T: Serialize>(
                 step="any"
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2471,7 +3078,7 @@ pub fn select_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2480,15 +3087,15 @@ pub fn select_input<T: Serialize>(
             select
                 id=(field)
                 name=(field)
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or("")) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
                 }
             }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -2516,7 +3123,7 @@ pub fn required_select_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = format!("{field}-error");
+    let error_id = has_errors.then(|| format!("{field}-error"));
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
@@ -2527,15 +3134,15 @@ pub fn required_select_input<T: Serialize>(
                 name=(field)
                 required
                 aria-required="true"
-                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                aria-invalid=(if has_errors { "true" } else { "false" })
-                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
+                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
+                aria-describedby=(error_id.as_deref().unwrap_or("")) {
                 @for (option_value, option_label) in options {
                     option value=(option_value) selected[*option_value == current] { (option_label) }
                 }
             }
             @if has_errors {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -3085,13 +3692,13 @@ fn wrap_field_control(
     control: impl maud::Render,
     errors: &[String],
 ) -> maud::Markup {
-    let error_id = format!("{field_name}-error");
+    let error_id = (!errors.is_empty()).then(|| format!("{field_name}-error"));
     let wrapper_id = format!("{field_name}-field");
     maud::html! {
         div id=(wrapper_id) class="autumn-field" {
             (control)
             @if !errors.is_empty() {
-                div id=(error_id) role="alert" class="autumn-field__errors" {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
                         p class="autumn-field__error" { (error) }
                     }
@@ -3252,6 +3859,78 @@ fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fast_escape ─────────────────────────────────────────────────
+
+    #[test]
+    fn fast_escape_no_special_chars_borrows() {
+        let input = "ART-1042";
+        match fast_escape(input) {
+            std::borrow::Cow::Borrowed(s) => assert_eq!(s, input),
+            std::borrow::Cow::Owned(_) => panic!("expected a borrow, no allocation needed"),
+        }
+    }
+
+    #[test]
+    fn fast_escape_empty_string_borrows() {
+        assert!(matches!(fast_escape(""), std::borrow::Cow::Borrowed("")));
+    }
+
+    #[test]
+    fn fast_escape_escapes_all_four_chars() {
+        assert_eq!(fast_escape(r#"&<>""#), "&amp;&lt;&gt;&quot;");
+    }
+
+    #[test]
+    fn fast_escape_leading_trailing_and_adjacent_specials() {
+        assert_eq!(fast_escape("&start"), "&amp;start");
+        assert_eq!(fast_escape("end&"), "end&amp;");
+        assert_eq!(fast_escape("a&&b"), "a&amp;&amp;b");
+        assert_eq!(
+            fast_escape("<script>alert('x')</script>"),
+            "&lt;script&gt;alert('x')&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn fast_escape_preserves_multibyte_utf8() {
+        assert_eq!(fast_escape("café <3"), "café &lt;3");
+        assert_eq!(fast_escape("日本語"), "日本語");
+    }
+
+    /// Naive per-byte reference matching `maud::escape::escape_to_string`'s
+    /// documented behavior verbatim (that module is private to the `maud`
+    /// crate, so it can't be called directly from here). `fast_escape` is
+    /// checked against this obviously-correct-by-inspection reference
+    /// rather than against its own bulk-copy logic.
+    fn naive_escape_reference(input: &str) -> String {
+        // Builds on raw bytes (like `maud`'s own implementation does) rather
+        // than `char`, since casting a UTF-8 continuation/lead byte to `char`
+        // and pushing it would re-encode it as a *different* multi-byte
+        // sequence instead of preserving the original bytes.
+        let mut out = Vec::with_capacity(input.len());
+        for b in input.bytes() {
+            match b {
+                b'&' => out.extend_from_slice(b"&amp;"),
+                b'<' => out.extend_from_slice(b"&lt;"),
+                b'>' => out.extend_from_slice(b"&gt;"),
+                b'"' => out.extend_from_slice(b"&quot;"),
+                _ => out.push(b),
+            }
+        }
+        String::from_utf8(out).expect("escaping ASCII-only replacements preserves valid UTF-8")
+    }
+
+    proptest::proptest! {
+        /// `fast_escape` must be byte-for-byte identical to the naive
+        /// reference for arbitrary input, including strings that mix the
+        /// four special ASCII bytes with arbitrary (possibly multi-byte)
+        /// Unicode text.
+        #[test]
+        fn fast_escape_matches_naive_reference(s in ".*") {
+            proptest::prop_assert_eq!(fast_escape(&s).into_owned(), naive_escape_reference(&s));
+        }
+    }
 
     // ── Changeset::new ─────────────────────────────────────────────
 
@@ -3430,6 +4109,61 @@ mod tests {
     }
 
     #[test]
+    fn into_changeset_with_resolves_a_translated_message_for_an_unmessaged_code() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(email)]
+            email: String,
+        }
+        let cs = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset_with(|field, code| {
+            if field == "email" && code == "email" {
+                Some("not a valid address".to_string())
+            } else {
+                None
+            }
+        });
+        assert!(!cs.is_valid());
+        assert_eq!(cs.errors_for("email"), ["not a valid address".to_string()]);
+    }
+
+    #[test]
+    fn into_changeset_with_falls_back_to_the_default_message_when_resolve_returns_none() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(email)]
+            email: String,
+        }
+        let without_resolver = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset();
+        let with_noop_resolver = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset_with(|_, _| None);
+        assert_eq!(
+            with_noop_resolver.errors_for("email"),
+            without_resolver.errors_for("email")
+        );
+    }
+
+    #[test]
+    fn into_changeset_with_never_overrides_an_explicit_message() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(length(min = 5, message = "too short"))]
+            name: String,
+        }
+        let cs = F { name: "ab".into() }.into_changeset_with(|_, _| {
+            Some("the resolver's message, which must never win".to_string())
+        });
+        assert_eq!(cs.errors_for("name"), ["too short".to_string()]);
+    }
+
+    #[test]
     fn into_changeset_preserves_data_on_failure() {
         #[derive(validator::Validate)]
         struct F {
@@ -3483,6 +4217,42 @@ mod tests {
             .into_changeset();
             assert!(!cs.is_valid());
             assert!(!cs.errors_for("address.street").is_empty());
+        }
+
+        #[derive(validator::Validate)]
+        struct NestedContact {
+            #[validate(email)]
+            email: String,
+        }
+
+        #[derive(validator::Validate)]
+        struct PersonWithContact {
+            #[validate(nested)]
+            contact: NestedContact,
+        }
+
+        #[test]
+        fn into_changeset_with_resolver_sees_the_dotted_nested_key() {
+            use std::cell::RefCell;
+
+            let seen_keys: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let cs = PersonWithContact {
+                contact: NestedContact {
+                    email: "not-an-email".into(),
+                },
+            }
+            .into_changeset_with(|field, code| {
+                seen_keys.borrow_mut().push(field.to_string());
+                (field == "contact.email" && code == "email")
+                    .then(|| "not a valid address".to_string())
+            });
+            assert!(!cs.is_valid());
+            assert_eq!(
+                cs.errors_for("contact.email"),
+                ["not a valid address".to_string()]
+            );
+            // The resolver received the fully dotted key, not the bare field name.
+            assert_eq!(seen_keys.into_inner(), vec!["contact.email".to_string()]);
         }
     }
 
@@ -3898,6 +4668,235 @@ mod tests {
         assert_eq!(field_from_urlencoded(b"", "body"), None);
         // A key that merely *contains* the name must not match.
         assert_eq!(field_from_urlencoded(b"body_extra=no", "body"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_hint() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains("Se admite Markdown."), "{html}");
+        assert!(!html.contains("Markdown supported"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_toolbar_group_label() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().toolbar_group("Formato Markdown");
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains(r#"aria-label="Formato Markdown""#), "{html}");
+        assert!(!html.contains("Markdown formatting"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_controls() {
+        const CUSTOM_CONTROLS: &[(&str, &str)] = &[("Negrita", "**negrita**")];
+
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().controls(CUSTOM_CONTROLS);
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains("Negrita"), "{html}");
+        assert!(html.contains("**negrita**"), "{html}");
+        // The default English control names are gone entirely, not just augmented.
+        assert!(!html.contains(">Bold<"), "{html}");
+        assert!(!html.contains("**bold**"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_labels_overrides_the_preview_heading() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html =
+            rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &labels).into_string();
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(!html.contains(">Preview<"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_token_field_with_labels_overrides_the_preview_heading() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = rich_text_area_htmx_with_token_field_with_labels(
+            &cs,
+            "body",
+            "Body",
+            "/p",
+            "_one_time",
+            &labels,
+        )
+        .into_string();
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(html.contains(r#"hx-params="not _one_time""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_with_labels_keeps_the_required_signal_and_labels() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        let html = required_rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Se admite Markdown."), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_htmx_with_labels_keeps_the_required_signal_and_labels() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = required_rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &labels)
+            .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Vista previa"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_htmx_with_token_field_with_labels_keeps_the_required_signal_and_labels()
+     {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = required_rich_text_area_htmx_with_token_field_with_labels(
+            &cs,
+            "body",
+            "Body",
+            "/p",
+            "_one_time",
+            &labels,
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(html.contains(r#"hx-params="not _one_time""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_default_labels_match_rich_text_area() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "Hello **world**".into(),
+        });
+        assert_eq!(
+            rich_text_area_with_labels(&cs, "body", "Body", &RichTextLabels::new()).into_string(),
+            rich_text_area(&cs, "body", "Body").into_string()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_labels_default_labels_match_rich_text_area_htmx() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F { body: "hi".into() });
+        assert_eq!(
+            rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &RichTextLabels::new())
+                .into_string(),
+            rich_text_area_htmx(&cs, "body", "Body", "/p").into_string()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn changeset_form_exposes_the_rich_text_labels_helpers() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let form = ChangesetForm {
+            changeset: Changeset::new(F { body: "hi".into() }),
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+        };
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        assert_eq!(
+            form.rich_text_area_with_labels("body", "Body", &labels)
+                .into_string(),
+            rich_text_area_with_labels(&form.changeset, "body", "Body", &labels).into_string()
+        );
+        assert_eq!(
+            form.rich_text_area_htmx_with_labels("body", "Body", "/p", &labels)
+                .into_string(),
+            rich_text_area_htmx_with_labels(&form.changeset, "body", "Body", "/p", &labels)
+                .into_string()
+        );
+        assert_eq!(
+            form.rich_text_area_htmx_with_token_field_with_labels(
+                "body",
+                "Body",
+                "/p",
+                "_one_time",
+                &labels
+            )
+            .into_string(),
+            rich_text_area_htmx_with_token_field_with_labels(
+                &form.changeset,
+                "body",
+                "Body",
+                "/p",
+                "_one_time",
+                &labels
+            )
+            .into_string()
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -6277,6 +7276,334 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        // ── #2423: an embedded NUL byte is a field error, not a 500 ───
+
+        #[derive(serde::Deserialize, serde::Serialize, validator::Validate)]
+        struct NulTestForm {
+            #[validate(length(min = 3))]
+            name: String,
+            #[serde(default)]
+            body: String,
+        }
+
+        /// The shape from issue #2423: a free-text field carrying `%00`
+        /// decodes cleanly and satisfies every `#[validate(...)]` rule, so it
+        /// used to reach Postgres raw and come back as an unhandled 500. It is
+        /// now one ordinary field error on the changeset, which the handler
+        /// re-renders inline like any other rejected submission.
+        #[tokio::test]
+        async fn nul_byte_in_text_field_is_a_field_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} body_errors={}",
+                    form.is_valid(),
+                    form.errors_for("body").join("|")
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=before%00after"))
+                .await
+                .unwrap();
+            assert_body(
+                resp,
+                &format!("valid=false body_errors={NUL_CHARACTER_FIELD_ERROR}"),
+            )
+            .await;
+        }
+
+        /// The retained value is the author's text minus the NUL: the
+        /// re-rendered form keeps their work (the `ChangesetForm` round-trip
+        /// contract) without echoing a raw `0x00` back into the HTML.
+        #[tokio::test]
+        async fn nul_byte_is_stripped_from_the_redisplayed_value() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                form.into_changeset()
+                    .field_value("body")
+                    .unwrap_or_default()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=before%00after"))
+                .await
+                .unwrap();
+            assert_body(resp, "beforeafter").await;
+        }
+
+        /// Only the field that actually carried the byte is flagged.
+        #[tokio::test]
+        async fn nul_byte_flags_only_the_offending_field() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "name={} body={}",
+                    form.errors_for("name").len(),
+                    form.errors_for("body").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=a%00b"))
+                .await
+                .unwrap();
+            assert_body(resp, "name=0 body=1").await;
+        }
+
+        /// No false positives: an ordinary submission is untouched.
+        #[tokio::test]
+        async fn form_without_nul_is_unaffected() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} body={}", form.is_valid(), form.data().body)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=plain"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true body=plain").await;
+        }
+
+        /// Framework plumbing fields carry no renderable error key, so a NUL
+        /// in one is cleaned but not reported — same reasoning as `_csrf`.
+        #[tokio::test]
+        async fn nul_byte_in_the_method_override_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "_method=PA%00TCH&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// A scaffolded flat form posts the submit token as a hidden field, so
+        /// its name has to be exempt here too — the nested extractor already
+        /// exempted it, and the flat one must not diverge.
+        #[tokio::test]
+        async fn nul_byte_in_the_submit_token_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "_submit_token=to%00ken&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// The exemption follows the *configured* field name, not just the
+        /// default, so renaming `security.csrf.form_field` does not reintroduce
+        /// an unrenderable error.
+        #[tokio::test]
+        async fn nul_byte_in_a_renamed_csrf_field_is_not_a_form_error() {
+            let mut req = urlencoded_req("/test", "authenticity=to%00ken&name=Alice&body=ok");
+            req.extensions_mut()
+                .insert(crate::security::csrf::CsrfFormField(
+                    "authenticity".to_owned(),
+                ));
+
+            let form = ChangesetForm::<NulTestForm>::from_request(req, &())
+                .await
+                .expect("extraction should succeed");
+            assert!(form.is_valid(), "errors: {:?}", form.errors());
+        }
+
+        /// A submitted name that is not a field of `T` is normally ignored, but
+        /// a NUL in one is still reported — under that name. Documented in
+        /// `docs/guide/forms.md`; pinned here so the choice is deliberate
+        /// rather than incidental.
+        #[tokio::test]
+        async fn nul_byte_in_an_unknown_key_is_reported_under_that_key() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} unknown={}",
+                    form.is_valid(),
+                    form.errors_for("return_to").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "return_to=a%00b&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=false unknown=1").await;
+        }
+
+        /// A key submitted more than once contributes one message, not one per
+        /// occurrence. Repeating a key that *is* a field of `T` is a hard
+        /// `duplicate field` decode failure in `serde_urlencoded` (a 400 before
+        /// any of this runs), so the case that actually reaches the sweep is a
+        /// repeated key `T` does not declare — which is also the shape that
+        /// makes the dedupe load-bearing, since an unbounded body can repeat a
+        /// key arbitrarily many times.
+        #[tokio::test]
+        async fn a_repeated_key_reports_once() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("errors={}", form.errors_for("return_to").len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "name=Alice&body=ok&return_to=a%00a&return_to=b%00b&return_to=c%00c",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "errors=1").await;
+        }
+
+        /// Keys are deliberately never cleaned. Stripping a NUL out of a key
+        /// would rename it — potentially onto a real field of `T` — inventing a
+        /// submission the client never made.
+        #[tokio::test]
+        async fn a_nul_in_a_key_never_renames_it_onto_a_real_field() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} body={:?}", form.is_valid(), form.data().body)
+            }
+            // `bod y` must NOT become `body`.
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&bod%00y=injected"))
+                .await
+                .unwrap();
+            assert_body(resp, r#"valid=true body="""#).await;
+        }
+
+        /// A NUL in a *rule-violating* field adds to that field's messages
+        /// rather than replacing the validator's own.
+        #[tokio::test]
+        async fn nul_byte_error_is_appended_to_existing_field_errors() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                let errs = form.errors_for("name");
+                format!(
+                    "count={} has_nul={}",
+                    errs.len(),
+                    errs.iter().any(|e| e == NUL_CHARACTER_FIELD_ERROR)
+                )
+            }
+            // "a\0b" is 2 characters after stripping, so `length(min = 3)`
+            // fails as well.
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=a%00b&body="))
+                .await
+                .unwrap();
+            assert_body(resp, "count=2 has_nul=true").await;
+        }
+
+        /// The CSRF token is transport plumbing, not a form field: a NUL there
+        /// must not surface as a validation error on a name no template
+        /// renders (which would make the form permanently, invisibly invalid).
+        /// CSRF verification itself still rejects the mangled token upstream.
+        #[tokio::test]
+        async fn nul_byte_in_the_csrf_field_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "_csrf=to%00ken&name=Alice&body=ok"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// The multipart blank-optional retry re-deserializes from a filtered
+        /// pair set; the NUL report must survive that second attempt rather
+        /// than being dropped with the blank field.
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_nul_report_survives_the_blank_optional_retry() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!(
+                    "age={:?} name_errors={}",
+                    form.data().age,
+                    form.errors_for("name").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    // The blank `age` forces the retry path; the NUL is on
+                    // `name`, which the retry keeps.
+                    &[("name", "Ali\u{0}ce"), ("age", "")],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "age=None name_errors=1").await;
+        }
+
+        /// A file part is binary by definition, so it is never swept and never
+        /// blocks the submission.
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_file_part_carrying_a_nul_is_untouched() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
+            let body = format!(
+                "--{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"name\"\r\n\r\n\
+                 Alice\r\n\
+                 --{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"avatar\"; filename=\"a.bin\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\
+                 bin\u{0}ary\r\n\
+                 --{boundary}--\r\n"
+            );
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap();
+
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_nul_byte_in_text_field_is_a_field_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} body_errors={} body={}",
+                    form.is_valid(),
+                    form.errors_for("body").len(),
+                    form.data().body
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    &[("name", "Alice"), ("body", "before\u{0}after")],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=false body_errors=1 body=beforeafter").await;
         }
 
         // ── Helpers ────────────────────────────────────────────────

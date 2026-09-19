@@ -616,10 +616,25 @@ pub fn deliver_webhook_job(
         request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
 
         let start = std::time::Instant::now();
+        // `target_url` is a subscriber-chosen destination, not one the app
+        // itself picked — exactly the case `ssrf_safe()` exists for. Without
+        // it this POST carries none of the private/link-local/loopback/cloud-
+        // metadata deny-list `Client::get_ssrf_safe` documents. `ssrf_safe()`
+        // alone would route through the custom send path, which (like the
+        // mock path) bypasses `send_recorded`'s circuit breaker by default —
+        // right for a one-off fetch of an arbitrary URL, wrong for repeated
+        // deliveries to the same subscriber host. `breaker_scoped()` keeps
+        // the fail-fast-on-a-down-receiver behavior every other outbound call
+        // gets, correctly ordered with the mock bypass, capsule replay, and
+        // capsule *recording* of the attempt — all handled inside
+        // `send_recorded` itself, not layered on here. See
+        // docs/security/2026-09-03-webhook-ssrf/README.md.
         let req = manager
             .client
             .named(&sub.target_url)
             .post(&sub.target_url)
+            .ssrf_safe()
+            .breaker_scoped()
             .header("Content-Type", "application/json")
             .header("Autumn-Signature", signature_header)
             .text_body(log.payload.clone());
@@ -939,6 +954,79 @@ mod tests {
             .expect("log should remain stored");
         assert!(log.is_dlq, "disabled replay must remain visible in DLQ");
         assert_eq!(log.last_error.as_deref(), Some("Subscription is disabled"));
+        assert_eq!(log.response_status, None);
+    }
+
+    /// 🛡 Warden — SSRF via subscriber-chosen `target_url` (2026-09-03).
+    ///
+    /// `WebhookSubscription::target_url` is exactly the kind of destination
+    /// `docs/guide/outbound-webhooks.md` describes as "a consumer's registered
+    /// endpoint" — supplied by whoever registers the subscription, not chosen
+    /// by the app. An attacker who can register (or edit) a subscription can
+    /// point it at an internal service, the app's own DB host, or a cloud
+    /// metadata endpoint (169.254.169.254); Autumn's own background job then
+    /// makes the outbound call from inside the app's network. No app code in
+    /// this path is doing anything the guide warns against — the guide's only
+    /// stated security mechanism is the outbound HMAC signature, which says
+    /// nothing about where the request is allowed to go.
+    ///
+    /// `127.0.0.1` stands in for that internal destination: it is on the
+    /// framework's own SSRF deny-list ([`crate::http_client::is_blocked_ip`]),
+    /// so a real local listener lets the test observe, without touching the
+    /// network beyond loopback, whether the connection was ever attempted.
+    #[tokio::test]
+    async fn deliver_webhook_job_refuses_ssrf_target_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener
+            .local_addr()
+            .expect("listener has a local address")
+            .port();
+        let target_url = format!("http://127.0.0.1:{port}/hook");
+
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        // Deliberately NOT registering an `HttpMockRegistryExt` — the mock
+        // path short-circuits before the SSRF check runs (`send_recorded`
+        // checks `self.mock.is_some()` first), so this test needs the real
+        // send path to observe whether the connection was actually blocked.
+        install_outbound_webhook_manager(&state, store.clone(), 1);
+
+        let sub = sample_subscription("sub_ssrf", &target_url, WebhookSubscriptionStatus::Active);
+        store.create_subscription(sub).await.unwrap();
+        store
+            .replace_delivery_log(sample_log("log_ssrf", "sub_ssrf"))
+            .await
+            .unwrap();
+
+        let accept = tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept());
+
+        let job_result =
+            deliver_webhook_job(state, serde_json::json!({ "log_id": "log_ssrf" })).await;
+
+        assert!(
+            accept.await.is_err(),
+            "the listener standing in for an internal service must never see a \
+             connection — a blocked destination has to be rejected before dial"
+        );
+        assert!(
+            job_result.is_err(),
+            "delivery to a blocked destination must not report success"
+        );
+
+        let log = store
+            .get_delivery_log("log_ssrf")
+            .await
+            .unwrap()
+            .expect("log should remain stored");
+        assert!(
+            log.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("SSRF")),
+            "delivery log should record the SSRF block, got: {:?}",
+            log.last_error
+        );
         assert_eq!(log.response_status, None);
     }
 

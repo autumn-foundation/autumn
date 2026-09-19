@@ -1,0 +1,43 @@
+# Config for the `react-graphql` example.
+#
+# Note what is NOT here: no CORS section. The React bundle is served by this
+# same server from `/static/app/`, so the browser's GraphQL calls are
+# same-origin. Under `npm run dev` the Vite dev server proxies `/graphql` here
+# (see frontend/vite.config.ts), which keeps them same-origin too.
+#
+# The default Content-Security-Policy (`script-src 'self'`) is also left
+# alone: the bundle is an external module script, so no inline script or
+# nonce is needed.
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# `docker compose up -d` in this directory provides this database.
+[database]
+url = "postgres://autumn:autumn@localhost:5432/notes"
+# Applying migrations at boot is a dev-profile default; in `prod` the
+# framework leaves it to an explicit `autumn migrate` step unless told
+# otherwise. This single-process example opts in so the one-file deploy in
+# the README boots against a fresh database. Multi-replica fleets should
+# keep this off and run `autumn migrate` as a release step.
+auto_migrate = true
+
+[log]
+level = "info"
+format = "Pretty"
+
+# This example's whole API is deliberately unauthenticated — the GraphQL
+# endpoint and the generated `/api/notes` REST handlers alike — so the
+# framework's production gate, which refuses to start when a
+# `#[repository(api = …)]` exposes POST/PUT/DELETE without a `policy = …`,
+# is opted out of explicitly. A real app adds `policy = NotePolicy` to the
+# repository (and `.guard(RequireApiToken::new(..), ..)` on the GraphQL
+# plugin) instead of setting this. See `docs/guide/authorization.md`.
+[security]
+allow_unauthorized_repository_api = true
+
+# `prod` also refuses to start without a Host-header allow-list. These are
+# the loopback names the README's one-file deploy uses; a real deployment
+# lists its real hostname(s). See docs/guide/deployment.md.
+[security.trusted_hosts]
+hosts = ["localhost", "127.0.0.1"]

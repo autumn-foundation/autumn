@@ -1225,27 +1225,26 @@ fn diff_column(
         });
     }
 
-    // Rule B: only the *add* direction is ever considered (a desired `None` is
-    // "unknown, retained" — never a DropForeignKey). `diff_column` only runs for a
-    // column present on BOTH sides — i.e. a pre-existing column — so an added FK
-    // here is on a pre-existing column, which is unsafe: the parser cannot see a
-    // generated `#[belongs_to(...)]` association FK, so a baseline `references:
-    // None` is *unknown*, not proof the DB has no `<table>_<column>_fkey`
-    // constraint — emitting `ADD CONSTRAINT` could collide with an existing one.
+    // Rule B: only the add direction is ever considered — a desired `None` is "unknown,
+    // retained", never a DropForeignKey. `diff_column` runs only for a column present on
+    // both sides, so an added FK here is on a pre-existing column, which is unsafe: the
+    // parser cannot see a generated `#[belongs_to(...)]` association FK, so a baseline
+    // `references: None` is unknown rather than proof the DB has no
+    // `<table>_<column>_fkey` constraint, and emitting `ADD CONSTRAINT` could collide
+    // with an existing one.
     //
-    // The three sub-cases when the desired side has an explicit FK on a
-    // pre-existing column:
-    //   * baseline had none            → the FK may (invisibly) already exist →
-    //     the refused `AddForeignKeyToExistingColumn` marker (no override).
-    //   * baseline had the same FK     → no change.
-    //   * baseline had a *different* FK → a retarget we cannot safely emit
-    //     (there is no `DropForeignKey`, and re-`ADD CONSTRAINT`-ing the default
-    //     `<table>_<column>_fkey` name would collide) → the refused
-    //     `ForeignKeyChange` marker, mirroring `PrimaryKeyChange`.
+    // The three sub-cases when the desired side has an explicit FK on a pre-existing
+    // column:
+    //   * baseline had none → the FK may already exist invisibly → the refused
+    //     `AddForeignKeyToExistingColumn` marker, with no override.
+    //   * baseline had the same FK → no change.
+    //   * baseline had a different FK → a retarget we cannot safely emit, since there is
+    //     no `DropForeignKey` and re-`ADD CONSTRAINT`-ing the default
+    //     `<table>_<column>_fkey` name would collide → the refused `ForeignKeyChange`
+    //     marker, mirroring `PrimaryKeyChange`.
     //
-    // A genuinely-new FK column arrives as an `AddColumn` (whose `REFERENCES` is
-    // rendered inline, never as a separate `AddForeignKey`), so it never reaches
-    // this branch and is emitted normally.
+    // A genuinely new FK column arrives as an `AddColumn`, whose `REFERENCES` is rendered
+    // inline rather than as a separate `AddForeignKey`, so it never reaches this branch.
     if let Some(fk) = &want.references {
         match &base.references {
             None => changes.push(SchemaChange::AddForeignKeyToExistingColumn {
@@ -1260,16 +1259,15 @@ fn diff_column(
         }
     }
 
-    // Identity clause: an id-generation change (`GENERATED ALWAYS AS IDENTITY` →
-    // plain, or `ALWAYS` ↔ `BY DEFAULT`) is compared ONLY in an authoritative diff
-    // (both sides introspected — doctor's `database-schema-drift` and
-    // `pull --dry-run`). The model parser cannot express an identity clause, so in a
-    // model diff a desired `identity: None` is "unknown, retained" (never drift),
-    // exactly like a baseline `definition` index the DSL cannot describe — comparing
-    // it there would spuriously refuse every model against an identity-column DB.
-    // In an authoritative diff both sides carry the clause faithfully, so a genuine
-    // change surfaces as the refused `IdentityChange` marker instead of being
-    // silently dropped.
+    // Identity clause: an id-generation change — `GENERATED ALWAYS AS IDENTITY` to plain,
+    // or `ALWAYS` against `BY DEFAULT` — is compared only in an authoritative diff, where
+    // both sides are introspected: doctor's `database-schema-drift` and `pull --dry-run`.
+    // The model parser cannot express an identity clause, so in a model diff a desired
+    // `identity: None` is "unknown, retained" and never drift, exactly like a baseline
+    // `definition` index the DSL cannot describe; comparing it there would spuriously
+    // refuse every model against an identity-column DB. In an authoritative diff both
+    // sides carry the clause faithfully, so a genuine change surfaces as the refused
+    // `IdentityChange` marker instead of being dropped.
     if opts.definitions_authoritative && base.identity != want.identity {
         changes.push(SchemaChange::IdentityChange {
             table: table.to_owned(),
@@ -1555,19 +1553,19 @@ fn diff_indexes(
     for want_idx in &want.indexes {
         match base_by_name.get(want_idx.name.as_str()) {
             None => {
-                // In a MODEL diff (`!definitions_authoritative`), a desired UNIQUE
-                // index whose column SET is already enforced by an existing baseline
-                // unique index — under ANY name, including a `definition`-carrying
-                // constraint index a brownfield `UNIQUE` produced (`accounts_email_key`)
-                // — is already satisfied. The differently-named baseline index enforces
-                // the exact uniqueness the model's `#[unique]` asks for, so emitting an
-                // `AddIndex` here would be redundant AND would trip `guard_plan`'s
+                // In a model diff (`!definitions_authoritative`), a desired UNIQUE
+                // index whose column set is already enforced by an existing baseline
+                // unique index — under any name, including a `definition`-carrying
+                // constraint index a brownfield `UNIQUE` produced — is already
+                // satisfied. The differently-named baseline index enforces exactly the
+                // uniqueness the model's `#[unique]` asks for, so an `AddIndex` here
+                // would be redundant and would trip `guard_plan`'s
                 // unique-index-on-populated-table dedup refusal, blocking the user from
-                // ever keeping the annotation. Suppress it (and leave the retained
-                // baseline index in place — no `DropIndex`). Matching is by EXACT column
-                // set (see [`baseline_unique_index_covers`]). Authoritative diffs are
-                // untouched: a brownfield constraint index has the same name on both
-                // sides there and already matches by name, so real drift stays detected.
+                // ever keeping the annotation. Suppress it, and leave the baseline index
+                // in place with no `DropIndex`. Matching is by exact column set (see
+                // [`baseline_unique_index_covers`]). Authoritative diffs are untouched:
+                // a brownfield constraint index has the same name on both sides and
+                // already matches by name, so real drift stays detected.
                 if !opts.definitions_authoritative
                     && baseline_satisfies_desired_unique(base, want_idx)
                 {
@@ -1587,17 +1585,16 @@ fn diff_indexes(
                 let involves_definition =
                     base_idx.definition.is_some() || want_idx.definition.is_some();
                 if involves_definition && !opts.definitions_authoritative {
-                    // Model diff: the desired side cannot express B's
-                    // definition, so the same-named definition-carrying baseline
-                    // index B is retained (the drop loop below skips a name still
-                    // present in `want`). But a unique D whose uniqueness B does
-                    // NOT fully cover — B is partial, an expression index (empty
-                    // key columns), or keyed on a different column set — leaves
-                    // the model's table-wide `#[unique]` UNENFORCED even though a
-                    // conventionally-named index exists. Emit `AddIndex(D)` so the
-                    // full unique index is created ALONGSIDE the retained B;
-                    // suppress D only when SOME baseline index fully covers it
-                    // (or D is non-unique).
+                    // Model diff: the desired side cannot express B's definition,
+                    // so the same-named definition-carrying baseline index B is
+                    // retained — the drop loop below skips a name still present in
+                    // `want`. But a unique D whose uniqueness B does not fully cover
+                    // — B is partial, an expression index with empty key columns, or
+                    // keyed on a different column set — leaves the model's table-wide
+                    // `#[unique]` unenforced even though a conventionally-named index
+                    // exists. Emit `AddIndex(D)` so the full unique index is created
+                    // alongside the retained B; suppress D only when some baseline
+                    // index fully covers it, or D is non-unique.
                     if want_idx.unique && !baseline_satisfies_desired_unique(base, want_idx) {
                         changes.push(SchemaChange::AddIndex {
                             table: table.to_owned(),
@@ -1626,32 +1623,30 @@ fn diff_indexes(
         {
             continue;
         }
-        // SQLite ONLY: an index that depends on a column being DROPPED must be
-        // dropped first — even a retained (`definition`) one the model cannot express
-        // — else it would reference a missing column (SQLite rejects the
-        // `DROP COLUMN`). This OVERRIDES the retention rule below; its down leg
-        // recreates the index verbatim (after the column is re-added), so the
-        // rollback is faithful. Postgres is EXCLUDED: it cascade-drops the dependent
-        // index automatically on `DROP COLUMN` and restores it on rollback via
-        // `retained_indexes_depending_on_any`, so an explicit `DropIndex` there would
-        // double-drop and break that mechanism.
+        // SQLite only: an index that depends on a column being dropped must be dropped
+        // first — even a retained `definition` one the model cannot express — or it would
+        // reference a missing column and SQLite would reject the `DROP COLUMN`. This
+        // overrides the retention rule below; its down leg recreates the index verbatim,
+        // after the column is re-added, so the rollback is faithful. Postgres is excluded:
+        // it cascade-drops the dependent index on `DROP COLUMN` and restores it on
+        // rollback via `retained_indexes_depending_on_any`, so an explicit `DropIndex`
+        // there would double-drop and break that mechanism.
         let orphaned_by_column_drop = backend == Backend::Sqlite
             && dropped_columns
                 .iter()
                 .any(|c| index_depends_on_column(base_idx, c, backend));
-        // Retain (never DropIndex) — in a MODEL diff, and only when the index is not
-        // being orphaned by a SQLite column drop — when EITHER:
-        //   (a) it carries a `definition` the model DSL cannot express (an
-        //       expression/partial/constraint-owned index), OR
-        //   (b) it is a plain unique index that COVERS a model `#[unique]` whose own
-        //       `AddIndex` was suppressed as already-satisfied (the SAME uniqueness
-        //       under a different name — e.g. a pulled `accounts_email_uq` vs the
-        //       model's `idx_accounts_email_unique`). Dropping it would remove the
-        //       ONLY uniqueness enforcement with no replacement — a silent
-        //       data-integrity loss. This is the symmetric counterpart to the add
-        //       branch's `baseline_satisfies_desired_unique` suppression.
-        // In an introspection diff both sides are authoritative (indexes match by
-        // name), so neither retention applies and a genuinely-dropped index drops.
+        // Retain, never DropIndex, in a model diff — and only when the index is not being
+        // orphaned by a SQLite column drop — when either:
+        //   (a) it carries a `definition` the model DSL cannot express: an expression,
+        //       partial, or constraint-owned index; or
+        //   (b) it is a plain unique index covering a model `#[unique]` whose own
+        //       `AddIndex` was suppressed as already satisfied — the same uniqueness under
+        //       a different name, such as a pulled `accounts_email_uq` against the model's
+        //       `idx_accounts_email_unique`. Dropping it would remove the only uniqueness
+        //       enforcement with no replacement, a silent data-integrity loss. This is the
+        //       symmetric counterpart to the add branch's suppression.
+        // In an introspection diff both sides are authoritative and indexes match by name,
+        // so neither retention applies and a genuinely dropped index drops.
         let retain = !opts.definitions_authoritative
             && !orphaned_by_column_drop
             && (base_idx.definition.is_some()
@@ -1821,16 +1816,15 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(err);
     }
 
-    // 6. Add of a required column (NOT NULL, no default) to an existing table —
-    //    no override. Postgres validates the NOT NULL against existing rows the
-    //    instant the column is added, so `ADD COLUMN ... NOT NULL` fails on any
-    //    non-empty table; the offline engine has no backfill value to synthesize,
-    //    so it refuses rather than emit an unappliable migration. This matches
-    //    only `AddColumn` (altering an existing baseline table) — a NOT NULL,
-    //    no-default column inlined in a brand-new `CreateTable` is empty-table-safe
-    //    and is never matched here. It is not destructive, so it always refuses,
-    //    regardless of `--allow-destructive` (checked in both branches: the
-    //    `allow_destructive` short-circuit below is only reached after this guard).
+    // 6. Add of a required column (NOT NULL, no default) to an existing table — no
+    //    override. Postgres validates the NOT NULL against existing rows the instant the
+    //    column is added, so `ADD COLUMN ... NOT NULL` fails on any non-empty table, and
+    //    the offline engine has no backfill value to synthesize, so it refuses rather
+    //    than emit an unappliable migration. This matches only `AddColumn`, altering an
+    //    existing baseline table: a NOT NULL, no-default column inlined in a brand-new
+    //    `CreateTable` is empty-table-safe and is never matched. It is not destructive,
+    //    so it always refuses whatever `--allow-destructive` says — checked in both
+    //    branches, since the short-circuit below is only reached after this guard.
     if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
         SchemaChange::AddColumn { table, column }
             if !column.nullable && column.default.is_none() =>
@@ -1857,17 +1851,16 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::SetNotNullRequiresBackfill { table, column });
     }
 
-    // 6c. A unique index added to a pre-existing table where ALL its indexed
-    //     columns already existed — no override. `CREATE UNIQUE INDEX` validates
-    //     uniqueness against every existing row the instant it runs, so it fails
-    //     on any pre-existing duplicate; the offline engine cannot dedup the data.
-    //     The index-level sibling of the `SET NOT NULL` refusal above. It is not
-    //     destructive, so it always refuses, regardless of `--allow-destructive`
-    //     (checked here, before the `allow_destructive` short-circuit below). A
-    //     unique index on a brand-new `CreateTable` (empty) rides inline on that
-    //     change and never reaches `AddIndex`; a unique index touching a
-    //     newly-added column (whose existing rows are all NULL, treated as
-    //     distinct) and any non-unique index are safe and are never matched here.
+    // 6c. A unique index added to a pre-existing table where all its indexed columns
+    //     already existed — no override. `CREATE UNIQUE INDEX` validates uniqueness
+    //     against every existing row the instant it runs, so it fails on any pre-existing
+    //     duplicate, and the offline engine cannot dedup the data. This is the
+    //     index-level sibling of the `SET NOT NULL` refusal above. It is not destructive,
+    //     so it always refuses whatever `--allow-destructive` says, checked before the
+    //     short-circuit below. A unique index on a brand-new, empty `CreateTable` rides
+    //     inline on that change and never reaches `AddIndex`; a unique index touching a
+    //     newly-added column, whose existing rows are all NULL and so distinct, and any
+    //     non-unique index are safe and never matched.
     if let Some(err) = find_unique_index_requires_dedup(plan) {
         return Err(err);
     }
@@ -2775,22 +2768,21 @@ fn render_sqlite_rebuild(
             "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
         );
     }
-    // Preserve the AUTOINCREMENT high-water mark only when BOTH the copy SOURCE and
-    // the target shape's single PK are `BigSerial` (an `INTEGER PRIMARY KEY
-    // AUTOINCREMENT` column). Such a source table has a `sqlite_sequence` row that
-    // `DROP TABLE` would discard, resetting the high-water to the max surviving id and
-    // letting a later insert reuse an id that was previously issued and deleted.
-    // Gating on the source too is load-bearing: `sqlite_sequence` is created LAZILY by
-    // SQLite (only once some AUTOINCREMENT table exists), so a migration that
-    // INTRODUCES autoincrement (an `i32`->`i64` PK change) on a database with no prior
-    // AUTOINCREMENT table has no `sqlite_sequence` table, and the capture SELECT would
-    // fail with `no such table: sqlite_sequence`. The high-water only needs preserving
-    // when the SOURCE was already AUTOINCREMENT — and in that case its `sqlite_sequence`
-    // row is guaranteed to exist, so the capture can't fail. When the source is not
-    // AUTOINCREMENT there is no prior high-water to preserve (the new autoincrement
-    // table correctly starts fresh from the max copied id), so skipping is also correct.
-    // Uuid / composite / non-single PK tables have no `sqlite_sequence` entry either, so
-    // they emit none of these statements.
+    // Preserve the AUTOINCREMENT high-water mark only when both the copy source and the
+    // target shape's single PK are `BigSerial` — an `INTEGER PRIMARY KEY AUTOINCREMENT`
+    // column. Such a source table has a `sqlite_sequence` row that `DROP TABLE` would
+    // discard, resetting the high-water to the max surviving id and letting a later insert
+    // reuse an id that was previously issued and deleted.
+    //
+    // Gating on the source too is load-bearing: SQLite creates `sqlite_sequence` lazily,
+    // only once some AUTOINCREMENT table exists, so a migration that introduces
+    // autoincrement — an `i32` to `i64` PK change — on a database with no prior
+    // AUTOINCREMENT table has no `sqlite_sequence`, and the capture SELECT would fail with
+    // `no such table: sqlite_sequence`. The high-water only needs preserving when the
+    // source was already AUTOINCREMENT, and then its row is guaranteed to exist. When the
+    // source is not AUTOINCREMENT there is no prior high-water to preserve, so skipping is
+    // correct too. Uuid, composite, and non-single-PK tables have no `sqlite_sequence`
+    // entry either, so they emit none of these statements.
     let preserve_seq = matches!(single_pk_column(source_shape), Some((_, IdKind::BigSerial)))
         && matches!(single_pk_column(new_shape), Some((_, IdKind::BigSerial)));
 
@@ -3551,16 +3543,16 @@ fn serial_kinds_conflict(base: &Table, want: &Table) -> bool {
 /// swaps its UUID-generation behavior for `gen_random_uuid()` or adds a default
 /// where none existed.
 fn pk_kind_for(column: &Column) -> Option<IdKind> {
-    // An EXPLICIT `Plain` serial marker (a brownfield plain `BIGINT`/`INTEGER
-    // PRIMARY KEY` with no owned sequence — populated by both introspectors, never
-    // by the model parser) must NOT reconstruct as `BIGSERIAL`/`AUTOINCREMENT`: that
-    // would fabricate auto-increment (and a `sqlite_sequence` row) on a table
-    // rebuild or `DropTable` rollback, silently changing id-generation behavior. The
-    // `None` path renders it as an ordinary integer column plus a table-level
-    // `PRIMARY KEY (col)` clause — a plain PK with no sequence/AUTOINCREMENT. A
-    // legacy/unknown `None` marker keeps the historical `BigSerial` behavior for
-    // back-compat (`serial_kinds_conflict` treats a legacy `None` as compatible, so
-    // this only ever fires for an explicitly-`Plain`-marked pull).
+    // An explicit `Plain` serial marker — a brownfield plain `BIGINT`/`INTEGER PRIMARY
+    // KEY` with no owned sequence, populated by both introspectors and never by the model
+    // parser — must not reconstruct as `BIGSERIAL`/`AUTOINCREMENT`. That would fabricate
+    // auto-increment, and a `sqlite_sequence` row, on a table rebuild or `DropTable`
+    // rollback, silently changing id-generation behaviour. The `None` path renders it as
+    // an ordinary integer column plus a table-level `PRIMARY KEY (col)` clause: a plain PK
+    // with no sequence or AUTOINCREMENT. A legacy or unknown `None` marker keeps the
+    // historical `BigSerial` behaviour for back-compat, since `serial_kinds_conflict`
+    // treats a legacy `None` as compatible, so this fires only for an explicitly
+    // `Plain`-marked pull.
     if column.serial == Some(SerialKind::Plain) {
         return None;
     }
@@ -7354,15 +7346,15 @@ PRAGMA foreign_keys=ON;
 
     #[test]
     fn sqlite_rebuild_survives_dependent_view() {
-        // A SQLite view referencing the rebuilt table makes the post-`DROP TABLE`
-        // `ALTER TABLE ... RENAME` fail ("error in view v: no such table: main.posts")
-        // under the modern default `legacy_alter_table=OFF`. The offline emitter cannot
-        // see or recreate views, so the rebuild wraps the rename with
-        // `PRAGMA legacy_alter_table=ON`…`OFF`, a blind "dumb" rename that does not
-        // descend into / validate views — so the migration applies and the view
-        // re-validates against the recreated table. This exercises the REAL in-transaction
-        // path (diesel wraps each migration in one) to confirm the pragma is not a
-        // mid-transaction no-op like `foreign_keys`.
+        // A SQLite view referencing the rebuilt table makes the post-`DROP TABLE` `ALTER
+        // TABLE ... RENAME` fail with "error in view v: no such table: main.posts" under
+        // the modern default `legacy_alter_table=OFF`. The offline emitter cannot see or
+        // recreate views, so the rebuild wraps the rename with `PRAGMA
+        // legacy_alter_table=ON`…`OFF`, a blind rename that does not descend into or
+        // validate views, so the migration applies and the view re-validates against the
+        // recreated table. This exercises the real in-transaction path — diesel wraps each
+        // migration in one — to confirm the pragma is not a mid-transaction no-op like
+        // `foreign_keys`.
         use diesel::connection::SimpleConnection as _;
         use diesel::prelude::*;
 

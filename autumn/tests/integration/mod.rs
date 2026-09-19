@@ -1,8 +1,18 @@
 #[cfg(feature = "maud")]
 mod a11y;
 mod access_log;
+#[cfg(feature = "acme")]
+mod acme_dns01;
+#[cfg(feature = "acme")]
+mod acme_end_to_end;
+#[cfg(feature = "acme")]
+mod acme_fake_ca;
+#[cfg(feature = "acme-pebble")]
+mod acme_pebble;
 mod acting_as_integration;
 mod after_commit_integration;
+#[cfg(feature = "mcp")]
+mod agent_authority;
 mod alerts;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
@@ -10,14 +20,20 @@ mod api_versioning_openapi;
 mod api_versioning_unit;
 mod app_builder;
 mod app_metrics_facade;
+#[cfg(feature = "db")]
+mod auth_lockout_race;
 mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
 #[cfg(feature = "ws")]
 mod broadcast_recorder;
+#[cfg(all(feature = "db", feature = "cache-moka"))]
+mod cache_coherence;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+#[cfg(all(feature = "db", feature = "cache-moka"))]
+mod cached_tenant_scope;
 #[cfg(feature = "ws")]
 mod chaos_channels;
 #[cfg(feature = "ws")]
@@ -40,14 +56,34 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(all(feature = "db", feature = "collab"))]
+mod collab_model;
+#[cfg(all(feature = "collab", feature = "offline-sync"))]
+mod collab_offline_merge;
+#[cfg(all(feature = "collab", feature = "presence"))]
+mod collab_session;
 #[cfg(feature = "db")]
 mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(feature = "db")]
+mod confidential_model;
+#[cfg(feature = "db")]
+mod confidential_red_team;
+mod confidential_sealing;
+#[cfg(feature = "db")]
+mod confidential_threat_model;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "constela")]
+mod constela;
+#[cfg(feature = "acme")]
+mod custom_domain_issuance;
+mod custom_domains;
 mod custom_layer;
+#[cfg(feature = "db")]
+mod data_classification;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
@@ -55,6 +91,7 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+mod edge_conformance_ci_coverage;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
@@ -68,6 +105,7 @@ mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
 mod error_reporting;
+mod error_validation_details;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
@@ -85,6 +123,8 @@ mod failure_capsule_capture;
     not(feature = "sqlite")
 ))]
 mod failure_capsule_db;
+#[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
+mod failure_capsule_effects;
 #[cfg(all(
     feature = "reporting",
     feature = "db",
@@ -108,6 +148,9 @@ mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
+mod framework_retention;
+#[cfg(feature = "db")]
+mod framework_retention_pg;
 mod graceful_shutdown_contract;
 mod health_indicator_integration;
 mod hooks_lifecycle;
@@ -116,6 +159,11 @@ mod htmx_serving;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 mod idempotency_middleware;
+mod idempotency_tenant_scope;
+mod idempotency_token_principal;
+mod impersonation;
+#[cfg(feature = "db")]
+mod impersonation_versioned_db;
 #[cfg(feature = "inbound-mail")]
 mod inbound_mail_integration;
 mod ingress_named_futures;
@@ -127,6 +175,7 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
+mod live_state;
 mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
@@ -153,6 +202,8 @@ mod mcp_repository;
 #[cfg(feature = "mcp")]
 mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
+mod mcp_secured_guard;
+#[cfg(feature = "mcp")]
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
@@ -165,9 +216,13 @@ mod migrate_checksum_proptest;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
+mod model_derivation;
+#[cfg(feature = "db")]
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
+#[cfg(feature = "db")]
+mod money_ledger_postgres;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -175,6 +230,7 @@ mod nested_form_atomic_save;
 #[cfg(feature = "maud")]
 mod nested_form_order_example;
 mod notifications;
+mod nul_byte_input;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -189,6 +245,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(feature = "openapi")]
+mod openapi_export;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -197,6 +255,7 @@ mod payload_version_integration;
 mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
+mod plugin_contract;
 #[cfg(feature = "db")]
 mod position_repository_integration;
 #[cfg(feature = "db")]
@@ -204,18 +263,54 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+#[cfg(feature = "maud")]
+mod profile_conditional_surfaces;
+// The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
+// runtime) and `test-support` (the shared WAT escape corpus), neither of which
+// the Docker sweep's feature set enables — so the ignored timing benchmark in
+// here is never picked up by that bare `--ignored` run.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox;
+// The grown capability vocabulary (#1632): the adversarial corpus for KV,
+// outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox_capabilities;
+mod push_end_to_end;
+mod push_router;
+#[cfg(feature = "db")]
+mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
+mod queue_pinning;
 mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;
 #[cfg(feature = "redis")]
 mod rate_limit_redis_integration;
+mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+// ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
+// fails when one of them stops matching (#1186). No feature gate: it only reads
+// job.rs and ci.yml as text.
+mod redis_job_admin_ci_coverage;
+// ci.yml names the `--lib` Postgres relative-delay Docker tests by full test
+// path; this fails if either is renamed (#2111 follow-up). No feature gate:
+// it only reads job.rs and ci.yml as text.
+mod pg_relative_delay_ci_coverage;
+// Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
+// The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
+// Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
+#[cfg(feature = "db")]
+mod ledger_postgres;
+// Ledger findings/fix harness for the generated `ledger_as_of`/`ledger_diff`
+// read path: profiles the unbounded full-chain read against a deep,
+// production-shaped chain and (after the fix) the bounded replacement.
+#[cfg(feature = "db")]
+mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
 mod repository_audit_actor;
 #[cfg(feature = "db")]
@@ -223,7 +318,16 @@ mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
 #[cfg(feature = "db")]
+mod repository_commit_hooks_claim_ack_profile;
+#[cfg(feature = "db")]
 mod repository_dependent_destroy;
+// Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
+// cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
+// (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "tls")]
+mod mtls_support;
+#[cfg(feature = "db")]
+mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]
 mod repository_find_in_batches;
 #[cfg(feature = "db")]
@@ -240,6 +344,8 @@ mod repository_replica_routing;
 mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
+#[cfg(feature = "db")]
+mod repository_upsert_many_advisory_lock_batching_profile;
 mod request_timeout;
 #[cfg(feature = "db")]
 mod retention;
@@ -252,9 +358,12 @@ mod schema_drift_guard;
 mod scoped_tokens;
 #[cfg(feature = "db")]
 mod search_index_definition;
+mod secured_route;
 mod security;
 mod seo;
 mod server_timing;
+#[cfg(feature = "http-client")]
+mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
 #[cfg(feature = "db")]
@@ -268,8 +377,12 @@ mod signed_webhooks;
 mod sim_advance_to;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
+#[cfg(feature = "collab")]
+mod sim_collab_convergence;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
+mod sim_fault_plan;
+mod sim_fault_plan_pg;
 mod sim_job_clock;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
@@ -277,9 +390,17 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sqlite_ci_coverage;
+#[cfg(feature = "db")]
+mod sqlite_replication;
+#[cfg(all(feature = "db", feature = "http-client"))]
+mod sqlite_replication_s3;
+#[cfg(feature = "db")]
+mod sqlite_replication_wal;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;
+mod step_up_route;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
 #[cfg(feature = "maud")]
@@ -296,7 +417,13 @@ mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
+mod tls_app_surface;
+#[cfg(feature = "tls")]
+mod tls_client_auth;
+#[cfg(feature = "tls")]
 mod tls_serving;
+#[cfg(feature = "tls")]
+mod tls_support;
 mod transactional_test_integration;
 #[cfg(all(feature = "db", feature = "i18n"))]
 mod translatable_model;
@@ -306,9 +433,13 @@ mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]
+mod validate_on_insert;
+#[cfg(feature = "db")]
 mod validate_on_update_blind;
 mod validate_patch_option_ip;
 mod webhook_outbound;
+#[cfg(feature = "db")]
+mod webhook_outbound_dispatch_fanout_profile;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]

@@ -13,7 +13,7 @@ use autumn_web::app::ApiVersion;
 use chrono::TimeZone;
 
 #[autumn_web::main]
-async fn main() -> Result<(), autumn_web::Error> {
+async fn main() {
     let app = autumn_web::app()
         // Register API v1: Deprecated on 2026-06-01, Sunset on 2026-12-01
         .api_version(ApiVersion {

@@ -1,3 +1,0 @@
--- Test-only fixture for `check_migration_version_collisions`: shares its
--- version with `test_migrations_collision_b/20260601000000_widget_beta` on
--- purpose, under a different name.

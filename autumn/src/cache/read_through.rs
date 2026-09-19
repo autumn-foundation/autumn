@@ -412,7 +412,10 @@ fn now_unix_ms(clock: &dyn ClockSource) -> u64 {
 /// replica mistake the old stale envelope for a completed refresh.
 fn fast_path_value<V>(cache: &Arc<dyn Cache>, key: &str, options: &GetOrComputeOptions) -> Option<V>
 where
-    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+    // `Serialize` because `get_cached` records the value it served into a
+    // failure capsule (#1634); every caller of this helper already carries the
+    // bound, since the same `V` is written back through `insert_cached`.
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     if options.stale_while_revalidate.is_some() {
         get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)

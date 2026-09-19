@@ -4,8 +4,8 @@
 //! labeled `TextField` can be rendered — these are exactly those forms.
 
 use autumn_web::a11y::{
-    Button, ButtonType, Checkbox, FileField, Img, Link, MenuItem, Select, SelectOption, TextArea,
-    TextField,
+    Button, ButtonType, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption, Select,
+    SelectOption, TextArea, TextField,
 };
 use autumn_web::html;
 use maud::Render;
@@ -117,6 +117,24 @@ fn main() {
         .accept("image/*")
         .multiple()
         .label("Avatar")
+        .render();
+
+    // A labeled radio group: every choice names itself, the group names itself,
+    // and the group always carries at least one choice.
+    let _speed = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+        .options([
+            RadioOption::new("express", "Express"),
+            RadioOption::new("overnight", "Overnight").disabled(),
+        ])
+        .checked_value("express")
+        .required()
+        .aria_required()
+        .label("Shipping speed")
+        .render();
+
+    // aria-label names the group without a visible legend.
+    let _billing = RadioGroup::new("billing", RadioOption::new("monthly", "Monthly"))
+        .aria_label("Billing period")
         .render();
 
     // The hx-* escape hatch keeps the typed label obligation on the htmx path.

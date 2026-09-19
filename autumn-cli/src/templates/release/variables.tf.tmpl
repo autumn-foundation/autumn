@@ -28,9 +28,11 @@ variable "image_tag" {
 # points both at this public placeholder on the first apply, then ignores
 # further image drift (see the `lifecycle.ignore_changes` blocks in main.tf)
 # once `az containerapp update`/the migration job start in azure-deploy.yml
-# take over managing the real image.
+# take over managing the real image. Keep min_replicas at 0 until after the
+# first real deploy so the placeholder app container is never started with
+# production secret refs or a Key Vault-capable managed identity.
 variable "bootstrap_image" {
-  description = "Public placeholder image Terraform uses to create the Container App and migration job before any real image has been pushed to ACR."
+  description = "Public placeholder image Terraform uses only to create inactive first revisions before any real image has been pushed to ACR. Keep min_replicas at 0 until after the first real deploy so this image never starts with production secrets."
   type        = string
   default     = "mcr.microsoft.com/k8se/quickstart:latest"
 }
@@ -42,14 +44,16 @@ variable "db_sku" {
 }
 
 # ── Scale config defaults ────────────────────────────────────────────────────
-# Min replicas: 1, Max: 10. The http_scale_rule in main.tf (concurrent_requests
-# = 10) decides when Container Apps scales between these bounds; it will not
-# scale to zero while min_replicas > 0. Set min_replicas = 0 for scale-to-zero.
+# Min replicas: 0, Max: 10. Keep the default at 0 for the initial Terraform
+# apply: the first revision uses the public bootstrap image, and scaling it up
+# before the real image is deployed would start that placeholder with
+# production secret refs and the app's managed identity. Raise this after the
+# first real deploy if you do not want scale-to-zero.
 
 variable "min_replicas" {
   description = "Minimum number of Container App replicas kept running."
   type        = number
-  default     = 1
+  default     = 0
 }
 
 variable "max_replicas" {

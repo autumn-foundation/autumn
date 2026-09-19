@@ -1,5 +1,8 @@
 //! Autumn's request extractors.
 //!
+//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/extractors.md)
+//! for the full catalog, the ordering rules, and how to write your own.
+//!
 //! Most are thin wrappers over the Axum extractor of the same name, provided so
 //! users don't need `axum` as a direct dependency and so parse failures use
 //! Autumn's Problem Details error contract. [`Query`] is the exception: it
@@ -108,9 +111,20 @@ where
     }
 }
 
+/// The one gated sink of the first compile-time data-classification slice
+/// (issue #1654).
+///
+/// [`JsonSink`](crate::classify::JsonSink) is blanket-implemented for every
+/// `Serialize` type, so an ordinary handler never notices the bound. What it
+/// excludes is exactly the set autumn withholds `Serialize` from: a `#[model]`
+/// carrying a `#[classified]` column. Releasing such a column at a declared
+/// declassification boundary yields a plain value again, and the released view
+/// serializes here like anything else.
+///
+/// See `docs/guide/data-classification.md`.
 impl<T> IntoResponse for Json<T>
 where
-    axum::Json<T>: IntoResponse,
+    T: crate::classify::JsonSink,
 {
     fn into_response(self) -> Response {
         axum::Json(self.0).into_response()

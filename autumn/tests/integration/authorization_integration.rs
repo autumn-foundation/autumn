@@ -747,6 +747,72 @@ async fn reversed_attribute_order_owner_passes_both() {
     assert_eq!(response.status, StatusCode::OK);
 }
 
+// ── Reversed order + idempotency replay (#1668 follow-up) ────
+//
+// `#[secured]` (and `#[step_up]`/`#[throttle]`) now run their check in a
+// pre-body `FromRequestParts` gate, which executes BEFORE `#[authorize]`'s
+// policy check when `#[authorize]` is written above them — that check still
+// lives entirely inside the handler body. A stale idempotency-guard body
+// scan once let the gate believe it should own replay-serving in this
+// ordering, which would let a retried mutation replay its cached response
+// without ever re-running `#[authorize]`'s policy check.
+
+#[autumn_web::post("/notes-reversed-idempotent/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+#[autumn_web::secured]
+async fn update_note_reversed_attribute_order_idempotent(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    Ok("ok")
+}
+
+fn build_idempotent_reversed_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_reversed_attribute_order_idempotent])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+#[tokio::test]
+async fn idempotent_replay_does_not_bypass_authorize_policy_check_when_secured_gate_runs_first() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-reversed-policy", "999", Some("admin")).await;
+    let client = build_idempotent_reversed_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-reversed-idempotent/1")
+        .header("Cookie", "autumn.sid=sess-reversed-policy")
+        .header("idempotency-key", "reversed-policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    seed_session(&store, "sess-reversed-policy", "999", None).await;
+
+    let retry = client
+        .post("/notes-reversed-idempotent/1")
+        .header("Cookie", "autumn.sid=sess-reversed-policy")
+        .header("idempotency-key", "reversed-policy-recheck-key")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "a #[secured] gate stacked below #[authorize] must not claim idempotency-replay \
+         ownership and bypass #[authorize]'s policy re-check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
 // ── #[authorize] bindings recorded in route metadata (#1627) ──
 //
 // The route macros record every `#[authorize("action", resource = Type)]` on a
@@ -868,4 +934,33 @@ fn handler_without_authorize_has_no_bindings() {
         &["admin"],
         "…while its role guard is still recorded, unchanged"
     );
+}
+
+// ── #[authorize] response schema survives above-route ordering (#1677) ──
+//
+// `#[authorize]` rewrites the handler's return type to `Response` when it
+// expands, exactly like `#[secured]`/`#[step_up]`/`#[throttle]`. Written
+// above `#[post]`, it expands first, so the route macro must recover the
+// original `Json<T>` return type from the `__autumn_inner` binding the guard
+// leaves behind instead of losing the response schema.
+
+#[autumn_web::authorize("update", resource = Note)]
+#[autumn_web::post("/notes-attr-response/{id}")]
+async fn update_note_authorize_above_route_response(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> axum::Json<serde_json::Value> {
+    let _ = id;
+    let _ = note;
+    axum::Json(serde_json::json!({}))
+}
+
+#[test]
+fn authorize_above_route_preserves_response_schema() {
+    let route = __autumn_route_info_update_note_authorize_above_route_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[authorize] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
 }

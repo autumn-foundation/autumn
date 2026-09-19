@@ -79,6 +79,15 @@ pub use password::{
     validate_password,
 };
 
+pub mod impersonation;
+pub use impersonation::{
+    BEGIN_AUDIT_ACTION, END_AUDIT_ACTION, IMPERSONATED_SESSION_KEY, IMPERSONATION_SESSION_ID_KEY,
+    IMPERSONATOR_ROLE_SESSION_KEY, IMPERSONATOR_SESSION_KEY, IMPERSONATOR_STEP_UP_SESSION_KEY,
+    Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationState, ImpersonationTarget,
+    RESERVED_SESSION_KEYS, audit_actor_id, begin_impersonation, end_impersonation,
+    impersonation_state, impersonator_id, is_impersonating, is_reserved_session_key,
+};
+
 pub mod remember;
 pub use remember::{
     DEFAULT_ROTATION_GRACE_SECS, RememberConfig, RememberCredential, RememberDecision,
@@ -217,8 +226,13 @@ pub async fn __check_secured_with_key(
     // token principal, so we must not clobber it with the session user here.
     // (`log::context::set_user_id` for #1169 is independent and stays
     // unconditional.)
+    //
+    // While the session is impersonating (#1394) the responsible principal is
+    // the *real* impersonator, not the user the request resolves as, so the
+    // actor published here is the impersonator. The log context keeps carrying
+    // the effective user (that is the identity the request is acting under).
     if crate::current::Current::actor().is_none() {
-        crate::current::Current::set_actor(user_id.clone());
+        crate::current::Current::set_actor(impersonation::audit_actor_id(session, &user_id).await);
     }
     crate::log::context::set_user_id(user_id);
 
@@ -435,8 +449,16 @@ where
                 // resolver wins" rule: if an outer bearer layer or an explicit
                 // `with_actor(...)` scope already resolved a principal, that one
                 // stays. (`set_user_id` for #1169 is independent, stays unconditional.)
+                //
+                // Impersonation (#1394): the actor is the real impersonator
+                // whenever the session carries one, so writes made while
+                // impersonating stay attributed to the operator.
                 if crate::current::Current::actor().is_none() {
-                    crate::current::Current::set_actor(user_id.clone());
+                    let actor = match session.as_ref() {
+                        Some(session) => impersonation::audit_actor_id(session, &user_id).await,
+                        None => user_id.clone(),
+                    };
+                    crate::current::Current::set_actor(actor);
                 }
                 crate::log::context::set_user_id(user_id);
                 inner.call(req).await
@@ -2521,21 +2543,35 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>(
 }
 
 /// Build a Problem Details response from the API token store error.
+///
+/// Renders through the same classification the canonical [`AutumnError`]
+/// response uses: the rendered status/problem type (which carries the
+/// explicit problem type and the query-timeout reclassification) and the
+/// validation field map. Building the body from `status()` alone derived the
+/// wrong `code` and dropped `errors` (issue #2635).
 fn api_token_error_response<ResBody: From<String> + Default>(
     err: &crate::AutumnError,
     request_id: Option<String>,
     instance: Option<String>,
 ) -> Response<ResBody> {
-    let status = err.status();
-    let message = err.to_string();
+    let (status, problem_type) = err.rendered_problem();
+    // `message`, not `Display`: this string becomes the response `detail`,
+    // which stays the wrapped error even when the error carries a field map.
+    let message = err.message();
+    let details = err.details().cloned();
+    // Redact server-error detail in the body itself: this is the response the
+    // client sees unless a downstream exception filter rebuilds it, and the
+    // raw message stays available to filters/logging via
+    // `AutumnErrorInfo.message`. A reclassified query timeout must read
+    // "Service unavailable", not leak the store's db message.
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
-        None,
-        None,
+        details.as_ref(),
+        problem_type,
         request_id,
         instance,
-        true,
+        false,
     );
     let mut response = Response::builder()
         .status(status)
@@ -2547,8 +2583,8 @@ fn api_token_error_response<ResBody: From<String> + Default>(
         .insert(crate::middleware::AutumnErrorInfo {
             status,
             message,
-            details: None,
-            problem_type: None,
+            details,
+            problem_type,
             backtrace_string: None,
         });
     response
@@ -2977,42 +3013,8 @@ mod tests {
     /// otherwise-identical struct literal that each test would copy verbatim.
     fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
         crate::state::AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            #[cfg(all(feature = "db", feature = "reporting"))]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: auth_session_key.into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: crate::state::AppState::next_app_id(),
+            ..crate::state::AppState::test_default()
         }
     }
 
@@ -4864,7 +4866,10 @@ mod api_token_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], 503);
         assert_eq!(json["code"], "autumn.service_unavailable");
-        assert_eq!(json["detail"], "api token store unavailable");
+        // Server-error detail is redacted in the body (issue #2635): the
+        // store's message stays available to exception filters and logging
+        // via `AutumnErrorInfo.message`, never to the client.
+        assert_eq!(json["detail"], "Service unavailable");
     }
 
     #[tokio::test]
@@ -4944,6 +4949,118 @@ mod api_token_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn api_token_error_response_detail_omits_the_field_map() {
+        // The body renders through the canonical classification, but `detail`
+        // must take `message()`. With `Display` a store returning a
+        // validation error would put the field list in `detail` (issue
+        // #2587).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+        assert_eq!(err.to_string(), "Validation failed: token: Malformed");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(json["detail"], "Validation failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_code_and_errors_for_validation() {
+        // Regression for issue #2635: the body dropped the field map and the
+        // explicit problem type, so `code`/`errors` disagreed with the
+        // canonical render (`autumn.unprocessable_entity`, `errors` empty).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["code"], "autumn.validation_failed");
+        assert_eq!(
+            json["type"],
+            "https://autumn.dev/problems/validation-failed"
+        );
+        assert_eq!(
+            json["errors"],
+            serde_json::json!([{"field": "token", "messages": ["Malformed"]}]),
+        );
+        // The canonical render agrees: same error through `code()`.
+        assert_eq!(err.code(), "autumn.validation_failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_explicit_problem_type() {
+        // Regression for issue #2635: an explicit problem type rendered under
+        // the status-derived code (`autumn.service_unavailable`).
+        let err = crate::AutumnError::query_timeout("query exceeded statement_timeout");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        assert_eq!(json["type"], "https://autumn.dev/problems/query-timeout");
+        assert_eq!(err.code(), "autumn.query_timeout");
+    }
+
+    #[test]
+    fn api_token_error_response_reclassifies_cancelled_statements() {
+        // A database error from a custom `ApiTokenStore` whose message shows a
+        // cancelled statement renders as a redacted 503 query timeout, like
+        // the canonical `IntoResponse` path, not the assigned 500.
+        let err = crate::AutumnError::internal_server_error_msg(
+            "db: canceling statement due to statement timeout",
+        );
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        // Internal detail stays redacted in the body.
+        assert_eq!(json["detail"], "Service unavailable");
+    }
+
+    #[test]
+    fn api_token_error_response_stashes_details_for_exception_filters() {
+        // Regression for issue #2635: the `AutumnErrorInfo` extension dropped
+        // `details`/`problem_type`, so a downstream exception filter could not
+        // recover them either.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let info = response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(info.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            info.details.as_ref().and_then(|m| m.get("token")),
+            Some(&vec!["Malformed".to_owned()]),
+        );
+        // Validation errors carry no explicit problem type (the type URI is
+        // derived from the 422 + field map at render); explicit types like
+        // `query_timeout` are preserved verbatim.
+        assert_eq!(info.problem_type, None);
+        let timeout_err = crate::AutumnError::query_timeout("slow");
+        let timeout_response: http::Response<String> =
+            super::api_token_error_response(&timeout_err, None, None);
+        let timeout_info = timeout_response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(
+            timeout_info.problem_type,
+            Some("https://autumn.dev/problems/query-timeout")
+        );
     }
 
     #[tokio::test]

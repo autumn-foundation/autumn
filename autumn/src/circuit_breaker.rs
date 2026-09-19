@@ -802,16 +802,39 @@ mod tests {
             open_duration: Duration::ZERO,
             half_open_trial_count: 1,
         };
-        let breaker = CircuitBreaker::new("transition_panic_test", policy);
-
         // Panic mid-transition (Closed -> Open) while holding the lock; this
         // both poisons the mutex and interrupts `transition_to`.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracing::subscriber::with_default(PanickingSubscriber, || {
-                breaker.after_call(false);
-            });
-        }));
-        assert!(result.is_err());
+        //
+        // `tracing` callsite `Interest` is a single value cached per callsite
+        // across the WHOLE PROCESS, combined from every concurrently active
+        // dispatcher. `cargo test` runs this alongside thousands of other
+        // unit tests in the same binary, dozens of which install their own
+        // scoped subscribers, so the transition callsite can occasionally be
+        // (re-)cached as "not interested" in the narrow window between this
+        // thread's dispatcher registering and the event firing -- and then
+        // the subscriber never runs and nothing panics. Rebuilding the cache
+        // and re-firing on a fresh breaker converges almost immediately in
+        // practice (the same remedy `router.rs`'s access-log test uses), so
+        // retry a few times rather than flake.
+        let mut breaker = None;
+        for attempt in 1..=5 {
+            let candidate = CircuitBreaker::new("transition_panic_test", policy.clone());
+            tracing::callsite::rebuild_interest_cache();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracing::subscriber::with_default(PanickingSubscriber, || {
+                    candidate.after_call(false);
+                });
+            }));
+            if result.is_err() {
+                breaker = Some(candidate);
+                break;
+            }
+            assert!(
+                attempt < 5,
+                "the panicking subscriber never observed the transition event after {attempt} attempts"
+            );
+        }
+        let breaker = breaker.expect("a poisoned breaker");
         assert!(breaker.inner.is_poisoned());
 
         // The interrupted transition must still be complete: `open_until` was

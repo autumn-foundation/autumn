@@ -13,6 +13,7 @@ framework without destroying the applications that depend on it.
 
 - [Versioning (SemVer)](#versioning-semver)
 - [The Public API Surface](#the-public-api-surface)
+- [The plugin API surface](#the-plugin-api-surface-issue-1601)
 - [What counts as a breaking change](#what-counts-as-a-breaking-change)
 - [What does *not* count as a breaking change](#what-does-not-count-as-a-breaking-change)
 - [Minimum Supported Rust Version (MSRV) policy](#minimum-supported-rust-version-msrv-policy)
@@ -104,11 +105,81 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   in any release. The protocol carries a version field precisely so a host and
   an artifact built from different Autumn versions degrade to origin-serving
   instead of guessing.
+- **The wire-contract lane (issue #1755).** `autumn_web::wire` in full —
+  `Endpoint`, `WireShape`, `WireField`, `ClientEndpoint`, `NoBody`, `WireError`,
+  `call`, and the const checkers `has_field` / `omittable_required_covered` /
+  `client_produces` / `client_accepts` / `client_request_covered` /
+  `path_params_are` / `render_path` — together with the **input syntax** of
+  `#[endpoint]`, `#[derive(WireShape)]`, `wire_client!` and
+  `#[contract_checked]`, and the JSON **descriptor format** written under
+  `target/autumn-contracts/`. All of it is experimental and may change in any
+  release, including a patch. This is a first slice: one workspace, synchronous
+  request/response, JSON over HTTP. The descriptor is a build artifact, not an
+  interchange format — nothing outside this workspace should read it yet, and
+  the cross-version work the format exists to enable will reshape it.
+
+- **The capability-sandboxed plugin lane (issue #1609).** Everything behind the
+  `plugin-sandbox` feature — `autumn_web::plugin_sandbox` in full, including the
+  sandbox **wire protocol** (`WIRE_VERSION`, its NDJSON frames), the
+  `.autumn-plugin` **artifact container** and its format version, the
+  `SandboxManifest` schema and its capability vocabulary, `SandboxHost` /
+  `SandboxOutcome` / `SandboxFailure`, and the `autumn plugin package` /
+  `autumn plugin inspect` output — is experimental and may change in any
+  release. "In full" is meant literally: **every item re-exported from
+  `autumn_web::plugin_sandbox`** is covered, including everything the grown
+  capability vocabulary added in #1632 — the `kv` / `http-outbound` / `db` /
+  `jobs` / `render` capability words, the `[grants]` and `[quotas]` manifest
+  tables, the `call` / `call_result` / `render` / `fragment` wire frames and the
+  `CapabilityCall` / `CallResult` / `CallValue` / `DenialReason` types a guest
+  author codes against, the `CapabilityServices` / `KvStore` / `OutboundHttp` /
+  `PluginStore` / `JobSink` backend traits and their reference implementations,
+  `SandboxRenderOutcome`, `FragmentNode`, `RenderSlots`, `PluginActivityLog`,
+  and every `MAX_*` ceiling. Both the wire and the container carry version
+  fields, and a capability name this build does not understand is a refusal
+  rather than a silently dropped grant — so a host refuses an artifact it cannot
+  fully enforce instead of guessing at it.
+
+  One shape to know: [`SandboxManifest`] is deliberately *not*
+  `#[non_exhaustive]` — building one by hand is a supported path — so every
+  slice that grows the vocabulary adds a field and breaks a struct literal over
+  it. Build one with `SandboxManifest::parse` and edit the public fields of what
+  comes back; that spelling survives.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.
 
 [`AppBuilder::run`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html
+[`SandboxManifest`]: https://docs.rs/autumn-web/latest/autumn_web/plugin_sandbox/manifest/struct.SandboxManifest.html
+
+### The plugin API surface (issue #1601)
+
+Plugins get a contract of their own, narrower and more strongly enforced than
+the crate-wide promise above. Every plugin-facing API is declared **stable** or
+**experimental** in
+[`autumn_web::plugin_contract::PLUGIN_SURFACES`](autumn/src/plugin_contract.rs),
+rendered in [`docs/plugins.md`](docs/plugins.md#the-plugin-api-contract), and
+kept honest by three gates:
+
+- **A pinned reference plugin.** `autumn-plugin-reference` implements `Plugin`
+  and calls every *stable* surface. It is built by the `plugin-contract` CI job
+  on every change, so removing, renaming, or re-signaturing a stable plugin API
+  is a red build here rather than a surprise in a plugin author's.
+- **A registry that cannot outrun its proof.** A stable entry with no call site
+  in the reference plugin fails the same job — the list cannot promise
+  stability for something nothing compiles.
+- **A guide section that must be filled.** A change to the declared surface
+  requires a **Plugin authors** section in
+  [`docs/migrations/next.md`](docs/migrations/next.md), enforced by
+  `scripts/check-plugin-surface.sh`.
+
+A **stable** plugin surface follows this document's SemVer policy exactly. An
+**experimental** one may change in any release, patch included; a plugin
+declares its use of one via `PluginContract::uses_experimental`, and
+`autumn plugin-check` reports it.
+
+Separately, a plugin declares the `autumn-web` range it supports through
+`Plugin::contract`. An excluded pairing fails at registration with a diagnostic
+naming both versions and both remedies, so a mismatch is never silent.
 
 ### The edge capsule's byte-identity claim
 
@@ -324,9 +395,11 @@ UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 **Every release with a breaking change ships a migration guide** under
 [`docs/migrations/`](docs/migrations/) — pre-`1.0` that means most `0.x`
 releases, not just majors. This is enforced, not merely promised:
-`scripts/check-migration-guides.sh` fails CI when a `CHANGELOG.md` section
-declares a breaking change without a matching `docs/migrations/<version>.md`,
-or when a breaking entry does not link its guide (issue #1588). A release
+`scripts/check-migration-guides.sh` fails CI when a changelog section declares
+a breaking change without a matching `docs/migrations/<version>.md`, or when a
+breaking entry does not link its guide (issue #1588). It reads the unreleased
+notes from their own files under `changelog.d/`, so the gate fires on the PR
+that makes the break. A release
 without an upgrade path is treated as a broken build.
 
 The guide is written against the
@@ -346,7 +419,9 @@ Draft guides are opened alongside the *first* breaking change of a cycle, as
 subsequent breaking-change PR; the draft is renamed to `<version>.md` at
 release time, so the release ships with a complete guide on day one. See
 [`docs/migrations/README.md`](docs/migrations/README.md) for the process and
-the `**Breaking:**` changelog convention.
+the `**Breaking:**` changelog convention, and
+[`changelog.d/README.md`](changelog.d/README.md) for where an unreleased entry
+is written.
 
 ## CSV import/export (issue #808)
 
@@ -475,6 +550,55 @@ entirely from already-stable primitives, not a new library surface.
 
 See `docs/generate-teams.md` for the two-line auth-integration seam this
 generator relies on instead of generating its own login/signup.
+
+## SSG manifest `Content-Type` (issue #1832)
+
+### SemVer impact
+
+**Breaking**, and deliberately taken pre-1.0 to close the hole permanently.
+`static_gen::ManifestEntry` gained a public `content_type` field, and both it
+and `static_gen::StaticManifest` became `#[non_exhaustive]` — so an existing
+`ManifestEntry { file, revalidate }` or `StaticManifest { .. }` literal stops
+compiling (E0063/E0639), as does an exhaustive destructuring pattern such as
+`let ManifestEntry { file, revalidate } = entry;` (E0638). Sealing them is the
+point: the manifest format is
+expected to keep growing, and after this release a new field is additive rather
+than breaking. Only code that reads or writes `dist/manifest.json` itself is
+affected; ordinary `#[static_get]` applications are not. See
+[`docs/migrations/next.md`](docs/migrations/next.md).
+
+The JSON format itself is compatible in both directions. `content_type` is
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a new runtime
+reads an old manifest (the field defaults to absent, and the pre-#1832
+derivation runs unchanged), and an old runtime reads a new one (no
+`deny_unknown_fields`, so the extra key is ignored).
+
+`revalidate` gained `#[serde(default)]` — a hand-written entry may now omit it —
+but deliberately **not** `skip_serializing_if`, so what `autumn build` writes
+keeps the shape it has always had. An older Autumn runtime would read either
+form (serde's derive maps a missing `Option` field to `None` even without
+`#[serde(default)]`), so this is not a compatibility fix; it is a decision to
+leave the generated format unchanged for anything else that reads
+`dist/manifest.json` — a rollback, a rolling deploy sharing one `dist/` volume,
+or external tooling with a stricter reader.
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `ManifestEntry::new` / `with_revalidate` / `with_content_type` | `autumn_web::static_gen` | The construction path that survives future fields |
+| `ManifestEntry::content_type` | `autumn_web::static_gen` | `Option<String>`; `None` means "nothing recorded", not "unknown type" |
+| `StaticManifest::new` | `autumn_web::static_gen` | Stamps `generated_at` (Unix-epoch seconds as a decimal string) and `autumn_version` |
+| `StaticManifest::with_generated_at` | `autumn_web::static_gen` | Pins the build timestamp `new` stamped, for reproducible builds |
+| `StaticFileLayer::resolve_entry` → `ResolvedStatic` | `autumn_web::static_gen` | Returns the file path plus the ready-to-serve `Content-Type`; `resolve` remains the file-path-only shorthand |
+| `resolved_content_type` | `autumn_web::static_gen` | The decision function, public so an app serving `dist/` itself can match Autumn's behaviour exactly |
+
+`ResolvedStatic` is `#[non_exhaustive]` from the start, and has no public
+constructor — it is a return type, not something downstream code builds.
+
+`resolved_content_type` returns an `http::HeaderValue`, so `http` is now part of
+`autumn-web`'s public API surface here; it is re-exported as
+`autumn_web::reexports::http` (`autumn_web::http` is the HTTP *client* module).
 
 ## Pre-1.0 notes
 

@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [idempotency, routing, headers, session, body]
+        target: [idempotency, routing, headers, session, body, dns, sandbox]
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
@@ -48,7 +48,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-fuzz tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.7.8
@@ -61,7 +61,7 @@ jobs:
       # to the newest prior cache for this target+ref if the exact key misses, so
       # the corpus is never silently reset to the committed seeds alone.
       - name: Restore persisted corpus
-        uses: actions/cache@v7
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-${{ github.run_id }}

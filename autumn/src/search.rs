@@ -294,6 +294,19 @@ impl IndexDefinition {
                 self.name
             ));
         }
+        // "all" is the magic value `AUTUMN_SEARCH_BACKFILL=all` (and `autumn
+        // search reindex --index all`) use to mean "every registered index".
+        // An index actually named `all` would make that request ambiguous —
+        // and, resolved as "every index", silently reindex (or with
+        // `--purge`, empty) every index instead of the one requested. Reject
+        // it at registration so the ambiguity can never reach a backfill.
+        if self.name.eq_ignore_ascii_case("all") {
+            return invalid(format!(
+                "search index name {:?} is reserved: \"all\" selects every index in \
+                 AUTUMN_SEARCH_BACKFILL / `autumn search reindex --index`",
+                self.name
+            ));
+        }
         if !is_valid_index_identifier(self.language) {
             return invalid(format!(
                 "search language {:?} on index {:?} is not an identifier",
@@ -599,6 +612,18 @@ mod tests {
         let mut d = def();
         d.name = "arti cles";
         assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn definition_rejects_the_reserved_all_name() {
+        // "all" is the AUTUMN_SEARCH_BACKFILL / `--index` sentinel for "every
+        // index" — an index actually named `all` would make a request for it
+        // ambiguous with a request to rebuild (or purge) everything.
+        for name in ["all", "All", "ALL"] {
+            let mut d = def();
+            d.name = name;
+            assert!(d.validate().is_err(), "{name:?} must be rejected");
+        }
     }
 
     #[test]

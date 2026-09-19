@@ -1,0 +1,36 @@
+{
+  "id": "evt_test_inv_paid_1",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1789257600,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "invoice.paid",
+  "data": {
+    "object": {
+      "id": "in_test_1",
+      "object": "invoice",
+      "amount_due": 1999,
+      "amount_paid": 1999,
+      "amount_remaining": 0,
+      "attempt_count": 2,
+      "attempted": true,
+      "billing_reason": "subscription_cycle",
+      "collection_method": "charge_automatically",
+      "created": 1788994800,
+      "currency": "usd",
+      "customer": "cus_test_1",
+      "customer_email": "buyer@example.com",
+      "livemode": false,
+      "metadata": {},
+      "next_payment_attempt": null,
+      "paid": true,
+      "period_end": 1788998400,
+      "period_start": 1786406400,
+      "status": "paid",
+      "subscription": "sub_test_1",
+      "total": 1999
+    }
+  }
+}

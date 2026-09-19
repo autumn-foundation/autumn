@@ -1,0 +1,5 @@
+error: `#[derivation(Post, ...)]` cannot pick a foreign key: model `Comment` has 2 `#[belongs_to(Post)]` legs (`post_id`, `origin_id`). Name the one this derivation counts with `fk = <column>`
+  --> tests/compile-fail/model_derivation_ambiguous_fk.rs:35:3
+   |
+35 | #[derivation(Post, column = "published_comment_count", filter = published)]
+   |   ^^^^^^^^^^

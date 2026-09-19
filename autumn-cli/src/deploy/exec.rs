@@ -65,6 +65,7 @@
 //! before cutover (AC-3).
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -821,6 +822,11 @@ pub fn first_deploy_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909). Immediately after
+    // `prepare-dirs` and before the migrate one-shot, so the migration and the app
+    // open the same file.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -861,22 +867,24 @@ pub fn first_deploy_ops(
             "systemctl daemon-reload",
         )),
     ]);
-    // Pending migrations run BEFORE the initial release is even started (issue
-    // #1607, AC-3). `systemd-run --wait` returns the child's exit status, so a
-    // failed migration surfaces a non-zero error that stops `run_ops` here — the
-    // slot never starts, the proxy is never routed at it, and the caller's
-    // first-deploy teardown removes the half-written release.
+    // Pending migrations run before the initial release is even started (#1607, AC-3).
+    // `systemd-run --wait` returns the child's exit status, so a failed migration
+    // surfaces a non-zero error that stops `run_ops` here: the slot never starts, the
+    // proxy is never routed at it, and the caller's first-deploy teardown removes the
+    // half-written release.
     //
-    // It sits AFTER `daemon-reload` (which only reloads unit files and starts
-    // nothing) rather than before it, so `daemon-reload` is unambiguously a
-    // PRE-migrate step on BOTH builders — see [`PRE_MIGRATE_LABELS`], which the
-    // fleet summary uses to tell "died before migrating" from "the schema moved".
-    //
-    // `MigrateStep::Skip` omits ONLY this op (a fleet migrates exactly once); see
-    // [`MigrateStep`].
+    // It sits after `daemon-reload`, which only reloads unit files and starts nothing,
+    // rather than before it, so `daemon-reload` is unambiguously a pre-migrate step on
+    // both builders — see [`PRE_MIGRATE_LABELS`], which the fleet summary uses to tell
+    // "died before migrating" from "the schema moved". `MigrateStep::Skip` omits only
+    // this op, since a fleet migrates exactly once; see [`MigrateStep`].
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
+    // The migration is what creates the SQLite database on a first deploy, so
+    // the marker that tells a later deploy it MUST be there is recorded here,
+    // not left for a later deploy to observe (#2589 item 17).
+    ops.extend(sqlite_data_adopted_op(cfg).map(DeployOp::Run));
     ops.extend([
         // enable = boot-persistence; restart = start-or-relaunch. We deliberately
         // use `restart` (not `enable --now`) because an already-active slot — one
@@ -979,30 +987,32 @@ pub fn cutover_ops(
     let candidate_unit_path = format!("/etc/systemd/system/{candidate_unit}.service");
     let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
 
-    // Refresh the SHARED proxy unit on the redeploy path too (issue #2070).
-    // Previously only `first_deploy_ops` wrote the proxy unit, so a fix landed in
-    // the unit (e.g. the reboot-durable `StateDirectory`/`HOME` of #2069) never
-    // reached an already-provisioned host on upgrade. Prepending the idempotent
-    // install (mirroring how `first_deploy_ops` starts) rewrites it on every
-    // redeploy, and — kamal-proxy only — restarts + re-registers the live upstream
-    // ONLY when the unit actually changed, so an existing host adopts the new unit
-    // with a routeless window bounded to ~the restart (see
-    // `ProxyController::refresh_installed_ops`). Writing the unit is deterministic,
-    // lands at the final path, and causes no restart on its own, so it is safe to do
-    // at the very start of the cutover; the live upstream re-registered on a change
-    // is the release serving RIGHT NOW, targeted at the DERIVED live-slot port
-    // (`plan.live_port`). That derived port is CORRECT here because the redeploy path
-    // refuses a concurrent `server.port` change at pre-flight (#2073,
-    // `refuse_concurrent_public_port_change`), so the public port is unchanged and the
-    // derived live port necessarily equals the port the live release actually binds —
-    // a live-safe port change is future work (Option C). The candidate/flip below use
-    // the new derived candidate port, which the new release genuinely binds.
+    // Refresh the shared proxy unit on the redeploy path too (#2070). Previously only
+    // `first_deploy_ops` wrote the proxy unit, so a fix landed in the unit — the
+    // reboot-durable `StateDirectory`/`HOME` of #2069, say — never reached an
+    // already-provisioned host on upgrade. Prepending the idempotent install, mirroring
+    // how `first_deploy_ops` starts, rewrites it on every redeploy and, for kamal-proxy
+    // only, restarts and re-registers the live upstream when the unit actually changed,
+    // so an existing host adopts the new unit with a routeless window bounded to about
+    // the restart (see `ProxyController::refresh_installed_ops`). Writing the unit is
+    // deterministic, lands at the final path, and causes no restart on its own, so it is
+    // safe at the very start of the cutover.
     //
-    // The re-register carries `reregister_options` — the OLD release's own TLS/host
-    // recovered from the `shared/proxy-options` marker (issue #2074) — NOT the new
-    // config's, so a later-op failure + rollback leaves the still-live old release on
-    // its OWN host/TLS instead of the new/removed one. The candidate flip below still
-    // uses the controller's NEW `tls_host`.
+    // The live upstream re-registered on a change is the release serving right now,
+    // targeted at the derived live-slot port (`plan.live_port`). That derived port is
+    // correct here because `plan.public_port` is always the port the live release was
+    // ACTUALLY deployed under: on a redeploy carrying a concurrent `server.port` change
+    // (#2073, `PublicPortMove`), the caller builds `plan` from the OLD installed port, not
+    // the new requested one, so this refresh call sees no port change and stays a no-op
+    // through phase 3. The move to the new public port is a separate, later phase
+    // (`execute_public_port_rebind`), run only after the candidate is live and the old
+    // release has drained. The candidate and flip below use the new derived candidate
+    // port, which the new release genuinely binds.
+    //
+    // The re-register carries `reregister_options` — the old release's own TLS and host,
+    // recovered from the `shared/proxy-options` marker (#2074) — not the new config's, so
+    // a later-op failure and rollback leaves the still-live old release on its own host
+    // and TLS. The candidate flip below still uses the controller's new `tls_host`.
     let mut ops = proxy.refresh_installed_ops(
         plan.public_port,
         &cfg.service_name,
@@ -1018,6 +1028,10 @@ pub fn cutover_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909) — same position as
+    // on the first-deploy path, and still before the migrate one-shot.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -1060,18 +1074,21 @@ pub fn cutover_ops(
             ),
         )),
     ]);
-    // Migrations run BEFORE the flip. `systemd-run --wait` returns the child's
-    // exit status, so a failed migration surfaces a non-zero error that stops
-    // run_ops before the flip — old release still serving (AC-3).
-    //
-    // #1621: this is the ONE op a fleet parameterises. The position is unchanged
-    // (between `start-candidate` and `readiness-gate`, i.e. PRE-boundary, so the
-    // existing candidate-teardown path still covers a failed migration), and
-    // `MigrateStep::Skip` omits ONLY this op — hosts 2..N of a fleet, whose shared
-    // schema the first redeploying host already migrated. See [`MigrateStep`].
+    // Migrations run before the flip. `systemd-run --wait` returns the child's exit
+    // status, so a failed migration surfaces a non-zero error that stops `run_ops` before
+    // the flip, leaving the old release serving (AC-3). #1621: this is the one op a fleet
+    // parameterises. Its position is unchanged — between `start-candidate` and
+    // `readiness-gate`, so pre-boundary, and the existing candidate-teardown path still
+    // covers a failed migration — and `MigrateStep::Skip` omits only this op, for hosts
+    // 2..N of a fleet whose shared schema the first redeploying host already migrated.
+    // See [`MigrateStep`].
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
+    // The migration is what creates the SQLite database on a first deploy, so
+    // the marker that tells a later deploy it MUST be there is recorded here,
+    // not left for a later deploy to observe (#2589 item 17).
+    ops.extend(sqlite_data_adopted_op(cfg).map(DeployOp::Run));
     ops.extend([
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
@@ -1081,15 +1098,14 @@ pub fn cutover_ops(
         // live traffic to it and drains the old target. Only reached after a
         // passing readiness gate (AC-2).
         proxy.flip_op(&cfg.service_name, &loopback_upstream(plan.candidate_port)),
-        // Commit the on-disk state markers as ONE remote transaction after the flip
-        // (#1938): a single SSH round-trip that either lands as a unit or fails as a
-        // unit, so a failure between the flip and completing the markers can no
-        // longer leave the proxy on the new release while the markers still describe
-        // the old one. Internally it (1) records the release being replaced (its dir
-        // + live slot) as the new "previous release" — read from `current` +
-        // live-slot BEFORE they change — then (2) repoints `current` to the new
-        // release, then (3) records the new live slot. Each marker file is written
-        // via temp-file + `mv` (atomic rename), not a truncating redirect.
+        // Commit the on-disk state markers as one remote transaction after the flip
+        // (#1938): a single SSH round-trip that lands as a unit or fails as a unit, so a
+        // failure between the flip and completing the markers can no longer leave the
+        // proxy on the new release while the markers describe the old one. It records the
+        // release being replaced — its dir and live slot — as the new "previous release",
+        // read from `current` and the live slot before they change; then repoints
+        // `current` to the new release; then records the new live slot. Each marker file
+        // is written via temp file plus `mv`, an atomic rename, not a truncating redirect.
         DeployOp::Run(commit_markers_command(
             cfg,
             &release_dir,
@@ -1198,6 +1214,14 @@ pub fn candidate_teardown_ops(
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
+///
+/// Builds ONLY the app-teardown chain — never the proxy route. The fleet
+/// compensation case (issue #2270) removes the route as its OWN, separate step
+/// after this succeeds; see
+/// [`compensate_teardown`](crate::deploy::compensate_teardown) for why: folding
+/// it in here would let a transport failure on the route step (which carries no
+/// op label at all) masquerade as an ordinary op failure earlier in this chain,
+/// when in truth every op here would already have succeeded.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -1351,15 +1375,14 @@ pub fn rollback_ops(
 ) -> Vec<DeployOp> {
     let previous_unit = slot_unit_name(&cfg.service_name, target.slot);
     let previous_unit_path = format!("/etc/systemd/system/{previous_unit}.service");
-    // Re-render the TARGET release's slot unit from the persisted marker (dir +
-    // port), so rollback never depends on the slot's on-disk unit being intact. A
-    // redeploy reusing this slot overwrites its unit to point at the new candidate
-    // BEFORE the flip; if that redeploy fails pre-flip its teardown removes the
-    // candidate dir but leaves the slot unit pointing at the now-removed dir. Left
-    // as-is, `restart-previous` below would relaunch that clobbered unit
-    // (ExecStart -> removed dir) instead of the retained previous release. Rendering
-    // from `target.release_dir`/`target.port` (NOT the current live config) restores
-    // the correct unit for the release we roll back to.
+    // Re-render the target release's slot unit from the persisted marker — dir and port
+    // — so rollback never depends on the slot's on-disk unit being intact. A redeploy
+    // reusing this slot overwrites its unit to point at the new candidate before the
+    // flip; if that redeploy fails pre-flip, its teardown removes the candidate dir but
+    // leaves the slot unit pointing at the now-removed dir. Left as-is, `restart-previous`
+    // below would relaunch that clobbered unit, whose ExecStart names a removed dir,
+    // instead of the retained previous release. Rendering from `target.release_dir` and
+    // `target.port`, not the current live config, restores the correct unit.
     let target_unit = super::render_app_unit(cfg, &target.release_dir, target.port, target.slot);
     // The slot that was live before this rollback — traffic just moved away from
     // it. `target.slot` is the slot we roll back TO, so the former-live slot is the
@@ -1374,7 +1397,14 @@ pub fn rollback_ops(
         .port
         .saturating_sub(if target.slot == SLOT_GREEN { 2 } else { 1 });
     let former_live_fallback_port = slot_app_port(public_port, other_slot(target.slot));
-    vec![
+    let mut ops = Vec::new();
+    // Re-link the rollback target at the shared SQLite data file (#1909) before its
+    // unit is written or started. A release deployed BEFORE the file was adopted
+    // into `shared/` no longer holds one at that path, so without this the
+    // rolled-back release would boot against a fresh, empty database.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
+    ops.extend(sqlite_data_link_op(cfg, &target.release_dir).map(DeployOp::Run));
+    ops.extend([
         // Re-render the target slot's unit BEFORE bringing it up, so rollback can
         // never restart a slot unit that an earlier failed redeploy clobbered (see
         // the `target_unit` comment above). The unit is rendered from the target's
@@ -1409,17 +1439,15 @@ pub fn rollback_ops(
         // Health-gated flip back: the previous unit (brought up above) must pass
         // /ready before the proxy swaps traffic to it.
         proxy.flip_op(&cfg.service_name, &loopback_upstream(target.port)),
-        // Commit the on-disk state markers as ONE remote transaction after the flip
-        // (#1938), symmetric with cutover: a single SSH round-trip that lands or
-        // fails as a unit, so a failure between the flip and completing the markers
-        // cannot leave the proxy on the rolled-back release while the markers still
-        // describe the release we rolled back FROM. Internally it (1) records the
-        // release we are rolling back FROM (its dir + the former-live slot,
-        // `other_slot(target.slot)`) as the new "previous release" — read from
-        // `current` + live-slot BEFORE they change — then (2) repoints `current` to
-        // the target release, then (3) records the target's live slot. Each marker
-        // file is written via temp-file + `mv` (atomic rename), not a truncating
-        // redirect.
+        // Commit the on-disk state markers as one remote transaction after the flip
+        // (#1938), symmetric with cutover: a single SSH round-trip that lands or fails as
+        // a unit, so a failure between the flip and completing the markers cannot leave
+        // the proxy on the rolled-back release while the markers still describe the
+        // release we rolled back from. It records the release being rolled back from —
+        // its dir and the former-live slot, `other_slot(target.slot)` — as the new
+        // "previous release", read from `current` and the live slot before they change;
+        // then repoints `current` to the target release; then records the target's live
+        // slot. Each marker file is written via temp file plus `mv`, an atomic rename.
         DeployOp::Run(commit_markers_command(
             cfg,
             &target.release_dir,
@@ -1445,7 +1473,8 @@ pub fn rollback_ops(
             "drain-rolled-back-slot",
             format!("systemctl disable --now {rolled_back_unit}.service"),
         )),
-    ]
+    ]);
+    ops
 }
 
 /// Teardown for an on-demand rollback that fails AT OR BEFORE the health-gated
@@ -1658,6 +1687,9 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     "proxy-install",
     "proxy-restart-if-changed",
     "prepare-dirs",
+    // #1909: the SQLite data-file ops, emitted only for a SQLite app.
+    "check-data-dir",
+    "link-data",
     "upload-binary",
     "upload-config",
     "write-env",
@@ -1729,6 +1761,368 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
             bin = shell_quote(&bin),
         ),
     )
+}
+
+/// The op that makes a `SQLite` data file survive a deploy (issue #1909), or
+/// `None` when there is nothing to keep (a Postgres app, or an absolute path
+/// the deploy does not relocate).
+///
+/// A slot unit's `WorkingDirectory` is the release dir, so a relative
+/// `sqlite://app.db` resolves inside a directory that is replaced on every
+/// deploy and deleted by retention. So the real file lives under `shared/data`,
+/// and the release is linked at the path the app resolves. `SQLite` follows the
+/// symlink when it names the `-wal`/`-shm`/`-journal` sidecars, so they land
+/// beside the shared file too.
+///
+/// It runs immediately after `prepare-dirs`, and so BEFORE the migrate one-shot.
+/// A migration that ran first would apply to a file in the release dir that the
+/// app never opens.
+///
+/// # The states, decided together
+///
+/// Guards added one at a time did not converge here (#2589 items 8, 10, 17):
+/// each new guard needed an exemption, and each exemption was a state nobody had
+/// enumerated. So the two questions are asked ONCE, in this order, over the whole
+/// state space rather than per-case:
+///
+/// **1. Who owns the file at `current/<db>`?** Only two answers let a deploy
+/// proceed — nothing is there, or what is there is a symlink this deploy wrote,
+/// pointing at the shared file. Anything else is a database the deploy did not
+/// put there, and linking past it would serve an empty one and orphan theirs:
+///
+/// | `current/<db>` | |
+/// | --- | --- |
+/// | absent | proceed |
+/// | symlink → the shared file | proceed — already adopted |
+/// | symlink → anywhere else | refuse: operator-managed database |
+/// | a real file | refuse: live pre-#1909 database |
+///
+/// This is deliberately NOT gated on the shared file being absent. That gate
+/// made the two refusals unreachable whenever the shared file happened to exist,
+/// so a legacy `current/<db>` pointing at a different database was linked past in
+/// silence and the app served the shared one after cutover (#2589 item 8).
+///
+/// **2. Should the shared file be there?** A missing shared file is either a
+/// first deploy or a mounted volume that is gone, and `current` cannot tell them
+/// apart — on both, the link exists and dangles. The distinguishing signal is
+/// [`ResolvedDeployConfig::sqlite_data_marker_file`], written once the database
+/// is known to exist and kept in `shared/`, outside any `shared/data` mount:
+///
+/// | shared file | marker | |
+/// | --- | --- | --- |
+/// | present | either | proceed, and record the marker |
+/// | absent | absent | proceed — never created, a genuine first deploy |
+/// | absent | present | refuse: it existed once and is gone |
+///
+/// Without that distinction the deploy recreated the directory under the absent
+/// mount, the migration opened the dangling link under `SQLite`'s
+/// create-on-missing mode, and a fresh empty database was served while the real
+/// one was orphaned (#2589 item 17).
+///
+/// # Then
+///
+/// **Set aside a stale real file.** A rollback target from before the migration
+/// still holds its own database at the release path. It is moved beside the
+/// shared file as `<file>.superseded`, under `shared/`, where retention never
+/// reaches it. An existing one is refused rather than overwritten, so the op can
+/// never destroy a database.
+///
+/// **Link this release.**
+///
+/// Every interpolated path is shell-quoted, and every step gates the next.
+#[must_use]
+pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Option<RemoteCommand> {
+    let relative = cfg.relative_sqlite_data_file()?;
+    let shared = cfg.shared_sqlite_data_file()?;
+    let marker = cfg.sqlite_data_marker_file();
+    let superseded = format!("{shared}.superseded");
+    let shared_parent = parent_dir(&shared);
+    let in_release = format!("{release_dir}/{relative}");
+    let release_parent = parent_dir(&in_release);
+    let current = format!("{}/{relative}", cfg.current_symlink());
+    let service = &cfg.service_name;
+
+    // Diagnostics are built HERE, from raw paths, and shell-quoted ONCE as whole
+    // words. Interpolating already-quoted paths inside a double-quoted `echo`
+    // would leave them expandable — single quotes are literal there — so a
+    // database path containing `$(…)` would run a command on the deploy host.
+    let refusal = format!(
+        "autumn deploy: {current} is a live SQLite database. The data file must live at \
+         {shared} to survive a deploy, and moving it while the app runs is not safe, so \
+         this deploy stopped."
+    );
+    let recovery = adoption_recovery(service, &current, &shared, MoveSource::TheLinkPathItself);
+    // A `current` that is a SYMLINK is refused too, and needs its own message:
+    // it points at a database the operator manages elsewhere, and `mv` on the
+    // link would move the link, not that database.
+    let linked_refusal = format!(
+        "autumn deploy: {current} is a symlink to a SQLite database that is not \
+         {shared}. The data file must live there to survive a deploy, so this deploy \
+         stopped rather than link past it and serve a different database."
+    );
+    let linked_recovery = adoption_recovery(service, &current, &shared, MoveSource::WhatItPointsAt);
+    // The marker says the database existed; the file says it does not. Never
+    // "probably a first deploy" — creating a fresh one here is the loss.
+    let missing_refusal = format!(
+        "autumn deploy: the SQLite database {shared} is missing, but {marker} records that \
+         it existed. The volume holding {shared_parent} is most likely not mounted, and \
+         continuing would create a fresh empty database and orphan the real one, so this \
+         deploy stopped."
+    );
+    let missing_recovery = format!(
+        "Mount the volume holding {shared} and deploy again. If the database was \
+         deliberately removed and a new one should be created, remove {marker} first."
+    );
+    let occupied =
+        format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
+
+    Some(RemoteCommand::new(
+        "link-data",
+        // Question 1 is the `current/<db>` ownership block; question 2 is the
+        // shared-file/marker block. Question 2 is asked BEFORE the `mkdir`, which
+        // would otherwise create a directory over an absent mount and hide the
+        // very state it refuses on.
+        format!(
+            "if {{ [ -e {current_q} ] || [ -L {current_q} ]; }} && \
+             ! {{ [ -L {current_q} ] && [ \"$(readlink {current_q})\" = {shared_q} ]; }}; then \
+             if [ -L {current_q} ]; then \
+             echo {linked_refusal_q} >&2; echo {linked_recovery_q} >&2; \
+             else echo {refusal_q} >&2; echo {recovery_q} >&2; fi; exit 1; \
+             fi && \
+             if [ -e {shared_q} ]; then : > {marker_q} || exit 1; \
+             elif [ -e {marker_q} ]; then \
+             echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi && \
+             mkdir -p {shared_parent_q} {release_parent_q} && \
+             if [ -e {in_release_q} ] && [ ! -L {in_release_q} ]; then \
+             if [ -e {superseded_q} ]; then echo {occupied_q} >&2; exit 1; fi; \
+             for s in -wal -shm -journal; do \
+             if [ -e {in_release_q}$s ]; then \
+             mv -f {in_release_q}$s {superseded_q}$s || exit 1; fi; \
+             done; \
+             mv -f {in_release_q} {superseded_q} || exit 1; \
+             fi && \
+             rm -f {in_release_q} && ln -s {shared_q} {in_release_q}",
+            shared_parent_q = shell_quote(&shared_parent),
+            release_parent_q = shell_quote(&release_parent),
+            shared_q = shell_quote(&shared),
+            marker_q = shell_quote(&marker),
+            superseded_q = shell_quote(&superseded),
+            current_q = shell_quote(&current),
+            in_release_q = shell_quote(&in_release),
+            refusal_q = shell_quote(&refusal),
+            recovery_q = shell_quote(&recovery),
+            linked_refusal_q = shell_quote(&linked_refusal),
+            linked_recovery_q = shell_quote(&linked_recovery),
+            missing_refusal_q = shell_quote(&missing_refusal),
+            missing_recovery_q = shell_quote(&missing_recovery),
+            occupied_q = shell_quote(&occupied),
+        ),
+    ))
+}
+
+/// Which file the printed adoption recovery moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveSource {
+    /// `current/<db>` is a real database: move it.
+    TheLinkPathItself,
+    /// `current/<db>` is a symlink: move what it resolves to, then drop the link.
+    /// `mv` on the link would move the link, not the database.
+    WhatItPointsAt,
+}
+
+/// The one-time manual adoption an operator pastes and runs, for both refusals.
+///
+/// # Why sidecars move first, one gated step each
+///
+/// `shared/data/<file>` existing is what makes the NEXT deploy skip the adoption
+/// refusal. So the database must be the LAST thing to move: if a sidecar move
+/// fails, the database is still at its old path, the refusal fires again, and a
+/// retry resumes. Moving the database first and then looping over the sidecars
+/// strands the `-wal` — the next deploy proceeds and the app starts without every
+/// frame it held (#2589 item 10).
+///
+/// Each sidecar is therefore its own `&&`-gated step rather than a `for` loop: a
+/// loop's status is its LAST iteration's, so a failure in the first is invisible
+/// to whatever follows — which is exactly how that invariant was lost.
+///
+/// `&&` throughout, and never `exit`: this is pasted into an interactive shell,
+/// where `exit` would close the operator's session. A failed `systemctl stop`
+/// (stop timeout, no permission, a process that will not die) must stop the
+/// chain, because relocating a LIVE database is the split-WAL loss the refusal
+/// exists to prevent.
+///
+/// Sidecars are named, never globbed: `{file}*` also matches an unrelated
+/// `{file}.backup` and would move it, possibly over a file of that name already
+/// in the shared dir.
+///
+/// Each file moves to its EXACT shared name, not merely into the shared
+/// directory: the link target may carry a different basename, and landing the
+/// database next to the name the deploy expects rather than at it leaves the next
+/// deploy creating an empty one.
+fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSource) -> String {
+    let blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE)));
+    let green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN)));
+    let current_q = shell_quote(current);
+    let shared_q = shell_quote(shared);
+    // The database to move, as one shell word. For a symlink it is resolved
+    // first, into `$src`, because `mv` on a link moves the link.
+    let (resolve, src) = match source {
+        MoveSource::TheLinkPathItself => (String::new(), current_q.clone()),
+        MoveSource::WhatItPointsAt => (
+            format!("src=$(readlink -f {current_q}) && "),
+            "\"$src\"".to_owned(),
+        ),
+    };
+    let mut sidecars = String::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        // `[ ! -e X ] || mv X Y` — absent is success, present must move
+        // successfully, and either way the result gates the next step.
+        write!(
+            sidecars,
+            "{{ [ ! -e {src}{suffix} ] || mv {src}{suffix} {shared_q}{suffix}; }} && "
+        )
+        .expect("writing to a String cannot fail");
+    }
+    // The link itself is removed last of all, after the database has landed: a
+    // failure before that leaves the refusal firing on an unchanged layout.
+    let cleanup = match source {
+        MoveSource::TheLinkPathItself => String::new(),
+        MoveSource::WhatItPointsAt => format!(" && rm -f {current_q}"),
+    };
+    format!(
+        "Run this on the host once, then deploy again: systemctl stop {blue_q} {green_q} && \
+         {resolve}{sidecars}mv {src} {shared_q}{cleanup}"
+    )
+}
+
+/// Record that the shared `SQLite` database now exists (issue #1909, #2589 item
+/// 17), or `None` when the deploy manages no data file.
+///
+/// This runs AFTER the migrate one-shot, which is what creates the database on a
+/// first deploy. Without it the marker was only ever written by a LATER deploy
+/// observing the file, leaving a one-deploy window: a first deploy creates the
+/// database, the `shared/data` volume then becomes unavailable, and the next
+/// deploy sees both the file and the marker absent, reads that as a genuine
+/// first deploy, and creates a fresh database beneath the missing mount while
+/// the real one is orphaned.
+///
+/// Guarded on the file existing, so a run whose migration was skipped (or which
+/// legitimately has no database yet) records nothing rather than arming a
+/// refusal against a database that was never created.
+#[must_use]
+pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
+    let shared = cfg.managed_sqlite_data_file()?;
+    Some(RemoteCommand::new(
+        "record-data-adopted",
+        format!(
+            "if [ -e {shared_q} ]; then : > {marker_q} || exit 1; fi",
+            shared_q = shell_quote(&shared),
+            marker_q = shell_quote(&cfg.sqlite_data_marker_file()),
+        ),
+    ))
+}
+
+/// Verify on the HOST that an operator-managed absolute `SQLite` database is not
+/// inside the releases directory (issue #1909, #2589 item 13), or `None` when
+/// there is none to check.
+///
+/// `classify_sqlite_data_file` answers this locally and lexically, which is the
+/// only thing it CAN do — the path names a file on the deploy target and this
+/// process cannot stat it. That leaves one hole: a symlinked `app_dir`
+/// (`/srv/autumn/app -> /mnt/apps/app`) whose database URL uses the RESOLVED
+/// spelling. The text compare calls the file external and grades it durable,
+/// while the prune walks `/srv/autumn/app/releases` to the same inodes and
+/// deletes it.
+///
+/// No local computation can close that — so this asks the host, which can
+/// `readlink -f` both sides. It runs beside `link-data`, before anything is
+/// uploaded or pruned, so a refusal costs nothing.
+///
+/// Directories are resolved, not the database file itself: the file may not
+/// exist yet, and `readlink -f` on a missing path still resolves its existing
+/// prefix, so an absent database grades the same as a present one.
+///
+/// It also CREATES the parent when the database sits in `shared/data`. That is
+/// the placement the guide recommends (`sqlite:///srv/autumn/myapp/shared/data/app.db`),
+/// and nothing else makes the directory for it: `prepare-dirs` creates `shared/`
+/// but not `shared/data/`, and the op that does — `sqlite_data_link_op` — is
+/// emitted only for a RELATIVE path. On a fresh host the migration then failed,
+/// because `SQLite` will not create a database whose parent directory is absent.
+///
+/// Only inside `shared/data`, never for a path outside the app dir: `/var/lib/…`
+/// is the operator's own directory, and silently creating it would be the deploy
+/// reaching past its own namespace.
+#[must_use]
+pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
+    let path = cfg.persistent_sqlite_data_file()?;
+    let app_dir = &cfg.app_dir;
+    let marker = cfg.sqlite_data_marker_file();
+    // The same refusal `link-data` gives a relative database whose shared file has
+    // gone: the marker says it existed, so a missing file is a fault, not a first
+    // deploy. Without it the `mkdir` below recreated the directory over an absent
+    // mount and the migration created a fresh empty database inside it, which the
+    // app then served and wrote to while the real one sat unavailable.
+    let missing_refusal = format!(
+        "autumn deploy: the SQLite database {path} is missing, but {marker} records that \
+         it existed. The volume holding it is most likely not mounted, and continuing \
+         would create a fresh empty database and orphan the real one, so this deploy \
+         stopped."
+    );
+    let missing_recovery = format!(
+        "Mount the volume holding {path} and deploy again. If the database was \
+         deliberately removed and a new one should be created, remove {marker} first."
+    );
+    let refusal = format!(
+        "autumn deploy: the SQLite database {path} resolves to a path inside the deploy's \
+         own app directory ({app_dir}), where only {} is yours: `releases/` is replaced on \
+         every deploy and deleted by release retention, and the rest of `shared/` holds \
+         deploy state files that would overwrite it. Only the host can see this, because \
+         `{app_dir}` resolves elsewhere there. Move the database there, or outside \
+         {app_dir} altogether.",
+        cfg.shared_data_dir()
+    );
+    Some(RemoteCommand::new(
+        // Named for the check, but it also CREATES the directory when the
+        // database sits in the deploy's own `shared/data` — see below.
+        "check-data-dir",
+        // The same rule `classify_sqlite_data_file` applies lexically — inside
+        // the app dir but outside `shared/` — re-asked where both sides can
+        // actually be resolved.
+        //
+        // The DATABASE PATH is resolved, not merely its parent: the configured
+        // path can itself be a symlink (`/var/lib/app.db -> …/releases/r1/app.db`),
+        // and resolving only the parent leaves it outside the app dir and
+        // approves it while the app opens the target inside `releases/`, where
+        // pruning deletes it. `readlink -f` resolves a path whose final component
+        // does not exist yet, so a not-yet-created database grades the same as a
+        // present one; the literal spelling is the fallback for a path it cannot
+        // resolve at all.
+        format!(
+            "app=$(readlink -f {app_dir_q} 2>/dev/null || printf '%s' {app_dir_q}); \
+             db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
+             dir=$(dirname \"$db\"); \
+             case \"$dir\" in \
+             \"$app/shared/data\"|\"$app/shared/data/\"*) \
+             if [ -e \"$db\" ]; then : > {marker_q} || exit 1; \
+             elif [ -e {marker_q} ]; then \
+             echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi; \
+             mkdir -p \"$dir\" || exit 1 ;; \
+             \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
+             esac",
+            app_dir_q = shell_quote(app_dir),
+            db_q = shell_quote(path),
+            marker_q = shell_quote(&marker),
+            refusal_q = shell_quote(&refusal),
+            missing_refusal_q = shell_quote(&missing_refusal),
+            missing_recovery_q = shell_quote(&missing_recovery),
+        ),
+    ))
+}
+
+/// The parent directory of a remote path, or `.` when it has none.
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(|| ".".to_owned(), |(head, _)| head.to_owned())
 }
 
 /// Prune shell: keep the newest `keep` release dirs, delete the rest — but NEVER
@@ -1883,23 +2277,42 @@ fn parse_proxy_options(section: &str) -> ProxyOptionsMarker {
 
 /// The `--http-port` state of the currently-installed kamal-proxy systemd unit,
 /// captured in the same deploy-start probe round-trip (#2073). The redeploy path
-/// uses it to REFUSE a concurrent `server.port` change before touching the proxy:
-/// the reboot-durability restart-refresh (#2070) re-execs `kamal-proxy run` and
-/// re-registers the still-live upstream at its DERIVED port, which is only correct
-/// when the public port is unchanged — so a mismatch must fail the pre-flight
-/// rather than strand `:80` mid-cutover. Supporting a live-safe port change is
-/// tracked separately (Option C).
+/// compares it against the requested `server.port` to detect a concurrent public-
+/// port change BEFORE touching the proxy: the reboot-durability restart-refresh
+/// (#2070) re-execs `kamal-proxy run` and re-registers the still-live upstream at
+/// its DERIVED port, which is only correct when computed from the port the proxy
+/// is ACTUALLY installed on. A detected change resolves to a [`PublicPortMove`]
+/// (Option C) — the OLD port drives every op through the drain of the old release,
+/// and the move to the NEW port is deferred to its own post-cutover phase
+/// ([`execute_public_port_rebind`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstalledProxyPort {
     /// No proxy unit file on disk (a first-deploy shape — the durability refresh
-    /// writes it fresh). The refuse guard treats this as "nothing to conflict with".
+    /// writes it fresh). Nothing to compare against, so no move is detected.
     Absent,
     /// The unit file is present but its `run --http-port {N}` value could not be
     /// read/parsed (missing flag, non-numeric, out of range, or ambiguous). The
-    /// refuse guard FAILS CLOSED here — derived correctness can't be guaranteed.
+    /// redeploy path FAILS CLOSED here — a move can't be proven safe without
+    /// knowing the actual installed port.
     Unreadable,
     /// The port the installed unit's `ExecStart … run --http-port {N}` binds.
     Port(u16),
+}
+
+/// A `server.port` change detected between the installed kamal-proxy unit and the
+/// requested config, on the redeploy path (issue #2073, Option C).
+///
+/// Every op through the drain of the old release (phases 1-3: standing the
+/// candidate up on the OLD port's non-colliding slot, the health-gated flip, and
+/// draining the old release) runs as if `server.port` were still `old_port` — the
+/// public port itself does not move until [`execute_public_port_rebind`]'s own,
+/// separate failure boundary (phase 4), which rolls back to `old_port` on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicPortMove {
+    /// The port the installed kamal-proxy unit actually binds right now.
+    pub old_port: u16,
+    /// The port the config requests.
+    pub new_port: u16,
 }
 
 /// Delimiter appended by the deploy-start probe between the first-vs-redeploy
@@ -1952,7 +2365,7 @@ pub fn release_id_from_dir(dir: &str) -> Option<&str> {
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
 /// marker can be reconciled against the live proxy and a concurrent `server.port`
-/// change refused, both without a second probe.
+/// change detected, both without a second probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProbe {
     /// First-vs-redeploy decision (parsed exactly as before from the marker).
@@ -1961,7 +2374,8 @@ pub struct DeployProbe {
     /// the reconcile then falls back to the marker, fail-safe).
     pub proxy_list: String,
     /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
-    /// path to refuse a concurrent `server.port` change before touching the proxy.
+    /// path to detect a concurrent `server.port` change before touching the proxy
+    /// and resolve it to a [`PublicPortMove`].
     pub installed_proxy_port: InstalledProxyPort,
     /// The proxy TLS/host options the last forward deploy recorded (#2074), used by
     /// the redeploy path to PRESERVE the old release's options on the durability
@@ -2126,9 +2540,11 @@ pub fn probe_deploy_state(
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
             // the slot is the FIRST tab-separated field either way. The persisted port
             // (SECOND field, when present) is not read here — the cutover re-register
-            // uses the DERIVED port, which the pre-flight refuse guard (#2073) proves
-            // equals the actual live port by rejecting any concurrent `server.port`
-            // change. The marker keeps persisting the port for forward-compatibility.
+            // uses the DERIVED port, computed from the EFFECTIVE public port (the
+            // installed proxy's OLD port across a detected `server.port` change, #2073
+            // `PublicPortMove`), which the caller threads through so the derived port
+            // always equals the actual live port. The marker keeps persisting the port
+            // for forward-compatibility.
             let live_slot = canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE));
             DeployMode::Redeploy { live_slot }
         });
@@ -2980,6 +3396,147 @@ pub fn execute_rollback(
     )
 }
 
+/// Per-deploy scratch path for [`execute_public_port_rebind`]'s content-hash
+/// snapshot (Option C, issue #2073) — distinct from [`proxy_unit_snapshot_path`]
+/// so the phase-4 rebind never shares a scratch file with the cutover's own
+/// durability-refresh snapshot, even though both run sequentially in one deploy.
+fn public_port_rebind_snapshot_path(release_id: &str) -> String {
+    format!("/tmp/autumn-kamal-proxy-portmove-{release_id}.sha256")
+}
+
+/// Build the ops that (re)bind kamal-proxy's public HTTP listener to
+/// `target_public_port` and re-register the now-live release at `live_port`
+/// (Option C phase 4, issue #2073).
+///
+/// Reuses [`ProxyController::refresh_installed_ops`] — the same content-hash-gated
+/// restart-and-reregister the reboot-durability upgrade (#2070) uses — since
+/// moving `--http-port` is just another unit content change from that
+/// mechanism's point of view. [`execute_public_port_rebind`] calls this TWICE:
+/// once forward, to the new public port, and — only on failure — again, to the
+/// old public port, to roll back.
+#[must_use]
+pub fn public_port_rebind_ops(
+    cfg: &ResolvedDeployConfig,
+    proxy: &impl ProxyController,
+    release_id: &str,
+    live_port: u16,
+    reregister_options: &ProxyServiceOptions,
+    target_public_port: u16,
+) -> Vec<DeployOp> {
+    proxy.refresh_installed_ops(
+        target_public_port,
+        &cfg.service_name,
+        &loopback_upstream(live_port),
+        &public_port_rebind_snapshot_path(release_id),
+        reregister_options,
+    )
+}
+
+/// How [`execute_public_port_rebind`] (Option C phase 4, issue #2073) ended when
+/// moving the public port did not simply succeed.
+///
+/// Distinct from [`DeployExecError`] because this phase runs strictly AFTER a
+/// successful [`execute_redeploy`]: the release has already gone live, so a
+/// failure here can never mean "never served" the way most `DeployExecError`
+/// variants do. Both variants carry the OLD and NEW port so an operator-facing
+/// message never has to re-derive which is which.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicPortRebindError {
+    /// The move to `new_port` failed and rolling back to `old_port` succeeded —
+    /// the release is still live, reachable at `old_port`. The public port did
+    /// not move; retry the change alone in a separate deploy.
+    #[error(
+        "server.port could not be moved from {old_port} to {new_port} (`{failed_step}` \
+         failed: {source}) — rolled back, and the release is still live and reachable at \
+         {old_port}. Retry the port change alone in a separate deploy."
+    )]
+    RolledBack {
+        /// The port the release is still reachable at.
+        old_port: u16,
+        /// The port the move to which failed.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+    },
+    /// The move to `new_port` failed AND rolling back to `old_port` also failed.
+    /// The proxy's public bind on this host is now unknown — this needs a human,
+    /// not a retry.
+    #[error(
+        "server.port move from {old_port} to {new_port} failed (`{failed_step}`: {source}) \
+         AND the rollback to {old_port} ALSO failed ({rollback_source}) — the proxy's public \
+         bind on this host is now UNKNOWN. Check `systemctl status kamal-proxy` and \
+         `kamal-proxy list` on the host by hand before retrying."
+    )]
+    RollbackFailed {
+        /// The port the rollback tried, and failed, to restore.
+        old_port: u16,
+        /// The port the original move tried to reach.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The move's underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+        /// The rollback attempt's own underlying failure.
+        rollback_source: Box<DeployExecError>,
+    },
+}
+
+/// Execute Option C's phase 4 (issue #2073): move kamal-proxy's public listener
+/// from `old_port` to `new_port`, run strictly AFTER [`execute_redeploy`] has
+/// already put the new release live on `old_port` — phases 1-3 (standing the
+/// candidate up on a non-colliding loopback port, the health-gated flip, and
+/// draining the old release) are unchanged and already committed by the time this
+/// runs.
+///
+/// This is its own failure boundary, deliberately separate from
+/// [`execute_with_teardown`]'s: the release is ALREADY live, so nothing here is
+/// ever torn down. A step failure instead rolls the proxy back to `old_port`
+/// (`rollback`) and reports which of the two outcomes landed — see
+/// [`PublicPortRebindError`].
+///
+/// # Errors
+///
+/// Returns [`PublicPortRebindError::RolledBack`] when the move failed and the
+/// rollback to `old_port` succeeded, or [`PublicPortRebindError::RollbackFailed`]
+/// when the rollback itself failed too.
+pub fn execute_public_port_rebind(
+    ops: &[DeployOp],
+    rollback: &[DeployOp],
+    old_port: u16,
+    new_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<(), PublicPortRebindError> {
+    for op in ops {
+        if let Err(source) = run_one(op, exec) {
+            let failed_step = op.label();
+            eprintln!(
+                "  \u{2717} {failed_step} failed \u{2014} rolling the public port back to \
+                 {old_port}\u{2026}"
+            );
+            return match run_ops(rollback, exec) {
+                Ok(()) => Err(PublicPortRebindError::RolledBack {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                }),
+                Err(rollback_source) => Err(PublicPortRebindError::RollbackFailed {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                    rollback_source: Box::new(rollback_source),
+                }),
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Shared driver for the deploy entrypoints: gate on preflight, then run `ops`
 /// one at a time; if a step fails at or before `boundary_label` run `teardown`
 /// (best-effort — its own errors are swallowed so they can't mask the real
@@ -3309,6 +3866,11 @@ pub(crate) mod test_support {
         /// failure (fail closed) where a `CommandFailed` on the same step might be
         /// mere housekeeping.
         transport_fail_labels: Vec<&'static str>,
+        /// Labels whose `run` should fail on one SPECIFIC 1-indexed occurrence only
+        /// — for a label that runs more than once in a sequence (Option C's phase-4
+        /// rebind reuses the SAME labels for its forward attempt and its rollback),
+        /// which `fail_labels` (every occurrence) cannot express.
+        fail_on_occurrence: Vec<(&'static str, usize)>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
         /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
@@ -3347,6 +3909,17 @@ pub(crate) mod test_support {
         /// than one label (a fleet script needs per-host failure injection).
         pub(crate) fn failing(mut self, label: &'static str) -> Self {
             self.fail_labels.push(label);
+            self
+        }
+
+        /// Chainable: fail `label`'s `occurrence`-th call only (1-indexed), leaving
+        /// every other call to that label — earlier or later — scripted to succeed.
+        pub(crate) fn failing_on_occurrence(
+            mut self,
+            label: &'static str,
+            occurrence: usize,
+        ) -> Self {
+            self.fail_on_occurrence.push((label, occurrence));
             self
         }
 
@@ -3432,6 +4005,16 @@ pub(crate) mod test_support {
 
     impl DeployExecutor for RecordingExecutor {
         fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
+            // 1-indexed: how many times `cmd.label` has already run, BEFORE this call
+            // is recorded below — so `failing_on_occurrence(label, 1)` means "the
+            // first call to this label", not "the second".
+            let occurrence = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.run_label() == Some(cmd.label))
+                .count()
+                + 1;
             self.record(RecordedCall::Run {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
@@ -3442,7 +4025,9 @@ pub(crate) mod test_support {
                     source: std::io::Error::other("scripted transport failure"),
                 });
             }
-            if self.fail_labels.contains(&cmd.label) {
+            if self.fail_labels.contains(&cmd.label)
+                || self.fail_on_occurrence.contains(&(cmd.label, occurrence))
+            {
                 return Err(DeployExecError::CommandFailed {
                     label: cmd.label,
                     message: "scripted failure".to_owned(),
@@ -3499,6 +4084,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SqliteDataPlacement;
     use super::test_support::{RecordedCall, RecordingExecutor};
     use super::*;
 
@@ -3511,6 +4097,12 @@ mod tests {
             "myapp",
         )
         .expect("deploy config resolves")
+    }
+
+    /// [`resolved`] plus the #1909 `SQLite` data-file contract: a relative
+    /// `sqlite://app.db`, which is the shape that needs relocating.
+    fn resolved_sqlite() -> ResolvedDeployConfig {
+        resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative("app.db".to_owned()))
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";
@@ -3570,8 +4162,10 @@ mod tests {
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
     /// green (loopback 3002). The cutover re-registers the still-live OLD release at
     /// the DERIVED live-slot port (`plan.live_port`, blue = 3001) — correct because
-    /// the redeploy path refuses a concurrent `server.port` change at pre-flight
-    /// (#2073), so the public port is unchanged and derived == actual.
+    /// `plan.public_port` here IS the port the live release was actually deployed
+    /// under (#2073's `PublicPortMove` is the caller's job to resolve BEFORE
+    /// building this `plan`; this helper builds it already-resolved, as if
+    /// unchanged), so derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
         sample_cutover_ops_with(env, MigrateStep::Run)
     }
@@ -4035,16 +4629,14 @@ mod tests {
 
     #[test]
     fn cutover_ops_skip_omits_only_the_migrate_op() {
-        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates EXACTLY
-        // ONCE — hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping
-        // must remove the `migrate` op and NOTHING else: the boundary label
-        // (`proxy-flip`) keeps its identity and every other step keeps its relative
-        // position, or `execute_with_teardown`'s boundary lookup (and with it the
-        // per-host auto-rollback the fleet driver depends on) would silently change
-        // meaning on every host after the first.
-        //
-        // The assertion is differential — `Skip`'s vector is derived from `Run`'s —
-        // so it can never drift from the exact vector pinned by
+        // #1621 (AC-4): a fleet's schema is fleet-wide, so it migrates exactly once, and
+        // hosts 2..N build their cutover with `MigrateStep::Skip`. Skipping must remove
+        // the `migrate` op and nothing else: the boundary label (`proxy-flip`) keeps its
+        // identity and every other step keeps its relative position, or
+        // `execute_with_teardown`'s boundary lookup — and with it the per-host
+        // auto-rollback the fleet driver depends on — would silently change meaning on
+        // every host after the first. The assertion is differential, deriving `Skip`'s
+        // vector from `Run`'s, so it can never drift from the exact vector pinned by
         // `redeploy_produces_exact_zero_downtime_sequence`.
         let labels = |ops: &[DeployOp]| ops.iter().map(DeployOp::label).collect::<Vec<_>>();
         let run = labels(&sample_cutover_ops_with(
@@ -4917,6 +5509,183 @@ mod tests {
         );
     }
 
+    // --- Option C phase 4: live public-port rebind (issue #2073) --------------
+
+    #[test]
+    fn public_port_rebind_ops_threads_the_target_port_live_loopback_and_release_id() {
+        // A thin wrapper over `refresh_installed_ops` — the exact mechanism the
+        // reboot-durability upgrade (#2070) uses to restart the proxy on a changed
+        // unit — bound to the phase-4 target port and the now-live release's
+        // loopback port instead of the cutover's own `plan` fields.
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
+
+        let DeployOp::Run(snapshot) = &ops[0] else {
+            panic!("op 0 must be the snapshot Run op");
+        };
+        assert!(
+            snapshot
+                .shell
+                .contains(&format!("autumn-kamal-proxy-portmove-{RELEASE_ID}.sha256")),
+            "the snapshot path is keyed on release_id, in its OWN scratch namespace \
+             (distinct from the cutover's own durability-refresh snapshot): {}",
+            snapshot.shell,
+        );
+
+        let DeployOp::WriteFile {
+            contents: FileContents::Plain(unit),
+            ..
+        } = &ops[1]
+        else {
+            panic!("op 1 must re-write the proxy unit");
+        };
+        assert!(
+            unit.contains("--http-port 8080\n"),
+            "the rewritten unit binds the TARGET public port: {unit}"
+        );
+
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--target '127.0.0.1:3002'"),
+            "the re-register targets the NOW-LIVE release's loopback port: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn public_port_rebind_ops_threads_tls_and_host_through_the_reregister() {
+        // The phase-4 rebind must carry the now-live release's OWN TLS/host, exactly
+        // as `refresh_installed_ops` does for any other re-register (#2074's own TLS
+        // tests exhaustively cover the underlying mechanism; this only confirms the
+        // wrapper forwards `reregister_options` unchanged).
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        };
+        let controller = super::super::proxy::KamalProxyController::new(60)
+            .with_tls_host(Some("app.example.com".to_owned()));
+        let ops = public_port_rebind_ops(&cfg, &controller, RELEASE_ID, 3002, &options, 8080);
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--host 'app.example.com' --tls"),
+            "the phase-4 re-register carries the release's own TLS/host: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_succeeds_without_touching_rollback() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        let exec = RecordingExecutor::new();
+
+        execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect("a healthy rebind succeeds");
+
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed"
+            ],
+            "a healthy rebind runs only the forward ops, never the rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_rolls_back_to_the_old_port_on_failure() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // The forward attempt's restart fails once; the rollback's own restart (the
+        // SAME op label) is left unscripted, so it succeeds on its turn — the new
+        // port could not bind, but the old one still can.
+        let exec = RecordingExecutor::new().failing_on_occurrence("proxy-restart-if-changed", 1);
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a failed rebind must roll back");
+        match err {
+            PublicPortRebindError::RolledBack {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RollbackFailed { .. } => {
+                panic!("expected RolledBack, got {other:?}")
+            }
+        }
+        // Both the forward attempt AND the rollback ran their full sequence.
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+            ],
+            "a rolled-back rebind runs the forward attempt then the full rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_reports_when_the_rollback_itself_fails() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // BOTH the forward restart and the rollback's restart fail — the proxy's
+        // public bind is now genuinely unknown.
+        let exec = RecordingExecutor::failing_on("proxy-restart-if-changed");
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a doubly-failed rebind must report RollbackFailed");
+        match err {
+            PublicPortRebindError::RollbackFailed {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RolledBack { .. } => {
+                panic!("expected RollbackFailed, got {other:?}")
+            }
+        }
+    }
+
     #[test]
     fn resolve_rollback_target_reads_the_marker_not_the_mtime_newest_dir() {
         // Codex P1: resolution must come from the explicit previous-release MARKER,
@@ -5146,18 +5915,31 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_never_touches_the_proxy_route() {
+        // Issue #2270: the proxy route is removed as its OWN separate step by
+        // the fleet driver (`compensate_teardown`), never folded into this app-
+        // only chain — see the function's own doc comment for why.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("proxy")),
+            "this chain must never run a proxy op: {labels:?}"
+        );
+    }
+
+    #[test]
     fn first_deploy_teardown_records_the_torn_down_result() {
-        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to
-        // NOTHING INSTALLED — that is what `CompensatedTeardown` means. Leaving
-        // `shared/last-deploy` untouched made `deploy status` report
-        // `last deploy: deployed <ts>` for a host carrying no release at all: a
-        // wrong value in the column an operator reads FIRST when inspecting a
-        // halted rollout.
-        //
-        // The teardown RECORDS `torn down` rather than deleting the marker. An
-        // absent marker renders `last deploy: ?`, which is also what a host that
-        // was never deployed shows, so clearing it would erase exactly the fact
-        // triage needs: this host WAS taken back down, on purpose, at this time.
+        // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to nothing
+        // installed — that is what `CompensatedTeardown` means. Leaving
+        // `shared/last-deploy` untouched made `deploy status` report `last deploy:
+        // deployed <ts>` for a host carrying no release at all: a wrong value in the
+        // column an operator reads first when inspecting a halted rollout. The teardown
+        // records `torn down` rather than deleting the marker, because an absent marker
+        // renders `last deploy: ?`, the same as a host that was never deployed, so
+        // clearing it would erase exactly the fact triage needs — this host was taken back
+        // down, on purpose, at this time.
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
         let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
@@ -6199,19 +6981,17 @@ mod tests {
 
     #[test]
     fn probe_host_status_consults_the_live_slot_unit_for_the_maintenance_flag_path() {
-        // #1621 review round 1 (Codex 2). The status probe used to read ONLY the
-        // shared flag path. A host still running a slot unit rendered BEFORE #1621
-        // has no `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it is
-        // running polls the cwd-relative (release-local) `tmp/autumn-maintenance
-        // .json` instead — and `deploy status` reported the SHARED path's state for
-        // it anyway. So it could print `maintenance off` for a host that is
-        // actually maintained, and `maintenance ON` for one whose legacy write
-        // failed and which is therefore still taking traffic.
-        //
-        // The probe must instead ask the LIVE SLOT UNIT which file the running app
-        // polls, resolving it exactly as `maintenance::flag_file_path_from` does
-        // (the override when set, else `WorkingDirectory` + the legacy relative
-        // path), and report THAT file's presence.
+        // #1621 review round 1 (Codex 2). The status probe used to read only the shared
+        // flag path. A host still running a slot unit rendered before #1621 has no
+        // `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=` line, so the app it runs polls the
+        // cwd-relative, release-local `tmp/autumn-maintenance.json` instead — and `deploy
+        // status` reported the shared path's state for it anyway. It could print
+        // `maintenance off` for a host that is actually maintained, and `maintenance ON`
+        // for one whose legacy write failed and which is therefore still taking traffic.
+        // The probe must instead ask the live slot unit which file the running app polls,
+        // resolving it exactly as `maintenance::flag_file_path_from` does — the override
+        // when set, else `WorkingDirectory` plus the legacy relative path — and report
+        // that file's presence.
         let cfg = resolved();
         let exec = RecordingExecutor::new()
             .with_stdout("detect-current", status_probe_stdout(RELEASE_ID, 3001))
@@ -6553,7 +7333,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]
@@ -6570,6 +7352,9 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn deregister_op(&self, _service: &str) -> DeployOp {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             // compat_probe() and binary_install_ops() use the trait defaults → None.
@@ -6734,6 +7519,9 @@ mod tests {
             }
             fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
                 self.0.flip_op(service, new_upstream)
+            }
+            fn deregister_op(&self, service: &str) -> DeployOp {
+                self.0.deregister_op(service)
             }
             fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
                 self.0.compat_probe()
@@ -7191,5 +7979,1241 @@ mod tests {
             !exec.run_labels().contains(&"proxy-route"),
             "proxy must not be routed after a failed readiness gate"
         );
+    }
+
+    // ── SQLite data-file persistence (issue #1909) ─────────────────────────
+
+    /// A Postgres app emits no data-link op at all, so its op sequence is
+    /// byte-identical to pre-#1909.
+    #[test]
+    fn no_data_link_op_without_a_sqlite_data_file() {
+        assert!(sqlite_data_link_op(&resolved(), RELEASE_DIR).is_none());
+        let labels: Vec<&str> = sample_ops(Secret::new("X=1\n"))
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!labels.contains(&"link-data"), "{labels:?}");
+    }
+
+    /// The link op is what makes the data file outlive the release: the real file
+    /// sits in `shared/data`, the release dir only holds a symlink at the path the
+    /// app resolves.
+    #[test]
+    fn the_data_link_op_points_the_release_at_the_shared_file() {
+        let cfg = resolved_sqlite();
+        let op = sqlite_data_link_op(&cfg, RELEASE_DIR).expect("a SQLite app links its data file");
+        assert_eq!(op.label, "link-data");
+        assert!(
+            op.shell.contains(
+                "ln -s '/srv/autumn/myapp/shared/data/app.db' \
+                    '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"
+            ),
+            "the release path must be a link to the shared file: {}",
+            op.shell
+        );
+        // The shared dir must exist before the link is made, and a stale entry at
+        // the release path must be cleared or `ln` would link INSIDE a directory.
+        assert!(
+            op.shell
+                .contains("mkdir -p '/srv/autumn/myapp/shared/data'"),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell
+                .contains("rm -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"),
+            "{}",
+            op.shell
+        );
+    }
+
+    /// An app deployed before this contract holds a real file in the release that
+    /// is still serving. Moving it while that app runs is not safe — `SQLite`
+    /// derives the `-wal` name from the path it resolved, and there is no atomic
+    /// move — so the deploy stops and names the one-time manual step.
+    #[test]
+    fn the_data_link_op_refuses_to_relocate_a_live_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The refusal fires whenever `current` holds a database this deploy did
+        // not put there. `-L` only picks WHICH message.
+        //
+        // The shared file must NOT gate it. Gating on `[ ! -e shared ]` made both
+        // refusals unreachable once that file existed, so a legacy `current`
+        // pointing at a different database was linked past in silence and the app
+        // served the shared one after cutover (#2589 item 8).
+        assert!(
+            op.shell
+                .contains("[ -e '/srv/autumn/myapp/current/app.db' ]"),
+            "the refusal must fire when the current release still holds a database: {}",
+            op.shell
+        );
+        assert!(
+            !op.shell
+                .contains("if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] &&"),
+            "the shared file existing must not disable the refusal: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("exit 1"),
+            "it must stop the deploy: {}",
+            op.shell
+        );
+        // The message must name the fix, including the units to stop and the
+        // move. Its operands are shell-quoted so the line is safe to paste, and
+        // the whole line is one `echo` word, so those quotes appear escaped.
+        assert!(
+            op.shell.contains(
+                r"systemctl stop '\''myapp-blue.service'\'' '\''myapp-green.service'\'' &&"
+            ),
+            "the message must name the units to stop: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                r"mv '\''/srv/autumn/myapp/current/app.db'\'' '\''/srv/autumn/myapp/shared/data/app.db'\''"
+            ),
+            "the message must name the move, sidecars included: {}",
+            op.shell
+        );
+        // Nothing in the op moves a live database itself.
+        assert!(
+            !op.shell
+                .contains("mv '/srv/autumn/myapp/current/app.db' '/srv/autumn/myapp/shared"),
+            "the op must never relocate the live database itself: {}",
+            op.shell
+        );
+    }
+
+    /// Every interpolated value is a shell-quoted WORD. A quoted path nested
+    /// inside a double-quoted `echo` would still expand — single quotes are
+    /// literal there — so a database path holding `$(…)` would run a command on
+    /// the deploy host.
+    #[test]
+    fn the_data_link_op_never_expands_a_configured_path() {
+        let hostile = resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative(
+            "$(touch pwned).db".to_owned(),
+        ));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        // The hazard is a shell-quoted path sitting in an expandable position,
+        // not the double-quote character itself. Two constructs legitimately
+        // use one: the printed symlink recovery (inert until pasted) and the
+        // dangling-link guard's `"$(readlink '…')"`. Both wrap a path that is
+        // ALREADY single-quoted, so nothing configured can expand. Every other
+        // double quote must sit inside a single-quoted word.
+        let guard = format!(
+            r#""$(readlink {})""#,
+            shell_quote("/srv/autumn/myapp/current/$(touch pwned).db")
+        );
+        let elsewhere = op.shell.replace(&guard, "");
+        for (index, _) in elsewhere.match_indices('"') {
+            assert!(
+                inside_single_quotes(&elsewhere, index),
+                "a double quote outside single quotes makes paths expandable: {elsewhere}"
+            );
+        }
+        // The guard really is present, and its path really is single-quoted.
+        assert!(
+            op.shell.contains(&guard),
+            "the dangling-link guard must quote its path: {}",
+            op.shell
+        );
+        // The substitution survives only inside single quotes, where it is inert.
+        for (index, _) in op.shell.match_indices("$(touch pwned)") {
+            assert!(
+                inside_single_quotes(&op.shell, index),
+                "every occurrence must sit inside a single-quoted word: {}",
+                op.shell
+            );
+        }
+        // `$s`, our own loop variable, is the only thing left expandable, and it
+        // now appears ONLY in the op body: the printed recoveries gate each
+        // sidecar separately so an early failure cannot be skipped past.
+        assert_eq!(op.shell.matches("for s in -wal -shm -journal").count(), 1);
+    }
+
+    /// Is byte `index` inside a single-quoted word?
+    ///
+    /// The generated script uses single quotes only (asserted separately), so
+    /// POSIX rules reduce to two: outside quotes a backslash escapes the next
+    /// character, and inside them nothing escapes. That is why a naive quote
+    /// count is wrong: the escape idiom that puts a literal quote inside a quoted
+    /// word closes, emits an escaped quote, then reopens, and that middle quote
+    /// must not toggle.
+    fn inside_single_quotes(shell: &str, index: usize) -> bool {
+        let mut quoted = false;
+        let mut chars = shell.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if i >= index {
+                break;
+            }
+            if quoted {
+                if c == '\'' {
+                    quoted = false;
+                }
+            } else if c == '\\' {
+                chars.next();
+            } else if c == '\'' {
+                quoted = true;
+            }
+        }
+        quoted
+    }
+
+    /// The recovery line is a command the operator pastes and runs, so quoting
+    /// the `echo` around it is not enough: its own operands must be quoted, or
+    /// the substitution runs on paste and a path with a space splits the `mv`.
+    ///
+    /// The whole line is one `echo` word, so the operand quoting appears here in
+    /// its escaped form, which is what the outer quote turns it into.
+    #[test]
+    fn the_data_link_op_prints_a_recovery_command_that_is_safe_to_paste() {
+        let hostile = resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative(
+            "$(touch pwned).db".to_owned(),
+        ));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/$(touch pwned).db'\'' "),
+            "the pasted `mv` must carry the path as a quoted word: {}",
+            op.shell
+        );
+
+        // A path holding a space must reach `mv` as ONE argument. The `*` stays
+        // outside the quotes so it still globs the sidecars.
+        let spaced = resolved()
+            .with_sqlite_data_placement(SqliteDataPlacement::Relative("app data.db".to_owned()));
+        let op = sqlite_data_link_op(&spaced, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\'' "),
+            "the source must be one quoted word: {}",
+            op.shell
+        );
+    }
+
+    /// A `current` that is a SYMLINK to an operator-managed database must be
+    /// refused too. Linking past it points the release at a shared file that
+    /// does not exist; the migration then creates an empty one and cutover
+    /// serves it while the real database is orphaned.
+    #[test]
+    fn the_data_link_op_refuses_a_legacy_symlinked_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // `current` counts as occupied if it EXISTS or is a symlink at all —
+        // a dangling link to an unavailable mount fails `-e`, and treating that
+        // as "nothing here" linked past an operator database and orphaned it.
+        // The one exemption is our own link to the shared file, which dangles
+        // until the migration creates that file.
+        assert!(
+            op.shell.contains(
+                "if { [ -e '/srv/autumn/myapp/current/app.db' ] || \
+                 [ -L '/srv/autumn/myapp/current/app.db' ]; }"
+            ),
+            "a dangling `current` symlink must count as occupied: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "[ \"$(readlink '/srv/autumn/myapp/current/app.db')\" = \
+                 '/srv/autumn/myapp/shared/data/app.db' ]"
+            ),
+            "our own link to the shared file must stay exempt: {}",
+            op.shell
+        );
+        assert!(
+            !op.shell
+                .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]; then"),
+            "the symlink case must not be excluded from the refusal: {}",
+            op.shell
+        );
+        // It gets its own message: `mv` on a link moves the link, not the
+        // database, so the real-file recovery would be wrong here.
+        assert!(
+            op.shell
+                .contains("is a symlink to a SQLite database that is not"),
+            "the symlink case needs its own refusal: {}",
+            op.shell
+        );
+        // The target moves to the EXACT shared name. Moving it merely INTO the
+        // shared directory keeps a differently-named target's basename, and the
+        // next deploy then creates an empty database at the name it does expect.
+        assert!(
+            op.shell
+                .contains(r"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'') && ")
+                && op
+                    .shell
+                    .contains(r#"mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#),
+            "the symlink recovery must move the target to the exact shared path: {}",
+            op.shell
+        );
+        // Sidecars PRECEDE it, each to the matching shared name and each gating
+        // the next — see `both_recoveries_move_the_sidecars_before_the_database`
+        // for why the ordering is the load-bearing part.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                op.shell.contains(&format!(
+                    r#"{{ [ ! -e "$src"{suffix} ] || mv "$src"{suffix} '\''/srv/autumn/myapp/shared/data/app.db'\''{suffix}; }} && "#
+                )),
+                "{suffix} must move to the matching shared name, gating what follows: {}",
+                op.shell
+            );
+        }
+    }
+
+    /// Both printed recoveries must move every sidecar BEFORE the database, with
+    /// each step gating the next, and must never glob or `exit`.
+    ///
+    /// `shared/data/<file>` existing is what makes the next deploy skip the
+    /// adoption refusal, so the database has to land LAST: a sidecar that fails
+    /// after the database has moved strands the `-wal`, and the next deploy then
+    /// starts the app without every frame it held (#2589 item 10).
+    ///
+    /// A `for` loop cannot express that — its status is the last iteration's, so
+    /// a failure in the first is invisible to what follows, which is exactly how
+    /// the invariant was lost. Each sidecar is its own `&&`-gated step instead.
+    #[test]
+    fn both_recoveries_move_the_sidecars_before_the_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The recovery is printed inside a single-quoted `echo` word, so its own
+        // operands appear in the escaped form that quoting turns them into.
+        let shared = r"'\''/srv/autumn/myapp/shared/data/app.db'\''";
+
+        // Two recoveries are printed: one moves the link path itself, one moves
+        // what the link resolves to.
+        let recoveries: Vec<&str> = op
+            .shell
+            .match_indices("Run this on the host once")
+            .map(|(index, _)| {
+                // The recovery is one single-quoted `echo` word, so it ends at
+                // the quote that closes it — the only `\' >&2` in the line.
+                let rest = op.shell.get(index..).unwrap_or_default();
+                rest.split_once("' >&2").map_or(rest, |(line, _)| line)
+            })
+            .collect();
+        assert_eq!(recoveries.len(), 2, "both refusals print one: {}", op.shell);
+
+        for recovery in recoveries {
+            // Every sidecar moves, and every one of them before the database.
+            // The database is the one destination with no sidecar suffix on it.
+            let database = recovery
+                .match_indices(shared)
+                .map(|(index, _)| index)
+                .find(|index| {
+                    !recovery
+                        .get(index + shared.len()..)
+                        .is_some_and(|rest| rest.starts_with('-'))
+                })
+                .unwrap_or_else(|| panic!("no database move in: {recovery}"));
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = recovery
+                    .find(&format!("{shared}{suffix}"))
+                    .unwrap_or_else(|| panic!("{suffix} is not moved by: {recovery}"));
+                assert!(
+                    sidecar < database,
+                    "{suffix} must move before the database: {recovery}"
+                );
+            }
+            // No `for` loop: a loop's status is its last iteration's, so an early
+            // failure would not stop the database from moving.
+            assert!(
+                !recovery.contains("for s in"),
+                "each sidecar must gate the next on its own: {recovery}"
+            );
+            // Pasted into an interactive shell, `exit` would close the session.
+            assert!(
+                !recovery.contains("exit "),
+                "a pasted recovery must never exit the operator's shell: {recovery}"
+            );
+            // The stop gates everything, with `&&` and never `;`.
+            let stop = recovery.find("systemctl stop").expect("a stop");
+            let rest = recovery.get(stop..).unwrap_or_default();
+            assert!(
+                rest.find("&&").unwrap_or(usize::MAX) < rest.find(';').unwrap_or(usize::MAX),
+                "the stop must gate the move with `&&` before any `;`: {recovery}"
+            );
+            // Sidecars are named, never globbed.
+            assert!(
+                !recovery.contains("app.db*") && !recovery.contains(&format!("{shared}*")),
+                "sidecars must be named, not globbed: {recovery}"
+            );
+        }
+    }
+
+    /// Every row of the `link-data` state table, RUN, not pattern-matched.
+    ///
+    /// The defects this replaces (#2589 items 8 and 17) were both a guard that
+    /// read correctly and covered one state fewer than the deploy can reach, so
+    /// asserting on the generated text would have passed for both. This builds
+    /// each layout on disk and executes the real shell against it.
+    ///
+    /// `Verdict::Proceed` also asserts the link actually lands on the shared
+    /// file: a guard that lets a state through without linking is a different
+    /// failure, not a pass.
+    #[cfg(target_os = "linux")]
+    /// What occupies `current/<db>` in one row of the state table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Current {
+        Absent,
+        LinkToShared,
+        LinkElsewhere,
+        RealFile,
+    }
+
+    #[cfg(target_os = "linux")]
+    /// What the deploy must do about it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Proceed,
+        Refuse,
+    }
+
+    #[cfg(target_os = "linux")]
+    /// One row: `current` × shared-file × marker → verdict, and why.
+    type LinkDataRow = (Current, bool, bool, Verdict, &'static str);
+
+    /// Build a row's layout under `root` and return the release dir to link.
+    ///
+    /// `operator.db` sits outside the app dir entirely: a refusal must leave it
+    /// byte-intact, which is what makes "refused" mean "touched nothing".
+    #[cfg(target_os = "linux")]
+    fn build_link_data_layout(
+        root: &Path,
+        current: Current,
+        shared_exists: bool,
+        marker: bool,
+    ) -> PathBuf {
+        let releases = root.join("releases");
+        let previous = releases.join("prev");
+        let release = releases.join("new");
+        std::fs::create_dir_all(&release).expect("release dir");
+        std::fs::create_dir_all(&previous).expect("previous release dir");
+        let shared_dir = root.join("shared");
+        let shared_file = shared_dir.join("data/app.db");
+        std::fs::create_dir_all(shared_dir.join("data")).expect("shared dir");
+        if shared_exists {
+            std::fs::write(&shared_file, b"SHARED").expect("shared db");
+        }
+        if marker {
+            std::fs::write(shared_dir.join("sqlite-data-adopted"), b"").expect("marker");
+        }
+        std::fs::write(root.join("operator.db"), b"OPERATOR").expect("operator db");
+
+        if current != Current::Absent {
+            let at = previous.join("app.db");
+            match current {
+                Current::LinkToShared => {
+                    std::os::unix::fs::symlink(&shared_file, &at).expect("link to shared");
+                }
+                Current::LinkElsewhere => {
+                    std::os::unix::fs::symlink(root.join("operator.db"), &at)
+                        .expect("link elsewhere");
+                }
+                Current::RealFile => std::fs::write(&at, b"LIVE").expect("live db"),
+                Current::Absent => unreachable!(),
+            }
+            std::os::unix::fs::symlink(&previous, root.join("current")).expect("current symlink");
+        }
+        release
+    }
+
+    /// Run the real `link-data` shell against one row's layout and check it.
+    #[cfg(target_os = "linux")]
+    fn check_link_data_row(root: &Path, row: LinkDataRow) {
+        let (current, shared_exists, marker, want, why) = row;
+        let release = build_link_data_layout(root, current, shared_exists, marker);
+        let shared_file = root.join("shared/data/app.db");
+        let elsewhere = root.join("operator.db");
+
+        let mut cfg = resolved_sqlite();
+        cfg.app_dir = root.to_str().expect("utf-8 temp dir").to_owned();
+        let op = sqlite_data_link_op(&cfg, release.to_str().expect("utf-8")).expect("linked");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run link-data");
+
+        let got = if out.status.success() {
+            Verdict::Proceed
+        } else {
+            Verdict::Refuse
+        };
+        assert_eq!(
+            got,
+            want,
+            "{current:?} + shared={shared_exists} + marker={marker} ({why}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        if want == Verdict::Proceed {
+            assert_eq!(
+                std::fs::read_link(release.join("app.db")).ok().as_deref(),
+                Some(shared_file.as_path()),
+                "{why}: the release must be linked at the shared file"
+            );
+            // The shared database is never rewritten by the link step.
+            if shared_exists {
+                assert_eq!(
+                    std::fs::read(&shared_file).expect("shared db"),
+                    b"SHARED",
+                    "{why}: the shared database must be left exactly as it was"
+                );
+            }
+        } else {
+            // A refusal touches nothing — including the operator's database.
+            assert!(
+                !release.join("app.db").exists(),
+                "{why}: a refusal must not link anything"
+            );
+            assert_eq!(
+                std::fs::read(&elsewhere).expect("operator db"),
+                b"OPERATOR",
+                "{why}: a refusal must not touch the operator's database"
+            );
+            assert!(
+                !String::from_utf8_lossy(&out.stderr).is_empty(),
+                "{why}: a refusal must say why"
+            );
+        }
+    }
+
+    /// Every row of the `link-data` state table, RUN, not pattern-matched.
+    ///
+    /// The two defects this replaces (#2589 items 8 and 17) were each a guard
+    /// that read correctly and covered one state fewer than the deploy can
+    /// reach, so an assertion on the generated TEXT would have passed for both.
+    /// Reintroducing either gate fails this test on its exact row.
+    // Linux-only, for the reason `prune_shell_protects_current_and_previous_dirs_end_to_end`
+    // is: these execute the generated shell against a real tree, so they need
+    // `std::os::unix::fs::symlink` (absent on Windows — a compile error) and GNU
+    // `readlink -f` (BSD `readlink` has no `-f`, so macOS panics). The shell they
+    // run is written for a POSIX deploy target that is Ubuntu, so gating the
+    // RUNNER loses no coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_link_op_decides_every_state_of_current_and_the_shared_file() {
+        use Current::{Absent, LinkElsewhere, LinkToShared, RealFile};
+        use Verdict::{Proceed, Refuse};
+
+        let table: [LinkDataRow; 9] = [
+            (Absent, false, false, Proceed, "a genuine first deploy"),
+            (
+                LinkToShared,
+                false,
+                false,
+                Proceed,
+                "a retry after a first deploy that failed before the migration",
+            ),
+            (
+                LinkToShared,
+                false,
+                true,
+                Refuse,
+                "the database existed and is gone: an unmounted volume (#2589 item 17)",
+            ),
+            (LinkToShared, true, true, Proceed, "already adopted"),
+            (
+                LinkToShared,
+                true,
+                false,
+                Proceed,
+                "adopted before the marker existed",
+            ),
+            (
+                LinkElsewhere,
+                true,
+                true,
+                Refuse,
+                "an operator database, silently swapped for the shared one (#2589 item 8)",
+            ),
+            (
+                LinkElsewhere,
+                false,
+                false,
+                Refuse,
+                "an operator database on a mount that is away",
+            ),
+            (
+                RealFile,
+                true,
+                true,
+                Refuse,
+                "a live pre-#1909 database, swapped on rollback (#2589 item 8)",
+            ),
+            (RealFile, false, false, Refuse, "a live pre-#1909 database"),
+        ];
+
+        for (index, row) in table.into_iter().enumerate() {
+            let root = std::env::temp_dir()
+                .join(format!("autumn-link-data-{}-{index}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            check_link_data_row(&root, row);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The marker is written the first time the shared database is seen, so the
+    /// refusal above has something to key on — and it lives in `shared/`, never
+    /// in `shared/data`, which is the mount whose absence it exists to detect.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seeing_the_shared_database_records_the_marker_outside_the_data_mount() {
+        let cfg = resolved_sqlite();
+        assert_eq!(
+            cfg.sqlite_data_marker_file(),
+            "/srv/autumn/myapp/shared/sqlite-data-adopted",
+            "a marker under shared/data would vanish with the mount it reports on"
+        );
+
+        let root = std::env::temp_dir().join(format!("autumn-marker-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let release = root.join("releases/new");
+        std::fs::create_dir_all(&release).expect("release dir");
+        let shared_data = root.join("shared/data");
+        std::fs::create_dir_all(&shared_data).expect("shared dir");
+        std::fs::write(shared_data.join("app.db"), b"SHARED").expect("shared db");
+
+        let mut cfg = resolved_sqlite();
+        cfg.app_dir = root.to_str().expect("utf-8 temp dir").to_owned();
+        let op = sqlite_data_link_op(&cfg, release.to_str().unwrap()).expect("linked");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run link-data")
+                .success()
+        );
+        assert!(
+            root.join("shared/sqlite-data-adopted").exists(),
+            "the marker must be recorded once the database is seen"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The marker is recorded AFTER the migrate one-shot, on both deploy paths.
+    ///
+    /// The migration is what creates the database on a first deploy. Leaving the
+    /// marker for a LATER deploy to write when it happens to observe the file
+    /// left a one-deploy window: create the database, lose the `shared/data`
+    /// volume, and the next deploy reads both the file and the marker as absent,
+    /// calls it a first deploy, and creates a fresh database beneath the missing
+    /// mount (#2589 item 17).
+    #[test]
+    fn the_marker_is_recorded_after_the_migration_on_both_deploy_paths() {
+        let cfg = resolved_sqlite();
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                first_deploy_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    MigrateStep::Run,
+                ),
+            ),
+            (
+                "redeploy",
+                cutover_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    &ProxyServiceOptions {
+                        tls: false,
+                        host: None,
+                    },
+                    MigrateStep::Run,
+                ),
+            ),
+        ] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .unwrap_or_else(|| panic!("{path}: no migrate step: {labels:?}"));
+            let record = labels
+                .iter()
+                .position(|l| *l == "record-data-adopted")
+                .unwrap_or_else(|| panic!("{path}: the marker is never recorded: {labels:?}"));
+            assert!(
+                migrate < record,
+                "{path}: the marker must be recorded after the migration creates \
+                 the database: {labels:?}"
+            );
+        }
+
+        // It records only a database that is actually there, so a run whose
+        // migration was skipped cannot arm the refusal against one that was
+        // never created.
+        let op = sqlite_data_adopted_op(&cfg).expect("a SQLite app records the marker");
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db' ]"),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell
+                .contains(": > '/srv/autumn/myapp/shared/sqlite-data-adopted'"),
+            "{}",
+            op.shell
+        );
+        // A Postgres app gets no such op, so its sequence is unchanged.
+        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+    }
+
+    /// An ABSOLUTE database in `shared/data` gets the same missing-volume guard a
+    /// relative one does (#2589 round 20).
+    ///
+    /// This is the hole the round-19 `mkdir` opened. The state table built for
+    /// `Relative` was never applied to `Persistent`, so an absolute database in
+    /// the deploy's own namespace had no marker, no refusal — and then a `mkdir`
+    /// that recreated its mount point, after which the migration created a fresh
+    /// empty database the app served and wrote to while the real one was away.
+    ///
+    /// Same three rows as `link-data`'s second question, run against the real
+    /// generated shell.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_absolute_database_in_shared_data_refuses_a_missing_volume() {
+        // (database present, marker present, may proceed, why)
+        let table = [
+            (
+                false,
+                false,
+                true,
+                "a genuine first deploy: nothing has been created yet",
+            ),
+            (true, true, true, "already adopted and present"),
+            (true, false, true, "adopted before the marker existed"),
+            (
+                false,
+                true,
+                false,
+                "it existed and is gone — an unmounted volume, not a first deploy",
+            ),
+        ];
+
+        for (index, (db_exists, marker, may_proceed, why)) in table.into_iter().enumerate() {
+            let root =
+                std::env::temp_dir().join(format!("autumn-absvol-{}-{index}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            let app = root.join("srv/myapp");
+            std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+            let db = app.join("shared/data/app.db");
+            if db_exists {
+                std::fs::create_dir_all(app.join("shared/data")).expect("data dir");
+                std::fs::write(&db, b"REAL").expect("db");
+            }
+            if marker {
+                std::fs::write(app.join("shared/sqlite-data-adopted"), b"").expect("marker");
+            }
+
+            let mut cfg = resolved();
+            cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+            cfg.sqlite_data =
+                SqliteDataPlacement::Persistent(db.to_str().expect("utf-8").to_owned());
+            let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run check-data-dir");
+
+            assert_eq!(
+                out.status.success(),
+                may_proceed,
+                "db={db_exists} marker={marker} ({why}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if may_proceed {
+                assert!(
+                    app.join("shared/data").is_dir(),
+                    "{why}: the parent must be created so the migration can open it"
+                );
+            } else {
+                // The refusal happens BEFORE the mkdir: recreating the directory
+                // is what lets the migration create the replacement database.
+                assert!(
+                    !app.join("shared/data").exists(),
+                    "{why}: the absent mount point must not be recreated"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&out.stderr).is_empty(),
+                    "{why}: a refusal must say why"
+                );
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The adoption marker is recorded for BOTH placements, so the guard above
+    /// has something to key on. Keying it on the relative case alone is what left
+    /// the absolute one unguarded.
+    #[test]
+    fn the_marker_covers_an_absolute_database_in_shared_data_too() {
+        let mut cfg = resolved();
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent("/srv/autumn/myapp/shared/data/app.db".to_owned());
+        let op = sqlite_data_adopted_op(&cfg).expect("an in-namespace database is recorded");
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db' ]")
+                && op
+                    .shell
+                    .contains(": > '/srv/autumn/myapp/shared/sqlite-data-adopted'"),
+            "{}",
+            op.shell
+        );
+
+        // A database OUTSIDE the deploy's namespace is the operator's: not
+        // recorded, and not guarded, because the deploy never creates its
+        // directory either.
+        cfg.sqlite_data = SqliteDataPlacement::Persistent("/var/lib/myapp/app.db".to_owned());
+        assert!(sqlite_data_adopted_op(&cfg).is_none());
+        // …and a Postgres app still gets nothing at all.
+        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+    }
+
+    /// A symlinked `app_dir` is invisible to the local lexical containment check,
+    /// so the host is asked instead (#2589 item 13): a database whose parent
+    /// resolves into the releases directory is refused before anything is
+    /// uploaded or pruned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_persistent_data_guard_resolves_a_symlinked_app_dir_on_the_host() {
+        let root = std::env::temp_dir().join(format!("autumn-datadir-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let real = root.join("mnt/apps/myapp");
+        std::fs::create_dir_all(real.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(real.join("shared/data")).expect("shared dir");
+        let link = root.join("srv-myapp");
+        std::fs::create_dir_all(root.join("srv")).ok();
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked app dir");
+
+        // The database is spelled with the RESOLVED app dir, so the lexical check
+        // in `classify_sqlite_data_file` compares two unrelated strings and grades
+        // it durable — while retention walks the symlink to the same inode.
+        let inside = real.join("releases/r1/app.db");
+        let bare_inside = real.join("app.db");
+        let shared = real.join("shared/data/app.db");
+        let outside = root.join("var/lib/app.db");
+        std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
+
+        // A configured path that is ITSELF a symlink into the releases dir. Its
+        // parent (`var/lib`) is outside the app dir entirely, so resolving only
+        // the parent approves it while the app opens the target that pruning
+        // deletes.
+        std::fs::write(&inside, b"LIVE").expect("live db");
+        let linked = root.join("var/lib/linked.db");
+        std::os::unix::fs::symlink(&inside, &linked).expect("symlinked database");
+
+        for (path, refuse) in [
+            (&inside, true),
+            (&linked, true),
+            // Inside the app dir but outside `shared/` — the same rule the local
+            // lexical check applies, asked where the symlink resolves.
+            (&bare_inside, true),
+            (&shared, false),
+            (&outside, false),
+        ] {
+            let mut cfg = resolved();
+            cfg.app_dir = link.to_str().expect("utf-8 temp dir").to_owned();
+            cfg.sqlite_data =
+                SqliteDataPlacement::Persistent(path.to_str().expect("utf-8").to_owned());
+            let op = sqlite_data_dir_guard_op(&cfg).expect("a persistent file is verified");
+            assert_eq!(op.label, "check-data-dir");
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run check-data-dir");
+            assert_eq!(
+                out.status.success(),
+                !refuse,
+                "{}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // A Postgres app, and one whose file the deploy relocates itself, get no
+        // such op at all.
+        assert!(sqlite_data_dir_guard_op(&resolved()).is_none());
+        assert!(sqlite_data_dir_guard_op(&resolved_sqlite()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An absolute database under `shared/data` has its parent CREATED, because
+    /// nothing else does (#2589 round 19).
+    ///
+    /// This is the placement the guide recommends. `prepare-dirs` makes
+    /// `shared/` but not `shared/data/`, and the op that makes it —
+    /// `sqlite_data_link_op` — is emitted only for a RELATIVE path. So on a fresh
+    /// host the migration failed: `SQLite` will not create a database whose parent
+    /// directory is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_persistent_data_guard_creates_a_shared_data_parent_but_not_the_operators() {
+        let root = std::env::temp_dir().join(format!("autumn-mkdata-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let app = root.join("srv/myapp");
+        // Exactly a fresh host after `prepare-dirs`: `shared/` exists, and
+        // `shared/data/` does not.
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
+
+        let recommended = app.join("shared/data/app.db");
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent(recommended.to_str().expect("utf-8").to_owned());
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run check-data-dir")
+                .success()
+        );
+        assert!(
+            app.join("shared/data").is_dir(),
+            "the recommended placement must have its parent created, or the \
+             migration cannot open the database"
+        );
+
+        // A path outside the app dir is the operator's: verified, never created.
+        let theirs = root.join("var/lib/nested/app.db");
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent(theirs.to_str().expect("utf-8").to_owned());
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run check-data-dir")
+                .success()
+        );
+        assert!(
+            !root.join("var/lib/nested").exists(),
+            "the deploy must not reach past its own namespace to create directories"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The op must never delete a database file. A rollback target deployed
+    /// before the migration still holds a real one at that path; it is moved
+    /// aside, not removed.
+    #[test]
+    fn the_data_link_op_never_deletes_a_real_database_file() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            !op.shell.contains("rm -rf"),
+            "no recursive delete may touch a database path: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "if [ -e '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ] && \
+                 [ ! -L '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ]"
+            ),
+            "a real file must be distinguished from a stale link: {}",
+            op.shell
+        );
+        // It is moved beside the SHARED file, under `shared/`, where release
+        // retention never reaches it.
+        assert!(
+            op.shell.contains(
+                "mv -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db' \
+                 '/srv/autumn/myapp/shared/data/app.db.superseded'"
+            ),
+            "a real file must be moved aside into shared/: {}",
+            op.shell
+        );
+        // …and never over an existing one.
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db.superseded' ]"),
+            "an existing superseded copy must be refused, not overwritten: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("already exists"),
+            "and it must say so: {}",
+            op.shell
+        );
+        // Sidecars move first here too, for the reason they do in the printed
+        // recoveries: the destination database existing is what a later step
+        // reads as "the move finished". Each `mv` carries `|| exit 1`, so unlike a
+        // pasted recovery the loop cannot continue past a failure.
+        let superseded = "'/srv/autumn/myapp/shared/data/app.db.superseded'";
+        let sidecars = op
+            .shell
+            .find(&format!("{superseded}$s"))
+            .expect("the sidecar move");
+        let database = op
+            .shell
+            .find(&format!(
+                "mv -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db' {superseded}"
+            ))
+            .expect("the database move");
+        assert!(
+            sidecars < database,
+            "the sidecars must be set aside before the database: {}",
+            op.shell
+        );
+    }
+
+    /// Both journal modes leave sidecars. WAL leaves `-wal`/`-shm`; the default
+    /// rollback journal leaves `-journal`, and `VACUUM INTO` writes its output in
+    /// that mode whatever the source used. All three must move with the database.
+    #[test]
+    fn the_data_link_op_moves_every_sidecar_kind() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell.contains("for s in -wal -shm -journal"),
+            "the move-aside step must cover every sidecar: {}",
+            op.shell
+        );
+    }
+
+    /// Every file the deploy writes into the release ROOT must be refused as a
+    /// relative database path (#2589 item 11).
+    ///
+    /// This is the part that keeps `collides_with_release_payload` honest. Its
+    /// rule for the app binary and the `autumn*.toml` family is written out by
+    /// hand, so a payload added to the op builders later — a new sidecar file, a
+    /// second binary — would silently fall outside it and reopen exactly the hole
+    /// item 11 describes. Rather than trust the enumeration, this reads the real
+    /// op stream and asserts the grader refuses every name in it.
+    #[test]
+    fn every_release_root_payload_is_refused_as_a_database_path() {
+        let manifests = [
+            ManifestUpload {
+                local: PathBuf::from("/tmp/autumn.toml"),
+                remote_basename: "autumn.toml".to_owned(),
+            },
+            ManifestUpload {
+                local: PathBuf::from("/tmp/autumn-prod.toml"),
+                remote_basename: "autumn-prod.toml".to_owned(),
+            },
+            // An arbitrarily-named capacity contract (#1733): the case no static
+            // rule can predict, which is why the deploy passes the real list.
+            ManifestUpload {
+                local: PathBuf::from("/tmp/prod.lock"),
+                remote_basename: "prod.lock".to_owned(),
+            },
+        ];
+        // Mirror production: the payload list the grader sees is the one the op
+        // builders are handed.
+        let cfg = resolved_sqlite().with_release_payloads(
+            manifests
+                .iter()
+                .map(|m| m.remote_basename.clone())
+                .collect(),
+        );
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+
+        let ops = first_deploy_ops(
+            &cfg,
+            &proxy(),
+            &unit,
+            Secret::new("X=1\n"),
+            Path::new("/tmp/app"),
+            &manifests,
+            RELEASE_ID,
+            &plan,
+            MigrateStep::Run,
+        );
+
+        let root = format!("{RELEASE_DIR}/");
+        let payloads: Vec<String> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DeployOp::UploadFile { remote_path, .. }
+                | DeployOp::WriteFile { remote_path, .. } => Some(remote_path.clone()),
+                DeployOp::Run(_) => None,
+            })
+            // Only the release ROOT: the data link is created there, and every
+            // payload is written flat, so nothing nested can collide.
+            .filter_map(|path| path.strip_prefix(&root).map(str::to_owned))
+            .filter(|rest| !rest.contains('/'))
+            .collect();
+
+        assert!(
+            payloads.contains(&"myapp".to_owned()),
+            "the binary must be among the release-root payloads: {payloads:?}"
+        );
+        assert!(
+            payloads.len() > manifests.len(),
+            "expected the binary and every manifest: {payloads:?}"
+        );
+
+        for payload in &payloads {
+            let url = format!("sqlite://{payload}");
+            assert!(
+                matches!(
+                    super::super::classify_sqlite_data_file(Some(&url), &cfg),
+                    super::super::SqliteDataFile::Refused(_)
+                ),
+                "{payload} is written into the release root, so a database at that \
+                 path would be truncated by the upload — it must be refused"
+            );
+        }
+    }
+
+    /// The link must exist before the migrate one-shot runs, on BOTH deploy paths:
+    /// a migration applied to a file in the release dir is a migration the app
+    /// never sees.
+    #[test]
+    fn the_data_link_precedes_the_migration_on_both_deploy_paths() {
+        let cfg = resolved_sqlite();
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                first_deploy_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    MigrateStep::Run,
+                ),
+            ),
+            (
+                "redeploy",
+                cutover_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    &ProxyServiceOptions {
+                        tls: false,
+                        host: None,
+                    },
+                    MigrateStep::Run,
+                ),
+            ),
+        ] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let link = labels
+                .iter()
+                .position(|l| *l == "link-data")
+                .unwrap_or_else(|| panic!("{path}: no link-data op in {labels:?}"));
+            let prepare = labels
+                .iter()
+                .position(|l| *l == "prepare-dirs")
+                .expect("prepare-dirs");
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .expect("migrate");
+            assert!(
+                prepare < link && link < migrate,
+                "{path}: the link must sit between prepare-dirs and migrate: {labels:?}"
+            );
+        }
+    }
+
+    /// A rollback target deployed before adoption no longer holds the file at that
+    /// path, so the rolled-back release must be re-linked before it is started.
+    #[test]
+    fn rollback_relinks_the_target_release_before_starting_it() {
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T120000Z".to_owned(),
+            slot: SLOT_GREEN,
+            port: 3002,
+        };
+        let ops = rollback_ops(&resolved_sqlite(), &proxy(), &target);
+        let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+        let link = labels
+            .iter()
+            .position(|l| *l == "link-data")
+            .unwrap_or_else(|| panic!("no link-data op in {labels:?}"));
+        let start = labels
+            .iter()
+            .position(|l| *l == "restart-previous")
+            .expect("restart-previous");
+        assert!(
+            link < start,
+            "the link must precede the restart: {labels:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                DeployOp::Run(c)
+                    if c.shell
+                        .contains("'/srv/autumn/myapp/releases/20260713T120000Z/app.db'")
+            )),
+            "the rollback must link the TARGET release dir, not the current one"
+        );
+        // A Postgres rollback is unchanged.
+        let plain: Vec<&str> = rollback_ops(&resolved(), &proxy(), &target)
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!plain.contains(&"link-data"), "{plain:?}");
+    }
+
+    /// Release retention removes release DIRS. `rm -rf` unlinks a symlink rather
+    /// than following it, so pruning a release can never reach the shared data
+    /// file — but only as long as the prune shell never opts into following.
+    #[test]
+    fn pruning_a_release_never_follows_the_data_symlink() {
+        let shell = prune_releases_shell(
+            "/srv/autumn/myapp/releases",
+            "/srv/autumn/myapp/current",
+            "/srv/autumn/myapp/shared/previous-release",
+            3,
+        );
+        assert!(shell.contains("rm -rf"), "{shell}");
+        for follows in ["-follow", "-L ", "--dereference", "cp -L"] {
+            assert!(
+                !shell.contains(follows),
+                "the prune must not follow symlinks ({follows}): {shell}"
+            );
+        }
     }
 }

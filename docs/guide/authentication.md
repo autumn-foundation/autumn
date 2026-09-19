@@ -140,7 +140,7 @@ cannot be replayed afterwards.
 [session]
 backend      = "memory"       # "memory" | "redis"
 cookie_name  = "autumn.sid"
-max_age_secs = 86400          # 24 hours
+max_age_secs = 86400          # session TTL in seconds — 24 hours
 secure       = true           # HTTPS-only
 http_only    = true           # invisible to JavaScript
 same_site    = "Lax"
@@ -363,15 +363,28 @@ pub async fn logout(
     let config = state.config_arc();
     let remember_cfg = &config.auth.remember;
 
-    // Drop this device's tracking row, then revoke its remember chain — before
-    // the session teardown, and only a no-op when neither is in play. Skipping
-    // this is the classic bug: the session dies, the remember cookie survives,
-    // and the next request logs the browser straight back in.
+    // Drop this device's tracking row (best-effort — the device must sign out
+    // even if the row delete hiccups), then revoke its remember chain. Hold
+    // that second result: the session teardown below must run either way, or
+    // skipping it is the classic bug — the session dies, the remember cookie
+    // survives, and the next request logs the browser straight back in.
     let _ = untrack_current_session(&mut db, &session).await;
-    revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
+    let revoke_result = revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
 
     session.clear().await;
     session.rotate_id().await;   // old cookie can no longer be replayed
+
+    // Fail the logout if the remember chain survived — it is a long-lived
+    // credential, so reporting success would be false. Still clear the
+    // cookie on THIS browser even on failure: otherwise it keeps presenting
+    // a still-valid remember cookie, and once the database recovers,
+    // `remember_me` would silently re-establish a session on the very next
+    // request, undoing this logout.
+    if let Err(error) = revoke_result {
+        let mut response = error.into_response();
+        append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
+        return Ok(response);
+    }
 
     let mut response = Redirect::to("/").into_response();
     append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
@@ -387,15 +400,22 @@ If you issue neither remember cookies nor tracking rows, the two helper calls
 and the `Set-Cookie` drop out and logout really is just `clear()` +
 `rotate_id()`. Add them back the moment you turn remember-me on.
 
-**Logout is best-effort against database failure.** Both generated helpers
-swallow their delete errors (`let _ = …`) and return `()`, so the handler has
-nothing to propagate: if the `DELETE` fails, the browser still gets a cleared
-cookie and a destroyed session, but the remember chain survives server-side and
-a copy of that cookie can still authenticate later. The session teardown itself
-is unaffected. If your threat model does not tolerate that, delete the chain
-yourself with a checked query and fail the logout — or queue a
-[durable job](./jobs.md) to retry the deletion — instead of relying on the
-best-effort helper.
+**The session teardown is unconditional; the remember chain is not
+best-effort.** The tracking-row delete (`untrack_current_session`) still
+swallows its error (`let _ = …`) — losing that row only drops a device from
+the account's device list, so a hiccup there is not worth failing logout over.
+The remember-chain delete is different: it is a long-lived bearer credential,
+so `revoke_remember_from_cookie` returns its error instead. `logout` holds
+that result, tears the session down regardless, and only then branches on
+it — so a failed `DELETE` still fails the whole request (the browser sees an
+error, not a redirect), but the session is destroyed either way. The error
+response still carries the remember-clear `Set-Cookie`: without it, this
+browser would keep presenting its (still valid, since the delete failed)
+remember cookie, and the next request after the database recovers would let
+`remember_me` quietly log it back in. If your threat model needs the
+remember-chain delete to succeed before you consider the account safe, queue
+a [durable job](./jobs.md) to retry it after this response, rather than
+treating the request's own delete attempt as final.
 
 Working code: [`examples/saas/src/routes/auth.rs`](../../examples/saas/src/routes/auth.rs)
 (signup with policy enforcement, [submit tokens](./submit-tokens.md), and
@@ -445,6 +465,74 @@ grants.
 See [macro transparency](./macro-transparency.md#securedrole) for the exact
 expansion.
 
+### Issuing, listing, rotating and revoking API tokens
+
+The scopes in `#[secured(scopes = [...])]` above come from the bearer token the
+client presents, and that token is minted by the CLI rather than by a signup
+flow. Manage them with `autumn token` — run any of these with `--help` for the
+full argument list.
+
+**This lifecycle is PostgreSQL-only.** Every `autumn token` subcommand shells
+out to `psql`, and [`DbApiTokenStore`](../../autumn/src/auth.rs) is backed by a
+Postgres pool. On a [SQLite](./sqlite-in-production.md) app neither is
+available: use `InMemoryApiTokenStore` for local work, or implement the
+[`ApiTokenStore`](../../autumn/src/auth.rs) trait against your own table and
+manage tokens through it.
+
+```bash
+# `issue` and `rotate` print the new token on stdout — and only its hash is
+# stored, so capture it now or it is unrecoverable. (The "✓ …" confirmation
+# goes to stderr, so it stays out of the captured value.)
+TOKEN=$(autumn token issue service:ci --name ci --scope posts:write)
+
+autumn token list service:ci        # name, scopes, expiry, last-used, revoked — never the secret
+
+# Then EITHER rotate — the old token stops working and this is the new one:
+TOKEN=$(autumn token rotate "$TOKEN")
+
+# …OR revoke, to stop it working with no replacement:
+autumn token revoke "$TOKEN"
+```
+
+`rotate` and `revoke` are alternatives, not steps. Rotating already revokes the
+token you passed it, so running `revoke "$TOKEN"` afterwards without
+re-capturing would retire a token that is already dead and leave the live
+replacement in the database with its secret lost.
+
+`--expires-at <ISO-8601>` makes a token expire; omit it for a non-expiring one.
+
+On Postgres, these commands read and write the managed `api_tokens` table, so
+they reach your app only when it mounts `DbApiTokenStore` and has that table —
+pass `API_TOKEN_MIGRATIONS` to `.migrations()`, or run `autumn migrate`. An app
+wired to `InMemoryApiTokenStore` keeps its tokens in the process and seeds them
+in code: a token issued by the CLI is invisible to it, and verification answers
+`401`.
+
+**To revoke a leaked API token**, run `autumn token revoke "$TOKEN"`: it sets
+`revoked_at`, and `RequireApiToken` answers `401` for every later request
+presenting it.
+
+**To rotate an API token** — a CI credential that must keep working — run
+`autumn token rotate "$TOKEN"` instead. It revokes the old row and **inserts a
+new one** carrying the same principal, name, scopes and expiry, then prints the
+new secret. The replacement is a distinct token: new id, new `created_at`, and
+no `last_used_at` until it is used. The retired row stays in the table with
+`revoked_at` set, so `autumn token list` shows both — expect one live row and
+one revoked row per rotation.
+
+Nothing on the row survives a rotation as an identifier, and `name` is not a
+substitute: the column is `TEXT NOT NULL DEFAULT ''` with no unique
+constraint, and `--name` defaults to the empty string, so it is a label that
+several tokens — including every unnamed one — can share. Tooling should
+filter on `revoked_at IS NULL` to find the live token rather than treating
+either the id or the name as a stable handle across rotations.
+
+In Rust, the same four operations are
+[`issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token` and
+`revoke_api_token`](../../autumn/src/auth.rs) — one per CLI subcommand.
+`issue_scoped_api_token` takes its name, scopes and expiry as an
+[`IssueTokenSpec`](../../autumn/src/auth.rs).
+
 ### `RequireAuth` and `Auth<T>`
 
 `#[secured]` is per-handler. To gate a whole subtree, layer `RequireAuth`, which
@@ -485,13 +573,13 @@ generated login handler therefore also counts failures **per account**:
    bytes, and an IP prefix (IPv4 /24, IPv6 /64) — correlatable across log lines
    for incident response without putting a raw account id in the logs.
 
-   **Set the salt.** The digest is salted from `SECRET_KEY_BASE`, falling back
-   to `AUTUMN_ADMIN_SECRET`, falling back to a compiled-in constant. With
-   neither variable set, the salt is public and account ids are small sequential
-   integers, so anyone holding the logs can hash candidates and recover the id.
-   Export one of the two in production — note this digest does not read
-   `AUTUMN_SECURITY__SIGNING_SECRET`, so provisioning only the
-   [signing secret](./signing-secrets.md) leaves the fallback in place.
+   **Set the salt.** The digest is salted from the app's
+   [signing secret](./signing-secrets.md)
+   (`AUTUMN_SECURITY__SIGNING_SECRET`). Production always has this set — see
+   that guide's production requirements — so the digest is unrecoverable
+   there. Dev and test may run with no secret configured; the digest then
+   falls back to a compiled-in constant salt and logs a warning, but that
+   only affects those local, process-only logs.
 3. While locked, *every* attempt — including the correct password — returns the
    same response as a wrong password, so the endpoint never reveals which
    accounts are locked.
@@ -652,6 +740,168 @@ and include the table in your GDPR export.
 
 ---
 
+## Impersonation ("log in as this user")
+
+Support eventually needs to see what a customer sees. Doing it by hand —
+`session.insert("user_id", target)` — quietly breaks the audit trail: from that
+point on every version row and audit event claims the *customer* did it.
+`autumn_web::auth::impersonation` is the primitive that keeps the real operator
+on the record.
+
+Opt in first — it is **default-deny**, so an app without a registered gate
+refuses every attempt with `403`:
+
+```rust,ignore
+use autumn_web::auth::impersonation::ImpersonationGate;
+
+autumn_web::app()
+    .state_initializer(|state| {
+        state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+    })
+```
+
+Then begin and end it from your own routes:
+
+```rust,ignore
+use autumn_web::auth::impersonation;
+
+#[post("/support/impersonate/{user_id}")]
+#[secured("admin")]
+async fn start(
+    State(state): State<AppState>,
+    session: Session,
+    Path(user_id): Path<String>,
+) -> AutumnResult<Redirect> {
+    impersonation::begin_impersonation(&state, &session, user_id).await?;
+    Ok(Redirect::to("/"))
+}
+
+#[post("/support/stop-impersonating")]
+async fn stop(State(state): State<AppState>, session: Session) -> AutumnResult<Redirect> {
+    impersonation::end_impersonation(&state, &session).await?;
+    Ok(Redirect::to("/"))
+}
+```
+
+What the framework guarantees while impersonation is active:
+
+| Question | Answer |
+|---|---|
+| Who do `#[secured]`, `RequireAuth` and `PolicyContext` resolve? | the **impersonated** user |
+| Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** |
+| Who does `impersonation::impersonator_id(&state, &session)` return? | the **real impersonator** |
+| Session id | rotated on begin *and* end |
+| Audit | one event on begin, one on end, each with `actor_id` = the impersonator and `target_resource_id` = the target |
+
+`Auth<T>` is not in that first row: it is populated by your own loader
+middleware from request extensions, so it follows the impersonated user only if
+that loader reads the auth session key. The same caveat applies to any identity
+key your app writes alongside `user_id` at login (a generated `{model}_id` /
+`{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
+key and nothing else, so map the rest yourself if your handlers read them.
+
+`RequireAuth` also publishes `RateLimitPrincipal` and the log context's
+`user_id` as the **effective** user, so rate-limit buckets and log lines follow
+the target while attribution follows the operator.
+
+Read the state with the `Impersonation` extractor when you just want to branch
+on it:
+
+```rust,ignore
+use autumn_web::auth::impersonation::Impersonation;
+
+#[get("/")]
+async fn home(impersonation: Impersonation) -> Markup {
+    match impersonation.state() {
+        Some(active) => /* show a banner naming active.impersonator_id */,
+        None => /* normal page */,
+    }
+}
+```
+
+And what it refuses:
+
+- **No nesting.** Starting a second hop while impersonating is a `409`, so it
+  cannot be chained to escalate.
+- **No self-impersonation**, and no blank target.
+- **No unaudited swap.** `begin_impersonation` returns `500` — leaving the
+  session untouched — if the audit write fails *or* if the app has no audit sink
+  installed at all (`audit::write_from_state` is a silent no-op without one, so
+  a missing sink would otherwise mean a swap with no record). Register one with
+  `AppBuilder::with_audit_sink(TracingAuditSink)` at minimum before enabling
+  impersonation. Ending is the opposite trade-off: a sink failure is logged, but
+  the revert still happens.
+- **No client-chosen role.** The impersonated session's role comes from
+  `ImpersonationPolicy::target_role`, resolved server-side; it defaults to *no*
+  role rather than inheriting the admin's.
+- **No laundering past step-up.** `last_strong_auth_at` is a bare timestamp with
+  no identity bound to it, so begin **stashes and drops** the operator's claim
+  rather than carrying it over — otherwise a `#[step_up]` route could run a
+  destructive action on the *target's* account on the strength of the operator's
+  re-authentication. Ending restores the operator's own claim. The practical
+  consequence: sensitive, step-up-gated actions cannot be performed while
+  impersonating.
+
+- **No self-destructive configuration.** `auth.session_key` must not be one of
+  the keys the impersonation record reserves (`impersonator_id`,
+  `impersonated_id`, `impersonator_role`, `impersonator_last_strong_auth_at`,
+  `role`) — the swap would clobber its own record. Both directions refuse the
+  misconfiguration, and registering the gate logs it at startup. Check it
+  yourself with `impersonation::is_reserved_session_key`.
+
+- **No inherited record.** The record is bound both to *which* user it describes
+  and to the session generation that created it. Either a different effective
+  user, or a session-id rotation — which every login must perform anyway, to
+  prevent fixation — retires it: it stops counting for attribution and the
+  revert route refuses it, instead of handing whoever comes next the operator's
+  identity and role. The generation binding is what covers the case an id check
+  alone misses: the impersonated customer signing in **as themselves** on the
+  same browser. Belt and braces: call `impersonation::clear(&session)` from your
+  own login / magic-link / passkey promotion too, so the record is gone outright
+  rather than merely inert.
+
+Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
+not look at the target at all, so it will happily impersonate any string
+including another admin or a user in a different tenant. For anything
+multi-tenant, implement `ImpersonationPolicy` and consult `ctx` (which carries
+the session and the DB pool) to confirm the target exists and is in the caller's
+tenant. `begin_impersonation` trims the target id **before** the policy sees it,
+so the id you authorize is exactly the id that lands in the session.
+
+```rust,ignore
+use autumn_web::auth::impersonation::{ImpersonationPolicy, ImpersonationTarget};
+use autumn_web::authorization::{BoxFuture, PolicyContext};
+
+struct SupportDesk;
+
+impl ImpersonationPolicy for SupportDesk {
+    fn can_impersonate<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("support") && same_tenant(ctx, target).await })
+    }
+
+    fn target_role<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { lookup_role(target.user_id()).await })
+    }
+}
+```
+
+Session-based auth only: an API-token principal has no session to swap, so the
+bearer-token path is untouched.
+
+`autumn-admin-plugin` ships the whole flow — routes, a persistent "Viewing as …
+— Stop impersonating" banner, and one-click revert — behind
+`AdminPlugin::with_impersonation(gate)`. See the [admin guide](./admin.md).
+
+---
+
 ## Testing authenticated routes
 
 The test client can mint an authenticated session directly, so a test of a
@@ -696,10 +946,13 @@ indistinguishable, and that logout makes the old cookie unusable. See the
       addresses by a bcrypt's width.
 - [ ] `[auth.password]` reviewed; consider `breach_check = "fail_open"`.
 - [ ] `[auth.lockout]` left enabled, `AUTUMN_ADMIN_SECRET` set, and the unlock
-      route network-restricted. That variable (or `SECRET_KEY_BASE`) also salts
-      the `account_locked` log digest — without either, the digest is reversible.
+      route network-restricted. The `account_locked` log digest is salted from
+      `AUTUMN_SECURITY__SIGNING_SECRET` — production already requires this
+      (see [signing secrets](./signing-secrets.md)), so it needs no separate
+      setup.
 - [ ] Logout revokes the remember chain and the tracking row, not just the
-      session.
+      session — a failed remember-chain delete fails the logout request, so
+      watch for it in error monitoring.
 - [ ] Every authenticated route reaches `require_tracked_session` (directly or
       via middleware) if you rely on session revocation — `#[secured]` alone
       does not enforce it.
@@ -725,6 +978,9 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.
+- [API tokens](#issuing-listing-rotating-and-revoking-api-tokens) — `autumn
+  token issue | list | rotate | revoke` for the bearer tokens that carry
+  `#[secured(scopes = [...])]` grants.
 - [Signing secrets](./signing-secrets.md) — the key behind session cookies, CSRF
   tokens, and flash state.
 - [Middleware](./middleware.md) — where the session, CSRF, and security-header

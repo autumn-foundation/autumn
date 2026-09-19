@@ -9,8 +9,12 @@ use diesel_async::RunQueryDsl;
 use autumn_web::prelude::*;
 
 /// Compute Reddit-style hot rank from score and age.
+///
+/// `pub` rather than `pub(crate)` so `tests/sim_hot_rank.rs` can drive the real
+/// decay curve from a `#[sim_test]` instead of reimplementing it — a copy in
+/// the test would still pass after this formula changed.
 #[must_use]
-pub(crate) fn calculate_hot_rank(
+pub fn calculate_hot_rank(
     score: i64,
     created_at: chrono::NaiveDateTime,
     now: chrono::NaiveDateTime,

@@ -420,7 +420,7 @@ impl Scope<{pascal_name}> for {pascal_name}Scope {{
     fn list<'a>(
         &'a self,
         {scope_ctx_param}: &'a PolicyContext,
-        {scope_conn_param}: &'a mut diesel_async::AsyncPgConnection,
+        {scope_conn_param}: &'a mut autumn_web::RuntimeConnection,
     ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<{pascal_name}>>> {{
 {scope_body}    }}
 }}

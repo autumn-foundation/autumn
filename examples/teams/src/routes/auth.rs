@@ -33,7 +33,7 @@ use super::layout::{csrf_value, layout};
 // login handler takes the same wall time whether or not the account exists.
 const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
-fn signup_page(min_len: usize, csrf_token: &str, error: Option<&str>) -> Markup {
+fn signup_page(min_len: usize, csrf_token: &str, email: &str, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
@@ -47,7 +47,7 @@ fn signup_page(min_len: usize, csrf_token: &str, error: Option<&str>) -> Markup 
                 input type="hidden" name="_csrf" value=(csrf_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -72,6 +72,7 @@ pub async fn signup_form(State(state): State<AppState>, csrf: Option<CsrfToken>)
     signup_page(
         state.config_arc().auth.password.min_length,
         csrf_value(&csrf),
+        "",
         None,
     )
 }
@@ -84,20 +85,36 @@ pub async fn signup(
     csrf: Option<CsrfToken>,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
-    let email = form.email.trim().to_lowercase();
-    if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address (max 254 characters)",
-        ));
-    }
-    if form.password.len() > 128 {
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at most 128 characters",
-        ));
-    }
     // `config_arc` shares the resolved config behind an `Arc`; `config()` would
     // deep-clone every section just to read `[auth.password]` on a request path.
+    // Read once up front so every re-render below (including the two input
+    // checks that used to bypass the form entirely) can reach `min_length`.
     let config = state.config_arc();
+
+    let email = form.email.trim().to_lowercase();
+    // Both of these used to `Err(...)` out to the generic JSON/error-page
+    // response, dropping the user off the form and losing the email they
+    // typed; they now redisplay the same form the password-policy failure
+    // below always has, with the entered email preserved (Wayfinder:
+    // error-path inventory).
+    if !email.contains('@') || email.len() > 254 {
+        return Ok(signup_page(
+            config.auth.password.min_length,
+            csrf_value(&csrf),
+            &form.email,
+            Some("Enter a valid email address (max 254 characters)"),
+        )
+        .into_response());
+    }
+    if form.password.len() > 128 {
+        return Ok(signup_page(
+            config.auth.password.min_length,
+            csrf_value(&csrf),
+            &form.email,
+            Some("Password must be at most 128 characters"),
+        )
+        .into_response());
+    }
     let policy = config.auth.password.policy();
     let validation =
         autumn_web::auth::validate_password(&form.password, &policy, &[email.as_str()]).await;
@@ -111,6 +128,7 @@ pub async fn signup(
         return Ok(signup_page(
             config.auth.password.min_length,
             csrf_value(&csrf),
+            &form.email,
             Some(&message),
         )
         .into_response());
@@ -129,10 +147,39 @@ pub async fn signup(
     // and can never retry signup (`users.email` is `UNIQUE`).
     let organization_name = format!("{email}'s Organization");
     let role = Role::Owner;
-    let (user, org): (User, Organization) = db
+    let tx_result: Result<(User, Organization), AutumnError> = db
         .tx(move |conn| {
             async move {
-                let user: User = diesel::insert_into(users::table)
+                // A duplicate email hits the `users_email_key` UNIQUE
+                // constraint (Postgres's default name for an unnamed
+                // `UNIQUE` column, per `autumn-cli/src/schema/diff.rs`'s own
+                // brownfield-introspection tests); classified here (rather
+                // than folded into the blanket `?` below) so the handler can
+                // redisplay the signup form inline instead of navigating to
+                // a generic error page (Wayfinder: error-path inventory) —
+                // see the match on `tx_result` below. Checked via the
+                // framework's own `unique_violation_field` (the same helper
+                // `examples/teams/src/routes/invitations.rs` already uses
+                // for a different constraint), matched on the specific
+                // constraint name rather than any `UniqueViolation` (Codex
+                // review finding: `users_pkey` — e.g. a sequence left behind
+                // the table by an import — would otherwise also be
+                // misreported as "duplicate email"). Any other error,
+                // including a `UniqueViolation` on a different constraint,
+                // still propagates as the real 500/503 it is.
+                let insert_err_to_conflict = |err: AutumnError| {
+                    if autumn_web::error::unique_violation_field(
+                        &err,
+                        &[("users_email_key", "email", "Could not create account")],
+                    )
+                    .is_some()
+                    {
+                        AutumnError::conflict_msg("Could not create account")
+                    } else {
+                        err
+                    }
+                };
+                let user: User = match diesel::insert_into(users::table)
                     .values(&NewUser {
                         email: email.clone(),
                         password_hash,
@@ -140,7 +187,10 @@ pub async fn signup(
                     .returning(User::as_returning())
                     .get_result(conn)
                     .await
-                    .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
+                {
+                    Ok(user) => user,
+                    Err(err) => return Err(insert_err_to_conflict(err.into())),
+                };
 
                 let org: Organization = diesel::insert_into(organizations::table)
                     .values(&InsertOrganization {
@@ -163,7 +213,23 @@ pub async fn signup(
             }
             .scope_boxed()
         })
-        .await?;
+        .await;
+    let (user, org) = match tx_result {
+        Ok(pair) => pair,
+        // Redisplay the form inline for the one classified, user-fixable
+        // failure (duplicate email); anything else propagates as a real
+        // server error, unchanged from before.
+        Err(err) if err.status() == StatusCode::CONFLICT => {
+            return Ok(signup_page(
+                config.auth.password.min_length,
+                csrf_value(&csrf),
+                &form.email,
+                Some("Could not create account"),
+            )
+            .into_response());
+        }
+        Err(err) => return Err(err),
+    };
 
     establish_session(&session, user.id, &org.id.to_string(), role).await;
     Ok(Redirect::to("/members").into_response())
@@ -207,21 +273,32 @@ pub async fn login_form(
     Query(query): Query<crate::models::NextQuery>,
     csrf: Option<CsrfToken>,
 ) -> Markup {
-    let next = query.next.unwrap_or_default();
+    login_page(&query.next.unwrap_or_default(), "", csrf_value(&csrf), None)
+}
+
+/// `next` re-populates the post-login redirect target, `email` re-populates
+/// the field, and `error`, when present, is shown above the form (Wayfinder:
+/// error-path inventory — the message must sit adjacent to the form that
+/// caused it, and what the user already typed/was navigating to must not be
+/// thrown away).
+fn login_page(next: &str, email: &str, csrf_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
-        csrf_value(&csrf),
+        csrf_token,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Log in" }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
             form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
-                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                input type="hidden" name="_csrf" value=(csrf_token);
                 @if !next.is_empty() {
                     input type="hidden" name="next" value=(next);
                 }
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -246,11 +323,26 @@ pub async fn login(
     session: Session,
     mut db: Db,
     membership_repo: PgMembershipRepository,
+    csrf: Option<CsrfToken>,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
+    let next = form.next.clone().unwrap_or_default();
+    // Redisplayed inline rather than sent to a generic error page, same as
+    // every failure mode below — a navigating browser was on the login form
+    // and should stay there (Wayfinder: error-path inventory).
+    let invalid = |csrf: &Option<CsrfToken>| {
+        login_page(
+            &next,
+            &form.email,
+            csrf_value(csrf),
+            Some("Invalid email or password"),
+        )
+        .into_response()
+    };
+
     let email = form.email.trim().to_lowercase();
     if email.len() > 254 || form.password.len() > 128 {
-        return Err(AutumnError::unauthorized_msg("Invalid email or password"));
+        return Ok(invalid(&csrf));
     }
 
     let user: Option<User> = users::table
@@ -260,16 +352,15 @@ pub async fn login(
         .await
         .optional()?;
 
-    let invalid = || AutumnError::unauthorized_msg("Invalid email or password");
     let user = match user {
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Err(invalid());
+            return Ok(invalid(&csrf));
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Err(invalid());
+        return Ok(invalid(&csrf));
     }
 
     let memberships: Vec<Membership> = membership_repo

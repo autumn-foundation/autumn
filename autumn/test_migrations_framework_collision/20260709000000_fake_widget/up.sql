@@ -1,3 +1,0 @@
--- Test-only fixture: deliberately shares its version with the real
--- FRAMEWORK_MIGRATIONS entry 20260709000000_create_migration_checksums, to
--- exercise log_migration_version_collisions's control_targets_postgres gate.

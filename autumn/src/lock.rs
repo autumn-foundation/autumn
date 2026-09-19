@@ -63,6 +63,22 @@
 //! - **Not row-level.** Use `with_lock` (pessimistic) or optimistic locking for
 //!   per-row contention; this is a *named*, row-independent lock.
 //! - **`PostgreSQL` only.** Advisory-lock semantics assume `PostgreSQL`.
+//!
+//! # On `SQLite`
+//!
+//! The same API works under the `sqlite` feature, over a lease row in the app's
+//! own database file rather than a `PostgreSQL` session lock (issue #1907). The
+//! contract a caller relies on is the same — one holder at a time, released on
+//! drop — with three differences worth knowing:
+//!
+//! - **The scope is one host.** Processes sharing the database file contend;
+//!   two hosts do not. That is the whole `SQLite` tier, not this lock.
+//! - **It is a lease, not a session.** The row carries an expiry, so a holder
+//!   that dies frees the lock rather than wedging it. A live holder renews in
+//!   the background, so a long critical section is not preempted.
+//! - **It is not re-entrant.** A `PostgreSQL` session lock can be taken twice
+//!   on one connection; a second [`Lock::try_lock`] on the same name in the
+//!   same process observes `None`.
 
 use std::time::Duration;
 
@@ -152,10 +168,18 @@ impl std::error::Error for LockError {}
 /// ([`Lock::lock_timeout`]).
 pub const DEFAULT_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub use db_impl::{Lock, LockGuard};
 
-#[cfg(feature = "db")]
+/// Under the `sqlite` feature the same [`Lock`] API is served by a lease table
+/// in the app's own database file (issue #1907). `SQLite` has no
+/// `pg_advisory_lock`, and a `SQLite` deployment is single-host, so the lock
+/// coordinates the processes on that host. See [`sqlite_impl`] for the
+/// differences a caller can observe.
+#[cfg(feature = "sqlite")]
+pub use sqlite_impl::{Lock, LockGuard};
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod db_impl {
     use std::time::{Duration, Instant};
 
@@ -705,6 +729,554 @@ mod db_impl {
                     "distributed lock released by force-closing its session on drop"
                 );
             }
+        }
+    }
+}
+
+/// The [`Lock`] API over a `SQLite` lease table (issue #1907).
+///
+/// `SQLite` has no `pg_advisory_lock`, so a named lock is a row in
+/// `autumn_locks`: `lock_key` is the primary key, so an insert is the atomic
+/// arbiter, and `SQLite` serializes writers so two processes cannot both win.
+/// The runtime creates the table on first use — framework migrations are
+/// Postgres SQL and do not run here.
+///
+/// See the [module docs](crate::lock) for the three differences from the
+/// `PostgreSQL` lock a caller can observe.
+#[cfg(feature = "sqlite")]
+mod sqlite_impl {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use diesel_async::pooled_connection::deadpool::Pool;
+
+    use super::{DEFAULT_LOCK_POLL_INTERVAL, LockError, distributed_lock_key};
+    use crate::db::RuntimeConnection;
+
+    /// Lower bound on the effective [`Lock::lock_timeout`] poll interval, so a
+    /// zero interval yields to the runtime instead of busy-spinning.
+    const MIN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// Default lease duration. A live holder renews well inside it, so this
+    /// only bounds how long a *dead* holder's lock stays taken.
+    pub(super) const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
+
+    /// Floor on the effective lease duration.
+    ///
+    /// A zero TTL would write `expires_at == now`, which the reap predicate
+    /// (`expires_at <= now`) treats as already dead — so the next contender
+    /// takes the lock while the first holder is still in its critical section,
+    /// and renewal cannot intervene because it only runs after a sleep. Clamp
+    /// rather than reject: the setter is a `const fn` a caller may reach
+    /// through a computed duration.
+    const MIN_LEASE_TTL: Duration = Duration::from_secs(1);
+
+    /// How often a held lock renews its lease, as a fraction of the TTL.
+    const RENEW_DIVISOR: u32 = 3;
+
+    type SqlitePool = Pool<RuntimeConnection>;
+
+    /// Owner token minted per acquire, so a guard can only release the lease it
+    /// actually took — never one that expired and was granted to someone else.
+    fn next_owner() -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("{}#{seq}", std::process::id())
+    }
+
+    /// Create the lock table. Idempotent, and safe to run concurrently.
+    async fn create_table(conn: &mut RuntimeConnection) -> Result<(), LockError> {
+        use diesel_async::RunQueryDsl as _;
+
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS autumn_locks ( \
+               lock_key    BIGINT PRIMARY KEY NOT NULL, \
+               lock_name   TEXT   NOT NULL, \
+               owner       TEXT   NOT NULL, \
+               acquired_at BIGINT NOT NULL, \
+               expires_at  BIGINT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_autumn_locks_expiry \
+             ON autumn_locks (expires_at)",
+        ] {
+            diesel::sql_query(statement)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| LockError::Database(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// A handle to a named lock, held on one host.
+    ///
+    /// Cheap to clone-construct. See the [module docs](crate::lock) for
+    /// semantics and non-goals.
+    #[derive(Clone)]
+    pub struct Lock {
+        pool: SqlitePool,
+        name: String,
+        key: i64,
+        poll_interval: Duration,
+        lease_ttl: Duration,
+        clock: Arc<dyn crate::time::ClockSource>,
+        schema: Arc<tokio::sync::OnceCell<()>>,
+    }
+
+    impl Lock {
+        /// Build a lock bound to `pool` and identified by `name`.
+        ///
+        /// `name` is hashed to a stable, namespaced 64-bit key (see
+        /// [`distributed_lock_key`]), the same derivation the `PostgreSQL` lock
+        /// uses, so the two tiers agree on what a name means.
+        #[must_use]
+        pub fn new(pool: SqlitePool, name: impl Into<String>) -> Self {
+            let name = name.into();
+            let key = distributed_lock_key(&name);
+            Self {
+                pool,
+                name,
+                key,
+                poll_interval: DEFAULT_LOCK_POLL_INTERVAL,
+                lease_ttl: DEFAULT_LEASE_TTL,
+                clock: Arc::new(crate::time::SystemClock),
+                schema: Arc::new(tokio::sync::OnceCell::new()),
+            }
+        }
+
+        /// Build a lock from any [`DbState`](crate::db::DbState), using its
+        /// primary pool and injected clock.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError::PoolUnavailable`] if the state has no primary
+        /// database pool configured.
+        pub fn from_state<S: crate::db::DbState + ?Sized>(
+            state: &S,
+            name: impl Into<String>,
+        ) -> Result<Self, LockError> {
+            let pool = state.pool().ok_or_else(|| {
+                LockError::PoolUnavailable("no primary database pool configured".to_string())
+            })?;
+            Ok(Self::new(pool.clone(), name).with_clock(state.clock()))
+        }
+
+        /// The lock's name.
+        #[must_use]
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// The derived 64-bit lock key.
+        #[must_use]
+        pub const fn key(&self) -> i64 {
+            self.key
+        }
+
+        /// Override the poll interval used by [`Lock::lock`] and
+        /// [`Lock::lock_timeout`] (default [`DEFAULT_LOCK_POLL_INTERVAL`]).
+        ///
+        /// `SQLite` has no server-side lock wait, so a blocking acquire polls.
+        #[must_use]
+        pub const fn with_poll_interval(mut self, interval: Duration) -> Self {
+            self.poll_interval = interval;
+            self
+        }
+
+        /// Override the lease duration (default 30s, floor 1s).
+        ///
+        /// Only bounds how long a lock a *dead* holder took stays taken: a live
+        /// holder renews every third of this interval. A value below the floor
+        /// is clamped, because a lease that expires the instant it is written
+        /// would let a second holder in while the first is still running.
+        #[must_use]
+        pub const fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+            self.lease_ttl = ttl;
+            self
+        }
+
+        /// Replace the clock the lease timestamps are read from.
+        #[must_use]
+        pub fn with_clock(mut self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
+            self.clock = clock;
+            self
+        }
+
+        fn now_ms(&self) -> i64 {
+            self.clock.now().timestamp_millis()
+        }
+
+        /// Check out a connection, creating the lock table on first use.
+        async fn conn(
+            &self,
+        ) -> Result<diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>, LockError>
+        {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|error| LockError::PoolUnavailable(error.to_string()))?;
+            // A failed attempt leaves the cell empty, so the next call retries.
+            self.schema
+                .get_or_try_init(|| create_table(&mut conn))
+                .await?;
+            Ok(conn)
+        }
+
+        /// Try to acquire the lock without blocking.
+        ///
+        /// Returns `Ok(Some(guard))` if the lock was acquired, or `Ok(None)`
+        /// immediately if another holder has it right now.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError`] if a connection could not be obtained or the
+        /// query failed.
+        pub async fn try_lock(&self) -> Result<Option<LockGuard>, LockError> {
+            use diesel_async::RunQueryDsl as _;
+
+            let mut conn = self.conn().await?;
+            let now = self.now_ms();
+            // Reap expired leases first, so the insert below is the whole
+            // acquire: a live lock keeps its row and blocks it, while a lock
+            // whose holder died is already gone.
+            diesel::sql_query("DELETE FROM autumn_locks WHERE expires_at <= ?")
+                .bind::<diesel::sql_types::BigInt, _>(now)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| LockError::Database(error.to_string()))?;
+
+            let owner = next_owner();
+            let lease_ttl = self.lease_ttl.max(MIN_LEASE_TTL);
+            let ttl_ms = i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX);
+            let inserted = diesel::sql_query(
+                "INSERT INTO autumn_locks (lock_key, lock_name, owner, acquired_at, expires_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(lock_key) DO NOTHING",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(self.key)
+            .bind::<diesel::sql_types::Text, _>(&self.name)
+            .bind::<diesel::sql_types::Text, _>(&owner)
+            .bind::<diesel::sql_types::BigInt, _>(now)
+            .bind::<diesel::sql_types::BigInt, _>(now.saturating_add(ttl_ms))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| LockError::Database(error.to_string()))?;
+            drop(conn);
+
+            if inserted == 0 {
+                return Ok(None);
+            }
+            Ok(Some(LockGuard::new(
+                self.pool.clone(),
+                &self.clock,
+                self.key,
+                self.name.clone(),
+                owner,
+                lease_ttl,
+            )))
+        }
+
+        /// Acquire the lock, blocking until it becomes available.
+        ///
+        /// `SQLite` has no server-side lock wait, so this polls at the
+        /// configured interval. For a bounded wait, use [`Lock::lock_timeout`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError`] if a connection could not be obtained or the
+        /// query failed.
+        pub async fn lock(&self) -> Result<LockGuard, LockError> {
+            loop {
+                if let Some(guard) = self.try_lock().await? {
+                    return Ok(guard);
+                }
+                tokio::time::sleep(self.poll_interval.max(MIN_LOCK_POLL_INTERVAL)).await;
+            }
+        }
+
+        /// Acquire the lock, blocking up to `timeout`.
+        ///
+        /// The deadline is rechecked before every poll, so no poll is issued
+        /// past `timeout`. The wait is bounded to the deadline plus at most one
+        /// in-flight poll round-trip.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError::Timeout`] if the lock is not acquired within
+        /// `timeout`, or another [`LockError`] on connection/query failure.
+        pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
+            let start = tokio::time::Instant::now();
+            loop {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    return Err(LockError::Timeout {
+                        name: self.name.clone(),
+                        waited: elapsed,
+                    });
+                }
+                if let Some(guard) = self.try_lock().await? {
+                    return Ok(guard);
+                }
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let poll = self
+                    .poll_interval
+                    .max(MIN_LOCK_POLL_INTERVAL)
+                    .min(remaining);
+                tokio::time::sleep(poll).await;
+            }
+        }
+
+        /// Run `f` while holding the lock, blocking to acquire it first.
+        ///
+        /// The lock auto-releases when `f` finishes — on normal return, on an
+        /// early `?` inside `f`, or on panic. Returns whatever `f` returns.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError`] if the lock could not be acquired.
+        pub async fn with<F, Fut, T>(&self, f: F) -> Result<T, LockError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = T>,
+        {
+            let guard = self.lock().await?;
+            Ok(run_guarded(guard, f).await)
+        }
+
+        /// Run `f` while holding the lock, blocking up to `timeout` to acquire.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError::Timeout`] if the lock is not acquired within
+        /// `timeout`, or another [`LockError`] on connection/query failure.
+        pub async fn with_timeout<F, Fut, T>(&self, timeout: Duration, f: F) -> Result<T, LockError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = T>,
+        {
+            let guard = self.lock_timeout(timeout).await?;
+            Ok(run_guarded(guard, f).await)
+        }
+
+        /// Run `f` only if the lock can be acquired without blocking.
+        ///
+        /// Returns `Ok(Some(f_result))` if the lock was acquired and `f` ran, or
+        /// `Ok(None)` if another holder has it. The lock auto-releases when `f`
+        /// finishes (including on panic).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError`] if a connection could not be obtained or the
+        /// query failed.
+        pub async fn try_with<F, Fut, T>(&self, f: F) -> Result<Option<T>, LockError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = T>,
+        {
+            let Some(guard) = self.try_lock().await? else {
+                return Ok(None);
+            };
+            Ok(Some(run_guarded(guard, f).await))
+        }
+    }
+
+    /// Run `f` to completion, then release `guard`.
+    ///
+    /// If `f` panics, `guard`'s `Drop` releases the lock as the stack unwinds.
+    async fn run_guarded<F, Fut, T>(guard: LockGuard, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let result = f().await;
+        if let Err(e) = guard.release().await {
+            tracing::warn!(error = %e, "distributed lock release failed after guarded section");
+        }
+        result
+    }
+
+    /// Delete this holder's lease row. Owner-scoped, so a guard whose lease
+    /// already expired cannot free the lock its successor now holds.
+    async fn delete_owned(pool: &SqlitePool, key: i64, owner: &str) -> Result<usize, LockError> {
+        use diesel_async::RunQueryDsl as _;
+
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| LockError::PoolUnavailable(error.to_string()))?;
+        diesel::sql_query("DELETE FROM autumn_locks WHERE lock_key = ? AND owner = ?")
+            .bind::<diesel::sql_types::BigInt, _>(key)
+            .bind::<diesel::sql_types::Text, _>(owner)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| LockError::Database(error.to_string()))
+    }
+
+    /// An acquired lock. Releases automatically on drop.
+    ///
+    /// Prefer [`LockGuard::release`], which deletes the lease row and reports a
+    /// failure. A guard that is simply dropped — including while unwinding from
+    /// a panic — releases best-effort on the runtime, and in any case at the
+    /// lease expiry.
+    ///
+    /// While the guard lives, a background task renews the lease every third of
+    /// its TTL, so a critical section longer than the TTL is not preempted.
+    pub struct LockGuard {
+        pool: SqlitePool,
+        key: i64,
+        name: String,
+        owner: String,
+        renew: Option<tokio::task::JoinHandle<()>>,
+        released: bool,
+    }
+
+    impl LockGuard {
+        fn new(
+            pool: SqlitePool,
+            clock: &Arc<dyn crate::time::ClockSource>,
+            key: i64,
+            name: String,
+            owner: String,
+            lease_ttl: Duration,
+        ) -> Self {
+            let renew = Self::spawn_renewal(&pool, clock, key, &owner, lease_ttl);
+            Self {
+                pool,
+                key,
+                name,
+                owner,
+                renew,
+                released: false,
+            }
+        }
+
+        /// Keep the lease ahead of its expiry for as long as this guard lives.
+        ///
+        /// `None` when there is no runtime to spawn on, in which case the lease
+        /// simply expires — the same outcome as the process dying, which is what
+        /// the expiry exists for.
+        fn spawn_renewal(
+            pool: &SqlitePool,
+            clock: &Arc<dyn crate::time::ClockSource>,
+            key: i64,
+            owner: &str,
+            lease_ttl: Duration,
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            use diesel_async::RunQueryDsl as _;
+
+            tokio::runtime::Handle::try_current().ok()?;
+            let pool = pool.clone();
+            let clock = Arc::clone(clock);
+            let owner = owner.to_owned();
+            let every = (lease_ttl / RENEW_DIVISOR).max(MIN_LOCK_POLL_INTERVAL);
+            let ttl_ms = i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX);
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    let Ok(mut conn) = pool.get().await else {
+                        continue;
+                    };
+                    let expires_at = clock.now().timestamp_millis().saturating_add(ttl_ms);
+                    let renewed = diesel::sql_query(
+                        "UPDATE autumn_locks SET expires_at = ? \
+                         WHERE lock_key = ? AND owner = ?",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(expires_at)
+                    .bind::<diesel::sql_types::BigInt, _>(key)
+                    .bind::<diesel::sql_types::Text, _>(&owner)
+                    .execute(&mut *conn)
+                    .await;
+                    match renewed {
+                        // Renewed: keep going.
+                        Ok(rows) if rows > 0 => {}
+                        // Zero rows is the one definitive answer — the lease is
+                        // no longer ours, so there is nothing left to renew.
+                        Ok(_) => return,
+                        // An error is not an answer. Writer contention is
+                        // ordinary on SQLite, and giving up here would let the
+                        // lease expire under a guard whose critical section is
+                        // still running — two holders, which is the one thing
+                        // this lock exists to prevent. Try again next tick; the
+                        // guard's drop stops this task.
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %error,
+                                lock_key = key,
+                                "distributed lock renewal failed; retrying"
+                            );
+                        }
+                    }
+                }
+            }))
+        }
+
+        /// The lock's name.
+        #[must_use]
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// The derived 64-bit lock key.
+        #[must_use]
+        pub const fn key(&self) -> i64 {
+            self.key
+        }
+
+        /// Explicitly release the lock by deleting its lease row.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`LockError`] if the delete failed. The lease still expires
+        /// on its own, so the lock is never held forever.
+        pub async fn release(mut self) -> Result<(), LockError> {
+            self.released = true;
+            if let Some(renew) = self.renew.take() {
+                renew.abort();
+            }
+            let deleted = delete_owned(&self.pool, self.key, &self.owner).await?;
+            if deleted == 0 {
+                tracing::warn!(
+                    lock_name = %self.name,
+                    lock_key = self.key,
+                    "distributed lock lease had already expired when released"
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Debug for LockGuard {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("LockGuard")
+                .field("name", &self.name)
+                .field("key", &self.key)
+                .field("held", &!self.released)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            if let Some(renew) = self.renew.take() {
+                renew.abort();
+            }
+            if self.released {
+                return;
+            }
+            // Released implicitly (early return without `release`, a panic
+            // unwind, or a cancelled future). `Drop` cannot await, so delete the
+            // row on the runtime; if there is none, the lease expiry releases it.
+            let (pool, key, owner) = (self.pool.clone(), self.key, self.owner.clone());
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    let _ = delete_owned(&pool, key, &owner).await;
+                });
+            }
+            tracing::debug!(
+                lock_name = %self.name,
+                lock_key = self.key,
+                "distributed lock released on drop"
+            );
         }
     }
 }

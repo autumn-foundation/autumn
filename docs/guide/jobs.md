@@ -119,7 +119,7 @@ that has already become due / started running cannot be canceled.)
 
 ```toml
 [jobs]
-backend = "local"   # local | postgres | redis
+backend = "local"   # local | postgres | redis | sqlite
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
@@ -132,13 +132,19 @@ visibility_timeout_ms = 30000   # default: 30 000 ms
 url = "redis://127.0.0.1/"
 key_prefix = "autumn:jobs"
 visibility_timeout_ms = 30000
+
+[jobs.sqlite]
+# Reuses the configured [database] pool. No extra URL needed.
+visibility_timeout_ms = 30000   # default: 30 000 ms
+poll_interval_ms = 250          # default: 250 ms
 ```
 
-| Backend | Durable | Multi-replica safe | Extra infra |
+| Backend | Durable | Shared by | Extra infra |
 |---|---|---|---|
-| `local` | No | No (in-process) | None |
-| `postgres` | Yes | Yes (SKIP LOCKED) | DB only — no Redis |
-| `redis` | Yes | Yes | Redis |
+| `local` | No | Nothing (in-process) | None |
+| `postgres` | Yes | Every replica (SKIP LOCKED) | DB only — no Redis |
+| `redis` | Yes | Every replica | Redis |
+| `sqlite` | Yes | Every process on the host | DB only — no Redis |
 
 - `local`: in-process channel, zero configuration. Jobs are lost on restart. Fine
   for development or single-process demos.
@@ -148,6 +154,10 @@ visibility_timeout_ms = 30000
   `autumn migrate` run before the first worker starts.
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
+- `sqlite`: durable queue in the app's own SQLite file, for the single-host
+  SQLite tier. Requires the `sqlite` cargo feature. The runtime creates the
+  table itself, so no migration is needed. See
+  [SQLite delivery semantics](#sqlite-delivery-semantics).
 
 ## Web and worker process roles
 
@@ -242,9 +252,16 @@ names.
 ### Split roles require a durable backend
 
 A split web/worker topology **requires a durable jobs backend**
-(`jobs.backend = "postgres"` or `"redis"`). The default `local` backend is an
-in-process, in-memory queue: a `web` replica would enqueue into its own memory,
-where no separate `worker` replica can ever drain it.
+(`jobs.backend = "postgres"`, `"redis"`, or `"sqlite"`). The default `local`
+backend is an in-process, in-memory queue: a `web` replica would enqueue into
+its own memory, where no separate `worker` replica can ever drain it.
+
+`sqlite` qualifies because the queue is a table both processes open — but only
+while they run on the **same host**, which a SQLite deployment does by
+definition, and only against a **file-backed** database. An in-memory target
+(`sqlite::memory:`, `file::memory:`, `?mode=memory`) is private to each process,
+so a split role on one is refused at boot and flagged by
+`autumn doctor --strict`.
 
 Autumn rejects this combination at startup — a `web` or `worker` role on the
 `local` backend exits with a clear error rather than silently dropping work —
@@ -253,7 +270,7 @@ always fine, because one process both enqueues and drains.
 
 ```toml
 [jobs]
-backend = "postgres"   # or "redis"; required once role is "web" or "worker"
+backend = "postgres"   # or "redis" / "sqlite"; required once role is "web" or "worker"
 ```
 
 ### Graceful drain on workers
@@ -311,6 +328,39 @@ Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
 that is slow beyond the visibility timeout can overlap with a recovered retry,
 so external side effects should use natural idempotency keys such as the job id,
 domain aggregate id, or provider idempotency token.
+
+## SQLite delivery semantics
+
+The SQLite backend provides **at-least-once delivery** with the same row
+lifecycle as Postgres. Each job is a row in an `autumn_jobs` table in the app's
+own database file, so work survives a restart with no Redis and no Postgres.
+
+SQLite serializes writers, so a worker claims a row with a single statement —
+`UPDATE … WHERE id = (SELECT … ORDER BY run_at LIMIT 1) RETURNING …` — which is
+the single-host analog of `FOR UPDATE SKIP LOCKED`. Two workers can never claim
+one row.
+
+A claimed row is `running` with a `claimed_at` timestamp and a `claimed_by`
+worker id. A maintenance loop re-enqueues rows whose `claimed_at` is older than
+`jobs.sqlite.visibility_timeout_ms`, at start and on an interval, so a crash
+mid-job loses nothing. A recovered claim consumes another attempt and records a
+`last_error`. A job that exhausts `max_attempts` becomes `failed` and is not
+retried.
+
+There is no `LISTEN`/`NOTIFY`. An enqueue in the same process wakes a worker
+directly; work another process enqueued is seen within
+`jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
+to cut idle wakeups.
+
+Terminal rows are pruned by the runtime, not by `autumn db retention`, whose
+sweep is Postgres-only. Set `retention.job_history` to bound the table; leave it
+unset and history is kept forever, exactly as on Postgres.
+
+The runtime creates the table and its indexes at start, because framework
+migrations are Postgres SQL. Nothing to run by hand.
+
+Because delivery is at-least-once, handlers must be idempotent — the same rule
+as every other durable backend.
 
 ## Retry/backoff and dead letters
 
@@ -449,6 +499,14 @@ pin = ["critical"]
 AUTUMN_JOBS__PIN=bulk,default
 ```
 
+```bash
+# Or as a flag, when one image is started under several roles from a script.
+# `--pin` is repeatable and comma-separated, and sets `AUTUMN_JOBS__PIN` for the
+# app process; `autumn serve restart` restores it.
+autumn serve --role worker --pin critical
+autumn serve --role worker --pin bulk --pin default
+```
+
 A pinned process **never** claims jobs from queues outside its subset, on both
 the Postgres and Redis backends. Weighted/strict ordering is preserved *within*
 the pinned subset. An empty/unset `pin` (the default) keeps today's behavior:
@@ -469,23 +527,80 @@ the `[jobs.queues]` config **and** any queues declared solely via
 `#[job(queue = "…")]` — and diagnoses a genuinely uncovered queue loudly at
 boot.
 
-`autumn doctor --strict` **does not fail** on queue coverage — it reports
-coverage **informationally** (a `jobs_queue_coverage` line that always passes).
-It prints what the pinned tier claims, which configured queues it does not
-claim, and any pinned queues absent from `[jobs.queues]`. Why it can only
-report, not enforce: doctor is **config-only and per-process**. It sees only
-**one** process, so it cannot know what sibling worker tiers drain — a multi-tier
-deployment where each pinned tier omits queues covered by other tiers (one
-process `AUTUMN_JOBS__PIN=critical`, another `AUTUMN_JOBS__PIN=bulk,default`) is
-legitimate. And it inspects only `[jobs.queues]` (plus the implicit `default`
-queue), so it cannot see a queue declared solely via `#[job(queue = "…")]`,
-which the runtime appends to the effective schedule and drains. Any hard-fail
-doctor asserted on coverage would therefore false-positive on a valid
-deployment, which is exactly why enforcement lives in the runtime warning above.
+`autumn doctor` reports coverage as a `jobs_queue_coverage` check. What that
+check can *prove* — report only, or fail the run — depends on how much of the
+deployment you have declared.
 
-Ensuring every queue is drained by some tier remains the operator's
-responsibility: make sure some process (an unpinned worker tier, or one pinned
-to those queues) covers every queue you enqueue to.
+**Without a declared topology it only reports.** Doctor is config-only and
+per-process: it sees **one** process, so it cannot know what sibling worker
+tiers drain — a multi-tier deployment where each pinned tier omits queues
+covered by other tiers (one process `AUTUMN_JOBS__PIN=critical`, another
+`AUTUMN_JOBS__PIN=bulk,default`) is perfectly legitimate. It also inspects only
+`[jobs.queues]` (plus the implicit `default` queue), so it cannot see a queue
+declared solely via `#[job(queue = "…")]`, which the runtime appends to the
+effective schedule and drains. Any hard-fail asserted from that vantage point
+would false-positive on a valid deployment, so the check passes and prints what
+this tier claims, which configured queues it does not claim, and any pinned
+queues absent from `[jobs.queues]`.
+
+**Declare the fleet topology and doctor can hard-fail.** Give doctor every
+worker tier's pin under `[jobs.fleet]` and it reasons about the *union* of what
+the fleet drains instead of one process, which makes a zero-coverage gap
+provable:
+
+```toml
+[jobs.queues]
+critical = { weight = 4, reserved = 2 }
+bulk = { weight = 1, concurrency = 4 }
+default = 2
+
+[jobs.fleet]
+# One entry per worker tier, each holding that tier's `jobs.pin`. This must list
+# EVERY tier you actually run — see the warning below.
+# An empty entry (`[]`) is an unpinned tier that drains every queue.
+tiers = [["critical"], ["bulk", "default", "thumbnails"]]
+
+# Optional — teach doctor about queues declared in code but absent from
+# `[jobs.queues]` (here, a `#[job(queue = "thumbnails")]`), so they count toward
+# coverage too. List them inline…
+declared_queues = ["thumbnails"]
+```
+
+…or, better, point at a manifest the app emits, which is the ground-truth set
+rather than a list you maintain by hand. Generate it with
+`autumn jobs manifest <path>` (it runs your app binary to dump the queues it
+really drains) and reference it instead of `declared_queues` — when both are
+set, `manifest` wins and `declared_queues` is never read:
+
+```toml
+[jobs.fleet]
+tiers = [["critical"], ["bulk", "default", "thumbnails"]]
+manifest = "target/jobs-manifest.toml"
+```
+
+With a topology declared, `autumn doctor` **fails** — exit 1, in every mode, not
+only under `--strict` — when some queue that must be drained is claimed by no
+tier anywhere, naming the uncovered queues. (`--strict` escalates *warnings*; a
+failed check is fatal regardless.)
+
+`manifest` and `declared_queues` can only *add* to the set of queues that must
+be covered, so an incomplete or missing manifest never manufactures a failure —
+it just leaves doctor blind to the queues it did not see.
+
+> **`tiers` must be exhaustive.** It is the one input where under-declaring is
+> unsafe: doctor can only reason about the tiers you list, so omitting a tier
+> that really runs — especially an unpinned one, which would make coverage
+> total — reports a gap that does not exist. Treat `[jobs.fleet] tiers` as the
+> checked-in description of the whole fleet, and update it when you add or
+> remove a worker tier.
+
+`[jobs.fleet]` is purely declarative. A running process never acts on it — it
+describes the *other* tiers, which no single process can observe — so it changes
+no runtime behavior, and an app that declares nothing keeps today's behavior.
+
+Absent that declaration, ensuring every queue is drained by some tier remains
+the operator's responsibility: make sure some process (an unpinned worker tier,
+or one pinned to those queues) covers every queue you enqueue to.
 
 ### Observability
 
@@ -500,12 +615,13 @@ addition to the existing per-job-type gauges under `jobs`:
 }
 ```
 
-On durable backends (Postgres/Redis) with multiple processes, these per-queue
-gauges — like the existing per-job-type gauges — reflect enqueue/start events
-observed in the local process, so an enqueue-only `web` replica shows work it
-doesn't drain; treat them as per-process approximations. Authoritative
-cluster-wide queue depth is tracked as future work (composes with the metrics
-in #1378).
+On the durable backends (Postgres/Redis) these gauges are **not** per-process
+approximations: a periodic survey of the durable store wholesale-replaces this
+process's local enqueue marks each tick (#1752), so an enqueue-only `web`
+replica reports the true shared backlog, and a queue absent from the latest
+survey resets to `depth` 0 rather than leaking a stale one. On the in-process
+`local` backend there is only one process, so the local marks *are* the whole
+picture.
 
 > Still out of scope (separate follow-up): per-job-instance dynamic priority at
 > enqueue time.
@@ -550,7 +666,9 @@ Semantics:
   `total_deduplicated` in `/actuator/jobs` and recorded with the
   `deduplicated` job-admin status.
 - Jobs over the concurrency cap **wait** (they stay enqueued/parked and run
-  when a slot frees) — they are never dropped.
+  when a slot frees) — they are never dropped. They stay on the admin
+  dashboard's enqueued tab; Redis also marks the row "waiting on a concurrency
+  slot".
 - Keys and slots are released on success, terminal failure, **and worker
   crash**: Postgres ties them to row status recovered by the visibility
   timeout; Redis settles them in the claim-validated transition and
@@ -686,21 +804,27 @@ Progress/result records expire `jobs.tracking.ttl_secs` after their last
 write (default `86400`, 24h). The record store follows whichever job
 backend is configured — `local` and `redis` use an in-memory or Redis-backed
 store respectively, `postgres` uses the `autumn_job_tracking` table (see
-[Migration notes](#migration-notes)) — so a tracked job's status composes
-with the backend an app already runs, with no extra setup. Expired records
-are invisible to reads/writes immediately on all three stores; each also
-actually frees the expired record so long-running processes don't
-accumulate one dead entry per tracked job forever: the in-memory store
-sweeps them out opportunistically (amortized across `create` calls), a
-Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
-and Redis expires keys natively via `EX`.
+[Migration notes](#migration-notes)), and `sqlite` uses the same table in the
+app's own database file — so a tracked job's status composes with the backend
+an app already runs, with no extra setup. Expired records are invisible to
+reads/writes immediately on every store; each also actually frees the expired
+record so long-running processes don't accumulate one dead entry per tracked
+job forever: the in-memory store sweeps them out opportunistically (amortized
+across `create` calls), the Postgres and SQLite background sweeps run every 5
+minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 
 ### Async CSV export, end to end
 
 The synchronous `GET /{plural}/export.csv` admin route runs inline on the
 request thread — fine for small tables, but a 50k-row export blocks the
 worker and risks tripping a proxy idle timeout. A tracked job moves that
-work off the request thread:
+work off the request thread.
+
+`autumn_web::data::csv` is behind the non-default `csv` feature:
+
+```toml
+autumn-web = { version = "0.7", features = ["csv"] }
+```
 
 ```rust,ignore
 use autumn_web::data::csv::export_csv;
@@ -856,6 +980,9 @@ in-flight, success, retry/failure, and dead-letter activity observed by the
 replica serving the actuator request.
 
 ## Migration notes
+
+When using `jobs.backend = "sqlite"`, the runtime creates its own `autumn_jobs`
+table at start; no migration step is needed.
 
 When using `jobs.backend = "local"` or `jobs.backend = "redis"`, no SQL migration
 is required.

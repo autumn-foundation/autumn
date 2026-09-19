@@ -182,6 +182,71 @@ side effects:
 | `POST` / `PUT` / `PATCH` | `false` | — |
 | `DELETE` | `false` | `true` |
 
+The verb is a floor. A handler that declares an authority envelope can raise
+`destructiveHint`, never clear it — see below.
+
+### Proving what an agent can do
+
+A tool description says what an endpoint is *for*. It says nothing about what
+the call is **allowed to do**, and an MCP tool is an action an agent takes with
+no human in the loop. `#[agent_operable(grant = ...)]` closes that gap at build
+time:
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        outbound: ["https://api.stripe.com/v1/refunds"],
+        jobs: [NotifyFinanceJob],
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[api_doc(mcp, summary = "Draft a refund")]
+#[agent_operable(grant = RefundDrafter)]
+pub async fn draft_refund(/* … */) -> AutumnResult<Json<Refund>> { /* … */ }
+```
+
+The macro walks the body, derives the effects it can prove — row writes,
+unbounded writes, cross-tenant access, outbound hosts, webhook topics, jobs —
+and fails `cargo build` when the grant does not cover one of them. Three things
+follow for MCP specifically:
+
+- **`destructiveHint` gets a proved input.** When a tool carries a grant, a
+  `compensable` or `irreversible` reversibility sets the hint, raising a
+  `POST`/`PATCH` the verb alone says nothing about. It only ever adds: a
+  `DELETE` stays `true` whatever the grant declares, because `reversible` means
+  the effect set is bounded writes — not that the application can put the row
+  back — and a client skips its confirmation prompt on `false`. Ungoverned
+  tools keep the table above exactly as it is.
+- **Every `tools/call` is audited**, with no per-handler wiring: an
+  `agent.tool.<name>.attempt` event before dispatch and an `agent.tool.<name>`
+  event after it, sharing one correlation id and carrying the tool, the grant,
+  the reversibility, the proved effect set and the argument *names* (never
+  their values — only the keys the tool declares, with any others counted as
+  `+N unknown`). Each carries a `phase` of `attempt`, `outcome` or `refused`.
+  An ungoverned tool is audited too, with `reversibility = "unknown"`. Every
+  write is bounded by a 2-second timeout; if the attempt record cannot be
+  written or times out and the action is not `reversible`, the call fails
+  closed, the handler never runs, and a best-effort
+  `agent.tool.<name>.refused` (status Failure, with a `refused_reason` and no
+  `http_status`) records the refusal. Note the attempt is written *before* the
+  request is dispatched, and so before route-level authorization — once a sink
+  is installed, gate the endpoint with `secure_mcp(...)` (§6) and rate-limit
+  it.
+- **`autumn agents manifest --check`** lists every MCP-exposed tool: governed
+  ones with their envelope, and every mutating tool that has *no* envelope —
+  the one gap the compiler cannot catch, because a tool with no grant has no
+  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§9) have
+  no annotation site in this slice, so they surface there.
+
+See [The Agent Authority Envelope](agent-authority.md) for the grant grammar,
+the effect table, the escape hatches, the manifest and the audit record.
+
 ---
 
 ## 4. Calling a tool
@@ -349,6 +414,16 @@ header an agent sends to `/mcp` is **forwarded** into the dispatched request,
 so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
 headers are forwarded too, so session-based `#[secured]` routes and
 CSRF-protected writes behave identically to a direct call.
+
+The example below uses `InMemoryApiTokenStore`, which keeps tokens in the
+process and seeds them in code. To manage an agent's token from the CLI
+instead — `autumn token issue <principal> --scope <scope>`, and `revoke` /
+`rotate` to take it back — the app must read the same `api_tokens` table the
+CLI writes, which means mounting
+[`DbApiTokenStore`](../../autumn/src/auth.rs) in place of the in-memory one.
+A token issued by the CLI is invisible to an in-memory store, so verification
+answers `401`. See
+[API tokens](authentication.md#issuing-listing-rotating-and-revoking-api-tokens).
 
 To put a tool behind token auth, register the route inside a `scoped` group
 carrying the `RequireApiToken` layer. The scope keeps the route in the

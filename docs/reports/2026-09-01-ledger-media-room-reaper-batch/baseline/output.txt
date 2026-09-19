@@ -1,0 +1,66 @@
+running 1 test
+test room_reaper_batch_profile ... 
+=== fixture: 8002 stale candidate rooms, expect 7501 reaped / 1203 surviving ===
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): occupancy check for one candidate room (baseline: issued once per candidate) ===
+SELECT COUNT(*) FROM media_room_participants WHERE namespace = 'tenant-busy-0' AND room_id = 'stale-empty-0'
+Aggregate  (cost=8.30..8.31 rows=1 width=8) (actual time=0.018..0.019 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=2
+  ->  Index Only Scan using media_room_participants_pkey on public.media_room_participants  (cost=0.28..8.30 rows=1 width=0) (actual time=0.014..0.015 rows=0 loops=1)
+        Output: namespace, room_id, participant_id
+        Index Cond: ((media_room_participants.namespace = 'tenant-busy-0'::text) AND (media_room_participants.room_id = 'stale-empty-0'::text))
+        Heap Fetches: 0
+        Buffers: shared hit=2
+Query Identifier: -4543600605187576825
+Planning:
+  Buffers: shared hit=26 read=1
+Planning Time: 0.327 ms
+Execution Time: 0.074 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched anti-join DELETE candidate set (fix: entire phase 2 in one statement) ===
+SELECT namespace, room_id FROM media_rooms WHERE created_at < '2026-06-01 11:30:00.000000' AND NOT EXISTS (SELECT 1 FROM media_room_participants p WHERE p.namespace = media_rooms.namespace AND p.room_id = media_rooms.room_id)
+Hash Right Anti Join  (cost=310.83..544.59 rows=5794 width=31) (actual time=4.073..4.532 rows=6001 loops=1)
+  Output: media_rooms.namespace, media_rooms.room_id
+  Inner Unique: true
+  Hash Cond: ((p.namespace = media_rooms.namespace) AND (p.room_id = media_rooms.room_id))
+  Buffers: shared hit=194
+  ->  Seq Scan on public.media_room_participants p  (cost=0.00..175.02 rows=6302 width=32) (actual time=0.011..0.667 rows=6302 loops=1)
+        Output: p.namespace, p.room_id, p.participant_id, p.display_name, p.token, p.joined_at, p.token_expires_at, p.last_seen_at
+        Buffers: shared hit=112
+  ->  Hash  (cost=190.80..190.80 rows=8002 width=31) (actual time=2.311..2.312 rows=8002 loops=1)
+        Output: media_rooms.namespace, media_rooms.room_id
+        Buckets: 8192  Batches: 1  Memory Usage: 560kB
+        Buffers: shared hit=82
+        ->  Seq Scan on public.media_rooms  (cost=0.00..190.80 rows=8002 width=31) (actual time=0.011..0.837 rows=8002 loops=1)
+              Output: media_rooms.namespace, media_rooms.room_id
+              Filter: (media_rooms.created_at < '2026-06-01 11:30:00'::timestamp without time zone)
+              Rows Removed by Filter: 702
+              Buffers: shared hit=82
+Query Identifier: 8456495656596168171
+Planning:
+  Buffers: shared hit=104 read=2
+Planning Time: 0.974 ms
+Execution Time: 4.933 ms
+
+=== reap_stale result: rooms_reaped=7501 participants_reaped=5400 ===
+
+=== pg_stat_statements: reap_stale phase 2 (candidate rooms) ===
+calls=8002   buffers=18412    temp_read=0    temp_written=0    SELECT COUNT(*) FROM "media_room_participants" WHERE (("media_room_participants"."namespace" = $1) AND ("media_room_participants"."room_id" = $2))
+calls=7501   buffers=15002    temp_read=0    temp_written=0    DELETE FROM ONLY "public"."media_room_participants" WHERE $1 OPERATOR(pg_catalog.=) "namespace" AND $2 OPERATOR(pg_catalog.=) "room_id"
+calls=7501   buffers=60018    temp_read=0    temp_written=0    DELETE FROM "media_rooms" WHERE (("media_rooms"."namespace" = $1) AND ("media_rooms"."room_id" = $2))
+calls=1      buffers=5512     temp_read=0    temp_written=0    DELETE FROM "media_room_participants" WHERE ("media_room_participants"."last_seen_at" < $1)
+calls=1      buffers=82       temp_read=0    temp_written=0    SELECT "media_rooms"."namespace", "media_rooms"."room_id" FROM "media_rooms" WHERE ("media_rooms"."created_at" < $1)
+-- candidate-scan calls=1 -- COUNT(*) calls=8002 buffers=18412 -- media_rooms DELETE calls=7501 buffers=60018 -- FK cascade calls=7501 buffers=15002 -- phase-1 sweep calls=1 buffers=5512 -- temp_blks_read=0 temp_blks_written=0 (all media_room statements) --
+
+=== statement-count summary (candidate rooms: 8002) ===
+candidate scan:                     1 call(s),      82 buffers
+COUNT(*) occupancy checks:       8002 call(s),   18412 buffers
+media_rooms DELETE:              7501 call(s),   60018 buffers
+-- phase-2 client statements:   15504,   78512 buffers --
+FK ON DELETE CASCADE (internal): 7501 call(s),   15002 buffers
+phase-1 participant sweep:          1 call(s),    5512 buffers (unchanged by this fix)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.38s
+

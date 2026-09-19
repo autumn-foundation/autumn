@@ -1,0 +1,11 @@
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 02s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-5038567e9df926b0)
+
+running 3 tests
+test integration::profile_conditional_surfaces::dev_error_badge_stays_closed_in_explicit_prod_profile ... ok
+test integration::profile_conditional_surfaces::dev_error_badge_stays_closed_when_profile_is_unset ... ok
+test integration::profile_conditional_surfaces::inspector_stays_closed_when_profile_is_unset ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2023 filtered out; finished in 0.52s
+

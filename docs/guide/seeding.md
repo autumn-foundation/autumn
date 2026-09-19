@@ -120,7 +120,10 @@ autumn seed --profile demo
 3. **Sets the profile** via the `AUTUMN_ENV` environment variable (default:
    `dev`). Your seed binary reads `ctx.profile()` to branch on environment.
 
-4. **Delegates to `cargo run --bin seed`**. All Cargo flags such as `--package`
+4. **Delegates to `cargo run --bin <seed-target>`**, where `<seed-target>` is the
+   bin target built from `src/bin/seed.rs` (resolved from `cargo metadata`, so
+   a renamed target such as `todo-app-seed` still works). All Cargo flags such
+   as `--package`
    work:
    ```sh
    autumn seed --profile demo --package my-workspace-member
@@ -263,8 +266,16 @@ complete working example that populates 200 rows this way.
 realistic value for one field: `fake::name()`, `fake::username()`,
 `fake::email()`, `fake::word()` / `fake::words(n)` / `fake::sentence()` /
 `fake::paragraph()`, `fake::url()`, `fake::boolean()`,
-`fake::int_range(lo, hi)`, `fake::decimal()`, `fake::recent_datetime()`, and
+`fake::int_range(lo, hi)`, `fake::decimal()`,
+`fake::decimal_with(precision, scale)`, `fake::recent_datetime()`, and
 `fake::uuid()`.
+
+`fake::decimal_with(p, s)` draws a value shaped for a `decimal{p,s}` column
+(at most `p - s` integer digits and at most `s` fractional digits); the
+factory `.fake()` selects it automatically for `decimal{p,s}` fields via the
+`#[decimal_shape]` attribute the generator emits, so seeded rows always fit
+the declared column (#2597). `fake::decimal()` stays the untyped
+`0.00..=9999.99` draw for ad-hoc use.
 
 ### Reproducible fake data
 
@@ -317,6 +328,9 @@ box with no manual edits.
   automatically; see the `#[factory_assoc]` docs for the associated-model
   factory pattern.
 - **`autumn generate seed`** — tracked in #493 follow-up work.
+
+<!-- cli-surface-allow: autumn generate seed — listed under "Out of scope" precisely because it does not exist; tracked in #493 -->
+
 
 ---
 

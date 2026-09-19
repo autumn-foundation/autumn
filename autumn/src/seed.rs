@@ -486,7 +486,9 @@ mod tests {
     /// database.
     fn lazy_pool() -> Pool<RuntimeConnection> {
         crate::db::create_pool(&DatabaseConfig {
-            primary_url: Some("postgres://localhost/unused".to_string()),
+            // Backend-parametric: `build_sqlite_pool` refuses a `postgres://`
+            // target, so a literal here panics under `--features "sqlite,seed"`.
+            primary_url: Some(crate::test_urls::primary("unused")),
             ..DatabaseConfig::default()
         })
         .expect("pool builds")

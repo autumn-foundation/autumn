@@ -171,7 +171,7 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
 /// id that belongs to tenant A must leave tenant A's row completely untouched —
 /// the DO UPDATE `WHERE tenant_id = <current>` predicate never matches, so the
 /// row is neither returned nor moved into tenant B. This is the no-cross-tenant-
-/// leak assertion; without the SQLite tenant predicate the row's `tenant_id`
+/// leak assertion; without the `SQLite` tenant predicate the row's `tenant_id`
 /// would be rewritten to "tenant-b".
 #[tokio::test]
 async fn tenant_scoped_upsert_many_never_leaks_cross_tenant_row_on_sqlite() {
@@ -232,7 +232,7 @@ async fn tenant_scoped_upsert_many_never_leaks_cross_tenant_row_on_sqlite() {
     );
 }
 
-/// Tenant-scoped + optimistic lock: proves the SQLite DO UPDATE carries BOTH the
+/// Tenant-scoped + optimistic lock: proves the `SQLite` DO UPDATE carries BOTH the
 /// tenant predicate (cross-tenant silent, no leak) AND the
 /// `lock_version = excluded.lock_version` guard (same-tenant stale → 409),
 /// matching Postgres exactly.
@@ -323,7 +323,7 @@ async fn tenant_scoped_versioned_upsert_many_isolates_and_conflicts_on_sqlite() 
     assert_eq!(final_a.lock_version, 2);
 }
 
-/// Plain (non-tenant) optimistic-lock `upsert_many` runs on SQLite: a valid
+/// Plain (non-tenant) optimistic-lock `upsert_many` runs on `SQLite`: a valid
 /// upsert bumps the version, and a stale one yields the 409 conflict — matching
 /// Postgres.
 #[tokio::test]

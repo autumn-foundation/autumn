@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use autumn_web::AutumnError;
 use autumn_web::capsule::{
-    Capsule, CapsuleOutcome, DivergenceLog, ReplayClock, Verdict, execute, load_capsule,
+    CapsuleOutcome, DivergenceLog, ReplayFixtures, Verdict, execute, load_capsule,
     pool_from_capsule,
 };
 use autumn_web::config::AutumnConfig;
@@ -30,7 +30,6 @@ use autumn_web::db::Db;
 use autumn_web::test::{TestApp, TestDb};
 use autumn_web::{get, routes};
 use axum::extract::State;
-use chrono::{DateTime, Utc};
 use diesel_async::RunQueryDsl as _;
 
 // ── The application under capture ───────────────────────────────────────────
@@ -181,28 +180,6 @@ async fn await_one_capsule(dir: &Path) -> PathBuf {
     );
 }
 
-/// A [`ReplayClock`] the test keeps a handle on: `TestApp::with_clock` takes
-/// ownership, and the driver needs the same clock to count over-reads.
-struct SharedClock(Arc<ReplayClock>);
-
-impl autumn_web::time::ClockSource for SharedClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.0.now()
-    }
-}
-
-fn replay_clock(capsule: &Capsule) -> Arc<ReplayClock> {
-    // `as_slice` disambiguates from diesel's `RunQueryDsl::first`, which is in
-    // scope here and applies to `Vec` without an autoderef.
-    let fallback = capsule
-        .clock
-        .as_slice()
-        .first()
-        .copied()
-        .unwrap_or(capsule.captured_at);
-    Arc::new(ReplayClock::new(capsule.clock.clone(), fallback))
-}
-
 const fn status_of(outcome: &CapsuleOutcome) -> u16 {
     match outcome {
         CapsuleOutcome::Status { code, .. } => *code,
@@ -278,16 +255,17 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
     let divergences = Arc::new(DivergenceLog::new());
     let replay_pool =
         pool_from_capsule(&capsule, Arc::clone(&divergences)).expect("replay pool builds");
-    let clock = replay_clock(&capsule);
+    let fixtures = ReplayFixtures::from_capsule(&capsule);
     let router = TestApp::new()
         .config(replay_config())
         .routes(routes![widgets_broken])
         .with_db(replay_pool)
-        .with_clock(SharedClock(Arc::clone(&clock)))
+        .with_clock(fixtures.clock())
+        .with_entropy(fixtures.entropy())
         .build()
         .into_router();
 
-    let outcome = execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+    let outcome = execute(router, &capsule, divergences, &fixtures).await;
 
     assert!(
         outcome.divergences.is_empty(),
@@ -372,16 +350,17 @@ async fn a_request_that_checks_out_twice_records_no_pool_traffic_and_replays() {
     let divergences = Arc::new(DivergenceLog::new());
     let replay_pool =
         pool_from_capsule(&capsule, Arc::clone(&divergences)).expect("replay pool builds");
-    let clock = replay_clock(&capsule);
+    let fixtures = ReplayFixtures::from_capsule(&capsule);
     let router = TestApp::new()
         .config(replay_config())
         .routes(routes![widgets_twice])
         .with_db(replay_pool)
-        .with_clock(SharedClock(Arc::clone(&clock)))
+        .with_clock(fixtures.clock())
+        .with_entropy(fixtures.entropy())
         .build()
         .into_router();
 
-    let outcome = execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+    let outcome = execute(router, &capsule, divergences, &fixtures).await;
     assert!(
         outcome.divergences.is_empty(),
         "a request that reused its connection must still replay on the tape: {:?}",
@@ -424,16 +403,17 @@ async fn a_panicking_db_reading_route_is_captured_and_replayed_identically() {
     let divergences = Arc::new(DivergenceLog::new());
     let replay_pool =
         pool_from_capsule(&capsule, Arc::clone(&divergences)).expect("replay pool builds");
-    let clock = replay_clock(&capsule);
+    let fixtures = ReplayFixtures::from_capsule(&capsule);
     let router = TestApp::new()
         .config(replay_config())
         .routes(routes![widgets_panic])
         .with_db(replay_pool)
-        .with_clock(SharedClock(Arc::clone(&clock)))
+        .with_clock(fixtures.clock())
+        .with_entropy(fixtures.entropy())
         .build()
         .into_router();
 
-    let outcome = execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+    let outcome = execute(router, &capsule, divergences, &fixtures).await;
 
     assert!(
         outcome.divergences.is_empty(),

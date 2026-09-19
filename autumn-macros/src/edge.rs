@@ -497,8 +497,9 @@ mod tests {
         // `(async move { … }).await`, burying the marker one level down.
         let edged = edge_macro(quote! {}, quote! { async fn h() -> &'static str { "ok" } });
         let secured = crate::secured::secured_macro(quote! { "admin" }, edged);
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "h");
         assert!(
-            detect(&parse_fn(secured)).is_some(),
+            detect(&secured_fn).is_some(),
             "a buried #[edge] marker must still be detected"
         );
     }

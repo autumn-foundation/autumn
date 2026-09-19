@@ -17,7 +17,11 @@ name: Release Image Build-and-Boot Gate
 # `docker build`s the image, runs the documented one-shot `autumn migrate`, boots
 # the container against a throwaway Postgres, and asserts /health and
 # /actuator/health return 200 within the documented startup budget. It covers
-# both the bare `release init` target and the `--target docker-compose` variant.
+# both the bare `release init` target and the `--target docker-compose` variant,
+# plus a direct-TLS variant (issue #1603): the same image booted with
+# `[server.tls]` configured and a test certificate, asserted through an HTTPS
+# health check — the regression gate for the "serve HTTPS with no reverse proxy"
+# story, including that the generated HEALTHCHECK still works over https://.
 #
 # Path-scoped to the deployment-scaffold surface (so it does not tax unrelated
 # PRs) plus a weekly scheduled run so transitive base-image / crate rot is caught
@@ -70,6 +74,10 @@ env:
   # size budget, surfaced as workflow-level knobs.
   STARTUP_BUDGET_SECS: "30"
   IMAGE_SIZE_BUDGET_MB: "150"
+  # Deadline for the container's OWN Docker HEALTHCHECK to report `healthy` in
+  # the direct-TLS target. The generated HEALTHCHECK has a 10s start period and
+  # a 30s interval, so this needs headroom over the probe budget above.
+  HEALTHY_BUDGET_SECS: "120"
 
 jobs:
   # ── Bare `release init` target ──────────────────────────────────────────────
@@ -118,6 +126,56 @@ jobs:
           PG_HOST: localhost
           PG_PORT: "5432"
         run: ./scripts/check-release-image-boot.sh default
+
+  # ── direct-TLS (HTTPS) target ───────────────────────────────────────────────
+  #
+  # Issue #1603 AC6. Same image and same one-shot migrate as `bare-target`, but
+  # the app terminates TLS itself: the generated Cargo.toml turns the `tls`
+  # feature on by default, a self-signed test certificate is mounted into the
+  # container, and `[server.tls]` is supplied through AUTUMN_SERVER__TLS__*.
+  # The gate then asserts an HTTPS `/health` + `/actuator/health` 200 (validating
+  # the certificate with `--cacert`, not `-k`), that plain HTTP on the same port
+  # does NOT answer, and that the container's own HEALTHCHECK reaches `healthy`
+  # over https://.
+  https-target:
+    name: Build + boot (direct TLS)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: autumn
+          POSTGRES_PASSWORD: autumn
+          POSTGRES_DB: releasecheck_prod
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U autumn -d releasecheck_prod"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Build the autumn CLI (scaffold under test)
+        run: cargo build -p autumn-cli --bin autumn
+
+      - name: Build and boot the generated image over HTTPS
+        env:
+          AUTUMN_BIN: ${{ github.workspace }}/target/debug/autumn
+          PG_HOST: localhost
+          PG_PORT: "5432"
+        run: ./scripts/check-release-image-boot.sh https
 
   # ── docker-compose target ───────────────────────────────────────────────────
   #

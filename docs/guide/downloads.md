@@ -100,18 +100,19 @@ inferred from the filename extension → blob-metadata default →
 
 ## Serving a private stored file behind auth
 
-Because `Download` is a plain `IntoResponse`, a policy-protected handler can
-stream a stored blob as a download in one expression. `from_blob` reads only the
-object's metadata up front and opens the byte stream lazily, so the full object
-is never buffered in memory — it works for large files behind authorization
-without issuing a public presigned URL:
+Because `Download` is a plain `IntoResponse`, a
+[`#[secured]`](./authentication.md#secured) handler can stream a stored blob as
+a download in one expression. `from_blob` reads only the object's metadata up
+front and opens the byte stream lazily, so the full object is never buffered in
+memory — it works for large files behind authorization without issuing a public
+presigned URL:
 
 ```rust
 use autumn_web::download::Download;
 use autumn_web::storage::SharedBlobStore;
 use autumn_web::{secured, AutumnError};
 
-#[secured(policy = "reports.read")]
+#[secured(scopes = ["reports:read"])]
 async fn download_report(
     store: SharedBlobStore,
     report_key: String,
@@ -191,7 +192,7 @@ use autumn_web::storage::SharedBlobStore;
 use autumn_web::{secured, AutumnError};
 use http::HeaderMap;
 
-#[secured(policy = "media.watch")]
+#[secured(scopes = ["media:watch"])]
 async fn watch(
     store: SharedBlobStore,
     key: String,

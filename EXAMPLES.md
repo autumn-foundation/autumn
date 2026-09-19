@@ -85,6 +85,21 @@ The island crate that produces the wasm lives in `examples/island-flock`
 
 ---
 
+### `examples/cms` — WordPress-Parity Content Management
+
+<!-- catalog:example name=cms tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer replacing a WordPress install, or starting a content site |
+| **Journey** | Full CMS: register → author → publish → moderate, with roles, themes and plugins |
+| **Key capabilities** | `#[state_machine]` post lifecycle, `#[searchable]`, `#[cached]` + `invalidates`, `MutationHooks`, `storage::BlobStore`, `#[scheduled]`, capability-based authorization, typed action/filter hooks |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL 12+ (stored generated column), Docker for the full test suite |
+| **Run command** | `cargo run -p cms` |
+| **Success proof** | `curl http://localhost:3000/register` returns the registration screen |
+
+---
+
 ### `examples/bookmarks` — Profiles, Repository Macro, and Scheduled Tasks
 
 <!-- catalog:example name=bookmarks tier=supported -->
@@ -93,7 +108,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer adding operational features to an existing Autumn app |
 | **Journey** | Profiles/tasks: generated CRUD API, actuator endpoints, profile-based config, hourly scheduled task |
-| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering |
+| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering, app-metrics facade (`autumn_web::metrics` counter + timer on `/actuator/prometheus`), OpenAPI spec + `autumn openapi export` for typed clients |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p bookmarks` |
 | **Success proof** | `curl http://localhost:3000/actuator/health` returns `{"status":"UP"}` |
@@ -107,11 +122,11 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer deploying an Autumn app at production scale with read replicas |
-| **Journey** | Distributed deployment: primary/replica Postgres, Redis-optional, multi-replica web tier behind nginx, one-shot migrator |
-| **Key capabilities** | Explicit repository seam, partitioned `#[scheduled]` with advisory locks, `autumn-{profile}.toml` layering, Docker Compose topology |
+| **Journey** | Distributed deployment: primary/replica Postgres, Redis-optional, multi-replica web tier behind nginx, one-shot migrator, and a two-node cluster the replicas form between themselves |
+| **Key capabilities** | Explicit repository seam, partitioned `#[scheduled]` with advisory locks, `autumn-{profile}.toml` layering, Docker Compose topology, self-clustering substrate (`[cluster]`, `ClusterHandle`, cluster-wide counter, `cluster:membership` health) |
 | **Prerequisites** | Docker and Docker Compose |
 | **Run command** | `docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --build` |
-| **Success proof** | `curl http://localhost:3000/api/bookmarks` returns `[]` after the stack is healthy |
+| **Success proof** | `curl http://localhost:3000/api/bookmarks` returns `[]` after the stack is healthy; `curl http://localhost:3000/cluster` reports a two-member view whose `node` alternates between `web-1` and `web-2` |
 
 ---
 
@@ -152,11 +167,11 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
-| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, cookie consent, and live-tunable runtime config |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve) |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
-| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
+| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML *and* the cookie-consent banner; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts; `curl 'http://localhost:3000/r/rust?page=2'` returns page 2 with a `<nav aria-label="Pagination">` of plain links |
 
 ---
 
@@ -212,6 +227,24 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 
 ---
 
+### `examples/collab-notes` — Collaborative Editing
+
+<!-- catalog:example name=collab-notes tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who needs multiplayer editing and does not want to rent a real-time backend |
+| **Journey** | Mark a field `#[collaborative]` → open one note in two browsers → type in both → watch the text merge character by character with a live participant list |
+| **Key capabilities** | `#[collaborative]` field marker, `CollabText` (an in-tree RGA text CRDT), `CollabHub` + `serve_socket` over the existing `#[ws]`/channel/presence seams, a 150-line browser replica, cursor reporting |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p collab-notes` |
+| **Success proof** | `curl -s http://localhost:3000/notes/1 \| grep -o 'data-socket="[^"]*"'` prints `data-socket="/notes/1/collab"`; opening that page in two browser windows and typing in both leaves both windows showing the same merged text |
+
+Boots with no database or external real-time service; the companion narrative
+is `docs/guide/collaboration.md`.
+
+---
+
 ### `examples/invoice` — PDF Downloads
 
 <!-- catalog:example name=invoice tier=supported -->
@@ -220,12 +253,27 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 |-------|-------|
 | **Persona** | Developer building billing/reporting features who needs a downloadable PDF |
 | **Journey** | Render one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` |
-| **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains` |
+| **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains`, a `#[lifecycle]` invoice state machine proven sound at compile time |
 | **Prerequisites** | Rust 1.88.0+ |
 | **Run command** | `cargo run -p invoice` |
 | **Success proof** | `curl -OJ http://localhost:3000/invoices/42/pdf` downloads `invoice-42.pdf` |
 
 Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`.
+
+---
+
+### `examples/react-graphql` — React SPA + GraphQL Plugin
+
+<!-- catalog:example name=react-graphql tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer with a TypeScript/React front end who wants an Autumn backend, and wants to see how a GraphQL surface interacts with `#[model]`, `#[repository]`, hooks, and the pool |
+| **Journey** | SPA + GraphQL on a real model: Autumn renders the page shell → a committed Vite/React 19/TypeScript bundle mounts into it → the bundle queries and mutates over GraphQL served by a generic `GraphqlPlugin` → every resolver goes through the generated `PgNoteRepository`, so normalisation, validation, and hooks behave identically for GraphQL and the generated REST handlers |
+| **Key capabilities** | `#[model]` with `#[normalize(trim)]` + `#[validate]`, `MutationHooks` (`before_create` validation, `before_delete` rule), `#[repository(hooks = …, api = …)]` with a derived finder and generated REST CRUD mounted beside GraphQL, `PgNoteRepository::with_pool_untracked` from `AppState` in resolvers, an `on_startup` seed that runs once across instances under a transaction-scoped advisory lock, embedded migrations, `AutumnError` → GraphQL error with `extensions.status`, `Plugin` + `AppBuilder::nest` + `declare_plugin_routes` (audit-clean raw router), `PluginContract` + `plugin_conformance::run_conformance`, Maud shell + `asset_url` under the default `script-src 'self'` CSP, `autumn build --embed` single-binary deploy (`embed_static!` + `.embedded_static`), `GET /graphql/sdl` with a committed-SDL drift test, two-tier tests (`TestApp` without Docker; `TestDb` testcontainer with the real migration applied) |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one); the React bundle is committed, so Node 20.19+/22.12+ is needed only to change the frontend |
+| **Run command** | `cargo run -p react-graphql` |
+| **Success proof** | `curl -s http://127.0.0.1:3000/graphql -H 'content-type: application/json' -d '{"query":"{ notes { title } }"}'` returns `{"data":{"notes":[{"title":"Welcome to Autumn Notes"},{"title":"Try the GraphQL endpoint"}]}}` (seeded on boot); `curl -s http://127.0.0.1:3000/api/notes` returns the same rows through the generated REST handler; the browser page lists them and adds a third from its form without a reload |
 
 ---
 
@@ -256,6 +304,61 @@ load a page" — it has its own dedicated CI job instead.
 
 Boots with no database; the companion narrative is `docs/guide/edge.md` and the
 design record is `docs/adr/0011-edge-capsule-read-lane.md`.
+
+---
+
+### `examples/hot-upgrade` — In-Place Upgrade (`SIGUSR2` socket + state handoff)
+
+<!-- catalog:example name=hot-upgrade tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator of a single-binary Autumn app who wants to deploy continuously without a load balancer, a cold cache, or a dropped connection |
+| **Journey** | In-place upgrade: designate a block of live state, build a new binary whose state shape changed, `kill -USR2`, and watch the same socket keep serving while the state is carried across a compile-checked migration |
+| **Key capabilities** | `AppBuilder::with_live_state`, `with_live_state_from`, `AppState::live_state`, `state_migration!`, `LiveStateHandle` freeze semantics, `[server.upgrade]` |
+| **Prerequisites** | Rust 1.88.0+ on Linux or another Unix. No database, no config file |
+| **Run command** | `cargo build -p hot-upgrade`, then `AUTUMN_UPGRADE_BINARY=target/debug/hot-upgrade-v2 ./target/debug/hot-upgrade-v1` |
+| **Success proof** | `cargo test -p hot-upgrade --test live_upgrade` boots the real v1 binary, upgrades it to the real v2 binary under sustained load, and asserts zero refused connections, zero failed reads, 100% carry-over of the pre-upgrade value, and a bounded cutover latency spike |
+| **Rationale for the tier** | Its proof is a live two-process upgrade under load, not a Chromium smoke: what it demonstrates has no page to click. The test runs in the ordinary `cargo test --workspace` lane. |
+
+Two binaries rather than one — the whole point is the *old* build becoming the
+*new* one. The companion narrative is `docs/guide/hot-upgrades.md`.
+
+---
+
+### `examples/mesh-catalog` — Service Contract (callee half)
+
+<!-- catalog:example name=mesh-catalog tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, callee side: mark a typed handler `#[endpoint]` and let the framework emit the contract its callers are compiled against |
+| **Key capabilities** | `#[endpoint]`, `#[derive(WireShape)]`, the JSON wire descriptor build artifact |
+| **Prerequisites** | Rust 1.88.0+. No database, no config file |
+| **Run command** | `AUTUMN_SERVER__PORT=3001 cargo run -p mesh-catalog` |
+| **Success proof** | `curl http://127.0.0.1:3001/items/42` returns the item as JSON; `target/autumn-contracts/` carries its wire descriptors |
+| **Rationale for the tier** | Half of a two-crate pair whose proof is a *compile-time* contract failure in its sibling, not a browser smoke. See `examples/mesh-storefront`. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
+
+---
+
+### `examples/mesh-storefront` — Service Contract (caller half)
+
+<!-- catalog:example name=mesh-storefront tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, caller side: call another Autumn service through a generated typed client, and have a breaking change on the callee fail *this* build at the call site |
+| **Key capabilities** | `wire_client!`, `#[contract_checked]`, `autumn_web::wire::Endpoint`, `NoBody` |
+| **Prerequisites** | Rust 1.88.0+ and `examples/mesh-catalog` in the same workspace |
+| **Run command** | `CATALOG_URL=http://127.0.0.1:3001 cargo run -p mesh-storefront` |
+| **Success proof** | `python3 scripts/wire-contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
+| **Rationale for the tier** | Its proof is a build that must *fail*, which no Chromium smoke can express. The sweep script is the dedicated proof. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
 
 ---
 
@@ -295,15 +398,17 @@ can pick the closest starting point without overlap.
 | WASM island | `flock` | Server-rendered maud page that mounts a Yew CSR "literary boids" wasm widget on `GET /` |
 | CRUD + MCP | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, bearer-token API, and MCP tool projection |
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
-| Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
-| Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
+| Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task, app-metrics counter + timer |
+| Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, a two-node self-clustering substrate with no coordination service, Docker Compose |
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
-| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
+| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
-| PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |
+| Collaborative editing | `collab-notes` | A `#[collaborative]` text field merged by an in-tree CRDT, streamed with live presence over `#[ws]` + channels, with no external real-time service |
+| PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf`; also carries the worked `#[lifecycle]` invoice state machine |
+| SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
 
 ---
 

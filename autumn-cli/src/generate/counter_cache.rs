@@ -138,8 +138,16 @@ pub fn push_counter_cache_warning(
     ));
 }
 
+/// `#[autumn_web::model]` is always the first attribute `render_model_file`
+/// emits, and rustc applies stacked attribute macros top-down — so anything
+/// below `#[model]` reaches its expansion as an inert helper attribute, while
+/// anything above it rustc tries to resolve as a standalone macro and fails
+/// with "cannot find attribute `belongs_to` in this scope" (issue #2431).
+const MODEL_ATTR: &str = "#[autumn_web::model]\n";
+
 /// Insert `counter_cache` into the child model source's `#[belongs_to(...)]`
-/// attribute, adding the attribute when the scaffold did not emit one.
+/// attribute, adding the attribute (and the `use` imports its expansion
+/// needs) when the scaffold did not emit one.
 ///
 /// Returns `source` unchanged when the attribute is already counter-cached, so
 /// re-running the scaffold over its own output is idempotent.
@@ -148,6 +156,8 @@ pub fn add_counter_cache_to_model_source(
     source: &str,
     pascal_name: &str,
     parent_pascal: &str,
+    parent_snake: &str,
+    parent_plural: &str,
 ) -> String {
     let existing = format!("#[belongs_to({parent_pascal}");
     if let Some(start) = source.find(&existing) {
@@ -168,23 +178,82 @@ pub fn add_counter_cache_to_model_source(
     }
 
     // No `belongs_to` on the generated model (the flat scaffold does not emit
-    // one): add the whole attribute directly above the struct declaration, which
-    // is where `#[model]`'s attributes have to sit.
+    // one): add the whole attribute right after `#[autumn_web::model]`.
+    // Anchoring on that literal line, rather than "whatever attribute line
+    // sits closest to the struct," is what keeps this correct once other
+    // struct-level attributes (`#[commentable]`, `#[searchable]`,
+    // `#[shard_key]`) are also stacked between it and `pub struct` — a prior
+    // version walked back to the wrong end of that stack and landed the new
+    // attribute above `#[model]` on every real scaffold.
     let needle = format!("pub struct {pascal_name} ");
     let Some(struct_at) = source.find(&needle) else {
         return source.to_owned();
     };
-    // Walk back over the attribute block above the struct to the line after the
-    // last blank line, so the new attribute joins the existing attribute stack
-    // rather than splitting it.
     let insert_at = source[..struct_at]
-        .rfind("\n#[")
-        .map_or(struct_at, |i| i + 1);
+        .find(MODEL_ATTR)
+        .map_or(struct_at, |i| i + MODEL_ATTR.len());
     let mut out = String::with_capacity(source.len() + 48);
     out.push_str(&source[..insert_at]);
     out.push_str("#[belongs_to(");
     out.push_str(parent_pascal);
     out.push_str(", counter_cache)]\n");
+    out.push_str(&source[insert_at..]);
+    add_belongs_to_imports(&out, parent_pascal, parent_snake, parent_plural)
+}
+
+/// `#[belongs_to(Parent, ...)]` is not just consumed by `#[model]`'s own
+/// expansion — the eager-loading codegen it drives emits real references to
+/// the target type (`Preloaded<Parent>`, `<Parent as Preloadable>::Spec`, …)
+/// and its Diesel schema module (`parents::table`, `parents::id`, …). The
+/// flat scaffold's OWN table is already imported (`use
+/// crate::schema::{table};`, from `render_model_file`), but nothing before
+/// `--counter-cache` ever put an attribute-driven association on a model, so
+/// the PARENT's type and schema module were never in scope — `cargo check`
+/// fails with "cannot find type `Parent`" / "unresolved module `parents`"
+/// otherwise. Both imports are added right next to the child's own, matching
+/// the `use crate::schema::{table};` convention already there.
+fn add_belongs_to_imports(
+    source: &str,
+    parent_pascal: &str,
+    parent_snake: &str,
+    parent_plural: &str,
+) -> String {
+    let schema_import = format!("use crate::schema::{parent_plural};\n");
+    let model_import = format!("use crate::models::{parent_snake}::{parent_pascal};\n");
+    // Idempotent: a `--force` re-run over output that already carries these
+    // (e.g. this same model belongs to two parents, or was regenerated)
+    // must not stack duplicate `use` lines.
+    if source.contains(&schema_import) && source.contains(&model_import) {
+        return source.to_owned();
+    }
+    let own_schema_import = "use crate::schema::";
+    let Some(own_start) = source.find(own_schema_import) else {
+        // Defensive: `render_model_file` always emits this line, but if a
+        // hand-edited model dropped it, fall back to just above `#[model]`
+        // rather than silently skipping imports the generated code needs.
+        // Guarded the same way as the normal path below, so this stays
+        // idempotent even if only one of the two imports is already there.
+        let mut prefix = String::new();
+        if !source.contains(&schema_import) {
+            prefix.push_str(&schema_import);
+        }
+        if !source.contains(&model_import) {
+            prefix.push_str(&model_import);
+        }
+        return source.replacen(MODEL_ATTR, &format!("{prefix}{MODEL_ATTR}"), 1);
+    };
+    let Some(line_end_rel) = source[own_start..].find('\n') else {
+        return source.to_owned();
+    };
+    let insert_at = own_start + line_end_rel + 1;
+    let mut out = String::with_capacity(source.len() + schema_import.len() + model_import.len());
+    out.push_str(&source[..insert_at]);
+    if !source.contains(&schema_import) {
+        out.push_str(&schema_import);
+    }
+    if !source.contains(&model_import) {
+        out.push_str(&model_import);
+    }
     out.push_str(&source[insert_at..]);
     out
 }
@@ -259,7 +328,7 @@ mod tests {
     #[test]
     fn the_attribute_is_added_above_the_struct_when_absent() {
         let src = "#[autumn_web::model]\npub struct Comment {\n    pub id: i64,\n}\n";
-        let out = add_counter_cache_to_model_source(src, "Comment", "Post");
+        let out = add_counter_cache_to_model_source(src, "Comment", "Post", "post", "posts");
         assert!(
             out.contains(
                 "#[autumn_web::model]\n#[belongs_to(Post, counter_cache)]\npub struct Comment"
@@ -271,12 +340,110 @@ mod tests {
     #[test]
     fn an_existing_attribute_gains_the_key_and_is_idempotent() {
         let src = "#[autumn_web::model]\n#[belongs_to(Post)]\npub struct Comment {\n}\n";
-        let once = add_counter_cache_to_model_source(src, "Comment", "Post");
+        let once = add_counter_cache_to_model_source(src, "Comment", "Post", "post", "posts");
         assert!(
             once.contains("#[belongs_to(Post, counter_cache)]"),
             "{once}"
         );
-        let twice = add_counter_cache_to_model_source(&once, "Comment", "Post");
+        let twice = add_counter_cache_to_model_source(&once, "Comment", "Post", "post", "posts");
         assert_eq!(once, twice, "re-running the scaffold must not stack keys");
+    }
+
+    /// Issue #2431: `#[belongs_to(Post, ...)]` is not just a marker for
+    /// `#[model]` to notice — the eager-loading codegen it drives references
+    /// `Post` (the type) and `posts` (the Diesel schema module) directly, and
+    /// neither was ever imported into the child's model file before
+    /// `--counter-cache` put the first attribute-driven association on a
+    /// generated model. Without both imports `cargo check` fails with
+    /// "cannot find type `Post`" / "unresolved module `posts`" even once the
+    /// attribute sits in the right place.
+    #[test]
+    fn the_parent_type_and_schema_module_are_imported() {
+        let src = "use crate::schema::comments;\n\n#[autumn_web::model]\npub struct Comment {\n}\n";
+        let out = add_counter_cache_to_model_source(src, "Comment", "Post", "post", "posts");
+        assert!(
+            out.contains("use crate::schema::posts;\n"),
+            "the parent's schema module must be imported: {out}"
+        );
+        assert!(
+            out.contains("use crate::models::post::Post;\n"),
+            "the parent's model type must be imported: {out}"
+        );
+        // Re-running must not stack duplicate `use` lines.
+        let twice = add_counter_cache_to_model_source(&out, "Comment", "Post", "post", "posts");
+        assert_eq!(
+            twice.matches("use crate::schema::posts;").count(),
+            1,
+            "{twice}"
+        );
+        assert_eq!(
+            twice.matches("use crate::models::post::Post;").count(),
+            1,
+            "{twice}"
+        );
+    }
+
+    /// Issue #2431: the real scaffold output is never as bare as the fixture
+    /// above — `render_model_file` always puts a blank line (the `use
+    /// crate::schema::...;` line, then an empty line) between the doc header
+    /// and `#[autumn_web::model]`. That blank line is what the old
+    /// `rfind("\n#[")` walk-back latched onto: it found the newline
+    /// immediately before `#[autumn_web::model]` itself and inserted the new
+    /// attribute there, landing it ABOVE `#[model]` instead of below it —
+    /// which is exactly the `cannot find attribute belongs_to in this scope`
+    /// build break from the issue. `#[belongs_to]` is a helper attribute
+    /// `#[model]`'s own expansion understands; rustc only accepts it below
+    /// `#[model]`, never above.
+    #[test]
+    fn the_attribute_lands_below_model_even_with_a_leading_use_statement() {
+        let src = "//! Generated by `autumn generate`.\n\
+                    //!\n\
+                    //! Edit this file freely.\n\n\
+                    use crate::schema::comments;\n\n\
+                    #[autumn_web::model]\n\
+                    pub struct Comment {\n    \
+                        #[id]\n    pub id: i64,\n\
+                    }\n";
+        let out = add_counter_cache_to_model_source(src, "Comment", "Post", "post", "posts");
+        let model_pos = out
+            .find("#[autumn_web::model]")
+            .expect("model attribute kept");
+        let belongs_to_pos = out
+            .find("#[belongs_to(Post, counter_cache)]")
+            .expect("belongs_to attribute added");
+        assert!(
+            model_pos < belongs_to_pos,
+            "#[belongs_to] must sit below #[autumn_web::model], not above it (rustc \
+             resolves helper attributes top-down): {out}"
+        );
+        assert!(
+            out.contains(
+                "#[autumn_web::model]\n#[belongs_to(Post, counter_cache)]\npub struct Comment"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A model carrying other struct-level attributes (`#[searchable]` here,
+    /// standing in for `#[commentable]`/`#[shard_key]` too) must still get
+    /// `#[belongs_to]` below `#[model]` — order among those other helper
+    /// attributes doesn't matter to the macro (it looks each one up by
+    /// ident), so anchoring on `#[autumn_web::model]` itself must not
+    /// disturb them.
+    #[test]
+    fn the_attribute_lands_below_model_when_other_struct_attributes_follow_it() {
+        let src = "use crate::schema::comments;\n\n\
+                    #[autumn_web::model]\n\
+                    #[searchable(language = \"english\")]\n\
+                    pub struct Comment {\n    \
+                        #[id]\n    pub id: i64,\n\
+                    }\n";
+        let out = add_counter_cache_to_model_source(src, "Comment", "Post", "post", "posts");
+        assert!(
+            out.contains(
+                "#[autumn_web::model]\n#[belongs_to(Post, counter_cache)]\n#[searchable(language = \"english\")]\npub struct Comment"
+            ),
+            "{out}"
+        );
     }
 }

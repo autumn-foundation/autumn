@@ -54,6 +54,15 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    // `#[serde(crate = "...")]`'s value is a string serde parses into a path
+    // itself (it never passes through this crate's own generic
+    // `::autumn_web` token rewrite — see `crate_path`'s module doc, #1828),
+    // so it must be built from the actively resolved crate name directly.
+    let serde_crate_path = format!(
+        "::{}::reexports::serde",
+        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target())
+    );
+
     quote! {
         // Derive serde through the framework's re-export (and point serde's
         // generated code at it) so `#[event]` works for apps that depend only
@@ -64,7 +73,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::std::clone::Clone,
             ::std::fmt::Debug,
         )]
-        #[serde(crate = "::autumn_web::reexports::serde")]
+        #[serde(crate = #serde_crate_path)]
         #input
 
         impl #impl_generics ::autumn_web::events::Event for #ident #ty_generics #where_clause {

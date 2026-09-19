@@ -1,0 +1,5 @@
+error: field `published` of model `Comment` carries `#[diesel(column_name = ...)]`, so it cannot appear in `#[derivation(filter = ...)]`: the filter is lowered to SQL that names the column after the Rust field. Name the Rust field after the column instead
+  --> tests/compile-fail/model_derivation_diesel_column_name.rs:33:65
+   |
+33 | #[derivation(Post, column = "published_comment_count", filter = published)]
+   |                                                                 ^^^^^^^^^

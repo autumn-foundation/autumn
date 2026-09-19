@@ -135,7 +135,7 @@ fn migrate_up_then_down_against_a_sqlite_file() {
 /// list` and reads the Postgres migration connection). Under the `SQLite` backend
 /// it must fail with a CLEAR provider-appropriate message rather than reaching
 /// the `diesel` subprocess and dying with a raw "No such file or directory" OS
-/// error — the `diesel` CLI preflight is deliberately skipped for all-SQLite runs
+/// error — the `diesel` CLI preflight is deliberately skipped for all-`SQLite` runs
 /// (issue #2058, codex P2).
 #[test]
 fn migrate_status_under_sqlite_is_a_clear_provider_error() {

@@ -24,9 +24,10 @@ with `#[state_machine(transitions(...))]` on the field and enforce with the
 generated `transition_{field}_to` in `before_update` — never write your own
 `match (old, new)` validation in hooks or handlers. To reuse one transition
 graph across fields/models, define a `#[lifecycle]` enum and reference it with
-`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916); `autumn lifecycle
-check` statically verifies soundness and `autumn lifecycle diagram` emits a
-DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
+`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916). The macro proves the
+graph sound at compile time — an unreachable state or a non-terminal dead-end
+does not compile (#1675); `autumn lifecycle check` re-proves it project-wide
+and `autumn lifecycle diagram` emits a DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
 example in `skills/autumn-web/references/examples.md`.
 
 ## Testing with TestApp and TestClient
@@ -36,7 +37,7 @@ server is needed. Add the feature for tests only:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 ```
 
 ```rust
@@ -76,6 +77,83 @@ client.get("/posts").send().await
 `TestResponse::query_count()` returns the observed count (from the
 `Server-Timing` query counter); `assert_max_queries(n)` chains and returns
 `&Self` (issue #1262).
+
+### Prove a route's query budget at compile time (trunk-dev)
+
+`assert_max_queries` catches an N+1 only on the path a test exercises.
+`#[query_budget(N)]` fails the **build** when any statically reachable path
+can exceed `N` — every branch, tested or not:
+
+```rust
+#[get("/posts")]
+#[query_budget(2)]
+pub async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+    let posts = repo.find_all().await?;                                // 1
+    let posts = repo.preload(posts, Post::preload().author()).await?;  // 2
+    Ok(render(&posts))
+}
+```
+
+Written with a per-row `repo.find_author(...)` inside a `for` loop instead, the
+build fails with a diagnostic naming the loop and the call. Straight-line
+statements sum; `if`/`match` arms take the worst arm; a handle-rooted chain is
+one query; `preload` costs one query per association. Anything the analysis
+cannot read — a helper handed the `Db` handle, a macro body naming it, a
+closure that may run per element — is reported, not assumed query-free.
+
+Escape hatches: `#[query_budget(unbounded, reason = "…")]` on the handler,
+`#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement. Use the
+two together: the compile-time gate for the upper bound, `assert_max_queries`
+for the SQL actually issued (issue #1667). See `docs/guide/query-budgets.md`.
+
+### Prove an agent's authority envelope at compile time (trunk-dev)
+
+An endpoint tagged `#[api_doc(mcp)]` is an action an autonomous agent can take.
+Declare what it is allowed to do, and let the build prove nothing in the body
+exceeds it (#1691):
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        outbound: ["https://api.stripe.com/v1/refunds"],
+        jobs: [NotifyFinanceJob],
+        rate: "10/min",
+        spend: "500.00 USD",
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[api_doc(mcp, summary = "Draft a refund")]
+#[agent_operable(grant = RefundDrafter)]
+pub async fn draft_refund(repo: PgRefundRepository, client: Client, Json(body): Json<NewRefund>)
+    -> AutumnResult<Json<Refund>> { /* … */ }
+```
+
+The analysis derives the handler's effect set — bounded and unbounded writes
+(`delete_all`, `truncate`, an unfiltered `diesel::update`), cross-tenant reach
+(`across_tenants()`, `for_tenant(..)`, a raw diesel query on the request's
+connection), literal outbound URLs and `named("alias")` clients, webhook
+topics, and job enqueues — and emits one const-eval assertion per effect, so
+`payouts.delete_all()` in that body fails `cargo build` at the call. Effects
+are a set over every branch; a job, webhook, outbound call or unbounded write
+cannot be declared `reversible`. Anything opaque (a helper handed a handle, a
+`format!`-built URL, a non-literal job name, `tokio::spawn`, a `dyn`/`impl`
+handle) is refused, never assumed harmless; discharge it with
+`#[agent_effect(writes(Refund), reason = "…")]` or
+`#[agent_effect(none, reason = "…")]` on the statement — declared effects are
+checked against the grant exactly like proved ones.
+
+`autumn agents manifest --check agent-authority.json` writes the diffable
+record and fails on drift or on an ungoverned mutating MCP tool. Every MCP
+`tools/call` writes attempt and outcome audit events carrying a correlation
+id, the grant, the compile-known reversibility and the proved effects, with no
+per-handler wiring. `rate`/`spend` are declared and published, not enforced.
+See `docs/guide/agent-authority.md`.
 
 ### Fake-data factories and bulk seeding (trunk-dev)
 

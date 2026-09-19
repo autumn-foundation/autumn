@@ -1,0 +1,83 @@
+running 1 test
+test integration::repository_dependent_destroy_leaf_batch_profile::repository_dependent_destroy_leaf_batch_profile ... 
+-- fixture: 23378 total comments across 500 posts; post 500 has 5000 comments (expected 5000) --
+
+=== pg_stat_statements: delete_by_id(viral post) ===
+calls=5000   buffers=20454    SELECT "ledger_dd_comments"."id", "ledger_dd_comments"."post_id", "ledger_dd_comments"."body", "ledger_dd_comments"."author", "ledger_dd_comments"."edited_at" FROM "ledger_dd_comments" WHERE ("ledger_dd_comments"."id" = $1) LIMIT $2 FOR UPDATE
+calls=5000   buffers=20000    DELETE FROM "ledger_dd_comments" WHERE ("ledger_dd_comments"."id" = $1)
+calls=1      buffers=63       SELECT $2 FROM ONLY "public"."ledger_dd_comments" x WHERE $1 OPERATOR(pg_catalog.=) "post_id" FOR KEY SHARE OF x
+calls=1      buffers=5066     SELECT id FROM "ledger_dd_comments" WHERE "post_id" = $1 ORDER BY id FOR UPDATE
+-- ledger_dd_comments total: calls=10002 buffers=45583 --
+
+-- statement-count claim: 5000 comments cascaded, ledger_dd_comments statements: calls=10002 buffers=45583 --
+
+thread 'integration::repository_dependent_destroy_leaf_batch_profile::repository_dependent_destroy_leaf_batch_profile' (15368) panicked at autumn/tests/integration/repository_dependent_destroy_leaf_batch_profile.rs:426:5:
+the destroy cascade over a leaf child must issue a small constant number of statements regardless of fan-out, not one no matter how many rows are destroyed; got 10002 calls for 5000 rows
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: {async_block#0}
+             at ./tests/integration/repository_dependent_destroy_leaf_batch_profile.rs:426:5
+   3: poll<&mut dyn core::future::future::Future<Output=()>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+   4: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+   5: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:70
+   6: with_budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:167:5
+   7: budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:133:5
+   8: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:25
+   9: tokio::runtime::scheduler::current_thread::Context::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:488:19
+  10: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:829:44
+  11: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:68
+  12: tokio::runtime::context::scoped::Scoped<T>::set
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/scoped.rs:40:9
+  13: tokio::runtime::context::set_scheduler::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:38
+  14: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>, core::option::Option<()>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>)>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:513:12
+  15: std::thread::local::LocalKey<T>::with
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:477:20
+  16: tokio::runtime::context::set_scheduler
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:17
+  17: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:27
+  18: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:817:24
+  19: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:218:33
+  20: tokio::runtime::context::runtime::enter_runtime
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65:16
+  21: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:206:9
+  22: tokio::runtime::runtime::Runtime::block_on_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:374:52
+  23: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:343:18
+  24: repository_dependent_destroy_leaf_batch_profile
+             at ./tests/integration/repository_dependent_destroy_leaf_batch_profile.rs:459:10
+  25: integration_tests::integration::repository_dependent_destroy_leaf_batch_profile::repository_dependent_destroy_leaf_batch_profile::{{closure}}
+             at ./tests/integration/repository_dependent_destroy_leaf_batch_profile.rs:288:59
+  26: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+  27: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    integration::repository_dependent_destroy_leaf_batch_profile::repository_dependent_destroy_leaf_batch_profile
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1940 filtered out; finished in 11.05s
+
+error: test failed, to rerun pass `--test integration_tests`

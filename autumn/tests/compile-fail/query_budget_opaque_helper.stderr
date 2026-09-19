@@ -1,0 +1,7 @@
+error: `#[query_budget(5)]` cannot be proven: `load_links` is handed the database handle, and what it does with it is another function's business.
+
+       Declare the statement's cost with `#[query_cost(N)]`, or exempt it with `#[query_exempt(reason = ...)]` once you have checked it issues nothing. See docs/guide/query-budgets.md.
+  --> tests/compile-fail/query_budget_opaque_helper.rs:17:17
+   |
+17 |     let links = load_links(&mut db, 1).await?;
+   |                 ^^^^^^^^^^

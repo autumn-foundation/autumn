@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: authority_grant! requires `reversibility:`. Add one of `reversibility: reversible`, `reversibility: compensable` or `reversibility: irreversible` to the grant -- how far an agent's action can be walked back is the one thing about it nobody should have to infer. See docs/guide/agent-authority.md
+  --> tests/compile-fail/agent_authority_missing_reversibility.rs:6:1
+   |
+ 6 | / autumn_web::authority_grant! {
+ 7 | |     /// Draft-only refund authority for the support agent.
+ 8 | |     pub RefundDrafter {
+ 9 | |         writes: [Refund],
+...  |
+12 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `autumn_web::authority_grant` (in Nightly builds, run with -Z macro-backtrace for more info)

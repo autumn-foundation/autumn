@@ -611,6 +611,71 @@ fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
     }
 }
 
+/// A release note belongs in its own file under `changelog.d/`, never at the
+/// top of the `## [Unreleased]` section — the lines every other open PR also
+/// edits. The rule only holds while the gate runs and the instruction files
+/// say so, and both have been quietly dropped from this repository before.
+#[test]
+fn changelog_notes_are_written_as_fragments() {
+    let root = workspace_root();
+
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    assert!(
+        workflow.contains("./scripts/check-changelog-fragments.sh"),
+        "ci.yml must run the changelog fragment gate; without it, CHANGELOG.md \
+         edits come back and every PR conflicts with every other PR",
+    );
+
+    for path in ["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            doc.contains("changelog.d/"),
+            "{path} must send a release note to changelog.d/",
+        );
+    }
+
+    for path in ["CLAUDE.md", "AGENTS.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            !doc.contains("under the existing `## [Unreleased]` section"),
+            "{path} must not tell an agent to write into the Unreleased section",
+        );
+    }
+
+    assert!(
+        root.join("changelog.d/README.md").is_file(),
+        "changelog.d/README.md documents the fragment shape the gate enforces",
+    );
+    assert!(
+        root.join("scripts/update-changelog.sh").is_file(),
+        "scripts/update-changelog.sh folds the fragments in at release time",
+    );
+
+    // The splice in scripts/lib/changelog.sh carries whole markdown files
+    // between stages. `awk -v` carries a value in ONE line: the BSD awk on
+    // macOS rejects a newline in a `-v` assignment ("awk: newline in string"),
+    // which failed the macOS test leg while every Linux leg passed.
+    // Comments are skipped: the rule is written down beside the code it
+    // governs, and a test that reads its own explanation as a violation
+    // teaches the next author to delete the explanation.
+    let lib = std::fs::read_to_string(root.join("scripts/lib/changelog.sh"))
+        .expect("read scripts/lib/changelog.sh");
+    let offenders: Vec<&str> = lib
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("awk -v"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "scripts/lib/changelog.sh must not pass changelog text through an awk \
+         `-v` assignment — a newline in one kills the one-true-awk on macOS:\n{}",
+        offenders.join("\n"),
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
@@ -822,12 +887,42 @@ fn generator_conformance_ci_gate_is_configured() {
         );
     }
 
-    // The Postgres-dependent gate must also be present (AC-2).
-    assert!(
-        workflow.contains("generated_scaffold_serves_posts_index_and_json_api"),
-        "generator-conformance.yml must run the Postgres e2e gate \
-         `generated_scaffold_serves_posts_index_and_json_api`",
-    );
+    // The Postgres-dependent gate must also be present (AC-2), alongside the two
+    // issue #1388 gates: the live-HTTP one is the only RUNTIME proof of that
+    // feature's headline acceptance criterion, and `constrained_scaffold_cargo_checks`
+    // the only proof that the full constraint mix (including `{url}` and a
+    // nullable bound) COMPILES. Every other test for the scaffold DSL's `{…}`
+    // modifiers string-matches generated source, so if these are dropped from
+    // the workflow the feature stops being verified anywhere.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the bare
+    // name: every gate is also mentioned in the job's header comment, so a bare
+    // substring check would stay green after the `run:` step itself was deleted
+    // — exactly the regression this pin exists to catch.
+    //
+    // Backslashes are dropped and all whitespace collapsed first, because the
+    // longer invocations wrap across shell line continuations. Folding on the
+    // literal "\\\n" would be WRONG: on a Windows checkout the workflow arrives
+    // with CRLF endings, so the continuation is a backslash followed by "\\r\\n"
+    // and the fold silently no-ops — which is exactly how this assertion first
+    // failed on `Test (windows-latest)` while passing everywhere else.
+    let invocations = workflow
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for test_name in [
+        "generated_scaffold_serves_posts_index_and_json_api",
+        "generated_constrained_scaffold_enforces_validation_end_to_end",
+        "integration::scaffold_validation::constrained_scaffold_cargo_checks",
+    ] {
+        assert!(
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment); these gates are the only place issue #1388's scaffold \
+             DSL constraints are compiled and exercised at runtime",
+        );
+    }
 
     // The auth/TOTP generator gate must also be included so that changes to
     // autumn-cli/src/generate/auth.rs are caught alongside scaffold changes.
@@ -863,6 +958,260 @@ fn generator_conformance_ci_gate_is_configured() {
         "generator-conformance.yml must include a cron schedule so generator rot \
          is caught even when no template or prelude file was touched directly",
     );
+}
+
+// ── cli_tests per-test triage (issue #1945) ───────────────────────────────
+
+#[test]
+fn cli_tests_docker_ignored_tests_are_ci_swept() {
+    let root = workspace_root();
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_yml = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", ci_path.display()));
+
+    // A newly-added `#[ignore = "requires Docker (testcontainers)"]` test in
+    // ANY `autumn-cli/tests/integration/*.rs` module must run in CI with no
+    // workflow edit, the same guarantee the autumn-web sweep already gives
+    // (#1923). That only holds if ci.yml's cli_tests invocation is a BARE
+    // `--ignored` sweep (discovers every ignored test in the binary) rather
+    // than a specific-test filter — matched as the literal invocation tail,
+    // not a substring of the surrounding comment, so deleting the sweep
+    // itself would still fail this even though "cli_tests" stays mentioned
+    // in prose above it.
+    let invocation = ci_yml
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        invocation
+            .contains("cargo test -p autumn-cli --test cli_tests -- --ignored --test-threads=1"),
+        "ci.yml must run a BARE `--ignored` sweep over `cli_tests` so a newly-added \
+         Docker `#[ignore]`d test runs automatically; see issue #1945",
+    );
+}
+
+#[test]
+fn cli_tests_cold_start_ignored_tests_are_ci_named() {
+    let root = workspace_root();
+    let generator_conformance_path = root.join(".github/workflows/generator-conformance.yml");
+    let generator_conformance = std::fs::read_to_string(&generator_conformance_path)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read {}: {err}",
+                generator_conformance_path.display()
+            )
+        });
+
+    // Unlike the Docker-gated tests above, these `#[ignore]`d tests each
+    // scaffold and cargo-check/build/run a fresh project — too slow for the
+    // fast Docker sweep, and ci.yml's cli_tests invocation explicitly
+    // `--skip`s each of them by exact name for that reason. So each one must
+    // be named explicitly in generator-conformance.yml (matching every other
+    // generator-shaped gate above) or it never runs anywhere — the gap issue
+    // #1945 flagged as the `cli_tests` binary's remaining per-test triage.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the
+    // bare name (same rationale and normalization as
+    // `generator_conformance_ci_gate_is_configured` above): a bare substring
+    // check would stay green after cargo lost its `--ignored --exact` flags,
+    // gained a typo that selects zero tests, or the whole `run:` step was
+    // deleted while the test name lingered in a comment.
+    let invocations = generator_conformance
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for test_name in [
+        "integration::api_scaffold::api_scaffold_cargo_checks",
+        "integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate",
+        "integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate",
+        "integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks",
+        "integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks",
+        "integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks",
+        "integration::scaffold_rich_text::richtext_scaffold_cargo_checks",
+        "integration::scaffold_search::searchable_scaffold_cargo_checks",
+        "integration::scaffold_trash::trash_generated_project_cargo_checks",
+        "integration::seed_model_linking::linked_seed_binary_cargo_checks",
+        "integration::serve::serve_daemon_start_status_stop_over_unix_socket",
+        "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
+        "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
+    ] {
+        assert!(
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment) via --ignored --exact; this cli_tests test is CI-gated, \
+             not abandoned — see issue #1945",
+        );
+    }
+}
+
+/// Drop YAML comment text from a workflow file.
+///
+/// The coverage guard below matches `--test <name>` against workflow source, so
+/// without this a target whose invocation was commented out — or merely
+/// mentioned in prose — would satisfy it while no job runs the target, which is
+/// the very hole the guard exists to close.
+///
+/// A `#` opens a comment when it starts the line or follows whitespace and is
+/// not inside a quoted string; a `#` inside a shell word (`$#`) is left alone.
+fn strip_yaml_comments(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let (mut in_single, mut in_double, mut after_ws) = (false, false, true);
+        let mut end = line.len();
+        for (idx, ch) in line.char_indices() {
+            match ch {
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '#' if !in_single && !in_double && after_ws => {
+                    end = idx;
+                    break;
+                }
+                _ => {}
+            }
+            after_ws = ch.is_whitespace();
+        }
+        out.push_str(line.get(..end).unwrap_or(line));
+        out.push('\n');
+    }
+    out
+}
+
+/// Values a cargo command gives to `flag`, in both the `--flag value` and
+/// `--flag=value` spellings. Values are whole tokens, so `--test sim_chaos_crash`
+/// yields `sim_chaos_crash` and never satisfies a lookup for `sim_chaos`.
+fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
+    let eq = format!("{flag}=");
+    let mut values: Vec<&str> = tokens
+        .windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1])
+        .collect();
+    values.extend(tokens.iter().filter_map(|t| t.strip_prefix(eq.as_str())));
+    values
+}
+
+/// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
+/// in a CI workflow (issue #1908).
+///
+/// These targets are `#![cfg(feature = "sqlite")]`, so the default
+/// `cargo test --workspace` compiles each to an empty, passing binary. The
+/// backend flip makes a bare `cargo test --features sqlite` unsafe, so the
+/// sqlite job enumerates its targets BY NAME. A target added to `Cargo.toml` but
+/// not to that list therefore never runs anywhere and fails silently forever —
+/// which is how `sqlite_tracked_sessions` shipped dark. This closes the gap for
+/// every future target.
+///
+/// Membership is read from each target's own `#![cfg(...)]` gate rather than a
+/// name prefix, so a sqlite target named otherwise is still covered and a
+/// backend-independent `sim_*` target is not wrongly demanded. Coverage means a
+/// live cargo command that enables the `sqlite` feature AND names the target:
+/// a commented-out line, a prose mention, a prefix of another target's name, or
+/// a `--test` without the feature all leave the target dark and must fail here.
+#[test]
+fn sqlite_test_targets_are_ci_named() {
+    let root = workspace_root();
+    let manifest_path = root.join("autumn/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+
+    // Collect the cargo commands every workflow actually runs. `strip_yaml_comments`
+    // drops commented-out invocations and prose mentions; joining `\`-continued
+    // lines keeps one wrapped command as one command, so a target is credited only
+    // to the invocation that names it.
+    let workflows_dir = root.join(".github/workflows");
+    let mut commands: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows_dir.display()))
+        .flatten()
+    {
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut pending = String::new();
+        for line in strip_yaml_comments(&body).lines() {
+            let trimmed = line.trim_end();
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                pending.push_str(head);
+                pending.push(' ');
+            } else {
+                pending.push_str(trimmed);
+                commands.push(std::mem::take(&mut pending));
+            }
+        }
+        if !pending.is_empty() {
+            commands.push(pending);
+        }
+    }
+
+    // A command covers a target only when it BOTH enables the `sqlite` feature and
+    // names the target. Without the feature the target's crate-level
+    // `#![cfg(feature = "sqlite")]` compiles it to an empty binary that exits 0, so
+    // a feature-less `--test <target>` is not coverage.
+    let sqlite_commands: Vec<Vec<&str>> = commands
+        .iter()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| {
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && (tokens.contains(&"--all-features")
+                    || flag_values(tokens, "--features").iter().any(|value| {
+                        value
+                            .trim_matches(['"', '\''])
+                            .split(',')
+                            .any(|feature| feature.trim() == "sqlite")
+                    }))
+        })
+        .collect();
+
+    let is_invoked = |target: &str| {
+        sqlite_commands
+            .iter()
+            .any(|tokens| flag_values(tokens, "--test").contains(&target))
+    };
+
+    // Pair each `[[test]]` name with its path, then keep only the sqlite-gated
+    // ones.
+    let mut name: Option<&str> = None;
+    let mut gated = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if let Some(value) = line
+            .strip_prefix("name = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            name = Some(value);
+        } else if let Some(path) = line
+            .strip_prefix("path = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            && let Some(target) = name.take()
+        {
+            let source = std::fs::read_to_string(root.join("autumn").join(path))
+                .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+            if source
+                .lines()
+                .take_while(|l| !l.starts_with("use ") && !l.starts_with("mod "))
+                .any(|l| l.starts_with("#![cfg(") && l.contains(r#"feature = "sqlite""#))
+            {
+                gated.push(target.to_owned());
+            }
+        }
+    }
+    assert!(
+        gated.len() > 20,
+        "expected the sqlite-gated [[test]] targets to be discovered, found {gated:?}"
+    );
+
+    for target in gated {
+        assert!(
+            is_invoked(&target),
+            "a CI workflow must run `--test {target}`; a sqlite-gated target missing from \
+             the sqlite job's named list compiles to an empty binary and never runs — \
+             see issue #1908",
+        );
+    }
 }
 
 #[test]
@@ -8604,4 +8953,122 @@ fn codemod_gate_accepts_a_walkthrough_codemod_bullet_wrapped_onto_a_continuation
     write_fixture_registry(&tmp, &["0.7.0-with-pool"]);
     let output = run_migration_gate(tmp.path());
     assert!(output.status.success(), "{}", gate_report(&output));
+}
+
+/// The registry every `MinIO` testcontainer must be pulled from.
+const MINIO_REGISTRY: &str = "quay.io/minio/minio";
+
+/// Collect `.rs` files under `dir`, skipping build output.
+fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+    {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_dir() {
+            if name != "target" && name != ".git" {
+                rust_sources(&path, found);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// The builder lines a `MinIO::default()` call spans, since rustfmt splits it.
+fn builder_window(source: &str, index: usize) -> String {
+    source
+        .lines()
+        .skip(index)
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn every_minio_container_is_pulled_from_the_public_registry() {
+    // Docker Hub refuses anonymous pulls of `minio/minio` — its registry answers
+    // 401, which Docker reports as "repository does not exist". Every call site
+    // must therefore override the name that `testcontainers-modules` pins.
+    //
+    // This is a whole-tree scan rather than a list, because the tests it guards
+    // run only in the Docker sweep: a fourth call site added without the
+    // override would compile, pass review, and fail CI with an error that names
+    // a registry rather than the file that forgot.
+    let root = workspace_root();
+    let mut sources = Vec::new();
+    rust_sources(&root, &mut sources);
+
+    let mut offenders = String::new();
+    for path in sources {
+        // This file states the rule and carries its own fixtures, so it would
+        // otherwise report itself.
+        if path.ends_with("repo_hygiene.rs") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        for (index, line) in content.lines().enumerate() {
+            if !line.contains("MinIO::default()") {
+                continue;
+            }
+            let window = builder_window(&content, index);
+            // Only a container actually being started needs the override; the
+            // builder is also read for its tag, which pulls nothing.
+            if !window.contains(".start()") {
+                continue;
+            }
+            // The registry may be named inline or through a constant, so the
+            // literal is looked for anywhere in the file rather than in the
+            // builder itself.
+            if window.contains(".with_name(") && content.contains(MINIO_REGISTRY) {
+                continue;
+            }
+            let relative = path.strip_prefix(&root).unwrap_or(&path);
+            let _ = writeln!(
+                offenders,
+                "  {}:{} — {}",
+                relative.display(),
+                index + 1,
+                line.trim(),
+            );
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "every MinIO container must be started with \
+         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub denies anonymous pulls \
+         of minio/minio. Unqualified call sites:\n{offenders}",
+    );
+}
+
+#[test]
+fn the_minio_registry_scan_sees_an_unqualified_call_site() {
+    // Proves the scan above can fail: its assertion is worth nothing if the
+    // matcher never fires.
+    let flags = |src: &str| -> bool {
+        src.lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("MinIO::default()"))
+            .any(|(index, _)| {
+                let window = builder_window(src, index);
+                window.contains(".start()")
+                    && !(window.contains(".with_name(") && src.contains(MINIO_REGISTRY))
+            })
+    };
+    let unqualified = "let c = MinIO::default()\n    .start()\n    .await;";
+    let inline = format!(
+        "let c = MinIO::default()\n    .with_name(\"{MINIO_REGISTRY}\")\n    .start()\n    .await;",
+    );
+    let via_const = format!(
+        "const IMAGE: &str = \"{MINIO_REGISTRY}\";\n\
+         let c = MinIO::default()\n    .with_name(IMAGE)\n    .start()\n    .await;",
+    );
+    let wrong_registry = "let c = MinIO::default()\n    .with_name(\"docker.io/minio/minio\")\n    .start()\n    .await;";
+    let tag_only = "let t = MinIO::default().tag();";
+    assert!(flags(unqualified), "an unqualified start must be caught");
+    assert!(!flags(&inline), "an inline registry must pass");
+    assert!(!flags(&via_const), "a registry named by constant must pass");
+    assert!(flags(wrong_registry), "a different registry must be caught");
+    assert!(!flags(tag_only), "reading the tag pulls nothing");
 }

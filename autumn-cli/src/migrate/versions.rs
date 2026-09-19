@@ -22,10 +22,10 @@
 //! plugin author who might ship alongside it. That gap is closed at the
 //! framework level instead -- every registered `EmbeddedMigrations` set
 //! (framework, plugin, and app) is checked for cross-set version collisions
-//! at app startup by
-//! [`autumn_web::migrate::check_migration_version_collisions`], which fails
-//! loudly before any migration is applied, regardless of whether the
-//! colliding authors ever coordinated.
+//! at app startup, and a collision is resolved automatically by
+//! `autumn_web::migrate::compute_migration_disambiguation`, which gives the
+//! losing migration a deterministic substitute version so both still apply,
+//! regardless of whether the colliding authors ever coordinated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

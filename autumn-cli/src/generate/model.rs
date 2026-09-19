@@ -17,6 +17,7 @@ use super::schema_edit::{
     position_triggers_up_sql_for,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
+use autumn_web::config::DatabaseBackend;
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -212,20 +213,23 @@ fn plan_model_with_options_impl(
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    let mut metadata = parse_model_metadata(&fields, options)?;
-    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
-    // actually exists in this project — naming a missing one would be a
-    // compile error in a file the author did not write.
-    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
-
     // Determine the target app's database backend so the emitted DDL / diesel
     // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
     // (`--searchable`) is now supported on both backends — Postgres emits a
     // `tsvector` column + GIN index, SQLite emits an FTS5 virtual table +
     // triggers (issue #1910) — so it is no longer rejected here.
+    //
+    // Read before the metadata: a `--default` literal is rendered per backend
+    // (issue #1924).
     let backend = detect_backend(project_root);
+    let mut metadata = parse_model_metadata_for(backend, &fields, options)?;
+    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
+    // actually exists in this project — naming a missing one would be a
+    // compile error in a file the author did not write.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
+
     // A UUID primary key needs app-side id generation on SQLite (no
-    // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
+    // `gen_random_uuid()`), which the runtime slice deferred to #2555;
     // reject `--id uuid` on a SQLite app at generate time rather than emit a
     // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
@@ -239,14 +243,9 @@ fn plan_model_with_options_impl(
     if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
         return Err(super::uuid_pk_commentable_unsupported_error());
     }
-    // A few DSL field kinds still render to Rust model types with no working
-    // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
-    // (TimestamptzSqlite) and Attachment (autumn-web's local Blob Text/Sqlite
-    // impls) so those now round-trip, but the remaining kinds' Rust types are
-    // foreign to autumn-web (orphan rule) with only Postgres-side diesel impls,
-    // so a generated SQLite app using one of them would fail to compile. Reject
-    // at generate time rather than emit uncompilable code (AC #4); wrapper-based
-    // support for the rest is tracked in #1924.
+    // Every DSL field kind converts on SQLite as of #1924, so this is a standing
+    // guard rather than an active gate: a NEW kind with no working conversion is
+    // reported here rather than emitted as code that cannot compile (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite {
         super::reject_sqlite_unsupported_field_kinds(&fields)?;
     }
@@ -269,23 +268,21 @@ fn plan_model_with_options_impl(
     // the SQL migration and schema.rs block include the nullable column.
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
-    // Issue #1318: `lock_version` is managed by the database, so it contributes
-    // nothing to `New{Model}` — and neither does any `--default` column. A model
-    // whose columns are ALL database-managed therefore emits an empty
-    // `New{Model}`, whose Diesel `Insertable` derive does not compile, so the
-    // generated project is dead on arrival.
+    // #1318: `lock_version` is managed by the database, so it contributes nothing to
+    // `New{Model}`, and neither does any `--default` column. A model whose columns are all
+    // database-managed therefore emits an empty `New{Model}`, whose Diesel `Insertable`
+    // derive does not compile, leaving the generated project dead on arrival.
     //
-    // The check is on the EFFECTIVE set rather than the declared token count:
-    // `Post title:String lock_version:i32 --default title=x` declares two
-    // columns and leaves zero. `metadata.defaults` carries both the explicit
-    // `--default` columns and (from `parse_model_metadata`) the lock column.
+    // The check is on the effective set rather than the declared token count: `Post
+    // title:String lock_version:i32 --default title=x` declares two columns and leaves
+    // zero. `metadata.defaults` carries both the explicit `--default` columns and, from
+    // `parse_model_metadata`, the lock column.
     //
     // Scoped to lock-version models deliberately. A model whose every column is
-    // `--default`ed — or one declared with no fields at all — has always emitted
-    // this same uncompilable struct; widening the refusal to those pre-existing
-    // cases is a separate change from wiring #1318, and would move a fieldless
-    // `generate scaffold Post` from a compile error to a planning error that an
-    // existing test pins.
+    // `--default`ed, or one declared with no fields, has always emitted this same
+    // uncompilable struct; widening the refusal to those pre-existing cases is a separate
+    // change from wiring #1318, and would move a fieldless `generate scaffold Post` from a
+    // compile error to a planning error an existing test pins.
     if !for_revert {
         validate_lock_version_field(&fields, &options.defaults)?;
     }
@@ -406,6 +403,7 @@ fn plan_model_with_options_impl(
                 None
             },
             options.id_type,
+            backend,
         ),
     );
 
@@ -534,7 +532,7 @@ fn plan_model_with_options_impl(
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
     // for `diesel`, `serde`, `serde_json`, `chrono`, and supported field crates
     // such as `uuid`, none of which are in the freshly-`autumn new`-ed project.
-    let mut deps: Vec<(&str, &str)> = MODEL_DEPS.to_vec();
+    let mut deps: Vec<(&str, &str)> = model_deps(backend).to_vec();
     if metadata.has_validator_rules() {
         deps.push((
             "validator",
@@ -544,14 +542,19 @@ fn plan_model_with_options_impl(
     if schema_fields.iter().any(|f| f.kind.is_decimal()) {
         deps.push((
             "rust_decimal",
-            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+            match backend {
+                DatabaseBackend::Postgres => {
+                    "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }"
+                }
+                DatabaseBackend::Sqlite => "{ version = \"1\", features = [\"serde\"] }",
+            },
         ));
         let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
         warn_if_existing_dep_missing_features(
             &mut plan,
             &existing_cargo_toml,
             "rust_decimal",
-            &["db-diesel2-postgres", "serde"],
+            decimal_dep_features(backend),
         );
     }
     plan_cargo_deps(
@@ -560,6 +563,12 @@ fn plan_model_with_options_impl(
         &deps,
         &project_root.join("src/models"),
     );
+    // A SQLite app links a different backend inside `autumn-web` too: the
+    // `sqlite` feature flips `RuntimeConnection` and supplies the `SqliteUuid` /
+    // `SqliteDecimal` conversions the model file names (issue #1924).
+    if backend == DatabaseBackend::Sqlite {
+        plan_autumn_web_feature(&mut plan, project_root, "sqlite");
+    }
 
     // (e) Link the new model (and the `schema` module it reads) into the
     // standalone `src/bin/seed.rs` binary, when the project was scaffolded
@@ -1051,7 +1060,8 @@ pub(super) fn augment_fields_for_soft_delete(
     Ok(std::borrow::Cow::Owned(augmented))
 }
 
-/// Direct dependencies the *model* generator's output requires at compile time.
+/// Direct dependencies the *model* generator's Postgres output requires at
+/// compile time. See [`model_deps`] for the backend-aware accessor.
 pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
@@ -1071,6 +1081,62 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ("serde_json", "\"1\""),
     ("uuid", "{ version = \"1\", features = [\"serde\"] }"),
 ];
+
+/// [`MODEL_DEPS`] for a `SQLite` app (issue #1924).
+///
+/// Same shape, different backend: diesel on its `sqlite` feature with the
+/// bundled `libsqlite3-sys` amalgamation, `diesel-async` on the sync-connection
+/// wrapper that `autumn-web`'s `sqlite` feature runs the pool through, and no
+/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (`autumn-web`'s
+/// `db` feature still pulls it in transitively, so this trims the app's direct
+/// dependency list, not its link line.) `returning_clauses_for_sqlite_3_35`
+/// matches `autumn-web`, so the two never disagree about `RETURNING` support.
+pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
+    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
+    (
+        "diesel",
+        "{ version = \"2\", features = [\"sqlite\", \"chrono\", \"serde_json\", \
+         \"returning_clauses_for_sqlite_3_35\"] }",
+    ),
+    (
+        "diesel-async",
+        "{ version = \"0.9\", features = [\"sync-connection-wrapper\"] }",
+    ),
+    (
+        "libsqlite3-sys",
+        "{ version = \"0.38\", features = [\"bundled\"] }",
+    ),
+    ("diesel_migrations", "\"2\""),
+    ("serde", "{ version = \"1\", features = [\"derive\"] }"),
+    ("serde_json", "\"1\""),
+    ("uuid", "{ version = \"1\", features = [\"serde\"] }"),
+];
+
+/// The direct dependencies a generated model needs on `backend` (issue #1924).
+#[must_use]
+pub(super) const fn model_deps(
+    backend: DatabaseBackend,
+) -> &'static [(&'static str, &'static str)] {
+    match backend {
+        DatabaseBackend::Postgres => MODEL_DEPS,
+        DatabaseBackend::Sqlite => MODEL_DEPS_SQLITE,
+    }
+}
+
+/// The `rust_decimal` features a `decimal{p,s}` field needs on `backend`
+/// (issue #1924).
+///
+/// Postgres rides `rust_decimal`'s own diesel impls; `SQLite` rides
+/// `autumn-web`'s `SqliteDecimal` newtype instead, and `rust_decimal` ships no
+/// diesel-`SQLite` feature at all, so asking for the Postgres one would pull
+/// libpq into a `SQLite` build.
+#[must_use]
+pub(super) const fn decimal_dep_features(backend: DatabaseBackend) -> &'static [&'static str] {
+    match backend {
+        DatabaseBackend::Postgres => &["db-diesel2-postgres", "serde"],
+        DatabaseBackend::Sqlite => &["serde"],
+    }
+}
 
 /// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
 /// in `deps` is present under `[dependencies]` in the project's `Cargo.toml`.
@@ -1093,28 +1159,24 @@ pub(super) fn plan_cargo_deps(
     if updated != existing {
         plan.modify(cargo_toml_path.clone(), updated);
     }
-    // Recorded unconditionally — mirroring every other `push_revert` call in
-    // this module — so `autumn destroy` (issue #1048), which recomputes
-    // this same plan against the *already-generated* Cargo.toml (where
-    // these deps are, by definition, already present), still knows to
-    // remove them. Gating this on "did the Modify actually change
-    // anything" would make it a no-op at destroy time, since re-running
-    // this same idempotent transform against post-generate disk never
-    // produces a diff.
+    // Recorded unconditionally, mirroring every other `push_revert` call in this module,
+    // so `autumn destroy` (#1048) — which recomputes this same plan against the
+    // already-generated Cargo.toml, where these deps are by definition present — still
+    // knows to remove them. Gating on "did the Modify actually change anything" would make
+    // it a no-op at destroy time, since re-running this idempotent transform against
+    // post-generate disk never produces a diff.
     //
-    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s own
-    // template already declares them (see `templates/Cargo.toml.tmpl`), so
-    // `ensure_cargo_dependencies` never actually adds them for a real
-    // project — they're only in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS` as a
-    // safety net for a hand-rolled Cargo.toml missing them. Reverting them
-    // unconditionally would strip a framework dependency the project needs
-    // regardless of any generated resource.
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s template already
+    // declares them (see `templates/Cargo.toml.tmpl`), so `ensure_cargo_dependencies`
+    // never adds them for a real project — they are in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS`
+    // only as a safety net for a hand-rolled Cargo.toml missing them. Reverting them
+    // unconditionally would strip a framework dependency the project needs regardless of
+    // any generated resource.
     //
-    // Known limitation (documented, out of scope per issue #1048): for any
-    // *other* name, if a *different* resource's generator also depends on
-    // it, destroying this resource still removes it — reverting a shared
-    // dependency across multiple generated resources needs the multi-step
-    // undo history the issue explicitly scopes out.
+    // Known limitation, out of scope per #1048: for any other name, if a different
+    // resource's generator also depends on it, destroying this resource still removes it.
+    // Reverting a shared dependency across several generated resources needs the
+    // multi-step undo history the issue explicitly scopes out.
     let names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
@@ -1143,7 +1205,7 @@ pub(super) const TEMPLATE_SHIPPED_CARGO_DEPS: &[&str] =
 /// section, skipping entries already present. Pure string transformation —
 /// preserves the rest of the file as-is. If the file has no `[dependencies]`
 /// section yet, appends a new one with the requested entries.
-pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
+pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
 
     // Locate the `[dependencies]` table header. Tolerate trailing whitespace
@@ -1169,17 +1231,16 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
         return out;
     };
 
-    // We split two concerns here:
-    // 1. The "scan extent" — how far the dependency section reaches when
-    //    deciding which deps are already declared. `[dependencies.<crate>]`
-    //    subtables are *part of* `[dependencies]`, so they extend the scan
-    //    until a real boundary like `[dev-dependencies]` or `[[bin]]`.
-    // 2. The "insertion point" — where to write new shorthand `key = value`
-    //    entries. This stops at the FIRST table header (subtable or not),
-    //    because TOML attaches shorthand keys to whichever section header
-    //    precedes them: a `chrono = "0.4"` placed *after* a
-    //    `[dependencies.chrono]` line would become a key inside that
-    //    subtable, not a sibling shorthand dep.
+    // Two concerns are split here:
+    // 1. The scan extent — how far the dependency section reaches when deciding which
+    //    deps are already declared. `[dependencies.<crate>]` subtables are part of
+    //    `[dependencies]`, so they extend the scan until a real boundary such as
+    //    `[dev-dependencies]` or `[[bin]]`.
+    // 2. The insertion point — where to write new shorthand `key = value` entries. This
+    //    stops at the first table header, subtable or not, because TOML attaches
+    //    shorthand keys to whichever section header precedes them: a `chrono = "0.4"`
+    //    placed after a `[dependencies.chrono]` line would become a key inside that
+    //    subtable rather than a sibling shorthand dep.
     let scan_end = lines[deps_idx + 1..]
         .iter()
         .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
@@ -1243,7 +1304,15 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
 /// never added by this generator — destroy only reverses lines `generate`
 /// itself would have written.
 #[must_use]
-pub(super) fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
+/// Two callers now: `autumn destroy` (which only ever reverses lines
+/// `generate` itself wrote) and `autumn plugin remove` (issue #1631), which
+/// operates on a manifest the user owns. The second is why every caller must
+/// verify the result — see `plugin::remove::dependency_cleanly_removed`: a
+/// dependency written as a multi-line inline table or a
+/// `[dependencies.<crate>]` subtable is NOT rewritten correctly by this
+/// line-based pass, and writing its output unchecked would leave a `Cargo.toml`
+/// Cargo cannot parse.
+pub fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
     let mut lines: Vec<&str> = existing.lines().collect();
     let Some(deps_idx) = lines
         .iter()
@@ -1816,8 +1885,34 @@ fn validate_enum_field_collisions(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `parse_model_metadata_for` is what production calls. Not doc
+// linked from it: this is `#[cfg(test)]`, so a link would break the doc build.
+#[cfg(test)]
 pub fn parse_model_metadata(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<ModelMetadata, GenerateError> {
+    parse_model_metadata_for(DatabaseBackend::Postgres, fields, options)
+}
+
+/// Fold every metadata-bearing `--flag` (`--index`, `--validate`, `--default`,
+/// `--searchable`, …) into a [`ModelMetadata`], validated against `fields`.
+///
+/// `backend` reaches only `--default` rendering (issue #1924): a `decimal`
+/// default is an unquoted numeric literal on Postgres and a quoted, normalized
+/// text literal on `SQLite`. See [`sql_default_literal`].
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] for a flag naming an unknown field,
+/// or carrying a value the field's kind cannot take.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validation pass per `--flag` that contributes model metadata; \
+              splitting it would scatter the shared `metadata` accumulator"
+)]
+pub fn parse_model_metadata_for(
+    backend: DatabaseBackend,
     fields: &[Field],
     options: &ModelOptions,
 ) -> Result<ModelMetadata, GenerateError> {
@@ -1897,11 +1992,12 @@ pub fn parse_model_metadata(
                 ),
             });
         }
-        let sql =
-            sql_default_literal(field, value).map_err(|reason| GenerateError::InvalidField {
+        let sql = sql_default_literal(field, value, backend).map_err(|reason| {
+            GenerateError::InvalidField {
                 token: default.clone(),
                 reason,
-            })?;
+            }
+        })?;
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
@@ -2519,7 +2615,11 @@ fn validate_decimal_default_fits(value: &str, precision: u32, scale: u32) -> Res
     Ok(())
 }
 
-fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
+fn sql_default_literal(
+    field: &Field,
+    value: &str,
+    backend: DatabaseBackend,
+) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
             "true" => Ok("TRUE".to_owned()),
@@ -2557,12 +2657,37 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
                 );
             }
             validate_decimal_default_fits(value, precision, scale)?;
-            // Emitted as the original string, not `parsed.to_string()` —
-            // `autumn-cli` doesn't depend on `rust_decimal` itself, and an
-            // unquoted numeric literal is valid Postgres `NUMERIC` SQL
-            // whether or not it round-trips exactly through `f64` (this arm
-            // only used `f64` to reject non-numeric garbage above).
-            Ok(value.to_owned())
+            match backend {
+                // Emitted as the original string, not `parsed.to_string()` —
+                // an unquoted numeric literal is valid Postgres `NUMERIC` SQL
+                // whether or not it round-trips exactly through `f64` (this arm
+                // only used `f64` to reject non-numeric garbage above).
+                DatabaseBackend::Postgres => Ok(value.to_owned()),
+                // On SQLite the column is `TEXT`, so the default has to be a
+                // text literal: unquoted, SQLite evaluates `DEFAULT 0.10`
+                // numerically before applying TEXT affinity and stores `0.1`,
+                // or scientific notation for a wide value, which
+                // `Decimal::from_str` cannot read back at all.
+                //
+                // It also has to be the SAME text `SqliteDecimal` would write,
+                // which is normalized (`db::sqlite_types`). A default of
+                // `0.10` stored verbatim would never equal the `0.1` every
+                // later write produces — a `find_by_…` could not match a row
+                // holding its own default, and a unique index would admit
+                // both. Normalizing through the real `Decimal` rather than by
+                // hand is what guarantees the two agree (issue #1924).
+                DatabaseBackend::Sqlite => {
+                    use autumn_web::reexports::rust_decimal::Decimal;
+                    let decimal = value.parse::<Decimal>().map_err(|err| {
+                        format!(
+                            "decimal default '{value}' is not representable as a \
+                             rust_decimal::Decimal, the Rust type a SQLite decimal \
+                             column round-trips through: {err}"
+                        )
+                    })?;
+                    Ok(format!("'{}'", decimal.normalize()))
+                }
+            }
         }
         FieldKind::Json => {
             serde_json::from_str::<serde_json::Value>(value)
@@ -2624,6 +2749,7 @@ pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Fiel
         false,
         None,
         IdType::BigSerial,
+        DatabaseBackend::Postgres,
     )
 }
 
@@ -2645,7 +2771,11 @@ pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Fiel
     reason = "This is a single template emitting one enum type plus its trait \
               impls — splitting it produces less readable output, not more."
 )]
-fn render_enum_decl(field: &Field, default_variant: Option<&str>) -> String {
+fn render_enum_decl(
+    field: &Field,
+    default_variant: Option<&str>,
+    backend: DatabaseBackend,
+) -> String {
     use std::fmt::Write as _;
     let ty = field
         .enum_type_name()
@@ -2654,16 +2784,14 @@ fn render_enum_decl(field: &Field, default_variant: Option<&str>) -> String {
 
     let mut out = String::new();
 
-    // Always derive `Default`, even without an explicit `--default`: the
-    // `#[model]` macro's generated `UpdateX` patch struct wraps every field
-    // in `Patch<T>` and unconditionally derives `Default` on itself, and
-    // `#[derive(Default)]` on a generic type adds a `T: Default` bound for
-    // every type parameter regardless of which variant is `#[default]`d —
-    // so every field's Rust type must implement `Default`, the same
-    // requirement every other field kind already satisfies via `std`. Absent
-    // an explicit `--default field=variant`, the first declared variant is
-    // the natural, unsurprising choice (matching how other kinds default to
-    // a canonical baseline, e.g. `i32::default() == 0`).
+    // Always derive `Default`, even without an explicit `--default`. The `#[model]`
+    // macro's generated `UpdateX` patch struct wraps every field in `Patch<T>` and
+    // unconditionally derives `Default` on itself, and `#[derive(Default)]` on a generic
+    // type adds a `T: Default` bound for every type parameter whatever variant is
+    // `#[default]`ed — so every field's Rust type must implement `Default`, a requirement
+    // every other field kind already satisfies via `std`. Absent an explicit `--default
+    // field=variant`, the first declared variant is the unsurprising choice, matching how
+    // other kinds default to a canonical baseline such as `i32::default() == 0`.
     let default_raw = default_variant.unwrap_or_else(|| {
         field
             .variants
@@ -2738,37 +2866,98 @@ fn render_enum_decl(field: &Field, default_variant: Option<&str>) -> String {
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
-    let _ = writeln!(
-        out,
-        "impl diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
-    );
-    out.push_str(
-        "    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>) -> diesel::serialize::Result {\n",
-    );
-    out.push_str(
-        "        <str as diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.as_str(), out)\n",
-    );
-    out.push_str("    }\n");
-    out.push_str("}\n\n");
+    // The conversions target the app's ACTUAL backend: diesel implements
+    // `ToSql`/`FromSql` per backend, and a generated app links only the diesel
+    // backend feature its database needs, so emitting the other arm would not
+    // compile (issue #1924).
+    match backend {
+        DatabaseBackend::Postgres => {
+            let _ = writeln!(
+                out,
+                "impl diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
+            );
+            out.push_str(
+                "    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>) -> diesel::serialize::Result {\n",
+            );
+            out.push_str(
+                "        <str as diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.as_str(), out)\n",
+            );
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
 
-    let _ = writeln!(
-        out,
-        "impl diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
-    );
-    out.push_str(
-        "    fn from_sql(bytes: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {\n",
-    );
-    let _ = writeln!(
-        out,
-        "        let s = <String as diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg>>::from_sql(bytes)?;"
-    );
-    out.push_str("        s.parse().map_err(Into::into)\n");
-    out.push_str("    }\n");
-    out.push_str("}\n");
+            let _ = writeln!(
+                out,
+                "impl diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
+            );
+            out.push_str(
+                "    fn from_sql(bytes: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {\n",
+            );
+            let _ = writeln!(
+                out,
+                "        let s = <String as diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg>>::from_sql(bytes)?;"
+            );
+            out.push_str("        s.parse().map_err(Into::into)\n");
+            out.push_str("    }\n");
+            out.push_str("}\n");
+        }
+        DatabaseBackend::Sqlite => {
+            // `set_value` (not the `str` delegate the Pg arm uses): diesel's
+            // SQLite output buffer takes an owned value, so the borrowed
+            // `&'static str` is handed over directly.
+            let _ = writeln!(
+                out,
+                "impl diesel::serialize::ToSql<diesel::sql_types::Text, diesel::sqlite::Sqlite> for {ty} {{"
+            );
+            out.push_str(
+                "    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::sqlite::Sqlite>) -> diesel::serialize::Result {\n",
+            );
+            out.push_str("        out.set_value(self.as_str());\n");
+            out.push_str("        Ok(diesel::serialize::IsNull::No)\n");
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+
+            let _ = writeln!(
+                out,
+                "impl diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::sqlite::Sqlite> for {ty} {{"
+            );
+            out.push_str(
+                "    fn from_sql(bytes: <diesel::sqlite::Sqlite as diesel::backend::Backend>::RawValue<'_>) -> diesel::deserialize::Result<Self> {\n",
+            );
+            let _ = writeln!(
+                out,
+                "        let s = <String as diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::sqlite::Sqlite>>::from_sql(bytes)?;"
+            );
+            out.push_str("        s.parse().map_err(Into::into)\n");
+            out.push_str("    }\n");
+            out.push_str("}\n");
+        }
+    }
 
     out
 }
 
+/// Emit the `#[decimal_shape]` marker for a `decimal{p,s}` field (issue #2597).
+///
+/// The declared shape rides into `#[model]` on a field attribute the macro
+/// parses, so the factory `.fake()` draws values that fit the column by
+/// construction (`fake::decimal_with(p, s)`). A no-op for every other kind,
+/// which keeps their output byte-identical.
+fn push_decimal_shape_attr(out: &mut String, kind: FieldKind) {
+    use std::fmt::Write as _;
+
+    if let FieldKind::Decimal { precision, scale } = kind {
+        let _ = writeln!(
+            out,
+            "    #[decimal_shape(precision = {precision}, scale = {scale})]"
+        );
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per axis of the emitted model file; a struct here would \
+              only rename the same list"
+)]
 fn render_model_file(
     name: &str,
     table: &str,
@@ -2777,6 +2966,9 @@ fn render_model_file(
     soft_delete: bool,
     shard_key: Option<&str>,
     id_type: IdType,
+    // Selects the field Rust types and the generated enum's diesel conversions
+    // (issue #1924). Postgres output is byte-for-byte unchanged.
+    backend: DatabaseBackend,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 128 + 256);
@@ -2793,20 +2985,18 @@ fn render_model_file(
                 .get(&f.name)
                 .and_then(|literal| literal.strip_prefix('\''))
                 .and_then(|s| s.strip_suffix('\''));
-            out.push_str(&render_enum_decl(f, default_variant));
+            out.push_str(&render_enum_decl(f, default_variant, backend));
             out.push('\n');
         }
     }
-    // Struct-level `#[commentable(...)]` (issue #1367) — emitted by the
-    // `comments:commentable` DSL token. It is what brings the repository's
-    // `add_comment`/`comment_thread`/`delete_comment` helpers into existence
-    // and registers this model with the framework's generic comment router.
-    //
-    // `by = User` is the convention `autumn generate auth` produces; a project
-    // whose author model is named differently changes that one word. No
-    // `author_name` is emitted on purpose: the generated `User` carries an
-    // `email`, and defaulting a *public* display name to it would leak
-    // addresses into every rendered thread.
+    // Struct-level `#[commentable(...)]` (#1367), emitted by the `comments:commentable`
+    // DSL token. It brings the repository's `add_comment`, `comment_thread`, and
+    // `delete_comment` helpers into existence and registers this model with the
+    // framework's generic comment router. `by = User` is the convention `autumn generate
+    // auth` produces; a project whose author model is named differently changes that one
+    // word. No `author_name` is emitted on purpose: the generated `User` carries an
+    // `email`, and defaulting a public display name to it would leak addresses into every
+    // rendered thread.
     if fields.iter().any(|f| f.kind.is_commentable()) {
         out.push_str(
             "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
@@ -2913,6 +3103,7 @@ fn render_model_file(
         if f.is_translatable() {
             out.push_str("    #[translatable]\n");
         }
+        push_decimal_shape_attr(&mut out, f.kind);
         // Issue #1255: a `richtext` column renders as a bare `String`, exactly
         // like `String`/`Text`, so nothing in the emitted source would otherwise
         // distinguish it. Emit a marker doc comment that (a) tells a human
@@ -2924,25 +3115,23 @@ fn render_model_file(
         if f.kind.is_rich_text() {
             let _ = writeln!(out, "    /// {RICH_TEXT_MARKER_DOC}");
         }
-        let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
+        let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type_for(backend));
     }
     if soft_delete {
-        // `deleted_at` must come *before* `created_at` here, matching the
-        // column order `create_table_sql_with_metadata_and_id`/
-        // `schema_table_block_with_id` emit (they append the soft-delete
-        // field to the field list, then always append `created_at` last).
-        // The repository macro's generated insert-then-`RETURNING` query
-        // loads into this struct positionally, so a struct field order that
-        // doesn't match the table's column order produces a Diesel
-        // `CompatibleType` mismatch at compile time.
+        // `deleted_at` must come before `created_at` here, matching the column
+        // order `create_table_sql_with_metadata_and_id` and
+        // `schema_table_block_with_id` emit: they append the soft-delete field to
+        // the field list, then always append `created_at` last. The repository
+        // macro's generated insert-then-`RETURNING` query loads into this struct
+        // positionally, so a struct field order that does not match the table's
+        // column order produces a Diesel `CompatibleType` mismatch at compile time.
         //
-        // `deleted_at` is otherwise DB-managed (NULL on insert, set only by
-        // the destroy handler): the migration declares it nullable with no
-        // explicit SQL DEFAULT, so Postgres inserts NULL whenever it's
-        // omitted from the INSERT column list. `#[default]` excludes it from
-        // `NewX`/`UpdateX` accordingly -- without it, the `#[model]` macro
-        // treats `deleted_at` as a required field, and neither the
-        // `create`/`update` handler ever populates it.
+        // `deleted_at` is otherwise DB-managed — NULL on insert, set only by the
+        // destroy handler. The migration declares it nullable with no explicit SQL
+        // DEFAULT, so Postgres inserts NULL whenever it is omitted from the INSERT
+        // column list, and `#[default]` excludes it from `NewX`/`UpdateX`
+        // accordingly. Without it the `#[model]` macro treats `deleted_at` as a
+        // required field that neither the create nor the update handler populates.
         out.push_str("    #[default]\n");
         out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
     }
@@ -4187,41 +4376,365 @@ mod tests {
         });
     }
 
-    /// A `SQLite` app rejects field kinds whose Rust model type still has no
-    /// working diesel `SQLite` conversion (`Uuid`, `Decimal`, and `Enum`) at
-    /// generate time, citing #1924 (issue #1614 AC #4) — rather than emit a
-    /// model that fails to compile. `uuid::Uuid`/`rust_decimal::Decimal` are
-    /// foreign to `autumn-web` (orphan rule) with Postgres-only diesel impls;
-    /// `Enum` renders only Postgres (`Pg`) diesel conversions.
+    /// The last three kinds #1924 un-rejects — `Uuid`, `Decimal`, and `Enum` —
+    /// now plan cleanly on a `SQLite` app and render types that compile there.
+    ///
+    /// `uuid::Uuid` and `rust_decimal::Decimal` are foreign to `autumn-web`, so
+    /// it can implement no diesel conversion for them; the model renders the
+    /// `TEXT`-backed newtypes `autumn-web` owns instead. A generated `enum` is
+    /// local to the app, so it gets `Sqlite` `ToSql`/`FromSql` impls directly.
     #[test]
-    fn sqlite_app_rejects_field_kinds_without_diesel_conversion_citing_1924() {
+    fn sqlite_app_accepts_uuid_decimal_and_enum_after_1924() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
-            for (token, rust_type) in [
-                ("token:Uuid", "uuid::Uuid"),
-                ("price:decimal{10,2}", "rust_decimal::Decimal"),
-                // `Enum` reports its generated enum type name (`Status`), not
-                // the `String` storage-representation fallback.
-                ("status:enum{draft,published}", "Status"),
-            ] {
-                let err = plan_model(
-                    tmp.path(),
-                    "Post",
-                    &["title:String".into(), token.into()],
-                    "20260427000000",
-                )
-                .unwrap_err();
-                let msg = err.to_string();
+            let plan = plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "token:Uuid".into(),
+                    "owner:Option<Uuid>".into(),
+                    "price:decimal{10,2}".into(),
+                    "status:enum{draft,published}".into(),
+                ],
+                "20260427000000",
+            )
+            .expect("Uuid/Decimal/enum fields are accepted on SQLite (#1924)");
+            plan.execute(Flags::default()).unwrap();
+
+            let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+            assert!(
+                model.contains("pub token: autumn_web::db::sqlite_types::SqliteUuid,"),
+                "Uuid renders as the SQLite newtype: {model}"
+            );
+            assert!(
+                model.contains("pub owner: Option<autumn_web::db::sqlite_types::SqliteUuid>,"),
+                "Option<Uuid> renders as the SQLite newtype: {model}"
+            );
+            assert!(
+                model.contains("pub price: autumn_web::db::sqlite_types::SqliteDecimal,"),
+                "Decimal renders as the SQLite newtype: {model}"
+            );
+            for leak in ["uuid::Uuid", "rust_decimal::Decimal"] {
                 assert!(
-                    matches!(err, GenerateError::Config(_)),
-                    "expected Config error for `{token}`, got: {err:?}"
-                );
-                assert!(msg.contains("1924"), "`{token}` must cite #1924: {msg}");
-                assert!(
-                    msg.contains(rust_type),
-                    "`{token}` message must name the Rust type `{rust_type}`: {msg}"
+                    !model.contains(leak),
+                    "SQLite model leaked the unconvertible `{leak}`: {model}"
                 );
             }
+
+            // The generated enum carries `Sqlite` conversions, not `Pg` ones.
+            assert!(
+                model.contains("diesel::sqlite::Sqlite"),
+                "enum must emit Sqlite ToSql/FromSql: {model}"
+            );
+            assert!(
+                !model.contains("diesel::pg::Pg"),
+                "SQLite model must not emit Pg enum conversions: {model}"
+            );
+
+            // All three store TEXT, on both the DDL and the diesel schema.
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("token TEXT NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("price TEXT NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("status TEXT NOT NULL"), "up.sql: {up}");
+            assert!(
+                !up.contains("NUMERIC"),
+                "SQLite up.sql leaked NUMERIC: {up}"
+            );
+
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            for line in [
+                "token -> Text,",
+                "owner -> Nullable<Text>,",
+                "price -> Text,",
+                "status -> Text,",
+            ] {
+                assert!(schema.contains(line), "schema missing `{line}`: {schema}");
+            }
+        });
+    }
+
+    /// `autumn destroy` must not take the `sqlite` feature back out of a `SQLite`
+    /// app. It is a whole-app backend flip, not a per-resource capability: no
+    /// generated code names it, `autumn new` never writes it, and without it the
+    /// app's `sqlite://` URL is refused at boot with `UnsupportedBackend`.
+    /// The generic `owner_dir` rule would strip it once `src/models` empties.
+    #[test]
+    fn destroying_the_last_model_keeps_the_sqlite_feature() {
+        with_no_db_env(|| {
+            // A project that actually declares `autumn-web`, so the feature-wiring
+            // pass has a dependency line to edit.
+            let tmp = project_with_autumn_web_dep();
+            fs::write(
+                tmp.path().join("autumn.toml"),
+                "[database]\nprimary_url = \"sqlite://app.db\"\n",
+            )
+            .unwrap();
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+            let after_generate = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(
+                after_generate.contains("features = [\"sqlite\"]"),
+                "generate must add the feature first: {after_generate}"
+            );
+
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000001",
+            )
+            .expect("re-plan for revert")
+            .revert(Flags::default())
+            .unwrap();
+
+            let after_destroy = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(
+                after_destroy.contains("features = [\"sqlite\"]"),
+                "destroy stripped the backend flip, so the app no longer boots: {after_destroy}"
+            );
+        });
+    }
+
+    /// A `decimal{p,s}` column is `TEXT` on `SQLite`, so the declared precision
+    /// and scale bind nothing unless the migration says so. Without the `CHECK`
+    /// a repository write persists `123456.789` into a `decimal{5,2}` — the
+    /// invariant Postgres gets free from `NUMERIC(5,2)` (Codex #2561, #1924).
+    #[test]
+    fn sqlite_decimal_column_carries_a_precision_and_scale_check() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("price TEXT NOT NULL CHECK ("), "up.sql: {up}");
+            // The two digit budgets: 2 fractional, 10 - 2 = 8 integer.
+            assert!(up.contains("<= 2"), "scale bound missing: {up}");
+            assert!(up.contains("<= 8"), "precision bound missing: {up}");
+        });
+    }
+
+    /// Postgres keeps the real `NUMERIC(p,s)`, which enforces this natively —
+    /// no `CHECK` may appear there.
+    #[test]
+    fn decimal_field_emits_decimal_shape_attr_for_model_macro() {
+        // Issue #2597: the declared `decimal{p,s}` rides into `#[model]` on a
+        // `#[decimal_shape(precision = p, scale = s)]` field attribute, so the
+        // factory `.fake()` draws values that fit the column by construction.
+        let fields = parse_fields(&["price:decimal{10,2}".to_owned()]).expect("parse");
+        let model = render_model_file_for_test("Invoice", "invoices", &fields);
+        assert!(
+            model.contains("#[decimal_shape(precision = 10, scale = 2)]"),
+            "decimal field must carry its shape into #[model]: {model}"
+        );
+        assert!(
+            model.contains("pub price: rust_decimal::Decimal,"),
+            "decimal field still renders as rust_decimal::Decimal: {model}"
+        );
+
+        // Non-decimal fields are untouched — the no-op path keeps their
+        // output byte-identical (no new attribute appears).
+        let plain = parse_fields(&["title:String".to_owned()]).expect("parse");
+        let plain_model = render_model_file_for_test("Post", "posts", &plain);
+        assert!(
+            !plain_model.contains("decimal_shape"),
+            "non-decimal fields must not gain the attribute: {plain_model}"
+        );
+    }
+
+    #[test]
+    fn postgres_decimal_column_has_no_check_constraint() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("price NUMERIC(10,2) NOT NULL"), "up.sql: {up}");
+            assert!(
+                !up.contains("CHECK ("),
+                "Postgres must not gain a CHECK: {up}"
+            );
+        });
+    }
+
+    /// A `decimal` default must reach `SQLite` as a quoted, NORMALIZED text
+    /// literal. Unquoted,
+    /// `SQLite` evaluates `DEFAULT 0.10` numerically and TEXT affinity stores
+    /// `0.1`; a wide value becomes scientific notation, which `Decimal::from_str`
+    /// cannot read back at all (Codex #2561, #1924).
+    #[test]
+    fn sqlite_decimal_default_is_a_quoted_text_literal() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .map(|_| ())
+            .expect("plan without default");
+
+            let options = ModelOptions {
+                defaults: vec!["price=0.10".to_owned()],
+                ..Default::default()
+            };
+            let fields = parse_fields(&["price:decimal{10,2}".into()]).unwrap();
+
+            let sqlite = parse_model_metadata_for(DatabaseBackend::Sqlite, &fields, &options)
+                .expect("sqlite metadata");
+            assert_eq!(
+                sqlite.defaults().get("price").map(String::as_str),
+                Some("'0.1'"),
+                "a SQLite decimal default must be quoted AND normalized — the same \
+                 text `SqliteDecimal` writes, or a row holding its own default \
+                 would not match a `find_by_…` for that value"
+            );
+
+            let postgres = parse_model_metadata_for(DatabaseBackend::Postgres, &fields, &options)
+                .expect("postgres metadata");
+            assert_eq!(
+                postgres.defaults().get("price").map(String::as_str),
+                Some("0.10"),
+                "Postgres decimal defaults stay unquoted numeric literals"
+            );
+        });
+    }
+
+    /// A `SQLite` app's `Cargo.toml` must describe the `SQLite` backend: diesel
+    /// on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
+    /// and `autumn-web`'s `sqlite` feature — otherwise nothing the generator
+    /// emits can compile, whatever the field kinds (issue #1924).
+    #[test]
+    fn sqlite_app_cargo_deps_target_the_sqlite_backend() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(
+                cargo.contains("features = [\"sqlite\"]") || cargo.contains("\"sqlite\""),
+                "autumn-web must carry the sqlite feature: {cargo}"
+            );
+            assert!(
+                cargo.contains("libsqlite3-sys"),
+                "the bundled SQLite amalgamation must be a dependency: {cargo}"
+            );
+            assert!(
+                !cargo.contains("pq-sys"),
+                "a SQLite app must not name libpq as a direct dependency: {cargo}"
+            );
+            assert!(
+                !cargo.contains("db-diesel2-postgres"),
+                "rust_decimal's Postgres diesel feature is wrong here: {cargo}"
+            );
+        });
+    }
+
+    /// A Postgres app's `Cargo.toml` keeps the historical Postgres dependency
+    /// set — the backend-aware split must not leak `SQLite` into it.
+    #[test]
+    fn postgres_app_cargo_deps_are_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("pq-sys"), "Cargo.toml: {cargo}");
+            assert!(cargo.contains("db-diesel2-postgres"), "Cargo.toml: {cargo}");
+            assert!(
+                !cargo.contains("libsqlite3-sys"),
+                "a Postgres app must not link SQLite: {cargo}"
+            );
+        });
+    }
+
+    /// Byte-parity guard for the un-rejection: the same model on a Postgres app
+    /// still renders `uuid::Uuid` / `rust_decimal::Decimal` and Postgres-only
+    /// enum conversions (issue #1614 AC #10).
+    #[test]
+    fn postgres_app_model_output_for_uuid_decimal_enum_is_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "token:Uuid".into(),
+                    "price:decimal{10,2}".into(),
+                    "status:enum{draft,published}".into(),
+                ],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .unwrap();
+
+            let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+            assert!(model.contains("pub token: uuid::Uuid,"), "model: {model}");
+            assert!(
+                model.contains("pub price: rust_decimal::Decimal,"),
+                "model: {model}"
+            );
+            assert!(
+                model.contains("diesel::pg::Pg"),
+                "Postgres enum conversions must be unchanged: {model}"
+            );
+            assert!(
+                !model.contains("sqlite_types"),
+                "Postgres model must not name the SQLite newtypes: {model}"
+            );
         });
     }
 
@@ -4279,7 +4792,7 @@ mod tests {
     }
 
     /// Regression guard: those same field kinds are unchanged on a Postgres app
-    /// — the diesel-conversion gate is SQLite-only.
+    /// — the diesel-conversion gate is `SQLite`-only.
     #[test]
     fn postgres_app_field_kinds_without_sqlite_conversion_are_unchanged() {
         with_no_db_env(|| {
@@ -4302,12 +4815,13 @@ mod tests {
     }
 
     /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
-    /// citing #1905 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
+    /// citing #2555 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
     /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
     /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
-    /// deferred to the runtime slice #1905.
+    /// tracked in #2555 — the runtime slice (#1905) deferred it and has since
+    /// closed, so the message must not send a reader to a closed issue.
     #[test]
-    fn sqlite_app_uuid_primary_key_is_rejected_citing_1905() {
+    fn sqlite_app_uuid_primary_key_is_rejected_citing_the_tracking_issue() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
             let err = plan_model_with_options(
@@ -4326,7 +4840,7 @@ mod tests {
                 matches!(err, GenerateError::Config(_)),
                 "expected Config error, got: {err:?}"
             );
-            assert!(msg.contains("1905"), "must cite issue #1905: {msg}");
+            assert!(msg.contains("2555"), "must cite issue #2555: {msg}");
             assert!(
                 msg.contains("SQLite") && msg.contains("UUID"),
                 "message must be actionable: {msg}"
@@ -4421,7 +4935,7 @@ mod tests {
     }
 
     /// Regression guard: a `--sharded` model on a Postgres app is unchanged —
-    /// the sharded gate is SQLite-only.
+    /// the sharded gate is `SQLite`-only.
     #[test]
     fn postgres_app_sharded_model_is_unchanged() {
         with_no_db_env(|| {
@@ -4442,7 +4956,7 @@ mod tests {
     }
 
     /// Regression guard: `generate model --id uuid` on a Postgres app is
-    /// unchanged — the uuid gate is SQLite-only.
+    /// unchanged — the uuid gate is `SQLite`-only.
     #[test]
     fn postgres_app_uuid_primary_key_is_unchanged() {
         with_no_db_env(|| {

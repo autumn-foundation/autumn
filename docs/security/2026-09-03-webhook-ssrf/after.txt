@@ -1,0 +1,23 @@
+$ cargo test -p autumn-web --lib webhook_outbound:: -- --nocapture
+# with the fix applied (RequestBuilder::ssrf_safe() + deliver_webhook_job using it)
+
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 55s
+     Running unittests src/lib.rs (target/debug/deps/autumn_web-ab97033ae7ae3be3)
+
+running 10 tests
+test webhook_outbound::tests::outbound_webhook_plugin_installs_manager_without_startup_hook ... ok
+test webhook_outbound::tests::replace_delivery_log_is_not_a_delivery_outcome ... ok
+test webhook_outbound::tests::replay_job_keeps_disabled_subscription_log_in_dlq ... ok
+test webhook_outbound::tests::replay_job_sends_failed_subscription_instead_of_skipping ... ok
+test webhook_outbound::tests::delivery_log_response_body_is_capped ... ok
+test webhook_outbound::tests::self_contained_delivery_uses_latest_subscription_state ... ok
+test webhook_outbound::tests::dispatch_marks_log_dlq_when_fallback_enqueue_fails ... ok
+test webhook_outbound::tests::successful_delivery_does_not_retry_when_failure_reset_fails ... ok
+test webhook_outbound::tests::webhook_manager_uses_http_client_config_base_urls ... ok
+test webhook_outbound::tests::deliver_webhook_job_refuses_ssrf_target_url ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 5448 filtered out; finished in 0.50s
+
+
+[exited with code 0]

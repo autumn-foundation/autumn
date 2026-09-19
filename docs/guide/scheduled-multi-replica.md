@@ -36,6 +36,43 @@ AUTUMN_SCHEDULER__REPLICA_ID=web-1
 metadata such as `FLY_MACHINE_ID` or `HOSTNAME`, then falls back to the process
 id. Set it explicitly when you want stable names in `/actuator/tasks`.
 
+## Configure SQLite Coordination
+
+SQLite has no advisory locks, and a SQLite deployment is single-host, so
+`backend = "postgres"` is refused at boot there. Use `backend = "sqlite"` when
+several processes share one host — a web tier next to a worker tier, or the
+overlap window of a rolling restart:
+
+```toml
+[database]
+url = "sqlite:///var/lib/app/app.db"
+
+[scheduler]
+backend = "sqlite"
+lease_ttl_secs = 300
+key_prefix = "myapp:scheduler"
+```
+
+Each `(task, tick)` is leased in an `autumn_scheduler_leases` table in the same
+database file, so exactly one process runs each tick. The runtime creates that
+table itself.
+
+The lease carries an expiry, not a session. The row is what makes the tick
+claimed, and it stays for the whole of `lease_ttl_secs` whether the leader
+finished or died, so a process whose timer reaches the same tick a moment later
+cannot run it a second time. The next acquire reaps the row once it expires.
+
+Set the TTL longer than both the spread between the processes' timers and the
+longest a tick body can take. This is stricter than the Postgres coordinator,
+which frees the tick key as soon as the leader finishes.
+
+`backend = "sqlite"` requires the `sqlite` cargo feature, and a **file-backed**
+database: an in-memory target is private to each process, so every replica would
+claim the same tick and run it. That is refused at boot.
+
+A single-process SQLite app needs none of this: keep the default
+`backend = "in_process"`, where the one process is always the leader.
+
 ## Declare Scheduled Tasks
 
 Fleet coordination is the default task mode:

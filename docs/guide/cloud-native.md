@@ -126,7 +126,7 @@ delivery remain correlated with the request that triggered them.
 change, run the migration before deploying new workers:
 
 ```shell
-autumn migrate run
+autumn migrate
 ```
 
 or apply it manually:
@@ -200,6 +200,9 @@ key_prefix = "my-app:sessions"
 The `prod` profile warns when you keep `backend = "memory"` without explicitly
 acknowledging it via `session.allow_memory_in_production = true`.
 
+A managed Redis that only exposes a TLS port takes a `rediss://` URL here —
+see [Redis over TLS](#redis-over-tls-rediss).
+
 ## Mail
 
 The `mail` cargo feature gives apps a `Mailer` extractor and log/file/SMTP
@@ -272,9 +275,11 @@ deploy, and drain each tier on its own.
 
 Requirements:
 
-- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"`. The
-  `local` backend is in-process, so a web replica would enqueue where no worker
-  can drain. Autumn rejects a split role on `local` at startup and
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"` here,
+  because this page's topology spans hosts. (`"sqlite"` is durable too, but its
+  queue is a table in one file, so it only backs a split whose processes share a
+  host.) The `local` backend is in-process, so a web replica would enqueue where
+  no worker can drain. Autumn rejects a split role on `local` at startup and
   `autumn doctor --strict` flags it. See
   [Web and worker process roles](jobs.md#web-and-worker-process-roles).
 - **The same migration gate** — both tiers share one backend, so run the
@@ -427,10 +432,16 @@ autumn migrate check
 
 `autumn migrate check` reads every `migrations/*/up.sql` file from disk (no
 database connection required) and classifies each SQL statement by its risk for
-a rolling deploy. It exits **0** when all statements are fully safe and **1**
-when any finding is `potentially-blocking`, `destructive`, `irreversible`,
-`data-backfill`, or `manual-review`. Each finding includes a one-line reason and
-a concrete next action.
+a rolling deploy. It exits **0** when all `up.sql` statements are fully safe and
+**1** when any is `potentially-blocking`, `destructive`, `irreversible`,
+`data-backfill`, `manual-review`, or `unsupported`. `down.sql` is classified and
+reported too, but does not decide the exit code: it runs on `autumn migrate
+down`, not on deploy. Each finding includes a one-line reason and a concrete
+next action.
+
+Classification follows the app's own backend (#1906). The example below is a
+Postgres app; on SQLite the same command applies SQLite's rules — see
+[SQLite in production](./sqlite-in-production.md#migration-mechanics-on-sqlite).
 
 Example output:
 
@@ -454,6 +465,7 @@ Example output:
 | `irreversible` | Cannot be undone without a multi-step expand/contract cycle. |
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
+| `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
 
 ### Adding `autumn migrate check` to CI
 
@@ -537,18 +549,30 @@ that fails while the replica has not replayed the latest Diesel migration.
 
 Autumn's default behavior routes all replica-eligible reads to the replica
 regardless of whether the same request performed a write. Add
-`read_your_writes` in `[database]` to pin post-write reads to the primary:
+`read_your_writes` in `[database]` to pin post-write reads to the primary.
+
+Pick **one** of the two options below. `read_your_writes` is a single key, so
+setting it twice in one `[database]` table is a TOML duplicate-key error and the
+app will not start.
+
+Option A — intra-request pin only (Laravel "sticky"):
 
 ```toml
+# autumn.toml
 [database]
-primary_url   = "postgres://user:pass@primary:5432/app"
-replica_url   = "postgres://user:pass@replica:5432/app"
-
-# Option A — intra-request pin only (Laravel "sticky")
+primary_url      = "postgres://user:pass@primary:5432/app"
+replica_url      = "postgres://user:pass@replica:5432/app"
 read_your_writes = "request"
+```
 
-# Option B — cross-request pin via signed cookie (Rails automatic role switching)
-read_your_writes = "session"
+Option B — cross-request pin via signed cookie (Rails automatic role switching):
+
+```toml
+# autumn.toml
+[database]
+primary_url          = "postgres://user:pass@primary:5432/app"
+replica_url          = "postgres://user:pass@replica:5432/app"
+read_your_writes     = "session"
 pin_after_write_secs = 5          # how long the cookie pins reads; default 5 s
 ```
 
@@ -629,6 +653,42 @@ For read-through fills that coalesce concurrent misses into a single
 recompute (in-process single-flight, plus an opt-in distributed fill lock and
 stale-while-revalidate on the Redis backend), see [Cache Stampede
 Protection](cache-stampede.md).
+
+## Redis over TLS (`rediss://`)
+
+Managed Redis usually speaks TLS and often speaks *only* TLS. Azure Cache for
+Redis provisioned by `autumn release init --target azure-container-apps` sets
+`non_ssl_port_enabled = false`, and ElastiCache with transit encryption on
+behaves the same way, so the only URL you get is a `rediss://` one.
+
+Every Redis-backed subsystem accepts it — sessions, channels, jobs, job
+tracking, idempotency, webhook replay, rate limiting, and the
+`autumn-cache-redis` cache:
+
+```toml
+[session.redis]
+url = "rediss://:<access-key>@my-cache.redis.cache.windows.net:6380"
+```
+
+Valkey's `valkeys://` scheme works the same way. No extra Cargo feature is
+needed; TLS support is compiled in.
+
+Certificates are validated against the public CA store. A managed Redis that
+presents a private or provider-internal CA — Google Memorystore, for instance
+— will not validate, which is why `autumn release init --target
+gcp-cloud-run` provisions Memorystore with `transit_encryption_mode =
+"DISABLED"` and keeps the connection inside the VPC instead.
+
+Autumn installs the process-wide rustls `CryptoProvider` (`ring`) that the
+`redis` crate's TLS transport requires, once and only for TLS URLs. If your
+application installs its own provider — for example `aws-lc-rs` — install it
+at the top of `main`, before the app builder runs: Autumn keeps whatever is
+already installed, and it may reach for one as early as config validation. A
+plaintext `redis://` URL never claims the default, so it cannot pre-empt that
+choice.
+
+Redis URLs carry credentials, so Autumn redacts the password from any URL it
+logs. Do the same in your own code — `autumn_web::redis_tls::redact_url`.
 
 ## Concurrent Writes
 
@@ -862,8 +922,9 @@ concurrently during drain but is not awaited at shutdown.
 ### WebSocket drain contract
 
 Every `#[ws]` handler that uses `WithShutdown` receives a `CancellationToken`
-that is cancelled at phase 4. Handlers should send a close frame on
-cancellation:
+that is cancelled at phase 4. `#[ws]` is behind the non-default `ws` feature
+(`features = ["ws"]`); see [WebSockets](websockets.md). Handlers should send a
+close frame on cancellation:
 
 ```rust
 #[ws("/chat")]
@@ -923,7 +984,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
-- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis`, never `local`), with worker replicas exposing `/live` + `/ready`
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis` across hosts, `sqlite` within one, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

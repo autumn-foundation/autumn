@@ -24,14 +24,16 @@ SemVer contract.
 | `autumn-storage-s3` | `autumn-storage-s3/` | 6 | Depends on `autumn-web`. |
 | `autumn-cache-redis` | `autumn-cache-redis/` | 6 | Depends on `autumn-web`. |
 | `autumn-search` | `autumn-search/` | 6 | Depends on `autumn-web`. |
+| `autumn-billing` | `autumn-billing/` | 6 | Depends on `autumn-web`. |
 
 This table is the same set, in the same order, as `CRATES` in
 [`scripts/check-publish-dry-run.sh`](../scripts/check-publish-dry-run.sh) —
 that script is the executable copy, so keep the two in step. Note that two
 other gate scripts currently carry **narrower** lists —
 `scripts/check-crate-metadata.sh` omits `autumn-schema-core` and
-`autumn-media-plugin`, and `scripts/check-semver.sh` omits all three of
-`autumn-schema-core`, `autumn-edge` and `autumn-media-plugin`. Those crates are
+`autumn-media-plugin`, and `scripts/check-semver.sh` omits all four of
+`autumn-schema-core`, `autumn-edge`, `autumn-media-plugin` and `autumn-billing`
+(the last has no published baseline yet). Those crates are
 therefore published without a metadata or SemVer check today; widening both
 lists is worth doing, but it does not change the publish order above.
 
@@ -61,7 +63,7 @@ generated application CI. It is maintained on its own release train.
 
 - Autumn framework crate packaging, docs.rs build, and SemVer gate.
 - CLI commands shipped by `autumn-cli`.
-- Generated application smoke test (see [Downstream Smoke Test](#downstream-smoke-test)).
+- Generated application smoke test (see [Downstream Smoke Test](#6--downstream-smoke-test-smoke-job)).
 
 **Checks that belong in the Harvest repo:**
 
@@ -72,6 +74,68 @@ generated application CI. It is maintained on its own release train.
 When an Autumn release changes the generated-app contract (config schema,
 generated file structure, CLI flags), open a companion PR in the Harvest repo
 before tagging the Autumn release.
+
+---
+
+## Supply Chain: SBOM and Provenance
+
+Every tagged release attaches a CycloneDX SBOM (`autumn-<tag>.cdx.json`), and
+every release asset — the SBOM and each CLI archive with its `.sha256` — carries
+a keyless SLSA build-provenance attestation tied to the commit and CI run that
+produced it.
+
+- The `sbom` gate job (`scripts/check-sbom.sh`) generates the SBOM with the CLI
+  from the checkout being released, regenerates it and compares
+  component-by-component, and requires its root component version to equal both
+  `[workspace.package].version` and the pushed tag. The verified file is handed
+  to `prepare-release` as an artifact, so what ships is exactly what passed.
+- Attestations are published by `release.yml` and `cli-release.yml`, which need
+  `id-token: write` + `attestations: write`. Both attest **before** uploading,
+  so an attestation failure stops the release rather than leaving unattested
+  assets on a live one.
+
+Consumers verify with one command; the full walkthrough, including the
+negative (tampered-asset) case, is in
+[docs/guide/supply-chain.md](guide/supply-chain.md):
+
+```bash
+gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
+  --repo autumn-foundation/autumn
+```
+
+Run the gate locally before tagging:
+
+```bash
+RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
+```
+
+### Dependency advisories
+
+A release must not ship a known-vulnerable dependency. `scripts/check-advisories.sh`
+runs in both PR CI and the Publish Gate (`advisories` job, a `prepare-release`
+dependency), auditing five graphs against the RustSec database with cargo-deny:
+
+- the workspace (`deny.toml`) and the SQLite backend graph (`deny-sqlite.toml`);
+- **the scaffold's day-one graph** — `autumn-web`'s tree with every feature any
+  scaffold flavor can enable, audited with the `deny.toml` that `autumn new`
+  writes into a generated app. That is a superset of the autumn-web half of a
+  real app's tree (not its own direct dependencies, and resolved against this
+  workspace's lockfile), and it is what keeps "a scaffolded app's CI is green on
+  day one" true release over release rather than a claim that decays;
+- **two satellite graphs**, each its own excluded workspace root with its own
+  `Cargo.lock` and its own narrower `deny.toml` (advisories + sources only):
+  `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
+  `examples/island-flock/` (never built in CI, but its compiled wasm/js bundle
+  is committed and served by the `flock` example).
+
+An advisory with no fix is accepted by adding an `ignore` entry (id, `reason`,
+review-by date) — never by weakening or removing the gate. `--self-test` proves
+the gate can still go red by auditing an injected known-vulnerable dependency.
+
+```bash
+./scripts/check-advisories.sh              # the gate, all five graphs
+./scripts/check-advisories.sh --self-test  # the negative proof
+```
 
 ---
 
@@ -164,6 +228,57 @@ Creates a temporary directory outside the workspace, generates a minimal Autumn
 app skeleton, substitutes the candidate crate set (by path, simulating a crates.io
 install), and verifies it compiles. This proves the published `autumn-web` is
 usable from a fresh project without workspace path dependencies.
+
+### 6a · Dependency Advisory Gate (`advisories` job)
+
+Script: `scripts/check-advisories.sh`
+
+Fails the release when any crate in the tree being published carries a RustSec
+advisory that `deny.toml`, `deny-sqlite.toml`, or the scaffold's shipped
+`deny.toml` does not explicitly waive. PR CI runs the same script, but that is
+not enough on its own: a tag can be pushed from a commit whose CI predates an
+advisory's publication, so the database is fetched fresh at tag time. The
+advisory-database fetch retries with backoff and **fails closed** if the
+database stays unreachable; the audits then run `--offline` against it, so a
+failure names an advisory rather than a network blip.
+
+The job also runs `--self-test`, which audits a throwaway crate with an
+injected known-vulnerable dependency (`time 0.1.45`, RUSTSEC-2020-0071) and
+requires the gate to reject it — then to accept it once, and only once, that
+advisory is waived.
+
+### 6b · SBOM Gate (`sbom` job)
+
+Script: `scripts/check-sbom.sh`
+
+Builds the `autumn` CLI from the checkout being released and uses it to
+generate a CycloneDX 1.5 SBOM for the workspace, then:
+
+- **regenerates and compares it component-by-component** (`autumn sbom
+  --verify`), so a stale, hand-edited or substituted SBOM fails and the failure
+  names the components that drifted;
+- requires the SBOM's root component version to equal
+  `[workspace.package].version` (`autumn sbom --expect-version`) and, on a tag
+  push, requires that to equal the tag;
+- runs with `--locked`, so a `Cargo.lock` that disagrees with the manifests is
+  a gate failure rather than a silently different dependency set.
+
+The verified file is uploaded as the `sbom` artifact and *downloaded* by
+`prepare-release` rather than regenerated there, so the `autumn-<tag>.cdx.json`
+attached to the GitHub Release is byte-for-byte the document this gate passed.
+
+Signing happens in a **separate `sbom-attest` job** that checks out nothing and
+only downloads that artifact. That separation is deliberate and load-bearing:
+`publish-gate.yml` also runs on `pull_request`, and job-level `permissions:`
+are not conditional — an `if:` on an attest *step* withholds the step but not
+the token. Keeping `id-token: write` / `attestations: write` out of any job
+that runs branch code is what stops a contributor's branch from minting
+provenance under this repository's identity. `supply_chain.rs` enforces the
+invariant across every job in the workflow.
+
+The SBOM is deterministic by construction — no `serialNumber`, no
+`metadata.timestamp`, components sorted and de-duplicated — which is what makes
+`--verify` possible at all.
 
 ### 7 · Published Quickstart Gate (`quickstart-gate` workflow, post-publish)
 
@@ -313,6 +428,11 @@ the release's rename-level changes.
 - [ ] `cargo test -p autumn-cli --test cli_tests repo_hygiene` — `repo_hygiene`
   is a module inside the consolidated `cli_tests` binary, not a test target of
   its own, so `--test repo_hygiene` errors with "no test target named".
+- [ ] `RELEASE_TAG=v<version> ./scripts/check-sbom.sh` — the SBOM gate, run
+  locally before tagging so a drifted lockfile is caught before CI.
+- [ ] `./scripts/check-advisories.sh` — the advisory gate, run locally before
+  tagging so a newly published RUSTSEC advisory is triaged (fixed or waived
+  with a reason) before it blocks the tag.
 
 ## First-Run Docs Gate
 
@@ -335,9 +455,16 @@ Before pushing the release tag:
 1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
-3. **Update `CHANGELOG.md`** — move unreleased items under a `## [X.Y.Z]` heading.
-   Every breaking entry carries the `**Breaking:**` marker (or sits under a
+3. **Fold the changelog fragments in** — `./scripts/update-changelog.sh`
+   merges every `changelog.d/` file into `## [Unreleased]` under the kind it
+   declares, then deletes the files. Read the result: it is the release note
+   people get. Then move the items under a `## [X.Y.Z]` heading. Every breaking
+   entry carries the `**Breaking:**` marker (or sits under a
    `### Breaking Changes` heading) and links its migration guide.
+
+   A release PR is the one change allowed to edit `CHANGELOG.md`. Put the
+   literal token `[changelog]` in its body, or apply the `release` label, or
+   `./scripts/check-changelog-fragments.sh` fails it.
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
    record the codemod-first upgrade walk-through.
@@ -354,6 +481,7 @@ Before pushing the release tag:
 7. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
+   ./scripts/check-changelog-fragments.sh
    ./scripts/check-release-notes.sh
    ./scripts/check-migration-guides.sh
    ./scripts/check-skill-version-markers.sh
@@ -383,6 +511,7 @@ Before pushing the release tag:
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
+   cargo publish -p autumn-billing
    ```
 10. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):

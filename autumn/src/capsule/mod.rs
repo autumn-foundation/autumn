@@ -27,13 +27,20 @@
 //! * [`persist`] — writing, pruning, and reading capsules back.
 //! * [`capture`] — the request-scoped buffer and the Tower layer.
 //! * [`clock`] — the recording and replaying clock sources.
+//! * [`entropy`] — the recording and replaying entropy sources.
+//! * [`effects`] — the replay-side tape for the non-database effect seams
+//!   (outbound HTTP, jobs, cache, mail, tenancy, randomness).
 //! * [`replay`] — the replay driver, the divergence log and the verdict.
+//! * [`regression`] — replaying a committed capsule as an ordinary test.
 //! * `replay_db` — the in-process stub `PostgreSQL` server replay reads from.
 
 pub mod capture;
 pub mod clock;
+pub mod effects;
+pub mod entropy;
 pub mod persist;
 pub mod redact;
+pub mod regression;
 pub mod replay;
 pub mod schema;
 
@@ -51,9 +58,13 @@ pub(crate) mod wire;
 pub use capture::with_capture_scope;
 pub use capture::{
     CaptureHandle, CaptureLayer, CaptureScope, CaptureSettings, CapturedClientIdentity, DbBuffer,
-    current_scope, is_valid_scope_id, scope_by_id,
+    EffectBuffer, current_scope, is_valid_scope_id, scope_by_id,
 };
 pub use clock::{RecordingClock, ReplayClock};
+pub use effects::{
+    EffectDivergence, EffectDivergenceKind, EffectSeam, ReplayEffects, with_effect_tape,
+};
+pub use entropy::{RecordingEntropy, ReplayEntropy};
 pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 /// The recording pool, re-exported for tests that drive capture against a live
 /// database without reaching into the submodule path.
@@ -65,8 +76,8 @@ pub use record_db::{build_recording_pool, maybe_capture_pool_provider};
 pub use record_db::{capture_unavailable_reason, note_db_capture_unavailable};
 pub use replay::{
     Divergence, DivergenceKind, DivergenceLog, EXIT_DIVERGED, EXIT_REFUSED, EXIT_REPRODUCED,
-    ReplayOutcome, TapeProgress, Verdict, execute, print_refusal, print_verdict, refusal_exit_code,
-    refusal_reason,
+    JobDispatch, ReplayFixtures, ReplayOutcome, TapeProgress, Verdict, execute, execute_job,
+    print_refusal, print_verdict, refusal_exit_code, refusal_reason,
 };
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub use replay_db::{StubServer, pool_from_capsule, replica_pool_from_capsule};
@@ -94,8 +105,9 @@ pub fn note_backend_capture_gap() {
     }
 }
 pub use schema::{
-    AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
-    CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
+    AppInfo, BindValue, CAPSULE_FORMAT_VERSION, CacheEffect, Capsule, CapsuleBody, CapsuleDb,
+    CapsuleEffects, CapsuleError, CapsuleJob, CapsuleOutcome, CapsuleRequest, ConnectionTape,
+    Exchange, ExchangeProtocol, HttpEffect, JobEffect, MailEffect, RandomEffect, TenantEffect,
 };
 
 /// Build the capture settings the layer and the persistence path share.
@@ -124,7 +136,7 @@ pub fn settings_from_config(config: &crate::config::AutumnConfig) -> CaptureSett
 /// false mismatch this field exists to prevent, only pointed the other way.
 ///
 /// No roles are recorded where replay could not rebuild them: wire capture and
-/// wire replay are both PostgreSQL-only, so a `sqlite` build (and a build
+/// wire replay are both `PostgreSQL`-only, so a `sqlite` build (and a build
 /// without `db` at all) records none — the caller decides by not calling this.
 #[must_use]
 pub fn observed_db_roles(has_primary: bool, has_replica: bool) -> Vec<String> {

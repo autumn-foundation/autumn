@@ -215,49 +215,41 @@ pub fn resolve_retention_descriptors(
 ) -> AutumnResult<Vec<&'static RetentionSweepDescriptor>> {
     let all: Vec<&RetentionSweepDescriptor> =
         inventory::iter::<RetentionSweepDescriptor>().collect();
-    // Regression (#1342 review round 14): resolving descriptors alone
-    // doesn't validate them — the `every`/`after`/`purge_deleted_after`
-    // duration parsing, the model-dependents boot assert, and the
-    // backend-bind-limit assert all live inside `task_info()`, which this
-    // function never called. A policy with a bad `every` (e.g. "bogus")
-    // used to pass a dry run silently even though it panics the moment real
-    // boot calls `collect_retention_tasks()` (which does call `task_info()`
-    // on every descriptor). Run the exact same validation boot relies on —
-    // it's pure and DB-independent, so calling it here doesn't cost the
-    // "resolve before connecting" property this function exists for.
+    // Resolving descriptors alone does not validate them: the `every`, `after`, and
+    // `purge_deleted_after` duration parsing, the model-dependents boot assert, and the
+    // backend-bind-limit assert all live inside `task_info()`, which this function never
+    // called. A policy with a bad `every` — "bogus" — used to pass a dry run silently
+    // even though it panics the moment real boot calls `collect_retention_tasks()`, which
+    // does call `task_info()` on every descriptor. Run the exact validation boot relies
+    // on: it is pure and DB-independent, so calling it here does not cost the
+    // resolve-before-connecting property this function exists for.
     //
-    // Also apply the same duplicate-task-name check `collect_retention_tasks`
-    // applies (#1342 review round 15): calling `task_info()` alone catches a
-    // bad duration/dependents/bind-limit on any ONE descriptor, but not two
-    // different repositories that legitimately target the same table (see
-    // `live_broadcast.rs`) both declaring `retention(...)`.
+    // Also apply the duplicate-task-name check `collect_retention_tasks` applies. Calling
+    // `task_info()` alone catches a bad duration, dependents list, or bind limit on any
+    // one descriptor, but not two different repositories that legitimately target the same
+    // table (see `live_broadcast.rs`) both declaring `retention(...)`.
     //
-    // Validated against `all`, not the `--model`-narrowed `matches` below
-    // (#1342 review round 19): a filtered dry run used to validate only the
-    // selected descriptor, so a duplicate-name collision between two OTHER,
-    // unrelated policies not selected by `--model` went undetected — real
-    // boot's `collect_retention_tasks()` has no filter concept and walks
-    // every registered descriptor, so it would still panic on that
-    // collision regardless of what any dry run's `--model` happened to
-    // narrow to. Validate the complete registry up front, before narrowing
-    // to what `--model` actually selects for counting.
+    // Validated against `all`, not the `--model`-narrowed `matches` below: a filtered dry
+    // run used to validate only the selected descriptor, so a duplicate-name collision
+    // between two other, unselected policies went undetected — and real boot's
+    // `collect_retention_tasks()` has no filter concept, walking every registered
+    // descriptor, so it would still panic on that collision whatever `--model` narrowed
+    // to. Validate the complete registry up front, before narrowing (#1342).
     validate_resolved_descriptors(&all);
 
     let matches: Vec<&RetentionSweepDescriptor> = match model_filter {
         None => all,
         Some(filter) => {
-            // Regression (#1342 review round 24): the ambiguity error below
-            // tells the operator to pass the table name instead of the model
-            // name to disambiguate — but if a *different* policy's
-            // `table_name` happens to equal this filter (e.g. one repository
-            // uses model `Session` while another targets a table literally
-            // named `Session`), the combined `model_name == filter ||
-            // table_name == filter` filter below still collects both,
-            // making the suggested table-name filter just as ambiguous.
-            // Resolve an exact, unique `table_name` match first — schema
-            // table names are unique, so this can never be ambiguous — and
-            // only fall back to the model-or-table filter (whose ambiguity
-            // is expected and reported) when no single table matches.
+            // The ambiguity error below tells the operator to pass the table name
+            // instead of the model name to disambiguate — but if a different
+            // policy's `table_name` equals this filter, as when one repository uses
+            // model `Session` while another targets a table literally named
+            // `Session`, the combined `model_name == filter || table_name == filter`
+            // filter below still collects both, making the suggested table-name
+            // filter just as ambiguous. Resolve an exact, unique `table_name` match
+            // first — schema table names are unique, so that can never be ambiguous —
+            // and fall back to the model-or-table filter, whose ambiguity is expected
+            // and reported, only when no single table matches (#1342).
             let table_matches: Vec<&RetentionSweepDescriptor> = all
                 .iter()
                 .copied()
@@ -621,21 +613,19 @@ mod tests {
         assert!(error.to_string().contains("__NoSuchRetentionModel"));
     }
 
-    // Regression (#1342 review round 14): `resolve_retention_descriptors`
-    // used to return matched descriptors without ever calling their
-    // `task_info()` — the one place `every`/`after`/`purge_deleted_after`
-    // duration parsing, the model-dependents assert, and the bind-limit
-    // assert all live. A policy with a bad `every` therefore passed a dry
-    // run silently even though real boot (`collect_retention_tasks()`,
-    // which DOES call `task_info()` on every descriptor) would panic on it.
+    // `resolve_retention_descriptors` used to return matched descriptors without ever
+    // calling their `task_info()`, the one place the `every`, `after`, and
+    // `purge_deleted_after` duration parsing, the model-dependents assert, and the
+    // bind-limit assert all live. A policy with a bad `every` therefore passed a dry run
+    // silently even though real boot — `collect_retention_tasks()`, which does call
+    // `task_info()` on every descriptor — would panic on it (#1342).
     //
-    // Can't test this with a genuinely panicking fixture: `inventory`'s
-    // registry is process-global and every other test in this binary that
-    // calls `collect_retention_tasks()` also invokes every registered
-    // descriptor's `task_info()`, so a permanently-panicking fixture here
-    // would break those tests too. Count calls instead — proving
-    // `resolve_retention_descriptors` invokes `task_info()` is exactly what
-    // proves it would propagate a real panic without needing to trigger one.
+    // This cannot be tested with a genuinely panicking fixture: `inventory`'s registry is
+    // process-global, and every other test in this binary that calls
+    // `collect_retention_tasks()` also invokes every registered descriptor's
+    // `task_info()`, so a permanently panicking fixture would break those too. Count calls
+    // instead: proving `resolve_retention_descriptors` invokes `task_info()` is exactly
+    // what proves it would propagate a real panic.
     static COUNTING_TASK_INFO_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 

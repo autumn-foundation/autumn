@@ -97,12 +97,24 @@ just built:
 cargo install --path autumn-cli
 ```
 
-Between releases the workspace can be ahead of the published crates, so a
-source-built CLI may scaffold projects pinning an `autumn-web` version that is
-not on crates.io yet. `autumn doctor`'s `version_compat` check reports the two
-versions side by side; if they disagree, either point the generated
-`Cargo.toml` at your checkout with a `[patch.crates-io]` override or install
-the published CLI instead.
+Between releases the workspace can be ahead of the published crates while the
+version number stays put — this project never bumps the version for feature
+work, only for a release. So `autumn new` pins whatever `autumn-web` version
+your source-built CLI was compiled with, and that number is normally already
+on crates.io; it is the *code* behind it that has moved on. That means
+`autumn doctor`'s `version_compat` check, which compares version strings, will
+print a reassuring `✅ version_compat — autumn-cli 0.7.0 matches autumn-web
+0.7.0` even when your checkout and the published crate have diverged — it has
+no way to see API drift that the version number doesn't carry.
+
+The real symptom is a `cargo build` failure right after `autumn new`, usually
+a plain type-mismatch error inside generated code that calls into
+`autumn_web::`. If you hit that, don't trust a green `version_compat` to rule
+out the version-skew explanation — either point the generated `Cargo.toml` at
+your checkout with a `[patch.crates-io]` override, or install the published
+CLI instead. If you're building from a checkout that's more than a few commits
+past the last release tag, applying the `[patch.crates-io]` override up front
+avoids the failure entirely.
 
 Either way you get the `autumn` binary. These are the commands you will touch in
 your first hour:
@@ -148,6 +160,9 @@ my-app/
   rust-toolchain.toml
   rustfmt.toml
   clippy.toml
+  deny.toml                 # dependency advisory policy — CI audits against it
+  tailwind.config.js        # Tailwind content globs
+  .autumn/scaffold.toml     # which release scaffolded this — commit it
   src/
     main.rs                 # your application entry point
   static/
@@ -161,8 +176,18 @@ my-app/
   config/
     master.key              # encrypts credentials — keep secret, never commit
     credentials/development.toml.enc
-  .github/workflows/ci.yml  # fmt, clippy, test, and a11y checks
+  .github/workflows/ci.yml  # fmt, clippy, dependency audit, test, a11y checks
 ```
+
+`.autumn/scaffold.toml` is bookkeeping, but commit it: it records which
+release's scaffold produced the framework-owned files above, so a later
+[`autumn upgrade`](upgrading.md#scaffold-files) can tell a template that moved
+from a file you edited, and never overwrite your work.
+
+A sibling file, `.autumn/generated.toml`, appears after your first `autumn
+generate`. Commit it too: it does the same job for generated code, so
+[`autumn destroy`](generators.md#undoing-a-generator-autumn-destroy) can tell
+its own output from your edits.
 
 The files that matter right now:
 
@@ -201,9 +226,9 @@ On a fresh project, before `autumn setup`, you will see something like:
 ✅ port_bindable — port 3000 is available
 ❌ tailwind_binary — target/autumn/tailwindcss not found
    hint: Run `autumn setup` to download the Tailwind CSS binary
-⚠️  signing_secret — using an ephemeral per-process signing secret (dev/test
-    only; sessions and signed URLs will not survive restarts or be shared
-    across replicas)
+⚠️  signing_secret — no signing secret configured (dev/test only): sessions and
+    CSRF tokens ride unsigned; local-storage signed URLs use an ephemeral
+    per-process key instead
    hint: Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production
 ⚠️  dotenv — `.env.example` is present but no `.env` exists
    hint: Copy `.env.example` to `.env` and fill in local values
@@ -347,7 +372,9 @@ The pieces:
   is opt-in via `database.auto_migrate` (see
   [migrations](migrations.md)).
 - **`#[autumn_web::main]`** sets up the Tokio runtime — a thin wrapper around
-  `#[tokio::main]` that also records the build profile.
+  `#[tokio::main]` that also records the build profile. It takes optional
+  arguments for tuning that runtime (see
+  [tuning the Tokio runtime](#tuning-the-tokio-runtime) below).
 
 Handlers are ordinary async functions. They can return anything Axum can turn
 into a response: `&str`, `String`, `Json<T>`, `Markup` (Maud HTML), or your own
@@ -358,10 +385,12 @@ What the excerpt above leaves out is worth opening the file for. The scaffold's
 link, flash messages, and the framework's widget CSS. Alongside it is a working
 cookie-consent flow — a banner injected by a `.layer(...)` on the builder,
 CSRF-protected accept/reject routes, and a preferences page linked from the
-footer so withdrawing consent is as easy as giving it. There is also a
-`#[cfg(feature = "embed-assets")]` block that bakes `static/` into the binary
-for `autumn build --embed`. All of it is ordinary user code: delete what you do
-not need.
+footer so withdrawing consent is as easy as giving it — see the
+[cookie-consent guide](./cookie-consent.md) for how to gate your own
+non-essential cookies on it, since the banner alone is not the compliance.
+There is also a `#[cfg(feature = "embed-assets")]` block that bakes `static/`
+into the binary for `autumn build --embed`. All of it is ordinary user code:
+delete what you do not need.
 
 To see everything that is actually mounted, including framework routes and
 per-route middleware:
@@ -1174,7 +1203,9 @@ production.
 
 When a 5xx does reach a user, you can record it as a replayable
 [failure capsule](failure-capsules.md) — the request, the database traffic it
-produced, and the outcome, in one file that `autumn replay` re-runs offline.
+produced, and the outcome, in one file that `autumn replay` re-runs offline —
+then convert it with `autumn capsule test` into a committed regression test so
+the same bug can never come back unnoticed.
 
 ---
 
@@ -1280,6 +1311,81 @@ Autumn starts with no pool. Handlers that use `Db` return 503 Service
 Unavailable. That is useful for static sites, database-free APIs, and early
 development.
 
+### Tuning the Tokio runtime
+
+`#[autumn_web::main]` owns the `tokio::runtime::Builder` call, so the knobs you
+would otherwise abandon the macro to reach are attribute arguments. All of them
+are optional; with none, the runtime is
+`Builder::new_multi_thread().enable_all()` — tokio's own defaults, which is
+what most apps should keep.
+
+| Argument | Value | `tokio::runtime::Builder` call |
+|----------|-------|--------------------------------|
+| `flavor` | `"multi_thread"` (default) or `"current_thread"` | picks the constructor |
+| `worker_threads` | `usize` expression | `worker_threads` (multi-thread only) |
+| `max_blocking_threads` | `usize` expression | `max_blocking_threads` |
+| `thread_name` | `Into<String>` expression | `thread_name` |
+| `thread_stack_size` | `usize` expression, in bytes | `thread_stack_size` |
+| `thread_keep_alive` | duration string, e.g. `"30s"` | `thread_keep_alive` |
+| `configure` | path to `fn(&mut Builder)` | runs last, after everything above |
+
+```rust,no_run
+use autumn_web::prelude::*;
+
+#[get("/")]
+#[public]
+async fn index() -> &'static str { "ok" }
+
+#[autumn_web::main(
+    worker_threads = 4,
+    max_blocking_threads = 64,
+    thread_name = "autumn-worker",
+    thread_keep_alive = "30s"
+)]
+async fn main() {
+    autumn_web::app().routes(routes![index]).run().await;
+}
+```
+
+The numeric arguments take arbitrary expressions, not only literals, so a
+worker count can be computed at startup:
+
+```rust,ignore
+#[autumn_web::main(worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get()))]
+```
+
+`configure` is the escape hatch for `Builder` methods the table does not name —
+`on_thread_start`, `on_thread_stop`, `global_queue_interval`, and the rest. It
+names a function taking `&mut tokio::runtime::Builder`, and it runs *after* the
+declarative arguments, so it can also override them:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::reexports::tokio;
+
+#[get("/")]
+#[public]
+async fn index() -> &'static str { "ok" }
+
+fn tune_runtime(builder: &mut tokio::runtime::Builder) {
+    builder.on_thread_start(|| eprintln!("runtime thread started"));
+}
+
+#[autumn_web::main(configure = tune_runtime)]
+async fn main() {
+    autumn_web::app().routes(routes![index]).run().await;
+}
+```
+
+A typo'd argument, a repeated one, a literal `0` thread count, or a
+`worker_threads` paired with `flavor = "current_thread"` (where it would do
+nothing) are all compile errors rather than knobs that silently fail to apply.
+
+Reach for these only with a measurement in hand. Autumn's own background work —
+the job runner, scheduled tasks, the mailer — shares this runtime, so a worker
+count set below what the machine offers throttles those alongside your
+handlers.
+
 ### Escape hatch: mounting raw Axum routers
 
 Prefer the route macros — you keep Autumn's discovery conventions and the
@@ -1296,6 +1402,11 @@ async fn index() -> &'static str { "ok" }
 
 #[autumn_web::main]
 async fn main() {
+    // A generated app has no direct `axum` dependency (`autumn-web` pulls it
+    // in transitively) — go through `autumn_web::reexports::axum` rather
+    // than adding one just to spell this.
+    use autumn_web::reexports::axum;
+
     let graphql = axum::Router::<AppState>::new()
         .route("/graphql", axum::routing::get(|| async { "graphql endpoint" }));
 
@@ -1394,8 +1505,10 @@ See the [testing guide](testing.md) for `TestDb`, fixtures, and
 ## Before you deploy
 
 The generated app starts with local-safe defaults: in-memory sessions,
-in-process `#[scheduled]` tasks, an ephemeral signing secret, and a generic
-container Dockerfile. Before running multiple replicas you usually want to:
+in-process `#[scheduled]` tasks, no configured signing secret (see
+[signing secrets](signing-secrets.md) for what that does and does not sign),
+and a generic container Dockerfile. Before running multiple replicas you
+usually want to:
 
 1. Set `AUTUMN_ENV=prod`
 2. Set a durable `AUTUMN_SECURITY__SIGNING_SECRET` and a trusted-hosts list

@@ -203,7 +203,7 @@ fn private_in_memory_target_with_registered_migrations_is_rejected() {
 /// registered migrations is ALSO rejected up front (issue #1614 follow-up).
 /// Although a shared-cache database is shareable across the runtime pool's live
 /// connections, the migration runs on a *transient* synchronous connection and
-/// SQLite destroys a shared in-memory database the moment its last connection
+/// `SQLite` destroys a shared in-memory database the moment its last connection
 /// closes; the runtime deadpool is created lazily and may not have anchored a
 /// connection yet, so the pool's first checkout opens a fresh, empty database
 /// and every DB-backed request then 500s. The remedy is a **file-backed**

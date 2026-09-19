@@ -1,0 +1,161 @@
+# AGENTS.md - Autumn Workspace Guidelines
+
+## Versioning
+
+**Never bump the workspace version** (`version` under `[workspace.package]` in
+the root `Cargo.toml`, or any of the `autumn-web = { version = "..." }` /
+`autumn-macros = { version = "..." }` pins that track it) unless the user
+explicitly asks for a release/version bump. Cutting a release (bumping the
+version, folding the changelog fragments in, dating the changelog section,
+updating install instructions) is a separate, deliberate step the user asks for
+by name.
+
+## Changelog
+
+**Never edit `CHANGELOG.md` in a feature PR**, and never create a new
+dated/numbered `## [x.y.0]` section. Every PR wrote its note to the top of the
+`## [Unreleased]` section, which is the same few lines every other open PR
+wrote to — so PRs conflicted with each other over text that was never the point
+of either.
+
+Write the note as its own file instead:
+
+```
+changelog.d/<slug>.md
+```
+
+It holds the markdown the section holds: a `### <Kind>` heading and its
+bullets. Two PRs never edit one file, so the conflict cannot happen. See
+`changelog.d/README.md` for the shape, and
+`./scripts/check-changelog-fragments.sh` for the gate.
+
+Not every change needs a note. Write one for what a user of the framework can
+see. A breaking entry keeps the `**Breaking:**` marker and the link to
+`docs/migrations/next.md`: `scripts/check-migration-guides.sh` reads the
+fragments together with the changelog, so the guide is still gated while the
+change is in review.
+
+`scripts/update-changelog.sh` folds every fragment into the changelog at
+release time.
+
+## Commands
+
+- **Build**: `cargo build --workspace`
+- **Check**: `cargo check --workspace`
+- **Lint**: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+- **Test all**: `cargo test --workspace`
+- **Test specific package**: `cargo test -p <pkg>`
+- **Test specific target**: `cargo test -p <pkg> --test <target>`
+- **Pre-push gate**: `./scripts/pre-push-check.sh` — compile-only (`--no-run`)
+  mirror of CI's `lint` + `test` jobs. Run it before pushing: a narrow `cargo
+  test -p <pkg>` never links the autumn-web consolidated `integration_tests`
+  binary, so it misses cross-package compile breaks the CI `cargo test
+  --workspace` gate catches. See CONTRIBUTING.md "Before you push".
+
+---
+
+## Integration Test Layout Guidelines
+
+To minimize Cargo compilation and linking overhead (avoiding 100+ separate binaries), the workspace uses a consolidated test binary structure for both the `autumn` and `autumn-cli` packages.
+
+### Consolidated Test Targets
+
+- **autumn**: `tests/integration_tests.rs` (compiles all consolidated modules in `tests/integration/`)
+- **autumn-cli**: `tests/cli_tests.rs` (compiles all consolidated modules in `tests/integration/`)
+
+---
+
+### Adding a New Integration Test
+
+#### 1. Standard Integration Tests (Consolidated)
+
+The default approach for new tests is to add them to the consolidated binary so they compile in a single link step.
+
+1. Place the test file under `tests/integration/<test_name>.rs`.
+2. Add the module declaration to `tests/integration/mod.rs`:
+   ```rust
+   #[cfg(feature = "db")] // Add any required feature gates
+   mod <test_name>;
+   ```
+
+##### Docker / testcontainer DB tests run automatically in CI
+
+The CI "Run Docker-dependent tests" step — since #1747 a step of the Linux-only
+`Test (Docker)` job rather than the last step of `Test (ubuntu-latest)`, so it
+gets a runner whose disk it is the only claimant of — sweeps every `#[ignore]`d
+test that compiles into the `autumn` consolidated `integration_tests` binary with
+`--features "test-support,offline-sync"` (a bare `--ignored` run), so a new
+house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontainers)"]` in a `db`-gated (or ungated) module — executes in CI with
+**no workflow edit**. Do not add a per-test allowlist line.
+
+This sweep compiles the consolidated binary with `--features
+"test-support,offline-sync,ws,mail,redis,i18n"` (db + maud are already defaults), so
+a new Postgres/DB testcontainer test — and now also the previously-unreachable
+`ws`/`mail`/`redis` testcontainer Docker tests — runs automatically. As of
+#1945 the feature set folds in the `ws` `live_broadcast` OOB-fragment suite, the
+`redis` suites (`process_role_worker_gating`, `queue_dedicated_capacity`,
+`rate_limit_redis_integration`), and the `mail` newsletter-unsubscribe test:
+each is testcontainer-managed (Postgres/Redis in-process), so no CI `services:`
+block is required. As of #1384 the set also folds in `i18n`, so the
+`#[translatable]` per-locale column round-trip suite (`translatable_model`) is
+swept too.
+
+Only **`system-tests`-gated** (browser/Chromium) Docker tests remain excluded —
+they need a Chromium binary this runner does not provide. Consequently, a new
+`#[ignore]`d test that must not be swept in (a browser/Chromium test, a
+container this sweep doesn't provision, or a release-mode timing microbenchmark)
+must either sit behind a non-default feature **not** in this set (browser tests
+already live behind `system-tests`) so it never compiles into this run, or be
+added to the step's `--skip` list. The one unconditionally-compiled exception
+(the access_log p99 timing bench) is named in the step's `--skip` list.
+
+##### `autumn-cli`'s `cli_tests` binary gets the same bare Docker sweep
+
+As of #1945, ci.yml's "Run Docker-dependent tests" step also runs a bare
+`--ignored` sweep over **`autumn-cli`**'s consolidated `cli_tests` binary, so a
+new house-pattern `#[ignore = "requires Docker (testcontainers)"]` test added
+to *any* module under `autumn-cli/tests/integration/` — new or existing —
+executes in CI with no workflow edit, the same guarantee the `autumn` sweep
+above gives. Before this, `cli_tests`'s Docker-gated tests were NOT
+auto-swept; only two filtered invocations ran anything (`offsite`,
+`db_scrub`), leaving 46 tests across 8 modules dark. The sweep also
+`--skip`s the pre-existing `generate_json_postgres.rs` Docker test, which
+already ran in `generator-conformance.yml`, so it doesn't run twice.
+
+That sweep's `--skip` list names, **by exact test name** (never
+`--skip <module>::`), every `#[ignore]`d test that is NOT a Docker test: it
+instead scaffolds and cargo-check/build/runs a fresh generated project
+(`#[ignore = "slow: ..."]`), which is too slow for the fast Docker step and
+belongs in `generator-conformance.yml`'s own matrix'd job instead, named
+explicitly there (same convention as every other generator-shaped gate in
+that file). Skipping by exact name, not whole module, matters: a
+module-prefix skip would silently swallow any *Docker* test later added to
+that same file, defeating the very guarantee this sweep exists to give.
+Adding a new cold-start-compile test — to a new module, or an existing
+skipped one — needs BOTH a `--skip <exact test name>` line added to ci.yml's
+sweep AND its own named step in `generator-conformance.yml`, or it runs in
+the (wrong, slow, but not silently dark) Docker step, or never runs at all,
+respectively. `autumn-cli/tests/integration/repo_hygiene.rs`'s
+`cli_tests_cold_start_ignored_tests_are_ci_named` test enforces the
+generator-conformance.yml half for the tests #1945 added; extend its list
+when adding another.
+
+#### 2. Isolated Integration Tests (Separate Binaries)
+
+Only create separate test binaries if the test:
+
+- **Has process-wide side effects**: Mutates global state (e.g., process-wide global caches or registry setups) that would interfere with other tests running concurrently in the same process.
+- **Changes the working directory**: Calls `std::env::set_current_dir` (which can break relative path checks in other concurrent tests like trybuild). Note: Tests doing this should still use a drop guard to restore the directory.
+- **Is executed independently in CI**: Targeted individually via a `--test <name>` filter in GitHub Actions workflows to keep that specific CI runner's build/compilation slice minimal.
+- **Needs a non-host toolchain target**: Requires a target the default runner does not install (e.g. `wasm32-wasip1` for the edge-capsule conformance suite, #1790). Such a test must be `#[ignore]`d **and** live in its own `[[test]]` target outside `tests/integration/`, so the Docker sweep — which runs a bare `--ignored` over the consolidated binary — can never pick it up and fail on a missing target. It runs from its own CI job (`edge-conformance`), which installs the target explicitly.
+
+To add an isolated integration test:
+
+1. Place the test file directly in the root of `tests/` (e.g., `tests/<test_name>.rs`).
+2. Add a `[[test]]` entry to the crate's `Cargo.toml`:
+   ```toml
+   [[test]]
+   name = "<test_name>"
+   path = "tests/<test_name>.rs"
+   ```
+3. Do **not** add it to `tests/integration/mod.rs`.

@@ -298,16 +298,32 @@ pub fn validate_unique_one_off_task_names(tasks: &[OneOffTaskInfo]) -> Result<()
 ///
 /// Returns a message naming the first duplicate task.
 pub fn validate_unique_scheduled_task_names(tasks: &[TaskInfo]) -> Result<(), String> {
-    let mut names = std::collections::HashSet::new();
-    for task in tasks {
-        if !names.insert(task.name.as_str()) {
+    validate_unique_task_names(tasks.iter().map(|task| task.name.as_str()))
+}
+
+/// As [`validate_unique_scheduled_task_names`], over names alone.
+///
+/// The check only ever read `TaskInfo::name`, and `TaskInfo` is not `Clone`, so
+/// a caller holding a borrowed list plus one extra task — the no-boot export,
+/// which must validate the same `[retention]`-merged list `run()` validates —
+/// could not build a `&[TaskInfo]` to pass. Taking names is what lets both run
+/// one definition instead of the second growing a copy that drifts (issue #802).
+///
+/// # Errors
+///
+/// Returns the operator-facing message when two tasks share a name.
+pub fn validate_unique_task_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
             return Err(format!(
-                "duplicate scheduled task name '{}': two tasks — hand-declared via \
+                "duplicate scheduled task name '{name}': two tasks — hand-declared via \
                  tasks![...], or auto-collected from a #[repository(..., retention(...))] \
                  policy — registered the same name. The scheduler and fleet coordinator key \
                  state by this name, so both would compete and overwrite each other's \
-                 actuator state. Rename one of them",
-                task.name
+                 actuator state. Rename one of them"
             ));
         }
     }

@@ -232,7 +232,7 @@ fn comments_table_state(project_root: &Path) -> (bool, bool) {
 /// `UNLOGGED` is a durability setting, not a different kind of object: the
 /// relation is still permanent and still occupies the name, so a later
 /// `CREATE TABLE comments` fails with "already exists" — confirmed against
-/// PostgreSQL, not assumed. Missing it made the scan report no table and emit a
+/// `PostgreSQL`, not assumed. Missing it made the scan report no table and emit a
 /// duplicate migration.
 ///
 /// `TEMPORARY`/`TEMP` is deliberately NOT here, and that is the more
@@ -247,7 +247,7 @@ const CREATE_VERBS: &[&str] = &["create table", "create unlogged table"];
 /// `DROP TABLE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]` — the LIST is
 /// the point. Requiring `comments` immediately after the verb missed
 /// `DROP TABLE audit_log, comments;`, which really does drop it (confirmed
-/// against PostgreSQL). The replay then kept a table the database no longer
+/// against `PostgreSQL`). The replay then kept a table the database no longer
 /// has, the next scaffold skipped creating it, and every generated helper
 /// queried a missing relation — silently, until the first request.
 fn comments_drops(lowered: &str) -> Vec<usize> {
@@ -559,7 +559,7 @@ fn comments_creations(sql: &str) -> Vec<(usize, &str)> {
 ///
 /// Ordering is why. Diesel keys on the version prefix, and the shared table's
 /// version is `{timestamp}2` while a parent scaffolded in the same second is
-/// `{timestamp}` — so the parent migration runs FIRST, and PostgreSQL refuses
+/// `{timestamp}` — so the parent migration runs FIRST, and `PostgreSQL` refuses
 /// `CREATE TRIGGER` when its function does not yet exist. A parent that carries
 /// its own function cannot be ordered wrongly. The body may safely reference
 /// `comments` before that table exists: plpgsql resolves it at execution.
@@ -637,8 +637,8 @@ pub fn parent_cleanup_sql(
 
 /// The `DROP TRIGGER` undoing [`parent_cleanup_sql`].
 ///
-/// Backend-split because the syntax differs: PostgreSQL names the table
-/// (`DROP TRIGGER … ON <table>`), SQLite does not — triggers are global there.
+/// Backend-split because the syntax differs: `PostgreSQL` names the table
+/// (`DROP TRIGGER … ON <table>`), `SQLite` does not — triggers are global there.
 #[must_use]
 pub fn parent_cleanup_down_sql(
     backend: autumn_web::config::DatabaseBackend,
@@ -743,7 +743,7 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
 /// comments (commentable_type …)` in a migration's header, which is exactly the
 /// kind of thing a header explaining the shared table would contain — would
 /// otherwise read as the real table and make the generator emit nothing.
-/// Whether the quote at `quote` opens a PostgreSQL escape string (`E'…'`).
+/// Whether the quote at `quote` opens a `PostgreSQL` escape string (`E'…'`).
 ///
 /// Only these honour backslash escapes; an ordinary literal treats `\` as data
 /// under the default `standard_conforming_strings = on`. The `E` must be the
@@ -765,12 +765,12 @@ fn is_escape_string_prefix(sql: &str, quote: usize) -> bool {
 
 /// Length of the `$tag$` opening a dollar-quoted literal, if `text` starts one.
 ///
-/// `$$…$$` and `$tag$…$tag$` are PostgreSQL's quote-free string syntax. The tag
+/// `$$…$$` and `$tag$…$tag$` are `PostgreSQL`'s quote-free string syntax. The tag
 /// is an identifier: letters, digits and underscores, but it may NOT begin with
 /// a digit — `$1abc$x$1abc$` is rejected as "trailing junk after parameter",
 /// which is exactly why `$1` and `$2` placeholders must pass through untouched
 /// rather than being read as the start of a literal. Verified against
-/// PostgreSQL rather than recalled.
+/// `PostgreSQL` rather than recalled.
 fn dollar_tag_len(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     if bytes.first() != Some(&b'$') {
@@ -2114,7 +2114,7 @@ mod tests {
         }
     }
 
-    /// PostgreSQL makes `COLUMN` optional in a column rename, so both spellings
+    /// `PostgreSQL` makes `COLUMN` optional in a column rename, so both spellings
     /// have to be read the same way — in both directions.
     #[test]
     fn a_column_rename_is_recognised_with_or_without_the_column_keyword() {
@@ -2165,7 +2165,7 @@ mod tests {
     }
 
     /// Backslash escapes belong to `E'…'` and to nothing else. Both halves
-    /// were checked against a real PostgreSQL.
+    /// were checked against a real `PostgreSQL`.
     #[test]
     fn backslash_escapes_are_honoured_only_in_escape_strings() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2229,7 +2229,7 @@ mod tests {
     }
 
     /// `$tag$…$tag$` is a string, not DDL. Every case here was checked
-    /// against a real PostgreSQL before being encoded.
+    /// against a real `PostgreSQL` before being encoded.
     #[test]
     fn dollar_quoted_literals_are_not_read_as_ddl() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2322,7 +2322,7 @@ mod tests {
     }
 
     /// `UNLOGGED` still occupies the name; `TEMPORARY` does not. Both halves
-    /// were checked against a real PostgreSQL before being encoded here.
+    /// were checked against a real `PostgreSQL` before being encoded here.
     #[test]
     fn an_unlogged_comments_table_counts_and_a_temporary_one_does_not() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2512,7 +2512,7 @@ mod tests {
         assert!(!conflicting_comments_table(empty.path()));
     }
 
-    /// Quoting makes an identifier case-SENSITIVE: PostgreSQL treats
+    /// Quoting makes an identifier case-SENSITIVE: `PostgreSQL` treats
     /// `"Comments"` and `comments` as different relations, so folding the whole
     /// file would report a table the runtime cannot find.
     #[test]

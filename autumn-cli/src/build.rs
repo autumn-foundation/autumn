@@ -35,8 +35,23 @@ fn build_cargo_command(
     package: Option<&str>,
     bin: Option<&str>,
     extra_features: Option<&str>,
+    auditable: bool,
 ) -> Command {
     let mut cargo = Command::new("cargo");
+    // `cargo auditable build` embeds the resolved dependency list into the
+    // compiled binary (a `.dep-v0` section), so a deployed single binary can
+    // report exactly which crate versions are inside it with no source tree
+    // and no lockfile — see `autumn sbom --binary` and
+    // docs/guide/supply-chain.md.
+    //
+    // It MUST be reached through this subcommand. `cargo-auditable` only enters
+    // wrapper mode when `CARGO_AUDITABLE_ORIG_ARGS` is set, and only `cargo
+    // auditable` itself sets it; pointing RUSTC_WORKSPACE_WRAPPER straight at
+    // the binary makes it exit 1 on cargo's first `rustc -vV` probe, failing
+    // the build before anything compiles.
+    if auditable {
+        cargo.arg("auditable");
+    }
     cargo.arg("build");
     if !debug {
         cargo.arg("--release");
@@ -373,7 +388,49 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
 /// whose sources live elsewhere, and a selector-free CWD *without* `src/` is
 /// a virtual workspace root, where only `find_binary`'s resolution matches
 /// the package every later build step operates on.
-fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&str>) -> EdgeScan {
+///
+/// `features` is the same `--features` value the native and capsule builds
+/// receive (see `build_cargo_command`/`build_edge_cargo_command`); the scan
+/// needs it too, or a route gated on a feature this invocation explicitly
+/// requests — but that is not in the manifest's own `default = [...]` —
+/// would look cfg'd-out here even though the build about to run turns it on.
+///
+/// `embed` mirrors `build_cargo_command`'s own unconditional `embed-assets`
+/// feature injection for an `--embed` build: without it here too, a sole
+/// `#[cfg(feature = "embed-assets")] #[edge]` handler looked scanned-out
+/// (`edge_scan.is_empty()`), so `plan_edge_step` below saw no edge routes and
+/// silently let the embed build proceed instead of reporting the documented
+/// edge/embed conflict — the handler was then really compiled straight into
+/// the native binary by `build_embedded`, never into a capsule (Codex review
+/// on #2739, round 10, P1).
+/// The feature names to pass to the edge scan for one build invocation: the
+/// user's own `--features` list, split on `,`/whitespace like Cargo's own
+/// flag, plus `embed-assets` when `embed` is set — the same feature
+/// `build_cargo_command` unconditionally injects for an `--embed` build.
+/// Factored out of [`resolve_project_edge_scan`] so this part is
+/// unit-testable without a real project directory.
+fn edge_scan_requested_features(features: Option<&str>, embed: bool) -> Vec<&str> {
+    let mut requested: Vec<&str> = features
+        .map(|value| {
+            value
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if embed {
+        requested.push("embed-assets");
+    }
+    requested
+}
+
+fn resolve_project_edge_scan(
+    debug: bool,
+    embed: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: Option<&str>,
+) -> EdgeScan {
     let cwd = std::env::current_dir().expect("current dir");
     let root = if package.is_none() && bin.is_none() && cwd.join("src").is_dir() {
         cwd
@@ -382,7 +439,13 @@ fn resolve_project_edge_scan(debug: bool, package: Option<&str>, bin: Option<&st
             .1
             .unwrap_or_else(|| cwd.clone())
     };
-    crate::edge_scan::resolve_edge_scan(&root)
+    let requested = edge_scan_requested_features(features, embed);
+    // A custom `[[bin]] path` for the capsule can live outside `src/`, which
+    // the scan's own `src/` walk never reaches — see
+    // `resolve_edge_scan_with_extra_file`'s doc for why (Codex review on
+    // #2739, round 7).
+    let capsule_bin = crate::doctor::resolve_edge_capsule_bin(&root);
+    crate::edge_scan::resolve_edge_scan_with_extra_file(&root, &requested, capsule_bin.as_deref())
 }
 
 /// Run a cargo command, exiting the process on failure.
@@ -410,6 +473,7 @@ fn build_embedded(
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
+    auditable: bool,
 ) {
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
@@ -423,14 +487,18 @@ fn build_embedded(
     // Phase 1: compile WITHOUT embed-assets so build scripts populate static/.
     // Pass extra features (e.g. managed-pg-bundled) so apps wiring
     // ManagedPostgresPoolProvider can compile even in this pre-embed phase.
-    run_cargo_or_exit(build_cargo_command(debug, false, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, false, package, bin, features, auditable,
+    ));
 
     eprintln!("\nFingerprinting static assets for embedding...");
     fingerprint_assets_in(&static_dir);
 
     eprintln!("\nEmbedding assets and locales into the binary...");
     // Phase 3: recompile WITH embed-assets so include_dir! bakes the tree in.
-    run_cargo_or_exit(build_cargo_command(debug, true, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, true, package, bin, features, auditable,
+    ));
 
     eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
 }
@@ -493,6 +561,10 @@ fn effective_package<'a>(
 }
 
 /// Run the static build pipeline.
+// Each flag is an independent, orthogonal switch on the same pipeline and every
+// call site is the single `Commands::Build` match arm, so grouping them into an
+// options struct would add a type without removing an argument.
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run(
     debug: bool,
     embed: bool,
@@ -500,6 +572,7 @@ pub fn run(
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
+    auditable: bool,
 ) {
     eprintln!("\u{1F342} autumn build\n");
 
@@ -511,7 +584,7 @@ pub fn run(
     // edge routes) is reported in milliseconds instead of after a full native
     // build. The capsule itself is compiled much later — after the native build
     // and fingerprinting — by `run_edge_capsule_build`.
-    let edge_scan = resolve_project_edge_scan(debug, package, bin);
+    let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
     let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
@@ -529,12 +602,14 @@ pub fn run(
     // routes and the app's runtime state) and lets dynamic-server apps build a
     // single binary without a database or pre-render step.
     if embed {
-        build_embedded(debug, profile, package, bin, features);
+        build_embedded(debug, profile, package, bin, features, auditable);
         return;
     }
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, embed, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, embed, package, bin, features, auditable,
+    ));
 
     // Resolve the selected package's directory before fingerprinting so that
     // when --bin selects a member of a workspace without -p, we fingerprint
@@ -959,10 +1034,50 @@ mod tests {
         bin: Option<&str>,
         extra_features: Option<&str>,
     ) -> Vec<String> {
-        build_cargo_command(debug, embed, package, bin, extra_features)
+        build_cargo_command(debug, embed, package, bin, extra_features, false)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn cargo_args_auditable(debug: bool, embed: bool, auditable: bool) -> Vec<String> {
+        build_cargo_command(debug, embed, None, None, None, auditable)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn auditable_builds_go_through_the_cargo_auditable_subcommand() {
+        // `cargo-auditable` CANNOT be used as a bare RUSTC_WORKSPACE_WRAPPER:
+        // its wrapper mode only engages when `CARGO_AUDITABLE_ORIG_ARGS` is
+        // set, which only `cargo auditable` itself does. Invoked any other way
+        // it prints "'cargo auditable' should be invoked through Cargo" and
+        // exits 1 — killing the build on cargo's very first `rustc -vV` probe.
+        let args = cargo_args_auditable(false, false, true);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("auditable"),
+            "auditable builds must run `cargo auditable build ...`: {args:?}"
+        );
+        assert_eq!(args.get(1).map(String::as_str), Some("build"));
+        assert!(args.contains(&"--release".to_string()));
+    }
+
+    #[test]
+    fn non_auditable_builds_are_unchanged() {
+        let args = cargo_args_auditable(false, false, false);
+        assert_eq!(args.first().map(String::as_str), Some("build"));
+        assert!(!args.contains(&"auditable".to_string()));
+    }
+
+    #[test]
+    fn auditable_applies_to_the_embed_phase_too() {
+        // The embed path compiles TWICE; both must carry the dependency list,
+        // or the shipped single binary is the un-instrumented one.
+        let args = cargo_args_auditable(false, true, true);
+        assert_eq!(args.first().map(String::as_str), Some("auditable"));
+        assert!(args.windows(2).any(|w| w == ["--features", "embed-assets"]));
     }
 
     #[test]
@@ -1186,6 +1301,31 @@ mod tests {
         );
         assert!(EDGE_EMBED_ERROR.contains("--embed"));
         assert!(EDGE_EMBED_ERROR.contains("#1790"));
+    }
+
+    /// `--embed` must add `embed-assets` to the edge scan's requested
+    /// features, the same feature `build_cargo_command` unconditionally adds
+    /// to the real `cargo build` invocation — otherwise a sole
+    /// `#[cfg(feature = "embed-assets")] #[edge]` handler looks scanned-out,
+    /// `plan_edge_step` sees no edge routes, and the embed build silently
+    /// proceeds instead of hitting the documented edge/embed conflict (Codex
+    /// review on #2739, round 10, P1).
+    #[test]
+    fn embed_adds_the_embed_assets_feature_to_the_edge_scan() {
+        let requested = edge_scan_requested_features(None, true);
+        assert_eq!(requested, vec!["embed-assets"]);
+    }
+
+    #[test]
+    fn non_embed_does_not_add_the_embed_assets_feature_to_the_edge_scan() {
+        let requested = edge_scan_requested_features(None, false);
+        assert!(requested.is_empty());
+    }
+
+    #[test]
+    fn embed_combines_with_explicitly_requested_features_for_the_edge_scan() {
+        let requested = edge_scan_requested_features(Some("a,b"), true);
+        assert_eq!(requested, vec!["a", "b", "embed-assets"]);
     }
 
     fn capsule_metadata(with_capsule_bin: bool) -> serde_json::Value {

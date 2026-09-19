@@ -1,0 +1,10 @@
+name = "autumn-plugin-hello"
+version = "0.1.0"
+wire_version = 1
+prefix = "/hello"
+capabilities = ["http-request"]
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[routes]]
+method = "GET"
+path = "/hello/{name}"

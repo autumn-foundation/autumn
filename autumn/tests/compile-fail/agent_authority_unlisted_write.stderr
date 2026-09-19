@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `draft_payout` writes `Payout`, which grant `RefundDrafter` does not allow.
+
+              Add `Payout` to the grant's `writes: [...]`, or move the effect out of the agent-operable handler. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_unlisted_write.rs:32:13
+   |
+32 |     payouts.create(&NewPayout).await
+   |             ^^^^^^ evaluation of `_` failed here

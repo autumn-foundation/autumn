@@ -1,6 +1,7 @@
 # Spanish translations for the blog example.
 
 # ── Layout ────────────────────────────────────────────────────
+layout.skip_to_content = Saltar al contenido principal
 nav.brand = Blog de Autumn
 nav.home = Inicio
 nav.about = Acerca

@@ -257,6 +257,21 @@ pub fn plan_webhook(
     }
 
     let mut plan = Plan::new(project_root);
+    // Keyed on the RESOLVED endpoint, not the raw arguments: `destroy` is
+    // documented not to need a `--path`/`--secret-env` repeated, because
+    // `plan_webhook_for_revert` reads both back out of `autumn.toml`. Keyed on
+    // the arguments, the recovered run would look like a different command and
+    // be refused its own baseline (issue #1835).
+    plan.invocation = crate::generate::provenance::resolved_invocation(
+        project_root,
+        &[
+            "webhook",
+            spec.provider.as_str(),
+            &spec.name,
+            &spec.path,
+            &spec.secret_env,
+        ],
+    );
 
     // ── src/webhooks/<snake>.rs ───────────────────────────────────────────
     plan.create(

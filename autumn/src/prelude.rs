@@ -32,9 +32,22 @@ pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
-    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, routes, scheduled,
-    secured, service, static_get, static_routes, step_up, task, tasks, throttle,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget, routes,
+    scheduled, secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
+
+/// Service-to-service wire contracts (#1755): mark an endpoint, derive a DTO's
+/// wire shape, and check a caller's call sites against the callee.
+pub use crate::wire::NoBody;
+/// Generate a typed client for another Autumn service (#1755).
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
+pub use autumn_macros::{WireShape, contract_checked, endpoint};
+
+/// Declare a named agent authority envelope (#1691).
+pub use crate::authority_grant;
+/// Declare a handler agent-operable and check its effects against a grant (#1691).
+pub use autumn_macros::agent_operable;
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 
@@ -48,9 +61,13 @@ pub use crate::assets::asset_url;
 /// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
 #[cfg(feature = "maud")]
 pub use crate::assets::javascript_include_tag;
-/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+/// Cache a rendered Maud fragment keyed by `(identity, version)`; the `_in`
+/// variants add a cache-key namespace so a repository write can invalidate the
+/// fragment as a group (#1716).
 #[cfg(feature = "maud")]
-pub use crate::cache::{cache_fragment, cache_fragment_global};
+pub use crate::cache::{
+    cache_fragment, cache_fragment_global, cache_fragment_global_in, cache_fragment_in,
+};
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
@@ -61,6 +78,10 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Lazy database connection extractor. Use instead of `Db` alongside a body
+/// extractor. See [`crate::db::LazyDb`].
+#[cfg(feature = "db")]
+pub use crate::db::LazyDb;
 /// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
 #[cfg(feature = "db")]
 pub use crate::db::{IsolationLevel, TxOptions};
@@ -267,6 +288,10 @@ pub use crate::log::context::with_log_field;
 /// In-app notifications service/extractor (persistent per-recipient feed
 /// with read/unread state). See [`crate::notifications`] for the full surface.
 pub use crate::notifications::Notifications;
+/// Web Push service/extractor (deliver a notification to a subscribed browser
+/// even when the app's tab is closed). See [`crate::push`] for the full
+/// surface.
+pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.
@@ -413,73 +438,7 @@ mod tests {
 
     #[test]
     fn prelude_types_are_accessible() {
-        #[cfg(feature = "db")]
-        let _state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            replica_pool: None,
-            shards: None,
-            #[cfg(feature = "reporting")]
-            db_capture_gap: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
-        #[cfg(not(feature = "db"))]
-        let _state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: crate::time::monotonic_now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".into(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
+        let _state = AppState::test_default();
         let _err: AutumnResult<()> = Ok(());
     }
 

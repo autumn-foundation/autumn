@@ -994,7 +994,7 @@ impl RedisChannelsBackend {
             .clone()
             .filter(|url| !url.trim().is_empty())
             .ok_or(ChannelBackendConfigError::MissingRedisUrl)?;
-        let client = redis::Client::open(url)
+        let client = crate::redis_tls::open_client(&url)
             .map_err(|error| ChannelBackendConfigError::InvalidRedisUrl(error.to_string()))?;
         let local =
             LocalChannelsBackend::with_replay_capacity(config.capacity, config.replay_buffer);

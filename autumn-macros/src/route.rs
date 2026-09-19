@@ -33,14 +33,22 @@ pub fn route_macro(
 ) -> TokenStream {
     let route_args = match parse::parse_route_attr(attr) {
         Ok(a) => a,
-        Err(err) => return err,
+        Err(err) => return emit_with_attr_parse_error(&item, &err),
     };
     let path = route_args.path.clone();
 
-    let mut input_fn = match parse::parse_async_handler(item) {
-        Ok(f) => f,
+    let (leading_items, mut input_fn) = match parse::parse_async_handler_with_leading_items(item) {
+        Ok(v) => v,
         Err(err) => return err,
     };
+
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at when deciding whether this
+    // route keeps the standalone `IdempotencyReplayLayer` — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
 
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
@@ -166,6 +174,7 @@ pub fn route_macro(
     let (native_cfg, edge_companion) = emit_edge_items(edge, fn_name, &handler_name, vis, &path);
 
     // ── OpenAPI metadata ────────────────────────────────────────
+    let pools_tokens = emit_pool_slice(&derive_pools(&input_fn));
     let path_params = api_doc::extract_path_params(&path.value());
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
@@ -232,7 +241,24 @@ pub fn route_macro(
     // when it projects these onto the wire.
     let authorize_bindings =
         api_doc::emit_authorize_binding_slice(&api_doc::extract_authorize_bindings(&input_fn));
+    // `#[agent_operable]` names the authority static after the handler, so the
+    // route macro only needs to know *whether* the handler is governed — the
+    // grant, the proved effects and the const assertions are the analyser's.
+    let agent_authority = if api_doc::extract_agent_authority(&input_fn) {
+        let authority_static = format_ident!("__AUTUMN_AGENT_AUTHORITY_{}", fn_name);
+        quote! { ::core::option::Option::Some(&#authority_static) }
+    } else {
+        quote! { ::core::option::Option::None }
+    };
     let seo_defaults = route_args.seo.emit();
+
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    // Gated off wasm32 with `#native_cfg` for the same reason the route-info
+    // route companion does: a route the edge lane compiles out has nothing to
+    // say about the native binary's architecture, and the descriptor names
+    // `::autumn_web`, which never compiles for that target.
+    let graph_descriptor =
+        crate::graph::emit_route_descriptor(&input_fn, http_method, &quote! { #path }, false);
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -246,6 +272,12 @@ pub fn route_macro(
     };
 
     quote! {
+        // A guard macro that already expanded above this route attribute
+        // (#[secured]/#[step_up]/#[throttle], #1668) leaves its hidden
+        // `FromRequestParts` gate type here, ahead of the handler — re-emit
+        // it verbatim; empty when no such guard expanded first.
+        #leading_items
+
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
@@ -277,10 +309,12 @@ pub fn route_macro(
                     sunset_opt_out: #sunset_opt_out_val,
                     has_policy: #has_policy_val,
                     authorize_bindings: #authorize_bindings,
+                    pools: #pools_tokens,
                     public: #is_public,
                     module_path: ::core::module_path!(),
                     source_file: ::core::file!(),
                     source_line: ::core::line!(),
+                    agent_authority: #agent_authority,
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
@@ -291,10 +325,96 @@ pub fn route_macro(
         }
 
         #native_cfg
+        #graph_descriptor
+
+        #native_cfg
         #path_helper
         #fn_name_alias
 
         #edge_companion
+    }
+}
+
+/// When the `#[get("/path")]`-style attribute itself fails to parse (an empty
+/// literal, a missing leading slash, a dropped string literal entirely —
+/// `#[get()]`), still emit the handler and a stub `__autumn_route_info_*`
+/// companion alongside the `compile_error!`, instead of only the
+/// `compile_error!`.
+///
+/// Without this, the handler silently disappears from the module (the early
+/// `return err` this replaces never re-emits `item`), so `routes![handler]` —
+/// the README's documented way to register every handler — can't find
+/// `handler`, and can't find its `__autumn_route_info_handler` companion
+/// either: two more "cannot find" errors on top of the real one, the second
+/// naming an internal macro symbol no user ever typed (docs/reports/
+/// echo-audit-run.md). Mirrors the same guard already in
+/// `agent_operable_macro` and `query_budget_macro` (see their "Keep the
+/// original tokens so a parse failure still emits the item" comments).
+///
+/// Two things this re-emission must not do (Codex review, PR #2798):
+///
+/// - Assume `item` parses as a bare function. A guard macro stacked *above*
+///   the malformed route attribute (`#[secured]`/`#[step_up]`/`#[throttle]`)
+///   already expanded by the time this runs, so `item` is really its gate
+///   struct/impl followed by the handler — `split_leading_items_and_fn`
+///   (the same helper the successful path uses) is what actually finds the
+///   function in that shape.
+/// - Re-emit `#[intercept(...)]` verbatim. It is a route-macro-only marker
+///   (`parse::extract_interceptors`), never registered as its own attribute
+///   macro, so left on the handler it would fail to resolve and add
+///   "cannot find attribute `intercept`" on top of the real diagnostic.
+/// - Re-emit `#[api_doc(...)]` verbatim either. It *is* a real, independently
+///   registered attribute macro (`#[proc_macro_attribute] pub fn api_doc`),
+///   but only under its full path or when the caller's module has it in
+///   scope; a caller that wrote `use autumn_web::{get, routes};` (not the
+///   prelude) never imported the bare name, so re-emitting it unqualified
+///   fails to resolve too. The successful path always consumes it via
+///   `api_doc::extract` before emitting `input_fn` — this path must match.
+/// - Emit the `__autumn_route_info_*` stub unconditionally on an
+///   `#[edge]`-marked handler. `::autumn_web::Route` (its return type) does
+///   not resolve on `wasm32` builds of the edge lane — e.g.
+///   `examples/edge-greeting`'s capsule target, which depends on
+///   `autumn-edge` but never on `autumn-web` — so the stub itself would fail
+///   to compile there, and `edge_routes![handler]` (the wasm-side sibling of
+///   `routes![handler]`) would still be missing the
+///   `__autumn_edge_route_*` companion it actually collects. Mirrors
+///   `emit_edge_items`: the native stub is gated the same
+///   `#[cfg(not(target_arch = "wasm32"))]` way, and an unconditional
+///   `__autumn_edge_route_*` stub (returning `::autumn_edge::EdgeRoute`,
+///   available on every target `#[edge]` compiles for) stands in for it.
+fn emit_with_attr_parse_error(item: &TokenStream, err: &TokenStream) -> TokenStream {
+    let Ok((leading_items, mut input_fn)) = parse::split_leading_items_and_fn(item) else {
+        return quote! { #item #err };
+    };
+    parse::extract_interceptors(&mut input_fn.attrs);
+    let _ = api_doc::extract(&mut input_fn.attrs);
+    let edge = crate::edge::detect(&input_fn);
+    let vis = &input_fn.vis;
+    let fn_name = &input_fn.sig.ident;
+    let route_info_name = format_ident!("__autumn_route_info_{fn_name}");
+    let native_cfg = edge.map(|_| quote! { #[cfg(not(target_arch = "wasm32"))] });
+    let edge_stub = edge.map(|_| {
+        let edge_route_name = format_ident!("__autumn_edge_route_{fn_name}");
+        quote! {
+            #[doc(hidden)]
+            #vis fn #edge_route_name() -> ::autumn_edge::EdgeRoute {
+                unreachable!()
+            }
+        }
+    });
+    quote! {
+        #leading_items
+        #input_fn
+
+        #native_cfg
+        #[doc(hidden)]
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            unreachable!()
+        }
+
+        #edge_stub
+
+        #err
     }
 }
 
@@ -321,16 +441,27 @@ const EDGE_EXTENSION_ERROR: &str = "`#[edge]` handlers cannot take `Extension<..
                                     would be served as a 500 instead of falling through; use \
                                     `EdgeCache`, or serve this route from the origin";
 
-/// Marker consts the auth/rate guards inject into a handler body. A guard that
-/// expanded *before* this route macro left one of these behind instead of an
-/// attribute, and missing it would ship a guarded route to the unauthenticated
-/// edge lane.
+/// Compile error for `#[edge]` stacked with `#[agent_operable]`.
+const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[agent_operable(...)]` — the edge lane is \
+     read-only, and the capsule has no audit sink or `AppState` to record an agent \
+     invocation against, so a governed action would run there unaudited; serve this \
+     route from the origin.\n\nServe the route from the origin, or drop \
+     `#[agent_operable]`. See docs/guide/agent-authority.md.";
+
+/// Marker consts a guard that expanded *before* this route macro left behind
+/// in the handler body instead of an attribute, and missing it would ship a
+/// guarded route to the unauthenticated edge lane.
+///
+/// `#[step_up]`/`#[throttle]` don't appear here: their check moved into a
+/// pre-body `FromRequestParts` gate (#1668) and they never left an
+/// OpenAPI-readable body marker to begin with, so `has_auth_or_rate_guard`
+/// recognizes them via `has_step_up_guard`/`has_throttle_guard`'s own
+/// gate-param check instead of this body scan.
 const GUARD_MARKERS: &[&str] = &[
     "__AUTUMN_SECURED_ROLES",
     "__AUTUMN_SECURED_SCOPES",
-    "__AUTUMN_STEP_UP_MAX_AGE",
-    "__AUTUMN_THROTTLE_ROUTE_ID",
     "__AUTUMN_AUTHORIZE_BINDINGS",
+    "__AUTUMN_AGENT_OPERABLE",
 ];
 
 /// Reject an `#[edge]` route the edge lane cannot serve, spanning the error at
@@ -343,6 +474,13 @@ fn reject_ineligible_edge_route(
 ) -> Option<TokenStream> {
     if http_method != "GET" {
         return Some(syn::Error::new(span, EDGE_METHOD_ERROR).to_compile_error());
+    }
+    // Checked before the generic auth/rate guard sweep below: the marker is in
+    // `GUARD_MARKERS` too (so a governed handler can never slip past that
+    // sweep), but its own diagnostic names the real reason — the edge lane is
+    // read-only — instead of talking about session state.
+    if crate::api_doc::extract_agent_authority(input_fn) {
+        return Some(syn::Error::new(span, EDGE_AGENT_OPERABLE_ERROR).to_compile_error());
     }
     if has_auth_or_rate_guard(input_fn) {
         return Some(syn::Error::new(span, EDGE_GUARD_ERROR).to_compile_error());
@@ -374,6 +512,97 @@ fn has_extension_param(input_fn: &syn::ItemFn) -> bool {
         };
         tokens_contain_ident(&quote! { #pat_type }, "Extension")
     })
+}
+
+/// Extractor identifiers that prove a route holds a pooled or external
+/// resource for the length of the request, paired with the pool tag recorded
+/// in the capacity contract (issue #1733).
+///
+/// Deliberately narrow: only extractors that *are* a handle on the resource,
+/// for the length of the request, are listed. `LazyDb` (#2264) is excluded:
+/// its whole point is *not* holding a connection across the body read, so
+/// listing it here would claim the very thing it exists to avoid. An
+/// extractor that merely happens to consult the database on some paths
+/// (`Session`, `Tenant`, `Flags`) is not listed either, because a contract
+/// that over-claims is worse than one that under-claims — see the "provable
+/// subset" caveat on `RouteInfo::pools`.
+const POOL_EXTRACTORS: &[(&str, &str)] = &[
+    ("CrossShard", "db"),
+    ("Db", "db"),
+    ("Events", "events"),
+    ("Mailer", "mail"),
+    ("Notifications", "notifications"),
+    ("Presence", "presence"),
+    ("ShardedDb", "db"),
+    ("ShardedReadDb", "db"),
+    ("Shards", "db"),
+];
+
+/// The pool tags a handler's declared extractors prove it touches, sorted and
+/// deduplicated so the emitted contract diff is stable.
+///
+/// Only the parameter *types* are scanned, never the binding names, so a
+/// parameter called `events` cannot be mistaken for the `Events` extractor.
+/// Like every source-level check in this crate, a type alias that hides the
+/// extractor's name is not resolved.
+fn derive_pools(input_fn: &syn::ItemFn) -> Vec<&'static str> {
+    let mut pools: Vec<&'static str> = Vec::new();
+    for arg in &input_fn.sig.inputs {
+        let syn::FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        let Some(extractor) = declared_extractor(&pat_type.ty) else {
+            continue;
+        };
+        for (name, pool) in POOL_EXTRACTORS {
+            if extractor == *name && !pools.contains(pool) {
+                pools.push(pool);
+            }
+        }
+    }
+    pools.sort_unstable();
+    pools
+}
+
+/// The name of the extractor a parameter *declares*, or `None` when the type
+/// is not a plain path.
+///
+/// Deliberately NOT a recursive search for a resource name anywhere in the
+/// type: `State<AppState<Db>>` declares `State`, not `Db`. Matching nested
+/// generic arguments would contradict the documented rule that a pool held
+/// through an application `State` value is invisible to this derivation, and
+/// would write false `db-bound` shapes — and digest drift — into the contract.
+/// Under-claiming is the safe direction here; over-claiming is a lie.
+///
+/// Transparent wrappers axum itself sees through are peeled, so `Option<Db>`
+/// and `&Db` still declare `Db`. Like every source-level check in this crate,
+/// a type alias that hides the name is not resolved.
+fn declared_extractor(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Reference(inner) => declared_extractor(&inner.elem),
+        syn::Type::Paren(inner) => declared_extractor(&inner.elem),
+        syn::Type::Group(inner) => declared_extractor(&inner.elem),
+        syn::Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            if segment.ident == "Option"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+            {
+                return declared_extractor(inner);
+            }
+            Some(segment.ident.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Emit the derived pool set as a `&'static [&'static str]` literal.
+fn emit_pool_slice(pools: &[&'static str]) -> TokenStream {
+    if pools.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#pools),*] }
+    }
 }
 
 /// Whether `stream` contains `needle` as an exact identifier, at any nesting.
@@ -472,31 +701,41 @@ fn build_handler_expr(
 }
 
 fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
-    input_fn.attrs.iter().any(|attr| {
-        attr.path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "authorize")
-    }) || block_has_replay_guard(&input_fn.block)
+    input_fn
+        .attrs
+        .iter()
+        .any(|attr| crate::authorize::attr_is_authorize_shaped(attr, input_fn))
+        || block_has_replay_guard(&input_fn.block)
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 
+/// Whether `#[step_up]` applies to `input_fn`, in either attribute order: a
+/// still-unexpanded `#[step_up]` attribute, or (issue #1668) the
+/// `__AutumnStepUpGate_*` pre-body `FromRequestParts` gate parameter it
+/// expands into. The gate parameter check matters because `#[step_up]` no
+/// longer leaves any recognizable shape in the handler *body* — its check now
+/// runs in a sibling gate, before the body ever executes — so `body_guarded_replay`
+/// (which must stay true whenever a gate owns replay-serving, to keep the
+/// standalone `IdempotencyReplayLayer` from serving a cached response ahead of
+/// the gate's check) can no longer rely on a body-shape scan alone.
 fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
     input_fn.attrs.iter().any(|attr| {
         attr.path()
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "step_up")
-    })
+    }) || crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnStepUpGate_")
 }
 
+/// Whether `#[throttle]` applies to `input_fn`. See [`has_step_up_guard`] for
+/// why the pre-body gate parameter is checked alongside the attribute.
 fn has_throttle_guard(input_fn: &syn::ItemFn) -> bool {
     input_fn.attrs.iter().any(|attr| {
         attr.path()
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "throttle")
-    })
+    }) || crate::param_helpers::has_guard_gate_param_with_prefix(input_fn, "__AutumnThrottleGate_")
 }
 
 /// Whether a `#[secured]` attribute is still present on the handler (i.e. it has
@@ -777,6 +1016,176 @@ mod tests {
     }
 
     #[test]
+    fn route_macro_attr_parse_error_still_emits_handler_and_companion() {
+        // `#[get()]` -- a dropped path literal. Regression test for the
+        // cascade in `route_attr_error_cascades_through_routes.rs`: without
+        // re-emitting `index` and a stub `__autumn_route_info_index`, this
+        // handler vanishes from the module and `routes![index]` piles on two
+        // more "cannot find" errors, the second naming an internal macro
+        // symbol (docs/reports/echo-audit-run.md).
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute must still be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("fn index"),
+            "the handler must survive the attribute error, or routes![index] \
+             cannot find `index`: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_index"),
+            "the companion must survive the attribute error, or routes![index] \
+             adds a second, confusing \"cannot find function\" error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_intercept_marker() {
+        // Codex review, PR #2798: `#[intercept(...)]` is a route-macro-only
+        // marker (`parse::extract_interceptors`), never its own registered
+        // attribute macro. Left on the re-emitted handler it fails to
+        // resolve, adding "cannot find attribute `intercept`" on top of the
+        // real diagnostic -- defeating the one-error promise this whole
+        // helper exists for.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[intercept(MyLayer)]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("intercept"),
+            "`#[intercept(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_api_doc_marker() {
+        // Codex review, PR #2798, second round: `#[api_doc(...)]` *is* a real
+        // registered attribute macro, but a caller who wrote
+        // `use autumn_web::{get, routes};` (not the prelude) never imported
+        // the bare `api_doc` name into scope, so re-emitting it unqualified
+        // fails to resolve too -- a different "cannot find attribute" on top
+        // of the real diagnostic. The successful path always consumes it via
+        // `api_doc::extract` before emitting `input_fn`; this path must too.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[api_doc(summary = "Fetch a user by id")]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("api_doc"),
+            "`#[api_doc(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_gates_the_native_stub_on_edge_routes() {
+        // Codex review, PR #2798, third round: `::autumn_web::Route` (the
+        // route-info stub's return type) never resolves on the wasm32
+        // builds `#[edge]` compiles for (examples/edge-greeting's capsule
+        // depends on autumn-edge, never autumn-web) -- the unconditional
+        // stub would itself fail to compile there, and `edge_routes![show]`
+        // would still be missing its own `__autumn_edge_route_show`
+        // companion. Regression test, mirroring
+        // route_macro_edge_cfg_gates_native_companions above: the route-info
+        // stub gets the same wasm32 cfg gate as the successful path's native
+        // companions, and an unconditional edge-route stub stands in for
+        // `edge_routes![]`.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[edge]
+                async fn show() -> &'static str { "post" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute on an edge route must still be a compile error: {generated}"
+        );
+        let gate = "# [cfg (not (target_arch = \"wasm32\"))]";
+        assert!(
+            generated.contains(&format!(
+                "{gate} # [doc (hidden)] fn __autumn_route_info_show"
+            )),
+            "the route-info stub must be gated off wasm32, same as the successful path: \
+             {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_edge_route_show () -> :: autumn_edge :: EdgeRoute"),
+            "an unconditional edge-route stub must stand in for edge_routes![show]: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_survives_a_guard_expanded_above_it() {
+        // Codex review, PR #2798: `#[secured]` written above a malformed
+        // route attribute has already expanded into its gate struct/impl
+        // followed by the handler by the time route_macro runs -- `item`
+        // is that whole sequence, not a bare function. Regression test that
+        // `emit_with_attr_parse_error` uses `split_leading_items_and_fn`
+        // (the same helper the successful path relies on) rather than
+        // assuming a bare `ItemFn` and silently dropping to the "not a
+        // function" fallback, which would re-emit the gate item but never
+        // build the `__autumn_route_info_*` stub.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn create() -> &'static str { "ok" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! {}, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute above an expanded guard must still be a compile error: \
+             {generated}"
+        );
+        assert!(
+            generated.contains("fn create"),
+            "the handler must survive alongside the guard's gate item: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_create"),
+            "the companion must still be built even though `item` carries leading items: \
+             {generated}"
+        );
+    }
+
+    #[test]
     fn route_macro_string_literal_replay_guard_still_injects_layer() {
         let generated = route_macro(
             "POST",
@@ -865,6 +1274,149 @@ mod tests {
             !generated.contains("IdempotencyReplayLayer"),
             "throttled route (throttle expanded first) must not add the outer replay layer: \
              {generated}"
+        );
+    }
+
+    // ── OpenAPI response schema survives guard-outermost expansion (#1677) ──
+    //
+    // All four body guards rewrite `sig.output` to `Response` when they
+    // expand. When a guard is written ABOVE the route attribute it expands
+    // FIRST, so by the time the route macro runs and calls
+    // `infer_response_body`, the real `Json<T>` return type is already gone
+    // from `sig.output` — unless the route macro recovers it from the
+    // `__autumn_inner: T` binding the guard left behind.
+
+    #[test]
+    fn route_macro_infers_response_schema_when_throttle_expands_first() {
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 5, per = "1m", key = "ip" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        // #2488 redesigned throttle_macro to emit a SIBLING gate item (a
+        // marker struct + its FromRequestParts impl) alongside the
+        // transformed handler fn, rather than a single transformed item —
+        // see param_helpers::extract_fn_item's doc comment. The real
+        // compiler re-invokes a still-pending attribute (here, #[post])
+        // with only the one fn item's tokens, never the sibling gate item
+        // too, so the test has to reproduce that same slice.
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #throttled_fn },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[throttle]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_secured_expands_first() {
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        // See the comment in the throttle sibling test above: secured_macro
+        // returns the gate item and the transformed fn as siblings now, so
+        // only the fn item goes on to route_macro.
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[secured]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_step_up_expands_first() {
+        let stepped_up = crate::step_up::step_up_macro(
+            quote! {},
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        // See the comment in the throttle sibling test above: step_up_macro
+        // returns the gate item and the transformed fn as siblings now, so
+        // only the fn item goes on to route_macro.
+        let stepped_up_fn = crate::param_helpers::extract_fn_item(stepped_up, "create");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/users" },
+            quote! { #stepped_up_fn },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "a #[step_up]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_when_authorize_expands_first() {
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! {
+                async fn update_note(note: Note) -> ::autumn_web::reexports::axum::Json<Created> {
+                    todo!()
+                }
+            },
+        );
+        let generated =
+            route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "an #[authorize]-above-#[post] route must still document its Json<Created> response: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_infers_response_schema_under_stacked_guards_above_route() {
+        // `#[secured]` above `#[throttle]` above `#[post]`: throttle expands
+        // first and captures the real type, then secured wraps throttle's
+        // whole generated body one level deeper. Only the innermost
+        // `__autumn_inner` binding carries `Json<Created>` — the outer one
+        // reads `Response`. Each guard returns its gate item and the
+        // transformed fn as SIBLINGS (#2488), and the real compiler only
+        // ever re-invokes the next still-pending attribute with that one fn
+        // item's tokens — so extract_fn_item has to run after every hop,
+        // not just before the final one into route_macro.
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 5, per = "1m", key = "ip" },
+            quote! {
+                async fn create() -> ::autumn_web::reexports::axum::Json<Created> { todo!() }
+            },
+        );
+        let throttled_fn = crate::param_helpers::extract_fn_item(throttled, "create");
+        let secured = crate::secured::secured_macro(quote! { "admin" }, quote! { #throttled_fn });
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "create");
+        let generated =
+            route_macro("POST", "post", quote! { "/users" }, quote! { #secured_fn }).to_string();
+
+        assert!(
+            generated.contains("response : :: core :: option :: Option :: Some")
+                && generated.contains("\"Created\""),
+            "stacked guards above the route macro must not drop the response schema: {generated}"
         );
     }
 
@@ -1318,7 +1870,14 @@ mod tests {
             },
         );
         let secured = crate::secured::secured_macro(quote! { "admin" }, authorized);
-        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! { #secured_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains(r#"AuthorizeBinding { action : "update" , resource : "Note" }"#),
@@ -1372,8 +1931,11 @@ mod tests {
                 async fn update_note(note: Note) -> &'static str { "ok" }
             },
         );
-        let authorized =
-            crate::authorize::authorize_macro(quote! { "update", resource = Note }, secured);
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let authorized = crate::authorize::authorize_macro(
+            quote! { "update", resource = Note },
+            quote! { #secured_fn },
+        );
         let generated =
             route_macro("POST", "post", quote! { "/notes/{id}" }, authorized).to_string();
 
@@ -1404,7 +1966,14 @@ mod tests {
                 async fn update_note(note: Note) -> &'static str { "ok" }
             },
         );
-        let generated = route_macro("POST", "post", quote! { "/notes/{id}" }, secured).to_string();
+        let secured_fn = crate::param_helpers::extract_fn_item(secured, "update_note");
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/notes/{id}" },
+            quote! { #secured_fn },
+        )
+        .to_string();
 
         assert!(
             generated.contains(r#"required_roles : & ["admin"]"#),
@@ -1557,10 +2126,16 @@ mod tests {
             )),
             "the path helper must be gated too — it calls ::autumn_web::paths: {generated}"
         );
+        assert!(
+            generated.contains(&format!(
+                "{gate} :: autumn_web :: reexports :: inventory :: submit !"
+            )),
+            "the architecture-graph node references ::autumn_web too (#1747): {generated}"
+        );
         assert_eq!(
             generated.matches(gate).count(),
-            2,
-            "exactly the two native companions are gated: {generated}"
+            3,
+            "exactly the three native companions are gated: {generated}"
         );
         // The handler itself and the edge companion stay unconditional.
         assert!(
@@ -1593,8 +2168,8 @@ mod tests {
             generated
                 .matches("# [cfg (not (target_arch = \"wasm32\"))]")
                 .count(),
-            3,
-            "route info + path helper + alias are all native-only: {generated}"
+            4,
+            "route info + graph node + path helper + alias are all native-only: {generated}"
         );
     }
 
@@ -2089,5 +2664,333 @@ mod tests {
             generated.contains("authorize_bindings : & []"),
             "a string literal must not be mistaken for a generated binding marker: {generated}"
         );
+    }
+
+    // ── `#[agent_operable]` recorded in ApiDoc (#1691) ──────────────────────
+    //
+    // The route macro must fill `ApiDoc::agent_authority` from EITHER stacking
+    // order, exactly like `#[secured]`/`#[authorize]`/`#[edge]`: the attribute
+    // when it is still live below the route macro, the body marker const when
+    // `#[agent_operable]` expanded above it and deleted its own attribute.
+    // Losing it in one order would silently ship a governed handler as an
+    // *ungoverned* MCP tool — audited with `reversibility=unknown` and missing
+    // from the authority manifest's `actions` — with no diff anywhere.
+
+    /// The `Some(&…)` initializer the route macro must emit for a handler
+    /// governed by `#[agent_operable(grant = RefundDrafter)]`.
+    const DRAFT_REFUND_AUTHORITY: &str = "agent_authority : :: core :: option :: Option :: Some (& __AUTUMN_AGENT_AUTHORITY_draft_refund)";
+
+    #[test]
+    fn route_macro_sets_agent_authority_from_live_attribute() {
+        // Ordering A: `#[post]` outermost, `#[agent_operable]` still an
+        // attribute below it, so the route macro reads it straight off the
+        // unexpanded attribute.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                #[agent_operable(grant = RefundDrafter)]
+                async fn draft_refund() -> &'static str { "drafted" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(DRAFT_REFUND_AUTHORITY),
+            "a live #[agent_operable] attribute must point ApiDoc at the handler's \
+             authority static: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_sets_agent_authority_from_body_marker() {
+        // Ordering B: `#[agent_operable]` written ABOVE `#[post]`, so it
+        // expanded first, removed its own attribute and left only the marker
+        // const in the body. The marker names the grant, and the authority
+        // static is named after the handler either way.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                async fn draft_refund() -> &'static str {
+                    #[allow(dead_code)]
+                    const __AUTUMN_AGENT_OPERABLE: &str = "RefundDrafter";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(DRAFT_REFUND_AUTHORITY),
+            "an already-expanded #[agent_operable] must still point ApiDoc at the \
+             authority static: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_without_agent_operable_emits_none() {
+        // The default must stay `None`: `Some` here is a claim that the body
+        // was walked and every effect const-asserted against a grant, so an
+        // ungoverned handler must never accidentally assert one.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! { async fn draft_refund() -> &'static str { "drafted" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("agent_authority : :: core :: option :: Option :: None"),
+            "a handler with no #[agent_operable] records no authority: {generated}"
+        );
+        assert!(
+            !generated.contains("__AUTUMN_AGENT_AUTHORITY_"),
+            "…and must not reference an authority static that was never emitted: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_string_literal_agent_operable_marker_is_not_an_authority() {
+        // Handler *text* that merely spells the marker const must not opt the
+        // route into a governed authority: the marker is decoded structurally,
+        // never scanned for as a string.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/refunds" },
+            quote! {
+                async fn draft_refund() -> &'static str {
+                    let _ = "const __AUTUMN_AGENT_OPERABLE: &str = \"RefundDrafter\";";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("agent_authority : :: core :: option :: Option :: None"),
+            "a string literal must not be mistaken for the generated marker: {generated}"
+        );
+    }
+
+    #[test]
+    fn edge_rejects_agent_operable() {
+        // The edge lane is read-only and has no session, audit sink or state
+        // to record an agent invocation against, so a governed handler must
+        // never be served from it. Both stacking orders are refused — the
+        // marker is in `GUARD_MARKERS` for exactly this reason.
+
+        // Ordering A: both attributes still live below `#[get]`.
+        let attribute_form = route_macro(
+            "GET",
+            "get",
+            quote! { "/refunds" },
+            quote! {
+                #[edge]
+                #[agent_operable(grant = RefundDrafter)]
+                async fn draft_refund() -> &'static str { "drafted" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            attribute_form.contains("compile_error"),
+            "#[edge] + #[agent_operable] must be rejected: {attribute_form}"
+        );
+        assert!(
+            attribute_form.contains("read-only"),
+            "the error must say the edge lane is read-only: {attribute_form}"
+        );
+
+        // Ordering B: `#[agent_operable]` expanded above `#[get]`, leaving only
+        // its marker const in the body.
+        let marker_form = route_macro(
+            "GET",
+            "get",
+            quote! { "/refunds" },
+            quote! {
+                #[edge]
+                async fn draft_refund() -> &'static str {
+                    #[allow(dead_code)]
+                    const __AUTUMN_AGENT_OPERABLE: &str = "RefundDrafter";
+                    "drafted"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            marker_form.contains("compile_error"),
+            "an already-expanded #[agent_operable] must still be detected next to \
+             #[edge]: {marker_form}"
+        );
+        assert!(
+            marker_form.contains("read-only"),
+            "the error must say the edge lane is read-only: {marker_form}"
+        );
+    }
+
+    // ── capacity contract: statically derived pool set (#1733) ───────────
+
+    #[test]
+    fn route_macro_records_the_database_pool_from_a_db_extractor() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(db: Db) -> String {
+                    let _ = db;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db"]"#),
+            "a `Db` extractor must prove the database pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_no_pools_for_a_compute_only_handler() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about" },
+            quote! {
+                async fn about() -> &'static str {
+                    "about"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pools : & []"),
+            "a handler declaring no resource extractor proves no pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_records_each_distinct_pool_once_and_in_order() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/posts" },
+            quote! {
+                async fn create(db: Db, mailer: Mailer, events: Events) -> String {
+                    let _ = (db, mailer, events);
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db" , "events" , "mail"]"#),
+            "pools must be sorted and deduplicated for a stable contract diff: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_recognizes_sharded_database_extractors() {
+        for extractor in ["ShardedDb", "ShardedReadDb", "Shards", "CrossShard"] {
+            let ty = syn::Ident::new(extractor, proc_macro2::Span::call_site());
+            let generated = route_macro(
+                "GET",
+                "get",
+                quote! { "/posts" },
+                quote! {
+                    async fn index(db: #ty) -> String {
+                        let _ = db;
+                        String::new()
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains(r#"pools : & ["db"]"#),
+                "`{extractor}` is a database handle: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_macro_sees_a_pool_extractor_through_a_qualified_path() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(db: autumn_web::db::Db) -> String {
+                    let _ = db;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(r#"pools : & ["db"]"#),
+            "a fully qualified extractor path still proves the pool: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_does_not_read_a_pool_out_of_a_nested_generic() {
+        // `State<AppState<Db>>` is an application-held state value, not a `Db`
+        // extractor. Recording the database pool here would contradict the
+        // documented rule that `State`-held resources are invisible, and would
+        // put false `db-bound` shapes (and digest drift) into the contract.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(state: State<AppState<Db>>) -> String {
+                    let _ = state;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pools : & []"),
+            "a pool name nested inside another type is not a declared extractor: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_still_sees_a_pool_through_option_and_reference_wrappers() {
+        // The recognizer looks at the declared extractor, so the transparent
+        // wrappers axum itself understands must not hide it.
+        for spelling in ["Option < Db >", "& Db"] {
+            let ty: syn::Type = syn::parse_str(spelling).expect("type parses");
+            let generated = route_macro(
+                "GET",
+                "get",
+                quote! { "/posts" },
+                quote! {
+                    async fn index(db: #ty) -> String {
+                        let _ = db;
+                        String::new()
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains(r#"pools : & ["db"]"#),
+                "`{spelling}` still declares the database extractor: {generated}"
+            );
+        }
     }
 }

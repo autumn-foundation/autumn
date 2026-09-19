@@ -1,5 +1,0 @@
--- Test-only fixture: a THIRD, differently-named claimant of version
--- 00000000000000 alongside the framework's `create_api_tokens` shim and
--- `00000000000000_fake_app_first_migration`. Unlike the two-way shim
--- exception, this is a genuine collision between two non-shim migrations
--- and must still be reported.

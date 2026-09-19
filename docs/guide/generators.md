@@ -35,7 +35,7 @@ cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
 # Before migrating: configure the database (see the note below) and
 # create it if it does not exist yet:
-createdb my_app
+autumn db create
 autumn migrate
 autumn dev
 ```
@@ -46,8 +46,10 @@ One file edit belongs between `generate` and `migrate`: the generated
 Postgres so both `autumn migrate` and the running app can reach the
 database — without it, `autumn migrate` exits with `✗ No database URL found.`.
 `autumn migrate` runs migrations against that database but does not create
-it, hence the `createdb my_app` above (any equivalent, such as
-`CREATE DATABASE` in psql, works too):
+it, hence `autumn db create` above — it reads the same `url`/`primary_url`
+you just configured and creates that database, idempotently, with no extra
+tooling beyond what `autumn migrate` already needs (an external `createdb` or
+`CREATE DATABASE` in psql works too, if you have a Postgres client installed):
 
 ```toml
 [database]
@@ -442,6 +444,18 @@ This wires up, end to end:
   trimming leading/trailing `-`. An input that slugifies to nothing (empty,
   or entirely punctuation/non-Latin) falls back to a stable, deterministic
   non-empty token rather than ever returning `""`.
+
+  Because of that fallback, **`slugify(input).is_empty()` is always `false`**
+  and can never be used as a validation check. To reject input that carries no
+  text at all — a post title of `"***"` or `"🎉🔥💯"` — use
+  `autumn_web::contains_letter_or_number(&str) -> bool`, which asks whether the
+  input holds at least one letter or number *in any script*. It deliberately
+  accepts `"日本語"`: that has no ASCII fold and gets the hash fallback for its
+  URL segment, but it is real text the author typed, and the fallback exists so
+  such a page is still reachable. The generated scaffold does **not** apply
+  this check — it only derives the slug — so wire it into your own form
+  validation if a content-free source value matters to you. See
+  [Forms](forms.md#changesetformt--for-pages-a-human-is-looking-at).
 - **A `NOT NULL` column with its own `UNIQUE INDEX`** in the migration — a
   `slug` field is implicitly `unique`, so it reuses the exact `CREATE UNIQUE
   INDEX` codegen a `:unique` modifier produces on any other field.
@@ -539,6 +553,48 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Posts` as the table `posts`. If your name doesn't match `Add…To…` or
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
+
+### Always generate — never hand-create the directory
+
+Reach for the generator even when you intend to write every line of SQL
+yourself. The one thing it does that you cannot easily do by hand is pick the
+version.
+
+Your app's migrations, the framework's, and every plugin's are applied into
+**one shared version space**. Diesel records what it has applied by the
+14-digit version in `__diesel_schema_migrations`, and Autumn's
+`autumn_migration_checksums` table makes that version a `PRIMARY KEY`. Two
+migrations claiming the same version are therefore not two migrations — one of
+them silently never runs, and you find out when a column you were sure you
+added isn't there.
+
+Hand-written versions collide because everyone reaches for the same number. A
+human typing a date pads it out to `20260831000000`; the next person to touch
+the tree that day types the identical string. The generators mint a full
+`YYYYMMDDHHMMSS` from the wall clock instead, so two authors collide only if
+they generate in the same second:
+
+```bash
+autumn generate migration BackfillSomething      # → 20260831191622_backfill_something
+autumn schema diff --write-migration --name x    # → same convention
+```
+
+If you have already created a directory by hand, rename it to a real
+timestamp before committing:
+
+```bash
+date -u +%Y%m%d%H%M%S
+```
+
+CI enforces this (`scripts/check-migration-versions.sh`): a migration whose
+time component is `000000`, whose digits aren't a real UTC timestamp, or whose
+version is already claimed by another migration fails the build.
+
+One caveat if you are fixing an existing migration: **never rename one that
+has already been applied.** The version is how the framework knows it ran, so
+renaming it makes the framework consider it unapplied and run it a second
+time. Migrations already in that state are grandfathered in
+`scripts/migration-version-baseline.txt` rather than corrected.
 
 ### Generated safety comments
 
@@ -655,7 +711,7 @@ serialized and neither double-reverts.
 
 ### Sharded deployments
 
-Like `autumn migrate run`, `autumn migrate down` operates on the control
+Like `autumn migrate`, `autumn migrate down` operates on the control
 database plus every configured shard by default, and honours `--shard <name>`
 and `--control-only` to scope to a single target. Targets are rolled back in
 order and the command is **fail-fast**: if a later target fails (for example a
@@ -807,7 +863,9 @@ tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscribe
 
 SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
 htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
-client JS authored by the user**:
+client JS authored by the user**. `autumn_web::sse::stream` is behind the
+non-default `ws` feature (`features = ["ws"]`); see
+[WebSockets](websockets.md):
 
 ```rust
 #[get("/chat/events")]
@@ -1060,7 +1118,7 @@ async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
 }
 ```
 
-`autumn routes` and `/actuator/routes` keep reporting the declared
+`autumn routes` and `/actuator/graph` keep reporting the declared
 method (`PUT`, `PATCH`, or `DELETE`); the rewrite is a transport
 concession, not a routing one. CSRF protection still treats the
 overridden mutation as unsafe and rejects submissions without a valid
@@ -1138,7 +1196,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
@@ -1275,6 +1333,10 @@ autumn generate scaffold Post title:String comments:commentable
   attribute is what brings `add_comment` / `comment_thread` / `delete_comment`
   onto the generated repository and registers the model with the framework's
   comment router.
+- The **model's own migration** also gets an `AFTER DELETE` trigger (#2265).
+  `commentable_id` has no foreign key. Nothing else removes a deleted
+  parent's comments. The trigger removes them on any hard delete — a
+  delete through the repository, raw SQL, or an admin tool.
 - **No comment routes are generated at all.** Mount the framework's once:
 
   ```rust
@@ -1445,6 +1507,110 @@ pre-#1315 shape.
 > in the generated `to_csv_record` — the emitted impl carries a note at the
 > same spot.
 
+### Import CSV with a dry-run preview (`--import`)
+
+`--import` adds the other direction of the same data door: an upload form, a
+**dry-run preview** with per-row errors, and a confirmed commit — zero lines of
+user code, no hand-written multipart handler, no import loop (issue #1393).
+
+```bash
+autumn generate scaffold Post title:String body:Text published:bool --import
+```
+
+- `GET /<plural>/import` renders the upload form: a file input, the
+  confirmation checkbox, and the **expected header row** — printed as a
+  copy-pasteable line straight from the same `CsvSchema::csv_columns()` the
+  export writes, followed by the columns the import cannot set. An **Import
+  CSV** link appears on the index beside **New …**. (Unlike **Export CSV** it
+  stays there on a `--searchable` scaffold: it opens an upload form rather than
+  describing the row set on screen, so a search that swaps the results container
+  cannot leave it pointing at rows the user has filtered away.)
+- `POST /<plural>/import` parses the uploaded multipart CSV and, unless the
+  submit carries the `commit` confirmation, runs
+  `autumn_web::data::csv::import_csv` in **`ImportMode::DryRun`**: the response
+  reports rows read, rows that *would* insert, and a table of row errors with
+  the **line number** and message from `ImportReport`. Nothing is written.
+- Ticking **"Import for real"** and uploading again runs the same parse in write
+  mode and commits through the repository's `save_many_skip_invalid` — a batched
+  insert inside a transaction that falls back to row-by-row on a database
+  constraint failure, so one duplicate key does not take the batch down with it.
+  Every skipped row comes back against its own CSV line, and the result page
+  shows inserted-vs-failed. No row is dropped silently.
+- `autumn-web`'s `multipart` feature is added to `Cargo.toml` (`csv` is already
+  on, because the import rides on the export's gate), and removed again by
+  `autumn destroy scaffold` unless other code still uses it.
+- The generated `tests/<name>.rs` gains a database-free test that uploads a
+  2-row CSV (1 valid, 1 invalid), asserts the dry run reports 1 insertable row
+  and 1 row error **on the right line** and writes nothing, then commits and
+  asserts exactly the valid row persists.
+
+**One column map, both directions** — for every column the form can set. A
+column the CSV cannot faithfully carry back (`Attachment`, `Bytea`) is named on
+the upload page as one the import cannot set, rather than round-tripped
+lossily. The import decodes each row against the
+*same* generated `CsvSchema` impl the export writes from — there is no second
+list to keep in step. That also means a file this app exported can be edited and
+uploaded straight back: `id` and `created_at` are columns the form does not own,
+so they are ignored on the way in rather than rejected.
+
+Contract of the generated handler:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| The confirmation box | Comes back **unchecked** on every page the handler renders — the preview, the committed result and the 422 refusal alike. The operator's next move after any of them may be to choose a different file, and a carried-over tick would commit one nobody previewed. |
+| No `commit` confirmation | `ImportMode::DryRun`. Every row is parsed and validated, the report says what *would* happen, and the handler's only write call is not reached. This is the default: an unchecked checkbox submits nothing at all. |
+| A file missing an expected column | Refused whole with a 422 naming the missing columns, before any row is decoded. This is the check that catches the *wrong file*: `decode_form` ignores headers it does not know and defaults fields that are absent, so for a model whose every form field can be defaulted (an unchecked checkbox's `bool`, an optional column) an unrelated spreadsheet would otherwise decode into a run of blank records and report them as insertable. Row-level validation cannot see it — each row is valid. Only the header can. |
+| Whitespace around a column name | Trimmed, consistently. RFC 4180 keeps the space in `a, b, c`, and plenty of exporters write it — so both the header check and the row decoder compare trimmed names. They have to agree: a check that accepted `" published"` while the decoder looked for `published` would default the field and import blanks under a guarantee that the column was there. |
+| How a row becomes a record | The row (`column -> value`) is re-encoded as a urlencoded body and handed to the module's own `decode_form`, so it is decoded, blank-normalized and validated by **exactly** the code path a browser form submission takes — the same `#[validate(...)]` rules, the same `into_new`. |
+| A row that fails to parse | A row error naming the parse failure, against that row's line. The rest of the file still imports. |
+| A row that fails validation | A **field** error naming the column (alphabetically first, so the message is stable) and its messages. On a `#[normalize]` column there is a second, later check: the repository re-runs the model's rules on the normalized value (#2586), and a row only that pass rejects is reported against its CSV line as a write failure instead, with nothing written for it. |
+| A row the database rejects (e.g. a unique violation) | Reported against its own CSV line. `save_many_skip_invalid` isolates the failing chunk row-by-row rather than aborting the batch. |
+| Atomicity | Owned by `save_many_skip_invalid`, which this handler calls exactly once: successful rows commit, failed rows are skipped and reported. For all-or-nothing, swap in `save_many`, which aborts the batch on the first failure. |
+| Model hooks | Run per inserted row, exactly as for `create` — including `after_create_commit` and counter caches. An import of N rows is N records' worth of side effects. |
+| Upload size | Capped at the emitted `MAX_IMPORT_BYTES` (2 MiB) *and* `security.upload.max_file_size_bytes`, whichever is smaller — `with_max_bytes` takes the min. Over the cap is a **413**, never a truncated import. That constant, not a row count, is what bounds the handler's memory. |
+| File-type check | The filename must end in `.csv` (case-insensitively) **and** the declared content type must be one of a small allow-list (`text/csv`, `application/csv`, `text/plain`, `application/vnd.ms-excel`, `application/octet-stream`, or absent — browsers are inconsistent here). This is a *shape* check: CSV has no magic bytes, so what actually protects the handler is that the body is only ever parsed as CSV and every row is validated before it can be written. |
+| Magic-byte sniffing (#1354) | Composes with care, and is not required. Setting `security.upload.allowed_mime_types` makes the `Multipart` extractor sniff each file part before the handler runs; CSV is plain text and has no signature, so the extractor falls back to the *declared* type — but only for types it classifies as signatureless text (`text/*`, `application/json`, `application/csv`). The two fallbacks this route also accepts because browsers really send them, `application/vnd.ms-excel` and `application/octet-stream`, are **not** in that set: allow-listing them does not help, and such uploads are refused before the handler sees them. If you enable an allow-list, expect to accept only `text/csv`/`text/plain`-declared uploads. |
+| CSRF and double submit | The POST is `#[secured]` and the form renders the shipped CSRF and one-time submit-token hidden inputs as its **first** fields, so both land inside `security.csrf.token_scan_bytes` on a multipart body. Keep them first if you rearrange the form. |
+| Rate limiting | No `#[throttle]` (unlike the export): the route is `#[secured]`, and its work is bounded by `MAX_IMPORT_BYTES` and `MAX_IMPORT_ROWS` rather than by the size of the table. It also does not fit: the handler declares 9 extractors on a policy-enabled scaffold (10 under `--i18n`), `#[secured]` injects 3 more and `#[throttle]` 8, and axum's `Handler` tops out at 16. To add one, drop extractors to make room — the submit-token pair is the cheapest, at the cost of double-submit protection. `--no-policy` (7 params) does leave room. |
+| Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and calls `authorize_create::<Model>` once, exactly like `create`: an import has no loaded row to authorize per record, any more than a create does. A per-row rule therefore does not apply here either; add the check inside the row closure if your policy needs one. |
+| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it, and strips the parser's own uncalibrated line number out of the message so a reader never sees two.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. A header that itself spans a quoted newline is accounted for, so it does not shift the rows under it. The shift is measured once, so only a file that *mixes* terminators drifts. |
+| Existing records | **Never matched or updated.** Every row is inserted as a new record and an `id` column in the file is ignored, so re-uploading an exported file *duplicates* it rather than updating it in place. `ImportMode::Upsert { by }` exists in the framework for update-in-place; wiring it up means matching on the `by` columns in the row closure and calling the repository's update path, which is deliberately left to you rather than guessed at. |
+| Columns the import cannot set | Named on the upload page, from an emitted `CSV_IGNORED_COLUMNS`: `id` and `created_at` (the database assigns both), an `Attachment` (a storage key in a cell is not a file), and anything dropped from the form — a `--default`ed column, for instance. They are in the file the export writes, so without that line an operator could edit one, re-upload, and watch nothing happen. |
+| An `#[encrypted]` column | **Refuses the whole surface.** The export omits an at-rest encrypted column (#1340 — the model holds plaintext), but the generated form requires it, so a file headed by `csv_columns()` could never satisfy it and every row would fail with "missing field". `--import` generates nothing there and warns, naming the column. |
+| `bool` column | Normalized through an emitted `csv_bool_cell`: `TRUE`/`FALSE` (what Excel writes), `1`/`0`, `yes`/`no`, `on`/`off` all decode, and a **blank** cell means `false` for a non-nullable column — the same thing an unchecked checkbox means, which the form's `#[serde(default)]` already encodes. A nullable column keeps its blank as `NULL`. An unrecognised value is passed through untouched so it fails with the form's own message, naming the column. |
+| Duplicate header names | The last column wins, silently (`import_csv` builds a `column -> value` map). A shifted or duplicated column in a spreadsheet therefore imports the wrong data rather than being rejected — check the preview. |
+| No owner column | The POST is still `#[secured]` (unlike the export, which mirrors an unsecured index): an import writes. |
+| Owner-scoped scaffold | `authorize_create` runs once, exactly as for `create` — and, exactly as for `create`, an owner column is taken from the submitted data, so an authorized user can insert rows owned by anyone. That is not new (the create form has the same property), but note the asymmetry with the export directly above, which *is* owner-scoped through `list_scoped`. Move the owner column out of the file and set it from the session in the row closure if that matters. |
+| `--belongs-to` child | The parent foreign key comes from the FILE, not from a URL — the nested create route's "the parent is the route" rule does not apply to a flat `POST /<children>/import`. |
+| A write that fails partway | `save_many_skip_invalid` writes in chunks, each in its own transaction. A failure a constraint cannot explain (a timeout, a dropped connection) aborts the call with earlier chunks already committed; the report says so in a `role="alert"` banner rather than 500ing, because the operator's natural next move — re-upload — would duplicate whatever landed. How many rows landed is unknowable there, so the count keeps the parse pass's total (rows that *reached* the write) and its label reverts to the dry run's wording rather than claiming an insert count it cannot have. |
+| A row reported as failed | May still be **in the database**. `after_create` hooks run once the insert has committed, and a hook that fails puts an already-persisted row among the failures with nothing to distinguish it from a row that never landed. (A row the model's own `#[validate]` rules rejected is the exception: that check runs before the insert, so nothing was written — but the report cannot tell you which kind you are looking at.) Whenever the database stage rejected any row, the report carries a `role="alert"` note saying so — check the list view before re-importing. |
+| A value for a column the import cannot set | Named in a `role="alert"` note on the report when the uploaded file actually carries one (`id` and `created_at` excluded — every exported file has those, so flagging them would fire on every round trip). Silently dropping an operator's spreadsheet edit is the one failure the counts could otherwise hide entirely. |
+| Row volume | Capped at `MAX_IMPORT_ROWS` (10 000), mirroring the export. A file over the cap is **refused whole** with a 422, never imported as a prefix — a partially imported spreadsheet is the trap this route exists to avoid. The count is taken by `autumn_web::data::csv::count_data_rows` *before* the import, because a malformed row never reaches the row handler (`import_csv` records it and moves on), so an in-handler counter would miss exactly the file that costs the most to accumulate. The rendered error list is separately capped at `MAX_REPORT_ERRORS` (200) with a "further errors not listed" line; the counts above the table are always the whole truth. |
+| An oversized upload | A **413** from the framework's size guard, not the friendly 422 the other refusals use — the status is the accurate one, but the page is the generic error page. |
+| A column the import cannot set | Filtered out of the row *before* `decode_form` sees it, not merely omitted from the column lists. For most such columns that is belt-and-braces (serde ignores a field the form does not have), but a `Bytea` column **does** have a form field, so the filter is what actually stops its exported mojibake being written back. |
+| A model with no settable column at all | Refused, with a warning. An empty form decodes *any* row, so such an importer could only ever commit rows of database defaults — and a file with any header would do it. Reached when every column is an `Attachment`, a `Bytea`, or `--default`ed. |
+| A **non-nullable** `Bytea` column | The import is **refused** for the whole model, with a warning naming the column. The import must filter the column out (see the row below), but the generated form declares a non-nullable `Bytea` as a bare `String` with no default — so a filtered row would fail "missing field" and the importer could never import anything. Make it `Option<Bytea>`, drop it, or import it by hand. This is the same shape as the `#[encrypted]` refusal: a column the import cannot set that the form nonetheless requires. |
+| `Bytea` column (nullable) | **Not importable.** The export renders it with `String::from_utf8_lossy`, so any non-UTF-8 byte is already a U+FFFD replacement character in the file — writing that back would silently replace a binary column with mojibake. It is listed among the columns the import cannot set, and supplying a value for it raises the report's discarded-column alert. A reversible encoding (base64/hex) would have to change the export too; that is out of this slice. |
+| `Attachment` column | Not importable — a storage key in a cell is not a file. The column is left NULL; upload the file through the record's own edit form afterwards. |
+| `datetime` column | Round-trips, naive and tz-aware alike: the export writes chrono's `Display` form (a space between date and time, plus a zone name for a tz-aware column) and an `--import` scaffold's `parse_local_datetime` accepts both shapes alongside the browser's `datetime-local` `T` form. Without the flag the helper is unchanged. |
+| A value that looks like a formula | Round-trips too. The export prefixes an apostrophe to a text cell beginning `=`, `+`, `-`, `@`, TAB or CR; the import strips it back off — but only in exactly that shape, so `'tis` is left alone. A value someone really typed as `'=x` is indistinguishable from a guarded `=x` in the file and resolves to the latter; drop the `csv_unguard_cell` call if you would rather store the apostrophe. |
+| `slug` column | Imported verbatim from the file. The blank-slug derivation `create` performs needs a database probe, which the parse closure (a synchronous callback) cannot do — so a blank slug reaches the insert as-is and its `UNIQUE` index reports the collision per row. A file exported from this app already carries its slugs. |
+| Route vs `/<plural>/{id}` | The static `import` segment outranks the `{id}` parameter, the same way `/<plural>/new` already does. With a `slug` route key the DERIVED-slug guard treats `"import"` as taken, so a post titled "Import" gets `import-2` — but a slug submitted explicitly (including one imported from a CSV column) is not rejected, and a record whose slug is literally `import` is unreachable at its own URL. Same caveat `new` and `export.csv` already carry. |
+| Very large files | Out of scope for this slice — it is the synchronous request-time flow. Raise `MAX_IMPORT_BYTES` only so far; past that, move the parse into a background job. |
+
+`--import` is honoured wherever the CSV export is (it shares that gate, because
+it shares that `CsvSchema` impl): the plain `repo.list` index — including
+`--live-validation` — and the owner-scoped `repo.list_scoped` one. Passing it to
+an `--api`, `--live`, `--sharded` or owner-scoped `--live-validation` scaffold —
+or to a model with an at-rest `#[encrypted]` column — generates nothing and
+prints a warning naming the reason and what to drop;
+`autumn_web::data::csv::import_csv` is still there for a hand-written route.
+
+It composes with `--i18n` (every string on both pages comes from the bundle),
+`--searchable`, `--soft-delete`, `--belongs-to` and `--counter-cache`, and it
+enables autumn-web's `multipart` feature (removed again by `autumn destroy
+scaffold` unless other code still uses it).
+
 ### Trash, Restore and Purge (`--soft-delete`)
 
 `--soft-delete` already turned the delete button into a `deleted_at`
@@ -1535,26 +1701,24 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   ({ $media }, { $size } bytes)` — so the media type and byte count
   interpolate as arguments and a translator owns the parentheses, the comma
   and the unit noun.
-- **Two widgets are not covered yet**, both because they build their text
-  inside autumn-web from arguments that carry no label seam. A `richtext`
-  column's field label translates, but `rich_text_area`'s own chrome — the
-  toolbar's group label and per-control names, the "Markdown supported…"
-  hint, and the preview heading — stays English; and a `:states(…)` column's
-  `transition_controls` keeps its `Mark as …` buttons and `… transitions`
-  group label in English. Unlike the pager and bulk-delete widgets, these
-  two are free functions with no label setters to call, so covering them
-  needs new autumn-web API (a label per transition edge, and per toolbar
-  control). Scaffolding either column with `--i18n` warns and names it,
-  rather than leaving you to find it in the browser.
-- **Validation messages stay English.** A field label translates; the
-  inline error under it after a rejected submission does not.
-  `#[validate(...)]` accepts a `message`, but `validator` takes it as a
-  compile-time literal, so a runtime lookup cannot go there — and a rule
-  with no message renders as `validation failed: <code>`. Reaching these
-  means mapping error *codes* to lookups before the changeset is built,
-  and that conversion happens inside autumn-web, so it needs a seam there
-  rather than a generator change. Scaffolding with `--validate` under
-  `--i18n` warns.
+- **The two widgets with their own chrome are covered too** (issue #2227).
+  A `richtext` column passes `RichTextLabels` to the editor. The toolbar
+  group label, the seven control names, the hint and the preview heading
+  come from the bundle, under `common.richtext.*`. The Markdown syntax
+  beside each name — `**bold**`, `- item` — stays as it is, because the
+  user types it. A `:states(…)` column passes `TransitionLabels`. The group
+  label reads from `<model>.field.<column>.transitions`, and each button
+  from `<model>.field.<column>.transition.<state>`. Two edges that end at
+  the same state share one button and one key.
+- **Validation messages are translated on the create and update forms.**
+  The handler resolves each validator error code through the bundle, under
+  `<model>.field.<column>.error.<code>`. The English default is the text
+  autumn-web shows today: `validation failed: <code>`. So an `en` app reads
+  the same, and a translator writes better wording in their own locale file.
+  A rule that carries its own `message` keeps it, and gets no key.
+  The CSV import report is the one gap. `import_csv` calls its row handler
+  per line, away from the request, so there is no locale to look a message
+  up in. Scaffolding `--import` with `--validate` under `--i18n` warns.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).
@@ -1573,8 +1737,8 @@ Keys are split so a translator sees each string exactly once:
 
 | Kind | Examples | Written |
 | ---- | -------- | ------- |
-| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
-| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.flash.*` | Once per resource, under a marked comment block. |
+| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected`, and the Markdown editor chrome `common.richtext.*` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
+| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.field.<column>.error.<code>`, `post.field.<column>.transition.<state>`, `post.flash.*` | Once per resource, under a marked comment block. |
 
 **What interpolates and what does not.** A row key or a count travels as a
 Fluent argument, so a translation can *position* it: `post.show.title =
@@ -1714,6 +1878,7 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
 | `--api` | Generates a JSON API-only scaffold (skips HTML routes/templates, registers 5 REST JSON routes, and generates a JSON-based smoke test). |
 | `--i18n` | Emits translatable views: every view string becomes a `t!(locale, "key")` lookup, view handlers take the `Locale` extractor, and `i18n/en.ftl` is back-filled with the English. See [Translatable views](#translatable-views---i18n). |
+| `--import` | Emits a CSV import route: an upload form, a dry-run preview with per-row errors, and a confirmed commit. See [Import CSV with a dry-run preview](#import-csv-with-a-dry-run-preview---import). |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -1880,6 +2045,60 @@ Every generator accepts:
   to clobber and surfaces a `would overwrite <path>` error listing every
   collision. `mod.rs` and `schema.rs` are always treated as modify-in-place
   edits and don't trigger collisions.
+
+## Undoing a generator: `autumn destroy`
+
+`autumn destroy <thing> <the same arguments>` reverses a matching `generate`.
+It removes the files that invocation owns. It also takes that invocation's
+edits back out of the files it shares with other resources.
+
+`destroy` refuses to delete a file you have edited. To tell your edits from its
+own output, `generate` records a digest of every file it **owns** in
+`.autumn/generated.toml` — the files it creates, not the shared files it edits
+in place. `destroy` deletes an owned file when the content matches that digest,
+or matches what the current templates render. It reports `Diverged` and stops
+when the content matches neither.
+
+Each entry also records the inputs that produced it — the command's arguments,
+a fingerprint of the `autumn.generate.toml` they resolve from, and the resolved
+database backend — so the digest only counts when all three match. That is what
+`destroy` asks for anyway. Changing the recipe, or moving the project between
+SQLite and Postgres, drops the baseline for every resource, back to comparing
+against the current templates: a stale baseline is worse than no baseline.
+`autumn destroy model Post` after `autumn generate model Post title:String`
+renders a different model and is refused, rather than deleting the file while
+the `schema.rs` and `Cargo.toml` reverts, which are derived from those fields,
+quietly do nothing. It also keeps one command from claiming another's files:
+`autumn new --starter` writes through the same machinery, and no generator
+owns what it wrote.
+
+Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
+against. Without it, `destroy` can only compare against the current templates —
+so a CLI upgrade that changed a template makes every untouched file that
+generator wrote look edited.
+
+Two cases need `--force`:
+
+- The project has no manifest entry for the file — it was generated before
+  Autumn wrote the manifest — **and** the template has changed since. Prefer
+  re-running the original generator command with `--force` first (for example
+  `autumn generate model Post title:String --force`): that rewrites the file
+  and records its digest, and the destroy then works without `--force`.
+- You edited the file, and you want it deleted anyway.
+
+`--force` skips the content check. It does not skip the applied-migration
+guard: `destroy` never removes migration files that a configured database
+records as applied.
+
+A file that several resources share (a mailer's `_layout.html`, say) is
+never a hard error and is never force-deleted. `destroy` removes it only
+when it is provably this generator's own output and no sibling resource is
+left in its directory; otherwise it warns and leaves it in place.
+
+`destroy` also removes each entry it acted on from the manifest, and deletes
+the manifest once it holds nothing. Deleting or hand-editing the manifest
+loses the baseline for the entries you removed — nothing fails, but those
+files fall back to comparing against the current templates only.
 
 ## `autumn db pull` — scaffold models from an existing database
 

@@ -51,6 +51,10 @@
 //!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
 //!   `Sim::run_proptest` sequentially across a batch of seeds, reporting the
 //!   first failing seed, driven in CI by the `sim-sweep` `[[bin]]`.
+//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
+//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
+//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
+//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -93,6 +97,18 @@ pub mod chaos;
 #[cfg(feature = "mail")]
 pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
+// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
+// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
+// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
+// the module docs for the determinism contract and how it differs from `Chaos`.
+pub mod fault;
+
+pub use fault::{
+    FaultEffect, FaultLedger, FaultOutcome, FaultPlan, FinalState, FiredFault, PlannedFault,
+    ReportedError,
+};
 
 // The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
 // completion client — canned responses + a seeded fault/latency schedule — for

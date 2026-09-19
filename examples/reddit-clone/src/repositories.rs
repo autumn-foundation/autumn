@@ -13,14 +13,14 @@
 //     mutations at /api/posts.  To broadcast from HTML routes too, call
 //     state.broadcast().publish_oob(...) after each Diesel mutation.
 
-use crate::hooks::PostHooks;
+use crate::hooks::{PostHooks, SubredditHooks};
 use crate::models::{
-    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
-    UpdateVote, Vote,
+    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, SubredditDraftExt, UpdatePost,
+    UpdateSubreddit, UpdateVote, Vote,
 };
 use crate::schema::{posts, subreddits, votes};
 
-#[autumn_web::repository(Subreddit, api = "/api/subreddits")]
+#[autumn_web::repository(Subreddit, hooks = SubredditHooks, api = "/api/subreddits")]
 pub trait SubredditRepository {
     /// SELECT * FROM subreddits WHERE slug = $1
     fn find_by_slug(slug: String) -> Vec<Subreddit>;

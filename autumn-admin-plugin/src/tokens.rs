@@ -15,6 +15,14 @@ use crate::{
 
 /// Admin panel model for scoped API tokens.
 ///
+/// # Postgres only
+///
+/// This model reads and writes `api_tokens`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
+///
 /// Register with the admin plugin to get a token management UI at
 /// `/admin/api-tokens/`:
 ///
@@ -96,22 +104,14 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = params.per_page;
-            let offset = if per_page == 0 {
-                0
-            } else {
-                params.page.saturating_sub(1) * per_page
-            };
-            let limit = if per_page == 0 {
-                i64::MAX
-            } else {
-                i64::try_from(per_page).unwrap_or(i64::MAX)
-            };
+            let (offset, limit) = params.sql_offset_limit();
             let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
 
             let total: i64 = diesel::sql_query(
@@ -133,7 +133,7 @@ impl AdminModel for TokenAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .bind::<diesel::sql_types::BigInt, _>(limit)
-            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
+            .bind::<diesel::sql_types::BigInt, _>(offset)
             .load::<TokenRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(TokenRow::into_json).collect())
@@ -158,6 +158,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -185,6 +186,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             let principal_id = data
                 .get("principal_id")
                 .and_then(Value::as_str)
@@ -246,6 +248,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // A token's secret/principal are immutable; only the human-readable
             // name and granted scopes are editable after issuance.
             let name = data.get("name").and_then(Value::as_str).unwrap_or("");
@@ -281,6 +284,7 @@ impl AdminModel for TokenAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("TokenAdminModel")?;
             // "Delete" a token means revoke it: keep the audit row, stop it
             // authenticating. Idempotent — re-revoking is a no-op.
             let mut conn = pool
@@ -297,6 +301,75 @@ impl AdminModel for TokenAdminModel {
             .map_err(|e| AdminError::Database(e.to_string()))?;
             Ok(())
         })
+    }
+
+    fn execute_action(
+        &self,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {
+        // `TokenAdminModel` never declares soft delete (`supports_soft_delete`
+        // is the trait default, `false`), so `actions()` (traits.rs) only
+        // ever offers `"delete"` — the admin UI can't reach `"restore"` or
+        // `"purge"` for this model. Only `"delete"` needs the batched fast
+        // path below; `"restore"`, `"purge"`, and any other action name fall
+        // through to the shared `dispatch_restore_purge_or_unhandled` helper
+        // (traits.rs), which a direct or out-of-band `execute_action` call
+        // still reaches for the same "unhandled action" (or
+        // soft-delete-unsupported) error it always got.
+        if action == "delete" {
+            let pool = pool.clone();
+            return Box::pin(async move {
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
+                //
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // TokenAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-`UPDATE`-per-id loop (an operator selecting
+                        // hundreds of rows in the admin list and clicking "Delete
+                        // selected" otherwise costs hundreds of statements and pool
+                        // checkouts for what is, on the wire, one predicate). Same
+                        // idempotent semantics as `delete()`: an id that doesn't
+                        // exist, or is already revoked, is silently a no-op for that
+                        // id.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually changed, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id's `UPDATE` matched a row) — a duplicate or
+                        // already-revoked id was, and still is, counted as "applied".
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                             WHERE id = ANY($1) AND revoked_at IS NULL",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("TokenAdminModel").map(|()| 0)
+                    }},
+                }
+            });
+        }
+
+        crate::traits::dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 }
 
@@ -493,5 +566,67 @@ mod tests {
         assert_eq!(json["scopes"], serde_json::json!(["posts:read"]));
         assert!(json.get("token_hash").is_none());
         assert!(json.get("token").is_none());
+    }
+
+    // ── execute_action fallthrough (restore/purge/unhandled) ──────────
+    //
+    // TokenAdminModel never supports soft delete, so these three branches
+    // always error on the first id without touching the pool —
+    // characterizing them pins the exact error text ahead of routing them
+    // through the shared trait helper (Echo merge with FeatureFlagAdminModel).
+
+    fn dummy_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
+            "postgresql://test",
+        );
+        Pool::builder(mgr).build().expect("build pool")
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "restore", vec![1, 2])
+            .await
+            .expect_err("restore must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "purge", vec![1])
+            .await
+            .expect_err("purge must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_unhandled_action_errors_with_action_name() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "archive", vec![1])
+            .await
+            .expect_err("unknown action must error");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("unhandled bulk action 'archive'"));
     }
 }
