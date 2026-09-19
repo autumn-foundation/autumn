@@ -34,6 +34,32 @@
   // Operations whose left neighbour has not arrived. The server buffers the
   // same way; dropping one would leave this replica short a character.
   let waiting = [];
+  // Remote operations received while the user has typed ahead of the echo
+  // (`pendingInput`). They are integrated only once the queue settles, in
+  // arrival order. Integrating one earlier would put characters into the
+  // replica that the textarea was never synced to, and the next `flush()`
+  // diff would misread them as text the user deleted — silently deleting
+  // another person's characters. Holding them for one round trip costs
+  // nothing: RGA inserts commute, so every replica converges identically.
+  let heldRemote = [];
+  /**
+   * Keystrokes typed while an edit is outstanding. They sit in the textarea,
+   * unseen by the replica, until the echo settles the queue and `flush()`
+   * sends them. While set:
+   *
+   * - `render()` must not redraw: the replica's view does not contain them
+   *   yet, and converging the textarea to it would delete them.
+   * - remote operations are held in `heldRemote` instead of integrated, for
+   *   the same reason: the diff in `flush()` compares the textarea against
+   *   the replica, and a character the textarea was never synced to would
+   *   read as a user deletion.
+   *
+   * (This used to be enforced with `editor.readOnly`, which was worse — a
+   * read-only textarea still fires `keydown`, but the browser suppresses the
+   * value mutation and the `input` event, so the keystroke vanished entirely,
+   * silently. Issue #2843.)
+   */
+  let pendingInput = false;
 
   // Ids are "<counter>@<actor>". Order by counter, then actor — the same
   // order the server uses, which is what keeps the two lists identical.
@@ -125,7 +151,9 @@
   }
 
   // Our own operation coming back. Drop the placeholder it replaces so the
-  // real, server-ordered character can take its place.
+  // real, server-ordered character can take its place. Returns `true` when
+  // the operation is one of ours (so the caller can tell our echoes apart
+  // from remote operations).
   function acknowledge(op) {
     if (op.op === "insert") {
       if (myActor !== null && op.id.slice(op.id.indexOf("@") + 1) === myActor) {
@@ -137,10 +165,11 @@
             known.delete(placeholder);
           }
         }
+        return true;
       }
-    } else {
-      unsentDeletes.delete(op.target);
+      return false;
     }
+    return unsentDeletes.delete(op.target);
   }
 
   // Drop every placeholder and un-delete anything the server refused. Used
@@ -199,24 +228,13 @@
     editor.setSelectionRange(caret, caret);
   }
 
-  // The textarea is closed while an edit is in flight.
-  //
-  // The server mints the character ids, so between sending an edit and seeing
-  // its echo this client cannot give a new keystroke an id — it would live in
-  // the textarea only, and the next redraw would drop it. Rather than guess,
-  // the example waits: one round trip, and the box opens again.
-  //
-  // A production client does not wait. It runs the same RGA, mints its own
-  // ids, and applies its edits locally the moment they are typed; the server
-  // then merges rather than numbers. That is a client-side CRDT, which is
-  // more than this example is for.
-  function updateWritability() {
-    editor.readOnly = !settled();
-  }
-
   // Redraw from the local view, which includes this editor's own pending
   // characters as placeholders. Safe at any time: a remote character merges
   // in beside them rather than appearing to replace them.
+  //
+  // Not safe while `pendingInput` is set: the textarea holds keystrokes the
+  // replica has not seen yet, and converging it to the replica's view would
+  // delete them. Callers check the flag before redrawing.
   function render() {
     const anchor = caretAnchor();
     const next = text();
@@ -264,6 +282,8 @@
       // accepted from us, so nothing is outstanding after it.
       provisional = [];
       unsentDeletes.clear();
+      pendingInput = false;
+      heldRemote = [];
       if (message.actor) myActor = message.actor;
       for (const element of message.elems) {
         elems.push({ id: element.id, ch: element.ch, deleted: !!element.deleted });
@@ -278,17 +298,32 @@
       }
       editor.disabled = false;
       render();
-      updateWritability();
       renderRoster(message.participants);
     } else if (message.type === "ops") {
       for (const op of message.ops) {
-        acknowledge(op);
-        integrate(op);
+        // Our own echoes settle the queue and are always integrated at once.
+        // Remote operations that arrive while the user has typed ahead wait
+        // in `heldRemote`: see its declaration for why they cannot be
+        // integrated or rendered yet.
+        if (!acknowledge(op) && pendingInput) {
+          heldRemote.push(op);
+        } else {
+          integrate(op);
+        }
       }
-      render();
-      updateWritability();
-      flush();
-      updateWritability();
+      // Send anything typed while the round trip was outstanding BEFORE
+      // redrawing: `render()` converges the textarea to the replica's view,
+      // which does not contain those keystrokes yet, and redrawing first
+      // would wipe them before `flush()` ever saw them.
+      if (flush()) {
+        pendingInput = false;
+        // The queue settled, so the textarea and the replica agree again:
+        // fold in whatever arrived while the user was typing ahead, then
+        // redraw once, with everything in place.
+        for (const op of heldRemote) integrate(op);
+        heldRemote = [];
+      }
+      if (!pendingInput) render();
     } else if (message.type === "presence") {
       renderRoster(message.participants);
     } else if (message.type === "error") {
@@ -298,8 +333,10 @@
       // nothing and showing nobody else's changes again. The refused text is
       // dropped, so redraw from the authority to show what really happened.
       discardProvisional();
+      pendingInput = false;
+      for (const op of heldRemote) integrate(op);
+      heldRemote = [];
       render();
-      updateWritability();
       if (status) status.textContent = message.message;
     }
   });
@@ -315,11 +352,15 @@
   // operations back, and `render()` puts them in. So a second keystroke inside
   // one round trip cannot be diffed yet: the document still lacks the first
   // one, and diffing against it would send that character twice. `flush`
-  // therefore does nothing while an edit is outstanding; the `ops` handler
+  // therefore reports `false` while an edit is outstanding; the `ops` handler
   // calls it again as soon as the echo lands, and the characters typed in
-  // between go out together.
+  // between go out together. The keystrokes themselves are never blocked —
+  // the textarea stays editable, so nothing the user typed is lost.
+  //
+  // Returns `true` when the diff ran (the queue was settled), `false` when
+  // the flush was deferred.
   function flush() {
-    if (!settled()) return;
+    if (!settled()) return false;
 
     const before = [...text()];
     const after = [...editor.value];
@@ -405,11 +446,14 @@
         slot += 1;
       }
     }
+    return true;
   }
 
   editor.addEventListener("input", () => {
-    flush();
-    updateWritability();
+    // A deferred flush leaves the keystroke in the textarea; the echo
+    // handler picks it up. Mark it so `render()` does not redraw over it
+    // in the meantime (see the `ops` handler).
+    if (!flush()) pendingInput = true;
   });
 
   const reportCaret = () =>
