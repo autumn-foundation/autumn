@@ -266,7 +266,7 @@ pub fn print_json(routes: &[RouteInfo]) {
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
 
 pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
-    find_binary_in_profile(package, bin, false)
+    find_binary_in_profile(package, bin, &CargoProfile::default())
 }
 
 /// Locate the app binary under an explicit Cargo profile.
@@ -277,7 +277,11 @@ pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
 /// different set of inventory items than the release one that ships -- which
 /// is exactly what `autumn data-flow --check` must not be blind to (#1654
 /// review round 3).
-pub fn find_binary_in_profile(package: Option<&str>, bin: Option<&str>, release: bool) -> PathBuf {
+pub fn find_binary_in_profile(
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: &CargoProfile,
+) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -292,7 +296,7 @@ pub fn find_binary_in_profile(package: Option<&str>, bin: Option<&str>, release:
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_in_profile(&metadata, package, &cwd, bin, release).unwrap_or_else(|error| {
+    resolve_binary_in_profile(&metadata, package, &cwd, bin, profile).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     })
@@ -303,7 +307,7 @@ fn resolve_binary_in_profile(
     package: Option<&str>,
     cwd: &Path,
     bin: Option<&str>,
-    release: bool,
+    profile: &CargoProfile,
 ) -> Result<PathBuf, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
@@ -404,7 +408,9 @@ fn resolve_binary_in_profile(
     })?;
 
     let mut path = PathBuf::from(target_dir);
-    path.push(if release { "release" } else { "debug" });
+    // Cargo's artifact-directory rule: dev -> target/debug, release ->
+    // target/release, any other profile name -> target/<name>.
+    path.push(profile.artifact_dir());
     path.push(bin_name);
 
     if cfg!(windows) {
@@ -416,8 +422,102 @@ fn resolve_binary_in_profile(
 
 // ── Also compile the binary before running ─────────────────────────────────
 
+/// The Cargo profile an inspected binary should be built and located under.
+///
+/// A manifest read out of a binary describes *that* binary. Build the debug
+/// profile and the manifest omits every `#[cached]` read and `#[repository]`
+/// write that is gated behind `#[cfg(not(debug_assertions))]` — so an audit
+/// can exit green while the deployed release build, which does compile them,
+/// is incoherent. These are the same flags `cargo build` takes, forwarded
+/// verbatim, so the inspected binary can be the one that ships.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CargoProfile {
+    /// `--release`, shorthand for `--profile release`.
+    pub release: bool,
+    /// An explicit `--profile <NAME>` selection. Conflicts with `release`;
+    /// Cargo rejects the combination too.
+    pub profile: Option<String>,
+}
+
+impl CargoProfile {
+    /// A profile selection from a plain `--release` flag.
+    #[must_use]
+    pub fn from_release(release: bool) -> Self {
+        Self {
+            release,
+            profile: None,
+        }
+    }
+
+    /// Whether this selects anything other than Cargo's default dev profile.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.release && self.profile.is_none()
+    }
+
+    /// The selection as the `cargo build` flags it forwards, for reporting.
+    #[must_use]
+    pub fn to_args(&self) -> Vec<String> {
+        if let Some(name) = &self.profile {
+            vec!["--profile".to_string(), name.clone()]
+        } else if self.release {
+            vec!["--release".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The `target/` subdirectory Cargo places this profile's artifacts in.
+    ///
+    /// Cargo's own rule: `dev` builds into `target/debug`, `release` into
+    /// `target/release`, and any other profile name into `target/<name>`.
+    #[must_use]
+    pub fn artifact_dir(&self) -> &str {
+        if self.release {
+            "release"
+        } else if let Some(name) = &self.profile {
+            if name == "dev" { "debug" } else { name }
+        } else {
+            "debug"
+        }
+    }
+}
+
 pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
-    compile_binary_with(package, bin, &CargoFeatures::default());
+    compile_binary_with(
+        package,
+        bin,
+        &CargoFeatures::default(),
+        &CargoProfile::default(),
+    );
+}
+
+/// Compile the app under an explicit Cargo feature selection and profile.
+///
+/// Pairs with [`find_binary_in_profile`]: a command that builds and then runs
+/// the binary must agree with itself about which profile it means.
+pub fn compile_binary_with(
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: &CargoFeatures,
+    profile: &CargoProfile,
+) {
+    let mut cargo = Command::new("cargo");
+    cargo.arg("build");
+    if let Some(pkg) = package {
+        cargo.args(["-p", pkg]);
+    }
+    if let Some(b) = bin {
+        cargo.args(["--bin", b]);
+    }
+    cargo.args(features.to_args());
+    cargo.args(profile.to_args());
+
+    let status = cargo.status().expect("failed to run cargo build");
+    if !status.success() {
+        eprintln!("\u{2717} Compilation failed");
+        std::process::exit(1);
+    }
 }
 
 /// The Cargo feature selection an audited build should be made under.
@@ -461,41 +561,6 @@ impl CargoFeatures {
             args.push(f.clone());
         }
         args
-    }
-}
-
-/// Compile the app under an explicit Cargo feature selection.
-pub fn compile_binary_with(package: Option<&str>, bin: Option<&str>, features: &CargoFeatures) {
-    compile_binary_with_profile(package, bin, features, false);
-}
-
-/// Compile the app under an explicit Cargo feature selection and profile.
-///
-/// Pairs with [`find_binary_in_profile`]: a command that builds and then runs
-/// the binary must agree with itself about which profile it means.
-pub fn compile_binary_with_profile(
-    package: Option<&str>,
-    bin: Option<&str>,
-    features: &CargoFeatures,
-    release: bool,
-) {
-    let mut cargo = Command::new("cargo");
-    cargo.arg("build");
-    if release {
-        cargo.arg("--release");
-    }
-    if let Some(pkg) = package {
-        cargo.args(["-p", pkg]);
-    }
-    if let Some(b) = bin {
-        cargo.args(["--bin", b]);
-    }
-    cargo.args(features.to_args());
-
-    let status = cargo.status().expect("failed to run cargo build");
-    if !status.success() {
-        eprintln!("\u{2717} Compilation failed");
-        std::process::exit(1);
     }
 }
 
@@ -757,9 +822,9 @@ mod tests {
         });
         let cwd = Path::new("/projects/hello");
 
-        let debug = resolve_binary_in_profile(&metadata, None, cwd, None, false)
+        let debug = resolve_binary_in_profile(&metadata, None, cwd, None, &CargoProfile::default())
             .expect("the debug binary resolves");
-        let release = resolve_binary_in_profile(&metadata, None, cwd, None, true)
+        let release = resolve_binary_in_profile(&metadata, None, cwd, None, &CargoProfile::from_release(true))
             .expect("the release binary resolves");
 
         assert!(
@@ -798,7 +863,7 @@ mod tests {
             Some("hello"),
             Path::new("/projects"),
             None,
-            false,
+            &CargoProfile::default(),
         );
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
@@ -823,7 +888,7 @@ mod tests {
             }]
         });
         let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, false);
+            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, &CargoProfile::default());
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -847,7 +912,7 @@ mod tests {
             Some("missing"),
             Path::new("/projects"),
             None,
-            false,
+            &CargoProfile::default(),
         );
         assert!(result.unwrap_err().contains("package 'missing'"));
     }
@@ -869,7 +934,7 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, false);
+        let result = resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, &CargoProfile::default());
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary packages"),
@@ -900,7 +965,7 @@ mod tests {
         });
         // Narrowing cwd to /ws/alpha means only "alpha" matches.
         let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/alpha"), None, false)
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/alpha"), None, &CargoProfile::default())
                 .unwrap();
         assert!(result.to_string_lossy().contains("alpha"));
     }
@@ -923,7 +988,7 @@ mod tests {
             ]
         });
         let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, false).unwrap();
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, &CargoProfile::default()).unwrap();
         assert!(result.to_string_lossy().contains("myapp"));
     }
 
@@ -938,7 +1003,7 @@ mod tests {
             }]
         });
         let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/mylib"), None, false);
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/mylib"), None, &CargoProfile::default());
         assert!(result.unwrap_err().contains("no binary target"));
     }
 
@@ -958,7 +1023,7 @@ mod tests {
             None,
             Path::new("/projects/hello/src"),
             None,
-            false,
+            &CargoProfile::default(),
         );
         assert!(
             result.unwrap().to_string_lossy().contains("hello"),
@@ -980,7 +1045,7 @@ mod tests {
             }]
         });
         let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/myapp"), None, false);
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/myapp"), None, &CargoProfile::default());
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary targets"),
@@ -1010,7 +1075,7 @@ mod tests {
             None,
             Path::new("/ws/myapp"),
             Some("migrate"),
-            false,
+            &CargoProfile::default(),
         )
         .unwrap();
         assert!(
@@ -1034,7 +1099,7 @@ mod tests {
             None,
             Path::new("/ws/myapp"),
             Some("missing"),
-            false,
+            &CargoProfile::default(),
         );
         let err = result.unwrap_err();
         assert!(
@@ -1084,5 +1149,97 @@ mod tests {
         };
         assert!(!all.is_default());
         assert_eq!(all.to_args(), vec!["--all-features"]);
+    }
+
+    // ── Cargo profile selection for audited builds (#2363) ─────────────────
+
+    fn profile_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "hello",
+                "manifest_path": "/projects/hello/Cargo.toml",
+                "targets": [{
+                    "name": "hello",
+                    "kind": ["bin"],
+                    "src_path": "/projects/hello/src/main.rs"
+                }]
+            }]
+        })
+    }
+
+    fn resolve_profile_dir(profile: &CargoProfile) -> String {
+        let metadata = profile_metadata();
+        let path = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/projects/hello"),
+            None,
+            profile,
+        )
+        .expect("the binary resolves");
+        path.parent()
+            .expect("binary has a parent dir")
+            .file_name()
+            .expect("dir has a name")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_default_profile_selection_adds_no_cargo_flags_and_resolves_debug() {
+        let p = CargoProfile::default();
+        assert!(p.is_default());
+        assert!(p.to_args().is_empty());
+        assert_eq!(resolve_profile_dir(&p), "debug");
+    }
+
+    /// `--release` has to reach `cargo build` *and* move the lookup into
+    /// `target/release` — forwarding the flag without teaching the resolver
+    /// is worse than not forwarding it: the CLI would compile one binary and
+    /// audit a different, stale one, silently.
+    #[test]
+    fn a_release_selection_forwards_the_flag_and_resolves_release() {
+        let p = CargoProfile::from_release(true);
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--release"]);
+        assert_eq!(p.artifact_dir(), "release");
+        assert_eq!(resolve_profile_dir(&p), "release");
+    }
+
+    #[test]
+    fn a_named_profile_forwards_the_flag_and_resolves_the_named_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("ci".to_string()),
+        };
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--profile", "ci"]);
+        assert_eq!(p.artifact_dir(), "ci");
+        assert_eq!(resolve_profile_dir(&p), "ci");
+    }
+
+    /// Cargo's special case: `--profile dev` builds into `target/debug`, not
+    /// `target/dev`.
+    #[test]
+    fn a_dev_profile_resolves_to_the_debug_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("dev".to_string()),
+        };
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--profile", "dev"]);
+        assert_eq!(p.artifact_dir(), "debug");
+        assert_eq!(resolve_profile_dir(&p), "debug");
+    }
+
+    #[test]
+    fn a_release_profile_name_resolves_to_the_release_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("release".to_string()),
+        };
+        assert_eq!(p.artifact_dir(), "release");
+        assert_eq!(resolve_profile_dir(&p), "release");
     }
 }
