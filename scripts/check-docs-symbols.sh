@@ -216,6 +216,12 @@ ROOT = sys.argv[2]
 CRATES = {
     'autumn_web': 'autumn/src',
     'autumn_macros': 'autumn-macros/src',
+    # The macro crate split (#2809). These three are publishable libraries, so
+    # `workspace_crates` requires them here; readers reach their macros through
+    # the `autumn_web` re-exports, not by these prefixes.
+    'autumn_macros_model': 'autumn-macros-model/src',
+    'autumn_macros_repository': 'autumn-macros-repository/src',
+    'autumn_macros_support': 'autumn-macros-support/src',
     'autumn_edge': 'autumn-edge/src',
     'autumn_search': 'autumn-search/src',
     'autumn_billing': 'autumn-billing/src',

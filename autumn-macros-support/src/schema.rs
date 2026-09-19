@@ -33,6 +33,7 @@ pub fn field_is_translatable(field: &syn::Field) -> bool {
 /// Its column holds an `autumn_web::collab::CollabText` document — a text
 /// CRDT that merges concurrent edits — instead of a plain string that the
 /// last writer overwrites.
+#[must_use]
 pub fn field_is_collaborative(field: &syn::Field) -> bool {
     has_attr(field, "collaborative")
 }

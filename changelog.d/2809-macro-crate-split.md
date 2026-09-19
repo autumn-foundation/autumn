@@ -1,6 +1,10 @@
-### Changed
+### Breaking Changes
 
-- **Macro crate split: `autumn-macros` is now four crates.**
+- **macros:** **Breaking:** `autumn-macros` is now four crates, and a
+  direct dependant of it loses `autumn_macros::{model, repository,
+  service}`. See the [migration guide](docs/migrations/next.md#macros-autumn-macros-no-longer-holds-the-database-macros-2809). An app
+  that depends on `autumn-web` is unaffected: every `autumn_web::` path is
+  unchanged.
   The database-layer codegen — `#[model]`/`#[commentable]` (`model.rs`),
   `#[repository]` (`repository.rs`), `#[service]` (`service.rs`), ~45k of the
   crate's ~87k lines — moved into the new proc-macro crates
@@ -23,7 +27,7 @@
   again, and `autumn plugin list` no longer flags itself.** The split moved
   `#[service]` into `autumn-macros-model` (gated behind the `db` feature) but
   `autumn/src/prelude.rs` still re-exported it unconditionally from
-  `autumn_macros`, breaking every build (`error[E0432]: unresolved import
+  `autumn_macros`, so no build compiled (`error[E0432]: unresolved import
   autumn_macros::service`); the prelude now re-exports it from
   `autumn_macros_model` under `#[cfg(feature = "db")]`, matching the
   already-correct top-level `autumn_web::service` re-export. Also: the

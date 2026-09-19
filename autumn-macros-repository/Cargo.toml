@@ -6,12 +6,16 @@ rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn"
+readme = "../README.md"
+keywords = ["web", "composable", "axum", "htmx", "fullstack"]
+categories = ["web-programming", "web-programming::http-server"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-autumn-macros-support.path = "../autumn-macros-support"
+autumn-macros-support = { version = "0.7.0", path = "../autumn-macros-support" }
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
