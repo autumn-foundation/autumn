@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compensated first deploy now removes its stale proxy route (issue
+  #2270):** when a halted fleet rollout compensated a host's just-completed
+  FIRST deploy, the host was torn down but kamal-proxy kept a route pointing
+  at the now-stopped slot, so its public port answered `502` instead of
+  refusing the connection until the next deploy. `ProxyController` gained
+  `deregister_op` (`kamal-proxy remove`), probed the same way `deploy --help`
+  already is, so a drifted or renamed `remove` subcommand fails the deploy
+  closed before any cutover, never assumed present. The route is removed as
+  its own step, only after the app teardown fully succeeds, so a failure
+  there reports its own outcome (`CompensatedTeardownRouteFailed`) rather
+  than the misleading "still serving, roll it back" — a first deploy has no
+  previous release to roll back to.
+
 ### Added
 
 - **💵 Money as a framework primitive: typed `Money<C>` and an enforced
