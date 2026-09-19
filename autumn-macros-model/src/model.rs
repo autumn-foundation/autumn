@@ -21,9 +21,9 @@ use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_co
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
-    is_option_type, serde_bare_word, serde_rename_all_serialize_rule, serde_valued_key,
-    type_name_str,
+    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
+    field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
+    serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -4495,10 +4495,19 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                // #1806: `#[collaborative]` is a marker the model macro reads;
+                // the behaviour lives in the field's `CollabText` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("collaborative")
                 // #1771: `#[confidential]` is a marker the model macro reads;
                 // the behaviour lives in the field's `Sealed` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("confidential")
+                // #2597: `#[decimal_shape(precision = .., scale = ..)]` is a
+                // marker the model macro reads to shape factory `.fake()`
+                // values; the field type carries no such information, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("decimal_shape")
         })
         .collect()
 }
@@ -5342,6 +5351,317 @@ fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
     Ok(())
 }
 
+// ── #1806: `#[collaborative]` field attribute ────────────────────────────────
+
+/// Marker combinations `#[collaborative]` refuses, with the reason each one
+/// is incoherent.
+///
+/// A table rather than a match arm: every entry is a pair whose two halves
+/// disagree about what the column contains, and the reason is what the author
+/// reads.
+const COLLABORATIVE_MARKER_CONFLICTS: &[(&str, &str)] = &[
+    (
+        "encrypted",
+        "an encrypted column stores one opaque ciphertext envelope, which the \
+         merge cannot read the characters out of",
+    ),
+    (
+        "classified",
+        "a classification tier applies to one value; a CRDT document is a JSON \
+         container of characters, and the merge would move them across the \
+         boundary the tier records",
+    ),
+    (
+        "searchable",
+        "full-text search indexes the stored column, which for a collaborative \
+         field is a JSON container — the index would match character ids and \
+         JSON punctuation, not the prose",
+    ),
+    (
+        "translatable",
+        "both markers own the column's representation, and one column cannot \
+         hold a per-locale container and a CRDT document at once. Keep one \
+         collaborative column per locale",
+    ),
+    (
+        "normalize",
+        "normalizers rewrite a single string; they cannot see inside the \
+         document, and a rewrite behind the merge's back would drop characters \
+         other editors still hold",
+    ),
+    (
+        "unique",
+        "uniqueness would compare whole documents, so two records with identical \
+         text but different edit histories would never collide",
+    ),
+    (
+        "indexed",
+        "an equality index over a CRDT document matches whole documents, never \
+         the text",
+    ),
+    ("id", "a primary key must be a single scalar value"),
+    (
+        "lock_version",
+        "the optimistic-lock column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "position",
+        "the position column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "state_machine",
+        "a state column must hold one state name, not a document",
+    ),
+];
+
+/// Validate a `#[collaborative]` field.
+///
+/// The attribute is a marker: the *type* carries the merge, so the type has to
+/// be right. The rest is [`COLLABORATIVE_MARKER_CONFLICTS`] plus the two
+/// renames that would desync the registry.
+fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_collaborative(field) {
+        return Ok(());
+    }
+    // The type must be `CollabText` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<CollabText>` is rejected on purpose
+    // — an empty document already models "no text", and a nullable column
+    // would give two spellings for one state.
+    let is_collab_text = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "CollabText")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_collab_text {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[collaborative]` requires the field type `autumn_web::collab::CollabText` \
+             (a text CRDT), not a plain string. Change the field to \
+             `pub <name>: autumn_web::collab::CollabText`; it renders through \
+             `Display` and merges concurrent edits character by character \
+             instead of letting the last writer overwrite them. The check is \
+             syntactic — a type alias for `CollabText` is not recognised, and \
+             conversely any type whose last path segment is `CollabText` is \
+             accepted, so spell the real type here.",
+        ));
+    }
+    for (marker, why) in COLLABORATIVE_MARKER_CONFLICTS {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[collaborative]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-collaborative column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry,
+    // the generated field-name-keyed accessors and `CollabResolver` all match
+    // against. Anything that gives the field a different wire name — or no
+    // name of its own — desyncs them.
+    //
+    // `rename` moves the key, `alias` adds a second one a request may arrive
+    // under, and `flatten` removes it entirely: the document's `elems` and
+    // `pending` are emitted at the row's top level, so the resolver's lookup
+    // of the registered name finds nothing, falls through to the wrapped
+    // last-write-wins verdict, and discards one replica's edits — silently,
+    // which is the outcome this whole feature exists to prevent.
+    if let Some(key) = field_serde_wire_name_override(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[collaborative]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which must match the field name passed to \
+                 `collaborative(..)`, used as the session key, and looked up by \
+                 `CollabResolver` when it merges an offline edit.",
+                serde_key_display(key),
+            ),
+        ));
+    }
+    // And anything that drops the column from the serialized form. The
+    // resolver reads both sides of a conflict out of the row's JSON, so a
+    // column that is not there is a column it cannot merge: the offline edit
+    // loses to last-write-wins exactly as if the field had never been marked.
+    if let Some(key) = field_serde_omission(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[collaborative]` fields cannot use `#[{key}]`: the column must be present \
+                 in the serialized row for `CollabResolver` to find and merge it. Without it \
+                 a conflicting offline edit falls back to last-write-wins and one side's \
+                 text is discarded."
+            ),
+        ));
+    }
+    // `#[diesel(column_name = ...)]` renames the *database* column, so it
+    // desyncs the registry harder than a serde rename: the descriptor would
+    // name a column that does not exist on the table.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[collaborative]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `impl` block a model's `#[collaborative]` fields contribute:
+/// per-field edit helpers plus the field-name-keyed surface a session hub
+/// resolves a document from (issue #1806).
+///
+/// Returns an empty token stream when the model has no collaborative field, so
+/// a model that never opts in expands byte-for-byte as before.
+/// The rustdoc for one collaborative field's generated accessors.
+struct CollaborativeDocs {
+    text: String,
+    insert: String,
+    remove: String,
+    set: String,
+    merge: String,
+}
+
+/// Written out here rather than inline so `emit_collaborative_items` stays
+/// about the code it emits.
+fn collaborative_docs(name: &str) -> CollaborativeDocs {
+    CollaborativeDocs {
+        text: format!("`{name}` as visible text."),
+        insert: format!(
+            "Insert `text` into `{name}` before visible character `index`, as `actor`. \
+             Returns the operations to send to the other editors.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the whole of `text`. \
+             Nothing is applied either way."
+        ),
+        remove: format!("Delete `count` visible characters from `{name}`, starting at `index`."),
+        set: format!(
+            "Rewrite `{name}` to `text` with the smallest edit that gets there, so a \
+             concurrent edit outside the changed span survives.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the replacement. Nothing \
+             is applied either way — in particular the replaced span is not tombstoned."
+        ),
+        merge: format!("Merge another replica's `{name}` in. Order does not matter."),
+    }
+}
+
+fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the key
+    // must be the real column name, not `r#type`.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = unraw_ident(ident);
+        let text = format_ident!("{}_text", ident);
+        let insert = format_ident!("{}_insert", ident);
+        let remove = format_ident!("{}_remove", ident);
+        let set_text = format_ident!("{}_set_text", ident);
+        let merge = format_ident!("{}_merge", ident);
+        let CollaborativeDocs {
+            text: doc_text,
+            insert: doc_insert,
+            remove: doc_remove,
+            set: doc_set,
+            merge: doc_merge,
+        } = collaborative_docs(&name);
+        quote! {
+            #[doc = #doc_text]
+            #[must_use]
+            pub fn #text(&self) -> ::std::string::String {
+                self.#ident.text()
+            }
+
+            #[doc = #doc_insert]
+            pub fn #insert(
+                &mut self,
+                actor: &str,
+                index: usize,
+                text: &str,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
+                self.#ident.insert(actor, index, text)
+            }
+
+            #[doc = #doc_remove]
+            pub fn #remove(
+                &mut self,
+                index: usize,
+                count: usize,
+            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+                self.#ident.remove(index, count)
+            }
+
+            #[doc = #doc_set]
+            pub fn #set_text(
+                &mut self,
+                actor: &str,
+                text: &str,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
+                self.#ident.set_text(actor, text)
+            }
+
+            #[doc = #doc_merge]
+            pub fn #merge(&mut self, other: &::autumn_web::collab::CollabText) {
+                self.#ident.merge(other);
+            }
+        }
+    });
+    let read_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    let write_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&mut self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[collaborative]`.
+            #[must_use]
+            pub const fn collaborative_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_COLLABORATIVE_COLUMNS
+            }
+
+            /// The document for `field`, or `None` when the model has no
+            /// collaborative field by that name.
+            #[must_use]
+            pub fn collaborative(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::collab::CollabText> {
+                match field {
+                    #(#read_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// The document for `field`, mutably — how a session hub applies
+            /// an incoming operation to the record it loaded.
+            pub fn collaborative_mut(
+                &mut self,
+                field: &str,
+            ) -> ::core::option::Option<&mut ::autumn_web::collab::CollabText> {
+                match field {
+                    #(#write_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    }
+}
+
 /// An identifier's name with any raw-identifier prefix removed (`r#type` ->
 /// `type`), matching the DB column and the key callers pass to the
 /// field-name-driven accessors.
@@ -6119,6 +6439,52 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
+/// Parse the declared `decimal{p,s}` shape from a field's
+/// `#[decimal_shape(precision = p, scale = s)]` attribute (issue #2597).
+///
+/// The attribute is emitted by the `autumn generate` model renderer for
+/// `decimal{p,s}` fields; the Rust type (`Decimal`/`SqliteDecimal`) carries
+/// no precision/scale, so the factory `.fake()` cannot do better without it.
+///
+/// Malformed spellings (unknown keys, missing or non-integer values) return
+/// `None`: the field then falls back to the untyped `fake::decimal()`,
+/// exactly as before this attribute existed. The macro's fake inference must
+/// never fail expansion on a best-effort hint, so silent fallback — not a
+/// compile error — is the correct failure mode here.
+fn field_decimal_shape(field: &Field) -> Option<(u32, u32)> {
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("decimal_shape"))
+    {
+        let mut precision = None;
+        let mut scale = None;
+        let parsed = attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("precision") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    precision = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else if meta.path.is_ident("scale") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    scale = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else {
+                    Err(meta
+                        .error("unsupported decimal_shape key (expected `precision` or `scale`)"))
+                }
+            })
+            .is_ok();
+        if !parsed {
+            continue;
+        }
+        if let (Some(p), Some(s)) = (precision, scale) {
+            return Some((p, s));
+        }
+    }
+    None
+}
+
 /// Infer the fake-data expression for a factory field when `.fake()` is active.
 ///
 /// Selection order (per issue #1343):
@@ -6133,24 +6499,38 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
 ///    `Uuid` → `uuid()`, …).
 /// 3. `Option<T>` wraps the inner expression in `Some(..)`.
 ///
+/// The `decimal_shape` parameter carries the declared `decimal{p,s}` from a
+/// `#[decimal_shape(precision = p, scale = s)]` field attribute (issue #2597),
+/// parsed by [`field_decimal_shape`]; a shaped `Decimal`/`SqliteDecimal`
+/// field draws from `fake::decimal_with(p, s)` so every value fits the column
+/// by construction. `None` keeps the untyped `fake::decimal()`.
+///
 /// Returns `None` when no sensible fake value can be produced — the caller then
 /// leaves the field at its `Default::default()` value. This function must NEVER
 /// emit an expression that fails to compile: when unsure, return `None`.
-fn fake_expr_for_field(ident: &syn::Ident, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_for_field(
+    ident: &syn::Ident,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let raw = ident.to_string();
     let name = raw.strip_prefix("r#").unwrap_or(&raw).to_ascii_lowercase();
 
     // Option<T>: fake the inner value, wrap in Some.
     if let Some(inner) = option_inner_type(ty) {
-        let inner_expr = fake_expr_core(&name, inner)?;
+        let inner_expr = fake_expr_core(&name, inner, decimal_shape)?;
         return Some(quote! { ::core::option::Option::Some(#inner_expr) });
     }
 
-    fake_expr_core(&name, ty)
+    fake_expr_core(&name, ty, decimal_shape)
 }
 
 /// Core inference over a non-`Option` target type. See [`fake_expr_for_field`].
-fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_core(
+    name: &str,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let last = ty_last_ident(ty)?;
     match last.as_str() {
         "String" => Some(fake_string_expr(name)),
@@ -6175,12 +6555,20 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
             Some(quote! { (::autumn_web::fake::decimal_f64() as #cast) })
         }
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
-        "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
+        // Issue #2597: a shaped decimal draws from `fake::decimal_with(p, s)`
+        // so factory values fit the declared `decimal{p,s}` by construction.
+        "Decimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s) },
+        )),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
         // The SQLite newtypes (issue #1924) wrap exactly those values. Without
         // these arms every faked row falls back to `Default` — one shared nil
         // UUID, which collides on a `:unique` column the first time twice.
-        "SqliteDecimal" => Some(quote! { ::autumn_web::fake::decimal().into() }),
+        "SqliteDecimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal().into() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
+        )),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
@@ -8133,6 +8521,56 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
     let translatable_items = emit_translatable_items(name, &translatable_columns);
 
+    // Collect `#[collaborative]` columns (issue #1806, validated to be
+    // non-null `CollabText`). Same keying rule as `#[translatable]`: the
+    // column name is the Rust field name, which is also the key the
+    // field-name-driven `collaborative` / `collaborative_mut` accessors and
+    // the session hub match on.
+    let mut collaborative_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_collaborative_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_collaborative(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            collaborative_columns.push(ident);
+        }
+    }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registry (Rust
+    // name) from the serialized key, exactly as it does for encrypted and
+    // classified columns — and here it is worse than a reporting mismatch:
+    // `CollabResolver` looks the field up by the registered name in a sync
+    // payload that carries the renamed one, finds neither side's document,
+    // and silently falls back to last-write-wins. That is the data loss the
+    // whole feature exists to prevent, so reject the combination.
+    if !collaborative_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[collaborative]` fields:              collaborative columns are registered under their Rust names, which must match              the serialized keys `CollabResolver` looks for in an offline-sync payload. A              renamed key would make the resolver miss the field and fall back to              last-write-wins, discarding one side's edits.",
+        )
+        .to_compile_error();
+    }
+    let collaborative_column_names: Vec<String> = collaborative_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let collaborative_inventory: Vec<TokenStream> = collaborative_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::collab::CollaborativeColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let collaborative_items = emit_collaborative_items(name, &collaborative_columns);
+
     // Collect `#[normalize]` columns (validated to be non-null `String`).
     // Each entry: (field ident, lookup key, normalizer chain).
     // The lookup key is the *Rust* field name (the diesel column), because the
@@ -9354,7 +9792,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     expr
                 }
             };
-            fake_expr_for_field(ident, &f.ty).map_or_else(
+            fake_expr_for_field(ident, &f.ty, field_decimal_shape(f)).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
                 || {
@@ -10428,6 +10866,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
                 &[#(#translatable_column_names),*];
+
+            /// Column names on this model declared `#[collaborative]` (#1806).
+            ///
+            /// Emitted for every model (empty when none are collaborative) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a CRDT document.
+            #[doc(hidden)]
+            pub const __AUTUMN_COLLABORATIVE_COLUMNS: &'static [&'static str] =
+                &[#(#collaborative_column_names),*];
         }
 
         #(#encrypted_inventory)*
@@ -10436,6 +10883,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #translatable_items
         #(#translatable_inventory)*
+
+        #collaborative_items
+        #(#collaborative_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -10940,7 +11390,7 @@ mod tests {
         // Narrow types must clamp the range to their own maximum so the `as`
         // cast can't wrap (`1000 as u8 == 232`, `1000 as i8 == -24`).
         let expr = |ty: syn::Type| {
-            fake_expr_core("count", &ty)
+            fake_expr_core("count", &ty, None)
                 .expect("integer type should infer a fake expr")
                 .to_string()
         };
@@ -10977,6 +11427,123 @@ mod tests {
         assert!(
             u128_expr.contains("as u128"),
             "u128 must be matched: {u128_expr}"
+        );
+    }
+
+    // ── Fake decimal shape (#2597) ─────────────────────────────────────────
+    // A `#[decimal_shape(precision = p, scale = s)]` field attribute carries
+    // the generator's declared `decimal{p,s}` into `#[model]`, so the
+    // factory `.fake()` draws from `fake::decimal_with(p, s)` — values that
+    // fit the column by construction — instead of the untyped
+    // `fake::decimal()`.
+
+    #[test]
+    fn decimal_shape_attr_parses_precision_and_scale() {
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), Some((5, 2)));
+    }
+
+    #[test]
+    fn decimal_shape_attr_absent_yields_no_shape() {
+        let field: syn::Field = syn::parse_quote! {
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), None);
+    }
+
+    #[test]
+    fn decimal_shape_attr_malformed_falls_back_to_untyped() {
+        // The macro must never fail expansion on a best-effort hint: unknown
+        // keys, missing values, and non-integer values all fall back to the
+        // untyped `fake::decimal()`, exactly as before the attribute existed.
+        for tokens in [
+            quote! { #[decimal_shape(frobnicate = 1)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = 5)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = "five", scale = 2)] pub price: rust_decimal::Decimal },
+        ] {
+            let field: syn::Field = syn::parse_quote!(#tokens);
+            assert_eq!(
+                field_decimal_shape(&field),
+                None,
+                "malformed attribute must fall back: {tokens}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_shape_attr_stripped_from_user_attrs() {
+        // The marker must not leak onto the generated Diesel query struct —
+        // Diesel doesn't understand it.
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("decimal_shape")),
+            "`#[decimal_shape]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn shaped_decimal_fake_expr_uses_decimal_with() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(rust_decimal::Decimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 2)))
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("5u32"), "{shaped}");
+        assert!(shaped.contains("2u32"), "{shaped}");
+
+        let untyped = fake_expr_for_field(&ident, &ty, None)
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(!untyped.contains("decimal_with"), "{untyped}");
+        assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn shaped_sqlite_decimal_fake_expr_converts() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(autumn_web::db::sqlite_types::SqliteDecimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 0)))
+            .expect("SqliteDecimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("into ()"), "{shaped}");
+    }
+
+    #[test]
+    fn model_macro_emits_decimal_with_for_shaped_field() {
+        // End-to-end at the macro level: the generator's attribute flows
+        // through `#[model]` into the factory's `.fake()` binding.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Invoice {
+                    #[id]
+                    pub id: i64,
+                    #[decimal_shape(precision = 5, scale = 2)]
+                    pub amount: rust_decimal::Decimal,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("decimal_with"),
+            "shaped decimal field must draw from fake::decimal_with: {generated}"
+        );
+        // ...and the marker attribute itself must not leak onto the Diesel
+        // structs (`cannot find attribute decimal_shape in this scope`).
+        assert!(
+            !generated.contains("decimal_shape ("),
+            "the marker must be consumed, not re-emitted: {generated}"
         );
     }
 
@@ -14578,6 +15145,268 @@ mod tests {
         assert!(
             !generated.contains("additionalProperties"),
             "no `#[translatable]` field means no locale-map schema"
+        );
+    }
+
+    // ── #1806: `#[collaborative]` field attribute ───────────────────────────
+
+    #[test]
+    fn collaborative_field_is_accepted_on_a_collab_text_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: ::autumn_web::collab::CollabText
+        };
+        assert!(validate_collaborative_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn collaborative_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: String
+        };
+        let msg = validate_collaborative_field(&field)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("CollabText"), "{msg}");
+    }
+
+    #[test]
+    fn collaborative_option_is_rejected() {
+        // An empty document already models "no text", so a nullable column
+        // would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: Option<CollabText>
+        };
+        assert!(validate_collaborative_field(&field).is_err());
+    }
+
+    #[test]
+    fn collaborative_conflicting_markers_are_rejected_by_name() {
+        for marker in [
+            "encrypted",
+            "classified",
+            "searchable",
+            "translatable",
+            "normalize",
+            "unique",
+            "indexed",
+            "id",
+            "lock_version",
+            "position",
+            "state_machine",
+        ] {
+            // `Attribute` has no `Parse` impl of its own — attributes are
+            // parsed as a list, so go through `parse_outer`.
+            let parsed = syn::parse::Parser::parse_str(
+                syn::Attribute::parse_outer,
+                &format!("#[collaborative] #[{marker}]"),
+            )
+            .expect("both markers parse");
+            let mut field: syn::Field = syn::parse_quote! { pub body: CollabText };
+            field.attrs = parsed;
+            let msg = validate_collaborative_field(&field)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(marker),
+                "the error must name the conflicting marker `{marker}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn collaborative_renames_are_rejected_because_they_desync_the_registry() {
+        let serde_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[serde(rename = "text")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&serde_renamed).is_err());
+
+        let column_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[diesel(column_name = "content")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&column_renamed).is_err());
+    }
+
+    /// Every other way to give the column a wire name the registry does not
+    /// know. `flatten` is the one that hides best: the field still *exists*,
+    /// but its `elems` and `pending` are emitted at the row's top level, so
+    /// `CollabResolver`'s lookup of the registered name finds nothing and the
+    /// conflict quietly falls back to last-write-wins.
+    #[test]
+    fn collaborative_rejects_every_serde_wire_name_override() {
+        for attr in [
+            quote! { #[serde(flatten)] },
+            quote! { #[serde(alias = "text")] },
+            quote! { #[serde(rename = "text")] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            let msg = validate_collaborative_field(&field)
+                .expect_err("the override must be refused")
+                .to_string();
+            assert!(
+                msg.contains("CollabResolver"),
+                "the error must say what breaks: {msg}"
+            );
+        }
+    }
+
+    /// And every way to drop the column from the serialized row, which leaves
+    /// the resolver nothing to merge for the same end result.
+    #[test]
+    fn collaborative_rejects_serialization_omissions() {
+        for attr in [
+            quote! { #[serde(skip_serializing)] },
+            quote! { #[serde(skip_serializing_if = "Option::is_none")] },
+            quote! { #[serde(default)] },
+            quote! { #[serde(skip_deserializing)] },
+            quote! { #[private] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            assert!(
+                validate_collaborative_field(&field).is_err(),
+                "an omitted collaborative column cannot be merged: {}",
+                quote! { #attr }
+            );
+        }
+    }
+
+    /// The marker never reaches the Diesel derives, and the generated surface
+    /// is keyed on the Rust field name.
+    #[test]
+    fn collaborative_emits_the_field_surface_and_strips_the_marker() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        for expected in [
+            "__AUTUMN_COLLABORATIVE_COLUMNS",
+            "collaborative_fields",
+            "fn collaborative",
+            "fn collaborative_mut",
+            "fn body_text",
+            "fn body_insert",
+            "fn body_remove",
+            "fn body_set_text",
+            "fn body_merge",
+            "CollaborativeColumnDescriptor",
+        ] {
+            assert!(
+                generated.contains(expected),
+                "expected the generated model to carry `{expected}`"
+            );
+        }
+        assert!(
+            !generated.contains("# [collaborative]"),
+            "the marker must be stripped before the Diesel derives see it"
+        );
+    }
+
+    /// A container `rename_all` desyncs the registry from the serialized key,
+    /// which would make `CollabResolver` miss the field and silently fall
+    /// back to last-write-wins — the loss the feature exists to prevent.
+    #[test]
+    fn collaborative_rejects_a_container_rename_all() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                #[serde(rename_all = "camelCase")]
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub note_body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("rename_all") && generated.contains("compile_error"),
+            "expected a compile error naming the conflict, got: {generated}"
+        );
+    }
+
+    /// The advertised schema must require `elems`, because the wire type does.
+    #[test]
+    fn collaborative_schema_requires_the_elements_array() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"required\""),
+            "the collaborative field's schema must mark `elems` required"
+        );
+        // An element record described as a bare object tells a client
+        // nothing: it cannot tell that an id is a string, not an object.
+        for part in ["\"deleted\"", "\"minLength\"", "\"oneOf\""] {
+            assert!(
+                generated.contains(part),
+                "the collaborative field's schema must describe its elements and \
+                 its pending operations; {part} is missing"
+            );
+        }
+    }
+
+    /// A model with no collaborative field expands as before: no const with a
+    /// name, no registry entry, no accessors.
+    #[test]
+    fn a_model_without_the_marker_registers_no_collaborative_column() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub body: domain::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("CollaborativeColumnDescriptor"),
+            "an unmarked look-alike must register nothing"
+        );
+        assert!(
+            !generated.contains("fn body_text"),
+            "an unmarked look-alike must gain no accessors"
         );
     }
 

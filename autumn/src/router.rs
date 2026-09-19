@@ -897,7 +897,7 @@ fn build_router_pre_state(
                 cors: config.cors.clone(),
                 // The same-origin shortcut is gated on the app's trusted-Host
                 // policy so it can't be abused for DNS rebinding.
-                trusted_hosts: TrustedHostPolicy::from_config(config),
+                trusted_hosts: TrustedHostPolicy::from_config_with_state(config, state),
                 tenant_header,
                 // Forward the configured CSRF header (default `x-csrf-token`) so
                 // customized CsrfConfig::token_header deployments work via MCP.
@@ -5013,7 +5013,7 @@ fn apply_middleware(
     // Redis-backed rate limiter — that must not run on the way to a fail-fast `Err`.
     let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
-    let trusted_host_policy = TrustedHostPolicy::from_config(config);
+    let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
@@ -5722,6 +5722,75 @@ pub fn try_build_router_with_static(
     )
 }
 
+/// Partition `custom_layers` for the static render path (#2405).
+///
+/// Returns `(session_scoped, drained)`:
+/// - `session_scoped`: layers that must stay on the inner (pre-layer) router —
+///   the i18n ambient-locale layer, which reads the session and therefore
+///   cannot run outside the static-first middleware (see #1384), and the i18n
+///   bundle `Extension`, which `Locale::from_request_parts` reads the bundle
+///   from exclusively. The build drops the drained set outright, so draining
+///   the bundle would make translated `#[static_get]` handlers write
+///   translation keys into `dist`. The extension inserts no headers and
+///   rewrites nothing, so keeping it does not disturb the recorded
+///   `Content-Type`.
+/// - `drained`: everything else — the user layers the SSG serve path applies
+///   outside the static-first middleware, to the cached response, at request
+///   time.
+///
+/// Both the static build (`App::run_build_mode`) and ISR regeneration render
+/// through the pre-layer router, so the recorded `Content-Type` and the body
+/// on disk are the handler's own. Recording the post-layer output instead
+/// double-applies the layers — once at generation, once per request — and,
+/// because ISR's type guard sees the pre-layer response, refuses every
+/// regeneration for an app with a `Content-Type`-rewriting layer, freezing
+/// the route until the next build.
+#[cfg(feature = "i18n")]
+pub fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    // #1384: the ambient-locale layer must not drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session,
+    // and everything drained here is applied outside the static-first middleware
+    // — that is, outside `SessionLayer`. Out there the session extension does not
+    // exist yet, so a locale persisted by the documented `set_locale_in_session`
+    // switcher would be invisible and content would resolve from
+    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
+    // A handler that deliberately takes no `Locale` argument — the point of the
+    // feature — never runs an extractor later to correct it.
+    //
+    // The i18n bundle `Extension` stays with it. `Locale::from_request_parts`
+    // obtains the bundle exclusively from the request extension that
+    // `install_i18n_bundle_layer` installs as a custom layer; the build drops
+    // the drained set, and without the extension the locale would carry no
+    // bundle, so `t()` would return the raw translation keys into the
+    // pre-rendered output. Registration order (Extension outermost) is
+    // preserved by the stable `partition`, so the ambient layer still reads
+    // the bundle exactly as on the fully-dynamic path.
+    let keep_type_ids = [
+        std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+        std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+    ];
+    custom_layers
+        .into_iter()
+        .partition(|r| keep_type_ids.contains(&r.type_id))
+}
+
+/// The same partition with the `i18n` feature off: nothing is session-scoped,
+/// so every custom layer drains.
+#[cfg(not(feature = "i18n"))]
+pub const fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    (Vec::new(), custom_layers)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
@@ -5798,34 +5867,20 @@ pub fn try_build_router_with_static_inner(
     );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
-    // #1384: the ambient-locale layer must not drain out with the rest. It runs
-    // `Locale::from_request_parts`, whose session step reads the signed session,
-    // and everything drained here is applied outside the static-first middleware
-    // — that is, outside `SessionLayer`. Out there the session extension does not
-    // exist yet, so a locale persisted by the documented `set_locale_in_session`
-    // switcher would be invisible and content would resolve from
-    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
-    // A handler that deliberately takes no `Locale` argument — the point of the
-    // feature — never runs an extractor later to correct it.
-    //
-    // Putting it back on the inner router's context lands it in
-    // `apply_middleware`'s merged tuple, which is inside `session_layer` on both
-    // this path and the fully-dynamic one. The bundle `Extension` still drains
-    // out and stays outer, so the layer can read it.
-    //
-    // Shadowed rather than mutated in place: with the `i18n` feature off this
-    // block vanishes, and a `let mut` the remaining code never reassigns fails
-    // `-D warnings` in every non-unified build (`-p autumn-web`, the sqlite
-    // lane). A `--workspace` build hides that, because another member turns
-    // `i18n` on and Cargo unifies it.
-    #[cfg(feature = "i18n")]
-    let custom_layers = {
-        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
-            .into_iter()
-            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
-        ctx.custom_layers = session_scoped;
-        outside
-    };
+    // The ambient-locale layer stays on the inner router's context, which
+    // lands it in `apply_middleware`'s merged tuple — inside `session_layer`
+    // on both this path and the fully-dynamic one. The i18n bundle
+    // `Extension` stays on the inner router too: the build drops the drained
+    // set outright, and `Locale::from_request_parts` reads the bundle from
+    // that extension exclusively, so draining it would leave translated
+    // `#[static_get]` handlers writing translation keys into `dist`. The
+    // partition is stable, so registration order (Extension outermost) is
+    // preserved and the ambient layer still reads the bundle. Shared with
+    // the static build (`App::run_build_mode`), which renders through the
+    // same pre-layer composition — see
+    // [`partition_custom_layers_for_static_render`].
+    let (session_scoped, custom_layers) = partition_custom_layers_for_static_render(custom_layers);
+    ctx.custom_layers = session_scoped;
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of
@@ -14078,6 +14133,71 @@ mod trusted_host_tests {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // #2405: the static render path drains user layers (#2405)
+    // ----------------------------------------------------------------------
+
+    /// A plain user layer must drain out of the static render entirely: the
+    /// build and ISR regeneration both render through the pre-layer router,
+    /// so the recorded Content-Type and the body on disk are the handler's
+    /// own.
+    #[test]
+    fn static_render_partition_drains_user_layers() {
+        let (kept, drained) =
+            partition_custom_layers_for_static_render(vec![redirect_gate_registration()]);
+        assert!(
+            kept.is_empty(),
+            "user layers must not survive the static-render drain"
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].type_name, "redirect_gate");
+    }
+
+    /// The ambient-locale layer reads the session, so it must stay on the
+    /// inner (pre-layer) router even though every other custom layer drains
+    /// (#1384). The i18n bundle `Extension` must stay too:
+    /// `Locale::from_request_parts` reads the bundle from that extension
+    /// exclusively, and the static build drops the drained set outright, so
+    /// draining it would make translated `#[static_get]` handlers write raw
+    /// translation keys into `dist`. Only the `TypeId`s matter to the
+    /// partition.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_render_partition_keeps_the_ambient_locale_layer() {
+        let ambient = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+            type_name: "ambient_locale",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let bundle_ext = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+            type_name: "i18n_bundle_extension",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let (kept, drained) = partition_custom_layers_for_static_render(vec![
+            redirect_gate_registration(),
+            bundle_ext,
+            ambient,
+        ]);
+        assert_eq!(
+            kept.len(),
+            2,
+            "the ambient-locale layer and the i18n bundle extension must stay"
+        );
+        assert_eq!(kept[0].type_name, "i18n_bundle_extension");
+        assert_eq!(kept[1].type_name, "ambient_locale");
+        assert_eq!(drained.len(), 1, "the user layer must drain");
+        assert_eq!(drained[0].type_name, "redirect_gate");
+    }
+
     /// Create a minimal dist dir with `manifest.json` mapping `/` → an
     /// `index.html` containing the marker text, and return the temp handle
     /// plus the dist path.
@@ -14855,6 +14975,18 @@ pub struct TrustedHostPolicy {
     allow_any: bool,
     allow_missing_host: bool,
     probe_bypass_paths: Arc<std::collections::HashSet<String>>,
+    /// Where a hostname that no static rule matches is looked up (#2657).
+    ///
+    /// A tenant's connected hostname is never in `[security.trusted_hosts]
+    /// hosts` — that is the point of the feature — so without this the
+    /// trusted-host layer answers `400 Invalid Host header` before tenancy
+    /// resolution runs, and custom domains work only with `hosts = ["*"]`.
+    ///
+    /// Read late, not captured, because the registry is published at bind
+    /// time, after the router is built. `None` for a policy built without a
+    /// state (the MCP unit tests); an app that does not enable custom domains
+    /// publishes no registry, so the lookup finds nothing.
+    custom_domains: Option<crate::state::LateExtensions>,
 }
 
 impl TrustedHostPolicy {
@@ -14883,6 +15015,20 @@ impl TrustedHostPolicy {
             allow_any,
             allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
+            custom_domains: None,
+        }
+    }
+
+    /// [`from_config`](Self::from_config), plus the app state that publishes
+    /// the custom-domain registry (#2657).
+    ///
+    /// Every ingress policy is built this way. The state is read per request,
+    /// so a domain connected — or offboarded — while the app runs takes effect
+    /// without a restart.
+    pub(crate) fn from_config_with_state(config: &AutumnConfig, state: &AppState) -> Self {
+        Self {
+            custom_domains: Some(state.late_extensions()),
+            ..Self::from_config(config)
         }
     }
 
@@ -14901,7 +15047,7 @@ impl TrustedHostPolicy {
         if self.allow_any {
             return true;
         }
-        self.rules.iter().any(|rule| {
+        let matches_rule = self.rules.iter().any(|rule| {
             rule.strip_prefix('.').map_or_else(
                 || host == rule,
                 |suffix| {
@@ -14911,6 +15057,21 @@ impl TrustedHostPolicy {
                             .is_some_and(|prefix| prefix.ends_with('.'))
                 },
             )
+        });
+        matches_rule || self.is_connected_domain(host)
+    }
+
+    /// Is `host` a tenant custom domain this deployment serves right now?
+    ///
+    /// Only after the static rules miss, so the common path stays a slice
+    /// comparison. Only a *servable* (`active`) domain passes, which is the
+    /// rule SNI already applies at the handshake: a registration stuck at
+    /// `pending_dns` must not become a way past host validation.
+    fn is_connected_domain(&self, host: &str) -> bool {
+        self.custom_domains.as_ref().is_some_and(|extensions| {
+            extensions
+                .get::<Arc<crate::custom_domain::CustomDomainRegistry>>()
+                .is_some_and(|registry| registry.is_servable(host))
         })
     }
 }
