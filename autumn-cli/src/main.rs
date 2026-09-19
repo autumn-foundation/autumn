@@ -1101,6 +1101,14 @@ enum Commands {
         /// production Dockerfile does this for `embed-assets` builds.
         #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
         features: Option<String>,
+        /// Resolve with the `default` feature disabled.
+        ///
+        /// An app built with `cargo build --no-default-features` links fewer
+        /// crates than the default set; without this the SBOM would list the
+        /// optional dependencies the default feature set pulls in. Composes
+        /// with `--features`.
+        #[arg(long, conflicts_with = "binary")]
+        no_default_features: bool,
         /// Restrict resolution to one target triple.
         ///
         /// Without it the document lists target-specific dependencies for
@@ -4905,6 +4913,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
@@ -4915,6 +4924,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         }),
@@ -6800,6 +6810,7 @@ mod tests {
             expect_version,
             all_features,
             features,
+            no_default_features,
             filter_platform,
         } = cli.command
         else {
@@ -6820,6 +6831,11 @@ mod tests {
              what the document describes by default"
         );
         assert!(features.is_none());
+        assert!(
+            !no_default_features,
+            "the default feature set is what a build actually links by default, \
+             so disabling it must be opt-in"
+        );
         assert!(
             filter_platform.is_none(),
             "a source release is consumed on every platform, so no filter by default"
@@ -6854,6 +6870,19 @@ mod tests {
             panic!("expected Sbom command");
         };
         assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_no_default_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--no-default-features"]).unwrap();
+        let Commands::Sbom {
+            no_default_features,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(no_default_features);
     }
 
     #[test]
