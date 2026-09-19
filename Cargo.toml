@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -34,7 +34,14 @@ repository = "https://github.com/autumn-foundation/autumn"
 
 [workspace.dependencies]
 # Runtime
-axum = { version = "0.8", features = ["macros", "ws"] }
+# `http2` is load-bearing for issue #2321: `autumn/src/tls.rs` advertises
+# `h2` in the rustls ALPN list, and `axum::serve` runs every connection
+# through `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
+# out unless hyper-util's `http2` feature is on (enabled here via
+# `axum/http2`). Without it, a client that negotiates `h2` gets
+# "HTTP/2 is not supported" and the connection dies instead of serving.
+# Pinned by `serve_stack_speaks_http2` in `autumn/src/tls.rs`.
+axum = { version = "0.8", features = ["macros", "ws", "http2"] }
 # Multipart boundary parsing for the submit-token replay guard. `multer` is the
 # exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
 # guard and the extractor can never disagree about the boundary. Already in the
@@ -68,6 +75,11 @@ pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
+# Direct edge for the `serve_stack_speaks_http2` regression test in
+# `autumn/src/tls.rs` (dev-dependency of the `autumn` crate only): it must NOT
+# enable `http2` itself, so that dropping `axum/http2` above breaks the test
+# compile. Pinned to the version already resolved in Cargo.lock.
+hyper-util = { version = "0.1.20", default-features = false, features = ["server", "tokio", "http1"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

@@ -536,6 +536,9 @@ impl ResolvesServerCert for ReloadableCertResolver {
 /// Build the rustls [`ServerConfig`](rustls::ServerConfig) that terminates
 /// inbound TLS, backed by `resolver` so the certificate stays swappable.
 ///
+/// Advertises ALPN `[b"h2", b"http/1.1"]` (#2321) so browsers negotiate
+/// HTTP/2; ALPN-less and http/1.1-only clients are unaffected.
+///
 /// # Errors
 ///
 /// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
@@ -551,7 +554,8 @@ pub fn build_server_config(
 ///
 /// The custom-domain path (#1635) serves a per-SNI resolver rather than the
 /// single swappable certificate, so the listener takes the resolver as a trait
-/// object; everything else about the config is identical.
+/// object; everything else about the config is identical — including the
+/// ALPN `[b"h2", b"http/1.1"]` advertisement (#2321).
 ///
 /// # Errors
 ///
@@ -569,7 +573,8 @@ pub fn build_server_config_with_resolver(
 ///
 /// `None` takes the identical `with_no_client_auth()` path as before, so a
 /// deployment with no `[server.tls.client_auth]` section handshakes exactly as
-/// it did under #1603.
+/// it did under #1603 — apart from the ALPN `[b"h2", b"http/1.1"]`
+/// advertisement (#2321), which both arms set identically.
 ///
 /// # Errors
 ///
@@ -608,9 +613,16 @@ pub fn build_server_config_with_client_auth(
         }
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
     };
-    // `config` is only reassigned in the client-auth arm above; silence the
-    // unused-mut in the server-only build without splitting the match.
-    let _ = &mut config;
+    // Advertise ALPN (#2321). Without an `alpn_protocols` list rustls
+    // completes the handshake with no protocol selected, so a browser (or
+    // `curl --http2`) never sends the HTTP/2 preface and the serve path's
+    // h2 half — `hyper_util::server::conn::auto` already speaks it — stays
+    // dead code in practice. `h2` first, then `http/1.1`: ALPN-less and
+    // http/1.1-only clients are unaffected, and a client offering only `h2`
+    // negotiates it. Both TLS modes funnel through here (static
+    // `[server.tls]` and the ACME path, #1608), as do both client-auth arms
+    // above, so the advertisement is identical everywhere.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -1476,5 +1488,100 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let second = load_certified_key(&cert, &key, &provider, now()).unwrap();
         resolver.store(Arc::clone(&second));
         assert!(Arc::ptr_eq(&resolver.current(), &second));
+    }
+
+    // Regression (#2321): `build_server_config` never set `alpn_protocols`,
+    // so rustls completed the handshake with no protocol selected and every
+    // browser silently fell back to HTTP/1.1 — even though the serve path's
+    // `hyper_util::server::conn::auto` already speaks h2 once the client
+    // sends the preface. The fix advertises `h2` first, then `http/1.1`:
+    // ALPN-less and http/1.1-only clients are unaffected.
+    #[test]
+    fn server_config_advertises_h2_then_http11_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let config =
+            build_server_config(provider, Arc::new(ReloadableCertResolver::new(certified)))
+                .expect("server config builds");
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "the static [server.tls] path must advertise h2 first, then http/1.1"
+        );
+    }
+
+    // The ACME path (#1608) funnels through `build_server_config_with_resolver`
+    // and the client-auth path (#1640) takes a different `match` arm, so pin
+    // the ALPN on both entry points rather than assuming the shared funnel.
+    #[test]
+    fn server_config_with_resolver_and_client_auth_advertise_the_same_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let expected = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let via_resolver = build_server_config_with_resolver(
+            Arc::clone(&provider),
+            Arc::new(ReloadableCertResolver::new(Arc::clone(&certified)))
+                as Arc<dyn ResolvesServerCert>,
+        )
+        .expect("resolver config builds");
+        assert_eq!(
+            via_resolver.alpn_protocols, expected,
+            "the resolver (ACME) entry point must advertise the same ALPN"
+        );
+
+        // rustls refuses to build a client verifier with zero trust anchors
+        // (`NoRootAnchors`) even in `Optional` mode, so load the client CA
+        // fixture instead of an empty store — the anchors are irrelevant to
+        // the ALPN assertion below; only the `Some(verifier)` arm matters.
+        let ca = write_temp(
+            dir.path(),
+            "ca.pem",
+            include_str!("../tests/fixtures/tls/client/ca.cert.pem"),
+        );
+        let verifier = client_auth::build_client_verifier(
+            client_auth::load_client_roots(&ca).expect("client roots load"),
+            vec![],
+            crate::config::ClientAuthMode::Optional,
+            Arc::clone(&provider),
+        )
+        .expect("client verifier builds");
+        let via_client_auth = build_server_config_with_client_auth(
+            provider,
+            Arc::new(ReloadableCertResolver::new(certified)) as Arc<dyn ResolvesServerCert>,
+            Some(verifier),
+        )
+        .expect("client-auth config builds");
+        assert_eq!(
+            via_client_auth.alpn_protocols, expected,
+            "the client-auth arm must advertise the same ALPN"
+        );
+    }
+
+    // Regression (Codex P1 on PR #2780): advertising `h2` in ALPN is only
+    // safe while the serve stack can actually speak HTTP/2. `axum::serve`
+    // runs every connection through
+    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
+    // out unless hyper-util's `http2` feature is enabled (via `axum/http2`
+    // in the workspace Cargo.toml). Without it, a client that negotiates
+    // `h2` gets "HTTP/2 is not supported" and the connection dies instead
+    // of serving — the advertisement becomes a breakage, not an upgrade.
+    //
+    // `Builder::http2()` exists only under hyper-util's `http2` feature,
+    // so this test fails to COMPILE if the feature is ever dropped: that is
+    // the point. The dev-dependency deliberately does not enable `http2`
+    // itself (see the workspace Cargo.toml), so only `axum/http2` keeps
+    // this green.
+    #[test]
+    fn serve_stack_speaks_http2() {
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _ = builder.http2();
     }
 }
