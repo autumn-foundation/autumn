@@ -3992,6 +3992,10 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// silently misses forms like `package= "..."` or `package ="..."`. Also
 /// tolerant of TOML's single-quoted literal-string form (`package =
 /// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
+/// The *key* may likewise be quoted (`"package" = "autumn-web"` is valid
+/// TOML that Cargo treats as the same key), so quote characters are stripped
+/// from the key exactly as they already are from the value — otherwise a
+/// properly-renamed dependency would be missed by the rename gate.
 ///
 /// `pub(super)`: also called from `super::auth`'s `ensure_autumn_web_*_feature`
 /// helpers, which must not treat a `[dependencies.autumn_web]` subtable as the
@@ -4006,7 +4010,8 @@ pub(super) fn declares_package(text: &str, target: &str) -> bool {
     };
     split_top_level_commas(body).into_iter().any(|part| {
         part.split_once('=').is_some_and(|(k, v)| {
-            k.trim() == "package" && v.trim().trim_matches(['"', '\'']) == target
+            k.trim().trim_matches(['"', '\'']) == "package"
+                && v.trim().trim_matches(['"', '\'']) == target
         })
     })
 }
@@ -8513,6 +8518,45 @@ fn main() {
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6\", features = [\"mail\"] }\n";
         let updated = ensure_autumn_web_feature(cargo, "mail");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    /// `declares_package` must accept TOML-quoted `package` keys (Codex review
+    /// on #2771): `"package" = "autumn-web"` is valid TOML that Cargo treats
+    /// as the same key, so the rename gate in `ensure_autumn_web_*_feature`
+    /// must not miss it.
+    #[test]
+    fn declares_package_accepts_quoted_keys() {
+        assert!(declares_package("package = \"autumn-web\"", "autumn-web"));
+        assert!(declares_package(
+            "\"package\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(declares_package("'package' = 'autumn-web'", "autumn-web"));
+        assert!(declares_package(
+            "version = \"0.3\", \"package\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(declares_package(
+            "{ version = \"0.3\", 'package' = \"autumn-web\" }",
+            "autumn-web"
+        ));
+    }
+
+    #[test]
+    fn declares_package_still_rejects_non_package_keys() {
+        assert!(!declares_package("version = \"0.3\"", "autumn-web"));
+        assert!(!declares_package(
+            "packaging = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(!declares_package(
+            "\"packaging\" = \"autumn-web\"",
+            "autumn-web"
+        ));
+        assert!(!declares_package(
+            "package = \"some-other-crate\"",
+            "autumn-web"
+        ));
     }
 
     #[test]
