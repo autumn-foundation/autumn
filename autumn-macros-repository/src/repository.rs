@@ -53,7 +53,7 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<
     Ok(cols)
 }
 
-use crate::model::infer_table_name;
+use autumn_macros_support::naming::infer_table_name;
 
 fn to_snake_case(name: &str) -> String {
     let mut result = String::new();
@@ -27993,5 +27993,39 @@ mod tests {
             chunk_def.contains("1000"),
             "a non-position repository must keep the bulk 1000-row upsert chunk cap: {chunk_def}"
         );
+    }
+
+    // ── Rename-pipeline contract (#1828) ────────────────────────────────────
+    // Moved here from `autumn-macros-support::crate_path`'s tests when the DB
+    // macros were split into their own crates: this pipeline couples the
+    // macro's codegen with the shared crate-path rewrite, so it lives with
+    // the macro it exercises.
+
+    fn ts_string(ts: &proc_macro2::TokenStream) -> String {
+        ts.to_string()
+    }
+
+    /// No genuine `::autumn_web` *token* path (crate-root anchored) may
+    /// survive `finalize`. `to_string()` renders a real `:: Ident ::` token
+    /// sequence with spaces around the identifier; a doc comment or string
+    /// literal's *contents* render with no such surrounding space, so this
+    /// specifically will not (and must not) flag those.
+    fn assert_no_leaked_autumn_web_token_path(s: &str) {
+        assert!(
+            !s.contains(":: autumn_web"),
+            "leaked `::autumn_web` token path in: {s}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        use autumn_macros_support::crate_path::{finalize, set_target};
+
+        let _guard = set_target(Some("renamed_autumn_web"));
+        let generated = repository_macro(quote! { Post }, quote! { pub trait PostRepository {} });
+        let rewritten = finalize(generated);
+        let s = ts_string(&rewritten);
+        assert_no_leaked_autumn_web_token_path(&s);
+        assert!(s.contains("renamed_autumn_web"), "got: {s}");
     }
 }

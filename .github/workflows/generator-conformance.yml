@@ -68,6 +68,11 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The macro crate split (#2809). These shards generate the model and
+      # repository surface a fresh scaffold compiles against.
+      - "autumn-macros-model/**"
+      - "autumn-macros-repository/**"
+      - "autumn-macros-support/**"
       # The `autumn plugin add` install gate (#1606) compiles each
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.
@@ -132,6 +137,11 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The macro crate split (#2809). These shards generate the model and
+      # repository surface a fresh scaffold compiles against.
+      - "autumn-macros-model/**"
+      - "autumn-macros-repository/**"
+      - "autumn-macros-support/**"
       # The `autumn plugin add` install gate (#1606) compiles each
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.

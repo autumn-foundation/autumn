@@ -220,6 +220,7 @@ dependencies = [
 name = "autumn-macros"
 version = "0.7.0"
 dependencies = [
+ "autumn-macros-support",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -229,11 +230,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-macros-model"
+version = "0.7.0"
+dependencies = [
+ "autumn-macros-support",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "autumn-macros-repository"
+version = "0.7.0"
+dependencies = [
+ "autumn-macros-support",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "autumn-macros-support"
+version = "0.7.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "autumn-web"
 version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "autumn-macros",
+ "autumn-macros-model",
+ "autumn-macros-repository",
  "axum",
  "base64 0.23.1",
  "bcrypt",

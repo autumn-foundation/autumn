@@ -90,6 +90,7 @@ const DEFAULT_NAME: &str = "autumn_web";
 /// `crate_name`'s own invalidation, or (Codex review, #2552) getting
 /// initialized from a test's temporarily-swapped `CARGO_MANIFEST_DIR` and
 /// staying poisoned with that fixture's answer for the rest of the process.
+#[must_use]
 pub fn resolve_autumn_web_name() -> String {
     match crate_name("autumn-web") {
         Ok(FoundCrate::Name(name)) => name,
@@ -103,8 +104,9 @@ pub fn resolve_autumn_web_name() -> String {
     }
 }
 
-/// Parse a `crate = "..."` override out of a macro's top-level attribute
-/// tokens — the escape hatch for a downstream crate that must host two
+/// Parse a `crate = "..."` override out of a macro's top-level attribute tokens.
+///
+/// This is the escape hatch for a downstream crate that must host two
 /// versions of `autumn-web` at once, where automatic resolution above is
 /// ambiguous (issue #1828). Returns the remaining tokens, with the override
 /// (if any) removed, for the macro's own parser to consume unchanged.
@@ -114,6 +116,12 @@ pub fn resolve_autumn_web_name() -> String {
 /// pair (`syn::Ident::parse` rejects keywords) — every attribute macro can
 /// therefore support this override with no grammar changes and no ambiguity
 /// against any existing usage.
+///
+/// # Errors
+///
+/// Returns `Err` (as a compile-error token stream) when the `crate = ...`
+/// value is not a string literal, or when the string is not a valid Rust
+/// identifier.
 pub fn extract_crate_override(
     attr: TokenStream,
 ) -> Result<(Option<String>, TokenStream), TokenStream> {
@@ -204,10 +212,11 @@ thread_local! {
     static CURRENT_TARGET: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// RAII guard returned by [`set_target`]; restores the previous target on
-/// drop (including on unwind), so a nested or short-circuiting return can't
-/// leave a stale target for whatever this same compiler process expands
-/// next.
+/// RAII guard returned by [`set_target`].
+///
+/// Restores the previous target on drop (including on unwind), so a nested
+/// or short-circuiting return can't leave a stale target for whatever this
+/// same compiler process expands next.
 pub struct TargetGuard {
     previous: Option<String>,
 }
@@ -218,13 +227,14 @@ impl Drop for TargetGuard {
     }
 }
 
-/// Set the crate-name target for the rest of the current scope (until the
-/// returned guard drops) — the given override, or the automatically detected
-/// default when `None`. Bind the result (`let _guard = ...;`), covering the
-/// entire expansion: both the later [`finalize`] pass over this macro's own
-/// output, and any nested call into this crate's own generators or
-/// recognizers, which need the same resolved name while *they* run, not just
-/// once their result is finalized.
+/// Set the crate-name target for the rest of the current scope.
+///
+/// Uses the given override, or the automatically detected default when
+/// `None`. Bind the result (`let _guard = ...;`), covering the entire
+/// expansion: both the later [`finalize`] pass over this macro's own output,
+/// and any nested call into this crate's own generators or recognizers,
+/// which need the same resolved name while *they* run, not just once their
+/// result is finalized.
 pub fn set_target(crate_override: Option<&str>) -> TargetGuard {
     let target: String =
         crate_override.map_or_else(resolve_autumn_web_name, std::borrow::ToOwned::to_owned);
@@ -232,10 +242,12 @@ pub fn set_target(crate_override: Option<&str>) -> TargetGuard {
     TargetGuard { previous }
 }
 
-/// The crate-name target the innermost enclosing [`set_target`] scope set,
-/// or the unrenamed default if none is active (e.g. a unit test in this
-/// crate calling a generator or recognizer directly, without going through
-/// `lib.rs`'s macro entry points).
+/// The crate-name target the innermost enclosing [`set_target`] scope set.
+///
+/// Falls back to the unrenamed default if none is active (e.g. a unit test
+/// in this crate calling a generator or recognizer directly, without going
+/// through `lib.rs`'s macro entry points).
+#[must_use]
 pub fn current_target() -> String {
     CURRENT_TARGET.with(|cell| {
         cell.borrow()
@@ -245,8 +257,10 @@ pub fn current_target() -> String {
 }
 
 /// Rewrite every macro-generated `::autumn_web` path to [`current_target`].
+///
 /// A no-op whenever that target is the unrenamed default — the overwhelming
 /// majority of expansions, since a rename or override is rare.
+#[must_use]
 pub fn finalize(ts: TokenStream) -> TokenStream {
     let target = current_target();
     if target == DEFAULT_NAME {
@@ -339,11 +353,14 @@ fn raw_escape(target: &str) -> (bool, &str) {
     }
 }
 
-/// The source text for [`current_target`] as a path segment, escaped for
-/// embedding inside a string literal that gets re-parsed as a path — the
-/// shape `#[serde(crate = "...")]` and `#[serde(deserialize_with = "...")]`
-/// need (`model.rs`, `event.rs`), since those never pass through the token
-/// rewrite [`ident_for_target`] backs (see the module doc).
+/// The source text for [`current_target`] as a path segment.
+///
+/// Escaped for embedding inside a string literal that gets re-parsed as a
+/// path — the shape `#[serde(crate = "...")]` and
+/// `#[serde(deserialize_with = "...")]` need (`model.rs`, `event.rs`), since
+/// those never pass through the token rewrite [`ident_for_target`] backs
+/// (see the module doc).
+#[must_use]
 pub fn escaped_target_path_segment(target: &str) -> String {
     let (raw, bare) = raw_escape(target);
     if raw {
@@ -353,17 +370,19 @@ pub fn escaped_target_path_segment(target: &str) -> String {
     }
 }
 
-/// [`escaped_target_path_segment`] of [`current_target`] — what a
-/// recognizer comparing a path's crate-root `Ident` against the actively
-/// resolved name must compare against instead of the bare name, once a
-/// keyword rename is in play. A raw identifier `Ident` (`r#type`) compares
-/// equal to the *escaped* string `"r#type"`, not the bare `"type"` — using
-/// [`current_target`] directly here has the same effect as skipping this
-/// module's own [`ident_for_target`] when *emitting* the identifier: both
-/// silently produce a token that no longer matches what it's supposed to
-/// (Codex review, #2552, round 2 of the keyword-rename fix — this recognizer
-/// side was still comparing against the bare name after the emission side
-/// was already fixed).
+/// [`escaped_target_path_segment`] of [`current_target`].
+///
+/// What a recognizer comparing a path's crate-root `Ident` against the
+/// actively resolved name must compare against instead of the bare name,
+/// once a keyword rename is in play. A raw identifier `Ident` (`r#type`)
+/// compares equal to the *escaped* string `"r#type"`, not the bare `"type"`
+/// — using [`current_target`] directly here has the same effect as skipping
+/// this module's own [`ident_for_target`] when *emitting* the identifier:
+/// both silently produce a token that no longer matches what it's supposed
+/// to (Codex review, #2552, round 2 of the keyword-rename fix — this
+/// recognizer side was still comparing against the bare name after the
+/// emission side was already fixed).
+#[must_use]
 pub fn current_target_path_segment() -> String {
     escaped_target_path_segment(&current_target())
 }
@@ -737,136 +756,4 @@ mod tests {
     // `::autumn_web` path some way our generic token walk doesn't expect
     // (e.g. through a helper that doesn't route through `quote!` the way
     // every test elsewhere in this file assumes).
-
-    /// The contract these pipeline tests check: no genuine `::autumn_web`
-    /// *token* path (crate-root anchored) survives `finalize`. `to_string()`
-    /// renders a real `:: Ident ::` token sequence with spaces around the
-    /// identifier (`":: renamed_autumn_web ::"`, matching e.g.
-    /// `rewrite_bare_path_segment_to_override` above); a doc comment or other
-    /// string literal's *contents* render with no such surrounding space,
-    /// however they read, since a literal is one opaque token — so this
-    /// specifically will not (and must not) flag those. Doc comments
-    /// generated by these pipelines legitimately still say `::autumn_web`
-    /// after a rename (string literals are never rewritten — see the module
-    /// doc); that's an accepted, purely cosmetic trade-off against the
-    /// alternative of risking corruption of a user's own string data.
-    fn assert_no_leaked_autumn_web_token_path(s: &str) {
-        assert!(
-            !s.contains(":: autumn_web"),
-            "leaked `::autumn_web` token path in: {s}"
-        );
-    }
-
-    #[test]
-    fn route_macro_pipeline_has_no_leaked_autumn_web_after_override() {
-        let _guard = set_target(Some("renamed_autumn_web"));
-        let generated = crate::route::route_macro(
-            "GET",
-            "get",
-            quote! { "/users/{id}", seo(title = "User") },
-            quote! {
-                async fn show_user(Path(id): Path<i64>) -> AutumnResult<Json<User>> {
-                    Ok(Json(repo.find_by_id(id).await?))
-                }
-            },
-        );
-        let rewritten = finalize(generated);
-        let s = ts_string(&rewritten);
-        assert_no_leaked_autumn_web_token_path(&s);
-        assert!(s.contains("renamed_autumn_web"), "got: {s}");
-    }
-
-    #[test]
-    #[cfg(feature = "db")]
-    fn model_macro_pipeline_has_no_leaked_autumn_web_after_override() {
-        let _guard = set_target(Some("renamed_autumn_web"));
-        let item = quote! {
-            struct Post {
-                #[id]
-                id: i64,
-                title: String,
-            }
-        };
-        let generated = crate::model::model_macro(quote! {}, item);
-        let rewritten = finalize(generated);
-        let s = ts_string(&rewritten);
-        assert_no_leaked_autumn_web_token_path(&s);
-        assert!(s.contains("renamed_autumn_web"), "got: {s}");
-        // The `deserialize_with`/`#[serde(crate = "...")]` string values this
-        // pipeline builds (issue #1828's original literal-rewrite targets)
-        // must reflect the active target too — proving `current_target()` at
-        // the source beats the removed post-hoc literal rewrite.
-        assert!(
-            s.contains("renamed_autumn_web :: reexports :: serde"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "db")]
-    fn repository_macro_pipeline_has_no_leaked_autumn_web_after_override() {
-        let _guard = set_target(Some("renamed_autumn_web"));
-        let generated = crate::repository::repository_macro(
-            quote! { Post },
-            quote! { pub trait PostRepository {} },
-        );
-        let rewritten = finalize(generated);
-        let s = ts_string(&rewritten);
-        assert_no_leaked_autumn_web_token_path(&s);
-        assert!(s.contains("renamed_autumn_web"), "got: {s}");
-    }
-
-    /// Regression test for the exact scenario a Codex review on #2552 found:
-    /// stacking `#[authorize]` above `#[secured]` under a rename must still
-    /// let the route macro recognize the replay guard `#[authorize]`'s own
-    /// (already-finalized, already-renamed) expansion injected, rather than
-    /// missing it because the recognizer only knew the literal
-    /// `"autumn_web"`.
-    #[test]
-    fn replay_guard_recognized_after_stacked_macro_rename() {
-        let _guard = set_target(Some("renamed_autumn_web"));
-        // Simulate what `#[authorize]` (or `#[secured]`/`#[step_up]`) leaves
-        // behind once ITS OWN `finalize` has already run: a block whose
-        // early-return replay check is rooted at the *renamed* crate, not
-        // `autumn_web` literally.
-        let block: syn::Block = syn::parse_quote! {{
-            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::renamed_autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return __autumn_response;
-            }
-        }};
-        assert!(
-            crate::idempotency_guard::block_has_replay_guard(&block),
-            "recognizer must accept the actively-resolved crate name, not just the literal \
-             \"autumn_web\""
-        );
-    }
-
-    /// Regression test for a second Codex round on the same #2552 scenario:
-    /// once the target is a keyword (`"type"`, from automatic resolution —
-    /// see `ident_for_target`/`rewrite`), an earlier-expanded macro's own
-    /// `finalize` pass emits the *raw* identifier `r#type`, not the bare
-    /// `type`. A recognizer comparing against the bare `current_target()`
-    /// (rather than `current_target_path_segment()`, which accounts for the
-    /// raw prefix) misses the match — the same class of bug as
-    /// `replay_guard_recognized_after_stacked_macro_rename` above, just
-    /// triggered by a keyword target instead of a plain renamed one.
-    #[test]
-    fn replay_guard_recognized_after_stacked_macro_rename_with_keyword_target() {
-        let _guard = set_target(Some("type"));
-        let block: syn::Block = syn::parse_quote! {{
-            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::r#type::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return __autumn_response;
-            }
-        }};
-        assert!(
-            crate::idempotency_guard::block_has_replay_guard(&block),
-            "recognizer must compare against the raw-escaped target, not the bare keyword"
-        );
-    }
 }

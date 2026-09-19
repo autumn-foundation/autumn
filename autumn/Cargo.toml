@@ -68,7 +68,8 @@ constela = ["maud"]
 # constructed, used and dropped only on those threads, never inside the async
 # runtime.
 db = [
-    "autumn-macros/db",
+    "dep:autumn-macros-model",
+    "dep:autumn-macros-repository",
     "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
@@ -292,12 +293,17 @@ autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
 wasmi = { version = "0.40", optional = true }
-# `default-features = false` drops the `#[model]` / `#[repository]` codegen from
-# the macro crate; the `db` feature above forwards it back on. A no-database app
-# could never reach either macro anyway (both re-exports are `#[cfg(feature =
-# "db")]` in `src/lib.rs`), and skipping them cuts the macro crate's own compile
-# time by ~90% on the no-DB onboarding path (issue #2309).
+# `default-features = false` drops the database-layer macros from the core
+# macro crate; the `db` feature above pulls them back in through the
+# `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app
+# could never reach those macros anyway (their re-exports are `#[cfg(feature =
+# "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
+# on the no-DB onboarding path (issue #2309).
 autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
+# Database-layer proc macros, split out of `autumn-macros` so a no-database
+# build never compiles their codegen. Optional: enabled by the `db` feature.
+autumn-macros-model = { version = "0.7.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.7.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -869,7 +875,7 @@ path = "tests/sqlite_json_field_conversion.rs"
 # tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
 # `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
 # SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
-# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# autumn-macros-repository expansion test. Only meaningful under `--features sqlite`; the
 # file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
 # an empty (passing) binary. Run explicitly:
 # `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.

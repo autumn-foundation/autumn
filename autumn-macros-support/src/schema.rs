@@ -1,7 +1,7 @@
 //! Field-level serde / JSON-schema helpers shared by the `#[model]` macro and
 //! the `#[derive(OpenApiSchema)]` derive.
 //!
-//! These live in their own module (rather than inside [`crate::model`]) so the
+//! These live in their own module (rather than inside `autumn-macros-model`) so the
 //! always-compiled `OpenApiSchema` derive does not drag the database-oriented
 //! `#[model]` codegen — which is gated behind the crate's `db` feature — into
 //! a no-database build. See `openapi_schema.rs` for the derive and `model.rs`
@@ -13,33 +13,41 @@ use quote::quote;
 use syn::Field;
 
 /// Whether a field carries the named marker attribute (e.g. `#[id]`).
+#[must_use]
 pub fn has_attr(field: &Field, name: &str) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-/// Whether a field is declared `#[translatable]` (issue #1384): its column
-/// holds an `autumn_web::i18n::Translated` container — an independent value
-/// per locale tag — instead of a single monolingual string.
+/// Whether a field is declared `#[translatable]` (issue #1384).
+///
+/// Its column holds an `autumn_web::i18n::Translated` container — an
+/// independent value per locale tag — instead of a single monolingual
+/// string.
+#[must_use]
 pub fn field_is_translatable(field: &syn::Field) -> bool {
     has_attr(field, "translatable")
 }
 
-/// Whether a field is declared `#[collaborative]` (issue #1806): its column
-/// holds an `autumn_web::collab::CollabText` document — a text CRDT that
-/// merges concurrent edits — instead of a plain string that the last writer
-/// overwrites.
+/// Whether a field is declared `#[collaborative]` (issue #1806).
+///
+/// Its column holds an `autumn_web::collab::CollabText` document — a text
+/// CRDT that merges concurrent edits — instead of a plain string that the
+/// last writer overwrites.
+#[must_use]
 pub fn field_is_collaborative(field: &syn::Field) -> bool {
     has_attr(field, "collaborative")
 }
 
-/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
-/// to *serialization*, if any. Handles both the plain form and the split
+/// The struct-level `#[serde(rename_all = "...")]` casing rule for serialization.
+///
+/// Handles both the plain form and the split
 /// `rename_all(serialize = "...", deserialize = "...")` form (taking the
 /// `serialize` side — that is what `Changeset::field_value` indexes by).
 ///
 /// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
 /// list this parser can't fully walk simply yields no rule (the real serde
 /// derive still validates the attribute itself).
+#[must_use]
 pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
     let mut rule = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -71,11 +79,13 @@ pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<Strin
     rule
 }
 
-/// The field-level `#[serde(rename = "...")]` name that applies to
-/// *serialization*, if any. Handles both the plain form and the split
+/// The field-level `#[serde(rename = "...")]` name for serialization.
+///
+/// Handles both the plain form and the split
 /// `rename(serialize = "...", deserialize = "...")` form (taking the
 /// `serialize` side). Field-level `rename` overrides a struct-level
 /// `rename_all`, mirroring serde's own precedence.
+#[must_use]
 pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
     let mut renamed = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -107,11 +117,13 @@ pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
     renamed
 }
 
-/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
-/// (`snake_case`) field identifier, mirroring `serde_derive`'s
-/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
-/// itself would reject (the `Serialize` derive on the emitted struct then
-/// reports the error — no point duplicating it here).
+/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule.
+///
+/// Applies the rule to a (`snake_case`) field identifier, mirroring
+/// `serde_derive`'s `RenameRule::apply_to_field`. Returns `None` for a rule
+/// string serde itself would reject (the `Serialize` derive on the emitted
+/// struct then reports the error — no point duplicating it here).
+#[must_use]
 pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
     fn pascal(field: &str) -> String {
         field
@@ -148,6 +160,7 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
 /// `skip`, `skip_serializing`, `skip_deserializing`, `untagged`, `default` in
 /// its bare form. Returns the first match, so callers can name it in a
 /// diagnostic.
+#[must_use]
 pub fn serde_bare_word(attrs: &[syn::Attribute], words: &[&'static str]) -> Option<&'static str> {
     let mut found = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -168,6 +181,7 @@ pub fn serde_bare_word(attrs: &[syn::Attribute], words: &[&'static str]) -> Opti
 ///
 /// For the value-taking attributes that change the wire shape: `into`, `from`,
 /// `try_from`, `tag`, `content`, and the field-level `default = "path"`.
+#[must_use]
 pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Option<&'static str> {
     let mut found = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -194,11 +208,13 @@ pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Opti
 /// and its audit (which must NOT refuse `skip_serializing_if` on a field serde
 /// can fill in). Those two have to agree on what "defaulted" means, so they ask
 /// the same function rather than each spelling the check out (issue #802).
+#[must_use]
 pub fn has_serde_default(attrs: &[syn::Attribute]) -> bool {
     serde_bare_word(attrs, &["default"]).is_some()
         || serde_valued_key(attrs, &["default"]).is_some()
 }
 
+#[must_use]
 pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
     let mut conditional = false;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -225,6 +241,7 @@ pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
 ///
 /// Returns `None` for a rule string serde itself would reject; the `Serialize`
 /// derive on the same enum then reports the error, so this does not duplicate it.
+#[must_use]
 pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Option<String> {
     // serde's own variant→snake_case: insert `_` before every uppercase char
     // after the first, then lowercase. (`XMLHttpRequest` → `x_m_l_http_request`,
@@ -277,6 +294,7 @@ pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Opti
 /// accept.
 ///
 /// Returns `None` for the default representation.
+#[must_use]
 pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static str> {
     let mut found = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -343,6 +361,7 @@ fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Resu
 /// Routed through [`consume_unrecognized_meta`] like every other scanner here,
 /// so a sibling list-valued attribute — `#[serde(bound(deserialize = "…"),
 /// alias = "legacy")]` — cannot abort the walk before `alias` is reached.
+#[must_use]
 pub fn variant_has_serde_alias(variant: &syn::Variant) -> bool {
     has_serde_alias(&variant.attrs)
 }
@@ -353,6 +372,7 @@ pub fn variant_has_serde_alias(variant: &syn::Variant) -> bool {
 /// deserialize-only widening in both places. One predicate serves both, so the
 /// two callers cannot drift the way the audit and the emitter drifted over
 /// `default` (issue #802).
+#[must_use]
 pub fn has_serde_alias(attrs: &[syn::Attribute]) -> bool {
     let mut found = false;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -372,6 +392,7 @@ pub fn has_serde_alias(attrs: &[syn::Attribute]) -> bool {
     found
 }
 
+#[must_use]
 pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> {
     let mut renamed = None;
     for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -413,6 +434,7 @@ pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> 
 ///
 /// Returns the attribute word (`rename_all` / `rename`) when the two sides are
 /// present and differ.
+#[must_use]
 pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option<&'static str> {
     let mut split = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -467,6 +489,7 @@ pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option
 /// the handler accepts. Neither can be inferred away, so the derive refuses the
 /// enum instead of publishing a half-true set. Plain `#[serde(skip)]` is
 /// unambiguous (gone from both directions) and stays supported.
+#[must_use]
 pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> {
     let mut found = None;
     for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -487,12 +510,14 @@ pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> 
 /// The field-level twin of [`variant_directional_skip`], with the same reasoning:
 /// a field present in only one serde direction has no correct rendering in a
 /// schema that describes both.
+#[must_use]
 pub fn variant_directional_skip_on_field(field: &syn::Field) -> Option<&'static str> {
     serde_bare_word(&field.attrs, &["skip_serializing", "skip_deserializing"])
 }
 
 /// Whether a variant carries `#[serde(skip)]`, in which case it never appears
 /// on the wire in either direction and must not be advertised.
+#[must_use]
 pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
     let mut skipped = false;
     for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -525,6 +550,7 @@ pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
 /// `#[derive(OpenApiSchema)]`, `#[model]`, and `FormModel` code paths in
 /// lockstep on the same serde helpers rather than duplicating a
 /// deserialize-side variant.
+#[must_use]
 pub fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -> Option<String> {
     let ident = field.ident.as_ref()?;
     let raw = ident.to_string();
@@ -537,6 +563,7 @@ pub fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -
 }
 
 /// Check whether a type is `Option<...>`.
+#[must_use]
 pub fn is_option_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(tp) = ty {
         tp.path
@@ -549,8 +576,9 @@ pub fn is_option_type(ty: &syn::Type) -> bool {
 }
 
 /// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
+#[must_use]
 pub fn type_name_str(ty: &syn::Type) -> String {
-    crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
+    last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Emit the JSON-Schema `TokenStream` for a `#[collaborative]` field.
@@ -669,6 +697,7 @@ fn emit_collaborative_schema_tokens() -> TokenStream {
 /// that merely happens to be called `Translated` (`domain::Translated`) keeps
 /// its ordinary `$ref`, so the advertised contract cannot silently disagree
 /// with what that type actually serializes to.
+#[must_use]
 pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
     if field_is_collaborative(field) {
         return emit_collaborative_schema_tokens();
@@ -780,9 +809,16 @@ fn emit_option_schema_tokens(ty: &syn::Type, inner: &syn::Type) -> TokenStream {
 ///
 /// Handles `Option<T>` (nullable), `Vec<T>` (array), primitives (`String`,
 /// `i64`, etc.), and everything else as a `$ref` to a component schema.
+///
+/// # Panics
+///
+/// Panics if the scalar tables diverge: `scalar_json_schema` and
+/// `scalar_identity_predicate` must cover the same type names (internal
+/// invariant — both are fed from the same list).
+#[must_use]
 pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
-    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
+    if let Some(inner) = unwrap_single_generic(ty, "Option") {
         return emit_option_schema_tokens(ty, &inner);
     }
 
@@ -792,7 +828,7 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // last path segment but is not an array, so the array body is the MATCHED
     // arm and anything else falls through to its registered schema or an
     // honest `$ref`.
-    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
+    if let Some(inner) = unwrap_single_generic(ty, "Vec") {
         let inner_tokens = emit_json_schema_tokens(&inner);
         let matched = quote! {{
             let __items = #inner_tokens;
@@ -863,7 +899,7 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         );
     }
 
-    crate::api_doc::primitive_json_type(&name).map_or_else(
+    primitive_json_type(&name).map_or_else(
         || {
             // Emit the `$ref` against the field type's FULL `type_name` identity
             // (built at runtime), NOT its short last segment, so the finalize
@@ -1155,6 +1191,11 @@ pub fn emit_schema_fn_body_full(
 /// model's rename metadata would advertise `authorName` for a body serde only
 /// accepts as `author_name`, and every generated client's POST would fail with
 /// a missing-field error (issue #802).
+///
+/// # Panics
+///
+/// Panics on unnamed (tuple-struct) fields: every field must have an
+/// identifier to advertise.
 pub fn emit_schema_fn_body_named(
     fields: &[&&Field],
     all_optional: bool,
@@ -1308,6 +1349,29 @@ pub fn emit_schema_fn_body_named(
     }
 }
 
+/// Map a short Rust primitive name to its JSON-schema `type` keyword.
+#[must_use]
+pub fn primitive_json_type(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "String" | "str" => "string",
+        "bool" => "boolean",
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
+            "integer"
+        }
+        "f32" | "f64" => "number",
+        _ => return None,
+    })
+}
+
+/// Return the final identifier in a type's path (e.g. `foo::Bar` → `"Bar"`).
+#[must_use]
+pub fn last_segment_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        syn::Type::Reference(r) => last_segment_name(&r.elem),
+        _ => None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use quote::quote;
@@ -1422,4 +1486,32 @@ mod tests {
         // A rule serde itself rejects resolves to no rename here.
         assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
     }
+}
+
+#[test]
+fn primitive_json_type_matches_common() {
+    assert_eq!(primitive_json_type("String"), Some("string"));
+    assert_eq!(primitive_json_type("i64"), Some("integer"));
+    assert_eq!(primitive_json_type("bool"), Some("boolean"));
+    assert_eq!(primitive_json_type("Foo"), None);
+}
+
+/// If `ty` is `Name<Inner>` (single generic argument), return `Inner`.
+/// The outermost segment of `ty`'s path must match `wrapper`.
+#[must_use]
+pub fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let last = path.path.segments.last()?;
+    if last.ident != wrapper {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    })
 }
