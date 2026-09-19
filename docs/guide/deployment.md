@@ -1463,11 +1463,6 @@ online-safe snapshot of the file with no external tools.
   cutover leaves the previous release serving against the migrated schema with
   nothing saying so. See
   [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
-- **A compensated first deploy leaves its proxy route behind.** When the fleet
-  removes a host's just-completed *first* deploy, that host's kamal-proxy still
-  holds a route pointing at the (now stopped) slot, so its public port answers
-  `502` instead of refusing the connection until the host is deployed again. The
-  state table names the host so this is never a surprise.
 - **Host identity is compared literally.** Duplicate `[deploy] hosts` entries are
   refused after trimming, but two DNS names for the same machine are not detected
   — the same limitation `autumn migrate` has for duplicate target URLs.

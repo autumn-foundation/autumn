@@ -109,6 +109,53 @@ ok() {
 }
 
 # ---------------------------------------------------------------------------
+# Read the `changelog.d/` fragments with the changelog.
+#
+# A release note is written as its own file now, because the top of the
+# Unreleased section was a line every open PR edited and therefore a conflict
+# every open PR carried. The note still has to reach THIS gate on the day the
+# PR lands: a breaking change found at release time is found too late to write
+# the guide while the author still remembers the break.
+#
+# `changelog_view` splices the fragments into the Unreleased section, so every
+# check below runs over the section as the release will read it. A finding
+# names a line of that merged view; its entry text names the fragment.
+#
+# Fails closed: a fragment directory this gate cannot read is a breaking
+# change it cannot see.
+# ---------------------------------------------------------------------------
+# One cleanup and one trap for every temporary this gate makes. A second
+# `trap ... EXIT` replaces the first, and the cleanup that got replaced is the
+# one that leaks.
+merged_changelog=""
+defs_dir=""
+cleanup() {
+  [[ -n "$merged_changelog" ]] && rm -rf "$(dirname "$merged_changelog")"
+  [[ -n "$defs_dir" ]] && rm -rf "$defs_dir"
+  return 0
+}
+trap cleanup EXIT
+
+CHANGELOG_FRAGMENT_DIR="${CHANGELOG_FRAGMENT_DIR:-changelog.d}"
+if [[ -d "$CHANGELOG_FRAGMENT_DIR" ]]; then
+  changelog_lib="$root/scripts/lib/changelog.sh"
+  [[ -f "$changelog_lib" ]] || {
+    echo "error: $CHANGELOG_FRAGMENT_DIR exists but $changelog_lib does not" >&2
+    exit 1
+  }
+  CHANGELOG_FILE="$CHANGELOG"
+  # shellcheck source=scripts/lib/changelog.sh
+  source "$changelog_lib"
+  if [[ -n "$(changelog_fragment_paths)" ]]; then
+    merged_changelog="$(mktemp -d)/CHANGELOG.md-with-changelog.d"
+    changelog_view > "$merged_changelog"
+    echo "note:  read $CHANGELOG with $(changelog_fragment_paths | wc -l | tr -d ' ') changelog.d fragment(s) spliced in."
+    echo "note:  a finding below cites that merged file, and names the entry it found."
+    CHANGELOG="$merged_changelog"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Shared markdown state machine, injected into every awk program below.
 #
 # awk has no include, and this script runs three separate awk processes over
@@ -1225,7 +1272,6 @@ function scan_comments(text, enter,   out, masked, pos, close_at, head, tail) {
 # resolve links.
 # ---------------------------------------------------------------------------
 defs_dir="$(mktemp -d)"
-trap 'rm -rf "$defs_dir"' EXIT
 
 collect_link_defs() {
   local src="$1" out="$2"

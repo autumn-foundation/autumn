@@ -1944,6 +1944,9 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
+        // Shared with the collaboration hub, for the reason `app.rs` gives.
+        #[cfg(feature = "presence")]
+        let test_presence = crate::presence::Presence::new(test_channels.clone());
         // Resolve the injected clock BEFORE the state literal so `started_at`
         // is stamped on the same timeline the app will read time from. A sim
         // installs a virtual clock here, and uptime has to start at that
@@ -2018,8 +2021,10 @@ impl TestApp {
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: crate::collab::CollabHub::new(test_channels.clone(), test_presence.clone()),
             #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(test_channels.clone()),
+            presence: test_presence,
             #[cfg(feature = "ws")]
             channels: test_channels,
 
@@ -2170,6 +2175,14 @@ impl TestApp {
                 #[cfg(feature = "presence")]
                 {
                     state.presence = crate::presence::Presence::new(state.channels.clone());
+                    // Same reason as `app.rs`: the hub captured the old pair.
+                    #[cfg(feature = "collab")]
+                    {
+                        state.collab = crate::collab::CollabHub::new(
+                            state.channels.clone(),
+                            state.presence.clone(),
+                        );
+                    }
                 }
             }
             recorder_for_client
