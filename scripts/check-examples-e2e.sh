@@ -104,12 +104,12 @@ echo "              the full compose integration is a follow-up gate." >&2
 echo "" >&2
 
 # Ephemeral Postgres instances each example's smoke provisions (0 = none).
-# hello has no database; bookmarks-distributed needs a primary + a
-# replica-stand-in; bookmarks-sharded needs a control + two shards. Every
-# other supported example needs exactly one.
+# hello and collab-notes have no database; bookmarks-distributed needs a
+# primary + a replica-stand-in; bookmarks-sharded needs a control + two shards.
+# Every other supported example needs exactly one.
 db_requirement() {
   case "$1" in
-    hello) echo 0 ;;
+    hello | collab-notes) echo 0 ;;
     bookmarks-distributed) echo 2 ;;
     bookmarks-sharded) echo 3 ;;
     *) echo 1 ;;

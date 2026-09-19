@@ -16,6 +16,13 @@ autotests = false
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
+# Conflict-free collaborative editing (issue #1806). Adds
+# `autumn_web::collab`: an in-tree RGA text CRDT (`CollabText`), the
+# `#[collaborative]` model field marker, and the session hub that streams ops
+# and cursors over the existing channel/presence seams. Zero new dependencies.
+# The hub half additionally needs `presence`; the CRDT, the marker and the
+# offline-sync resolver compile without it.
+collab = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -475,9 +482,20 @@ nix = { version = "0.31.2", features = ["fs"] }
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
 diesel = { version = "2", features = ["chrono", "postgres"] }
+# `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
+# the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
+# (issue #2597): generated apps get `db-diesel2-postgres` from the model
+# generator's `MODEL_DEPS`, but the `autumn-web` lib itself only enables
+# `serde`, so the in-repo test target needs the feature here. Test-only — the
+# sqlite `cargo build` / `clippy --lib` lanes never build dev-dependencies.
+rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
+# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
+# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
+# without `http2` — see the workspace dependency comment.
+hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
@@ -571,6 +589,17 @@ harness = false
 name = "repository_crud"
 harness = false
 required-features = ["db"]
+
+# Multi-page invoice workload for profilers, driving `Pdf::from_html`/
+# `Pdf::render` through the real HTML parser (`pdf::html`) and layout
+# walker/word-wrapper/PDF writer (`pdf::layout`) — the framework's HTML-to-PDF
+# export path (`examples/invoice`'s `invoice_pdf` handler drives the same
+# `render` call via `from_markup`). `required-features` since `pdf` is an
+# opt-in feature, unlike the other benches in this crate.
+[[bench]]
+name = "pdf_render"
+harness = false
+required-features = ["pdf"]
 
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
@@ -862,6 +891,14 @@ path = "tests/sqlite_upsert_isolation.rs"
 name = "sqlite_votable"
 path = "tests/sqlite_votable.rs"
 
+# SQLite golden suite for the double-entry money ledger (issue #1837). Runs
+# Docker-free on every push; the Postgres fork is
+# `tests/integration/money_ledger_postgres.rs`, which the CI Docker sweep picks
+# up. Needs `--features sqlite`. See the file's module doc for what it pins.
+[[test]]
+name = "sqlite_money_ledger"
+path = "tests/sqlite_money_ledger.rs"
+
 # SQLite proof for maintained derived read models (issue #1769). The Postgres
 # suite is server-gated, so this is the only place the `sqlite` arms a
 # derivation adds are type-checked and run. Needs `--features sqlite`.
@@ -927,6 +964,22 @@ path = "tests/sqlite_commit_hook_worker.rs"
 [[test]]
 name = "sqlite_jobs_scheduler_e2e"
 path = "tests/sqlite_jobs_scheduler_e2e.rs"
+
+# Snag QA probe (#1771): runs the `#[repository]`-generated
+# `find_by_body_bidx` finder against real data (many owners, some sharing
+# plaintext) on a tempfile SQLite pool, which nothing in the existing
+# confidential-fields suite does (`confidential_model.rs` queries the
+# blind-index column with a raw Diesel `.filter(...)`, and
+# `tests/compile-pass/confidential_blind_index_finder.rs` only proves the
+# generated finder compiles). Isolated for the same feature-unification
+# reason as `sqlite_jobs_scheduler_e2e` above: `sqlite` flips
+# `db::RuntimeConnection` for the whole build graph, so it cannot share the
+# consolidated `integration_tests` binary with the Postgres-assuming `db`
+# suite. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test confidential_repository_bidx`.
+[[test]]
+name = "confidential_repository_bidx"
+path = "tests/confidential_repository_bidx.rs"
 
 # FRAMEWORK_MIGRATIONS applies on SQLite (issue #2699). Proves the SQLite fork
 # (autumn/migrations_sqlite) through the real MigrationHarness: api_tokens,
