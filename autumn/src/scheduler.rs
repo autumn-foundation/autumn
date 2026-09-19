@@ -328,6 +328,16 @@ impl PostgresAdvisoryLease {
 /// tick after `scheduler.lease_ttl_secs` instead of wedging the task. Set the
 /// TTL above the longest a tick body can take. See
 /// `docs/guide/scheduled-multi-replica.md`.
+/// Floor on the effective lease TTL of [`SqliteLeaseSchedulerCoordinator`].
+///
+/// A zero (or sub-millisecond) TTL writes `expires_at == now_ms`, which the
+/// reap-first predicate in `try_acquire` (`expires_at <= now_ms`) treats as
+/// already dead — so a second coordinator takes the identical tick while the
+/// first task is still running. Clamp rather than reject: the constructor
+/// takes a plain [`Duration`] a caller may reach through a computed value.
+#[cfg(feature = "sqlite")]
+const MIN_SCHEDULER_LEASE_TTL: Duration = Duration::from_secs(1);
+
 #[cfg(feature = "sqlite")]
 #[derive(Clone)]
 pub struct SqliteLeaseSchedulerCoordinator {
@@ -342,6 +352,11 @@ pub struct SqliteLeaseSchedulerCoordinator {
 #[cfg(feature = "sqlite")]
 impl SqliteLeaseSchedulerCoordinator {
     /// Create a `SQLite` lease coordinator over the app's primary pool.
+    ///
+    /// `lease_ttl` is clamped to at least [`MIN_SCHEDULER_LEASE_TTL`]: a
+    /// shorter lease would expire the instant it is written, and the
+    /// reap-first predicate in `try_acquire` would hand the identical tick to
+    /// a second coordinator while the first task is still running.
     #[must_use]
     pub fn new(
         pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
@@ -354,7 +369,7 @@ impl SqliteLeaseSchedulerCoordinator {
             pool,
             replica_id: replica_id.into(),
             key_prefix: key_prefix.into(),
-            lease_ttl,
+            lease_ttl: lease_ttl.max(MIN_SCHEDULER_LEASE_TTL),
             clock,
             ready: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -842,5 +857,60 @@ mod tests {
             }
         }
         assert!(FakePostgresCoordinator.is_fleet_distributed());
+    }
+
+    // Issue #2585 item 2: `SqliteLeaseSchedulerCoordinator::new` takes the
+    // `Duration` unchecked, and `try_acquire` computes `ttl_ms` from
+    // `as_millis()` — so `Duration::ZERO` (or anything sub-millisecond)
+    // wrote `expires_at == now_ms`, which the reap-first predicate
+    // (`expires_at <= now_ms`) treats as already dead. A second coordinator
+    // then took the identical tick while the first task was still running.
+    // The constructor clamps to the same 1s floor `lock.rs` uses.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_test_coordinator(ttl: Duration) -> SqliteLeaseSchedulerCoordinator {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            crate::db::RuntimeConnection,
+        >::new(":memory:");
+        let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+            .max_size(1)
+            .runtime(deadpool::Runtime::Tokio1)
+            .build()
+            .expect("test pool builds without connecting");
+        SqliteLeaseSchedulerCoordinator::new(
+            pool,
+            "replica-1",
+            "test-prefix",
+            ttl,
+            std::sync::Arc::new(crate::time::SystemClock),
+        )
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn scheduler_coordinator_clamps_a_sub_second_lease_ttl() {
+        assert_eq!(
+            sqlite_test_coordinator(Duration::ZERO).lease_ttl,
+            Duration::from_secs(1),
+            "a zero TTL would expire the instant it is written"
+        );
+        assert_eq!(
+            sqlite_test_coordinator(Duration::from_micros(999)).lease_ttl,
+            Duration::from_secs(1),
+            "a sub-millisecond TTL leaves ttl_ms == 0"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn scheduler_coordinator_keeps_a_sane_lease_ttl() {
+        assert_eq!(
+            sqlite_test_coordinator(Duration::from_secs(30)).lease_ttl,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            sqlite_test_coordinator(Duration::from_secs(1)).lease_ttl,
+            Duration::from_secs(1),
+            "exactly the floor stays the floor"
+        );
     }
 }
