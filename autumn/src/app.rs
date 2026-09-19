@@ -9148,6 +9148,35 @@ fn control_backend_is_sqlite(url: &str) -> bool {
 /// path, so a coincidental version match with one of them is not a real
 /// collision at all — including it unconditionally would turn a harmless
 /// coincidence into a startup abort.
+/// The framework's own `00000000000000_create_api_tokens` migration is a
+/// deliberate no-op back-compat placeholder (its `up.sql` is `SELECT 1`),
+/// kept at the version many apps historically claimed for their own first
+/// migration (see e.g. `examples/todo-app/migrations/00000000000000_create_todos`).
+/// Diesel applies whichever one wins the race for that version slot and
+/// records it; the shim's own body is intentionally empty, so it is harmless
+/// no matter which claimant runs. `classify_applied_user_migrations` already
+/// encodes this as "local presence wins over a framework shim version" for
+/// rollback/checksum purposes -- this is the same exception applied to the
+/// startup collision gate.
+#[cfg(feature = "db")]
+const BACKWARD_COMPAT_SHIM_MIGRATION_NAME: &str = "00000000000000_create_api_tokens";
+
+/// Whether a reported collision is the known-safe shim exception above
+/// rather than a real one. Only a two-way collision naming exactly the shim
+/// is excused: a third differently-named claimant at that version is still a
+/// genuine collision between two *other* migrations and must still fail
+/// loudly.
+#[cfg(feature = "db")]
+fn is_known_backward_compat_shim_collision(
+    collision: &crate::migrate::MigrationVersionCollision,
+) -> bool {
+    collision.names.len() == 2
+        && collision
+            .names
+            .iter()
+            .any(|name| name == BACKWARD_COMPAT_SHIM_MIGRATION_NAME)
+}
+
 #[cfg(feature = "db")]
 fn log_migration_version_collisions(
     migrations: &[crate::migrate::EmbeddedMigrations],
@@ -9166,7 +9195,7 @@ fn log_migration_version_collisions(
     // the same migration twice (an app that DOES also call
     // `.migrations(FRAMEWORK_MIGRATIONS)`, e.g. some examples) is harmless --
     // see `check_migration_version_collisions`'s same-name handling.
-    let collisions = crate::migrate::check_migration_version_collisions(
+    let collisions: Vec<_> = crate::migrate::check_migration_version_collisions(
         migrations
             .iter()
             .chain(control_targets_postgres.then_some(&crate::migrate::FRAMEWORK_MIGRATIONS))
@@ -9175,7 +9204,10 @@ fn log_migration_version_collisions(
                     .then_some(&crate::sharding::SHARD_DIRECTORY_MIGRATIONS),
             )
             .chain(shard_map_migration_required.then_some(&crate::sharding::SHARD_MAP_MIGRATIONS)),
-    );
+    )
+    .into_iter()
+    .filter(|collision| !is_known_backward_compat_shim_collision(collision))
+    .collect();
     for collision in &collisions {
         tracing::error!(
             version = %collision.version,
@@ -11941,6 +11973,45 @@ mod tests {
         assert!(!log_migration_version_collisions(
             &[FRAMEWORK_COLLISION_FIXTURE],
             false, // control_targets_postgres
+            false,
+            false,
+        ));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn log_migration_version_collisions_excuses_the_api_tokens_back_compat_shim() {
+        // Mirrors the real examples (todo-app, wiki, blog, bookmarks, ...)
+        // whose own first migration claims version 00000000000000 -- the
+        // same version as the framework's `00000000000000_create_api_tokens`
+        // no-op back-compat shim, which FRAMEWORK_MIGRATIONS always
+        // contributes on a Postgres control target. This two-way collision
+        // is the shim's documented purpose, not a bug: it must not abort
+        // startup for every example that predates real timestamp versions.
+        use crate::migrate::EmbeddedMigrations;
+
+        const APP_FIRST_MIGRATION_FIXTURE: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("test_migrations_api_tokens_shim_collision");
+        // A THIRD differently-named claimant of that same version -- e.g. an
+        // app and a plugin both reusing 00000000000000 for their own
+        // migrations -- is a genuine collision between two non-shim
+        // migrations and must still fail loudly; the shim exception only
+        // excuses the shim itself, not every other claimant riding along
+        // with it.
+        const THIRD_CLAIMANT_FIXTURE: EmbeddedMigrations = diesel_migrations::embed_migrations!(
+            "test_migrations_api_tokens_shim_collision_third_claimant"
+        );
+
+        assert!(!log_migration_version_collisions(
+            &[APP_FIRST_MIGRATION_FIXTURE],
+            true, // control_targets_postgres
+            false,
+            false,
+        ));
+
+        assert!(log_migration_version_collisions(
+            &[APP_FIRST_MIGRATION_FIXTURE, THIRD_CLAIMANT_FIXTURE],
+            true, // control_targets_postgres
             false,
             false,
         ));

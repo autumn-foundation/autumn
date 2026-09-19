@@ -593,10 +593,10 @@ pub fn run_check_collisions() {
     // (verified) branch to this checkout, since a working-tree migration
     // inherited unchanged from trunk would look "not yet on the default
     // branch" purely because we never confirmed otherwise.
-    let default_verified = if let Some(default_ref) = &default_ref {
+    let default_verified = default_ref.as_ref().is_some_and(|default_ref| {
         let is_current = default_ref
             .strip_prefix("refs/remotes/origin/")
-            .is_some_and(|name| is_ref_current(name));
+            .is_some_and(is_ref_current);
         if is_current {
             for dir_name in migration_dirs_at_ref(default_ref, DEFAULT_MIGRATIONS_DIR) {
                 default_branch_entries.insert(dir_name.clone());
@@ -607,9 +607,7 @@ pub fn run_check_collisions() {
             }
         }
         is_current
-    } else {
-        false
-    };
+    });
 
     // Scoped to `origin` only, not the whole `refs/remotes` namespace: a
     // differently configured remote (e.g. `upstream`) is not what this

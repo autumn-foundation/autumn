@@ -1,0 +1,4 @@
+-- Test-only fixture: mirrors the many examples (e.g. todo-app, wiki) whose
+-- own first migration historically claimed version 00000000000000, the same
+-- version as the framework's `00000000000000_create_api_tokens` back-compat
+-- shim. Exercises the shim exception in `is_known_backward_compat_shim_collision`.
