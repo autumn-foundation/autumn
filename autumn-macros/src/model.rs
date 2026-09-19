@@ -9466,7 +9466,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .values(__autumn_row)
                 .on_conflict(#table_ident::id)
                 .do_update()
-                .set(Self::__autumn_upsert_set());
+                .set(Self::__autumn_upsert_set())
+                // #2854: explicit column list — never rely on physical column
+                // order when decoding the RETURNING row into `Self`.
+                .returning(Self::as_select());
         };
         if has_tenant_id {
             lock_version_field.map_or_else(
@@ -10943,7 +10946,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .values(chunk.to_vec())
                             .on_conflict(#table_ident::id)
                             .do_update()
-                            .set(Self::__autumn_upsert_set());
+                            .set(Self::__autumn_upsert_set())
+                            // #2854: explicit column list — never rely on physical
+                            // column order when decoding the RETURNING rows.
+                            .returning(Self::as_select());
 
                         #execute_upsert_body
                     },
@@ -11610,6 +11616,29 @@ mod tests {
         assert!(
             !generated.contains("decimal_shape ("),
             "the marker must be consumed, not re-emitted: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_macro_upsert_returns_self_as_select() {
+        // #2854: the upsert's RETURNING rows must be decoded against the
+        // model's own column list, not the table's physical column order —
+        // same positional-decode hazard as the repository reads/writes.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Widget {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("returning (Self :: as_select ())"),
+            "upsert must return Self::as_select(): {}",
+            &generated[..generated.len().min(400)]
         );
     }
 
