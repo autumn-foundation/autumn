@@ -1102,6 +1102,11 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     "autumn_jobs",
     // `context` / `record` JSONB hold the full row a hook was queued for.
     "autumn_repository_commit_hooks",
+    // `raw_value` is the live operator-set override for each key — it can
+    // hold a secret. `autumn_runtime_config_changes` is the append-only audit
+    // log: `old_value` / `new_value` / `actor` for every set/unset (#2366).
+    "autumn_runtime_config_changes",
+    "autumn_runtime_config_values",
     // The indexed text of app records — the search index is a second copy of
     // whatever was made searchable.
     "autumn_search_documents",
@@ -7184,6 +7189,8 @@ mod tests {
             "autumn_feature_flags",
             "autumn_jobs",
             "autumn_repository_commit_hooks",
+            "autumn_runtime_config_changes",
+            "autumn_runtime_config_values",
             "autumn_search_documents",
             "autumn_sync_rows",
             "feature_flag_changes",

@@ -1,9 +1,10 @@
 # Migrating to the next Autumn release (rolling draft)
 
-> **Rolling draft.** This is the in-flight guide for the changes currently
-> under `## [Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md). Every PR
-> that lands a breaking change appends a section here and links this file from
-> its changelog entry. At release time the file is renamed to
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
 > `docs/migrations/<version>.md`, its version placeholders are filled in, and
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide

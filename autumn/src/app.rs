@@ -4104,6 +4104,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -6095,6 +6105,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -7475,6 +7495,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -13405,6 +13435,12 @@ fn build_state(
         crate::channels::Channels::with_shared_backend,
     );
 
+    // One tracker, shared with the collaboration hub: a hub built on a second
+    // `Presence` would report a participant list that disagrees with
+    // `state.presence()` (#1806).
+    #[cfg(feature = "presence")]
+    let presence = crate::presence::Presence::new(channels.clone());
+
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
@@ -13428,8 +13464,10 @@ fn build_state(
         config_props: crate::actuator::ConfigProperties::from_config(config),
         metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+        #[cfg(all(feature = "collab", feature = "presence"))]
+        collab: crate::collab::CollabHub::new(channels.clone(), presence.clone()),
         #[cfg(feature = "presence")]
-        presence: crate::presence::Presence::new(channels.clone()),
+        presence,
         #[cfg(feature = "ws")]
         channels,
         #[cfg(feature = "ws")]
